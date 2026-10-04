@@ -113,10 +113,21 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
     errors.push('Enter a valid umbrella number.');
   const ids = new Set<string>();
   const numbers = new Set<string>();
+  const aliases = new Map(graph.issues.map((issue) => [issue.id, issue.id]));
   for (const issue of graph.issues) {
+    if (!issue.number) continue;
+    const repo = issue.repository ?? graph.repository;
+    if (repo) aliases.set(`${repo}#${issue.number}`, issue.id);
+    if (!issue.repository || issue.repository === graph.repository)
+      aliases.set(String(issue.number), issue.id);
+  }
+  for (const issue of graph.issues) {
+    if (issue.id === 'umbrella') errors.push('Issue ID umbrella is reserved.');
     if (!issue.id.trim() || ids.has(issue.id))
       errors.push(`Duplicate or empty issue ID: ${issue.id || '(empty)'}.`);
     ids.add(issue.id);
+    if (aliases.get(issue.id) !== issue.id)
+      errors.push(`Issue ID ${issue.id} conflicts with an issue reference.`);
     if (!issue.title.trim()) errors.push(`Enter a title for ${issue.id || 'the issue'}.`);
     if (issue.number !== undefined) {
       if (!Number.isSafeInteger(issue.number) || issue.number <= 0)
@@ -128,11 +139,6 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
       if (local && issue.number === graph.umbrellaNumber)
         errors.push('An umbrella cannot be its own child.');
     }
-    const aliases = new Map(
-      graph.issues
-        .filter((item) => item.number && (!item.repository || item.repository === graph.repository))
-        .map((item) => [String(item.number), item.id]),
-    );
     const canonical = issue.dependsOn.map((dependency) => aliases.get(dependency) ?? dependency);
     if (new Set(canonical).size !== canonical.length)
       errors.push(`${issue.id} repeats a dependency.`);
@@ -140,13 +146,6 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const byId = new Map(graph.issues.map((issue) => [issue.id, issue]));
-  const byNumber = new Map(
-    graph.issues
-      .filter(
-        (issue) => issue.number && (!issue.repository || issue.repository === graph.repository),
-      )
-      .map((issue) => [String(issue.number), issue.id]),
-  );
   const visit = (id: string): void => {
     if (visiting.has(id)) {
       errors.push(`Dependency cycle includes ${id}.`);
@@ -155,7 +154,7 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
     if (visited.has(id)) return;
     visiting.add(id);
     for (const dependency of byId.get(id)?.dependsOn ?? []) {
-      const local = byId.has(dependency) ? dependency : byNumber.get(dependency);
+      const local = aliases.get(dependency);
       if (local) visit(local);
       else if (!/^(?:[1-9]\d*|[^/#]+\/[^/#]+#[1-9]\d*)$/.test(dependency))
         errors.push(`${id} depends on missing issue ${dependency}.`);

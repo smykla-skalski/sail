@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, OnceLock};
+
+static GRAPH_PUBLISH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Serialize, Deserialize)]
 pub struct PullRequest {
@@ -260,6 +263,30 @@ fn issue_parent(
     }
 }
 
+fn graph_aliases(graph: &IssueGraphDraft) -> HashMap<String, String> {
+    let mut aliases = graph
+        .issues
+        .iter()
+        .map(|issue| (issue.id.clone(), issue.id.clone()))
+        .collect::<HashMap<_, _>>();
+    for issue in &graph.issues {
+        if let Some(number) = issue.number {
+            if let Some(repo) = issue.repository.as_ref().or(graph.repository.as_ref()) {
+                aliases.insert(format!("{repo}#{number}"), issue.id.clone());
+            }
+            if issue.repository.as_ref().is_none_or(|repo| {
+                graph
+                    .repository
+                    .as_ref()
+                    .is_some_and(|target| repo.eq_ignore_ascii_case(target))
+            }) {
+                aliases.insert(number.to_string(), issue.id.clone());
+            }
+        }
+    }
+    aliases
+}
+
 fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
     use std::collections::{HashMap, HashSet};
     if graph.source.trim().is_empty() {
@@ -276,26 +303,19 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
     }
     let mut ids = HashSet::new();
     let mut numbers = HashSet::new();
-    let number_aliases: HashMap<String, &str> = graph
-        .issues
-        .iter()
-        .filter(|issue| {
-            issue.repository.as_ref().is_none_or(|repo| {
-                graph
-                    .repository
-                    .as_ref()
-                    .is_some_and(|target| repo.eq_ignore_ascii_case(target))
-            })
-        })
-        .filter_map(|issue| {
-            issue
-                .number
-                .map(|number| (number.to_string(), issue.id.as_str()))
-        })
-        .collect();
+    let aliases = graph_aliases(graph);
     for issue in &graph.issues {
+        if issue.id == "umbrella" {
+            return Err("Issue ID umbrella is reserved.".into());
+        }
         if issue.id.trim().is_empty() || !ids.insert(issue.id.as_str()) {
             return Err(format!("Duplicate or empty issue ID: {}.", issue.id));
+        }
+        if aliases.get(&issue.id) != Some(&issue.id) {
+            return Err(format!(
+                "Issue ID {} conflicts with an issue reference.",
+                issue.id
+            ));
         }
         if issue.title.trim().is_empty() {
             return Err(format!("Enter a title for {}.", issue.id));
@@ -324,9 +344,9 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
         }
         let mut dependencies = HashSet::new();
         for dependency in &issue.depends_on {
-            let canonical = number_aliases
+            let canonical = aliases
                 .get(dependency)
-                .copied()
+                .map(String::as_str)
                 .unwrap_or(dependency);
             if !dependencies.insert(canonical) {
                 return Err(format!("{} repeats dependency {dependency}.", issue.id));
@@ -338,43 +358,31 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
         .iter()
         .map(|issue| (issue.id.as_str(), issue))
         .collect();
-    let by_number: HashMap<u64, &str> = graph
-        .issues
-        .iter()
-        .filter(|issue| {
-            issue.repository.as_ref().is_none_or(|repo| {
-                graph
-                    .repository
-                    .as_ref()
-                    .is_some_and(|target| repo.eq_ignore_ascii_case(target))
-            })
-        })
-        .filter_map(|issue| issue.number.map(|number| (number, issue.id.as_str())))
-        .collect();
-    fn visit<'a>(
-        id: &'a str,
-        by_id: &HashMap<&'a str, &'a IssueDraft>,
-        by_number: &HashMap<u64, &'a str>,
-        visiting: &mut HashSet<&'a str>,
-        visited: &mut HashSet<&'a str>,
+    fn visit(
+        id: &str,
+        by_id: &HashMap<&str, &IssueDraft>,
+        aliases: &HashMap<String, String>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
     ) -> Result<(), String> {
         if visited.contains(id) {
             return Ok(());
         }
-        if !visiting.insert(id) {
+        if !visiting.insert(id.to_string()) {
             return Err(format!("Dependency cycle includes {id}."));
         }
         let issue = by_id
             .get(id)
             .ok_or_else(|| format!("Missing issue {id}."))?;
         for dependency in &issue.depends_on {
-            if by_id.contains_key(dependency.as_str()) {
-                visit(dependency, by_id, by_number, visiting, visited)?;
-            } else if let Some(number) = dependency.parse::<u64>().ok().filter(|number| *number > 0)
+            if let Some(local) = aliases.get(dependency) {
+                visit(local, by_id, aliases, visiting, visited)?;
+            } else if dependency
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number > 0)
+                .is_some()
             {
-                if let Some(local) = by_number.get(&number) {
-                    visit(local, by_id, by_number, visiting, visited)?;
-                }
             } else if let Some((repository, number)) = dependency.rsplit_once('#') {
                 let valid_repo = repository.split_once('/').is_some_and(|(owner, name)| {
                     !owner.is_empty() && !name.is_empty() && !name.contains('/')
@@ -393,13 +401,13 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
             }
         }
         visiting.remove(id);
-        visited.insert(id);
+        visited.insert(id.to_string());
         Ok(())
     }
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
     for issue in &graph.issues {
-        visit(&issue.id, &by_id, &by_number, &mut visiting, &mut visited)?;
+        visit(&issue.id, &by_id, &aliases, &mut visiting, &mut visited)?;
     }
     Ok(())
 }
@@ -513,12 +521,113 @@ fn delete_issue_link(directory: &Path, endpoint: &str, field: &str, id: u64) -> 
     .map(|_| ())
 }
 
+fn validate_reachable_dependencies(
+    directory: &Path,
+    graph: &IssueGraphDraft,
+    existing: &HashMap<String, serde_json::Value>,
+    external: &HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+    let draft_nodes = existing
+        .iter()
+        .map(|(id, value)| {
+            Ok((
+                value["id"].as_u64().ok_or("GitHub issue has no ID.")?,
+                format!("draft:{id}"),
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+    let mut pending = Vec::new();
+    for draft in &graph.issues {
+        let mut blockers = Vec::new();
+        for dependency in &draft.depends_on {
+            if graph.issues.iter().any(|issue| issue.id == *dependency) {
+                blockers.push(format!("draft:{dependency}"));
+            } else {
+                let value = external.get(dependency).ok_or("Missing dependency.")?;
+                let id = value["id"].as_u64().ok_or("GitHub dependency has no ID.")?;
+                blockers.push(format!("external:{id}"));
+                pending.push(value.clone());
+            }
+        }
+        edges.insert(format!("draft:{}", draft.id), blockers);
+    }
+    let mut seen = HashSet::new();
+    while let Some(value) = pending.pop() {
+        let id = value["id"].as_u64().ok_or("GitHub dependency has no ID.")?;
+        if !seen.insert(id) {
+            continue;
+        }
+        if seen.len() > 10_000 {
+            return Err("Dependency graph is too large to validate.".into());
+        }
+        let repository = issue_repository_name(&value)?;
+        let number = value["number"]
+            .as_u64()
+            .ok_or("GitHub dependency has no number.")?;
+        let blockers = issue_pages(
+            directory,
+            &format!("repos/{repository}/issues/{number}/dependencies/blocked_by"),
+        )?;
+        let mut next = Vec::new();
+        for blocker in blockers {
+            let blocker_id = blocker["id"]
+                .as_u64()
+                .ok_or("GitHub dependency has no ID.")?;
+            if let Some(draft) = draft_nodes.get(&blocker_id) {
+                next.push(draft.clone());
+            } else {
+                next.push(format!("external:{blocker_id}"));
+                pending.push(blocker);
+            }
+        }
+        edges.insert(format!("external:{id}"), next);
+    }
+    fn visit(
+        node: &str,
+        edges: &HashMap<String, Vec<String>>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) -> Result<(), String> {
+        if visited.contains(node) {
+            return Ok(());
+        }
+        if !visiting.insert(node.to_string()) {
+            return Err(format!("Dependency cycle includes {node}."));
+        }
+        if let Some(next) = edges.get(node) {
+            for blocker in next {
+                visit(blocker, edges, visiting, visited)?;
+            }
+        }
+        visiting.remove(node);
+        visited.insert(node.to_string());
+        Ok(())
+    }
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for draft in &graph.issues {
+        visit(
+            &format!("draft:{}", draft.id),
+            &edges,
+            &mut visiting,
+            &mut visited,
+        )?;
+    }
+    Ok(())
+}
+
 fn publish_graph(repository: String, mut graph: IssueGraphDraft) -> Result<PublishedGraph, String> {
     let (repository, target) = issue_repository(repository)?;
+    let _publish_guard = GRAPH_PUBLISH_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "Issue publication lock failed.")?;
     graph.repository = Some(target.clone());
     validate_graph(&graph)?;
-    let needs_lookup =
-        graph.umbrella_number.is_none() || graph.issues.iter().any(|issue| issue.number.is_none());
+    let needs_lookup = (graph.issues.len() > 1 && graph.umbrella_number.is_none())
+        || graph.issues.iter().any(|issue| issue.number.is_none());
     let all_issues = if needs_lookup {
         issue_pages(&repository, &format!("repos/{target}/issues?state=all"))?
     } else {
@@ -607,7 +716,16 @@ fn publish_graph(repository: String, mut graph: IssueGraphDraft) -> Result<Publi
             draft.number = value["number"].as_u64();
         }
     }
+    let aliases = graph_aliases(&resolved_graph);
+    for draft in &mut resolved_graph.issues {
+        for dependency in &mut draft.depends_on {
+            if let Some(id) = aliases.get(dependency) {
+                *dependency = id.clone();
+            }
+        }
+    }
     validate_graph(&resolved_graph)?;
+    graph = resolved_graph;
     let mut external = HashMap::new();
     for draft in &graph.issues {
         for dependency in &draft.depends_on {
@@ -628,6 +746,7 @@ fn publish_graph(repository: String, mut graph: IssueGraphDraft) -> Result<Publi
             external.insert(dependency.clone(), value);
         }
     }
+    validate_reachable_dependencies(&repository, &graph, &existing, &external)?;
     if !replace_existing {
         if let Some(parent) = &umbrella {
             let parent_number = parent["number"]
@@ -768,6 +887,7 @@ fn publish_graph(repository: String, mut graph: IssueGraphDraft) -> Result<Publi
             }
         }
     }
+    let mut pending_blockers = Vec::new();
     for (issue, _) in &issues {
         let blocked_by = issue_pages(
             &repository,
@@ -821,27 +941,22 @@ fn publish_graph(repository: String, mut graph: IssueGraphDraft) -> Result<Publi
             .collect::<std::collections::HashSet<_>>();
         for (reference, id) in desired {
             if !current.contains(&id) {
-                issue_api(
-                    &repository,
-                    &[
-                        "-X",
-                        "POST",
-                        &format!(
-                            "repos/{}/issues/{}/dependencies/blocked_by",
-                            issue.repository, issue.number
-                        ),
-                        "-F",
-                        &format!("issue_id={id}"),
-                    ],
-                )
-                .map_err(|error| {
-                    format!(
-                        "Cannot add blocker {reference} to #{}: {error}",
-                        issue.number
-                    )
-                })?;
+                pending_blockers.push((issue.repository.clone(), issue.number, reference, id));
             }
         }
+    }
+    for (issue_repo, number, reference, id) in pending_blockers {
+        issue_api(
+            &repository,
+            &[
+                "-X",
+                "POST",
+                &format!("repos/{issue_repo}/issues/{number}/dependencies/blocked_by"),
+                "-F",
+                &format!("issue_id={id}"),
+            ],
+        )
+        .map_err(|error| format!("Cannot add blocker {reference} to #{number}: {error}"))?;
     }
     Ok(PublishedGraph {
         umbrella: umbrella
@@ -1558,6 +1673,43 @@ mod tests {
             super::dependency_repository("owner/other#3", "owner/main").unwrap(),
             ("owner/other", 3)
         );
+    }
+
+    #[test]
+    fn graph_qualifies_local_aliases_and_reserves_umbrella_marker() {
+        let mut graph = IssueGraphDraft {
+            repository: Some("owner/main".into()),
+            umbrella_number: None,
+            source: "test".into(),
+            replace_existing: false,
+            title: "Umbrella".into(),
+            body: String::new(),
+            issues: vec![
+                IssueDraft {
+                    id: "a".into(),
+                    number: Some(3),
+                    repository: None,
+                    title: "A".into(),
+                    body: String::new(),
+                    depends_on: vec!["b".into()],
+                },
+                IssueDraft {
+                    id: "b".into(),
+                    number: Some(4),
+                    repository: None,
+                    title: "B".into(),
+                    body: String::new(),
+                    depends_on: vec!["owner/main#3".into()],
+                },
+            ],
+        };
+        assert!(validate_graph(&graph).unwrap_err().contains("cycle"));
+        graph.issues[0].depends_on.clear();
+        graph.issues[1].depends_on = vec!["a".into(), "owner/main#3".into()];
+        assert!(validate_graph(&graph).unwrap_err().contains("repeats"));
+        graph.issues[1].depends_on.clear();
+        graph.issues[1].id = "umbrella".into();
+        assert!(validate_graph(&graph).unwrap_err().contains("reserved"));
     }
 
     #[test]

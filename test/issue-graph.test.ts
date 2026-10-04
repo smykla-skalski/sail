@@ -124,6 +124,31 @@ await test('same issue number in another repository keeps its identity', () => {
   );
 });
 
+await test('qualified local references cannot hide a cycle or repeat a blocker', () => {
+  const qualified = { ...graph, repository: 'owner/main' };
+  assert.match(
+    graphErrors({
+      ...qualified,
+      issues: [
+        { ...graph.issues[0], dependsOn: ['b'] },
+        { ...graph.issues[1], dependsOn: ['owner/main#3'] },
+      ],
+    }).join(' '),
+    /cycle/,
+  );
+  assert.match(
+    graphErrors({
+      ...qualified,
+      issues: [graph.issues[0], { ...graph.issues[1], dependsOn: ['a', 'owner/main#3'] }],
+    }).join(' '),
+    /repeats/,
+  );
+  assert.match(
+    graphErrors({ ...qualified, issues: [{ ...graph.issues[0], id: 'umbrella' }] }).join(' '),
+    /reserved/,
+  );
+});
+
 await test('revision to one issue releases an authored umbrella', async () => {
   const { rebaseIssueGraph } = await import('../src/lib/issue-graph.ts');
   const plan = {
