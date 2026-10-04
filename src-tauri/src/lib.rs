@@ -1593,7 +1593,6 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::working_tree_revision;
     use super::{
         add_worktree, git_change_action, git_patch, normalize_picker_path,
@@ -1812,7 +1811,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn working_tree_revision_detects_edits_in_dirty_submodules() {
         let root =
