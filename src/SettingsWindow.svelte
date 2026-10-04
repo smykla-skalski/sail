@@ -3,8 +3,10 @@
   import { emitTo, listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { Button } from '@smykla-skalski/sui';
+  import { invoke } from '@tauri-apps/api/core';
   import OptionPicker from './OptionPicker.svelte';
   import { getSetting } from './lib/settings';
+  import { openExternalLink } from './lib/external-link';
   import type { SetupCheck, SetupReport } from './lib/onboarding';
   import {
     settingsAction,
@@ -22,6 +24,37 @@
   let selectedSection = $state<'general' | 'opencode' | 'agents'>('general');
   let themePickerOpen = $state(false);
   let requestError = $state('');
+  type HookEntry = {
+    provider: string;
+    source: string;
+    event: string;
+    identity: string;
+    state: string;
+  };
+  type HookError = { provider: string; source: string; message: string };
+  let hookReport = $state<{ entries: HookEntry[]; errors: HookError[] } | null>(null);
+  let hookError = $state('');
+  let hookLoading = $state(false);
+  let hookDirectory = '';
+
+  async function inspectHooks(directory: string) {
+    hookDirectory = directory;
+    hookReport = null;
+    hookError = '';
+    if (!directory) return;
+    hookLoading = true;
+    try {
+      const report = await invoke<{ entries: HookEntry[]; errors: HookError[] }>(
+        'inspect_agent_hooks',
+        { worktree: directory },
+      );
+      if (hookDirectory === directory) hookReport = report;
+    } catch (cause) {
+      if (hookDirectory === directory) hookError = String(cause);
+    } finally {
+      if (hookDirectory === directory) hookLoading = false;
+    }
+  }
 
   function setupRows(report: SetupReport): [string, SetupCheck][] {
     return [
@@ -69,6 +102,8 @@
       try {
         const stop = await listen<SettingsSnapshot>(settingsState, (event) => {
           snapshot = event.payload;
+          if (selectedSection === 'agents' && snapshot.directory !== hookDirectory)
+            void inspectHooks(snapshot.directory);
           document.documentElement.dataset.suiTheme = snapshot.theme;
           if (!binaryDirty) binaryPath = snapshot.binaryPath;
           if (!personalChecksDirty) personalChecks = snapshot.personalPostTurnChecks.join('\n');
@@ -110,7 +145,11 @@
       <button
         class:active={selectedSection === 'agents'}
         aria-current={selectedSection === 'agents' ? 'page' : undefined}
-        onclick={() => (selectedSection = 'agents')}>Agents</button
+        onclick={() => {
+          selectedSection = 'agents';
+          if (snapshot?.directory && snapshot.directory !== hookDirectory)
+            void inspectHooks(snapshot.directory);
+        }}>Agents</button
       >
     </nav>
   </aside>
@@ -214,6 +253,57 @@
             <strong>{agent.name}</strong>: {agent.binaryPath ?? agent.reason ?? 'Unavailable'}
           </p>{/each}
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
+      </section>
+      <section class="settings-card hook-inspector">
+        <h2>Configured hooks and plugins</h2>
+        <p class="runtime-binary" title={snapshot?.directory ?? ''}>
+          {snapshot?.directory || 'Select a worktree to inspect its configuration.'}
+        </p>
+        <Button
+          size="sm"
+          disabled={!snapshot?.directory || hookLoading}
+          onclick={() => void inspectHooks(snapshot!.directory)}
+          >{hookLoading ? 'Inspecting…' : 'Refresh'}</Button
+        >
+        {#if hookError}<p class="runtime-diagnostic" role="alert">{hookError}</p>{/if}
+        {#each hookReport?.errors ?? [] as item, index (`${item.source}:${index}`)}<p
+            class="runtime-diagnostic"
+            role="alert"
+          >
+            <strong>{item.provider}</strong> · {item.source}: {item.message}
+          </p>{/each}
+        {#if hookReport && !hookReport.entries.length}<p>
+            No configured hooks or plugins found.
+          </p>{/if}
+        {#if hookReport?.entries.length}<ul>
+            {#each hookReport.entries as item, index (`${item.source}:${item.event}:${index}`)}<li>
+                <strong>{item.provider} · {item.event}</strong><br />
+                <code>{item.identity}</code><br />
+                <small>{item.source} · {item.state}</small>
+              </li>{/each}
+          </ul>{/if}
+        <p class="runtime-binary">
+          Read-only file discovery. Check native controls for effective trust and enabled state:
+        </p>
+        <p class="runtime-binary">
+          <a
+            href="https://code.claude.com/docs/en/hooks"
+            onclick={(event) => openExternalLink(event, 'https://code.claude.com/docs/en/hooks')}
+            >Claude /hooks</a
+          >
+          ·
+          <a
+            href="https://learn.chatgpt.com/docs/hooks"
+            onclick={(event) => openExternalLink(event, 'https://learn.chatgpt.com/docs/hooks')}
+            >Codex hooks</a
+          >
+          ·
+          <a
+            href="https://opencode.ai/v2/docs/plugins"
+            onclick={(event) => openExternalLink(event, 'https://opencode.ai/v2/docs/plugins')}
+            >OpenCode plugins</a
+          >
+        </p>
       </section>
       <section class="settings-card">
         <h2>Agent coordination</h2>

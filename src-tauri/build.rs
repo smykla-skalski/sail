@@ -26,6 +26,7 @@ fn main() {
             "cancel_post_turn_check",
             "list_post_turn_checks",
             "run_post_turn_check",
+            "inspect_agent_hooks",
             "create_pull_request",
             "list_open_issues",
             "open_issue",
