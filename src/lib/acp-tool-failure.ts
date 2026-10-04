@@ -3,7 +3,7 @@ import { klaudiushRules } from './klaudiush.ts';
 import { toolCommand, toolInput } from './tool-display.ts';
 
 export interface AcpToolFailure {
-  kind: 'hook' | 'tool';
+  kind: 'hook' | 'post-hook' | 'tool';
   action: string;
   rule: string | null;
   reason: string;
@@ -37,11 +37,17 @@ export function acpToolFailure(tool: AgentTool): AcpToolFailure | null {
   const rules = klaudiushRules(output);
   const hookName = field(raw, ['hookName', 'hook_name', 'hook']);
   const ruleName = field(raw, ['ruleName', 'rule_name', 'rule']);
+  const hookPhase = field(raw, ['hookPhase', 'hook_phase', 'hookEvent', 'hook_event']);
+  const postHook = /PostToolUse:\w+ says:/i.test(output) || /PostToolUse/i.test(hookPhase ?? '');
   const hookEvidence =
-    /(?:PreToolUse|PostToolUse):\w+ says:|(?:blocked|denied|rejected|failed) by (?:a )?hook|hook (?:blocked|denied|rejected|failed)/i.test(
+    /PreToolUse:\w+ says:|(?:blocked|denied|rejected|failed) by (?:a )?hook|hook (?:blocked|denied|rejected|failed)/i.test(
       output,
     );
-  const kind = rules.length || hookName || ruleName || hookEvidence ? 'hook' : 'tool';
+  const kind = postHook
+    ? 'post-hook'
+    : rules.length || hookName || ruleName || hookEvidence
+      ? 'hook'
+      : 'tool';
   const rule = rules.length ? rules.map((item) => item.code).join(', ') : (ruleName ?? hookName);
   const reason = rules.length
     ? rules.map((item) => item.reason).join('; ')
@@ -60,15 +66,21 @@ export function acpToolFailure(tool: AgentTool): AcpToolFailure | null {
   return {
     kind,
     action: toolCommand(tool.input) ?? tool.title,
-    rule: kind === 'hook' ? rule : null,
+    rule: kind === 'tool' ? null : rule,
     reason: reason.slice(0, 1000),
     output: output.slice(0, 4000),
   };
 }
 
 export function fixAcpToolFailurePrompt(failure: AcpToolFailure): string {
+  const instruction =
+    failure.kind === 'post-hook'
+      ? 'Review the post-action hook failure below. Check the action result before retrying it, then address the hook failure.'
+      : failure.kind === 'hook'
+        ? 'Fix the hook-blocked action below. Follow the reported rule and explain the fix.'
+        : 'Fix the failed tool action below. Use the failure details to diagnose it and explain the fix.';
   return [
-    `Fix the ${failure.kind === 'hook' ? 'hook-blocked action' : 'failed tool action'} below. Follow the reported rule and explain the fix.`,
+    instruction,
     `Action: ${failure.action}`,
     ...(failure.rule ? [`Rule or hook: ${failure.rule}`] : []),
     `Reason: ${failure.reason}`,

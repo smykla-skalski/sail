@@ -64,6 +64,8 @@ void test('ordinary tool errors stay labeled as tool failures', () => {
   assert.equal(failure?.kind, 'tool');
   assert.equal(failure?.rule, null);
   assert.equal(failure?.reason, 'File not found');
+  assert.doesNotMatch(fixAcpToolFailurePrompt(failure), /reported rule/);
+  assert.match(fixAcpToolFailurePrompt(failure), /failure details/);
   assert.equal(
     acpToolFailure(tool({ content: 'Error: expected PreToolUse response from parser' }))?.kind,
     'tool',
@@ -76,6 +78,19 @@ void test('ordinary tool errors stay labeled as tool failures', () => {
     acpToolFailure(tool({ status: 'completed', content: 'hook blocked example' })),
     null,
   );
+});
+
+void test('post-action hook failures avoid implying the action was blocked', () => {
+  const failure = acpToolFailure(
+    tool({
+      content: 'PostToolUse:Bash says: Audit check failed',
+      output: { hookName: 'audit', hookEvent: 'PostToolUse' },
+    }),
+  );
+  assert.equal(failure?.kind, 'post-hook');
+  assert.equal(failure?.rule, 'audit');
+  assert.match(fixAcpToolFailurePrompt(failure), /Check the action result before retrying/);
+  assert.doesNotMatch(fixAcpToolFailurePrompt(failure), /hook-blocked action/);
 });
 
 void test('repeated ACP updates keep one card with the latest result', () => {

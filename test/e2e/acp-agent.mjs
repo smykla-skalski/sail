@@ -338,6 +338,28 @@ for await (const line of createInterface({ input: process.stdin })) {
     const user = { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } };
     sessions.get(sessionId).history.push(user);
     update(sessionId, user);
+    if (text === 'Post-hook failure demo') {
+      update(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: `post-hook-${message.id}`,
+        title: 'Publish package',
+        status: 'pending',
+        rawInput: { command: 'npm publish' },
+      });
+      update(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: `post-hook-${message.id}`,
+        status: 'failed',
+        content: [
+          {
+            type: 'content',
+            content: { type: 'text', text: 'PostToolUse:Bash says: Audit check failed' },
+          },
+        ],
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Hook failure demo') {
       const record = (value) => {
         sessions.get(sessionId).history.push(value);

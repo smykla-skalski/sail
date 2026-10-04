@@ -501,6 +501,30 @@ describe('ACP agent threads', () => {
     await expect(sent.at(-1)).toHaveText(expect.stringContaining('Rule or hook: GIT010'));
   });
 
+  it('keeps post-action hook failures distinct from blocked actions', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Post-hook failure demo');
+    await $('.agent-actions button').click();
+    await expect($('.agent-tool-failure')).toHaveText(
+      expect.stringContaining('Post-action hook failed'),
+    );
+    await $('.agent-tool-failure button').click();
+    const prepared = await $('.agent-composer textarea').getValue();
+    expect(prepared).toContain('Check the action result before retrying it');
+    expect(prepared).not.toContain('hook-blocked action');
+  });
+
   it('shows an agent shell command and its output in tool activity', async () => {
     await browser.execute((path) => {
       localStorage.setItem('sai-directory', path);

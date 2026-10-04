@@ -1339,12 +1339,14 @@
     {#snippet failureCard(tool: AgentTool)}
       {@const failure = acpToolFailure(tool)}
       {#if failure}
-        <div
-          class="agent-tool-failure"
-          role="group"
-          aria-label={failure.kind === 'hook' ? 'Action blocked by hook' : 'Tool failure'}
-        >
-          <strong>{failure.kind === 'hook' ? 'Action blocked by hook' : 'Tool failure'}</strong>
+        {@const label =
+          failure.kind === 'post-hook'
+            ? 'Post-action hook failed'
+            : failure.kind === 'hook'
+              ? 'Action blocked by hook'
+              : 'Tool failure'}
+        <div class="agent-tool-failure" role="group" aria-label={label}>
+          <strong>{label}</strong>
           <div><span>Action:</span> <code>{failure.action}</code></div>
           {#if failure.rule}<div><span>Rule or hook:</span> <code>{failure.rule}</code></div>{/if}
           <div><span>Reason:</span> {failure.reason}</div>
