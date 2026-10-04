@@ -26,7 +26,11 @@
   import SkillMenu from './SkillMenu.svelte';
   import { matchingSkills, promptSkill, type SkillChoice } from './lib/skills';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
-  import { reportedHookIdentity, toolFailurePrompt } from './lib/tool-failure';
+  import {
+    openCodeErrorDetails,
+    reportedHookIdentity,
+    toolFailurePrompt,
+  } from './lib/tool-failure';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import type { Confirmation } from './ConfirmDialog.svelte';
   import PathPicker from './PathPicker.svelte';
@@ -7126,7 +7130,9 @@
                       {#each message.content as part, ordinal (ordinal)}
                         {#if part.type === 'tool'}
                           {@const reason =
-                            part.state.status === 'error' ? part.state.error.message : ''}
+                            part.state.status === 'error'
+                              ? openCodeErrorDetails(part.state.error)
+                              : ''}
                           {@const output =
                             part.state.status === 'completed' || part.state.status === 'error'
                               ? (part.state.content ?? [])

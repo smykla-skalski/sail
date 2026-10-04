@@ -6,15 +6,27 @@ export function toolFailurePrompt(
   error: string,
   output: string,
 ): string {
-  const action = toolCommand(input) ?? toolInput(input);
+  const command = toolCommand(input);
+  const action = toolInput(input);
   return [
     `Fix the failed ${name} action. Inspect the cause, make the needed change, and verify it.`,
-    action && `Action:\n${action}`,
+    command && `Command:\n${command}`,
+    action && `Input:\n${action}`,
     `Error:\n${error}`,
     output && `Output:\n${output}`,
   ]
     .filter(Boolean)
     .join('\n\n');
+}
+
+export function openCodeErrorDetails(error: {
+  type: string;
+  message: string;
+  response?: { body: string };
+}): string {
+  const message = error.message.trim() || error.type || 'Tool failed';
+  const body = error.response?.body.trim();
+  return body && !message.includes(body) ? `${message}\n\n${body}` : message;
 }
 
 export function reportedHookIdentity(metadata: Record<string, unknown> | undefined): string | null {

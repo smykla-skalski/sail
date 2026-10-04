@@ -56,8 +56,7 @@
       {/if}
       {#if error}<p class="tool-activity-error">{error}</p>{/if}
       {#if source}<p class="tool-activity-source">Reported by {source}</p>{/if}
-      {#if error && onfix}<button class="tool-activity-fix" onclick={onfix}>Fix with agent</button
-        >{/if}
+      {#if onfix}<button class="tool-activity-fix" onclick={onfix}>Fix with agent</button>{/if}
       {#if children}{@render children()}{/if}
     </div>
   {/if}

@@ -29,7 +29,11 @@
   import type { SetupReport } from './lib/onboarding';
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import { mergeMessages, nearBottom } from './lib/timeline';
-  import { reportedHookIdentity, toolFailurePrompt } from './lib/tool-failure';
+  import {
+    openCodeErrorDetails,
+    reportedHookIdentity,
+    toolFailurePrompt,
+  } from './lib/tool-failure';
 
   let {
     client,
@@ -652,7 +656,8 @@
             {#if text}<Markdown source={text} />{/if}
             {#each message.content as part, ordinal (ordinal)}
               {#if part.type === 'tool'}
-                {@const reason = part.state.status === 'error' ? part.state.error.message : ''}
+                {@const reason =
+                  part.state.status === 'error' ? openCodeErrorDetails(part.state.error) : ''}
                 {@const output =
                   part.state.status === 'completed' || part.state.status === 'error'
                     ? (part.state.content ?? [])
