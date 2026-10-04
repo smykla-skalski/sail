@@ -468,6 +468,63 @@ describe('ACP agent threads', () => {
     await expect(group).toHaveText(expect.stringContaining('Could not read the first path.'));
   });
 
+  it('explains a blocked ACP action and sends its latest failure to the agent', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Hook failure demo');
+    await $('.agent-actions button').click();
+    await expect($('.agent-tool-failure')).toBeDisplayed();
+    await expect($$('.agent-tool-failure')).toBeElementsArrayOfSize(1);
+    await expect($('.agent-tool-failure')).toHaveText(expect.stringContaining('GIT010'));
+    await expect($('.agent-tool-failure')).toHaveText(expect.stringContaining('Add -s -S flags'));
+    await $('.agent-composer textarea').setValue('Keep this context.');
+    await $('.agent-tool-failure button').click();
+    await $('.agent-tool-failure button').click();
+    const prepared = await $('.agent-composer textarea').getValue();
+    expect(prepared).toContain('Keep this context.');
+    expect(prepared.match(/Rule or hook: GIT010/g)).toHaveLength(1);
+    await $('.agent-actions button').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('I will add the required flags.'),
+    );
+    const sent = await $$('.agent-conversation .user-message');
+    await expect(sent.at(-1)).toHaveText(expect.stringContaining('Rule or hook: GIT010'));
+  });
+
+  it('keeps post-action hook failures distinct from blocked actions', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Post-hook failure demo');
+    await $('.agent-actions button').click();
+    await expect($('.agent-tool-failure')).toHaveText(
+      expect.stringContaining('Post-action hook failed'),
+    );
+    await $('.agent-tool-failure button').click();
+    const prepared = await $('.agent-composer textarea').getValue();
+    expect(prepared).toContain('Check the action result before retrying it');
+    expect(prepared).not.toContain('hook-blocked action');
+  });
+
   it('shows an agent shell command and its output in tool activity', async () => {
     await browser.execute((path) => {
       localStorage.setItem('sai-directory', path);

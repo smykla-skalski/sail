@@ -9,6 +9,11 @@
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
   import { toolInput } from './lib/tool-display';
+  import {
+    acpToolFailure,
+    prepareAcpFailureDraft,
+    type AcpToolFailure,
+  } from './lib/acp-tool-failure';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import SkillMenu from './SkillMenu.svelte';
@@ -58,7 +63,7 @@
     notificationStats,
     splitTaskNotifications,
   } from './lib/task-notification';
-  import { blockedHookRules, splitKlaudiushMessage, type KlaudiushRule } from './lib/klaudiush';
+  import { splitKlaudiushMessage, type KlaudiushRule } from './lib/klaudiush';
   import { getSetting, removeSetting, setSetting } from './lib/settings';
   import { recordDiagnostic, type DiagnosticEvent } from './lib/diagnostics';
 
@@ -281,6 +286,7 @@
     if (spawnRevision && autoFollow) void follow();
   });
   let prompt: HTMLTextAreaElement;
+  const preparedFailures = new Map<string, string>();
   const name = $derived(agentName);
   const isBusy = $derived(busy || running || historyLoading);
 
@@ -367,6 +373,16 @@
 
   function describe(cause: unknown): string {
     return cause instanceof Error ? cause.message : String(cause);
+  }
+
+  function prepareFailure(tool: AgentTool, failure: AcpToolFailure) {
+    draft = prepareAcpFailureDraft(
+      draft,
+      preparedFailures,
+      `${activeSessionId}:${tool.id}`,
+      failure,
+    );
+    void tick().then(() => prompt.focus());
   }
 
   function flushUpdates() {
@@ -1320,12 +1336,35 @@
         {/each}
       </ToolActivity>
     {/snippet}
+    {#snippet failureCard(tool: AgentTool)}
+      {@const failure = acpToolFailure(tool)}
+      {#if failure}
+        {@const label =
+          failure.kind === 'post-hook'
+            ? 'Post-action hook failed'
+            : failure.kind === 'hook'
+              ? 'Action blocked by hook'
+              : 'Tool failure'}
+        <div class="agent-tool-failure" role="group" aria-label={label}>
+          <strong>{label}</strong>
+          <div><span>Action:</span> <code>{failure.action}</code></div>
+          {#if failure.rule}<div><span>Rule or hook:</span> <code>{failure.rule}</code></div>{/if}
+          <div><span>Reason:</span> {failure.reason}</div>
+          {#if failure.output}<details>
+              <summary>Failure output</summary>
+              <pre>{failure.output}</pre>
+            </details>{/if}
+          <Button size="sm" variant="secondary" onclick={() => prepareFailure(tool, failure)}
+            >Fix with agent</Button
+          >
+        </div>
+      {/if}
+    {/snippet}
     {#each displayEntries as entry (entry.id)}
       {#if entry.type === 'spawn-response'}
         <SpawnResponse receipt={entry.receipt} />
       {:else if entry.type === 'tool-group'}
-        {@const hookRules = blockedHookRules(entry.tools)}
-        {#if hookRules.length}{@render hookNotice(hookRules)}{/if}
+        {#each entry.tools.filter(toolFailed) as tool (tool.id)}{@render failureCard(tool)}{/each}
         {#if isBusy && (entry.id === displayEntries.at(-1)?.id || entry.tools.some(toolRunning))}
           {#if entry.tools.length > 1}
             <details class="agent-tool-group">
@@ -1689,6 +1728,28 @@
     padding: 9px 12px;
     border: 1px solid var(--danger, #d66);
     border-radius: 8px;
+  }
+  .agent-tool-failure {
+    margin: 0 0 8px 42px;
+    padding: 9px 12px;
+    border: 1px solid var(--danger, #d66);
+    border-radius: 8px;
+    overflow-wrap: anywhere;
+  }
+  .agent-tool-failure strong {
+    color: var(--danger, #d66);
+  }
+  .agent-tool-failure > div,
+  .agent-tool-failure details {
+    margin: 5px 0;
+  }
+  .agent-tool-failure span {
+    color: var(--text-muted, #888);
+  }
+  .agent-tool-failure pre {
+    max-height: 180px;
+    overflow: auto;
+    white-space: pre-wrap;
   }
   .message-body .agent-hook-notice {
     margin-left: 0;
