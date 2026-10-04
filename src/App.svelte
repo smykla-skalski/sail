@@ -1817,7 +1817,8 @@
       return;
     }
     if (issue.state === 'pending') return;
-    if (run.provider === 'opencode' && !client && issue.state === 'working') return;
+    if (run.provider === 'opencode' && !client && ['starting', 'working'].includes(issue.state))
+      return;
     const pr = await invoke<{
       url: string;
       state: string;
@@ -1853,7 +1854,10 @@
         if (existing && issue.path !== existing.path)
           await updateShipIssue(run, issue, { path: existing.path });
         await launchShipIssue(run, issue);
-      } else await updateShipIssue(run, issue, { state: 'working', threadId: receipt.targetId });
+      } else {
+        if (receipt.provider === 'opencode') await recoverShippingOpenCodePrompt(receipt);
+        await updateShipIssue(run, issue, { state: 'working', threadId: receipt.targetId });
+      }
     } else if (issue.state === 'working') {
       if (!receipt)
         await updateShipIssue(run, issue, {
@@ -1968,6 +1972,7 @@
 
   async function currentSpawnReceipt(receipt: SpawnReceipt): Promise<SpawnReceipt> {
     if (receiptIsSettled(receipt.state)) return receipt;
+    if (activeSpawnRequests.has(receipt.receiptId)) return receipt;
     if (
       !receipt.targetId ||
       !receipt.targetDirectory ||
@@ -2007,6 +2012,7 @@
           updateSpawnReceipt(receipt.receiptId, { state: 'queued' });
         else if (!receipt.turnId && inbox.length === 1)
           updateSpawnReceipt(receipt.receiptId, { state: 'queued', turnId: inbox[0].id });
+        else if (receipt.state === 'starting') return receipt;
         else await settleOpenCodeReceipt(receipt, client, session.outcome);
       } catch {
         updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
@@ -2015,6 +2021,42 @@
       updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
     }
     return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
+  }
+
+  async function recoverShippingOpenCodePrompt(receipt: SpawnReceipt): Promise<void> {
+    if (!client || !receipt.targetId || !receipt.prompt) return;
+    const source = client;
+    const sessionId = receipt.targetId.slice('opencode:'.length);
+    activeSpawnRequests.add(receipt.receiptId);
+    try {
+      const [session, page, inbox, active] = await Promise.all([
+        source.session.get({ sessionID: sessionId }),
+        source.message.list({ sessionID: sessionId, limit: 50, order: 'desc' }),
+        source.session.inbox.list({ sessionID: sessionId }),
+        source.session.active(),
+      ]);
+      if (session.location.directory !== receipt.targetDirectory)
+        throw new Error('Target session moved to another worktree.');
+      const promptSeen = page.data.some(
+        (message) => message.type === 'user' && message.text === receipt.prompt,
+      );
+      if (promptSeen || inbox.length || active[sessionId]?.type === 'running' || session.outcome)
+        return;
+      const turnId = receipt.turnId ?? crypto.randomUUID();
+      if (!receipt.turnId) {
+        updateSpawnReceipt(receipt.receiptId, { turnId });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      }
+      const startingPrompt = source.session.prompt({
+        sessionID: sessionId,
+        text: receipt.prompt,
+        id: turnId,
+      });
+      const inboxItem = await startingPrompt;
+      updateSpawnReceipt(receipt.receiptId, { state: 'queued', turnId: inboxItem.id });
+    } finally {
+      activeSpawnRequests.delete(receipt.receiptId);
+    }
   }
 
   async function reconcileOpenCodeSpawnReceipts() {
@@ -2935,7 +2977,16 @@
       thread: `opencode:${session.id}`,
     });
     const promptClient = client;
-    const startingPrompt = promptClient.session.prompt({ sessionID: session.id, text: prompt });
+    const turnId = receiptId ? crypto.randomUUID() : undefined;
+    if (receiptId) {
+      updateSpawnReceipt(receiptId, { turnId: turnId! });
+      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+    }
+    const startingPrompt = promptClient.session.prompt({
+      sessionID: session.id,
+      text: prompt,
+      id: turnId,
+    });
     if (receiptId)
       void startingPrompt
         .then(async (inbox) => {
