@@ -24,6 +24,8 @@
   import type { ThreadStatus } from './lib/attention';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
+  import type { PublishedGraph } from './lib/issue-graph';
+  import type { ShipRun } from './lib/issue-shipping';
   import { threadKey } from './lib/recent-threads';
   import { getPlan, getHistory, type PlanSnapshot, type HistoryEntry } from './lib/plan';
   import { annotateDiffs } from './lib/diff';
@@ -39,6 +41,7 @@
     pane: Pane;
     focused: string;
     directory: string;
+    project: string;
     dark: boolean;
     agents: AgentAvailability[];
     sideChat: SideChatState | null;
@@ -46,6 +49,13 @@
     setup: SetupReport | null;
     coordinationMessages: CoordinationMessage[];
     spawnReceipts: SpawnReceipt[];
+    shipRuns: ShipRun[];
+    onship: (
+      graph: PublishedGraph,
+      provider: ShipRun['provider'],
+      limit: number,
+      source: string,
+    ) => Promise<void>;
     postTurnChecks: PostTurnCheck[];
     onretrycheck: (check: PostTurnCheck) => void;
     agentUsage: Record<string, AgentUsage>;
@@ -97,6 +107,7 @@
     pane,
     focused,
     directory,
+    project,
     dark,
     agents,
     sideChat,
@@ -104,6 +115,8 @@
     setup,
     coordinationMessages,
     spawnReceipts,
+    shipRuns,
+    onship,
     postTurnChecks,
     onretrycheck,
     agentUsage,
@@ -340,6 +353,8 @@
     <PaneTree
       {coordinationMessages}
       {spawnReceipts}
+      {shipRuns}
+      {onship}
       {postTurnChecks}
       {onretrycheck}
       {agentUsage}
@@ -347,6 +362,7 @@
       pane={pane.first}
       {focused}
       {directory}
+      {project}
       {dark}
       {agents}
       {sideChat}
@@ -420,6 +436,8 @@
     <PaneTree
       {coordinationMessages}
       {spawnReceipts}
+      {shipRuns}
+      {onship}
       {postTurnChecks}
       {onretrycheck}
       {agentUsage}
@@ -427,6 +445,7 @@
       pane={pane.second}
       {focused}
       {directory}
+      {project}
       {dark}
       {agents}
       {sideChat}
@@ -644,6 +663,12 @@
                     sessionID={pane.thread?.sessionId ?? null}
                     {dark}
                     onchanged={refreshNativeDetails}
+                    shipRun={shipRuns.find(
+                      (run) =>
+                        run.source === nativeSnapshot.plan?.sessionID && run.repository === project,
+                    ) ?? null}
+                    onship={(graph, provider, limit) =>
+                      onship(graph, provider, limit, nativeSnapshot.plan?.sessionID ?? '')}
                     onselectfile={(file) => {
                       selectedFile = file;
                       nativeTab = 'changes';

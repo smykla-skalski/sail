@@ -15,6 +15,92 @@ pub struct PullRequest {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ShippingPullRequest {
+    number: u64,
+    url: String,
+    state: String,
+    merged_at: Option<String>,
+}
+
+#[tauri::command]
+pub async fn shipping_pull_request(
+    repository: String,
+    branch: String,
+) -> Result<Option<ShippingPullRequest>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = crate::validate_repository(repository)?;
+        if branch.is_empty() || branch.starts_with('-') || branch.contains(char::is_whitespace) {
+            return Err("Invalid shipping branch.".to_string());
+        }
+        let output = gh_command(
+            Path::new(&repository),
+            &[
+                "pr",
+                "list",
+                "--head",
+                &branch,
+                "--state",
+                "all",
+                "--json",
+                "number,url,state,mergedAt",
+                "--limit",
+                "2",
+            ],
+        )?;
+        let mut prs: Vec<ShippingPullRequest> =
+            serde_json::from_str(&output).map_err(|error| error.to_string())?;
+        if prs.len() > 1 {
+            return Err("Multiple pull requests use this shipping branch.".to_string());
+        }
+        Ok(prs.pop())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn shipping_dependency_closed(
+    repository: String,
+    reference: String,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = crate::validate_repository(repository)?;
+        let (target, number) = if let Some((target, number)) = reference.split_once('#') {
+            if target.split('/').count() != 2
+                || target.split('/').any(str::is_empty)
+                || !target.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "-_/.".contains(character)
+                })
+            {
+                return Err("Invalid dependency repository.".to_string());
+            }
+            (target.to_string(), number.to_string())
+        } else {
+            (target_repository(Path::new(&repository))?, reference)
+        };
+        let number = number
+            .parse::<u64>()
+            .map_err(|_| "Invalid dependency issue number.".to_string())?;
+        if number == 0 {
+            return Err("Invalid dependency issue number.".to_string());
+        }
+        let output = gh_command(
+            Path::new(&repository),
+            &[
+                "api",
+                &format!("repos/{target}/issues/{number}"),
+                "--jq",
+                ".state",
+            ],
+        )?;
+        Ok(output.trim() == "closed")
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PullRequestCheck {
     name: String,
     state: String,

@@ -48,9 +48,10 @@ export async function initializeSettings(): Promise<void> {
 
 function persist(key: string, value: string | null): void {
   if (!ready) return;
-  writes = writes
-    .then(() => invoke<void>('save_setting', { key, value }))
-    .catch((cause: unknown) => settingsError.set(`Could not save Sail settings: ${String(cause)}`));
+  writes = writes.catch(() => undefined).then(() => invoke<void>('save_setting', { key, value }));
+  void writes.catch((cause: unknown) =>
+    settingsError.set(`Could not save Sail settings: ${String(cause)}`),
+  );
 }
 
 export function getSetting(key: string): string | null {
@@ -62,6 +63,11 @@ export function setSetting(key: string, value: string): void {
   if (ready && values[key] === value) return;
   if (ready) values[key] = value;
   persist(key, value);
+}
+
+export async function setSettingDurable(key: string, value: string): Promise<void> {
+  setSetting(key, value);
+  await writes;
 }
 
 export function removeSetting(key: string): void {

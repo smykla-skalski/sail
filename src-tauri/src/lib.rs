@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use tauri::Emitter;
 use tauri::{Manager, State};
 
+static SHIPPING_WORKTREE_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(any(target_os = "macos", windows))]
 fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
@@ -1198,6 +1200,61 @@ async fn create_worktree(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+async fn create_shipping_worktree(
+    repository: String,
+    name: String,
+) -> Result<CreatedWorktree, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lock = SHIPPING_WORKTREE_LOCK
+            .lock()
+            .map_err(|_| "Shipping worktree creation is unavailable.")?;
+        let checked = validate_repository(repository.clone())?;
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&checked)
+            .args(["fetch", "origin"])
+            .output()
+            .map_err(|error| format!("Cannot fetch default branch: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Cannot fetch default branch: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        add_worktree(repository, name, None, None)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn run_shipping_setup(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = validate_repository(path)?;
+        let command = worktree_config::read(Path::new(&path))?
+            .ok_or("Worktree setup is no longer configured.")?
+            .setup;
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        let flag = if cfg!(windows) { "/C" } else { "-c" };
+        let output = Command::new(shell)
+            .args([flag, &command])
+            .current_dir(path)
+            .output()
+            .map_err(|error| format!("Cannot start worktree setup: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Worktree setup failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn add_worktree(
     repository: String,
     name: String,
@@ -1459,6 +1516,8 @@ pub fn run() {
             git_change_action,
             diff_file_contents,
             create_worktree,
+            create_shipping_worktree,
+            run_shipping_setup,
             registered_worktrees,
             delete_worktree,
             worktree_config,
@@ -1473,6 +1532,8 @@ pub fn run() {
             github::open_issue,
             github::publish_issue_graph,
             github::load_issue_graph,
+            github::shipping_pull_request,
+            github::shipping_dependency_closed,
             github::pull_request_checks,
             github::failed_check_log,
             github::open_pull_request,

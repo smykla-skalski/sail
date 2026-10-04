@@ -15,6 +15,13 @@
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import type { PublishedGraph } from './lib/issue-graph';
+  import {
+    createShipRun,
+    readyShipIssues,
+    type ShipIssue,
+    type ShipRun,
+  } from './lib/issue-shipping';
   import DiffPanel from './DiffPanel.svelte';
   import HistoryPanel from './HistoryPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
@@ -160,7 +167,13 @@
     withSpawnResponses,
     type SpawnReceipt,
   } from './lib/agent-results';
-  import { getSetting, removeSetting, setSetting, settingsError } from './lib/settings';
+  import {
+    getSetting,
+    removeSetting,
+    setSetting,
+    setSettingDurable,
+    settingsError,
+  } from './lib/settings';
   import {
     commandsForDirectory,
     loadSavedCommands,
@@ -214,6 +227,8 @@
   let projectCatalog = $state<ProjectCatalog>(
     loadProjectCatalog(getSetting('sai-project-catalog'), savedDirectory),
   );
+  let shipRuns = $state<ShipRun[]>(loadShipRuns());
+  let shippingBusy = false;
   let worktreeCreations = $state<WorktreeCreation[]>([]);
   let worktreeDeletions = $state<Record<string, string>>({});
   type WorktreeCreationRequest = {
@@ -1381,6 +1396,8 @@
       updateAttentionBadge();
     }
     void initialize();
+    const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
+    void tickShippingRuns();
     healthTimer = setInterval(() => void checkRuntime(), 5000);
     const sidebarRefreshTimer = setInterval(() => {
       if (client) void refreshSidebarOpenCodeThreads(client, JSON.parse(sidebarDirectoryKey));
@@ -1410,6 +1427,7 @@
       disposed = true;
       finishWorktreeApproval(false);
       clearInterval(coordinationRetry);
+      clearInterval(shippingTimer);
       eventController?.abort();
       clearTimeout(refreshTimer);
       clearTimeout(diffTimer);
@@ -1614,6 +1632,250 @@
     projectCatalog = next;
     setSetting('sai-project-catalog', JSON.stringify(next));
     scheduleInboxRefresh();
+  }
+
+  function loadShipRuns(): ShipRun[] {
+    try {
+      const value: unknown = JSON.parse(getSetting('sai-ship-runs') ?? '[]');
+      return Array.isArray(value)
+        ? value.filter(
+            (item): item is ShipRun =>
+              !!item &&
+              typeof item === 'object' &&
+              typeof item.id === 'string' &&
+              typeof item.repository === 'string' &&
+              Array.isArray(item.issues),
+          )
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async function saveShipRuns(): Promise<void> {
+    const value = JSON.stringify(shipRuns);
+    await setSettingDurable('sai-ship-runs', value);
+  }
+
+  async function updateShipIssue(
+    run: ShipRun,
+    issue: ShipIssue,
+    changes: Partial<ShipIssue>,
+  ): Promise<void> {
+    const current = run.issues.find((item) => item.id === issue.id);
+    if (!current) return;
+    Object.assign(current, changes);
+    await saveShipRuns();
+  }
+
+  async function startShippingRun(
+    graph: PublishedGraph,
+    provider: ShipRun['provider'],
+    limit: number,
+    source: string,
+  ): Promise<void> {
+    const repository = coordinationProject(directory) ?? directory;
+    const remote = graph.issues[0]?.repository ?? '';
+    if (!repository || !remote) throw new Error('Select a published repository issue graph.');
+    if (shipRuns.some((run) => run.repository === repository && run.source === source))
+      throw new Error('This plan already has a shipping run.');
+    const run = createShipRun(
+      graph,
+      repository,
+      remote,
+      source,
+      provider,
+      limit,
+      crypto.randomUUID(),
+      Date.now(),
+    );
+    if (
+      shipRuns.some((existing) =>
+        existing.issues.some((item) => run.issues.some((issue) => issue.url === item.url)),
+      )
+    )
+      throw new Error('An issue in this plan already has a shipping run.');
+    shipRuns.push(run);
+    await saveShipRuns();
+    void tickShippingRuns();
+  }
+
+  async function launchShipIssue(run: ShipRun, issue: ShipIssue): Promise<void> {
+    const receiptId = crypto.randomUUID();
+    await updateShipIssue(run, issue, { state: 'starting', receiptId });
+    try {
+      const created = await invoke<CreatedWorktree>('create_shipping_worktree', {
+        repository: run.repository,
+        name: issue.branch,
+      });
+      await updateShipIssue(run, issue, { path: created.path, branch: created.branch });
+      saveProjectCatalog(addWorktree(projectCatalog, run.repository, created));
+      if (created.setup.trim()) await invoke('run_shipping_setup', { path: created.path });
+      if (run.provider === 'opencode') {
+        if (!client || runtimeState !== 'connected') throw new Error('OpenCode is unavailable.');
+        const report = await inspectRepository(client, created.path);
+        if (!report.workReady) throw new Error('Complete OpenCode setup in this worktree.');
+      } else {
+        const available = (await acp.agents()).find((agent) => agent.id === run.provider);
+        if (!available?.available)
+          throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
+        await acp.connect(run.provider);
+      }
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread.`;
+      saveSpawnReceipt({
+        receiptId,
+        accessKey: crypto.randomUUID(),
+        requestId: `ship:${run.id}:${issue.id}`,
+        project: run.repository,
+        sourceId: `ship:${run.id}`,
+        sourceDirectory: run.repository,
+        targetId: null,
+        turnId: null,
+        targetDirectory: created.path,
+        worktreeId: created.path,
+        provider: run.provider,
+        prompt,
+        state: 'starting',
+        created: Date.now(),
+        updated: Date.now(),
+        result: null,
+        error: null,
+      });
+      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      const started = await startCoordinatedThread(
+        created,
+        run.provider === 'opencode'
+          ? { kind: 'opencode', agent: 'OpenCode', title: issue.title }
+          : { kind: 'acp', agent: run.provider, title: issue.title },
+        prompt,
+        receiptId,
+      );
+      await updateShipIssue(run, issue, { state: 'working', threadId: started.threadId });
+    } catch (cause) {
+      await updateShipIssue(run, issue, { state: 'failed', error: describe(cause) });
+    }
+  }
+
+  async function refreshShippingDependency(run: ShipRun, dependency: string): Promise<void> {
+    try {
+      if (
+        await invoke<boolean>('shipping_dependency_closed', {
+          repository: run.repository,
+          reference: dependency,
+        })
+      ) {
+        run.externalClosed[dependency] = true;
+        await saveShipRuns();
+      }
+    } catch (cause) {
+      error = describe(cause);
+    }
+  }
+
+  async function refreshShippingIssue(run: ShipRun, issue: ShipIssue): Promise<void> {
+    if (issue.state === 'merged') {
+      if (issue.path) {
+        const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+        if (receipt && !receiptIsSettled(receipt.state)) return;
+        try {
+          await invoke('delete_worktree', {
+            repository: run.repository,
+            worktree: issue.path,
+            force: true,
+          });
+          saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
+          await updateShipIssue(run, issue, { path: null, error: null });
+        } catch (cause) {
+          await updateShipIssue(run, issue, { error: `Cleanup: ${describe(cause)}` });
+        }
+      }
+      return;
+    }
+    if (issue.state === 'pending') return;
+    if (run.provider === 'opencode' && !client && issue.state === 'working') return;
+    const pr = await invoke<{
+      url: string;
+      state: string;
+      mergedAt: string | null;
+    } | null>('shipping_pull_request', {
+      repository: run.repository,
+      branch: issue.branch,
+    }).catch((cause) => {
+      error = describe(cause);
+      return null;
+    });
+    if (pr?.url && pr.url !== issue.pullRequest)
+      await updateShipIssue(run, issue, { pullRequest: pr.url });
+    if (pr?.mergedAt) {
+      await updateShipIssue(run, issue, { state: 'merged', error: null });
+      return;
+    }
+    if (pr?.state === 'CLOSED') {
+      await updateShipIssue(run, issue, {
+        state: 'failed',
+        error: 'Pull request closed without merging.',
+      });
+      return;
+    }
+    if (issue.state === 'failed') return;
+    const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+    if (issue.state === 'starting') {
+      if (!receipt?.targetId)
+        await updateShipIssue(run, issue, {
+          state: 'failed',
+          error: 'Launch was interrupted. Inspect the worktree before retrying.',
+        });
+      else await updateShipIssue(run, issue, { state: 'working', threadId: receipt.targetId });
+    } else if (issue.state === 'working') {
+      if (!receipt)
+        await updateShipIssue(run, issue, {
+          state: 'failed',
+          error: 'Worker receipt is missing. Inspect its thread.',
+        });
+      else {
+        const current = await currentSpawnReceipt(receipt);
+        if (current.state === 'completed')
+          await updateShipIssue(run, issue, { state: 'awaiting_merge' });
+        else if (['failed', 'interrupted', 'unavailable'].includes(current.state))
+          await updateShipIssue(run, issue, {
+            state: 'failed',
+            error: current.error ?? `Worker ${current.state}.`,
+          });
+      }
+    }
+  }
+
+  async function refreshShippingRun(run: ShipRun): Promise<void> {
+    run.externalClosed ??= {};
+    const aliases = new Set(
+      run.issues.flatMap((issue) => [
+        issue.id,
+        String(issue.number),
+        `${run.remote}#${issue.number}`,
+      ]),
+    );
+    await Promise.all(
+      [...new Set(run.issues.flatMap((issue) => issue.dependsOn))]
+        .filter((dependency) => !aliases.has(dependency) && !run.externalClosed[dependency])
+        .map((dependency) => refreshShippingDependency(run, dependency)),
+    );
+    await Promise.all(run.issues.map((issue) => refreshShippingIssue(run, issue)));
+    await readyShipIssues(run).reduce<Promise<void>>(async (previous, issue) => {
+      await previous;
+      await launchShipIssue(run, issue);
+    }, Promise.resolve());
+  }
+
+  async function tickShippingRuns(): Promise<void> {
+    if (shippingBusy || disposed || !isTauri()) return;
+    shippingBusy = true;
+    try {
+      await Promise.all(shipRuns.map((run) => refreshShippingRun(run)));
+    } catch (cause) {
+      error = describe(cause);
+    } finally {
+      shippingBusy = false;
+    }
   }
 
   function saveSpawnReceipt(receipt: SpawnReceipt) {
@@ -7701,6 +7963,13 @@
                     {dark}
                     onchanged={() => refreshSession()}
                     onselectfile={selectDiffPath}
+                    shipRun={shipRuns.find(
+                      (run) =>
+                        run.repository === (coordinationProject(directory) ?? directory) &&
+                        run.source === snapshot.plan?.sessionID,
+                    ) ?? null}
+                    onship={(graph, provider, limit) =>
+                      startShippingRun(graph, provider, limit, snapshot.plan?.sessionID ?? '')}
                   />
                 </div>{/if}
               <div class:inactive={!acpAgent && activeSideTab !== 'changes'} class="side-view">
@@ -7738,6 +8007,7 @@
       pane={paneLayout}
       focused={focusedPane}
       {directory}
+      project={coordinationProject(directory) ?? directory}
       {dark}
       agents={paneAgents}
       {sideChat}
@@ -7745,6 +8015,8 @@
       {setup}
       {coordinationMessages}
       {spawnReceipts}
+      {shipRuns}
+      onship={(graph, provider, limit, source) => startShippingRun(graph, provider, limit, source)}
       postTurnChecks={postTurnResults}
       onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
       {agentUsage}

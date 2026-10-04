@@ -10,8 +10,19 @@
     type PublishedGraph,
   } from './lib/issue-graph';
   import type { Plan } from './lib/plan';
+  import { shipIssueStatus, type ShipRun } from './lib/issue-shipping';
 
-  let { plan, directory }: { plan: Plan; directory: string } = $props();
+  let {
+    plan,
+    directory,
+    shipRun,
+    onship,
+  }: {
+    plan: Plan;
+    directory: string;
+    shipRun?: ShipRun | null;
+    onship?: (graph: PublishedGraph, provider: ShipRun['provider'], limit: number) => Promise<void>;
+  } = $props();
   let graph = $state<IssueGraphDraft>({ source: '', title: '', body: '', issues: [] });
   let source = $state('');
   let umbrellaInput = $state('');
@@ -22,6 +33,16 @@
   let approved = $state(false);
   let approvedGraph = $state('');
   let canPublish = $derived(approved && approvedGraph === JSON.stringify(graph));
+  let shipProvider = $state<ShipRun['provider']>('codex');
+  let shipLimit = $state(2);
+  let shipApproved = $state(false);
+  let shipApprovalSnapshot = $state('');
+  let shipping = $state(false);
+  let canShip = $derived(
+    !!published &&
+      shipApproved &&
+      shipApprovalSnapshot === JSON.stringify([published, shipProvider, shipLimit]),
+  );
   let errors = $derived(graphErrors(graph));
 
   $effect(() => {
@@ -53,6 +74,7 @@
       umbrellaInput = String(graph.umbrellaNumber ?? '');
       published = null;
       approved = false;
+      shipApproved = false;
       message = '';
     }
   });
@@ -64,6 +86,7 @@
   function updateIssue(index: number, change: Partial<IssueGraphDraft['issues'][number]>) {
     graph.issues[index] = { ...graph.issues[index], ...change };
     published = null;
+    shipApproved = false;
   }
 
   async function loadUmbrella() {
@@ -101,6 +124,7 @@
       };
       published = loaded;
       approved = false;
+      shipApproved = false;
       message = `Loaded ${loaded.issues.length} issues.`;
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
@@ -112,6 +136,7 @@
   function addIssue() {
     graph.issues.push({ id: crypto.randomUUID(), title: '', body: '', dependsOn: [] });
     published = null;
+    shipApproved = false;
   }
 
   async function publish() {
@@ -125,6 +150,7 @@
       });
       published = result;
       approved = false;
+      shipApproved = false;
       graph = {
         ...graph,
         repository: result.umbrella?.repository ?? result.issues[0]?.repository,
@@ -145,6 +171,21 @@
       message = error instanceof Error ? error.message : String(error);
     } finally {
       publishing = false;
+    }
+  }
+
+  async function ship() {
+    if (!published || !canShip || shipping || shipRun || !onship) return;
+    shipping = true;
+    message = '';
+    try {
+      await onship(published, shipProvider, shipLimit);
+      shipApproved = false;
+      message = 'Shipping plan started.';
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : String(cause);
+    } finally {
+      shipping = false;
     }
   }
 </script>
@@ -285,6 +326,47 @@
           <a href={issue.url} target="_blank" rel="noreferrer">#{issue.number} {issue.title}</a> · {issue.state}
         </li>{/each}
     </ul>
+  {/if}
+  {#if shipRun}
+    <h4>Shipping run</h4>
+    <ul>
+      {#each shipRun.issues as issue (issue.id)}
+        <li>
+          <a href={issue.url} target="_blank" rel="noreferrer">#{issue.number}</a>
+          · {shipIssueStatus(shipRun, issue)}
+          {#if issue.pullRequest}
+            · <a href={issue.pullRequest} target="_blank" rel="noreferrer">PR</a>{/if}
+          {#if issue.error}
+            · {issue.error}{/if}
+        </li>
+      {/each}
+    </ul>
+  {:else if published && onship}
+    <h4>Ship approved issues</h4>
+    <label
+      >Agent
+      <select bind:value={shipProvider}>
+        <option value="codex">Codex</option>
+        <option value="claude">Claude</option>
+        <option value="opencode">OpenCode</option>
+      </select>
+    </label>
+    <label
+      >Concurrent workers
+      <input type="number" min="1" max="8" bind:value={shipLimit} />
+    </label>
+    <label
+      ><input
+        type="checkbox"
+        bind:checked={shipApproved}
+        onchange={() =>
+          (shipApprovalSnapshot = JSON.stringify([published, shipProvider, shipLimit]))}
+      />
+      I approve launching only these {published.issues.length} issues</label
+    >
+    <button type="button" onclick={ship} disabled={!canShip || shipping}>
+      {shipping ? 'Starting…' : 'Ship issue graph'}
+    </button>
   {/if}
 </section>
 

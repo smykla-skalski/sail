@@ -19,6 +19,8 @@
     type PlanSnapshot,
   } from './lib/plan';
   import type { OpenCodeClient } from './lib/opencode';
+  import type { PublishedGraph } from './lib/issue-graph';
+  import type { ShipRun } from './lib/issue-shipping';
 
   interface Props {
     snapshot: PlanSnapshot;
@@ -28,9 +30,21 @@
     dark: boolean;
     onchanged: () => Promise<void>;
     onselectfile: (path: string) => void;
+    shipRun?: ShipRun | null;
+    onship?: (graph: PublishedGraph, provider: ShipRun['provider'], limit: number) => Promise<void>;
   }
 
-  let { snapshot, client, directory, sessionID, dark, onchanged, onselectfile }: Props = $props();
+  let {
+    snapshot,
+    client,
+    directory,
+    sessionID,
+    dark,
+    onchanged,
+    onselectfile,
+    shipRun,
+    onship,
+  }: Props = $props();
   let decisions = $state<Record<string, PlanDecision>>({});
   let answers = $state<Record<string, string[]>>({});
   let questionErrors = $state<Record<string, string>>({});
@@ -615,7 +629,7 @@
         {/each}
       {/if}
 
-      <IssueGraphPanel {plan} {directory} />
+      <IssueGraphPanel {plan} {directory} {shipRun} {onship} />
       <div class="subheading">Steps <span>{plan.steps.length}</span></div>
       {#each plan.steps as step, index (step.id)}
         <section class="step-card">
