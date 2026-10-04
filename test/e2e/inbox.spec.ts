@@ -38,7 +38,20 @@ describe('pending requests across projects', () => {
     await $('.agent-composer textarea').waitForEnabled();
     await $('.agent-composer textarea').setValue('First request');
     await $('.agent-actions button').click();
-    await expect($('.agent-permission')).toBeDisplayed();
+    try {
+      await expect($('.agent-permission')).toBeDisplayed();
+    } catch (cause) {
+      console.error('Inbox pending diagnostic', {
+        conversation: await $('.agent-conversation').getText(),
+        alerts: await browser.execute(() => document.body.innerText.slice(-2000)),
+        settings: await browser.execute(() =>
+          Object.fromEntries(
+            Object.entries(localStorage).filter(([key]) => key.startsWith('sai-')),
+          ),
+        ),
+      });
+      throw cause;
+    }
     await $(`.project-default-worktree-select[title="${paths[1]}"]`).click();
     await expect($('.agent-launches button')).toBeEnabled();
     await $('.agent-launches button').click();

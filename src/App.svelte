@@ -4394,17 +4394,22 @@
         check.focus();
         return;
       }
-    }
-    const visibleMessages = [
-      ...document.querySelectorAll<HTMLElement>('.conversation .assistant-message[data-created]'),
-    ]
-      .filter((element) => element.getClientRects().length)
-      .filter((element) => Number(element.dataset.created) <= item.receivedAt);
-    const target = visibleMessages.at(-1);
-    if (target) {
-      target.scrollIntoView({ block: 'center' });
-      target.focus();
-      return;
+    } else {
+      const visibleMessages = [
+        ...document.querySelectorAll<HTMLElement>('.conversation .assistant-message[data-created]'),
+      ]
+        .filter((element) => element.getClientRects().length)
+        .toSorted(
+          (left, right) =>
+            Math.abs(Number(left.dataset.created) - item.receivedAt) -
+            Math.abs(Number(right.dataset.created) - item.receivedAt),
+        );
+      const target = visibleMessages[0];
+      if (target) {
+        target.scrollIntoView({ block: 'center' });
+        target.focus();
+        return;
+      }
     }
     if (attempts === 0) return;
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -5414,6 +5419,7 @@
       });
     } finally {
       pendingPostTurnChecks.delete(key);
+      scheduleInboxRefresh();
     }
   }
 

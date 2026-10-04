@@ -16,7 +16,7 @@
   let recent = $derived(items.filter(isInboxOutcome).toReversed());
   let recentGroups = $derived(
     recent.reduce<Record<string, InboxItem[]>>((groups, item) => {
-      const key = `${item.project}\0${item.worktree ?? ''}`;
+      const key = item.directory;
       (groups[key] ??= []).push(item);
       return groups;
     }, {}),
