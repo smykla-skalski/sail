@@ -277,15 +277,17 @@ fn scan_claude(report: &mut HookReport, root: &Path, config_root: &Path, plugin_
     for (path, value) in configs {
         scan_hooks(report, "Claude", &path, &value, disabled);
     }
-    scan_claude_plugins(report, plugin_root, &enabled_plugins, disabled);
+    scan_claude_plugins(report, root, plugin_root, &enabled_plugins, disabled);
 }
 
 fn scan_claude_plugins(
     report: &mut HookReport,
+    root: &Path,
     plugin_root: &Path,
     enabled_plugins: &HashMap<String, (bool, PathBuf, bool)>,
     disabled_hooks: bool,
 ) {
+    let selected_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let registry_path = plugin_root.join("installed_plugins.json");
     let registry = read_json(report, "Claude", &registry_path);
     let installed = registry
@@ -305,7 +307,12 @@ fn scan_claude_plugins(
         {
             for install in installs {
                 let scope = install.get("scope").and_then(Value::as_str).unwrap_or("");
-                if scope != "user" && !project_enabled {
+                let matches_project = install
+                    .get("projectPath")
+                    .and_then(Value::as_str)
+                    .and_then(|path| Path::new(path).canonicalize().ok())
+                    .is_some_and(|path| path == selected_root);
+                if scope != "user" && (!project_enabled || !matches_project) {
                     continue;
                 }
                 let Some(path) = install.get("installPath").and_then(Value::as_str) else {
@@ -824,7 +831,13 @@ fn inspect_with_paths(root: &Path, home: &Path, locations: &ScanLocations<'_>) -
 }
 
 #[tauri::command]
-pub fn inspect_agent_hooks(worktree: String) -> Result<HookReport, String> {
+pub async fn inspect_agent_hooks(worktree: String) -> Result<HookReport, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_worktree(&worktree))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn inspect_worktree(worktree: &str) -> Result<HookReport, String> {
     let root = PathBuf::from(worktree)
         .canonicalize()
         .map_err(|error| error.to_string())?;
@@ -1008,10 +1021,10 @@ mod tests {
             &home.join(".claude/plugins"),
         );
         assert!(report.errors.is_empty());
-        assert!(report
-            .entries
-            .iter()
-            .any(|entry| entry.event == "Stop" && entry.source.contains("/cache/")));
+        assert!(report.entries.iter().any(|entry| entry.event == "Stop"
+            && Path::new(&entry.source)
+                .components()
+                .any(|component| component.as_os_str() == "cache")));
         assert!(report
             .entries
             .iter()
@@ -1037,7 +1050,11 @@ mod tests {
             r#"{"enabledPlugins":{"policy@local":true,"off@local":false}}"#,
         )
         .unwrap();
-        fs::write(plugins.join("installed_plugins.json"), format!(r#"{{"version":2,"plugins":{{"policy@local":[{{"scope":"user","installPath":"{}","version":"1.0.0"}}],"off@local":[{{"scope":"user","installPath":"{}","version":"1.0.0"}}]}}}}"#, policy.display(), off.display())).unwrap();
+        let registry = serde_json::json!({"version":2,"plugins":{
+            "policy@local":[{"scope":"user","installPath":policy,"version":"1.0.0"}],
+            "off@local":[{"scope":"user","installPath":off,"version":"1.0.0"}]
+        }});
+        fs::write(plugins.join("installed_plugins.json"), registry.to_string()).unwrap();
         fs::write(
             policy.join("hooks/hooks.json"),
             r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"check policy"}]}]}}"#,
@@ -1062,6 +1079,56 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.identity == "off@local" && entry.state == "Disabled"));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn excludes_claude_plugin_installs_for_other_projects() {
+        let base = std::env::temp_dir().join(format!("sail-claude-scope-{}", uuid::Uuid::new_v4()));
+        let root = base.join("repo");
+        let other_root = base.join("other");
+        let home = base.join("home");
+        let plugins = home.join(".claude/plugins");
+        let current = plugins.join("cache/local/policy/current");
+        let other = plugins.join("cache/local/policy/other");
+        for path in [
+            &root.join(".claude"),
+            &other_root,
+            &current.join("hooks"),
+            &other.join("hooks"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(
+            root.join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"policy@local":true}}"#,
+        )
+        .unwrap();
+        let registry = serde_json::json!({"version":2,"plugins":{"policy@local":[
+            {"scope":"project","projectPath":root,"installPath":current},
+            {"scope":"project","projectPath":other_root,"installPath":other}
+        ]}});
+        fs::write(plugins.join("installed_plugins.json"), registry.to_string()).unwrap();
+        fs::write(
+            current.join("hooks/hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"current check"}]}]}}"#,
+        )
+        .unwrap();
+        fs::write(
+            other.join("hooks/hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"other check"}]}]}}"#,
+        )
+        .unwrap();
+        let report = inspect(&root, &home, &home.join(".config"), &plugins);
+        assert!(report.errors.is_empty());
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.identity == "current check"));
+        assert!(!report
+            .entries
+            .iter()
+            .any(|entry| entry.identity == "other check"));
         fs::remove_dir_all(base).unwrap();
     }
 
