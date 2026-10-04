@@ -28,7 +28,6 @@
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
   import {
-    abandonImplementationTurn,
     beginImplementationTurn,
     beginShipItRun,
     recordImplementationModel,
@@ -612,8 +611,13 @@
           historyLoaded = true;
           rememberTranscript();
         }
-        if (current === generation)
+        if (current === generation) {
           configOptions = (session.configOptions as AgentConfigOption[] | undefined) ?? [];
+          const selectedModel = configOptions.find(
+            (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+          )?.currentValue;
+          if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
+        }
         if (current === generation && Array.isArray(session.availableCommands))
           updateSkills(session.availableCommands);
         if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
@@ -659,6 +663,9 @@
       const session = await acp.create(sessionAgent, sessionDirectory);
       const created: AgentThread = {
         agent: sessionAgent,
+        model: session.configOptions?.find(
+          (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+        )?.currentValue,
         sessionId: session.sessionId,
         directory: sessionDirectory,
         title,
@@ -761,8 +768,13 @@
         const update = params.update;
         if (!update || typeof update !== 'object') return;
         const data = update as Record<string, unknown>;
-        if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions))
+        if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions)) {
           configOptions = data.configOptions as AgentConfigOption[];
+          const selectedModel = configOptions.find(
+            (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+          )?.currentValue;
+          if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
+        }
         if (
           data.sessionUpdate === 'available_commands_update' &&
           Array.isArray(data.availableCommands)
@@ -884,7 +896,8 @@
       phase = 'config';
       if (settingConfig) await settingConfig;
       if (configFailure) throw new Error(configFailure);
-      if (activityThread) onactivity(activityThread);
+      if (activityThread)
+        onactivity({ ...activityThread, model: modelOption?.currentValue || activityThread.model });
       const id = activityThread?.sessionId ?? activeSessionId;
       deliverySessionId = id;
       if (stopRequested) {
@@ -925,7 +938,7 @@
         );
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
       } catch (cause) {
-        abandonImplementationTurn(turnDirectory, tracking);
+        await recordImplementationModel(turnDirectory, implementationModel, tracking);
         throw cause;
       }
       if (recoveredDraft && result.stopReason !== 'cancelled' && !stopRequested)
@@ -1212,6 +1225,10 @@
           configOptions.map((option) =>
             option.id === configId ? Object.assign({}, option, { currentValue: value }) : option,
           );
+        const selectedModel = configOptions.find(
+          (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+        )?.currentValue;
+        if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
       } catch (cause) {
         if (activeSessionId !== sessionId) return;
         configFailure = describe(cause);

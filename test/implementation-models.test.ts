@@ -77,6 +77,28 @@ void test('active implementation models are available before turns finish', asyn
   assert.deepEqual(activeImplementationModels(directory), []);
 });
 
+void test('shipping preserves models from implementation before the first run', async () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  let revision = 'before';
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => revision } },
+  });
+  const directory = '/test/pre-ship-it';
+  const turn = await beginImplementationTurn(directory, 'provider:model-a');
+  revision = 'after';
+  await recordImplementationModel(directory, 'provider:model-a', turn);
+  beginShipItRun(directory, '/ship-it #210');
+  assert.deepEqual(implementationModels(directory), ['provider:model-a']);
+});
+
 void test('an edit by a turn with an unknown model blocks strict attribution', async () => {
   const values = new Map<string, string>();
   Object.defineProperty(globalThis, 'localStorage', {

@@ -14,6 +14,7 @@ export interface AgentAvailability {
 
 export interface AgentThread {
   agent: AgentId;
+  model?: string;
   sessionId: string;
   directory: string;
   title: string;

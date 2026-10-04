@@ -1929,18 +1929,18 @@
             path: thread.directory,
             thread: target.id,
           });
-          const tracking = await beginImplementationTurn(thread.directory);
+          const tracking = await beginImplementationTurn(thread.directory, thread.model);
           updateAgentThreadStatus(thread, 'working');
           const turn = acp.prompt(thread.agent, thread.sessionId, text, crypto.randomUUID());
           void turn
             .then(
               async () => {
-                await recordImplementationModel(thread.directory, undefined, tracking);
+                await recordImplementationModel(thread.directory, thread.model, tracking);
                 updateAgentThreadStatus(thread, 'done');
                 return undefined;
               },
               async (cause) => {
-                await recordImplementationModel(thread.directory, undefined, tracking);
+                await recordImplementationModel(thread.directory, thread.model, tracking);
                 updateAgentThreadStatus(thread, 'failed');
                 error = `Agent message turn failed: ${describe(cause)}`;
                 return undefined;
@@ -2772,6 +2772,7 @@
       }
       const thread: AgentThread = {
         agent: source.agent,
+        model: source.model ?? reportedModel,
         sessionId: session.sessionId,
         directory: created.path,
         title: prompt.slice(0, 60),
@@ -7010,18 +7011,19 @@
             })),
           });
         } catch (cause) {
-          abandonImplementationTurn(path, tracking);
+          await recordImplementationModel(path, implementingModel, tracking);
           throw cause;
         }
-        if (implementingModel)
-          void source.session
-            .wait({ sessionID: id })
-            .then(() => recordImplementationModel(path, implementingModel, tracking))
-            .catch((cause) => {
-              abandonImplementationTurn(path, tracking);
-              error = `Could not track implementation model: ${describe(cause)}`;
-            });
-        else abandonImplementationTurn(path, tracking);
+        void source.session
+          .wait({ sessionID: id })
+          .then(
+            () => recordImplementationModel(path, implementingModel, tracking),
+            () => recordImplementationModel(path, implementingModel, tracking),
+          )
+          .catch((cause) => {
+            abandonImplementationTurn(path, tracking);
+            error = `Could not track implementation model: ${describe(cause)}`;
+          });
         return response;
       });
       sending = false;

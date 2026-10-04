@@ -505,18 +505,19 @@
             files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
           });
         } catch (cause) {
-          abandonImplementationTurn(directory, tracking);
+          await recordImplementationModel(directory, implementingModel, tracking);
           throw cause;
         }
-        if (implementingModel)
-          void source.session
-            .wait({ sessionID: id })
-            .then(() => recordImplementationModel(directory, implementingModel, tracking))
-            .catch((cause) => {
-              abandonImplementationTurn(directory, tracking);
-              error = `Could not track implementation model: ${describe(cause)}`;
-            });
-        else abandonImplementationTurn(directory, tracking);
+        void source.session
+          .wait({ sessionID: id })
+          .then(
+            () => recordImplementationModel(directory, implementingModel, tracking),
+            () => recordImplementationModel(directory, implementingModel, tracking),
+          )
+          .catch((cause) => {
+            abandonImplementationTurn(directory, tracking);
+            error = `Could not track implementation model: ${describe(cause)}`;
+          });
         return response;
       });
       sending = false;

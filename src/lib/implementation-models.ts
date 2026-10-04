@@ -57,14 +57,16 @@ export function beginShipItRun(directory: string, prompt: string): void {
       firstLine,
     )?.[1];
   const identity = issue ? `#${issue.match(/\d+$/)![0]}` : crypto.randomUUID();
-  if (issue && getSetting(runKey(directory)) === identity) return;
+  const previous = getSetting(runKey(directory));
+  if (issue && previous === identity) return;
   setSetting(runKey(directory), identity);
-  setSetting(key(directory), '[]');
-  setSetting(uncertainKey(directory), '0');
+  if (previous) {
+    setSetting(key(directory), '[]');
+    setSetting(uncertainKey(directory), '0');
+  }
 }
 
 export function implementationModels(directory: string): string[] {
-  if (!getSetting(runKey(directory))) return [];
   try {
     const saved: unknown = JSON.parse(getSetting(key(directory)) ?? '[]');
     return Array.isArray(saved)
@@ -81,7 +83,6 @@ export async function recordImplementationModel(
   turn: ImplementationTurn,
 ): Promise<void> {
   try {
-    if (!getSetting(runKey(directory))) return;
     const after = await invoke<string>('working_tree_revision', { path: directory });
     if (turn.before === after) return;
     if (turn.overlapped) {
