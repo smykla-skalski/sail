@@ -22,7 +22,12 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
-  import { beginShipItRun, recordImplementationModel } from './lib/implementation-models';
+  import {
+    abandonImplementationTurn,
+    beginImplementationTurn,
+    beginShipItRun,
+    recordImplementationModel,
+  } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
@@ -482,26 +487,36 @@
         const implementingModel = chosenModel
           ? `${chosenModel.providerID}:${chosenModel.id}`
           : undefined;
-        const before = await invoke<string>('working_tree_revision', { path: directory });
         await invoke('record_turn_snapshot', { path: directory, thread: `opencode:${id}` });
-        const response = await source.session.prompt({
-          sessionID: id,
-          text: resolveSkillPrompt(
-            skills,
-            text,
-            chosenModel ? `${chosenModel.providerID}:${chosenModel.id}` : undefined,
-          ),
-          skills: promptSkill(skills, text)?.id
-            ? [{ id: promptSkill(skills, text)!.id! }]
-            : undefined,
-          delivery: queued ? 'steer' : undefined,
-          files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
-        });
+        const tracking = await beginImplementationTurn(directory);
+        let response;
+        try {
+          response = await source.session.prompt({
+            sessionID: id,
+            text: resolveSkillPrompt(
+              skills,
+              text,
+              chosenModel ? `${chosenModel.providerID}:${chosenModel.id}` : undefined,
+            ),
+            skills: promptSkill(skills, text)?.id
+              ? [{ id: promptSkill(skills, text)!.id! }]
+              : undefined,
+            delivery: queued ? 'steer' : undefined,
+            files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
+          });
+        } catch (cause) {
+          abandonImplementationTurn(directory, tracking);
+          throw cause;
+        }
         if (implementingModel)
           void source.session
             .wait({ sessionID: id })
-            .then(() => recordImplementationModel(directory, implementingModel, before))
-            .catch((cause) => (error = `Could not track implementation model: ${describe(cause)}`));
+            .then(() => recordImplementationModel(directory, implementingModel, tracking))
+            .catch((cause) => {
+              abandonImplementationTurn(directory, tracking);
+              error = `Could not track implementation model: ${describe(cause)}`;
+            });
+        else abandonImplementationTurn(directory, tracking);
         return response;
       });
       sending = false;

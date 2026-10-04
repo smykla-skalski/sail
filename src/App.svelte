@@ -42,7 +42,10 @@
   import { parseValidationSettings, validationSettingsKey } from './lib/cross-validation';
   import { selectValidationChoice, type ValidationChoice } from './lib/cross-validation';
   import {
+    abandonImplementationTurn,
+    beginImplementationTurn,
     beginShipItRun,
+    implementationAttributionUncertain,
     implementationModels,
     recordImplementationModel,
   } from './lib/implementation-models';
@@ -2352,6 +2355,8 @@
     const usedModels = [
       ...new Set([...implementationModels(request.directory), ...implementingModels]),
     ];
+    if (implementationAttributionUncertain(request.directory))
+      throw new Error('Concurrent agent turns prevent reliable implementation model attribution.');
     const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
       repository: project,
       paths: [request.directory],
@@ -2370,15 +2375,16 @@
         : agents.some((agent) => agent.id === choice.agent && agent.available),
     );
     async function tryChoice(candidates: ValidationChoice[], reasons: string[]): Promise<unknown> {
-      if (!candidates.length) {
+      const currentCandidates = candidates.filter((candidate) =>
+        crossValidation.choices.some(
+          (selected) => selected.agent === candidate.agent && selected.model === candidate.model,
+        ),
+      );
+      if (!currentCandidates.length) {
         const unavailable = selectValidationChoice(crossValidation, [], usedModels);
         throw new Error([unavailable.reason, ...reasons].filter(Boolean).join(' '));
       }
-      const route = selectValidationChoice(
-        { ...crossValidation, choices: candidates },
-        candidates,
-        usedModels,
-      );
+      const route = selectValidationChoice(crossValidation, currentCandidates, usedModels);
       if (!route.choice) throw new Error(route.reason ?? 'No eligible validation model.');
       const choice: ValidationChoice = route.choice;
       const gateSource: CoordinationSource =
@@ -2395,6 +2401,11 @@
           : { kind: 'acp', agent: choice.agent, model: choice.model, title: String(gate) };
       const receiptId = crypto.randomUUID();
       const accessKey = crypto.randomUUID();
+      const ensureSelected = () => {
+        const current = selectValidationChoice(crossValidation, available, usedModels).choice;
+        if (current?.agent !== choice.agent || current.model !== choice.model)
+          throw new Error('Validation model selection changed before launch. Retry the gate.');
+      };
       saveSpawnReceipt({
         receiptId,
         accessKey,
@@ -2416,12 +2427,14 @@
       });
       try {
         if (choice.agent !== 'opencode') await acp.connect(choice.agent);
+        ensureSelected();
         const started = await startCoordinatedThread(
           { path: request.directory, branch },
           gateSource,
           gatePrompt,
           receiptId,
           true,
+          ensureSelected,
         );
         return {
           ...started,
@@ -2677,6 +2690,7 @@
     prompt: string,
     receiptId?: string,
     validation = false,
+    beforePrompt?: () => void,
   ) {
     if (!validation) beginShipItRun(created.path, prompt);
     if (source.kind === 'acp') {
@@ -2718,7 +2732,8 @@
         path: created.path,
         thread: `acp:${source.agent}:${session.sessionId}`,
       });
-      const before = await invoke<string>('working_tree_revision', { path: created.path });
+      const tracking = validation ? null : await beginImplementationTurn(created.path);
+      beforePrompt?.();
       updateAgentThreadStatus(thread, 'working');
       const turnId = crypto.randomUUID();
       if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', turnId });
@@ -2726,8 +2741,8 @@
       const turn = acp.prompt(source.agent, session.sessionId, prompt, turnId);
       const finished = turn.then(
         async (outcome) => {
-          if (!validation)
-            await recordImplementationModel(created.path, source.model ?? reportedModel, before);
+          if (tracking)
+            await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
           updateAgentThreadStatus(thread, 'done');
           if (receiptId) {
             const current = spawnReceipts.find((item) => item.receiptId === receiptId);
@@ -2745,6 +2760,7 @@
           return undefined;
         },
         (cause) => {
+          if (tracking) abandonImplementationTurn(created.path, tracking);
           updateAgentThreadStatus(thread, 'failed');
           if (receiptId) {
             updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
@@ -2801,8 +2817,9 @@
       path: created.path,
       thread: `opencode:${session.id}`,
     });
-    const before = await invoke<string>('working_tree_revision', { path: created.path });
+    const tracking = validation ? null : await beginImplementationTurn(created.path);
     const promptClient = client;
+    beforePrompt?.();
     const startingPrompt = promptClient.session.prompt({ sessionID: session.id, text: prompt });
     if (receiptId)
       void startingPrompt
@@ -2810,23 +2827,39 @@
           updateSpawnReceipt(receiptId, { state: 'queued', turnId: inbox.id });
           try {
             await promptClient.session.wait({ sessionID: session.id });
-            if (!validation)
+            if (tracking)
               await recordImplementationModel(
                 created.path,
                 session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-                before,
+                tracking,
               );
             const outcome = await promptClient.session.get({ sessionID: session.id });
             const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
             if (receipt) await settleOpenCodeReceipt(receipt, promptClient, outcome.outcome);
           } catch (cause) {
+            if (tracking) abandonImplementationTurn(created.path, tracking);
             updateSpawnReceipt(receiptId, { state: 'unavailable', error: describe(cause) });
           }
           return undefined;
         })
-        .catch((cause) =>
-          updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) }),
-        );
+        .catch((cause) => {
+          if (tracking) abandonImplementationTurn(created.path, tracking);
+          updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        });
+    else if (tracking)
+      void startingPrompt
+        .then(() => promptClient.session.wait({ sessionID: session.id }))
+        .then(() =>
+          recordImplementationModel(
+            created.path,
+            session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+            tracking,
+          ),
+        )
+        .catch((cause) => {
+          abandonImplementationTurn(created.path, tracking);
+          error = `Could not track implementation model: ${describe(cause)}`;
+        });
     await awaitCoordinationStart(startingPrompt, async () => {
       if (!client) return false;
       const active = await client.session.active();
@@ -6893,29 +6926,39 @@
         const implementingModel = chosenModel
           ? `${chosenModel.providerID}:${chosenModel.id}`
           : undefined;
-        const before = await invoke<string>('working_tree_revision', { path });
         await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
-        const response = await source.session.prompt({
-          sessionID: id,
-          text: resolveSkillPrompt(
-            skills,
-            text,
-            chosenModel ? `${chosenModel.providerID}:${chosenModel.id}` : undefined,
-          ),
-          skills: promptSkill(skills, text)?.id
-            ? [{ id: promptSkill(skills, text)!.id! }]
-            : undefined,
-          delivery: queueTurn ? 'steer' : undefined,
-          files: files.map((filePath) => ({
-            uri: fileUri(filePath),
-            name: clipboardAttachmentNames.get(filePath) ?? filePath.split(/[\\/]/).at(-1),
-          })),
-        });
+        const tracking = await beginImplementationTurn(path);
+        let response;
+        try {
+          response = await source.session.prompt({
+            sessionID: id,
+            text: resolveSkillPrompt(
+              skills,
+              text,
+              chosenModel ? `${chosenModel.providerID}:${chosenModel.id}` : undefined,
+            ),
+            skills: promptSkill(skills, text)?.id
+              ? [{ id: promptSkill(skills, text)!.id! }]
+              : undefined,
+            delivery: queueTurn ? 'steer' : undefined,
+            files: files.map((filePath) => ({
+              uri: fileUri(filePath),
+              name: clipboardAttachmentNames.get(filePath) ?? filePath.split(/[\\/]/).at(-1),
+            })),
+          });
+        } catch (cause) {
+          abandonImplementationTurn(path, tracking);
+          throw cause;
+        }
         if (implementingModel)
           void source.session
             .wait({ sessionID: id })
-            .then(() => recordImplementationModel(path, implementingModel, before))
-            .catch((cause) => (error = `Could not track implementation model: ${describe(cause)}`));
+            .then(() => recordImplementationModel(path, implementingModel, tracking))
+            .catch((cause) => {
+              abandonImplementationTurn(path, tracking);
+              error = `Could not track implementation model: ${describe(cause)}`;
+            });
+        else abandonImplementationTurn(path, tracking);
         return response;
       });
       sending = false;

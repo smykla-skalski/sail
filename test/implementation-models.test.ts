@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { beginShipItRun, implementationModels } from '../src/lib/implementation-models.ts';
+import {
+  beginImplementationTurn,
+  beginShipItRun,
+  implementationAttributionUncertain,
+  implementationModels,
+  recordImplementationModel,
+} from '../src/lib/implementation-models.ts';
 
 void test('a second issue in the same worktree starts with a fresh implementation set', () => {
   const values = new Map<string, string>();
@@ -24,4 +30,29 @@ void test('a second issue in the same worktree starts with a fresh implementatio
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-c']));
   beginShipItRun(directory, '/ship-it');
   assert.deepEqual(implementationModels(directory), []);
+});
+
+void test('overlapping turns do not attribute one agent’s edit to another', async () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  let revision = 'before';
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => revision } },
+  });
+  const directory = '/test/concurrent-worktree';
+  beginShipItRun(directory, '/ship-it #3');
+  const first = await beginImplementationTurn(directory);
+  const second = await beginImplementationTurn(directory);
+  revision = 'after';
+  await recordImplementationModel(directory, 'model-a', first);
+  await recordImplementationModel(directory, 'model-b', second);
+  assert.deepEqual(implementationModels(directory), []);
+  assert.equal(implementationAttributionUncertain(directory), true);
 });

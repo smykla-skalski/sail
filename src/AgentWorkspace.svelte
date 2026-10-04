@@ -27,7 +27,12 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
-  import { beginShipItRun, recordImplementationModel } from './lib/implementation-models';
+  import {
+    abandonImplementationTurn,
+    beginImplementationTurn,
+    beginShipItRun,
+    recordImplementationModel,
+  } from './lib/implementation-models';
   import {
     agentQueuePaused,
     queuedAgentMessages,
@@ -903,20 +908,26 @@
       }
       const skillText = resolveSkillPrompt(skills, text, modelOption?.currentValue || undefined);
       const implementationModel = modelOption?.currentValue;
-      const before = await invoke<string>('working_tree_revision', { path: turnDirectory });
+      const tracking = await beginImplementationTurn(turnDirectory);
       const promptText =
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
           : skillText;
       phase = 'prompt';
-      const result = await acp.prompt(
-        turnAgent,
-        id!,
-        withAttachedFiles(promptText, sentClipboard),
-        turnId,
-        promptImagePaths(sentImages, sentClipboard),
-      );
-      await recordImplementationModel(turnDirectory, implementationModel, before);
+      let result;
+      try {
+        result = await acp.prompt(
+          turnAgent,
+          id!,
+          withAttachedFiles(promptText, sentClipboard),
+          turnId,
+          promptImagePaths(sentImages, sentClipboard),
+        );
+        await recordImplementationModel(turnDirectory, implementationModel, tracking);
+      } catch (cause) {
+        abandonImplementationTurn(turnDirectory, tracking);
+        throw cause;
+      }
       if (recoveredDraft && result.stopReason !== 'cancelled' && !stopRequested)
         recoveredDraft = false;
       if (result.stopReason === 'cancelled' || stopRequested) notifyOnDone = false;
