@@ -40,6 +40,7 @@
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
   import { parseValidationSettings, validationSettingsKey } from './lib/cross-validation';
+  import { selectValidationChoice, type ValidationChoice } from './lib/cross-validation';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import {
     prepareToolFailureDraft,
@@ -253,6 +254,7 @@
     name:
       | 'worktree_create'
       | 'agent_spawn'
+      | 'validation_gate'
       | 'agent_status'
       | 'agent_wait'
       | 'agent_result'
@@ -277,7 +279,7 @@
     agent: string;
   };
   type CoordinationSource =
-    | { kind: 'acp'; agent: string; title: string }
+    | { kind: 'acp'; agent: string; model?: string; title: string }
     | { kind: 'opencode'; agent: string; model?: ModelRef; title: string };
   let browserApprovalQueue: Promise<unknown> = Promise.resolve();
   let worktreeApprovalDialog: HTMLDialogElement;
@@ -2269,6 +2271,8 @@
           : {}),
       };
     }
+    if (request.name === 'validation_gate')
+      return spawnValidationGate(request, project, source, sourceId);
     if (request.name === 'agent_spawn')
       return spawnCoordinatedAgent(request, project, source, sourceId);
     if (!agentWorktreesEnabled) throw new Error('Agent worktree creation is disabled in settings.');
@@ -2321,6 +2325,124 @@
       };
     }
     return startCoordinatedThread(created, source, prompt.trim());
+  }
+
+  async function spawnValidationGate(
+    request: CoordinationRequest,
+    project: string,
+    source: CoordinationSource,
+    sourceId: string,
+  ) {
+    if (!agentWorktreesEnabled) throw new Error('Agent coordination is disabled in settings.');
+    const { gate, prompt, implementingModels } = request.arguments;
+    if (!['code-adversary', 'findings-adversary', 'test-adversary'].includes(String(gate)))
+      throw new Error('Choose a Ship It validation gate.');
+    if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
+      throw new Error('Gate prompt must be 1–8000 characters.');
+    const gatePrompt = prompt.trim();
+    if (
+      !Array.isArray(implementingModels) ||
+      !implementingModels.length ||
+      !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
+    )
+      throw new Error('List every implementation model.');
+    const usedModels = [
+      ...implementingModels,
+      ...(source.kind === 'opencode' && source.model
+        ? [`${source.model.providerID}:${source.model.id}`]
+        : []),
+    ];
+    const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+      repository: project,
+      paths: [request.directory],
+    });
+    const worktree = registered.find((item) => item.path === request.directory);
+    if (!worktree) throw new Error('Source worktree is no longer registered with Git.');
+    const branch = worktree.branch ?? '';
+    const agents = await acp.agents();
+    const models =
+      client && runtimeState === 'connected'
+        ? (await inspectRepository(client, request.directory)).models
+        : [];
+    const available = crossValidation.choices.filter((choice) =>
+      choice.agent === 'opencode'
+        ? models.some((model) => `${model.providerID}:${model.id}` === choice.model)
+        : agents.some((agent) => agent.id === choice.agent && agent.available),
+    );
+    async function tryChoice(candidates: ValidationChoice[], reasons: string[]): Promise<unknown> {
+      if (!candidates.length) {
+        const unavailable = selectValidationChoice(crossValidation, [], usedModels);
+        throw new Error([unavailable.reason, ...reasons].filter(Boolean).join(' '));
+      }
+      const route = selectValidationChoice(
+        { ...crossValidation, choices: candidates },
+        candidates,
+        usedModels,
+      );
+      if (!route.choice) throw new Error(route.reason ?? 'No eligible validation model.');
+      const choice: ValidationChoice = route.choice;
+      const gateSource: CoordinationSource =
+        choice.agent === 'opencode'
+          ? {
+              kind: 'opencode',
+              agent: 'OpenCode',
+              model: {
+                providerID: choice.model.slice(0, choice.model.indexOf(':')),
+                id: choice.model.slice(choice.model.indexOf(':') + 1),
+              },
+              title: String(gate),
+            }
+          : { kind: 'acp', agent: choice.agent, model: choice.model, title: String(gate) };
+      const receiptId = crypto.randomUUID();
+      const accessKey = crypto.randomUUID();
+      saveSpawnReceipt({
+        receiptId,
+        accessKey,
+        requestId: request.id,
+        project,
+        sourceId,
+        sourceDirectory: request.directory,
+        targetId: null,
+        turnId: null,
+        targetDirectory: request.directory,
+        worktreeId: request.directory,
+        provider: choice.agent as SpawnReceipt['provider'],
+        prompt: gatePrompt,
+        state: 'starting',
+        created: Date.now(),
+        updated: Date.now(),
+        result: null,
+        error: null,
+      });
+      try {
+        const started = await startCoordinatedThread(
+          { path: request.directory, branch },
+          gateSource,
+          gatePrompt,
+          receiptId,
+        );
+        return {
+          ...started,
+          receiptId,
+          accessKey,
+          sourceId,
+          targetId: started.threadId,
+          provider: choice.agent,
+          model: choice.model,
+          gate,
+          status: 'started',
+        };
+      } catch (cause) {
+        updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        if (!/^(Model .+ is unavailable|Cannot verify .+ selected model)/.test(describe(cause)))
+          throw cause;
+        return tryChoice(
+          candidates.filter((item) => item !== choice),
+          [...reasons, `${choice.agent} / ${choice.model}: ${describe(cause)}`],
+        );
+      }
+    }
+    return tryChoice(available, []);
   }
 
   async function spawnCoordinatedAgent(
@@ -2555,6 +2677,22 @@
   ) {
     if (source.kind === 'acp') {
       const session = await acp.create(source.agent, created.path);
+      if (source.model) {
+        const modelOption = session.configOptions?.find(
+          (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+        );
+        if (!modelOption?.options.some((option) => option.value === source.model))
+          throw new Error(`Model ${source.model} is unavailable in ${source.agent}.`);
+        const changed = await acp.setConfig(
+          source.agent,
+          session.sessionId,
+          modelOption.id,
+          source.model,
+        );
+        const actual = changed.configOptions?.find((option) => option.id === modelOption.id);
+        if (actual?.currentValue !== source.model)
+          throw new Error(`Cannot verify ${source.agent} selected model ${source.model}.`);
+      }
       const thread: AgentThread = {
         agent: source.agent,
         sessionId: session.sessionId,
@@ -2628,6 +2766,14 @@
       agent: source.agent === 'OpenCode' ? undefined : source.agent,
       model: source.model,
     });
+    if (
+      source.model &&
+      (session.model?.providerID !== source.model.providerID ||
+        session.model.id !== source.model.id)
+    )
+      throw new Error(
+        `Cannot verify OpenCode selected model ${source.model.providerID}:${source.model.id}.`,
+      );
     if (receiptId)
       updateSpawnReceipt(receiptId, {
         targetId: `opencode:${session.id}`,

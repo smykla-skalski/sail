@@ -467,8 +467,8 @@ impl BrowserManager {
     ) -> Result<Value, String> {
         let setting = match name {
             "worktree_create" | "worktree_list" | "worktree_info" | "agent_spawn"
-            | "agent_status" | "agent_wait" | "agent_result" | "terminal_list"
-            | "terminal_read" | "terminal_wait" => "sai-agent-worktrees-enabled",
+            | "validation_gate" | "agent_status" | "agent_wait" | "agent_result"
+            | "terminal_list" | "terminal_read" | "terminal_wait" => "sai-agent-worktrees-enabled",
             "terminal_create" | "terminal_write" | "terminal_stop" => "sai-agent-terminals-enabled",
             "worktree_status" => "sai-agent-status-enabled",
             "project_threads" => "sai-agent-thread-list-enabled",
@@ -552,6 +552,7 @@ impl BrowserManager {
                 | "worktree_list"
                 | "worktree_info"
                 | "agent_spawn"
+                | "validation_gate"
                 | "agent_status"
                 | "agent_wait"
                 | "agent_result"
@@ -1107,6 +1108,11 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "provider,prompt",
     ),
     (
+        "validation_gate",
+        "Start one fresh Ship It validation pass in this worktree using a selected available agent and model. Returns its actual provider, model, and launch receipt. Run passes in order and wait for each result.",
+        "gate,prompt",
+    ),
+    (
         "agent_status",
         "Inspect a launch receipt with its ID and access key. Only the launching thread can read it.",
         "receiptId,accessKey",
@@ -1223,6 +1229,17 @@ pub fn run_mcp_stdio() {
                             ]}
                         },
                         "required":["provider","prompt"]
+                    }});
+                }
+                if *name == "validation_gate" {
+                    return json!({"name":name,"description":description,"inputSchema":{
+                        "type":"object",
+                        "properties":{
+                            "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
+                            "prompt":{"type":"string"},
+                            "implementingModels":{"type":"array","items":{"type":"string"}}
+                        },
+                        "required":["gate","prompt","implementingModels"]
                     }});
                 }
                 if *name == "agent_wait" {

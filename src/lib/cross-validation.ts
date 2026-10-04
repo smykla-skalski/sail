@@ -69,7 +69,7 @@ export function validationInstructions(
     `Strict different-model routing: ${settings.strictDifferentModel ? 'on' : 'off'}.`,
     currentModel ? `Current implementation model: ${currentModel}.` : '',
     'Before each gate, collect every model that implemented the issue and check current availability of the selected pool. Choose a selected available model different from every implementation model when one exists. If strict routing is on and none exists, pause with the exact reason. An empty pool also pauses the gate.',
-    'Launch Code Adversary, Findings Adversary, and manual Test Adversary in separate fresh sessions. Set the selected model explicitly. If the host cannot select or verify its actual model, pause the gate. Never launch an unselected agent or model as a substitute. Report the actual provider and model for each pass.',
+    'In Sail, use the validation_gate tool for each pass in order, with gate, prompt, and the complete implementingModels list. Wait for its receipt before starting the next pass. The tool selects the configured provider/model and starts a fresh session. If the tool is unavailable or cannot verify its actual model, pause the gate. Never launch an unselected agent or model as a substitute. Report the actual provider and model returned for each pass.',
   ]
     .filter(Boolean)
     .join('\n');

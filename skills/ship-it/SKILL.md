@@ -46,7 +46,7 @@ Signed conventional commits, scope required, title ≤50 chars, no AI attributio
 
 ## Phase 5 — Adversarial review
 
-Before a gate starts, apply the Sail cross-validation policy included with the prompt. Record every model that implemented this issue. Use only selected, currently available agent/model pairs. Prefer a model outside the complete implementation set. Under strict different-model routing, pause if none qualifies. Start each pass with fresh context, set its model explicitly, verify its actual provider and model, and report both. If the host cannot select or verify the model, pause the gate with the reason. Never substitute a model outside the selected pool.
+Before a gate starts, apply the Sail cross-validation policy included with the prompt. Record every model that implemented this issue. Use Sail's `validation_gate` tool for each pass, passing the complete model set; wait for its receipt before the next pass. The tool selects only a configured, available agent/model pair and verifies the actual model. Prefer a model outside the complete implementation set. Under strict different-model routing, pause if none qualifies. Report the actual provider and model for each pass. Never substitute outside the selected pool.
 
 Run `adversarial-review:adversarial-review` with `--base origin/<default> --context <task-context-file>`. Reply starts `Review Verdict: CLEAN` or `NEEDS_FIXES`. On NEEDS_FIXES fix every surviving `blocking:` and `issue:`, rerun gates and the review on the new tip. Unsettled `question:` findings go in the PR body. Phase 6 only after CLEAN.
 

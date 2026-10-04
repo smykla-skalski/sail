@@ -12,7 +12,7 @@ metadata:
 
 # Adversarial Test
 
-Apply the Sail cross-validation policy included with the prompt. Select only a configured, available agent/model pair, prefer a model different from every implementation model, and honor strict different-model routing. Set and verify the actual provider/model for the fresh Test Adversary session and include them in the verdict. Pause with the reason when no eligible choice exists or model selection cannot be verified. Never substitute outside the selected pool.
+Apply the Sail cross-validation policy included with the prompt. In Sail, launch the fresh Test Adversary session with `validation_gate`, passing its gate name, prompt, and every implementation model; wait for its receipt. The tool selects and verifies a configured agent/model pair, preferring a model different from every implementation model and honoring strict routing. Include the actual provider/model in the verdict. Pause with the reason when no eligible choice exists or the model cannot be verified.
 
 ## Sail execution rule
 
