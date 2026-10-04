@@ -33,6 +33,17 @@ pub struct CheckResult {
     pub code: Option<i32>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckRunRequest {
+    directory: String,
+    thread: String,
+    turn: String,
+    source: String,
+    command: String,
+    retry: bool,
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -195,13 +206,16 @@ pub fn list_post_turn_checks(
 pub async fn run_post_turn_check(
     app: AppHandle,
     lock: State<'_, CheckLock>,
-    directory: String,
-    thread: String,
-    turn: String,
-    source: String,
-    command: String,
-    retry: bool,
+    request: CheckRunRequest,
 ) -> Result<CheckResult, String> {
+    let CheckRunRequest {
+        directory,
+        thread,
+        turn,
+        source,
+        command,
+        retry,
+    } = request;
     if thread.is_empty() || turn.is_empty() || command.trim().is_empty() {
         return Err("Check requires a thread, turn, and command.".into());
     }

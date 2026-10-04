@@ -5311,7 +5311,9 @@
         }
       }
       postTurnResults = upsertCheck(postTurnResults, { ...check, status: 'running' });
-      const result = await invoke<PostTurnCheck>('run_post_turn_check', { ...check, retry });
+      const result = await invoke<PostTurnCheck>('run_post_turn_check', {
+        request: { ...check, retry },
+      });
       postTurnResults = upsertCheck(postTurnResults, result);
     } catch (cause) {
       postTurnResults = upsertCheck(postTurnResults, {

@@ -125,7 +125,9 @@ describe('post-turn checks', () => {
             Reflect.get(item, 'source') === 'repository',
         );
         if (!check || typeof check !== 'object') throw new Error('Repository result missing');
-        return tauri.core.invoke('run_post_turn_check', { ...check, retry: false });
+        return tauri.core.invoke('run_post_turn_check', {
+          request: { ...check, retry: false },
+        });
       },
       repository,
       repositoryCommand,
