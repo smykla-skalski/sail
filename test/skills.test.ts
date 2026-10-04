@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { matchingSkills, promptSkill, skillQuery } from '../src/lib/skills.ts';
+import {
+  matchingSkills,
+  mergeSkills,
+  promptSkill,
+  resolveSkillPrompt,
+  skillQuery,
+} from '../src/lib/skills.ts';
 
 const skills = [
   { id: 'one', name: 'ship-issue', description: 'Ship a GitHub issue' },
@@ -18,4 +24,16 @@ void test('a selected skill resolves from a prompt with arguments', () => {
   assert.equal(promptSkill(skills, '/ship-issue https://example.com')?.id, 'one');
   assert.equal(promptSkill(skills, '/ship-issue')?.id, 'one');
   assert.equal(promptSkill(skills, '/ship-issues'), undefined);
+});
+
+void test('bundled skills fill missing names without replacing installed skills', () => {
+  const bundled = [
+    { name: 'ship-issue', description: 'Bundled', instructions: 'Run the gate' },
+    { name: 'adversarial-test', description: 'Manual test', instructions: 'Test now' },
+  ];
+  const merged = mergeSkills(skills, bundled);
+  assert.deepEqual(merged, [...skills, bundled[1]]);
+  assert.equal(resolveSkillPrompt(merged, '/ship-issue #42'), '/ship-issue #42');
+  assert.match(resolveSkillPrompt(merged, '/adversarial-test --base main'), /Test now/);
+  assert.equal(resolveSkillPrompt(merged, '/unknown'), '/unknown');
 });
