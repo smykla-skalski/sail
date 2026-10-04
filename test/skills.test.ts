@@ -32,7 +32,7 @@ void test('bundled skills fill missing names without replacing installed skills'
     { name: 'adversarial-test', description: 'Manual test', instructions: 'Test now' },
   ];
   const merged = mergeSkills(skills, bundled);
-  assert.deepEqual(merged, [...skills, bundled[1]]);
+  assert.deepEqual(merged, [skills[0], bundled[1], skills[1]]);
   assert.equal(resolveSkillPrompt(merged, '/ship-issue #42'), '/ship-issue #42');
   assert.match(resolveSkillPrompt(merged, '/adversarial-test --base main'), /Test now/);
   assert.equal(resolveSkillPrompt(merged, '/unknown'), '/unknown');
@@ -45,6 +45,30 @@ void test('an installed shipping skill still receives the fresh session gate', (
   ]);
   assert.deepEqual(merged, installed);
   assert.match(resolveSkillPrompt(merged, '/ship-it #42'), /Never run a gate inline/);
+});
+
+void test('bundled choices stay visible with many installed skills and mixed case', () => {
+  const installed = [
+    { id: 'old', name: 'Ship-It', description: 'Installed' },
+    ...Array.from({ length: 12 }, (_, index) => ({
+      id: String(index),
+      name: `skill-${index}`,
+      description: '',
+    })),
+  ];
+  const bundled = [
+    { name: 'ship-it', description: 'Bundled', instructions: 'Bundle content' },
+    { name: 'adversarial-review', description: 'Bundled', instructions: 'Review content' },
+    { name: 'adversarial-test', description: 'Bundled', instructions: 'Test content' },
+  ];
+  const merged = mergeSkills(installed, bundled);
+  assert.deepEqual(
+    matchingSkills(merged, '/')
+      .slice(0, 3)
+      .map((skill) => skill.name),
+    ['Ship-It', 'adversarial-review', 'adversarial-test'],
+  );
+  assert.match(resolveSkillPrompt(merged, '/Ship-It #42'), /Never run a gate inline/);
 });
 
 void test('standalone gates require only their own fresh sessions', () => {
