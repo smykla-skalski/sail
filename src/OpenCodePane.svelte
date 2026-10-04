@@ -488,7 +488,7 @@
           ? `${chosenModel.providerID}:${chosenModel.id}`
           : undefined;
         await invoke('record_turn_snapshot', { path: directory, thread: `opencode:${id}` });
-        const tracking = await beginImplementationTurn(directory);
+        const tracking = await beginImplementationTurn(directory, implementingModel);
         let response;
         try {
           response = await source.session.prompt({

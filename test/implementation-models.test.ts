@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  activeImplementationModels,
+  abandonImplementationTurn,
   beginImplementationTurn,
   beginShipItRun,
   implementationAttributionUncertain,
@@ -55,4 +57,20 @@ void test('overlapping turns do not attribute one agent’s edit to another', as
   await recordImplementationModel(directory, 'model-b', second);
   assert.deepEqual(implementationModels(directory), []);
   assert.equal(implementationAttributionUncertain(directory), true);
+});
+
+void test('active implementation models are available before turns finish', async () => {
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => 'same' } },
+  });
+  const directory = '/test/active-models';
+  const known = await beginImplementationTurn(directory, 'provider:model-a');
+  assert.deepEqual(activeImplementationModels(directory), ['provider:model-a']);
+  const unknown = await beginImplementationTurn(directory);
+  assert.equal(activeImplementationModels(directory), null);
+  abandonImplementationTurn(directory, unknown);
+  assert.deepEqual(activeImplementationModels(directory), ['provider:model-a']);
+  abandonImplementationTurn(directory, known);
+  assert.deepEqual(activeImplementationModels(directory), []);
 });

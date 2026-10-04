@@ -43,6 +43,7 @@
   import { selectValidationChoice, type ValidationChoice } from './lib/cross-validation';
   import {
     abandonImplementationTurn,
+    activeImplementationModels,
     beginImplementationTurn,
     beginShipItRun,
     implementationAttributionUncertain,
@@ -2352,8 +2353,15 @@
       !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
     )
       throw new Error('List every implementation model.');
+    const activeModels = activeImplementationModels(request.directory);
+    if (!activeModels)
+      throw new Error('The active implementation model is unknown. Wait for the turn to finish.');
     const usedModels = [
-      ...new Set([...implementationModels(request.directory), ...implementingModels]),
+      ...new Set([
+        ...implementationModels(request.directory),
+        ...activeModels,
+        ...implementingModels,
+      ]),
     ];
     if (implementationAttributionUncertain(request.directory))
       throw new Error('Concurrent agent turns prevent reliable implementation model attribution.');
@@ -2435,7 +2443,15 @@
         error: null,
       });
       try {
-        if (choice.agent !== 'opencode') await acp.connect(choice.agent);
+        if (choice.agent !== 'opencode') {
+          try {
+            await acp.connect(choice.agent);
+          } catch (cause) {
+            throw new Error(`Provider ${choice.agent} is unavailable: ${describe(cause)}`, {
+              cause,
+            });
+          }
+        }
         ensureSelected();
         const started = await startCoordinatedThread(
           { path: request.directory, branch },
@@ -2458,7 +2474,11 @@
         };
       } catch (cause) {
         updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
-        if (!/^(Model .+ is unavailable|Cannot verify .+ selected model)/.test(describe(cause)))
+        if (
+          !/^(Provider .+ is unavailable|Model .+ is unavailable|Cannot verify .+ selected model)/.test(
+            describe(cause),
+          )
+        )
           throw cause;
         return tryChoice(
           candidates.filter((item) => item !== choice),
@@ -2741,7 +2761,9 @@
         path: created.path,
         thread: `acp:${source.agent}:${session.sessionId}`,
       });
-      const tracking = validation ? null : await beginImplementationTurn(created.path);
+      const tracking = validation
+        ? null
+        : await beginImplementationTurn(created.path, source.model ?? reportedModel);
       beforePrompt?.();
       updateAgentThreadStatus(thread, 'working');
       const turnId = crypto.randomUUID();
@@ -2826,7 +2848,12 @@
       path: created.path,
       thread: `opencode:${session.id}`,
     });
-    const tracking = validation ? null : await beginImplementationTurn(created.path);
+    const tracking = validation
+      ? null
+      : await beginImplementationTurn(
+          created.path,
+          session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+        );
     const promptClient = client;
     beforePrompt?.();
     const startingPrompt = promptClient.session.prompt({ sessionID: session.id, text: prompt });
@@ -6936,7 +6963,7 @@
           ? `${chosenModel.providerID}:${chosenModel.id}`
           : undefined;
         await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
-        const tracking = await beginImplementationTurn(path);
+        const tracking = await beginImplementationTurn(path, implementingModel);
         let response;
         try {
           response = await source.session.prompt({

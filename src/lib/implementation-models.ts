@@ -13,12 +13,15 @@ function uncertainKey(directory: string): string {
   return `sai-implementation-uncertain:${directory}`;
 }
 
-export type ImplementationTurn = { before: string; overlapped: boolean };
+export type ImplementationTurn = { before: string; model: string | undefined; overlapped: boolean };
 const activeTurns = new Map<string, Set<ImplementationTurn>>();
 
-export async function beginImplementationTurn(directory: string): Promise<ImplementationTurn> {
+export async function beginImplementationTurn(
+  directory: string,
+  model?: string,
+): Promise<ImplementationTurn> {
   const active = activeTurns.get(directory) ?? new Set<ImplementationTurn>();
-  const turn = { before: '', overlapped: active.size > 0 };
+  const turn = { before: '', model, overlapped: active.size > 0 };
   if (turn.overlapped) for (const other of active) other.overlapped = true;
   active.add(turn);
   activeTurns.set(directory, active);
@@ -39,6 +42,11 @@ export function abandonImplementationTurn(directory: string, turn: Implementatio
 
 export function implementationAttributionUncertain(directory: string): boolean {
   return getSetting(uncertainKey(directory)) === '1';
+}
+
+export function activeImplementationModels(directory: string): string[] | null {
+  const active = [...(activeTurns.get(directory) ?? [])];
+  return active.every((turn) => turn.model) ? active.map((turn) => turn.model!) : null;
 }
 
 export function beginShipItRun(directory: string, prompt: string): void {
