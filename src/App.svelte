@@ -41,6 +41,7 @@
   import { bundledSkills } from './lib/bundled-skills';
   import { parseValidationSettings, validationSettingsKey } from './lib/cross-validation';
   import { selectValidationChoice, type ValidationChoice } from './lib/cross-validation';
+  import { implementationModels, recordImplementationModel } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import {
     prepareToolFailureDraft,
@@ -120,7 +121,6 @@
     updateEntriesInPlace,
     type AgentEntry,
     type AgentAvailability,
-    type AgentConfigOption,
     type AgentEvent,
     type AgentId,
     type AgentThread,
@@ -2272,8 +2272,7 @@
           : {}),
       };
     }
-    if (request.name === 'validation_gate')
-      return spawnValidationGate(request, project, source, sourceId);
+    if (request.name === 'validation_gate') return spawnValidationGate(request, project, sourceId);
     if (request.name === 'agent_spawn')
       return spawnCoordinatedAgent(request, project, source, sourceId);
     if (!agentWorktreesEnabled) throw new Error('Agent worktree creation is disabled in settings.');
@@ -2331,7 +2330,6 @@
   async function spawnValidationGate(
     request: CoordinationRequest,
     project: string,
-    source: CoordinationSource,
     sourceId: string,
   ) {
     if (!agentWorktreesEnabled) throw new Error('Agent coordination is disabled in settings.');
@@ -2348,28 +2346,8 @@
     )
       throw new Error('List every implementation model.');
     const usedModels = [
-      ...implementingModels,
-      ...(source.kind === 'opencode' && source.model
-        ? [`${source.model.providerID}:${source.model.id}`]
-        : []),
+      ...new Set([...implementationModels(request.directory), ...implementingModels]),
     ];
-    if (source.kind === 'acp') {
-      const current = await acp.load(source.agent, request.directory, request.sessionId);
-      const options = Array.isArray(current.configOptions) ? current.configOptions : [];
-      const model = options.find(
-        (option): option is AgentConfigOption =>
-          !!option &&
-          typeof option === 'object' &&
-          option.type === 'select' &&
-          typeof option.id === 'string' &&
-          typeof option.name === 'string' &&
-          typeof option.currentValue === 'string' &&
-          /model/i.test(`${option.id} ${option.name}`),
-      );
-      if (!model?.currentValue)
-        throw new Error(`Cannot verify the implementation model in ${source.agent}.`);
-      usedModels.push(model.currentValue);
-    }
     const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
       repository: project,
       paths: [request.directory],
@@ -2439,6 +2417,7 @@
           gateSource,
           gatePrompt,
           receiptId,
+          true,
         );
         return {
           ...started,
@@ -2693,9 +2672,13 @@
     source: CoordinationSource,
     prompt: string,
     receiptId?: string,
+    validation = false,
   ) {
     if (source.kind === 'acp') {
       const session = await acp.create(source.agent, created.path);
+      const reportedModel = session.configOptions?.find(
+        (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+      )?.currentValue;
       if (source.model) {
         const modelOption = session.configOptions?.find(
           (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
@@ -2730,13 +2713,16 @@
         path: created.path,
         thread: `acp:${source.agent}:${session.sessionId}`,
       });
+      const before = await invoke<string>('working_tree_revision', { path: created.path });
       updateAgentThreadStatus(thread, 'working');
       const turnId = crypto.randomUUID();
       if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', turnId });
       if (receiptId) activeSpawnTargets.set(`acp:${source.agent}:${session.sessionId}`, receiptId);
       const turn = acp.prompt(source.agent, session.sessionId, prompt, turnId);
       const finished = turn.then(
-        (outcome) => {
+        async (outcome) => {
+          if (!validation)
+            await recordImplementationModel(created.path, source.model ?? reportedModel, before);
           updateAgentThreadStatus(thread, 'done');
           if (receiptId) {
             const current = spawnReceipts.find((item) => item.receiptId === receiptId);
@@ -2810,6 +2796,7 @@
       path: created.path,
       thread: `opencode:${session.id}`,
     });
+    const before = await invoke<string>('working_tree_revision', { path: created.path });
     const promptClient = client;
     const startingPrompt = promptClient.session.prompt({ sessionID: session.id, text: prompt });
     if (receiptId)
@@ -2818,6 +2805,12 @@
           updateSpawnReceipt(receiptId, { state: 'queued', turnId: inbox.id });
           try {
             await promptClient.session.wait({ sessionID: session.id });
+            if (!validation)
+              await recordImplementationModel(
+                created.path,
+                session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+                before,
+              );
             const outcome = await promptClient.session.get({ sessionID: session.id });
             const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
             if (receipt) await settleOpenCodeReceipt(receipt, promptClient, outcome.outcome);
@@ -6891,8 +6884,9 @@
         activityTool = '';
       }
       const promptRequest = runSerialOpenCodeTurn(id, async () => {
+        const before = await invoke<string>('working_tree_revision', { path });
         await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
-        return source.session.prompt({
+        const response = await source.session.prompt({
           sessionID: id,
           text: resolveSkillPrompt(
             skills,
@@ -6908,6 +6902,18 @@
             name: clipboardAttachmentNames.get(filePath) ?? filePath.split(/[\\/]/).at(-1),
           })),
         });
+        if (chosenModel)
+          void source.session
+            .wait({ sessionID: id })
+            .then(() =>
+              recordImplementationModel(
+                path,
+                `${chosenModel.providerID}:${chosenModel.id}`,
+                before,
+              ),
+            )
+            .catch((cause) => (error = `Could not track implementation model: ${describe(cause)}`));
+        return response;
       });
       sending = false;
       await promptRequest;

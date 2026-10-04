@@ -27,6 +27,7 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
+  import { recordImplementationModel } from './lib/implementation-models';
   import {
     agentQueuePaused,
     queuedAgentMessages,
@@ -900,6 +901,8 @@
         });
       }
       const skillText = resolveSkillPrompt(skills, text, modelOption?.currentValue || undefined);
+      const implementationModel = modelOption?.currentValue;
+      const before = await invoke<string>('working_tree_revision', { path: turnDirectory });
       const promptText =
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
@@ -912,6 +915,7 @@
         turnId,
         promptImagePaths(sentImages, sentClipboard),
       );
+      await recordImplementationModel(turnDirectory, implementationModel, before);
       if (recoveredDraft && result.stopReason !== 'cancelled' && !stopRequested)
         recoveredDraft = false;
       if (result.stopReason === 'cancelled' || stopRequested) notifyOnDone = false;

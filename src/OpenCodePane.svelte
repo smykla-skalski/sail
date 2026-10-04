@@ -22,6 +22,7 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
+  import { recordImplementationModel } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
@@ -477,8 +478,9 @@
       running = true;
       if (session) onstatus(summary(session), 'working');
       const promptRequest = runSerialOpenCodeTurn(id, async () => {
+        const before = await invoke<string>('working_tree_revision', { path: directory });
         await invoke('record_turn_snapshot', { path: directory, thread: `opencode:${id}` });
-        return source.session.prompt({
+        const response = await source.session.prompt({
           sessionID: id,
           text: resolveSkillPrompt(
             skills,
@@ -491,6 +493,18 @@
           delivery: queued ? 'steer' : undefined,
           files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
         });
+        if (chosenModel)
+          void source.session
+            .wait({ sessionID: id })
+            .then(() =>
+              recordImplementationModel(
+                directory,
+                `${chosenModel.providerID}:${chosenModel.id}`,
+                before,
+              ),
+            )
+            .catch((cause) => (error = `Could not track implementation model: ${describe(cause)}`));
+        return response;
       });
       sending = false;
       await promptRequest;
