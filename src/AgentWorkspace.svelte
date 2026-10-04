@@ -926,7 +926,11 @@
       }
       const skillText = resolveSkillPrompt(skills, text, modelOption?.currentValue || undefined);
       const implementationModel = modelOption?.currentValue;
-      const tracking = await beginImplementationTurn(turnDirectory, implementationModel);
+      const tracking = await beginImplementationTurn(
+        turnDirectory,
+        implementationModel,
+        `acp:${turnAgent}:${id}`,
+      );
       const promptText =
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`

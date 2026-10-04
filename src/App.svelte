@@ -1929,7 +1929,7 @@
             path: thread.directory,
             thread: target.id,
           });
-          const tracking = await beginImplementationTurn(thread.directory, thread.model);
+          const tracking = await beginImplementationTurn(thread.directory, thread.model, target.id);
           updateAgentThreadStatus(thread, 'working');
           const turn = acp.prompt(thread.agent, thread.sessionId, text, crypto.randomUUID());
           void turn
@@ -1965,6 +1965,7 @@
           const tracking = await beginImplementationTurn(
             target.directory,
             session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+            target.id,
           );
           const turn = promptClient.session.prompt({
             sessionID: sessionId,
@@ -2387,7 +2388,7 @@
       !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
     )
       throw new Error('List every implementation model.');
-    const activeModels = await activeImplementationModels(request.directory);
+    const activeModels = await activeImplementationModels(request.directory, sourceId);
     if (!activeModels)
       throw new Error('The active implementation model is unknown. Wait for the turn to finish.');
     const usedModels = [
@@ -2443,16 +2444,24 @@
           : { kind: 'acp', agent: choice.agent, model: choice.model, title: String(gate) };
       const receiptId = crypto.randomUUID();
       const accessKey = crypto.randomUUID();
-      const ensureSelected = () => {
+      const ensureSelected = async () => {
         const selectedCandidates = currentCandidates.filter((candidate) =>
           crossValidation.choices.some(
             (selected) => selected.agent === candidate.agent && selected.model === candidate.model,
           ),
         );
+        const active = await activeImplementationModels(request.directory, sourceId);
+        if (!active)
+          throw new Error(
+            'Concurrent agent turns prevent reliable implementation model attribution.',
+          );
+        const latestModels = [
+          ...new Set([...implementationModels(request.directory), ...active, ...usedModels]),
+        ];
         const current = selectValidationChoice(
           crossValidation,
           selectedCandidates,
-          usedModels,
+          latestModels,
         ).choice;
         if (current?.agent !== choice.agent || current.model !== choice.model)
           throw new Error('Validation model selection changed before launch. Retry the gate.');
@@ -2486,7 +2495,7 @@
             });
           }
         }
-        ensureSelected();
+        await ensureSelected();
         const started = await startCoordinatedThread(
           { path: request.directory, branch },
           gateSource,
@@ -2753,7 +2762,7 @@
     prompt: string,
     receiptId?: string,
     validation = false,
-    beforePrompt?: () => void,
+    beforePrompt?: () => Promise<void>,
   ) {
     if (!validation) beginShipItRun(created.path, prompt);
     if (source.kind === 'acp') {
@@ -2798,8 +2807,12 @@
       });
       const tracking = validation
         ? null
-        : await beginImplementationTurn(created.path, source.model ?? reportedModel);
-      beforePrompt?.();
+        : await beginImplementationTurn(
+            created.path,
+            source.model ?? reportedModel,
+            `acp:${source.agent}:${session.sessionId}`,
+          );
+      await beforePrompt?.();
       updateAgentThreadStatus(thread, 'working');
       const turnId = crypto.randomUUID();
       if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', turnId });
@@ -2889,9 +2902,10 @@
       : await beginImplementationTurn(
           created.path,
           session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+          `opencode:${session.id}`,
         );
     const promptClient = client;
-    beforePrompt?.();
+    await beforePrompt?.();
     const startingPrompt = promptClient.session.prompt({ sessionID: session.id, text: prompt });
     if (receiptId)
       void startingPrompt
@@ -7004,7 +7018,7 @@
           ? `${chosenModel.providerID}:${chosenModel.id}`
           : undefined;
         await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
-        const tracking = await beginImplementationTurn(path, implementingModel);
+        const tracking = await beginImplementationTurn(path, implementingModel, `opencode:${id}`);
         let response;
         try {
           response = await source.session.prompt({
