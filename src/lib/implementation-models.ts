@@ -57,13 +57,7 @@ export function beginShipItRun(directory: string, prompt: string): void {
       firstLine,
     )?.[1];
   const identity = issue ? `#${issue.match(/\d+$/)![0]}` : crypto.randomUUID();
-  const previous = getSetting(runKey(directory));
-  if (issue && previous === identity) return;
   setSetting(runKey(directory), identity);
-  if (previous) {
-    setSetting(key(directory), '[]');
-    setSetting(uncertainKey(directory), '0');
-  }
 }
 
 export function implementationModels(directory: string): string[] {

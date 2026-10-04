@@ -10,7 +10,7 @@ import {
   recordImplementationModel,
 } from '../src/lib/implementation-models.ts';
 
-void test('a second issue in the same worktree starts with a fresh implementation set', () => {
+void test('model history survives issue references and later Ship It runs', () => {
   const values = new Map<string, string>();
   Object.defineProperty(globalThis, 'localStorage', {
     configurable: true,
@@ -27,13 +27,13 @@ void test('a second issue in the same worktree starts with a fresh implementatio
   beginShipItRun(directory, '/ship-it https://github.com/example/repo/issues/1');
   assert.deepEqual(implementationModels(directory), ['model-a']);
   beginShipItRun(directory, '/ship-it #2');
-  assert.deepEqual(implementationModels(directory), []);
+  assert.deepEqual(implementationModels(directory), ['model-a']);
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-b']));
   beginShipItRun(directory, '/ship-it');
-  assert.deepEqual(implementationModels(directory), []);
+  assert.deepEqual(implementationModels(directory), ['model-b']);
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-c']));
   beginShipItRun(directory, '/ship-it');
-  assert.deepEqual(implementationModels(directory), []);
+  assert.deepEqual(implementationModels(directory), ['model-c']);
 });
 
 void test('overlapping turns do not attribute one agent’s edit to another', async () => {

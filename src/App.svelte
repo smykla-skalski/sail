@@ -1972,12 +1972,19 @@
           });
           void turn
             .then(() => promptClient.session.wait({ sessionID: sessionId }))
-            .then(() =>
-              recordImplementationModel(
-                target.directory,
-                session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-                tracking,
-              ),
+            .then(
+              () =>
+                recordImplementationModel(
+                  target.directory,
+                  session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+                  tracking,
+                ),
+              () =>
+                recordImplementationModel(
+                  target.directory,
+                  session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+                  tracking,
+                ),
             )
             .catch((cause) => {
               abandonImplementationTurn(target.directory, tracking);
@@ -2818,8 +2825,9 @@
           }
           return undefined;
         },
-        (cause) => {
-          if (tracking) abandonImplementationTurn(created.path, tracking);
+        async (cause) => {
+          if (tracking)
+            await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
           updateAgentThreadStatus(thread, 'failed');
           if (receiptId) {
             updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
