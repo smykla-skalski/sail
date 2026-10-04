@@ -1,4 +1,4 @@
-import { sailGateRule, type SkillChoice } from './skills';
+import { sailGateRules, type SkillChoice } from './skills';
 import shipIt from '../../skills/ship-it/SKILL.md?raw';
 import shipInputs from '../../skills/ship-it/references/inputs.md?raw';
 import shipFallbacks from '../../skills/ship-it/references/fallbacks.md?raw';
@@ -14,7 +14,7 @@ export const bundledSkills: SkillChoice[] = [
     name: 'ship-it',
     description: 'Implement, review, test, and ship one change',
     instructions: [
-      sailGateRule,
+      sailGateRules['ship-it'],
       shipIt,
       'Reference: inputs.md',
       shipInputs,
@@ -28,7 +28,7 @@ export const bundledSkills: SkillChoice[] = [
     name: 'adversarial-review',
     description: 'Review a change in two fresh opposed sessions',
     instructions: [
-      sailGateRule,
+      sailGateRules['adversarial-review'],
       review,
       'Code Adversary mandate:',
       codeAdversary,
@@ -39,6 +39,11 @@ export const bundledSkills: SkillChoice[] = [
   {
     name: 'adversarial-test',
     description: 'Manually test a change in a fresh session',
-    instructions: [sailGateRule, manualTest, 'Test Adversary mandate:', testAdversary].join('\n\n'),
+    instructions: [
+      sailGateRules['adversarial-test'],
+      manualTest,
+      'Test Adversary mandate:',
+      testAdversary,
+    ].join('\n\n'),
   },
 ];

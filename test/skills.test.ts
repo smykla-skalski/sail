@@ -46,3 +46,16 @@ void test('an installed shipping skill still receives the fresh session gate', (
   assert.deepEqual(merged, installed);
   assert.match(resolveSkillPrompt(merged, '/ship-it #42'), /Never run a gate inline/);
 });
+
+void test('standalone gates require only their own fresh sessions', () => {
+  const installed = [
+    { id: 'review', name: 'adversarial-review', description: '' },
+    { id: 'test', name: 'adversarial-test', description: '' },
+  ];
+  const review = resolveSkillPrompt(installed, '/adversarial-review');
+  const manualTest = resolveSkillPrompt(installed, '/adversarial-test');
+  assert.match(review, /Code Adversary and Findings Adversary/);
+  assert.doesNotMatch(review, /Test Adversary/);
+  assert.match(manualTest, /Test Adversary/);
+  assert.doesNotMatch(manualTest, /Code Adversary/);
+});

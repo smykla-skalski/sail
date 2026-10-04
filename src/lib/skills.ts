@@ -5,8 +5,16 @@ export interface SkillChoice {
   instructions?: string;
 }
 
-export const sailGateRule =
-  'Sail gate rule: run the Code Adversary, Findings Adversary, and Test Adversary in separate fresh subagent sessions, in order. If a fresh session cannot launch, pause shipping and report the failed gate and reason in this thread. Never run a gate inline. This overrides any inline fallback in an installed skill.';
+export const sailGateRules: Record<string, string> = {
+  'ship-it':
+    'Sail gate rule: run the Code Adversary, Findings Adversary, and Test Adversary in separate fresh subagent sessions, in order.',
+  'adversarial-review':
+    'Sail gate rule: run the Code Adversary and Findings Adversary in separate fresh subagent sessions, in order.',
+  'adversarial-test': 'Sail gate rule: run the Test Adversary in a fresh subagent session.',
+};
+
+const failedGateRule =
+  'If a required fresh session cannot launch, pause and report the failed gate and reason in this thread. Never run a gate inline. This overrides any inline fallback in an installed skill.';
 
 export function mergeSkills(installed: SkillChoice[], bundled: SkillChoice[]): SkillChoice[] {
   const names = new Set(installed.map((skill) => skill.name.toLowerCase()));
@@ -16,8 +24,8 @@ export function mergeSkills(installed: SkillChoice[], bundled: SkillChoice[]): S
 export function resolveSkillPrompt(skills: SkillChoice[], text: string): string {
   const skill = promptSkill(skills, text);
   if (!skill) return text;
-  const gate = ['ship-it', 'adversarial-review', 'adversarial-test'].includes(skill.name)
-    ? `\n\n${sailGateRule}`
+  const gate = sailGateRules[skill.name]
+    ? `\n\n${sailGateRules[skill.name]} ${failedGateRule}`
     : '';
   return skill.instructions
     ? `${text}${gate}\n\nFollow this bundled Sail skill:\n\n${skill.instructions}`
