@@ -32,6 +32,8 @@
     "allow-create-pull-request",
     "allow-list-open-issues",
     "allow-open-issue",
+    "allow-publish-issue-graph",
+    "allow-load-issue-graph",
     "allow-pull-request-checks",
     "allow-failed-check-log",
     "allow-open-pull-request",
