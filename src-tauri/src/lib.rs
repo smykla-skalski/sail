@@ -1494,12 +1494,29 @@ fn archive_ignored_and_remove(
     worktree: String,
 ) -> Result<Option<String>, String> {
     const IGNORED: &str = "Worktree has ignored files. Move or remove them before deleting.";
-    match remove_worktree(repository.clone(), worktree.clone(), None) {
-        Ok(()) => return Ok(None),
+    let worktree = PathBuf::from(worktree);
+    let parent = worktree.parent().ok_or("Worktree parent is missing.")?;
+    let archive = parent
+        .join(".sail-shipping-archive")
+        .join(worktree.file_name().ok_or("Worktree name is missing.")?);
+    let saved_archive = || {
+        archive
+            .exists()
+            .then(|| archive.to_string_lossy().into_owned())
+    };
+    if !worktree.exists() {
+        validate_repository(repository)?;
+        return Ok(saved_archive());
+    }
+    match remove_worktree(
+        repository.clone(),
+        worktree.to_string_lossy().into_owned(),
+        None,
+    ) {
+        Ok(()) => return Ok(saved_archive()),
         Err(error) if error == IGNORED => {}
         Err(error) => return Err(error),
     }
-    let worktree = PathBuf::from(worktree);
     let status = Command::new("git")
         .arg("-C")
         .arg(&worktree)
@@ -1542,21 +1559,26 @@ fn archive_ignored_and_remove(
     if ignored.is_empty() {
         return Err("Ignored worktree files changed during cleanup. Retry.".to_string());
     }
-    let parent = worktree.parent().ok_or("Worktree parent is missing.")?;
-    let archive = parent.join(".sail-shipping-archive").join(format!(
-        "{}-{}",
-        worktree.file_name().unwrap_or_default().to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ));
     for relative in ignored {
         let destination = archive.join(&relative);
+        if destination.exists() {
+            return Err(format!(
+                "Ignored file archive already contains {}. Inspect {} before retrying.",
+                relative.display(),
+                archive.display()
+            ));
+        }
         std::fs::create_dir_all(destination.parent().ok_or("Invalid archive path.")?)
             .map_err(|error| format!("Cannot prepare ignored file archive: {error}"))?;
-        std::fs::rename(worktree.join(relative), destination)
-            .map_err(|error| format!("Cannot archive ignored worktree files: {error}"))?;
+        std::fs::rename(worktree.join(relative), destination).map_err(|error| {
+            format!(
+                "Cannot archive ignored worktree files to {}: {error}",
+                archive.display()
+            )
+        })?;
     }
     remove_worktree(repository, worktree.to_string_lossy().into_owned(), None)?;
-    Ok(Some(archive.to_string_lossy().into_owned()))
+    Ok(saved_archive())
 }
 
 fn remove_worktree(
@@ -2054,6 +2076,10 @@ mod tests {
             "content"
         );
         assert!(!Path::new(&created.path).exists());
+        assert_eq!(
+            archive_ignored_and_remove(repository_path.into(), created.path.clone()).unwrap(),
+            Some(archive)
+        );
         let forced = add_worktree(
             repository_path.into(),
             "forced".into(),
