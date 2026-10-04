@@ -1,6 +1,6 @@
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -125,5 +125,78 @@ describe('pending requests across projects', () => {
     await browser.refresh();
     await $('[aria-label="Pending requests"]').click();
     await expect($$('.inbox-result')).toBeElementsArrayOfSize(2);
+  });
+
+  it('opens a failed check without clearing unrelated unread thread attention', async () => {
+    const paths = [realpathSync(first), realpathSync(second)];
+    mkdirSync(join(first, '.sail'), { recursive: true });
+    writeFileSync(
+      join(first, '.sail', 'worktree.json'),
+      JSON.stringify({ postTurnChecks: ['printf check; exit 7'] }),
+    );
+    execFileSync('git', ['-C', first, 'add', '.sail/worktree.json']);
+    execFileSync('git', [
+      '-C',
+      first,
+      '-c',
+      'user.name=Sail Test',
+      '-c',
+      'user.email=sail@example.invalid',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-qm',
+      'baseline',
+    ]);
+    await browser.execute(([one, two]) => {
+      sessionStorage.removeItem('sail-e2e-settings');
+      localStorage.setItem('sai-directory', one);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [one, two], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sail-agent-threads');
+      localStorage.removeItem('sai-thread-attention');
+      localStorage.removeItem('sai-inbox-outcomes');
+      localStorage.setItem('sai-notifications-enabled', 'false');
+    }, paths);
+    await browser.refresh();
+    await browser.execute(async (path) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('approve_post_turn_check', {
+        directory: path,
+        command: 'printf check; exit 7',
+      });
+    }, paths[0]);
+    await $('.agent-launches button').click();
+    await $('.agent-composer textarea').waitForEnabled();
+    await $('.agent-composer textarea').setValue('Activity demo');
+    await $('.agent-actions button').click();
+    await $(`.project-default-worktree-select[title="${paths[1]}"]`).click();
+    await browser.waitUntil(() =>
+      browser.execute(() =>
+        Object.values(JSON.parse(localStorage.getItem('sai-thread-attention') ?? '{}')).some(
+          (item: unknown) =>
+            !!item &&
+            typeof item === 'object' &&
+            Reflect.get(item, 'status') === 'done' &&
+            Reflect.get(item, 'unread') === true,
+        ),
+      ),
+    );
+    await $('[aria-label="Pending requests"]').click();
+    const failedCheck = $('//li[contains(@class, "inbox-result")][contains(., "Check failed")]');
+    await expect(failedCheck).toBeDisplayed();
+    const before = await browser.execute(() =>
+      JSON.parse(localStorage.getItem('sai-thread-attention') ?? '{}'),
+    );
+    await failedCheck.$('.inbox-open').click();
+    await browser.waitUntil(() =>
+      browser.execute(() => document.activeElement?.classList.contains('post-turn-check')),
+    );
+    const after = await browser.execute(() =>
+      JSON.parse(localStorage.getItem('sai-thread-attention') ?? '{}'),
+    );
+    expect(after).toEqual(before);
   });
 });

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   loadAttention,
   markAttentionRead,
+  preserveAttentionOnCheckOpen,
   reconcileAttention,
   updateAttention,
   type AttentionMap,
@@ -125,4 +126,12 @@ void test('unsaved waiting activity becomes unread without aborting reconciliati
   );
   assert.deepEqual(next.waiting, { status: 'waiting', unread: true });
   assert.deepEqual(next.working, { status: 'working', unread: false });
+});
+
+void test('opening a failed check keeps prior unread attention without hiding a new status', () => {
+  const before: AttentionMap = { target: { status: 'waiting', unread: true } };
+  const navigated = markAttentionRead(before, 'target');
+  assert.deepEqual(preserveAttentionOnCheckOpen(navigated, before, 'target'), before);
+  const changed: AttentionMap = { target: { status: 'done', unread: false } };
+  assert.equal(preserveAttentionOnCheckOpen(changed, before, 'target'), changed);
 });

@@ -80,6 +80,7 @@
   import {
     loadAttention,
     markAttentionRead,
+    preserveAttentionOnCheckOpen,
     reconcileAttention,
     updateAttention,
     type AttentionMap,
@@ -4344,24 +4345,37 @@
   async function openInboxItem(item: InboxItem) {
     inboxDialog.close();
     if (isInboxOutcome(item)) {
-      await jumpToRecentThread(JSON.stringify([item.agentId, item.directory, item.sessionId]));
-      const outcome: InboxOutcome = {
-        key: item.key,
-        kind: item.kind as InboxOutcome['kind'],
-        directory: item.directory,
-        agentId: item.agentId!,
-        sessionId: item.sessionId,
-        text: item.text,
-        receivedAt: item.receivedAt,
-        eventId: item.eventId,
-        read: false,
-      };
-      const previous = inboxOutcomes.filter((saved) => saved.key !== outcome.key);
-      const next = markInboxOutcomeRead(recordInboxOutcome(previous, outcome), item.key);
-      inboxOutcomes = next;
-      setSetting('sai-inbox-outcomes', JSON.stringify(next));
-      scheduleInboxRefresh();
-      await focusInboxOutcome(item);
+      const key = JSON.stringify([item.agentId, item.directory, item.sessionId]);
+      const attentionBefore = threadAttention;
+      try {
+        await jumpToRecentThread(key);
+        const outcome: InboxOutcome = {
+          key: item.key,
+          kind: item.kind as InboxOutcome['kind'],
+          directory: item.directory,
+          agentId: item.agentId!,
+          sessionId: item.sessionId,
+          text: item.text,
+          receivedAt: item.receivedAt,
+          eventId: item.eventId,
+          read: false,
+        };
+        const previous = inboxOutcomes.filter((saved) => saved.key !== outcome.key);
+        const next = markInboxOutcomeRead(recordInboxOutcome(previous, outcome), item.key);
+        inboxOutcomes = next;
+        setSetting('sai-inbox-outcomes', JSON.stringify(next));
+        scheduleInboxRefresh();
+        await focusInboxOutcome(item);
+      } finally {
+        if (item.kind === 'check-failed') {
+          const preserved = preserveAttentionOnCheckOpen(threadAttention, attentionBefore, key);
+          if (preserved !== threadAttention) {
+            threadAttention = preserved;
+            attentionRevision++;
+            saveThreadAttention();
+          }
+        }
+      }
       return;
     }
     if (item.kind === 'acp-permission') {
