@@ -12,6 +12,7 @@ let nextTerminalRequest = 3000;
 const agent = process.argv[2];
 let authenticated = agent !== 'codex';
 let nextSession = 0;
+const sessionRun = process.env.SAIL_ACP_TEST_UNIQUE_SESSIONS ? `-${process.pid}` : '';
 let nextPermission = 1000;
 
 function send(message) {
@@ -160,7 +161,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, error: { code: -32000, message: 'Authentication required' } });
       continue;
     }
-    const sessionId = `${agent}-test-${++nextSession}`;
+    const sessionId = `${agent}-test${sessionRun}-${++nextSession}`;
     sessions.set(sessionId, { history: [], config: { model: 'test', effort: 'medium' } });
     update(sessionId, { sessionUpdate: 'available_commands_update', availableCommands });
     setTimeout(
