@@ -120,6 +120,7 @@
     updateEntriesInPlace,
     type AgentEntry,
     type AgentAvailability,
+    type AgentConfigOption,
     type AgentEvent,
     type AgentId,
     type AgentThread,
@@ -2352,6 +2353,23 @@
         ? [`${source.model.providerID}:${source.model.id}`]
         : []),
     ];
+    if (source.kind === 'acp') {
+      const current = await acp.load(source.agent, request.directory, request.sessionId);
+      const options = Array.isArray(current.configOptions) ? current.configOptions : [];
+      const model = options.find(
+        (option): option is AgentConfigOption =>
+          !!option &&
+          typeof option === 'object' &&
+          option.type === 'select' &&
+          typeof option.id === 'string' &&
+          typeof option.name === 'string' &&
+          typeof option.currentValue === 'string' &&
+          /model/i.test(`${option.id} ${option.name}`),
+      );
+      if (!model?.currentValue)
+        throw new Error(`Cannot verify the implementation model in ${source.agent}.`);
+      usedModels.push(model.currentValue);
+    }
     const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
       repository: project,
       paths: [request.directory],
@@ -2415,6 +2433,7 @@
         error: null,
       });
       try {
+        if (choice.agent !== 'opencode') await acp.connect(choice.agent);
         const started = await startCoordinatedThread(
           { path: request.directory, branch },
           gateSource,
