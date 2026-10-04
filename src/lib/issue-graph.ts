@@ -12,6 +12,7 @@ export interface IssueDraft {
 export interface IssueGraphDraft {
   source: string;
   replaceExisting?: boolean;
+  loadedFromUmbrella?: boolean;
   umbrellaNumber?: number;
   title: string;
   body: string;
@@ -32,6 +33,7 @@ export interface PublishedGraph {
 const IssueGraphDraftSchema = z.object({
   source: z.string(),
   replaceExisting: z.boolean().optional(),
+  loadedFromUmbrella: z.boolean().optional(),
   umbrellaNumber: z.number().optional(),
   title: z.string(),
   body: z.string(),
@@ -60,6 +62,27 @@ export function splitPlan(plan: Plan): IssueGraphDraft {
       title: step.title,
       body: step.detail,
       dependsOn: step.dependsOn ?? [],
+    })),
+  };
+}
+
+export function rebaseIssueGraph(previous: IssueGraphDraft | null, plan: Plan): IssueGraphDraft {
+  const latest = splitPlan(plan);
+  if (!previous) return latest;
+  const prior = new Map(previous.issues.map((issue) => [issue.id, issue]));
+  const matches = latest.issues.filter((issue) => prior.has(issue.id));
+  if (!matches.length && previous.loadedFromUmbrella)
+    return { ...previous, source: plan.sessionID };
+  return {
+    ...latest,
+    umbrellaNumber: previous.umbrellaNumber,
+    replaceExisting: previous.replaceExisting,
+    issues: latest.issues.map((issue) => ({
+      id: issue.id,
+      title: issue.title,
+      body: issue.body,
+      dependsOn: issue.dependsOn,
+      number: prior.get(issue.id)?.number,
     })),
   };
 }

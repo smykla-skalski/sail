@@ -387,10 +387,8 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
     let umbrella_marker = marker(&graph.source, "umbrella");
     let umbrella = if let Some(number) = graph.umbrella_number {
         Some(github_issue(&repository, &target, number)?)
-    } else if graph.issues.len() > 1 {
-        marked_issue(&all_issues, &umbrella_marker)?.cloned()
     } else {
-        None
+        marked_issue(&all_issues, &umbrella_marker)?.cloned()
     };
     if let Some(value) = &umbrella {
         let issue = published_issue(value, "umbrella".into())?;
@@ -426,6 +424,16 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
             existing.insert(draft.id.clone(), value);
         }
     }
+    let recovered_managed = umbrella
+        .as_ref()
+        .and_then(|value| value["body"].as_str())
+        .is_some_and(|body| body.contains(&umbrella_marker))
+        || existing.iter().any(|(id, value)| {
+            value["body"]
+                .as_str()
+                .is_some_and(|body| body.contains(&marker(&graph.source, id)))
+        });
+    let replace_existing = graph.replace_existing || recovered_managed;
     let mut resolved_graph = graph.clone();
     for draft in &mut resolved_graph.issues {
         if let Some(value) = existing.get(&draft.id) {
@@ -489,7 +497,7 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
             .iter()
             .map(|(issue, _)| issue.number)
             .collect::<std::collections::HashSet<_>>();
-        if graph.replace_existing {
+        if replace_existing {
             for old in &linked {
                 let number = old["number"]
                     .as_u64()
@@ -562,7 +570,7 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
             .iter()
             .map(|(number, _)| *number)
             .collect::<std::collections::HashSet<_>>();
-        if graph.replace_existing {
+        if replace_existing {
             for old in &blocked_by {
                 let number = old["number"]
                     .as_u64()

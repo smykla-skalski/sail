@@ -59,3 +59,34 @@ await test('numeric aliases cannot hide a cycle', () => {
   };
   assert.match(graphErrors(cyclic).join(' '), /cycle/);
 });
+
+await test('plan revision refreshes scope while retaining issue numbers', async () => {
+  const { rebaseIssueGraph } = await import('../src/lib/issue-graph.ts');
+  const plan = {
+    title: 'Revised plan',
+    summary: 'Revised summary',
+    steps: [
+      {
+        id: 'a',
+        title: 'Revised first',
+        detail: 'Revised scope',
+        files: [],
+        risk: 'low' as const,
+        status: 'proposed' as const,
+        origin: 'plan' as const,
+        touched: [],
+      },
+    ],
+    sessionID: 'session-1',
+    version: 2,
+    state: 'review' as const,
+    reviewReason: 'plan' as const,
+    outside: [],
+    createdAt: 1,
+  };
+  const updated = rebaseIssueGraph({ ...graph, umbrellaNumber: 9, replaceExisting: true }, plan);
+  assert.equal(updated.issues[0].number, 3);
+  assert.equal(updated.issues[0].title, 'Revised first');
+  assert.equal(updated.umbrellaNumber, 9);
+  assert.equal(updated.replaceExisting, true);
+});

@@ -4,7 +4,7 @@
   import {
     graphErrors,
     isIssueGraphDraft,
-    splitPlan,
+    rebaseIssueGraph,
     type IssueGraphDraft,
     type PublishedGraph,
   } from './lib/issue-graph';
@@ -24,16 +24,32 @@
   let errors = $derived(graphErrors(graph));
 
   $effect(() => {
-    const key = `${directory}:${plan.sessionID}`;
+    if (publishing || loading) return;
+    const prefix = `${directory}:${plan.sessionID}:`;
+    const key = `${prefix}${plan.version}`;
     if (key !== source) {
-      source = key;
+      let saved: IssueGraphDraft | null = null;
+      let previous: IssueGraphDraft | null = source.startsWith(prefix) ? graph : null;
       try {
-        const saved: unknown = JSON.parse(getSetting(`sai-issue-graph:${key}`) ?? 'null');
-        graph = isIssueGraphDraft(saved) ? saved : splitPlan(plan);
+        const value: unknown = JSON.parse(getSetting(`sai-issue-graph:${key}`) ?? 'null');
+        if (isIssueGraphDraft(value)) saved = value;
+        if (!saved && !previous) {
+          for (let version = plan.version - 1; version >= 1; version--) {
+            const older: unknown = JSON.parse(
+              getSetting(`sai-issue-graph:${prefix}${version}`) ?? 'null',
+            );
+            if (isIssueGraphDraft(older)) {
+              previous = older;
+              break;
+            }
+          }
+        }
       } catch {
-        graph = splitPlan(plan);
+        previous = null;
       }
-      umbrellaInput = '';
+      source = key;
+      graph = saved ?? rebaseIssueGraph(previous, plan);
+      umbrellaInput = String(graph.umbrellaNumber ?? '');
       published = null;
       approved = false;
       message = '';
@@ -71,6 +87,7 @@
       graph = {
         source: plan.sessionID,
         replaceExisting: true,
+        loadedFromUmbrella: true,
         umbrellaNumber: number,
         title: loaded.umbrella?.title ?? '',
         body: loaded.umbrella?.body ?? '',
@@ -136,109 +153,114 @@
     Review each issue's scope and prerequisites before publishing. Publishing saves the graph on
     GitHub.
   </p>
-  <div class="load-row">
-    <label
-      >Existing umbrella # <input
-        aria-label="Existing umbrella number"
-        type="number"
-        min="1"
-        bind:value={umbrellaInput}
-      /></label
-    >
-    <button type="button" onclick={loadUmbrella} disabled={loading || publishing}
-      >Load umbrella</button
-    >
-  </div>
-  {#if graph.issues.length > 1 || graph.umbrellaNumber}
-    <label>Umbrella title <input aria-label="Umbrella title" bind:value={graph.title} /></label>
-    <label
-      >Umbrella scope <textarea aria-label="Umbrella scope" bind:value={graph.body}
-      ></textarea></label
-    >
-  {/if}
-  {#each graph.issues as issue, index (issue.id)}
-    <fieldset>
-      <legend>{issue.id}{issue.number ? ` · #${issue.number}` : ''}</legend>
+  <fieldset class="issue-editor" disabled={publishing || loading}>
+    <div class="load-row">
       <label
-        >Title <input
-          aria-label={`Title for ${issue.id}`}
-          value={issue.title}
-          oninput={(event) => updateIssue(index, { title: event.currentTarget.value })}
-        /></label
-      >
-      <label
-        >Scope <textarea
-          aria-label={`Scope for ${issue.id}`}
-          value={issue.body}
-          oninput={(event) => updateIssue(index, { body: event.currentTarget.value })}
-        ></textarea></label
-      >
-      <label
-        >Existing issue # <input
-          aria-label={`Existing number for ${issue.id}`}
+        >Existing umbrella # <input
+          aria-label="Existing umbrella number"
           type="number"
           min="1"
-          value={issue.number ?? ''}
-          oninput={(event) =>
-            updateIssue(index, { number: parseNumber(event.currentTarget.value) })}
+          bind:value={umbrellaInput}
         /></label
       >
+      <button type="button" onclick={loadUmbrella} disabled={loading || publishing}
+        >Load umbrella</button
+      >
+    </div>
+    {#if graph.issues.length > 1 || graph.umbrellaNumber}
+      <label>Umbrella title <input aria-label="Umbrella title" bind:value={graph.title} /></label>
       <label
-        >Blocked by <select
-          aria-label={`Dependency for ${issue.id}`}
-          multiple
-          value={issue.dependsOn}
-          onchange={(event) =>
-            updateIssue(index, {
-              dependsOn: [
-                ...issue.dependsOn.filter(
-                  (dependency) => !graph.issues.some((candidate) => candidate.id === dependency),
-                ),
-                ...[...event.currentTarget.selectedOptions].map((option) => option.value),
-              ],
-            })}
+        >Umbrella scope <textarea aria-label="Umbrella scope" bind:value={graph.body}
+        ></textarea></label
+      >
+    {/if}
+    {#each graph.issues as issue, index (issue.id)}
+      <fieldset>
+        <legend>{issue.id}{issue.number ? ` · #${issue.number}` : ''}</legend>
+        <label
+          >Title <input
+            aria-label={`Title for ${issue.id}`}
+            value={issue.title}
+            oninput={(event) => updateIssue(index, { title: event.currentTarget.value })}
+          /></label
         >
-          {#each graph.issues.filter((candidate) => candidate.id !== issue.id) as candidate (candidate.id)}
-            <option value={candidate.id}>{candidate.title || candidate.id}</option>
-          {/each}
-        </select></label
-      >
-      <label
-        >Other blocker numbers <input
-          aria-label={`Other blockers for ${issue.id}`}
-          value={issue.dependsOn
-            .filter((dependency) => !graph.issues.some((candidate) => candidate.id === dependency))
-            .join(', ')}
-          oninput={(event) =>
-            updateIssue(index, {
-              dependsOn: [
-                ...issue.dependsOn.filter((dependency) =>
-                  graph.issues.some((candidate) => candidate.id === dependency),
-                ),
-                ...event.currentTarget.value
-                  .split(',')
-                  .map((value) => value.trim())
-                  .filter(Boolean),
-              ],
-            })}
-        /></label
-      >
-      <button
-        type="button"
-        onclick={() => {
-          graph.issues.splice(index, 1);
-          published = null;
-        }}>Remove issue</button
-      >
-    </fieldset>
-  {/each}
-  <button type="button" onclick={addIssue}>Add issue</button>
+        <label
+          >Scope <textarea
+            aria-label={`Scope for ${issue.id}`}
+            value={issue.body}
+            oninput={(event) => updateIssue(index, { body: event.currentTarget.value })}
+          ></textarea></label
+        >
+        <label
+          >Existing issue # <input
+            aria-label={`Existing number for ${issue.id}`}
+            type="number"
+            min="1"
+            value={issue.number ?? ''}
+            oninput={(event) =>
+              updateIssue(index, { number: parseNumber(event.currentTarget.value) })}
+          /></label
+        >
+        <label
+          >Blocked by <select
+            aria-label={`Dependency for ${issue.id}`}
+            multiple
+            value={issue.dependsOn}
+            onchange={(event) =>
+              updateIssue(index, {
+                dependsOn: [
+                  ...issue.dependsOn.filter(
+                    (dependency) => !graph.issues.some((candidate) => candidate.id === dependency),
+                  ),
+                  ...[...event.currentTarget.selectedOptions].map((option) => option.value),
+                ],
+              })}
+          >
+            {#each graph.issues.filter((candidate) => candidate.id !== issue.id) as candidate (candidate.id)}
+              <option value={candidate.id}>{candidate.title || candidate.id}</option>
+            {/each}
+          </select></label
+        >
+        <label
+          >Other blocker numbers <input
+            aria-label={`Other blockers for ${issue.id}`}
+            value={issue.dependsOn
+              .filter(
+                (dependency) => !graph.issues.some((candidate) => candidate.id === dependency),
+              )
+              .join(', ')}
+            oninput={(event) =>
+              updateIssue(index, {
+                dependsOn: [
+                  ...issue.dependsOn.filter((dependency) =>
+                    graph.issues.some((candidate) => candidate.id === dependency),
+                  ),
+                  ...event.currentTarget.value
+                    .split(',')
+                    .map((value) => value.trim())
+                    .filter(Boolean),
+                ],
+              })}
+          /></label
+        >
+        <button
+          type="button"
+          onclick={() => {
+            graph.issues.splice(index, 1);
+            published = null;
+          }}>Remove issue</button
+        >
+      </fieldset>
+    {/each}
+    <button type="button" onclick={addIssue}>Add issue</button>
+  </fieldset>
   {#if errors.length}<ul class="errors">
       {#each errors as error (error)}<li>{error}</li>{/each}
     </ul>{/if}
   <label
     ><input
       type="checkbox"
+      disabled={publishing}
       bind:checked={approved}
       onchange={() => (approvedGraph = JSON.stringify(graph))}
     /> I approve this issue split</label
@@ -285,6 +307,13 @@
     display: grid;
     gap: 0.5rem;
     min-width: 0;
+  }
+  .issue-editor {
+    border: 0;
+    padding: 0;
+    min-width: 0;
+    display: grid;
+    gap: 0.7rem;
   }
   .load-row {
     display: flex;
