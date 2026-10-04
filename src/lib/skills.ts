@@ -48,5 +48,5 @@ export function matchingSkills(skills: SkillChoice[], draft: string): SkillChoic
 
 export function promptSkill(skills: SkillChoice[], text: string): SkillChoice | undefined {
   const name = /^\/([^\s/]+)(?:\s|$)/.exec(text)?.[1];
-  return skills.find((skill) => skill.name === name);
+  return skills.find((skill) => skill.name.toLowerCase() === name?.toLowerCase());
 }

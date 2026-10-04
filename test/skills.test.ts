@@ -23,6 +23,7 @@ void test('slash matches names and closes after arguments begin', () => {
 void test('a selected skill resolves from a prompt with arguments', () => {
   assert.equal(promptSkill(skills, '/ship-issue https://example.com')?.id, 'one');
   assert.equal(promptSkill(skills, '/ship-issue')?.id, 'one');
+  assert.equal(promptSkill(skills, '/SHIP-ISSUE #42')?.id, 'one');
   assert.equal(promptSkill(skills, '/ship-issues'), undefined);
 });
 
@@ -69,6 +70,7 @@ void test('bundled choices stay visible with many installed skills and mixed cas
     ['Ship-It', 'adversarial-review', 'adversarial-test'],
   );
   assert.match(resolveSkillPrompt(merged, '/Ship-It #42'), /Never run a gate inline/);
+  assert.match(resolveSkillPrompt(merged, '/SHIP-IT #42'), /Never run a gate inline/);
 });
 
 void test('standalone gates require only their own fresh sessions', () => {
