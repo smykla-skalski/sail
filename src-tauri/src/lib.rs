@@ -1812,6 +1812,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn working_tree_revision_detects_edits_in_dirty_submodules() {
         let root =
