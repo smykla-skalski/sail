@@ -26,6 +26,7 @@
   import SkillMenu from './SkillMenu.svelte';
   import { matchingSkills, promptSkill, type SkillChoice } from './lib/skills';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
+  import { reportedHookIdentity, toolFailurePrompt } from './lib/tool-failure';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import type { Confirmation } from './ConfirmDialog.svelte';
   import PathPicker from './PathPicker.svelte';
@@ -631,6 +632,7 @@
   let diffRevisionPath = '';
   let historyRefresh = 0;
   let draft = $state('');
+  let mainPrompt = $state<HTMLTextAreaElement | undefined>();
   let skills = $state<SkillChoice[]>([]);
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
@@ -6321,6 +6323,12 @@
     }
   }
 
+  function fixOpenCodeToolFailure(name: string, input: unknown, reason: string, output: string) {
+    const request = toolFailurePrompt(name, input, reason, output);
+    if (!draft.includes(request)) draft = [draft.trim(), request].filter(Boolean).join('\n\n');
+    void tick().then(() => mainPrompt?.focus());
+  }
+
   async function send() {
     await pendingPaste;
     const command = draft.trim().toLowerCase();
@@ -7117,19 +7125,34 @@
                       {#if assistantText(message)}<Markdown source={assistantText(message)} />{/if}
                       {#each message.content as part, ordinal (ordinal)}
                         {#if part.type === 'tool'}
-                          <ToolActivity
-                            title={part.name}
-                            status={part.state.status}
-                            input={part.state.input}
-                            output={part.state.status === 'completed' ||
-                            part.state.status === 'error'
+                          {@const reason =
+                            part.state.status === 'error' ? part.state.error.message : ''}
+                          {@const output =
+                            part.state.status === 'completed' || part.state.status === 'error'
                               ? (part.state.content ?? [])
                                   .map((item) =>
                                     item.type === 'text' ? item.text : (item.name ?? item.uri),
                                   )
                                   .join('\n')
                               : ''}
-                            error={part.state.status === 'error' ? part.state.error.message : ''}
+                          <ToolActivity
+                            title={part.name}
+                            status={part.state.status}
+                            input={part.state.input}
+                            {output}
+                            error={reason}
+                            source={part.state.status === 'error'
+                              ? (reportedHookIdentity(part.state.metadata) ?? '')
+                              : ''}
+                            onfix={part.state.status === 'error'
+                              ? () =>
+                                  fixOpenCodeToolFailure(
+                                    part.name,
+                                    part.state.input,
+                                    reason,
+                                    output,
+                                  )
+                              : undefined}
                           />
                         {/if}
                       {/each}
@@ -7210,6 +7233,7 @@
                       : undefined}
                     data-pane-prompt
                     aria-label="Message"
+                    bind:this={mainPrompt}
                     bind:value={draft}
                     onpaste={(event) => {
                       pendingPaste = Promise.all([pendingPaste, pasteFiles(event)]).then(() => {});

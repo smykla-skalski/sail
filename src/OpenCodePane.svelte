@@ -29,6 +29,7 @@
   import type { SetupReport } from './lib/onboarding';
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import { mergeMessages, nearBottom } from './lib/timeline';
+  import { reportedHookIdentity, toolFailurePrompt } from './lib/tool-failure';
 
   let {
     client,
@@ -115,6 +116,12 @@
   function chooseSkill(skill: SkillChoice) {
     draft = `/${skill.name} `;
     skillSelected = 0;
+    void tick().then(() => prompt.focus());
+  }
+
+  function fixToolFailure(name: string, input: unknown, reason: string, output: string) {
+    const request = toolFailurePrompt(name, input, reason, output);
+    if (!draft.includes(request)) draft = [draft.trim(), request].filter(Boolean).join('\n\n');
     void tick().then(() => prompt.focus());
   }
   let files = $state<string[]>([]);
@@ -645,16 +652,25 @@
             {#if text}<Markdown source={text} />{/if}
             {#each message.content as part, ordinal (ordinal)}
               {#if part.type === 'tool'}
-                <ToolActivity
-                  title={part.name}
-                  status={part.state.status}
-                  input={part.state.input}
-                  output={part.state.status === 'completed' || part.state.status === 'error'
+                {@const reason = part.state.status === 'error' ? part.state.error.message : ''}
+                {@const output =
+                  part.state.status === 'completed' || part.state.status === 'error'
                     ? (part.state.content ?? [])
                         .map((item) => (item.type === 'text' ? item.text : (item.name ?? item.uri)))
                         .join('\n')
                     : ''}
-                  error={part.state.status === 'error' ? part.state.error.message : ''}
+                <ToolActivity
+                  title={part.name}
+                  status={part.state.status}
+                  input={part.state.input}
+                  {output}
+                  error={reason}
+                  source={part.state.status === 'error'
+                    ? (reportedHookIdentity(part.state.metadata) ?? '')
+                    : ''}
+                  onfix={part.state.status === 'error'
+                    ? () => fixToolFailure(part.name, part.state.input, reason, output)
+                    : undefined}
                 />
               {/if}
             {/each}

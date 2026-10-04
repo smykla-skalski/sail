@@ -7,7 +7,9 @@
     input,
     output = '',
     error = '',
+    source = '',
     expanded = false,
+    onfix,
     children,
   }: {
     title: string;
@@ -15,13 +17,15 @@
     input?: unknown;
     output?: string;
     error?: string;
+    source?: string;
     expanded?: boolean;
+    onfix?: () => void;
     children?: import('svelte').Snippet;
   } = $props();
 
   let open = $state(false);
   $effect(() => {
-    if (expanded) open = true;
+    if (expanded || status === 'error' || status === 'failed') open = true;
   });
   const command = $derived(toolCommand(input));
   const formattedInput = $derived(toolInput(input));
@@ -33,6 +37,7 @@
     <span class="tool-activity-status" class:failed={status === 'failed' || status === 'error'}
       >{status.replaceAll('_', ' ')}</span
     >
+    {#if error}<span class="tool-activity-summary-error">{error}</span>{/if}
     {#if command}<code class="tool-activity-command">{command}</code>{/if}
   </summary>
   {#if open}
@@ -50,6 +55,9 @@
         </div>
       {/if}
       {#if error}<p class="tool-activity-error">{error}</p>{/if}
+      {#if source}<p class="tool-activity-source">Reported by {source}</p>{/if}
+      {#if error && onfix}<button class="tool-activity-fix" onclick={onfix}>Fix with agent</button
+        >{/if}
       {#if children}{@render children()}{/if}
     </div>
   {/if}
@@ -81,6 +89,13 @@
   .tool-activity-status.failed,
   .tool-activity-error {
     color: var(--danger, #d66);
+  }
+  .tool-activity-summary-error {
+    flex-basis: 100%;
+    color: var(--danger, #d66);
+    max-height: 3em;
+    overflow: hidden;
+    overflow-wrap: anywhere;
   }
   .tool-activity-command {
     flex-basis: 100%;
@@ -120,5 +135,18 @@
   }
   .tool-activity-error {
     margin: 8px 0 0;
+  }
+  .tool-activity-source {
+    margin: 8px 0 0;
+    color: var(--text-muted, var(--sui-muted));
+  }
+  .tool-activity-fix {
+    margin-top: 8px;
+    padding: 5px 9px;
+    border: 1px solid var(--shell-divider, var(--border));
+    border-radius: 6px;
+    color: var(--text, inherit);
+    background: var(--surface, transparent);
+    cursor: pointer;
   }
 </style>
