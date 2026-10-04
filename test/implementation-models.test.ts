@@ -10,7 +10,7 @@ import {
   recordImplementationModel,
 } from '../src/lib/implementation-models.ts';
 
-void test('model history survives issue references and later Ship It runs', () => {
+void test('model history survives equivalent references and rejects a second issue', () => {
   const values = new Map<string, string>();
   Object.defineProperty(globalThis, 'localStorage', {
     configurable: true,
@@ -26,7 +26,10 @@ void test('model history survives issue references and later Ship It runs', () =
   assert.deepEqual(implementationModels(directory), ['model-a']);
   beginShipItRun(directory, '/ship-it https://github.com/example/repo/issues/1');
   assert.deepEqual(implementationModels(directory), ['model-a']);
-  beginShipItRun(directory, '/ship-it #2');
+  assert.throws(
+    () => beginShipItRun(directory, '/ship-it #2'),
+    /This worktree tracks #1\. Start #2 in a new worktree/,
+  );
   assert.deepEqual(implementationModels(directory), ['model-a']);
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-b']));
   beginShipItRun(directory, '/ship-it');

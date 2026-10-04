@@ -56,7 +56,11 @@ export function beginShipItRun(directory: string, prompt: string): void {
     /^\/ship-it\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
       firstLine,
     )?.[1];
-  const identity = issue ? `#${issue.match(/\d+$/)![0]}` : crypto.randomUUID();
+  if (!issue) return;
+  const identity = `#${issue.match(/\d+$/)![0]}`;
+  const previous = getSetting(runKey(directory));
+  if (previous && previous !== identity)
+    throw new Error(`This worktree tracks ${previous}. Start ${identity} in a new worktree.`);
   setSetting(runKey(directory), identity);
 }
 
