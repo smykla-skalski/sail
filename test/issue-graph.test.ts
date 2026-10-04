@@ -48,3 +48,14 @@ await test('existing blockers outside the umbrella remain valid', () => {
     /missing issue/,
   );
 });
+
+await test('numeric aliases cannot hide a cycle', () => {
+  const cyclic = {
+    ...graph,
+    issues: [
+      { ...graph.issues[0], dependsOn: ['b'] },
+      { ...graph.issues[1], dependsOn: ['3'] },
+    ],
+  };
+  assert.match(graphErrors(cyclic).join(' '), /cycle/);
+});

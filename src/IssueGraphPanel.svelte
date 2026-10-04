@@ -28,7 +28,7 @@
     if (key !== source) {
       source = key;
       try {
-        const saved: unknown = JSON.parse(getSetting(`sail-issue-graph:${key}`) ?? 'null');
+        const saved: unknown = JSON.parse(getSetting(`sai-issue-graph:${key}`) ?? 'null');
         graph = isIssueGraphDraft(saved) ? saved : splitPlan(plan);
       } catch {
         graph = splitPlan(plan);
@@ -41,7 +41,7 @@
   });
 
   $effect(() => {
-    if (source && graph.source) setSetting(`sail-issue-graph:${source}`, JSON.stringify(graph));
+    if (source && graph.source) setSetting(`sai-issue-graph:${source}`, JSON.stringify(graph));
   });
 
   function parseNumber(value: string): number | undefined {
@@ -110,6 +110,7 @@
       approved = false;
       graph = {
         ...graph,
+        replaceExisting: true,
         umbrellaNumber: result.umbrella?.number,
         issues: result.issues.map((issue) => ({
           id: issue.id,
@@ -153,15 +154,6 @@
     <label
       >Umbrella scope <textarea aria-label="Umbrella scope" bind:value={graph.body}
       ></textarea></label
-    >
-    <label
-      >Reuse umbrella # <input
-        aria-label="Reuse umbrella number"
-        type="number"
-        min="1"
-        value={graph.umbrellaNumber ?? ''}
-        oninput={(event) => (graph.umbrellaNumber = parseNumber(event.currentTarget.value))}
-      /></label
     >
   {/if}
   {#each graph.issues as issue, index (issue.id)}

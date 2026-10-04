@@ -58,7 +58,7 @@ struct IssueDraft {
     depends_on: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IssueGraphDraft {
     umbrella_number: Option<u64>,
@@ -220,9 +220,15 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
         .iter()
         .map(|issue| (issue.id.as_str(), issue))
         .collect();
+    let by_number: HashMap<u64, &str> = graph
+        .issues
+        .iter()
+        .filter_map(|issue| issue.number.map(|number| (number, issue.id.as_str())))
+        .collect();
     fn visit<'a>(
         id: &'a str,
         by_id: &HashMap<&'a str, &'a IssueDraft>,
+        by_number: &HashMap<u64, &'a str>,
         visiting: &mut HashSet<&'a str>,
         visited: &mut HashSet<&'a str>,
     ) -> Result<(), String> {
@@ -237,13 +243,13 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
             .ok_or_else(|| format!("Missing issue {id}."))?;
         for dependency in &issue.depends_on {
             if by_id.contains_key(dependency.as_str()) {
-                visit(dependency, by_id, visiting, visited)?;
-            } else if dependency
-                .parse::<u64>()
-                .ok()
-                .filter(|number| *number > 0)
-                .is_none()
+                visit(dependency, by_id, by_number, visiting, visited)?;
+            } else if let Some(number) = dependency.parse::<u64>().ok().filter(|number| *number > 0)
             {
+                if let Some(local) = by_number.get(&number) {
+                    visit(local, by_id, by_number, visiting, visited)?;
+                }
+            } else {
                 return Err(format!("Missing dependency {dependency}."));
             }
         }
@@ -254,7 +260,7 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
     for issue in &graph.issues {
-        visit(&issue.id, &by_id, &mut visiting, &mut visited)?;
+        visit(&issue.id, &by_id, &by_number, &mut visiting, &mut visited)?;
     }
     Ok(())
 }
@@ -420,6 +426,13 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
             existing.insert(draft.id.clone(), value);
         }
     }
+    let mut resolved_graph = graph.clone();
+    for draft in &mut resolved_graph.issues {
+        if let Some(value) = existing.get(&draft.id) {
+            draft.number = value["number"].as_u64();
+        }
+    }
+    validate_graph(&resolved_graph)?;
     let mut external = HashMap::new();
     for draft in &graph.issues {
         for dependency in &draft.depends_on {
@@ -441,7 +454,7 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
         }
     }
     let mut umbrella = umbrella;
-    if graph.issues.len() > 1 {
+    if graph.issues.len() > 1 || umbrella.is_some() {
         umbrella = Some(save_issue(
             &repository,
             &target,
@@ -1266,6 +1279,10 @@ mod tests {
         };
         assert!(validate_graph(&graph).is_ok());
         graph.issues[0].depends_on.push("b".into());
+        assert!(validate_graph(&graph).unwrap_err().contains("cycle"));
+        graph.issues[0].depends_on.clear();
+        graph.issues[1].depends_on = vec!["3".into()];
+        graph.issues[0].depends_on = vec!["b".into()];
         assert!(validate_graph(&graph).unwrap_err().contains("cycle"));
         graph.issues[0].depends_on.clear();
         graph.issues[1].number = Some(3);

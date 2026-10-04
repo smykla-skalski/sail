@@ -96,6 +96,9 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const byId = new Map(graph.issues.map((issue) => [issue.id, issue]));
+  const byNumber = new Map(
+    graph.issues.filter((issue) => issue.number).map((issue) => [String(issue.number), issue.id]),
+  );
   const visit = (id: string): void => {
     if (visiting.has(id)) {
       errors.push(`Dependency cycle includes ${id}.`);
@@ -104,9 +107,10 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
     if (visited.has(id)) return;
     visiting.add(id);
     for (const dependency of byId.get(id)?.dependsOn ?? []) {
-      if (!byId.has(dependency) && !/^[1-9]\d*$/.test(dependency))
+      const local = byId.has(dependency) ? dependency : byNumber.get(dependency);
+      if (local) visit(local);
+      else if (!/^[1-9]\d*$/.test(dependency))
         errors.push(`${id} depends on missing issue ${dependency}.`);
-      else if (byId.has(dependency)) visit(dependency);
     }
     visiting.delete(id);
     visited.add(id);
