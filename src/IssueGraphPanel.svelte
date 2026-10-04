@@ -281,7 +281,7 @@
             >Umbrella #{published.umbrella.number}</a
           >
         </li>{/if}
-      {#each published.issues as issue (issue.number)}<li>
+      {#each published.issues as issue (issue.url)}<li>
           <a href={issue.url} target="_blank" rel="noreferrer">#{issue.number} {issue.title}</a> · {issue.state}
         </li>{/each}
     </ul>
