@@ -76,6 +76,8 @@ describe('ACP agent threads', () => {
       expect.stringContaining('Implement and ship a GitHub issue'),
     );
     await expect($('.skill-menu')).toHaveText(expect.stringContaining('/ship-it'));
+    await expect($$('.skill-menu button[role="option"]')).toBeElementsArrayOfSize(15);
+    await expect($('.skill-menu')).toHaveText(expect.stringContaining('/fixture-9'));
     await $(
       "//div[contains(@class,'skill-menu')]//button[strong[normalize-space()='/review']]",
     ).click();
