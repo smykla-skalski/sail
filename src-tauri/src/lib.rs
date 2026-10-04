@@ -1300,19 +1300,51 @@ async fn run_shipping_setup(path: String) -> Result<(), String> {
             .setup;
         let shell = if cfg!(windows) { "cmd" } else { "sh" };
         let flag = if cfg!(windows) { "/C" } else { "-c" };
-        let output = Command::new(shell)
-            .args([flag, &command])
-            .current_dir(path)
-            .output()
-            .map_err(|error| format!("Cannot start worktree setup: {error}"))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "Worktree setup failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
-        }
+        let log_path =
+            std::env::temp_dir().join(format!("sail-shipping-setup-{}.log", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let log = std::fs::File::create(&log_path)
+                .map_err(|error| format!("Cannot capture worktree setup: {error}"))?;
+            let mut process = Command::new(shell);
+            process.args([flag, &command]).current_dir(path);
+            #[cfg(unix)]
+            process.process_group(0);
+            let mut child = process
+                .stdout(Stdio::from(log.try_clone().map_err(|error| {
+                    format!("Cannot capture worktree setup: {error}")
+                })?))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .map_err(|error| format!("Cannot start worktree setup: {error}"))?;
+            let started = Instant::now();
+            loop {
+                let status = match child.try_wait() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        stop_child(&mut child);
+                        return Err(format!("Cannot inspect worktree setup: {error}"));
+                    }
+                };
+                if let Some(status) = status {
+                    if status.success() {
+                        return Ok(());
+                    }
+                    let output = std::fs::read(&log_path).unwrap_or_default();
+                    return Err(format!(
+                        "Worktree setup failed: {}",
+                        String::from_utf8_lossy(&output[output.len().saturating_sub(8192)..])
+                            .trim()
+                    ));
+                }
+                if started.elapsed() >= Duration::from_secs(600) {
+                    stop_child(&mut child);
+                    return Err("Worktree setup timed out after 10 minutes.".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })();
+        let _ = std::fs::remove_file(log_path);
+        result
     })
     .await
     .map_err(|error| error.to_string())?

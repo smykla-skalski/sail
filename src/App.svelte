@@ -229,6 +229,7 @@
   );
   let shipRuns = $state<ShipRun[]>(loadShipRuns());
   let shippingBusy = false;
+  const activeShipLaunches = new SvelteSet<string>();
   let acpRecoveryReady = false;
   let worktreeCreations = $state<WorktreeCreation[]>([]);
   let worktreeDeletions = $state<Record<string, string>>({});
@@ -1777,6 +1778,15 @@
     }
   }
 
+  function scheduleShipLaunch(run: ShipRun, issue: ShipIssue): void {
+    const key = `${run.id}:${issue.id}`;
+    if (activeShipLaunches.has(key)) return;
+    activeShipLaunches.add(key);
+    void launchShipIssue(run, issue)
+      .catch((cause) => (error = describe(cause)))
+      .finally(() => activeShipLaunches.delete(key));
+  }
+
   async function refreshShippingDependency(run: ShipRun, dependency: string): Promise<void> {
     try {
       const closed = await invoke<boolean>('shipping_dependency_closed', {
@@ -1823,6 +1833,7 @@
       return;
     }
     if (issue.state === 'pending') return;
+    if (issue.state === 'starting' && activeShipLaunches.has(`${run.id}:${issue.id}`)) return;
     if (run.provider === 'opencode' && !client && ['starting', 'working'].includes(issue.state))
       return;
     const pr = await invoke<{
@@ -1849,8 +1860,16 @@
       });
       return;
     }
-    if (issue.state === 'failed') return;
     const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+    if (issue.state === 'failed') {
+      if (
+        issue.error === 'Worker finished without a pull request. Inspect its thread.' &&
+        receipt?.state === 'completed' &&
+        pr?.url
+      )
+        await updateShipIssue(run, issue, { state: 'awaiting_merge', error: null });
+      return;
+    }
     if (issue.state === 'starting') {
       if (!receipt || !receipt.targetId || (receipt.provider !== 'opencode' && !receipt.turnId)) {
         const existing = await invoke<CreatedWorktree | null>('find_shipping_worktree', {
@@ -1859,7 +1878,7 @@
         });
         if (existing && issue.path !== existing.path)
           await updateShipIssue(run, issue, { path: existing.path });
-        await launchShipIssue(run, issue);
+        scheduleShipLaunch(run, issue);
       } else {
         if (receipt.provider === 'opencode') await recoverShippingOpenCodePrompt(receipt);
         else await recoverShippingAcpPrompt(receipt);
@@ -1873,9 +1892,14 @@
         });
       else {
         const current = await currentSpawnReceipt(receipt);
-        if (current.state === 'completed')
-          await updateShipIssue(run, issue, { state: 'awaiting_merge' });
-        else if (['failed', 'interrupted', 'unavailable'].includes(current.state))
+        if (current.state === 'completed') {
+          if (pr?.url) await updateShipIssue(run, issue, { state: 'awaiting_merge', error: null });
+          else if (Date.now() - current.updated > 60_000)
+            await updateShipIssue(run, issue, {
+              state: 'failed',
+              error: 'Worker finished without a pull request. Inspect its thread.',
+            });
+        } else if (['failed', 'interrupted', 'unavailable'].includes(current.state))
           await updateShipIssue(run, issue, {
             state: 'failed',
             error: current.error ?? `Worker ${current.state}.`,
@@ -1899,7 +1923,7 @@
         .map((dependency) => refreshShippingDependency(run, dependency)),
     );
     await Promise.all(run.issues.map((issue) => refreshShippingIssue(run, issue)));
-    await Promise.all(readyShipIssues(run).map((issue) => launchShipIssue(run, issue)));
+    for (const issue of readyShipIssues(run)) scheduleShipLaunch(run, issue);
   }
 
   async function tickShippingRuns(): Promise<void> {
