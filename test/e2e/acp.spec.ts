@@ -487,7 +487,13 @@ describe('ACP agent threads', () => {
     await expect($$('.agent-tool-failure')).toBeElementsArrayOfSize(1);
     await expect($('.agent-tool-failure')).toHaveText(expect.stringContaining('GIT010'));
     await expect($('.agent-tool-failure')).toHaveText(expect.stringContaining('Add -s -S flags'));
+    await $('.agent-composer textarea').setValue('Keep this context.');
     await $('.agent-tool-failure button').click();
+    await $('.agent-tool-failure button').click();
+    const prepared = await $('.agent-composer textarea').getValue();
+    expect(prepared).toContain('Keep this context.');
+    expect(prepared.match(/Rule or hook: GIT010/g)).toHaveLength(1);
+    await $('.agent-actions button').click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('I will add the required flags.'),
     );

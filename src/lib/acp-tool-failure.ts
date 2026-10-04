@@ -15,6 +15,10 @@ function field(value: unknown, names: string[]): string | null {
   for (const name of names) {
     const found: unknown = Reflect.get(value, name);
     if (typeof found === 'string' && found.trim()) return found.trim();
+    if (found && typeof found === 'object') {
+      const nested: unknown = Reflect.get(found, 'name');
+      if (typeof nested === 'string' && nested.trim()) return nested.trim();
+    }
   }
   return null;
 }
@@ -32,14 +36,14 @@ export function acpToolFailure(tool: AgentTool): AcpToolFailure | null {
   const hookName = field(raw, ['hookName', 'hook_name', 'hook']);
   const ruleName = field(raw, ['ruleName', 'rule_name', 'rule']);
   const hookEvidence =
-    /(?:PreToolUse|PostToolUse):\w+ says:|(?:blocked|denied|rejected|failed) by (?:a )?hook|hook (?:blocked|denied|rejected|failed)/i.test(
+    /\b(?:PreToolUse|PostToolUse)\b|(?:blocked|denied|rejected|failed) by (?:a )?hook|hook (?:blocked|denied|rejected|failed)/i.test(
       output,
     );
-  const kind = rules.length || hookName || hookEvidence ? 'hook' : 'tool';
+  const kind = rules.length || hookName || ruleName || hookEvidence ? 'hook' : 'tool';
   const rule = rules.length ? rules.map((item) => item.code).join(', ') : (ruleName ?? hookName);
   const reason = rules.length
     ? rules.map((item) => item.reason).join('; ')
-    : (field(raw, ['reason', 'error', 'message']) ??
+    : (field(raw, ['reason', 'error', 'message', 'stderr', 'stdout']) ??
       output
         .split('\n')
         .map((line) => line.trim())

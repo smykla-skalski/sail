@@ -375,7 +375,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
-    if (text.startsWith('Fix the hook-blocked action below.')) {
+    if (text.includes('Fix the hook-blocked action below.')) {
       const reply = {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'I will add the required flags.' },

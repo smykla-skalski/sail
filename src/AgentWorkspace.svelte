@@ -9,7 +9,11 @@
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
   import { toolInput } from './lib/tool-display';
-  import { acpToolFailure, fixAcpToolFailurePrompt } from './lib/acp-tool-failure';
+  import {
+    acpToolFailure,
+    fixAcpToolFailurePrompt,
+    type AcpToolFailure,
+  } from './lib/acp-tool-failure';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import SkillMenu from './SkillMenu.svelte';
@@ -282,6 +286,7 @@
     if (spawnRevision && autoFollow) void follow();
   });
   let prompt: HTMLTextAreaElement;
+  let preparedFailureId: string | null = null;
   const name = $derived(agentName);
   const isBusy = $derived(busy || running || historyLoading);
 
@@ -368,6 +373,14 @@
 
   function describe(cause: unknown): string {
     return cause instanceof Error ? cause.message : String(cause);
+  }
+
+  function prepareFailure(tool: AgentTool, failure: AcpToolFailure) {
+    if (preparedFailureId !== tool.id || !draft.trim()) {
+      draft = [draft.trim(), fixAcpToolFailurePrompt(failure)].filter(Boolean).join('\n\n');
+      preparedFailureId = tool.id;
+    }
+    void tick().then(() => prompt.focus());
   }
 
   function flushUpdates() {
@@ -1337,11 +1350,8 @@
               <summary>Failure output</summary>
               <pre>{failure.output}</pre>
             </details>{/if}
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={!ready}
-            onclick={() => void send(fixAcpToolFailurePrompt(failure)).catch((cause) => (error = describe(cause)))}>Fix with agent</Button
+          <Button size="sm" variant="secondary" onclick={() => prepareFailure(tool, failure)}
+            >Fix with agent</Button
           >
         </div>
       {/if}

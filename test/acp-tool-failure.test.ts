@@ -39,6 +39,12 @@ void test('structured hook metadata works without Klaudiush formatting', () => {
   assert.equal(failure?.rule, 'secret-scan');
   assert.equal(failure?.reason, 'Secret found');
   assert.match(failure?.output ?? '', /Blocked/);
+  const namedRule = acpToolFailure(
+    tool({ output: { ruleName: 'GIT020', stderr: 'Branch name rejected' } }),
+  );
+  assert.equal(namedRule?.kind, 'hook');
+  assert.equal(namedRule?.rule, 'GIT020');
+  assert.equal(namedRule?.reason, 'Branch name rejected');
 });
 
 void test('ordinary tool errors stay labeled as tool failures', () => {
@@ -46,6 +52,10 @@ void test('ordinary tool errors stay labeled as tool failures', () => {
   assert.equal(failure?.kind, 'tool');
   assert.equal(failure?.rule, null);
   assert.equal(failure?.reason, 'File not found');
+  assert.equal(
+    acpToolFailure(tool({ output: { stderr: 'Command exited 7' } }))?.reason,
+    'Command exited 7',
+  );
   assert.equal(
     acpToolFailure(tool({ status: 'completed', content: 'hook blocked example' })),
     null,
