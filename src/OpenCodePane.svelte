@@ -30,6 +30,7 @@
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import { mergeMessages, nearBottom } from './lib/timeline';
   import {
+    appendToolFailureDraft,
     openCodeErrorDetails,
     reportedHookIdentity,
     toolFailurePrompt,
@@ -125,7 +126,7 @@
 
   function fixToolFailure(name: string, input: unknown, reason: string, output: string) {
     const request = toolFailurePrompt(name, input, reason, output);
-    if (!draft.includes(request)) draft = [draft.trim(), request].filter(Boolean).join('\n\n');
+    draft = appendToolFailureDraft(draft, request);
     void tick().then(() => prompt.focus());
   }
   let files = $state<string[]>([]);

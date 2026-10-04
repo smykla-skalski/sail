@@ -27,6 +27,7 @@
   import { matchingSkills, promptSkill, type SkillChoice } from './lib/skills';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import {
+    appendToolFailureDraft,
     openCodeErrorDetails,
     reportedHookIdentity,
     toolFailurePrompt,
@@ -6329,7 +6330,7 @@
 
   function fixOpenCodeToolFailure(name: string, input: unknown, reason: string, output: string) {
     const request = toolFailurePrompt(name, input, reason, output);
-    if (!draft.includes(request)) draft = [draft.trim(), request].filter(Boolean).join('\n\n');
+    draft = appendToolFailureDraft(draft, request);
     void tick().then(() => mainPrompt?.focus());
   }
 

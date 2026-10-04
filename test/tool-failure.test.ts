@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  appendToolFailureDraft,
   openCodeErrorDetails,
   reportedHookIdentity,
   toolFailurePrompt,
@@ -16,6 +17,13 @@ void test('failure follow-up includes the action, reason, and output', () => {
     ),
     'Fix the failed bash action. Inspect the cause, make the needed change, and verify it.\n\nCommand:\nnpm test\n\nInput:\n{\n  "command": "npm test",\n  "workdir": "/repo/pkg"\n}\n\nError:\nProcess exited 1\n\nOutput:\nAssertion failed',
   );
+});
+
+void test('failure follow-up preserves the draft without duplicating the request', () => {
+  const request = 'Fix failed action';
+  const result = appendToolFailureDraft('Keep this', request);
+  assert.equal(result, 'Keep this\n\nFix failed action');
+  assert.equal(appendToolFailureDraft(result, request), result);
 });
 
 void test('structured OpenCode error details include response body and a fallback reason', () => {
