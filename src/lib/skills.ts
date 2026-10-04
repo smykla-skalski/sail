@@ -4,6 +4,12 @@ export interface SkillChoice {
   id?: string;
   instructions?: string;
 }
+import { getSetting } from './settings.ts';
+import {
+  parseValidationSettings,
+  validationInstructions,
+  validationSettingsKey,
+} from './cross-validation.ts';
 
 export const sailGateRules: Record<string, string> = {
   'ship-it':
@@ -25,11 +31,19 @@ export function mergeSkills(installed: SkillChoice[], bundled: SkillChoice[]): S
   ];
 }
 
-export function resolveSkillPrompt(skills: SkillChoice[], text: string): string {
+export function resolveSkillPrompt(
+  skills: SkillChoice[],
+  text: string,
+  currentModel?: string,
+): string {
   const skill = promptSkill(skills, text);
   if (!skill) return text;
   const rule = sailGateRules[skill.name.toLowerCase()];
-  const gate = rule ? `\n\n${rule} ${failedGateRule}` : '';
+  const policy =
+    rule && typeof localStorage !== 'undefined'
+      ? `\n\n${validationInstructions(parseValidationSettings(getSetting(validationSettingsKey)), currentModel)}`
+      : '';
+  const gate = rule ? `\n\n${rule} ${failedGateRule}${policy}` : '';
   return skill.instructions
     ? `${text}${gate}\n\nFollow this bundled Sail skill:\n\n${skill.instructions}`
     : `${text}${gate}`;

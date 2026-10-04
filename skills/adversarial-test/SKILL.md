@@ -12,6 +12,8 @@ metadata:
 
 # Adversarial Test
 
+Apply the Sail cross-validation policy included with the prompt. Select only a configured, available agent/model pair, prefer a model different from every implementation model, and honor strict different-model routing. Set and verify the actual provider/model for the fresh Test Adversary session and include them in the verdict. Pause with the reason when no eligible choice exists or model selection cannot be verified. Never substitute outside the selected pool.
+
 ## Sail execution rule
 
 Run the Test Adversary in a fresh subagent session. If it cannot launch, stop and report `Test Verdict: BLOCKED` with the reason. Never run the pass inline.

@@ -899,7 +899,7 @@
           thread: `acp:${turnAgent}:${id}`,
         });
       }
-      const skillText = resolveSkillPrompt(skills, text);
+      const skillText = resolveSkillPrompt(skills, text, modelOption?.currentValue || undefined);
       const promptText =
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
@@ -1096,7 +1096,10 @@
       .steer(
         turnAgent,
         sessionId,
-        withAttachedFiles(resolveSkillPrompt(skills, next.text), next.attachments),
+        withAttachedFiles(
+          resolveSkillPrompt(skills, next.text, modelOption?.currentValue || undefined),
+          next.attachments,
+        ),
         promptImagePaths(next.images, next.attachments),
       )
       .catch(() => ({ outcome: 'failed' as const }));

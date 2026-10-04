@@ -39,6 +39,7 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
+  import { parseValidationSettings, validationSettingsKey } from './lib/cross-validation';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import {
     prepareToolFailureDraft,
@@ -447,6 +448,7 @@
   );
   let attentionRevision = 0;
   let notificationsEnabled = $state(getSetting('sai-notifications-enabled') !== 'false');
+  let crossValidation = $state(parseValidationSettings(getSetting(validationSettingsKey)));
   let notificationSound = $state(getSetting('sai-notification-sound') !== 'false');
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
   let agentTerminalsEnabled = $state(getSetting('sai-agent-terminals-enabled') === 'true');
@@ -1152,6 +1154,7 @@
       busy: connecting || running || sending,
       agents: agentAvailability,
       agentsError: agentDetectionError,
+      crossValidation,
       notificationsEnabled,
       notificationSound,
       personalPostTurnChecks,
@@ -1338,7 +1341,10 @@
           agentMessagesEnabled = action.value;
           setSetting('sai-agent-messages-enabled', String(action.value));
         } else if (action.type === 'detect-agents') void detectAgents();
-        else if (action.type === 'restart-setup') void restartSetup();
+        else if (action.type === 'cross-validation') {
+          crossValidation = action.value;
+          setSetting(validationSettingsKey, JSON.stringify(action.value));
+        } else if (action.type === 'restart-setup') void restartSetup();
         void sendSettingsState();
       }).then((unlisten) => (stopSettingsAction = unlisten));
     }
@@ -6723,7 +6729,11 @@
         await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
         return source.session.prompt({
           sessionID: id,
-          text: resolveSkillPrompt(skills, text),
+          text: resolveSkillPrompt(
+            skills,
+            text,
+            chosenModel ? `${chosenModel.providerID}:${chosenModel.id}` : undefined,
+          ),
           skills: promptSkill(skills, text)?.id
             ? [{ id: promptSkill(skills, text)!.id! }]
             : undefined,

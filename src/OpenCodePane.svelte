@@ -480,7 +480,11 @@
         await invoke('record_turn_snapshot', { path: directory, thread: `opencode:${id}` });
         return source.session.prompt({
           sessionID: id,
-          text: resolveSkillPrompt(skills, text),
+          text: resolveSkillPrompt(
+            skills,
+            text,
+            chosenModel ? `${chosenModel.providerID}:${chosenModel.id}` : undefined,
+          ),
           skills: promptSkill(skills, text)?.id
             ? [{ id: promptSkill(skills, text)!.id! }]
             : undefined,

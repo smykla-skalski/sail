@@ -14,6 +14,8 @@ metadata:
 
 ## Sail execution rule
 
+Apply the Sail cross-validation policy included with the prompt to both passes. Select only a configured, available agent/model pair, prefer a model different from every implementation model, and honor strict different-model routing. Set and verify the actual provider/model for each fresh session and include them in the verdict. Pause with the reason when no eligible choice exists or model selection cannot be verified. Never substitute outside the selected pool.
+
 Use fresh subagent sessions for both passes, even when the first pass reports no findings. If either session cannot launch, stop and report `Review Verdict: BLOCKED` with the failed pass and reason. Never run a pass inline.
 
 Find the bug, then try to prove the bug report wrong. It answers one question - **is this change correct?** - and answers it hard. It does not evaluate architecture, conventions, dead code, or taste; that is `/staff-code-review`.
