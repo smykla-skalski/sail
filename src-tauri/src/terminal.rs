@@ -423,7 +423,7 @@ pub async fn terminal_inspect_wait(
     .map_err(|error| error.to_string())?
 }
 
-fn shell() -> PathBuf {
+pub(crate) fn shell() -> PathBuf {
     #[cfg(windows)]
     return std::env::var_os("COMSPEC")
         .map(PathBuf::from)

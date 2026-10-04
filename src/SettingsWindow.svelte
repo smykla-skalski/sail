@@ -16,6 +16,8 @@
 
   let snapshot = $state<SettingsSnapshot | null>(null);
   let binaryPath = $state('');
+  let personalChecks = $state('');
+  let personalChecksDirty = $state(false);
   let binaryDirty = $state(false);
   let selectedSection = $state<'general' | 'opencode' | 'agents'>('general');
   let themePickerOpen = $state(false);
@@ -69,6 +71,7 @@
           snapshot = event.payload;
           document.documentElement.dataset.suiTheme = snapshot.theme;
           if (!binaryDirty) binaryPath = snapshot.binaryPath;
+          if (!personalChecksDirty) personalChecks = snapshot.personalPostTurnChecks.join('\n');
         });
         if (!active) stop();
         else {
@@ -258,6 +261,32 @@
           />
           Message project threads
         </label>
+      </section>
+      <section class="settings-card">
+        <h2>Post-turn checks</h2>
+        <p>
+          One shell command per line. Runs in the active worktree after each completed agent turn.
+        </p>
+        <label for="personal-post-turn-checks">Personal commands</label>
+        <textarea
+          id="personal-post-turn-checks"
+          rows="5"
+          bind:value={personalChecks}
+          oninput={() => (personalChecksDirty = true)}
+          placeholder="mise run test"></textarea>
+        <Button
+          size="sm"
+          onclick={() => {
+            send({
+              type: 'personal-post-turn-checks',
+              value: personalChecks
+                .split('\n')
+                .map((item) => item.trim())
+                .filter(Boolean),
+            });
+            personalChecksDirty = false;
+          }}>Save checks</Button
+        >
       </section>
       <section class="settings-card">
         <h2>Notifications</h2>

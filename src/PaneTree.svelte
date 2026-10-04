@@ -22,6 +22,7 @@
   import { coordinationKey, type CoordinationMessage } from './lib/coordination';
   import { spawnReceiptsForSource, type SpawnReceipt } from './lib/agent-results';
   import type { ThreadStatus } from './lib/attention';
+  import type { PostTurnCheck } from './lib/post-turn-checks';
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import { threadKey } from './lib/recent-threads';
   import { getPlan, getHistory, type PlanSnapshot, type HistoryEntry } from './lib/plan';
@@ -45,6 +46,8 @@
     setup: SetupReport | null;
     coordinationMessages: CoordinationMessage[];
     spawnReceipts: SpawnReceipt[];
+    postTurnChecks: PostTurnCheck[];
+    onretrycheck: (check: PostTurnCheck) => void;
     agentUsage: Record<string, AgentUsage>;
     agentRates: Record<string, RateWindow[]>;
     onentries: (
@@ -101,6 +104,8 @@
     setup,
     coordinationMessages,
     spawnReceipts,
+    postTurnChecks,
+    onretrycheck,
     agentUsage,
     agentRates,
     onentries,
@@ -335,6 +340,8 @@
     <PaneTree
       {coordinationMessages}
       {spawnReceipts}
+      {postTurnChecks}
+      {onretrycheck}
       {agentUsage}
       {agentRates}
       pane={pane.first}
@@ -413,6 +420,8 @@
     <PaneTree
       {coordinationMessages}
       {spawnReceipts}
+      {postTurnChecks}
+      {onretrycheck}
       {agentUsage}
       {agentRates}
       pane={pane.second}
@@ -580,6 +589,13 @@
                   message.target ===
                     coordinationKey(directory, `opencode:${pane.thread.sessionId}`),
               )}
+              postTurnChecks={postTurnChecks.filter(
+                (check) =>
+                  pane.thread &&
+                  check.directory === directory &&
+                  check.thread === `opencode:${pane.thread.sessionId}`,
+              )}
+              {onretrycheck}
               spawnReceipts={spawnReceiptsForSource(
                 spawnReceipts,
                 pane.thread ? `opencode:${pane.thread.sessionId}` : null,
@@ -690,6 +706,13 @@
                 pane.thread ? `acp:${pane.agent}:${pane.thread.sessionId}` : null,
                 directory,
               )}
+              postTurnChecks={postTurnChecks.filter(
+                (check) =>
+                  pane.thread &&
+                  check.directory === directory &&
+                  check.thread === `acp:${pane.agent}:${pane.thread.sessionId}`,
+              )}
+              {onretrycheck}
               running={running(pane.thread)}
               focused={focused === pane.id}
               focusPrompt={focusPromptPane === pane.id}

@@ -1015,7 +1015,8 @@ button:disabled {
   margin-bottom: 6px;
 }
 .settings-card input,
-.settings-card select {
+.settings-card select,
+.settings-card textarea {
   display: block;
   width: 100%;
   min-width: 0;
