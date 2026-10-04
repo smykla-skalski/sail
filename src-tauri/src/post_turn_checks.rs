@@ -388,12 +388,11 @@ fn execute_with_timeout(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{execute, execute_with_timeout};
     use std::time::{Duration, Instant};
 
-    #[cfg(unix)]
     #[test]
     fn commands_capture_success_and_failure() {
         let directory = std::env::temp_dir();
@@ -406,7 +405,6 @@ mod tests {
         assert_eq!(output, "failed");
     }
 
-    #[cfg(unix)]
     #[test]
     fn background_child_cannot_hold_check_open() {
         let directory = std::env::temp_dir();
