@@ -338,6 +338,8 @@
             · <a href={issue.pullRequest} target="_blank" rel="noreferrer">PR</a>{/if}
           {#if issue.error}
             · {issue.error}{/if}
+          {#if issue.archivePath}
+            · Ignored files saved at {issue.archivePath}{/if}
         </li>
       {/each}
     </ul>

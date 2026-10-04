@@ -1819,13 +1819,14 @@
         const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
         if (receipt && !receiptIsSettled((await currentSpawnReceipt(receipt)).state)) return;
         try {
-          await invoke('delete_worktree', {
+          const archivePath = await invoke<string | null>('delete_worktree', {
             repository: run.repository,
             worktree: issue.path,
             force: false,
+            archiveIgnored: true,
           });
           saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
-          await updateShipIssue(run, issue, { path: null, error: null });
+          await updateShipIssue(run, issue, { path: null, archivePath, error: null });
         } catch (cause) {
           await updateShipIssue(run, issue, { error: `Cleanup: ${describe(cause)}` });
         }

@@ -15,6 +15,7 @@ export interface ShipIssue {
   receiptId: string | null;
   threadId: string | null;
   pullRequest: string | null;
+  archivePath?: string | null;
   error: string | null;
 }
 
@@ -73,6 +74,7 @@ export function createShipRun(
       receiptId: null,
       threadId: null,
       pullRequest: null,
+      archivePath: null,
       error: null,
     })),
   };

@@ -1475,10 +1475,88 @@ async fn delete_worktree(
     repository: String,
     worktree: String,
     force: Option<bool>,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || remove_worktree(repository, worktree, force))
-        .await
-        .map_err(|error| error.to_string())?
+    archive_ignored: Option<bool>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if archive_ignored == Some(true) {
+            archive_ignored_and_remove(repository, worktree)
+        } else {
+            remove_worktree(repository, worktree, force)?;
+            Ok(None)
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn archive_ignored_and_remove(
+    repository: String,
+    worktree: String,
+) -> Result<Option<String>, String> {
+    const IGNORED: &str = "Worktree has ignored files. Move or remove them before deleting.";
+    match remove_worktree(repository.clone(), worktree.clone(), None) {
+        Ok(()) => return Ok(None),
+        Err(error) if error == IGNORED => {}
+        Err(error) => return Err(error),
+    }
+    let worktree = PathBuf::from(worktree);
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--ignored",
+            "--untracked-files=normal",
+            "-z",
+        ])
+        .output()
+        .map_err(|error| format!("Cannot inspect worktree files before cleanup: {error}"))?;
+    if !status.status.success() {
+        return Err("Cannot inspect worktree files before cleanup.".to_string());
+    }
+    let mut ignored = Vec::new();
+    for entry in status
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        if !entry.starts_with(b"!! ") {
+            return Err(
+                "Worktree has changes outside ignored files. Inspect them before cleanup."
+                    .to_string(),
+            );
+        }
+        let path = PathBuf::from(
+            String::from_utf8(entry[3..].to_vec())
+                .map_err(|_| "Cannot archive a non-UTF-8 ignored path.")?,
+        );
+        if !path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("Cannot archive an invalid ignored path.".to_string());
+        }
+        ignored.push(path);
+    }
+    if ignored.is_empty() {
+        return Err("Ignored worktree files changed during cleanup. Retry.".to_string());
+    }
+    let parent = worktree.parent().ok_or("Worktree parent is missing.")?;
+    let archive = parent.join(".sail-shipping-archive").join(format!(
+        "{}-{}",
+        worktree.file_name().unwrap_or_default().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    for relative in ignored {
+        let destination = archive.join(&relative);
+        std::fs::create_dir_all(destination.parent().ok_or("Invalid archive path.")?)
+            .map_err(|error| format!("Cannot prepare ignored file archive: {error}"))?;
+        std::fs::rename(worktree.join(relative), destination)
+            .map_err(|error| format!("Cannot archive ignored worktree files: {error}"))?;
+    }
+    remove_worktree(repository, worktree.to_string_lossy().into_owned(), None)?;
+    Ok(Some(archive.to_string_lossy().into_owned()))
 }
 
 fn remove_worktree(
@@ -1730,9 +1808,10 @@ mod tests {
     #[cfg(unix)]
     use super::working_tree_revision;
     use super::{
-        add_worktree, existing_shipping_worktree, git_change_action, git_patch,
-        normalize_picker_path, parse_registered_worktrees, registered_worktrees, remove_worktree,
-        repository_namespace, server_args, shipping_default_ref, version_number, working_tree_diff,
+        add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
+        git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
+        remove_worktree, repository_namespace, server_args, shipping_default_ref, version_number,
+        working_tree_diff,
     };
     use std::fs;
     #[cfg(unix)]
@@ -1958,8 +2037,34 @@ mod tests {
         let result = remove_worktree(repository_path.into(), created.path.clone(), None);
         assert!(result.unwrap_err().contains("ignored files"));
         assert!(ignored.exists());
-        remove_worktree(repository_path.into(), created.path.clone(), Some(true)).unwrap();
+        let untracked = Path::new(&created.path).join("notes.txt");
+        fs::write(&untracked, "keep").unwrap();
+        assert!(
+            archive_ignored_and_remove(repository_path.into(), created.path.clone())
+                .unwrap_err()
+                .contains("changes outside ignored")
+        );
+        assert!(ignored.exists());
+        fs::remove_file(untracked).unwrap();
+        let archive = archive_ignored_and_remove(repository_path.into(), created.path.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(Path::new(&archive).join("node_modules/package/file.js")).unwrap(),
+            "content"
+        );
         assert!(!Path::new(&created.path).exists());
+        let forced = add_worktree(
+            repository_path.into(),
+            "forced".into(),
+            Some(parent.to_string_lossy().into_owned()),
+            Some("HEAD".into()),
+        )
+        .unwrap();
+        fs::create_dir_all(Path::new(&forced.path).join("node_modules")).unwrap();
+        fs::write(Path::new(&forced.path).join("node_modules/file"), "content").unwrap();
+        remove_worktree(repository_path.into(), forced.path.clone(), Some(true)).unwrap();
+        assert!(!Path::new(&forced.path).exists());
         fs::remove_dir_all(root).unwrap();
     }
 
