@@ -13,7 +13,35 @@ function uncertainKey(directory: string): string {
   return `sai-implementation-uncertain:${directory}`;
 }
 
+function pendingKey(directory: string): string {
+  return `sai-implementation-pending:${directory}`;
+}
+
+type PendingTurn = { id: string; before: string; model?: string };
+
+function pendingTurns(directory: string): PendingTurn[] {
+  try {
+    const saved: unknown = JSON.parse(getSetting(pendingKey(directory)) ?? '[]');
+    return Array.isArray(saved)
+      ? saved.filter(
+          (turn): turn is PendingTurn =>
+            !!turn &&
+            typeof turn.id === 'string' &&
+            typeof turn.before === 'string' &&
+            (turn.model === undefined || typeof turn.model === 'string'),
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePendingTurns(directory: string, turns: PendingTurn[]): void {
+  setSetting(pendingKey(directory), JSON.stringify(turns));
+}
+
 export type ImplementationTurn = {
+  id: string;
   before: string;
   model: string | undefined;
   owner: string | undefined;
@@ -26,8 +54,15 @@ export async function beginImplementationTurn(
   model?: string,
   owner?: string,
 ): Promise<ImplementationTurn> {
+  await recoverImplementationModels(directory);
   const active = activeTurns.get(directory) ?? new Set<ImplementationTurn>();
-  const turn: ImplementationTurn = { before: '', model, owner, peers: new Set() };
+  const turn: ImplementationTurn = {
+    id: crypto.randomUUID(),
+    before: '',
+    model,
+    owner,
+    peers: new Set(),
+  };
   for (const other of active) {
     turn.peers.add(other);
     other.peers.add(turn);
@@ -36,6 +71,10 @@ export async function beginImplementationTurn(
   activeTurns.set(directory, active);
   try {
     turn.before = await invoke<string>('working_tree_revision', { path: directory });
+    savePendingTurns(directory, [
+      ...pendingTurns(directory),
+      { id: turn.id, before: turn.before, model },
+    ]);
     return turn;
   } catch (cause) {
     abandonImplementationTurn(directory, turn);
@@ -51,6 +90,25 @@ export function abandonImplementationTurn(directory: string, turn: Implementatio
 
 export function implementationAttributionUncertain(directory: string): boolean {
   return getSetting(uncertainKey(directory)) === '1';
+}
+
+export async function recoverImplementationModels(directory: string): Promise<void> {
+  const active = activeTurns.get(directory) ?? new Set();
+  const pending = pendingTurns(directory);
+  const interrupted = pending.filter((turn) => ![...active].some((item) => item.id === turn.id));
+  if (!interrupted.length) return;
+  const revision = await invoke<string>('working_tree_revision', { path: directory });
+  const models = new Set(implementationModels(directory));
+  for (const turn of interrupted) {
+    if (turn.before === revision) continue;
+    if (turn.model) models.add(turn.model);
+    else setSetting(uncertainKey(directory), '1');
+  }
+  setSetting(key(directory), JSON.stringify([...models]));
+  savePendingTurns(
+    directory,
+    pending.filter((turn) => !interrupted.includes(turn)),
+  );
 }
 
 export async function activeImplementationModels(
@@ -102,19 +160,30 @@ export async function recordImplementationModel(
   model: string | undefined,
   turn: ImplementationTurn,
 ): Promise<void> {
+  let completed = false;
   try {
     const after = await invoke<string>('working_tree_revision', { path: directory });
-    if (turn.before === after) return;
+    if (turn.before === after) {
+      completed = true;
+      return;
+    }
     turn.model = model ?? turn.model;
     const participants = [turn, ...turn.peers];
     if (participants.some((participant) => !participant.model)) {
       setSetting(uncertainKey(directory), '1');
+      completed = true;
       return;
     }
     const models = new Set(implementationModels(directory));
     for (const participant of participants) models.add(participant.model!);
     setSetting(key(directory), JSON.stringify([...models]));
+    completed = true;
   } finally {
+    if (completed)
+      savePendingTurns(
+        directory,
+        pendingTurns(directory).filter((pending) => pending.id !== turn.id),
+      );
     abandonImplementationTurn(directory, turn);
   }
 }

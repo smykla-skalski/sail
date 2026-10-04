@@ -48,6 +48,7 @@
     beginShipItRun,
     implementationAttributionUncertain,
     implementationModels,
+    recoverImplementationModels,
     recordImplementationModel,
   } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
@@ -2388,6 +2389,7 @@
       !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
     )
       throw new Error('List every implementation model.');
+    await recoverImplementationModels(request.directory);
     const activeModels = await activeImplementationModels(request.directory, sourceId);
     if (!activeModels)
       throw new Error('The active implementation model is unknown. Wait for the turn to finish.');

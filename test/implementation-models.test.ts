@@ -7,6 +7,7 @@ import {
   beginShipItRun,
   implementationAttributionUncertain,
   implementationModels,
+  recoverImplementationModels,
   recordImplementationModel,
 } from '../src/lib/implementation-models.ts';
 
@@ -145,4 +146,27 @@ void test('an edit by a turn with an unknown model blocks strict attribution', a
   revision = 'after';
   await recordImplementationModel(directory, undefined, turn);
   assert.equal(implementationAttributionUncertain(directory), true);
+});
+
+void test('an interrupted editing turn recovers its model from persisted state', async () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  let revision = 'before';
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => revision } },
+  });
+  const directory = '/test/interrupted-model';
+  const turn = await beginImplementationTurn(directory, 'provider:model-a', 'agent-a');
+  revision = 'after';
+  abandonImplementationTurn(directory, turn);
+  await recoverImplementationModels(directory);
+  assert.deepEqual(implementationModels(directory), ['provider:model-a']);
+  assert.deepEqual(JSON.parse(values.get(`sai-implementation-pending:${directory}`) ?? 'null'), []);
 });
