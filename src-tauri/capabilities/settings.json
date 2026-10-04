@@ -5,6 +5,8 @@
   "windows": ["settings"],
   "permissions": [
     "allow-diagnostic-event",
+    "allow-inspect-agent-hooks",
+    "allow-open-external-url",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:event:allow-emit-to",

@@ -72,6 +72,7 @@ mod dev_servers;
 mod diagnostics;
 mod github;
 mod post_turn_checks;
+mod hook_inspector;
 mod settings;
 mod terminal;
 mod worktree_config;
@@ -1466,6 +1467,7 @@ pub fn run() {
             post_turn_checks::cancel_post_turn_check,
             post_turn_checks::list_post_turn_checks,
             post_turn_checks::run_post_turn_check,
+            hook_inspector::inspect_agent_hooks,
             github::create_pull_request,
             github::list_open_issues,
             github::open_issue,
