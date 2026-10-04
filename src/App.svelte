@@ -1929,35 +1929,63 @@
             path: thread.directory,
             thread: target.id,
           });
+          const tracking = await beginImplementationTurn(thread.directory);
           updateAgentThreadStatus(thread, 'working');
           const turn = acp.prompt(thread.agent, thread.sessionId, text, crypto.randomUUID());
-          void turn.then(
-            () => updateAgentThreadStatus(thread, 'done'),
-            (cause) => {
-              updateAgentThreadStatus(thread, 'failed');
-              error = `Agent message turn failed: ${describe(cause)}`;
-            },
-          );
+          void turn
+            .then(
+              async () => {
+                await recordImplementationModel(thread.directory, undefined, tracking);
+                updateAgentThreadStatus(thread, 'done');
+                return undefined;
+              },
+              async (cause) => {
+                await recordImplementationModel(thread.directory, undefined, tracking);
+                updateAgentThreadStatus(thread, 'failed');
+                error = `Agent message turn failed: ${describe(cause)}`;
+                return undefined;
+              },
+            )
+            .catch((cause) => {
+              abandonImplementationTurn(thread.directory, tracking);
+              error = `Could not track agent message turn: ${describe(cause)}`;
+            });
           await awaitCoordinationStart(turn, async () => {
             const state = (await acp.activity())[thread.agent];
             return !!state?.active.includes(thread.sessionId);
           });
         } else {
           if (!client) throw new Error('OpenCode is unavailable for the receiving thread.');
-          await waitForOpenCodeCoordinationThread(target.id.slice('opencode:'.length));
+          const promptClient = client;
+          const sessionId = target.id.slice('opencode:'.length);
+          await waitForOpenCodeCoordinationThread(sessionId);
           if (disposed) return;
           await invoke('record_turn_snapshot', { path: target.directory, thread: target.id });
-          const turn = client.session.prompt({
-            sessionID: target.id.slice('opencode:'.length),
+          const session = await promptClient.session.get({ sessionID: sessionId });
+          const tracking = await beginImplementationTurn(
+            target.directory,
+            session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+          );
+          const turn = promptClient.session.prompt({
+            sessionID: sessionId,
             text,
           });
-          void turn.catch((cause) => {
-            error = `Agent message turn failed: ${describe(cause)}`;
-          });
+          void turn
+            .then(() => promptClient.session.wait({ sessionID: sessionId }))
+            .then(() =>
+              recordImplementationModel(
+                target.directory,
+                session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+                tracking,
+              ),
+            )
+            .catch((cause) => {
+              abandonImplementationTurn(target.directory, tracking);
+              error = `Agent message turn failed: ${describe(cause)}`;
+            });
           await awaitCoordinationStart(turn, async () => {
-            if (!client) return false;
-            const active = await client.session.active();
-            return active[target.id.slice('opencode:'.length)]?.type === 'running';
+            const active = await promptClient.session.active();
+            return active[sessionId]?.type === 'running';
           });
         }
         coordinationMessages = coordinationMessages.map((item) =>
