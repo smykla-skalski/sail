@@ -229,6 +229,7 @@
   );
   let shipRuns = $state<ShipRun[]>(loadShipRuns());
   let shippingBusy = false;
+  let acpRecoveryReady = false;
   let worktreeCreations = $state<WorktreeCreation[]>([]);
   let worktreeDeletions = $state<Record<string, string>>({});
   type WorktreeCreationRequest = {
@@ -1380,7 +1381,12 @@
           if (disposed) unlisten();
           else {
             unlistenAgentEvents = unlisten;
-            void recoverInterruptedAgentTurns().then(() => restoreAgentActivity());
+            void recoverInterruptedAgentTurns()
+              .then(() => restoreAgentActivity())
+              .finally(() => {
+                acpRecoveryReady = true;
+                void tickShippingRuns();
+              });
             scheduleInboxRefresh();
           }
           return undefined;
@@ -1856,6 +1862,7 @@
         await launchShipIssue(run, issue);
       } else {
         if (receipt.provider === 'opencode') await recoverShippingOpenCodePrompt(receipt);
+        else await recoverShippingAcpPrompt(receipt);
         await updateShipIssue(run, issue, { state: 'working', threadId: receipt.targetId });
       }
     } else if (issue.state === 'working') {
@@ -1896,7 +1903,7 @@
   }
 
   async function tickShippingRuns(): Promise<void> {
-    if (shippingBusy || disposed || !isTauri()) return;
+    if (shippingBusy || disposed || !isTauri() || !acpRecoveryReady) return;
     shippingBusy = true;
     try {
       await Promise.all(shipRuns.map((run) => refreshShippingRun(run)));
@@ -2059,6 +2066,70 @@
     }
   }
 
+  async function recoverShippingAcpPrompt(receipt: SpawnReceipt): Promise<void> {
+    if (!receipt.targetId || !receipt.targetDirectory || !receipt.turnId || !receipt.prompt) return;
+    const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
+    const [agentActivity, interrupted] = await Promise.all([
+      acp.activity(),
+      acp.interruptedTurns(),
+    ]);
+    const state = agentActivity[receipt.provider];
+    if (
+      state?.activeTurns[sessionId] === receipt.turnId ||
+      state?.finished[sessionId]?.turnId === receipt.turnId ||
+      interrupted.some(
+        (turn) =>
+          turn.agent === receipt.provider &&
+          turn.sessionId === sessionId &&
+          turn.turnId === receipt.turnId,
+      )
+    )
+      return;
+    activeSpawnRequests.add(receipt.receiptId);
+    try {
+      const info = await acp.connect(receipt.provider);
+      const capabilities = info.agentCapabilities;
+      const sessionCapabilities =
+        capabilities && typeof capabilities === 'object' && 'sessionCapabilities' in capabilities
+          ? capabilities.sessionCapabilities
+          : null;
+      const canResume =
+        sessionCapabilities &&
+        typeof sessionCapabilities === 'object' &&
+        'resume' in sessionCapabilities;
+      if (canResume) await acp.resume(receipt.provider, receipt.targetDirectory, sessionId);
+      else await acp.load(receipt.provider, receipt.targetDirectory, sessionId);
+      const turn = acp.prompt(receipt.provider, sessionId, receipt.prompt, receipt.turnId);
+      activeSpawnTargets.set(receipt.targetId, receipt.receiptId);
+      void turn.then(
+        (outcome) => {
+          const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
+          updateSpawnReceipt(receipt.receiptId, {
+            state:
+              outcome.stopReason === 'cancelled' || current?.state === 'interrupted'
+                ? 'interrupted'
+                : 'completed',
+            result: spawnOutput.get(receipt.receiptId) ?? current?.result ?? null,
+          });
+          spawnOutput.delete(receipt.receiptId);
+          if (activeSpawnTargets.get(receipt.targetId!) === receipt.receiptId)
+            activeSpawnTargets.delete(receipt.targetId!);
+          return undefined;
+        },
+        (cause) => {
+          updateSpawnReceipt(receipt.receiptId, { state: 'failed', error: describe(cause) });
+          return undefined;
+        },
+      );
+      await awaitCoordinationStart(turn, async () => {
+        const current = (await acp.activity())[receipt.provider];
+        return current?.activeTurns[sessionId] === receipt.turnId;
+      });
+    } finally {
+      activeSpawnRequests.delete(receipt.receiptId);
+    }
+  }
+
   async function reconcileOpenCodeSpawnReceipts() {
     await Promise.all(
       spawnReceipts
@@ -2072,6 +2143,12 @@
     agentActivity: Awaited<ReturnType<typeof acp.activity>>[AgentId] | null,
   ) {
     const state = acpReceiptState(receipt, agentActivity);
+    if (
+      receipt.requestId.startsWith('ship:') &&
+      receipt.state === 'starting' &&
+      state === 'unavailable'
+    )
+      return;
     if (state === 'working' || state === 'waiting') {
       updateSpawnReceipt(receipt.receiptId, { state });
       activeSpawnTargets.set(receipt.targetId!, receipt.receiptId);
