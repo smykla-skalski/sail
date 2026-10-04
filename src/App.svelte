@@ -1696,7 +1696,13 @@
     )
       throw new Error('An issue in this plan already has a shipping run.');
     shipRuns.push(run);
-    await saveShipRuns();
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      shipRuns = shipRuns.filter((item) => item.id !== run.id);
+      setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+      throw cause;
+    }
     void tickShippingRuns();
   }
 
@@ -1781,7 +1787,7 @@
           await invoke('delete_worktree', {
             repository: run.repository,
             worktree: issue.path,
-            force: true,
+            force: false,
           });
           saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
           await updateShipIssue(run, issue, { path: null, error: null });
