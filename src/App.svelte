@@ -5714,7 +5714,15 @@
           saveAgentThread(thread);
         }
         const recoveredThread = thread;
+        const alreadyActive = async () => {
+          const current = (await acp.activity())[turn.agent];
+          return current?.activeTurns[turn.sessionId] === turn.turnId;
+        };
         try {
+          if (await alreadyActive()) {
+            updateAgentThreadStatus(recoveredThread, 'working');
+            return;
+          }
           const info = await acp.connect(turn.agent);
           const capabilities = info.agentCapabilities;
           const sessionCapabilities =
@@ -5730,6 +5738,10 @@
           if (canResume) await acp.resume(turn.agent, turn.directory, turn.sessionId);
           else await acp.load(turn.agent, turn.directory, turn.sessionId);
           if (disposed) return;
+          if (await alreadyActive()) {
+            updateAgentThreadStatus(recoveredThread, 'working');
+            return;
+          }
           await invoke('record_turn_snapshot', {
             path: turn.directory,
             thread: `acp:${turn.agent}:${turn.sessionId}`,
@@ -5753,8 +5765,11 @@
                 );
             } catch (cause) {
               if (!disposed) {
-                updateAgentThreadStatus(recoveredThread, 'failed');
-                error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+                if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
+                else {
+                  updateAgentThreadStatus(recoveredThread, 'failed');
+                  error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+                }
               }
             }
           })();
@@ -5763,8 +5778,11 @@
             return !!state?.active.includes(turn.sessionId);
           });
         } catch (cause) {
-          updateAgentThreadStatus(recoveredThread, 'failed');
-          error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+          if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
+          else {
+            updateAgentThreadStatus(recoveredThread, 'failed');
+            error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+          }
         }
       }),
     );
