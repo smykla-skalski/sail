@@ -3,6 +3,7 @@
   import { Badge, Button } from '@smykla-skalski/sui';
   import { tick } from 'svelte';
   import Diagram from './Diagram.svelte';
+  import IssueGraphPanel from './IssueGraphPanel.svelte';
   import Markdown from './Markdown.svelte';
   import {
     answerQuestions,
@@ -614,6 +615,7 @@
         {/each}
       {/if}
 
+      <IssueGraphPanel {plan} {directory} />
       <div class="subheading">Steps <span>{plan.steps.length}</span></div>
       {#each plan.steps as step, index (step.id)}
         <section class="step-card">
