@@ -1212,7 +1212,7 @@ fn output_or_error(output: Output, action: &str) -> Result<String, String> {
     }
 }
 
-fn github_remote(url: &str) -> Option<String> {
+pub(crate) fn github_remote(url: &str) -> Option<String> {
     let path = url
         .strip_prefix("git@github.com:")
         .or_else(|| url.strip_prefix("ssh://git@github.com/"))
@@ -1259,7 +1259,7 @@ fn source_repository(worktree: &Path, remote: &str) -> Result<String, String> {
     github_remote(&remote_url).ok_or("Push remote must be a github.com repository.".to_string())
 }
 
-fn target_repository(worktree: &Path) -> Result<String, String> {
+pub(crate) fn target_repository(worktree: &Path) -> Result<String, String> {
     let repository = gh_command(
         worktree,
         &["repo", "view", "--json", "nameWithOwner,isFork,parent"],

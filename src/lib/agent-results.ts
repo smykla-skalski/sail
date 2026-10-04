@@ -76,6 +76,7 @@ export function loadSpawnReceipts(raw: string | null): SpawnReceipt[] {
 export function saveBoundedReceipt(
   receipts: SpawnReceipt[],
   receipt: SpawnReceipt,
+  protectedIds: ReadonlySet<string> = new Set(),
 ): SpawnReceipt[] {
   const bounded = {
     ...receipt,
@@ -83,9 +84,9 @@ export function saveBoundedReceipt(
     error: receipt.error?.slice(0, 2_000) ?? null,
     activity: receipt.activity?.slice(0, 200),
   };
-  return [bounded, ...receipts.filter((item) => item.receiptId !== receipt.receiptId)].slice(
-    0,
-    200,
+  let ordinary = 0;
+  return [bounded, ...receipts.filter((item) => item.receiptId !== receipt.receiptId)].filter(
+    (item) => protectedIds.has(item.receiptId) || ordinary++ < 200,
   );
 }
 

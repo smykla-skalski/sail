@@ -1940,7 +1940,14 @@
   }
 
   function saveSpawnReceipt(receipt: SpawnReceipt) {
-    spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt);
+    const protectedIds = new Set(
+      shipRuns.flatMap((run) =>
+        run.issues.flatMap((issue) =>
+          issue.receiptId && (issue.state !== 'merged' || issue.path) ? [issue.receiptId] : [],
+        ),
+      ),
+    );
+    spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
   }
 

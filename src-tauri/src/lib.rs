@@ -41,17 +41,36 @@ fn existing_shipping_worktree(
     }))
 }
 
-fn shipping_default_ref(repository: &Path) -> Result<String, String> {
-    let advertised = git_reference(repository, &["ls-remote", "--symref", "origin", "HEAD"])
-        .ok_or("Cannot read origin's default branch.")?;
+fn shipping_fetch_source(repository: &Path, target: &str) -> Result<(String, bool), String> {
+    let remotes = git_reference(repository, &["remote"]).ok_or("Cannot list Git remotes.")?;
+    for remote in remotes.lines() {
+        let Some(url) = git_reference(repository, &["remote", "get-url", remote]) else {
+            continue;
+        };
+        if github::github_remote(&url).is_some_and(|name| name.eq_ignore_ascii_case(target)) {
+            return Ok((remote.to_string(), true));
+        }
+    }
+    let origin = git_reference(repository, &["remote", "get-url", "origin"])
+        .ok_or("Cannot find origin remote.")?;
+    if origin.starts_with("git@") || origin.starts_with("ssh://") {
+        Ok((format!("git@github.com:{target}.git"), false))
+    } else {
+        Ok((format!("https://github.com/{target}.git"), false))
+    }
+}
+
+fn shipping_default_branch(repository: &Path, source: &str) -> Result<String, String> {
+    let advertised = git_reference(repository, &["ls-remote", "--symref", source, "HEAD"])
+        .ok_or("Cannot read issue repository's default branch.")?;
     let branch = advertised
         .lines()
         .find_map(|line| {
             line.strip_prefix("ref: refs/heads/")?
                 .strip_suffix("\tHEAD")
         })
-        .ok_or("Origin does not advertise a default branch.")?;
-    Ok(format!("refs/remotes/origin/{branch}"))
+        .ok_or("Issue repository does not advertise a default branch.")?;
+    Ok(branch.to_string())
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -1252,16 +1271,20 @@ async fn create_shipping_worktree(
         if let Some(existing) = existing_shipping_worktree(Path::new(&checked), &name)? {
             return Ok(existing);
         }
-        let default_ref = shipping_default_ref(Path::new(&checked))?;
-        let branch = default_ref
-            .strip_prefix("refs/remotes/origin/")
-            .ok_or("Invalid origin default branch.")?;
+        let target = github::target_repository(Path::new(&checked))?;
+        let (source, configured_remote) = shipping_fetch_source(Path::new(&checked), &target)?;
+        let branch = shipping_default_branch(Path::new(&checked), &source)?;
+        let default_ref = if configured_remote {
+            format!("refs/remotes/{source}/{branch}")
+        } else {
+            "refs/sail-shipping/default".to_string()
+        };
         let output = Command::new("git")
             .arg("-C")
             .arg(&checked)
             .args([
                 "fetch",
-                "origin",
+                &source,
                 &format!("+refs/heads/{branch}:{default_ref}"),
             ])
             .output()
@@ -1832,8 +1855,8 @@ mod tests {
     use super::{
         add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
         git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
-        remove_worktree, repository_namespace, server_args, shipping_default_ref, version_number,
-        working_tree_diff,
+        remove_worktree, repository_namespace, server_args, shipping_default_branch,
+        shipping_fetch_source, version_number, working_tree_diff,
     };
     use std::fs;
     #[cfg(unix)]
@@ -2014,8 +2037,24 @@ mod tests {
         git(repository_path, &["push", "-q", "origin", "develop"]);
         git(repository_path, &["checkout", "-qb", "feature"]);
         assert_eq!(
-            shipping_default_ref(&repository).unwrap(),
-            "refs/remotes/origin/develop"
+            shipping_default_branch(&repository, "origin").unwrap(),
+            "develop"
+        );
+        git(
+            repository_path,
+            &["remote", "set-url", "origin", "git@github.com:me/fork.git"],
+        );
+        git(
+            repository_path,
+            &["remote", "add", "upstream", "git@github.com:owner/repo.git"],
+        );
+        assert_eq!(
+            shipping_fetch_source(&repository, "owner/repo").unwrap(),
+            ("upstream".to_string(), true)
+        );
+        assert_eq!(
+            shipping_fetch_source(&repository, "other/repo").unwrap(),
+            ("git@github.com:other/repo.git".to_string(), false)
         );
         fs::remove_dir_all(root).unwrap();
     }
