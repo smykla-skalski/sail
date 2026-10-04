@@ -10,14 +10,16 @@ export interface AcpToolFailure {
   output: string;
 }
 
-function field(value: unknown, names: string[]): string | null {
+function field(value: unknown, names: string[], nestedNames = ['name']): string | null {
   if (!value || typeof value !== 'object') return null;
   for (const name of names) {
     const found: unknown = Reflect.get(value, name);
     if (typeof found === 'string' && found.trim()) return found.trim();
     if (found && typeof found === 'object') {
-      const nested: unknown = Reflect.get(found, 'name');
-      if (typeof nested === 'string' && nested.trim()) return nested.trim();
+      for (const nestedName of nestedNames) {
+        const nested: unknown = Reflect.get(found, nestedName);
+        if (typeof nested === 'string' && nested.trim()) return nested.trim();
+      }
     }
   }
   return null;
@@ -36,15 +38,21 @@ export function acpToolFailure(tool: AgentTool): AcpToolFailure | null {
   const hookName = field(raw, ['hookName', 'hook_name', 'hook']);
   const ruleName = field(raw, ['ruleName', 'rule_name', 'rule']);
   const hookEvidence =
-    /\b(?:PreToolUse|PostToolUse)\b|(?:blocked|denied|rejected|failed) by (?:a )?hook|hook (?:blocked|denied|rejected|failed)/i.test(
+    /(?:PreToolUse|PostToolUse):\w+ says:|(?:blocked|denied|rejected|failed) by (?:a )?hook|hook (?:blocked|denied|rejected|failed)/i.test(
       output,
     );
   const kind = rules.length || hookName || ruleName || hookEvidence ? 'hook' : 'tool';
   const rule = rules.length ? rules.map((item) => item.code).join(', ') : (ruleName ?? hookName);
   const reason = rules.length
     ? rules.map((item) => item.reason).join('; ')
-    : (field(raw, ['reason', 'error', 'message', 'stderr', 'stdout']) ??
-      output
+    : (field(
+        raw,
+        ['reason', 'error', 'message', 'stderr', 'output', 'stdout'],
+        ['reason', 'message', 'name'],
+      ) ??
+      [tool.content, typeof raw === 'string' ? raw : '']
+        .filter(Boolean)
+        .join('\n')
         .split('\n')
         .map((line) => line.trim())
         .find(Boolean) ??
@@ -66,4 +74,18 @@ export function fixAcpToolFailurePrompt(failure: AcpToolFailure): string {
     `Reason: ${failure.reason}`,
     ...(failure.output ? [`Output:\n${failure.output}`] : []),
   ].join('\n\n');
+}
+
+export function prepareAcpFailureDraft(
+  draft: string,
+  prepared: Map<string, string>,
+  toolId: string,
+  failure: AcpToolFailure,
+): string {
+  const prompt = fixAcpToolFailurePrompt(failure);
+  const previous = prepared.get(toolId);
+  prepared.set(toolId, prompt);
+  if (draft.includes(prompt)) return draft;
+  if (previous && draft.includes(previous)) return draft.replace(previous, prompt);
+  return draft.trim() ? `${draft}\n\n${prompt}` : prompt;
 }

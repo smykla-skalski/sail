@@ -11,7 +11,7 @@
   import { toolInput } from './lib/tool-display';
   import {
     acpToolFailure,
-    fixAcpToolFailurePrompt,
+    prepareAcpFailureDraft,
     type AcpToolFailure,
   } from './lib/acp-tool-failure';
   import HarnessIcon from './HarnessIcon.svelte';
@@ -286,7 +286,7 @@
     if (spawnRevision && autoFollow) void follow();
   });
   let prompt: HTMLTextAreaElement;
-  let preparedFailureId: string | null = null;
+  const preparedFailures = new Map<string, string>();
   const name = $derived(agentName);
   const isBusy = $derived(busy || running || historyLoading);
 
@@ -376,10 +376,12 @@
   }
 
   function prepareFailure(tool: AgentTool, failure: AcpToolFailure) {
-    if (preparedFailureId !== tool.id || !draft.trim()) {
-      draft = [draft.trim(), fixAcpToolFailurePrompt(failure)].filter(Boolean).join('\n\n');
-      preparedFailureId = tool.id;
-    }
+    draft = prepareAcpFailureDraft(
+      draft,
+      preparedFailures,
+      `${activeSessionId}:${tool.id}`,
+      failure,
+    );
     void tick().then(() => prompt.focus());
   }
 
