@@ -66,6 +66,7 @@ export function setSetting(key: string, value: string): void {
 }
 
 export async function setSettingDurable(key: string, value: string): Promise<void> {
+  if (isTauri() && !ready) throw new Error('Sail settings are unavailable.');
   setSetting(key, value);
   await writes;
 }

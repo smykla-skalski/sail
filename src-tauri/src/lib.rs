@@ -15,6 +15,32 @@ use tauri::{Manager, State};
 
 static SHIPPING_WORKTREE_LOCK: Mutex<()> = Mutex::new(());
 
+fn existing_shipping_worktree(
+    repository: &Path,
+    name: &str,
+) -> Result<Option<CreatedWorktree>, String> {
+    let listed = git_reference(repository, &["worktree", "list", "--porcelain", "-z"])
+        .ok_or("Cannot inspect shipping worktrees.")?;
+    let existing = parse_registered_worktrees(&listed)
+        .into_iter()
+        .find(|entry| entry.present && entry.branch.as_deref() == Some(name));
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(existing.path)
+        .canonicalize()
+        .map_err(|_| "Shipping worktree is missing.")?;
+    let setup = worktree_config::read(&path)?
+        .map(|config| config.setup)
+        .unwrap_or_default();
+    Ok(Some(CreatedWorktree {
+        path: path.to_string_lossy().into_owned(),
+        branch: name.to_string(),
+        base: worktree_base(repository),
+        setup,
+    }))
+}
+
 #[cfg(any(target_os = "macos", windows))]
 fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
@@ -1210,6 +1236,9 @@ async fn create_shipping_worktree(
             .lock()
             .map_err(|_| "Shipping worktree creation is unavailable.")?;
         let checked = validate_repository(repository.clone())?;
+        if let Some(existing) = existing_shipping_worktree(Path::new(&checked), &name)? {
+            return Ok(existing);
+        }
         let output = Command::new("git")
             .arg("-C")
             .arg(&checked)
@@ -1223,6 +1252,19 @@ async fn create_shipping_worktree(
             ));
         }
         add_worktree(repository, name, None, None)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn find_shipping_worktree(
+    repository: String,
+    name: String,
+) -> Result<Option<CreatedWorktree>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = validate_repository(repository)?;
+        existing_shipping_worktree(Path::new(&repository), &name)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1517,6 +1559,7 @@ pub fn run() {
             diff_file_contents,
             create_worktree,
             create_shipping_worktree,
+            find_shipping_worktree,
             run_shipping_setup,
             registered_worktrees,
             delete_worktree,
@@ -1634,9 +1677,9 @@ mod tests {
     #[cfg(unix)]
     use super::working_tree_revision;
     use super::{
-        add_worktree, git_change_action, git_patch, normalize_picker_path,
-        parse_registered_worktrees, registered_worktrees, remove_worktree, repository_namespace,
-        server_args, version_number, working_tree_diff,
+        add_worktree, existing_shipping_worktree, git_change_action, git_patch,
+        normalize_picker_path, parse_registered_worktrees, registered_worktrees, remove_worktree,
+        repository_namespace, server_args, version_number, working_tree_diff,
     };
     use std::fs;
     #[cfg(unix)]
@@ -1725,6 +1768,55 @@ mod tests {
         assert_eq!(matched[0].path, alias);
         assert_eq!(matched[0].branch.as_deref(), Some("child"));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovers_shipping_worktree_after_interrupted_launch() {
+        let root =
+            std::env::temp_dir().join(format!("sail-shipping-test-{}", uuid::Uuid::new_v4()));
+        let repository = root.join("repository");
+        let child = root.join("child");
+        fs::create_dir_all(&repository).unwrap();
+        let repository = repository.canonicalize().unwrap();
+        let repository_path = repository.to_str().unwrap();
+        git(repository_path, &["init", "-q"]);
+        git(
+            repository_path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "seed",
+            ],
+        );
+        assert!(existing_shipping_worktree(&repository, "ship-issue-7-test")
+            .unwrap()
+            .is_none());
+        git(
+            repository_path,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "ship-issue-7-test",
+                child.to_str().unwrap(),
+            ],
+        );
+        let recovered = existing_shipping_worktree(&repository, "ship-issue-7-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.path,
+            child.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(recovered.branch, "ship-issue-7-test");
         fs::remove_dir_all(root).unwrap();
     }
 

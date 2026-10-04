@@ -22,6 +22,7 @@
     "allow-diff-file-contents",
     "allow-create-worktree",
     "allow-create-shipping-worktree",
+    "allow-find-shipping-worktree",
     "allow-run-shipping-setup",
     "allow-registered-worktrees",
     "allow-delete-worktree",

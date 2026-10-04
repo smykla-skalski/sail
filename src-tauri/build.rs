@@ -19,6 +19,7 @@ fn main() {
             "diff_file_contents",
             "create_worktree",
             "create_shipping_worktree",
+            "find_shipping_worktree",
             "run_shipping_setup",
             "registered_worktrees",
             "delete_worktree",

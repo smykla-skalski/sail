@@ -87,6 +87,8 @@ void test('external blocker waits until GitHub reports it closed', () => {
   assert.deepEqual(readyShipIssues(shipping), []);
   shipping.externalClosed['owner/other#7'] = true;
   assert.equal(readyShipIssues(shipping)[0].id, 'first');
+  shipping.externalClosed['owner/other#7'] = false;
+  assert.deepEqual(readyShipIssues(shipping), []);
 });
 
 void test('rejects issues outside the approved repository', () => {

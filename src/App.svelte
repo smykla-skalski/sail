@@ -1664,8 +1664,17 @@
   ): Promise<void> {
     const current = run.issues.find((item) => item.id === issue.id);
     if (!current) return;
+    const previous = Object.fromEntries(
+      Object.keys(changes).map((key) => [key, current[key as keyof ShipIssue]]),
+    ) as Partial<ShipIssue>;
     Object.assign(current, changes);
-    await saveShipRuns();
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      Object.assign(current, previous);
+      setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+      throw cause;
+    }
   }
 
   async function startShippingRun(
@@ -1764,17 +1773,27 @@
 
   async function refreshShippingDependency(run: ShipRun, dependency: string): Promise<void> {
     try {
-      if (
-        await invoke<boolean>('shipping_dependency_closed', {
-          repository: run.repository,
-          reference: dependency,
-        })
-      ) {
-        run.externalClosed[dependency] = true;
-        await saveShipRuns();
+      const closed = await invoke<boolean>('shipping_dependency_closed', {
+        repository: run.repository,
+        reference: dependency,
+      });
+      if (run.externalClosed[dependency] !== closed) {
+        const previous = run.externalClosed[dependency];
+        run.externalClosed[dependency] = closed;
+        try {
+          await saveShipRuns();
+        } catch (cause) {
+          run.externalClosed[dependency] = previous;
+          setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+          throw cause;
+        }
       }
     } catch (cause) {
       error = describe(cause);
+      if (run.externalClosed[dependency]) {
+        run.externalClosed[dependency] = false;
+        await saveShipRuns().catch((failure) => (error = describe(failure)));
+      }
     }
   }
 
@@ -1782,7 +1801,7 @@
     if (issue.state === 'merged') {
       if (issue.path) {
         const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
-        if (receipt && !receiptIsSettled(receipt.state)) return;
+        if (receipt && !receiptIsSettled((await currentSpawnReceipt(receipt)).state)) return;
         try {
           await invoke('delete_worktree', {
             repository: run.repository,
@@ -1826,10 +1845,18 @@
     if (issue.state === 'failed') return;
     const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
     if (issue.state === 'starting') {
-      if (!receipt?.targetId)
+      if (!receipt) {
+        const existing = await invoke<CreatedWorktree | null>('find_shipping_worktree', {
+          repository: run.repository,
+          name: issue.branch,
+        });
+        if (existing && issue.path !== existing.path)
+          await updateShipIssue(run, issue, { path: existing.path });
+        await launchShipIssue(run, issue);
+      } else if (!receipt.targetId)
         await updateShipIssue(run, issue, {
           state: 'failed',
-          error: 'Launch was interrupted. Inspect the worktree before retrying.',
+          error: 'Launch was interrupted after session creation. Inspect its thread.',
         });
       else await updateShipIssue(run, issue, { state: 'working', threadId: receipt.targetId });
     } else if (issue.state === 'working') {
@@ -1862,14 +1889,11 @@
     );
     await Promise.all(
       [...new Set(run.issues.flatMap((issue) => issue.dependsOn))]
-        .filter((dependency) => !aliases.has(dependency) && !run.externalClosed[dependency])
+        .filter((dependency) => !aliases.has(dependency))
         .map((dependency) => refreshShippingDependency(run, dependency)),
     );
     await Promise.all(run.issues.map((issue) => refreshShippingIssue(run, issue)));
-    await readyShipIssues(run).reduce<Promise<void>>(async (previous, issue) => {
-      await previous;
-      await launchShipIssue(run, issue);
-    }, Promise.resolve());
+    await Promise.all(readyShipIssues(run).map((issue) => launchShipIssue(run, issue)));
   }
 
   async function tickShippingRuns(): Promise<void> {
