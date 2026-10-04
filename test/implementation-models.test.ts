@@ -90,6 +90,19 @@ void test('active implementation models are available before turns finish', asyn
   assert.deepEqual(await activeImplementationModels(directory, 'agent-a'), []);
 });
 
+void test('a read-only coordinator does not inherit another active model', async () => {
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => 'same' } },
+  });
+  const directory = '/test/active-coordinator';
+  const implementer = await beginImplementationTurn(directory, 'model-a', 'agent-a');
+  const coordinator = await beginImplementationTurn(directory, 'model-b', 'agent-b');
+  assert.deepEqual(await activeImplementationModels(directory, 'agent-b'), ['model-a']);
+  abandonImplementationTurn(directory, coordinator);
+  abandonImplementationTurn(directory, implementer);
+});
+
 void test('shipping preserves models from implementation before the first run', async () => {
   const values = new Map<string, string>();
   Object.defineProperty(globalThis, 'localStorage', {

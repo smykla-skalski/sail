@@ -64,7 +64,7 @@ export async function activeImplementationModels(
   const participants = new Set<ImplementationTurn>();
   for (const turn of relevant) {
     participants.add(turn);
-    for (const peer of turn.peers) participants.add(peer);
+    if (turn.before !== revision) for (const peer of turn.peers) participants.add(peer);
   }
   return [...participants].every((turn) => turn.model)
     ? [...participants].map((turn) => turn.model!)
