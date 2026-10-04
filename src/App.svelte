@@ -2402,7 +2402,16 @@
       const receiptId = crypto.randomUUID();
       const accessKey = crypto.randomUUID();
       const ensureSelected = () => {
-        const current = selectValidationChoice(crossValidation, available, usedModels).choice;
+        const selectedCandidates = currentCandidates.filter((candidate) =>
+          crossValidation.choices.some(
+            (selected) => selected.agent === candidate.agent && selected.model === candidate.model,
+          ),
+        );
+        const current = selectValidationChoice(
+          crossValidation,
+          selectedCandidates,
+          usedModels,
+        ).choice;
         if (current?.agent !== choice.agent || current.model !== choice.model)
           throw new Error('Validation model selection changed before launch. Retry the gate.');
       };
