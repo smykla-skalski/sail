@@ -18,4 +18,10 @@ void test('a second issue in the same worktree starts with a fresh implementatio
   assert.deepEqual(implementationModels(directory), ['model-a']);
   beginShipItRun(directory, '/ship-it #2');
   assert.deepEqual(implementationModels(directory), []);
+  values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-b']));
+  beginShipItRun(directory, '/ship-it');
+  assert.deepEqual(implementationModels(directory), []);
+  values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-c']));
+  beginShipItRun(directory, '/ship-it');
+  assert.deepEqual(implementationModels(directory), []);
 });

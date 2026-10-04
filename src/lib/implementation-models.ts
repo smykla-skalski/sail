@@ -12,8 +12,13 @@ function runKey(directory: string): string {
 export function beginShipItRun(directory: string, prompt: string): void {
   const firstLine = prompt.split('\n')[0].trim();
   if (!/^\/ship-it(?:\s|$)/i.test(firstLine)) return;
-  if (getSetting(runKey(directory)) === firstLine) return;
-  setSetting(runKey(directory), firstLine);
+  const issue =
+    /^\/ship-it\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
+      firstLine,
+    )?.[1];
+  const identity = issue ?? crypto.randomUUID();
+  if (issue && getSetting(runKey(directory)) === identity) return;
+  setSetting(runKey(directory), identity);
   setSetting(key(directory), '[]');
 }
 
