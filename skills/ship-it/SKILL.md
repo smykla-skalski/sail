@@ -14,7 +14,7 @@ metadata:
 
 ## Sail execution rule
 
-For an issue opened in a Sail-managed worktree, use that worktree and branch. Skip branch creation and cleanup. Run the Code Adversary, Findings Adversary, and Test Adversary in three separate fresh subagent sessions, in order. If any session cannot launch, pause shipping and explain the failed gate in the current thread. Never run a gate inline. This rule overrides the inline fallback below.
+For an issue opened in a Sail-managed worktree, use that worktree and branch. Skip branch creation and cleanup. Run the Code Adversary, Findings Adversary, and Test Adversary in three separate fresh subagent sessions, in order. If any session cannot launch, pause shipping and explain the failed gate in the current thread. Never run a gate inline.
 
 Take one change (task description, GitHub issue, or Jira ticket) to a merged PR, closing the GitHub issue if any.
 

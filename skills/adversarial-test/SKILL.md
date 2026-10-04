@@ -14,7 +14,7 @@ metadata:
 
 ## Sail execution rule
 
-Run the Test Adversary in a fresh subagent session. If it cannot launch, stop and report `Test Verdict: BLOCKED` with the reason. Never run the pass inline. This overrides the inline fallback below.
+Run the Test Adversary in a fresh subagent session. If it cannot launch, stop and report `Test Verdict: BLOCKED` with the reason. Never run the pass inline.
 
 Prove the change does **not** do what the task says - by running it. It answers one question - **does this change work for a user?** - and answers it with commands and output, not by reading code. Code correctness review is the `adversarial-review` skill.
 
@@ -34,7 +34,7 @@ Paths in this file are relative to the skill directory (the one holding this SKI
 | Argument substitution                         | If the "Parse from" line under Arguments shows no value or an unreplaced placeholder, take the PR URL and flags from the user's request                                                                                                                                                    |
 | AskUserQuestion                               | Not used; the skill never stops for input                                                                                                                                                                                                                                                  |
 | Named agent `adversarial-test:test-adversary` | Claude Code and Copilot CLI register it from the plugin's `agents/` directory. Codex and opencode do not; there, or whenever the type is unknown, spawn a generic subagent with the full mandate from [references/test-adversary.md](references/test-adversary.md) prepended (see Phase 2) |
-| Subagent tool (Agent)                         | Codex: one `spawn_agent` call, waited on and closed before Phase 3. opencode: the `task` tool. No subagent tool, or both spawn attempts fail: run the pass inline yourself (see Fallback)                                                                                                  |
+| Subagent tool (Agent)                         | Codex: one `spawn_agent` call, waited on and closed before Phase 3. opencode: the `task` tool. No subagent tool or failed launches: report `Test Verdict: BLOCKED`.                                                                                                                        |
 | `context: fork`                               | Not used                                                                                                                                                                                                                                                                                   |
 
 The skill spawns at most one subagent at a time, so it runs sequentially on every agent.
@@ -91,7 +91,7 @@ The instruction for the subagent is: _"Prove this change does not satisfy the ta
 
 **opencode.** Use the `task` tool; each call creates a fresh child session, which is the clean context this skill needs. If a `test-adversary` subagent is installed (see the plugin README), use it with the Test assignment and the instruction. Otherwise use the built-in `general` subagent with the mandate prepended.
 
-**Validation and retry.** The reply must have a `Criteria:` list and end with a `TEST_ADVERSARY_VERDICT:` line. If it is empty or malformed, spawn a fresh subagent once more; if that fails too, run the pass inline (see Fallback).
+**Validation and retry.** The reply must have a `Criteria:` list and end with a `TEST_ADVERSARY_VERDICT:` line. If it is empty or malformed, spawn a fresh subagent once more; if that fails too, report `Test Verdict: BLOCKED` with the reason.
 
 Reject a `PASS` whose criteria cite only automated tests, lint, build, or grep while a runnable surface exists - spawn a fresh subagent once with _"Previous attempt used static evidence only. Run the real surface."_ appended. If it still cannot run the surface, treat it as `BLOCKED`.
 
@@ -135,10 +135,6 @@ Reproduction:
 ```
 
 End with one line: `Tester: <subagent verdict value, e.g. FAIL (2)> · confirmed <N> · flaky <N> · dropped <N>`. Nothing after it.
-
-## Fallback - no subagents
-
-If the agent has no subagent tool or both spawn attempts fail, run the pass inline following [references/test-adversary.md](references/test-adversary.md). Derive the criteria from the task context **before** reading the diff, so the implementation does not shape them. Assume your own mistakes are there. Phase 3 still applies. Note `inline` in the final Tester line.
 
 ## Anti-patterns
 

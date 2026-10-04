@@ -14,7 +14,7 @@ metadata:
 
 ## Sail execution rule
 
-Use fresh subagent sessions for both passes. If either session cannot launch, stop and report `Review Verdict: BLOCKED` with the failed pass and reason. Never run a pass inline. This overrides the inline fallback below.
+Use fresh subagent sessions for both passes, even when the first pass reports no findings. If either session cannot launch, stop and report `Review Verdict: BLOCKED` with the failed pass and reason. Never run a pass inline.
 
 Find the bug, then try to prove the bug report wrong. It answers one question - **is this change correct?** - and answers it hard. It does not evaluate architecture, conventions, dead code, or taste; that is `/staff-code-review`.
 
@@ -29,12 +29,12 @@ The second pass exists because an unrefuted adversary nit-bombs. It sees only th
 
 Paths in this file are relative to the skill directory (the one holding this SKILL.md). The workflow is written for Claude Code; on other agents, or when a Claude feature is missing, use these fallbacks:
 
-| Claude Code feature                                                     | Fallback                                                                                                                                                                     |
-| :---------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Argument substitution                                                   | If the "Parse from" line under Arguments shows no value or an unreplaced placeholder, take the PR URL, diff file, `--base` and `--context` from the user's request           |
-| Named agents `adversarial-review:code-adversary` / `findings-adversary` | Spawn a generic subagent with the matching mandate file from `references/` prepended (see [Spawning a clean-context subagent](#spawning-a-clean-context-subagent))           |
-| Subagent tool (Agent)                                                   | Codex: `spawn_agent`; opencode: `task`; Copilot CLI: its task/subagent tool. With no subagent tool at all, run both passes inline (see [Fallback](#fallback---no-subagents)) |
-| AskUserQuestion, `context: fork`                                        | Not used                                                                                                                                                                     |
+| Claude Code feature                                                     | Fallback                                                                                                                                                           |
+| :---------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Argument substitution                                                   | If the "Parse from" line under Arguments shows no value or an unreplaced placeholder, take the PR URL, diff file, `--base` and `--context` from the user's request |
+| Named agents `adversarial-review:code-adversary` / `findings-adversary` | Spawn a generic subagent with the matching mandate file from `references/` prepended (see [Spawning a clean-context subagent](#spawning-a-clean-context-subagent)) |
+| Subagent tool (Agent)                                                   | Codex: `spawn_agent`; opencode: `task`; Copilot CLI: its task/subagent tool. With no subagent tool, report `Review Verdict: BLOCKED`.                              |
+| AskUserQuestion, `context: fork`                                        | Not used                                                                                                                                                           |
 
 The two passes always run sequentially, so the skill never needs more than one extra subagent at a time.
 
@@ -93,19 +93,19 @@ Each pass is one fresh subagent whose prompt is the Review assignment plus the p
 
 **Copilot CLI.** The plugin registers the same named agents (`adversarial-review:code-adversary`, `adversarial-review:findings-adversary`); use them through its subagent tool when offered, otherwise a fresh generic subagent with the mandate prepended.
 
-**Other agents** with a subagent tool: spawn a fresh generic subagent with the mandate prepended. Without a subagent tool, use the inline Fallback.
+**Other agents** with a subagent tool: spawn a fresh generic subagent with the mandate prepended. Without a subagent tool, report `Review Verdict: BLOCKED`.
 
-**Validation and retry.** If a reply is empty or lacks its required final verdict line, spawn a fresh subagent once more. If that fails too, run the pass inline (see Fallback).
+**Validation and retry.** If a reply is empty or lacks its required final verdict line, spawn a fresh subagent once more. If that fails too, report `Review Verdict: BLOCKED` with the reason.
 
 ## Phase 2 - Code Adversary
 
 Spawn per [Spawning a clean-context subagent](#spawning-a-clean-context-subagent): named agent `adversarial-review:code-adversary`, mandate [references/code-adversary.md](references/code-adversary.md), payload _"Find the bug in this change and prove it. Read only; do not modify files."_
 
-The reply must end with a `CODE_ADVERSARY_VERDICT:` line. If the verdict is `CLEAN` with no findings, skip Phase 3 and go to Output.
+The reply must end with a `CODE_ADVERSARY_VERDICT:` line. Continue to Phase 3 even when it reports `CLEAN` with no findings.
 
 ## Phase 3 - Findings Adversary
 
-Spawn a **new** subagent - never resume, message, or reuse the Code Adversary: named agent `adversarial-review:findings-adversary`, mandate [references/findings-adversary.md](references/findings-adversary.md), payload `Findings to refute:` followed by **only** the numbered `F<n>` finding blocks (label, message, location) copied from Phase 2. Strip every other line of the Code Adversary's reply - the clean context is the point.
+Spawn a **new** subagent - never resume, message, or reuse the Code Adversary: named agent `adversarial-review:findings-adversary`, mandate [references/findings-adversary.md](references/findings-adversary.md), payload `Findings to refute:` followed by **only** the numbered `F<n>` finding blocks (label, message, location) copied from Phase 2. Use an empty findings list when Phase 2 is clean. Strip every other line of the Code Adversary's reply - the clean context is the point.
 
 The reply must have one verdict line per input finding and end with a `FINDINGS_ADVERSARY_VERDICT:` line.
 
@@ -141,11 +141,7 @@ Then the surviving findings, strongest first, in conventional-comment format, hi
 *Location:* `{path/to/file}:{line}`
 ```
 
-End with one line: `Adversaries: code <CODE_ADVERSARY_VERDICT> · findings <FINDINGS_ADVERSARY_VERDICT|skipped> · removed <N> · downgraded <N>`. Nothing after it. The findings verdict grades the findings, not the code - the `Review Verdict:` line is computed from the surviving findings alone.
-
-## Fallback - no subagents
-
-If the runtime has no subagent tool or both spawn attempts fail, run each pass inline as a separate labelled section, following the mandate files linked above. In the Findings pass you MUST re-open every cited `file:line` and re-derive the claim from the source - never verify from memory of having written it. Assume your own mistakes are there. Note `inline` in the final Adversaries line.
+End with one line: `Adversaries: code <CODE_ADVERSARY_VERDICT> · findings <FINDINGS_ADVERSARY_VERDICT> · removed <N> · downgraded <N>`. Nothing after it. The findings verdict grades the findings, not the code - the `Review Verdict:` line is computed from the surviving findings alone.
 
 ## Anti-patterns
 
