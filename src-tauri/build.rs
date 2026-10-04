@@ -30,6 +30,8 @@ fn main() {
             "create_pull_request",
             "list_open_issues",
             "open_issue",
+            "publish_issue_graph",
+            "load_issue_graph",
             "pull_request_checks",
             "failed_check_log",
             "open_pull_request",
