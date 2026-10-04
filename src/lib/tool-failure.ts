@@ -19,8 +19,10 @@ export function toolFailurePrompt(
     .join('\n\n');
 }
 
-export function appendToolFailureDraft(draft: string, request: string): string {
-  return draft.includes(request) ? draft : [draft.trim(), request].filter(Boolean).join('\n\n');
+export function prepareToolFailureDraft(draft: string, request: string, previous = ''): string {
+  if (draft.includes(request)) return draft;
+  if (previous && draft.includes(previous)) return draft.replace(previous, request);
+  return [draft.trim(), request].filter(Boolean).join('\n\n');
 }
 
 export function openCodeErrorDetails(error: {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import ToolActivity from '../../src/ToolActivity.svelte';
   import {
-    appendToolFailureDraft,
+    prepareToolFailureDraft,
     openCodeErrorDetails,
     reportedHookIdentity,
     toolFailurePrompt,
@@ -12,11 +12,14 @@
   let message = $state('Permission denied');
   let output = $state('');
   let draft = $state('Existing draft');
+  let previousRequest = '';
   const source = reportedHookIdentity({ plugin: 'policy' }) ?? '';
   const error = $derived(openCodeErrorDetails({ type: 'PluginError', message }));
 
   function fix() {
-    draft = appendToolFailureDraft(draft, toolFailurePrompt('bash', input, error, output));
+    const request = toolFailurePrompt('bash', input, error, output);
+    draft = prepareToolFailureDraft(draft, request, previousRequest);
+    previousRequest = request;
   }
 </script>
 

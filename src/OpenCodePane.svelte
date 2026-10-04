@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { SvelteSet } from 'svelte/reactivity';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { Badge, Button } from '@smykla-skalski/sui';
   import type { FormInfo, PermissionRequest } from '@opencode/client';
@@ -30,7 +30,7 @@
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import { mergeMessages, nearBottom } from './lib/timeline';
   import {
-    appendToolFailureDraft,
+    prepareToolFailureDraft,
     openCodeErrorDetails,
     reportedHookIdentity,
     toolFailurePrompt,
@@ -85,6 +85,7 @@
   let pendingPermissions = $state<PermissionRequest[]>([]);
   let pendingForms = $state<FormInfo[]>([]);
   let draft = $state('');
+  const failureRequests = new SvelteMap<string, string>();
   let skills = $state<SkillChoice[]>([]);
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
@@ -124,9 +125,16 @@
     void tick().then(() => prompt.focus());
   }
 
-  function fixToolFailure(name: string, input: unknown, reason: string, output: string) {
+  function fixToolFailure(
+    key: string,
+    name: string,
+    input: unknown,
+    reason: string,
+    output: string,
+  ) {
     const request = toolFailurePrompt(name, input, reason, output);
-    draft = appendToolFailureDraft(draft, request);
+    draft = prepareToolFailureDraft(draft, request, failureRequests.get(key));
+    failureRequests.set(key, request);
     void tick().then(() => prompt.focus());
   }
   let files = $state<string[]>([]);
@@ -675,7 +683,14 @@
                     ? (reportedHookIdentity(part.state.metadata) ?? '')
                     : ''}
                   onfix={part.state.status === 'error'
-                    ? () => fixToolFailure(part.name, part.state.input, reason, output)
+                    ? () =>
+                        fixToolFailure(
+                          `${message.id}:${part.id}`,
+                          part.name,
+                          part.state.input,
+                          reason,
+                          output,
+                        )
                     : undefined}
                 />
               {/if}

@@ -10,6 +10,8 @@ describe('OpenCode failed tool card', () => {
     await expect($('.tool-activity-error[role="alert"]')).toHaveText('Permission denied');
     await expect($('.tool-activity')).toHaveText(expect.stringContaining('blocked output'));
     await expect($('.tool-activity')).toHaveText(expect.stringContaining('Reported by policy'));
+    await $('.tool-activity-fix').click();
+    await expect($('textarea')).toHaveValue(expect.stringContaining('Permission denied'));
 
     await $('button[aria-label="Update failure"]').click();
     await expect($$('.tool-activity')).toBeElementsArrayOfSize(1);
@@ -20,6 +22,7 @@ describe('OpenCode failed tool card', () => {
     await expect($('textarea')).toHaveValue(expect.stringContaining('Existing draft'));
     await expect($('textarea')).toHaveValue(expect.stringContaining('Command:\nnpm test'));
     await expect($('textarea')).toHaveValue(expect.stringContaining('Policy blocked command'));
+    await expect($('textarea')).not.toHaveValue(expect.stringContaining('Permission denied'));
     const first = await $('textarea').getValue();
     await $('.tool-activity-fix').click();
     expect(await $('textarea').getValue()).toBe(first);

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  appendToolFailureDraft,
+  prepareToolFailureDraft,
   openCodeErrorDetails,
   reportedHookIdentity,
   toolFailurePrompt,
@@ -21,9 +21,13 @@ void test('failure follow-up includes the action, reason, and output', () => {
 
 void test('failure follow-up preserves the draft without duplicating the request', () => {
   const request = 'Fix failed action';
-  const result = appendToolFailureDraft('Keep this', request);
+  const result = prepareToolFailureDraft('Keep this', request);
   assert.equal(result, 'Keep this\n\nFix failed action');
-  assert.equal(appendToolFailureDraft(result, request), result);
+  assert.equal(prepareToolFailureDraft(result, request, request), result);
+  assert.equal(
+    prepareToolFailureDraft(`${result}\n\nMy note`, 'Fix revised action', request),
+    'Keep this\n\nFix revised action\n\nMy note',
+  );
 });
 
 void test('structured OpenCode error details include response body and a fallback reason', () => {

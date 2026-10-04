@@ -27,7 +27,7 @@
   import { matchingSkills, promptSkill, type SkillChoice } from './lib/skills';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import {
-    appendToolFailureDraft,
+    prepareToolFailureDraft,
     openCodeErrorDetails,
     reportedHookIdentity,
     toolFailurePrompt,
@@ -637,6 +637,7 @@
   let diffRevisionPath = '';
   let historyRefresh = 0;
   let draft = $state('');
+  const failureRequests = new SvelteMap<string, string>();
   let mainPrompt = $state<HTMLTextAreaElement | undefined>();
   let skills = $state<SkillChoice[]>([]);
   let skillSelected = $state(0);
@@ -6328,9 +6329,16 @@
     }
   }
 
-  function fixOpenCodeToolFailure(name: string, input: unknown, reason: string, output: string) {
+  function fixOpenCodeToolFailure(
+    key: string,
+    name: string,
+    input: unknown,
+    reason: string,
+    output: string,
+  ) {
     const request = toolFailurePrompt(name, input, reason, output);
-    draft = appendToolFailureDraft(draft, request);
+    draft = prepareToolFailureDraft(draft, request, failureRequests.get(key));
+    failureRequests.set(key, request);
     void tick().then(() => mainPrompt?.focus());
   }
 
@@ -7154,6 +7162,7 @@
                             onfix={part.state.status === 'error'
                               ? () =>
                                   fixOpenCodeToolFailure(
+                                    `${message.id}:${part.id}`,
                                     part.name,
                                     part.state.input,
                                     reason,
