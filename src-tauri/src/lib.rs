@@ -41,6 +41,19 @@ fn existing_shipping_worktree(
     }))
 }
 
+fn shipping_default_ref(repository: &Path) -> Result<String, String> {
+    let advertised = git_reference(repository, &["ls-remote", "--symref", "origin", "HEAD"])
+        .ok_or("Cannot read origin's default branch.")?;
+    let branch = advertised
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("ref: refs/heads/")?
+                .strip_suffix("\tHEAD")
+        })
+        .ok_or("Origin does not advertise a default branch.")?;
+    Ok(format!("refs/remotes/origin/{branch}"))
+}
+
 #[cfg(any(target_os = "macos", windows))]
 fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
@@ -1239,10 +1252,18 @@ async fn create_shipping_worktree(
         if let Some(existing) = existing_shipping_worktree(Path::new(&checked), &name)? {
             return Ok(existing);
         }
+        let default_ref = shipping_default_ref(Path::new(&checked))?;
+        let branch = default_ref
+            .strip_prefix("refs/remotes/origin/")
+            .ok_or("Invalid origin default branch.")?;
         let output = Command::new("git")
             .arg("-C")
             .arg(&checked)
-            .args(["fetch", "origin"])
+            .args([
+                "fetch",
+                "origin",
+                &format!("+refs/heads/{branch}:{default_ref}"),
+            ])
             .output()
             .map_err(|error| format!("Cannot fetch default branch: {error}"))?;
         if !output.status.success() {
@@ -1251,7 +1272,7 @@ async fn create_shipping_worktree(
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        add_worktree(repository, name, None, None)
+        add_worktree(repository, name, None, Some(default_ref))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1679,7 +1700,7 @@ mod tests {
     use super::{
         add_worktree, existing_shipping_worktree, git_change_action, git_patch,
         normalize_picker_path, parse_registered_worktrees, registered_worktrees, remove_worktree,
-        repository_namespace, server_args, version_number, working_tree_diff,
+        repository_namespace, server_args, shipping_default_ref, version_number, working_tree_diff,
     };
     use std::fs;
     #[cfg(unix)]
@@ -1817,6 +1838,52 @@ mod tests {
             child.canonicalize().unwrap().to_str().unwrap()
         );
         assert_eq!(recovered.branch, "ship-issue-7-test");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shipping_uses_advertised_default_without_local_origin_head() {
+        let root = std::env::temp_dir().join(format!("sail-default-test-{}", uuid::Uuid::new_v4()));
+        let remote = root.join("remote.git");
+        let repository = root.join("repository");
+        fs::create_dir_all(&root).unwrap();
+        git(
+            root.to_str().unwrap(),
+            &["init", "--bare", "-q", remote.to_str().unwrap()],
+        );
+        git(
+            remote.to_str().unwrap(),
+            &["symbolic-ref", "HEAD", "refs/heads/develop"],
+        );
+        fs::create_dir_all(&repository).unwrap();
+        let repository_path = repository.to_str().unwrap();
+        git(repository_path, &["init", "-q"]);
+        git(
+            repository_path,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(
+            repository_path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "seed",
+            ],
+        );
+        git(repository_path, &["branch", "-M", "develop"]);
+        git(repository_path, &["push", "-q", "origin", "develop"]);
+        git(repository_path, &["checkout", "-qb", "feature"]);
+        assert_eq!(
+            shipping_default_ref(&repository).unwrap(),
+            "refs/remotes/origin/develop"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

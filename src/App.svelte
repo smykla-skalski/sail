@@ -1845,7 +1845,7 @@
     if (issue.state === 'failed') return;
     const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
     if (issue.state === 'starting') {
-      if (!receipt) {
+      if (!receipt || !receipt.targetId || (receipt.provider !== 'opencode' && !receipt.turnId)) {
         const existing = await invoke<CreatedWorktree | null>('find_shipping_worktree', {
           repository: run.repository,
           name: issue.branch,
@@ -1853,12 +1853,7 @@
         if (existing && issue.path !== existing.path)
           await updateShipIssue(run, issue, { path: existing.path });
         await launchShipIssue(run, issue);
-      } else if (!receipt.targetId)
-        await updateShipIssue(run, issue, {
-          state: 'failed',
-          error: 'Launch was interrupted after session creation. Inspect its thread.',
-        });
-      else await updateShipIssue(run, issue, { state: 'working', threadId: receipt.targetId });
+      } else await updateShipIssue(run, issue, { state: 'working', threadId: receipt.targetId });
     } else if (issue.state === 'working') {
       if (!receipt)
         await updateShipIssue(run, issue, {
@@ -2010,6 +2005,8 @@
         else if (session.outcome) await settleOpenCodeReceipt(receipt, client, session.outcome);
         else if (inbox.some((item) => item.id === receipt.turnId))
           updateSpawnReceipt(receipt.receiptId, { state: 'queued' });
+        else if (!receipt.turnId && inbox.length === 1)
+          updateSpawnReceipt(receipt.receiptId, { state: 'queued', turnId: inbox[0].id });
         else await settleOpenCodeReceipt(receipt, client, session.outcome);
       } catch {
         updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
@@ -2855,6 +2852,8 @@
           targetDirectory: created.path,
           worktreeId: created.path,
         });
+      if (receiptId)
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       await invoke('record_turn_snapshot', {
         path: created.path,
         thread: `acp:${source.agent}:${session.sessionId}`,
@@ -2862,6 +2861,8 @@
       updateAgentThreadStatus(thread, 'working');
       const turnId = crypto.randomUUID();
       if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', turnId });
+      if (receiptId)
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       if (receiptId) activeSpawnTargets.set(`acp:${source.agent}:${session.sessionId}`, receiptId);
       const turn = acp.prompt(source.agent, session.sessionId, prompt, turnId);
       const finished = turn.then(
@@ -2920,6 +2921,8 @@
         targetDirectory: created.path,
         worktreeId: created.path,
       });
+    if (receiptId)
+      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
     rememberRecentThread({
       agent: 'opencode',
       sessionId: session.id,
