@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   failedCheckOutcome,
   inboxLocations,
+  inboxTurnMessageIndex,
   loadInboxOutcomes,
   loadInboxSeen,
   markInboxOutcomeRead,
@@ -135,4 +136,17 @@ void test('failed check results stay informational and point at their thread', (
   });
   assert.equal(failedCheckOutcome({ ...check, status: 'passed' }), null);
   assert.equal(failedCheckOutcome({ ...check, thread: 'broken' }), null);
+});
+
+void test('completed turn navigation stays between its user message and the next turn', () => {
+  const messages = [
+    { kind: 'user' as const, created: 100 },
+    { kind: 'assistant' as const, created: 110 },
+    { kind: 'assistant' as const, created: 120 },
+    { kind: 'user' as const, created: 1000 },
+    { kind: 'assistant' as const, created: 1001 },
+  ];
+  assert.equal(inboxTurnMessageIndex(messages, 999), 2);
+  assert.equal(inboxTurnMessageIndex(messages, 1002), 4);
+  assert.equal(inboxTurnMessageIndex([{ kind: 'user', created: 100 }], 101), 0);
 });

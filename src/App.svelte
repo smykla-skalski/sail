@@ -47,6 +47,7 @@
   import {
     failedCheckOutcome,
     inboxLocations,
+    inboxTurnMessageIndex,
     isInboxOutcome,
     loadInboxOutcomes,
     loadInboxSeen,
@@ -2761,19 +2762,14 @@
     scheduleInboxRefresh();
   }
 
-  function recordTurnOutcome(
-    thread: AgentThread,
-    eventId: string,
-    status: 'done' | 'failed',
-    receivedAt = Date.now(),
-  ) {
+  function recordTurnOutcome(thread: AgentThread, eventId: string, receivedAt = Date.now()) {
     saveInboxOutcome({
       key: `turn:${threadKey(thread)}:${eventId}`,
-      kind: status === 'done' ? 'turn-completed' : 'turn-failed',
+      kind: 'turn-completed',
       directory: thread.directory,
       agentId: thread.agent,
       sessionId: thread.sessionId,
-      text: status === 'done' ? `${thread.title} · completed` : `${thread.title} · failed`,
+      text: `${thread.title} · completed`,
       receivedAt,
       eventId,
       read: false,
@@ -4386,7 +4382,7 @@
   async function focusInboxOutcome(item: InboxItem, attempts = 40): Promise<void> {
     await tick();
     if (item.kind === 'check-failed') {
-      const check = [...document.querySelectorAll<HTMLElement>('[data-check-id]')].find(
+      const check = [...document.querySelectorAll<HTMLElement>('.chat-area [data-check-id]')].find(
         (element) => element.dataset.checkId === item.eventId && element.getClientRects().length,
       );
       if (check) {
@@ -4396,15 +4392,23 @@
       }
     } else {
       const visibleMessages = [
-        ...document.querySelectorAll<HTMLElement>('.conversation .assistant-message[data-created]'),
-      ]
-        .filter((element) => element.getClientRects().length)
-        .toSorted(
-          (left, right) =>
-            Math.abs(Number(left.dataset.created) - item.receivedAt) -
-            Math.abs(Number(right.dataset.created) - item.receivedAt),
-        );
-      const target = visibleMessages[0];
+        ...document.querySelectorAll<HTMLElement>(
+          '.chat-area .conversation .message[data-created]',
+        ),
+      ].filter(
+        (element) =>
+          element.getClientRects().length &&
+          (element.classList.contains('user-message') ||
+            element.classList.contains('assistant-message')),
+      );
+      const index = inboxTurnMessageIndex(
+        visibleMessages.map((element) => ({
+          kind: element.classList.contains('user-message') ? 'user' : 'assistant',
+          created: Number(element.dataset.created),
+        })),
+        item.receivedAt,
+      );
+      const target = index === null ? null : visibleMessages[index];
       if (target) {
         target.scrollIntoView({ block: 'center' });
         target.focus();
@@ -5541,8 +5545,12 @@
         (item) => item.agent === event.agent && item.sessionId === sessionId,
       )) {
         updateAgentThreadStatus(thread, status, event.message.params?.notify !== false);
-        if (typeof turnId === 'string' && event.message.params?.notify !== false)
-          recordTurnOutcome(thread, turnId, status);
+        if (
+          status === 'done' &&
+          typeof turnId === 'string' &&
+          event.message.params?.notify !== false
+        )
+          recordTurnOutcome(thread, turnId);
       }
       for (const receipt of spawnReceipts.filter(
         (item) =>
@@ -6433,11 +6441,12 @@
             event.type === 'session.execution.interrupted')
         ) {
           ++nativeActivityGeneration;
-          for (const thread of sidebarOpenCodeThreads.filter(
+          const matchingThreads = sidebarOpenCodeThreads.filter(
             (item) =>
               item.sessionId === eventSession &&
               (!event.location?.directory || item.directory === event.location.directory),
-          )) {
+          );
+          for (const thread of matchingThreads) {
             updateAgentThreadStatus(
               thread,
               event.type === 'session.execution.started'
@@ -6447,16 +6456,33 @@
                   : 'done',
               event.type !== 'session.execution.interrupted',
             );
-            if (
-              event.type === 'session.execution.succeeded' ||
-              event.type === 'session.execution.failed'
-            )
-              recordTurnOutcome(
-                thread,
-                event.id,
-                event.type === 'session.execution.failed' ? 'failed' : 'done',
-                event.created,
-              );
+            if (event.type === 'session.execution.succeeded')
+              recordTurnOutcome(thread, event.id, event.created);
+          }
+          if (event.type === 'session.execution.succeeded' && !matchingThreads.length) {
+            const eventId = event.id;
+            const completedAt = event.created;
+            void source.session
+              .get({ sessionID: eventSession })
+              .then((session) => {
+                if (signal.aborted || source !== client || session.parentID) return;
+                const path = session.location.directory;
+                if (!inboxLocations(projectCatalog).some((location) => location.directory === path))
+                  return;
+                recordTurnOutcome(
+                  {
+                    agent: 'opencode',
+                    sessionId: eventSession,
+                    directory: path,
+                    title: session.title ?? 'OpenCode session',
+                    updated: completedAt,
+                  },
+                  eventId,
+                  completedAt,
+                );
+                return undefined;
+              })
+              .catch(() => undefined);
           }
         }
         if (
@@ -7377,7 +7403,12 @@
                       (item) => item.target === coordinationKey(directory, `opencode:${sessionID}`),
                     ),
                   )}
-                  <article class="message user-message" data-message-id={message.id}>
+                  <article
+                    class="message user-message"
+                    data-message-id={message.id}
+                    data-created={message.time.created}
+                    tabindex="-1"
+                  >
                     <div class="avatar user-avatar">{attribution ? '↗' : 'You'}</div>
                     <div class="message-body">
                       <div class="message-author">

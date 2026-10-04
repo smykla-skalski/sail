@@ -78,7 +78,7 @@ describe('pending requests across projects', () => {
     await expect($('.inbox-empty')).toHaveText('Nothing needs your input.');
   });
 
-  it('keeps completed and failed turns as read or unread results', async () => {
+  it('keeps completed turns and opens the matching earlier response', async () => {
     await browser.execute((path) => {
       sessionStorage.removeItem('sail-e2e-settings');
       localStorage.setItem('sai-directory', path);
@@ -93,7 +93,7 @@ describe('pending requests across projects', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await $('.agent-composer textarea').waitForEnabled();
-    await $('.agent-composer textarea').setValue('Steer no-response follow-up');
+    await $('.agent-composer textarea').setValue('Activity demo');
     await $('.agent-actions button').click();
     await browser.waitUntil(async () => (await $$('.inbox-result')).length === 1);
     await $('[aria-label="Pending requests"]').click();
@@ -110,12 +110,18 @@ describe('pending requests across projects', () => {
       expect.stringContaining('unread'),
     );
     await $('[aria-label="Close pending requests"]').click();
-    await $('.agent-composer textarea').setValue('Prompt failure');
+    await $('.agent-composer textarea').setValue('Steer no-response follow-up');
     await $('.agent-actions button').click();
     await browser.waitUntil(async () => (await $$('.inbox-result')).length === 2);
     await $('[aria-label="Pending requests"]').click();
-    await expect($$('.inbox-result')).toBeElementsArrayOfSize(2);
-    await expect($('.inbox-result')).toHaveText(expect.stringContaining('Turn failed'));
+    const results = await $$('.inbox-result');
+    await expect(results).toBeElementsArrayOfSize(2);
+    await results[1].$('.inbox-open').click();
+    await browser.waitUntil(() =>
+      browser.execute(
+        () => document.activeElement?.textContent?.includes('The checks passed.') ?? false,
+      ),
+    );
     await browser.refresh();
     await $('[aria-label="Pending requests"]').click();
     await expect($$('.inbox-result')).toBeElementsArrayOfSize(2);

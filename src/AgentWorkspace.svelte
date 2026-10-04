@@ -852,7 +852,7 @@
     }
     const userEntryId = crypto.randomUUID();
     flushUpdates();
-    entries = [...entries, { id: userEntryId, type: 'user', text }];
+    entries = [...entries, { id: userEntryId, type: 'user', text, created: Date.now() }];
     void follow();
     try {
       if (!activeSessionId || !activityThread)
@@ -1067,7 +1067,7 @@
     const [next, ...remaining] = queued;
     const entryId = crypto.randomUUID();
     flushUpdates();
-    entries = [...entries, { id: entryId, type: 'user', text: next.text }];
+    entries = [...entries, { id: entryId, type: 'user', text: next.text, created: Date.now() }];
     rememberTranscript();
     queued = remaining;
     saveQueuedAgentMessages(turnAgent, turnDirectory, sessionId, queued);

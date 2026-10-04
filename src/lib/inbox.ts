@@ -8,13 +8,7 @@ export type InboxLocation = {
 
 export type InboxItem = InboxLocation & {
   key: string;
-  kind:
-    | 'acp-permission'
-    | 'opencode-permission'
-    | 'question'
-    | 'turn-completed'
-    | 'turn-failed'
-    | 'check-failed';
+  kind: 'acp-permission' | 'opencode-permission' | 'question' | 'turn-completed' | 'check-failed';
   agent: string;
   agentId?: string;
   sessionId: string;
@@ -28,7 +22,7 @@ export type InboxItem = InboxLocation & {
 
 export type InboxOutcome = {
   key: string;
-  kind: 'turn-completed' | 'turn-failed' | 'check-failed';
+  kind: 'turn-completed' | 'check-failed';
   directory: string;
   agentId: string;
   sessionId: string;
@@ -84,7 +78,7 @@ export function loadInboxOutcomes(raw: string | null): InboxOutcome[] {
           item &&
           typeof item === 'object' &&
           typeof item.key === 'string' &&
-          ['turn-completed', 'turn-failed', 'check-failed'].includes(item.kind) &&
+          ['turn-completed', 'check-failed'].includes(item.kind) &&
           typeof item.directory === 'string' &&
           typeof item.agentId === 'string' &&
           typeof item.sessionId === 'string' &&
@@ -110,9 +104,26 @@ export function markInboxOutcomeRead(items: InboxOutcome[], key: string): InboxO
 }
 
 export function isInboxOutcome(item: InboxItem): boolean {
-  return (
-    item.kind === 'turn-completed' || item.kind === 'turn-failed' || item.kind === 'check-failed'
+  return item.kind === 'turn-completed' || item.kind === 'check-failed';
+}
+
+export function inboxTurnMessageIndex(
+  messages: { kind: 'user' | 'assistant'; created: number }[],
+  completedAt: number,
+): number | null {
+  const start = messages.findLastIndex(
+    (message) => message.kind === 'user' && message.created <= completedAt,
   );
+  if (start < 0) {
+    const assistant = messages.findLastIndex(
+      (message) => message.kind === 'assistant' && message.created <= completedAt,
+    );
+    return assistant < 0 ? null : assistant;
+  }
+  const next = messages.findIndex((message, index) => index > start && message.kind === 'user');
+  for (let index = (next < 0 ? messages.length : next) - 1; index > start; index--)
+    if (messages[index].kind === 'assistant') return index;
+  return start;
 }
 
 export const maxInboxSeen = 256;

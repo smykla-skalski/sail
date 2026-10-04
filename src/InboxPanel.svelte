@@ -93,11 +93,7 @@
               <button class="inbox-open" onclick={() => onopen(item)}>
                 <span class="inbox-location"
                   ><strong>{item.agent}</strong><span>
-                    · {item.kind === 'check-failed'
-                      ? 'Check failed'
-                      : item.kind === 'turn-failed'
-                        ? 'Turn failed'
-                        : 'Turn completed'}</span
+                    · {item.kind === 'check-failed' ? 'Check failed' : 'Turn completed'}</span
                   ></span
                 >
                 <span class="inbox-text">{item.text}</span>
