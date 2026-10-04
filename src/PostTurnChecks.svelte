@@ -11,7 +11,7 @@
     class="post-turn-check"
     data-check-id={check.id}
     role="group"
-    aria-label={`Post-turn check ${check.status}`}
+    aria-label={`${check.source} post-turn check ${check.status}: ${check.command}`}
   >
     <div class="post-turn-check-head">
       <strong>Post-turn check · {check.source}</strong>

@@ -66,7 +66,10 @@ describe('post-turn checks', () => {
   });
 
   after(async () => {
-    await browser.execute(() => localStorage.clear());
+    await browser.execute(() => {
+      localStorage.clear();
+      sessionStorage.removeItem('sail-e2e-settings');
+    });
     rmSync(repository, { recursive: true, force: true });
   });
 
@@ -150,6 +153,48 @@ describe('post-turn checks', () => {
     );
     await expect($('.notice.error')).toHaveText(
       expect.stringContaining('Could not load repository post-turn checks'),
+    );
+  });
+
+  it('runs independent checks together while history stays readable', async () => {
+    const commands = ["sleep 4; printf 'first'", "sleep 4; printf 'second'"];
+    await browser.execute(async (checks) => {
+      const value = JSON.stringify(checks);
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('save_setting', { key: 'sai-post-turn-personal', value });
+      localStorage.setItem('sai-post-turn-personal', value);
+    }, commands);
+    await browser.refresh();
+    await completeTurn('Parallel checks');
+    const statuses = async () =>
+      browser.execute(async (expected) => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        const checks: unknown = await tauri.core.invoke('list_post_turn_checks');
+        if (!Array.isArray(checks)) throw new Error('Check history missing');
+        return checks
+          .filter(
+            (item: unknown) =>
+              item !== null &&
+              typeof item === 'object' &&
+              expected.includes(Reflect.get(item, 'command')),
+          )
+          .map((item: unknown) => Reflect.get(item, 'status'));
+      }, commands);
+    try {
+      await browser.waitUntil(
+        async () => (await statuses()).filter((status) => status === 'running').length === 2,
+      );
+    } catch (cause) {
+      console.error('Parallel check diagnostic', {
+        statuses: await statuses(),
+        setting: await browser.execute(() => localStorage.getItem('sai-post-turn-personal')),
+        cards: await $$('.post-turn-check').map((card) => card.getText()),
+        body: await browser.execute(() => document.body.innerText.slice(-3000)),
+      });
+      throw cause;
+    }
+    await browser.waitUntil(
+      async () => (await statuses()).filter((status) => status === 'passed').length === 2,
     );
   });
 });

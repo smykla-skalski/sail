@@ -14,7 +14,7 @@ const MAX_OUTPUT: usize = 32 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
-pub struct CheckLock(pub Arc<Mutex<()>>);
+pub struct CheckLock(pub Arc<Mutex<HashSet<String>>>);
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,11 +185,11 @@ pub fn list_post_turn_checks(
     app: AppHandle,
     lock: State<'_, CheckLock>,
 ) -> Result<Vec<CheckResult>, String> {
-    let _guard = lock.0.lock().map_err(|error| error.to_string())?;
+    let active = lock.0.lock().map_err(|error| error.to_string())?;
     let mut checks = history(&app)?;
     let mut changed = false;
     for check in &mut checks {
-        if check.status == "running" {
+        if check.status == "running" && !active.contains(&check.id) {
             check.status = "canceled".into();
             check.updated = now_ms();
             check.output = "Sail closed while this check was running.".into();
@@ -222,7 +222,6 @@ pub async fn run_post_turn_check(
     let directory = canonical_directory(&directory)?;
     let mutex = lock.inner().0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = mutex.lock().map_err(|error| error.to_string())?;
         if !configured(&app, &directory, &source, &command)? {
             return Err("Check command changed. Reload its configuration.".into());
         }
@@ -234,6 +233,7 @@ pub async fn run_post_turn_check(
                 return Err("Repository check needs approval.".into());
             }
         }
+        let mut active = mutex.lock().map_err(|error| error.to_string())?;
         let mut checks = history(&app)?;
         let position = checks.iter().position(|item| {
             item.directory == directory
@@ -270,6 +270,8 @@ pub async fn run_post_turn_check(
             checks.push(result.clone());
         }
         save_history(&app, &checks)?;
+        active.insert(result.id.clone());
+        drop(active);
         match execute(&directory, &command) {
             Ok((status, code, output)) => {
                 result.status = status;
@@ -282,6 +284,9 @@ pub async fn run_post_turn_check(
             }
         }
         result.updated = now_ms();
+        let mut active = mutex.lock().map_err(|error| error.to_string())?;
+        active.remove(&result.id);
+        let mut checks = history(&app)?;
         if let Some(item) = checks.iter_mut().find(|item| {
             item.directory == result.directory
                 && item.thread == result.thread

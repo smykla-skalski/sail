@@ -23,7 +23,11 @@ export function personalChecks(raw: string | null): string[] {
 }
 
 export function upsertCheck(checks: PostTurnCheck[], next: PostTurnCheck): PostTurnCheck[] {
-  const key = (item: PostTurnCheck) =>
-    JSON.stringify([item.directory, item.thread, item.turn, item.source, item.command]);
-  return [...checks.filter((item) => key(item) !== key(next)), next];
+  return [...checks.filter((item) => checkKey(item) !== checkKey(next)), next];
+}
+
+export function checkKey(
+  item: Pick<PostTurnCheck, 'directory' | 'thread' | 'turn' | 'source' | 'command'>,
+): string {
+  return JSON.stringify([item.directory, item.thread, item.turn, item.source, item.command]);
 }

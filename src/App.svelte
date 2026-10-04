@@ -22,7 +22,12 @@
   import type { GitHubIssue, PullRequestCheck } from './ProjectSidebar.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
-  import { personalChecks, upsertCheck, type PostTurnCheck } from './lib/post-turn-checks';
+  import {
+    checkKey,
+    personalChecks,
+    upsertCheck,
+    type PostTurnCheck,
+  } from './lib/post-turn-checks';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import SkillMenu from './SkillMenu.svelte';
@@ -1312,27 +1317,9 @@
     if (isTauri()) {
       void invoke<PostTurnCheck[]>('list_post_turn_checks').then(
         (checks) => {
+          const currentKeys = new Set(postTurnResults.map(checkKey));
           postTurnResults = [
-            ...checks.filter(
-              (stored) =>
-                !postTurnResults.some(
-                  (current) =>
-                    JSON.stringify([
-                      current.directory,
-                      current.thread,
-                      current.turn,
-                      current.source,
-                      current.command,
-                    ]) ===
-                    JSON.stringify([
-                      stored.directory,
-                      stored.thread,
-                      stored.turn,
-                      stored.source,
-                      stored.command,
-                    ]),
-                ),
-            ),
+            ...checks.filter((stored) => !currentKeys.has(checkKey(stored))),
             ...postTurnResults,
           ];
           return undefined;
@@ -5269,21 +5256,10 @@
   }
 
   async function runOnePostTurnCheck(check: PostTurnCheck, retry = false) {
-    const key = JSON.stringify([
-      check.directory,
-      check.thread,
-      check.turn,
-      check.source,
-      check.command,
-    ]);
+    const key = checkKey(check);
     if (
       pendingPostTurnChecks.has(key) ||
-      (!retry &&
-        postTurnResults.some(
-          (item) =>
-            JSON.stringify([item.directory, item.thread, item.turn, item.source, item.command]) ===
-            key,
-        ))
+      (!retry && postTurnResults.some((item) => checkKey(item) === key))
     )
       return;
     pendingPostTurnChecks.add(key);
