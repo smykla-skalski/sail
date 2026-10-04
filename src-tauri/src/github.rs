@@ -267,7 +267,12 @@ fn graph_aliases(graph: &IssueGraphDraft) -> HashMap<String, String> {
     let mut aliases = graph
         .issues
         .iter()
-        .map(|issue| (alias_key(&issue.id), issue.id.clone()))
+        .map(|issue| {
+            (
+                alias_key(&issue.id, graph.repository.as_deref()),
+                issue.id.clone(),
+            )
+        })
         .collect::<HashMap<_, _>>();
     for issue in &graph.issues {
         aliases.insert(issue.id.clone(), issue.id.clone());
@@ -275,7 +280,10 @@ fn graph_aliases(graph: &IssueGraphDraft) -> HashMap<String, String> {
     for issue in &graph.issues {
         if let Some(number) = issue.number {
             if let Some(repo) = issue.repository.as_ref().or(graph.repository.as_ref()) {
-                aliases.insert(alias_key(&format!("{repo}#{number}")), issue.id.clone());
+                aliases.insert(
+                    alias_key(&format!("{repo}#{number}"), graph.repository.as_deref()),
+                    issue.id.clone(),
+                );
             }
             if issue.repository.as_ref().is_none_or(|repo| {
                 graph
@@ -290,17 +298,19 @@ fn graph_aliases(graph: &IssueGraphDraft) -> HashMap<String, String> {
     aliases
 }
 
-fn alias_key(reference: &str) -> String {
+fn alias_key(reference: &str, target: Option<&str>) -> String {
     if let Some((repository, number)) = reference.rsplit_once('#') {
-        if repository.contains('/')
-            && number
-                .parse::<u64>()
-                .ok()
-                .filter(|number| *number > 0)
-                .is_some()
-        {
-            return format!("{}#{number}", repository.to_ascii_lowercase());
+        if repository.contains('/') {
+            if let Some(number) = number.parse::<u64>().ok().filter(|number| *number > 0) {
+                if target.is_some_and(|target| repository.eq_ignore_ascii_case(target)) {
+                    return number.to_string();
+                }
+                return format!("{}#{number}", repository.to_ascii_lowercase());
+            }
         }
+    }
+    if let Some(number) = reference.parse::<u64>().ok().filter(|number| *number > 0) {
+        return number.to_string();
     }
     reference.to_string()
 }
@@ -329,7 +339,7 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
         if issue.id.trim().is_empty() || !ids.insert(issue.id.as_str()) {
             return Err(format!("Duplicate or empty issue ID: {}.", issue.id));
         }
-        if aliases.get(&alias_key(&issue.id)) != Some(&issue.id) {
+        if aliases.get(&alias_key(&issue.id, graph.repository.as_deref())) != Some(&issue.id) {
             return Err(format!(
                 "Issue ID {} conflicts with an issue reference.",
                 issue.id
@@ -362,10 +372,8 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
         }
         let mut dependencies = HashSet::new();
         for dependency in &issue.depends_on {
-            let canonical = aliases
-                .get(&alias_key(dependency))
-                .map(String::as_str)
-                .unwrap_or(dependency);
+            let key = alias_key(dependency, graph.repository.as_deref());
+            let canonical = aliases.get(&key).cloned().unwrap_or(key);
             if !dependencies.insert(canonical) {
                 return Err(format!("{} repeats dependency {dependency}.", issue.id));
             }
@@ -380,6 +388,7 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
         id: &str,
         by_id: &HashMap<&str, &IssueDraft>,
         aliases: &HashMap<String, String>,
+        target: Option<&str>,
         visiting: &mut HashSet<String>,
         visited: &mut HashSet<String>,
     ) -> Result<(), String> {
@@ -393,8 +402,8 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
             .get(id)
             .ok_or_else(|| format!("Missing issue {id}."))?;
         for dependency in &issue.depends_on {
-            if let Some(local) = aliases.get(&alias_key(dependency)) {
-                visit(local, by_id, aliases, visiting, visited)?;
+            if let Some(local) = aliases.get(&alias_key(dependency, target)) {
+                visit(local, by_id, aliases, target, visiting, visited)?;
             } else if dependency
                 .parse::<u64>()
                 .ok()
@@ -425,7 +434,14 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
     for issue in &graph.issues {
-        visit(&issue.id, &by_id, &aliases, &mut visiting, &mut visited)?;
+        visit(
+            &issue.id,
+            &by_id,
+            &aliases,
+            graph.repository.as_deref(),
+            &mut visiting,
+            &mut visited,
+        )?;
     }
     Ok(())
 }
@@ -737,7 +753,7 @@ fn publish_graph(repository: String, mut graph: IssueGraphDraft) -> Result<Publi
     let aliases = graph_aliases(&resolved_graph);
     for draft in &mut resolved_graph.issues {
         for dependency in &mut draft.depends_on {
-            if let Some(id) = aliases.get(&alias_key(dependency)) {
+            if let Some(id) = aliases.get(&alias_key(dependency, graph.repository.as_deref())) {
                 *dependency = id.clone();
             }
         }
@@ -762,6 +778,20 @@ fn publish_graph(repository: String, mut graph: IssueGraphDraft) -> Result<Publi
                 return Err(format!("Dependency #{number} is closed."));
             }
             external.insert(dependency.clone(), value);
+        }
+    }
+    for draft in &graph.issues {
+        let mut seen = std::collections::HashSet::new();
+        for dependency in &draft.depends_on {
+            if let Some(value) = existing
+                .get(dependency)
+                .or_else(|| external.get(dependency))
+            {
+                let id = value["id"].as_u64().ok_or("GitHub dependency has no ID.")?;
+                if !seen.insert(id) {
+                    return Err(format!("{} repeats dependency {dependency}.", draft.id));
+                }
+            }
         }
     }
     validate_reachable_dependencies(&repository, &graph, &existing, &external)?;
@@ -1724,7 +1754,13 @@ mod tests {
         assert!(validate_graph(&graph).unwrap_err().contains("cycle"));
         graph.issues[1].depends_on = vec!["Owner/Main#3".into()];
         assert!(validate_graph(&graph).unwrap_err().contains("cycle"));
+        graph.issues[1].depends_on = vec!["Owner/Main#003".into()];
+        assert!(validate_graph(&graph).unwrap_err().contains("cycle"));
+        graph.issues[1].depends_on = vec!["003".into()];
+        assert!(validate_graph(&graph).unwrap_err().contains("cycle"));
         graph.issues[0].depends_on.clear();
+        graph.issues[1].depends_on = vec!["11".into(), "Owner/Main#11".into()];
+        assert!(validate_graph(&graph).unwrap_err().contains("repeats"));
         graph.issues[1].depends_on = vec!["a".into(), "owner/main#3".into()];
         assert!(validate_graph(&graph).unwrap_err().contains("repeats"));
         graph.issues[1].depends_on.clear();

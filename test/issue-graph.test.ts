@@ -154,6 +154,13 @@ await test('qualified local references cannot hide a cycle or repeat a blocker',
     /repeats/,
   );
   assert.match(
+    graphErrors({
+      ...qualified,
+      issues: [graph.issues[0], { ...graph.issues[1], dependsOn: ['11', 'Owner/Main#11'] }],
+    }).join(' '),
+    /repeats/,
+  );
+  assert.match(
     graphErrors({ ...qualified, issues: [{ ...graph.issues[0], id: 'umbrella' }] }).join(' '),
     /reserved/,
   );
