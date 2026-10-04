@@ -2387,7 +2387,7 @@
       !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
     )
       throw new Error('List every implementation model.');
-    const activeModels = activeImplementationModels(request.directory);
+    const activeModels = await activeImplementationModels(request.directory);
     if (!activeModels)
       throw new Error('The active implementation model is unknown. Wait for the turn to finish.');
     const usedModels = [
@@ -6941,7 +6941,12 @@
     let current = selection;
     const path = directory;
     const text = draft.trim();
-    beginShipItRun(path, text);
+    try {
+      beginShipItRun(path, text);
+    } catch (cause) {
+      error = describe(cause);
+      return;
+    }
     const queueTurn = running;
     const files = [...attachedFiles];
     let accepted = false;

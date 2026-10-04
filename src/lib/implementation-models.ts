@@ -44,9 +44,14 @@ export function implementationAttributionUncertain(directory: string): boolean {
   return getSetting(uncertainKey(directory)) === '1';
 }
 
-export function activeImplementationModels(directory: string): string[] | null {
+export async function activeImplementationModels(directory: string): Promise<string[] | null> {
   const active = [...(activeTurns.get(directory) ?? [])];
-  return active.every((turn) => turn.model) ? active.map((turn) => turn.model!) : null;
+  if (!active.length) return [];
+  const revision = await invoke<string>('working_tree_revision', { path: directory });
+  const changed = active.filter((turn) => turn.before !== revision);
+  return changed.every((turn) => turn.model && !turn.overlapped)
+    ? changed.map((turn) => turn.model!)
+    : null;
 }
 
 export function beginShipItRun(directory: string, prompt: string): void {

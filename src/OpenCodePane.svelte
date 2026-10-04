@@ -440,7 +440,12 @@
   async function send(externalText?: string) {
     const external = externalText !== undefined;
     const text = (externalText ?? draft).trim();
-    beginShipItRun(directory, text);
+    try {
+      beginShipItRun(directory, text);
+    } catch (cause) {
+      error = describe(cause);
+      return;
+    }
     if (!client || (!text && (external || !files.length)) || !inputReady || sending) {
       if (external) throw new Error('Wait for the current OpenCode turn.');
       return;

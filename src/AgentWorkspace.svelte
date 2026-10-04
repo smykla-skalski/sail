@@ -832,7 +832,12 @@
     const text =
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
-    beginShipItRun(directory, text);
+    try {
+      beginShipItRun(directory, text);
+    } catch (cause) {
+      error = describe(cause);
+      return;
+    }
     const command = text.toLowerCase();
     if (
       !external &&

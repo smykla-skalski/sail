@@ -71,13 +71,22 @@ void test('active implementation models are available before turns finish', asyn
   });
   const directory = '/test/active-models';
   const known = await beginImplementationTurn(directory, 'provider:model-a');
-  assert.deepEqual(activeImplementationModels(directory), ['provider:model-a']);
+  assert.deepEqual(await activeImplementationModels(directory), []);
+  let revision = 'same';
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => revision } },
+  });
+  revision = 'changed';
+  assert.deepEqual(await activeImplementationModels(directory), ['provider:model-a']);
   const unknown = await beginImplementationTurn(directory);
-  assert.equal(activeImplementationModels(directory), null);
+  assert.equal(await activeImplementationModels(directory), null);
+  revision = 'changed-again';
+  assert.equal(await activeImplementationModels(directory), null);
   abandonImplementationTurn(directory, unknown);
-  assert.deepEqual(activeImplementationModels(directory), ['provider:model-a']);
+  assert.equal(await activeImplementationModels(directory), null);
   abandonImplementationTurn(directory, known);
-  assert.deepEqual(activeImplementationModels(directory), []);
+  assert.deepEqual(await activeImplementationModels(directory), []);
 });
 
 void test('shipping preserves models from implementation before the first run', async () => {
