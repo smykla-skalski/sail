@@ -111,6 +111,10 @@ function configOptions(sessionId) {
 const availableCommands = [
   { name: 'ship-issue', description: 'Implement and ship a GitHub issue' },
   { name: 'review', description: 'Review a change' },
+  ...Array.from({ length: 10 }, (_, index) => ({
+    name: `fixture-${index}`,
+    description: `Fixture command ${index}`,
+  })),
 ];
 
 function requestPermission(sessionId, text, promptId) {

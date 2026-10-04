@@ -19,7 +19,14 @@
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import SkillMenu from './SkillMenu.svelte';
-  import { matchingSkills, skillQuery, type SkillChoice } from './lib/skills';
+  import {
+    matchingSkills,
+    mergeSkills,
+    resolveSkillPrompt,
+    skillQuery,
+    type SkillChoice,
+  } from './lib/skills';
+  import { bundledSkills } from './lib/bundled-skills';
   import {
     agentQueuePaused,
     queuedAgentMessages,
@@ -138,7 +145,7 @@
   let draft = $state('');
   let recoveredDraft = false;
   let recoveryEligible = false;
-  let skills = $state<SkillChoice[]>([]);
+  let skills = $state<SkillChoice[]>(bundledSkills);
   const commandUpdates: Record<string, unknown[]> = {};
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
@@ -170,17 +177,23 @@
   });
 
   function updateSkills(value: unknown[]) {
-    skills = value
-      .filter(
-        (item): item is { name: string; description?: string } =>
-          typeof item === 'object' &&
-          item !== null &&
-          'name' in item &&
-          typeof item.name === 'string' &&
-          (!('description' in item) || typeof item.description === 'string'),
-      )
-      .map((item) => ({ name: item.name.replace(/^\//, ''), description: item.description ?? '' }))
-      .filter((item) => item.name !== 'model' && item.name !== 'effort');
+    skills = mergeSkills(
+      value
+        .filter(
+          (item): item is { name: string; description?: string } =>
+            typeof item === 'object' &&
+            item !== null &&
+            'name' in item &&
+            typeof item.name === 'string' &&
+            (!('description' in item) || typeof item.description === 'string'),
+        )
+        .map((item) => ({
+          name: item.name.replace(/^\//, ''),
+          description: item.description ?? '',
+        }))
+        .filter((item) => item.name !== 'model' && item.name !== 'effort'),
+      bundledSkills,
+    );
   }
 
   function chooseSkill(skill: SkillChoice) {
@@ -535,7 +548,7 @@
     historyLoading = false;
     historyAttempted = false;
     configOptions = [];
-    skills = [];
+    skills = bundledSkills;
     queued =
       id && id === previousSessionId
         ? previousQueue
@@ -886,10 +899,11 @@
           thread: `acp:${turnAgent}:${id}`,
         });
       }
+      const skillText = resolveSkillPrompt(skills, text);
       const promptText =
         ephemeral && seedContext && entries.length === 1
-          ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${text}`
-          : text;
+          ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
+          : skillText;
       phase = 'prompt';
       const result = await acp.prompt(
         turnAgent,
@@ -1082,7 +1096,7 @@
       .steer(
         turnAgent,
         sessionId,
-        withAttachedFiles(next.text, next.attachments),
+        withAttachedFiles(resolveSkillPrompt(skills, next.text), next.attachments),
         promptImagePaths(next.images, next.attachments),
       )
       .catch(() => ({ outcome: 'failed' as const }));

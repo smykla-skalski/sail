@@ -31,7 +31,14 @@
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import SkillMenu from './SkillMenu.svelte';
-  import { matchingSkills, promptSkill, type SkillChoice } from './lib/skills';
+  import {
+    matchingSkills,
+    mergeSkills,
+    promptSkill,
+    resolveSkillPrompt,
+    type SkillChoice,
+  } from './lib/skills';
+  import { bundledSkills } from './lib/bundled-skills';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import {
     prepareToolFailureDraft,
@@ -665,7 +672,7 @@
   let draft = $state('');
   const failureRequests = new SvelteMap<string, string>();
   let mainPrompt = $state<HTMLTextAreaElement | undefined>();
-  let skills = $state<SkillChoice[]>([]);
+  let skills = $state<SkillChoice[]>(bundledSkills);
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
   const skillMatches = $derived(matchingSkills(skills, draft));
@@ -674,22 +681,25 @@
     const path = directory;
     const canLoad = setup?.workReady || setup?.planReady;
     if (!source || !path || !canLoad) {
-      skills = [];
+      skills = bundledSkills;
       return;
     }
     let cancelled = false;
     void source.skill.list({ location: { directory: path } }).then(
       (result) => {
         if (!cancelled)
-          skills = result.data.map((skill) => ({
-            id: skill.id,
-            name: skill.name,
-            description: skill.description ?? '',
-          }));
+          skills = mergeSkills(
+            result.data.map((skill) => ({
+              id: skill.id,
+              name: skill.name,
+              description: skill.description ?? '',
+            })),
+            bundledSkills,
+          );
         return undefined;
       },
       () => {
-        if (!cancelled) skills = [];
+        if (!cancelled) skills = bundledSkills;
         return undefined;
       },
     );
@@ -3044,7 +3054,7 @@
         ? await invoke<GitHubIssue>('open_issue', { repository: path, number: issue.number })
         : null;
       issuePrompt = currentIssue
-        ? `Work on GitHub issue #${currentIssue.number}: ${currentIssue.title}\n${currentIssue.url}\n\n${currentIssue.body}`
+        ? `/ship-it ${currentIssue.url}\n\nSail already created this issue worktree and branch. Stay here; skip branch creation and cleanup. Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread.`
         : null;
       worktreeCreations = worktreeCreations.map((creation) =>
         creation.id === id ? { ...creation, stage: 'Creating worktree' } : creation,
@@ -6713,7 +6723,7 @@
         await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
         return source.session.prompt({
           sessionID: id,
-          text,
+          text: resolveSkillPrompt(skills, text),
           skills: promptSkill(skills, text)?.id
             ? [{ id: promptSkill(skills, text)!.id! }]
             : undefined,
