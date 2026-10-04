@@ -2349,7 +2349,6 @@
     const gatePrompt = prompt.trim();
     if (
       !Array.isArray(implementingModels) ||
-      !implementingModels.length ||
       !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
     )
       throw new Error('List every implementation model.');

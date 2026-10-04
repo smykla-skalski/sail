@@ -56,7 +56,7 @@ export function beginShipItRun(directory: string, prompt: string): void {
     /^\/ship-it\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
       firstLine,
     )?.[1];
-  const identity = issue ?? crypto.randomUUID();
+  const identity = issue ? `#${issue.match(/\d+$/)![0]}` : crypto.randomUUID();
   if (issue && getSetting(runKey(directory)) === identity) return;
   setSetting(runKey(directory), identity);
   setSetting(key(directory), '[]');
@@ -88,7 +88,10 @@ export async function recordImplementationModel(
       setSetting(uncertainKey(directory), '1');
       return;
     }
-    if (!model) return;
+    if (!model) {
+      setSetting(uncertainKey(directory), '1');
+      return;
+    }
     const models = implementationModels(directory);
     if (!models.includes(model)) setSetting(key(directory), JSON.stringify([...models, model]));
   } finally {

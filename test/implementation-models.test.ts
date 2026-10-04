@@ -24,6 +24,8 @@ void test('a second issue in the same worktree starts with a fresh implementatio
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-a']));
   beginShipItRun(directory, '/ship-it #1');
   assert.deepEqual(implementationModels(directory), ['model-a']);
+  beginShipItRun(directory, '/ship-it https://github.com/example/repo/issues/1');
+  assert.deepEqual(implementationModels(directory), ['model-a']);
   beginShipItRun(directory, '/ship-it #2');
   assert.deepEqual(implementationModels(directory), []);
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-b']));
@@ -73,4 +75,26 @@ void test('active implementation models are available before turns finish', asyn
   assert.deepEqual(activeImplementationModels(directory), ['provider:model-a']);
   abandonImplementationTurn(directory, known);
   assert.deepEqual(activeImplementationModels(directory), []);
+});
+
+void test('an edit by a turn with an unknown model blocks strict attribution', async () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  let revision = 'before';
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => revision } },
+  });
+  const directory = '/test/unknown-model';
+  beginShipItRun(directory, '/ship-it #4');
+  const turn = await beginImplementationTurn(directory);
+  revision = 'after';
+  await recordImplementationModel(directory, undefined, turn);
+  assert.equal(implementationAttributionUncertain(directory), true);
 });
