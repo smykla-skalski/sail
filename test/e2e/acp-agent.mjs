@@ -338,6 +338,53 @@ for await (const line of createInterface({ input: process.stdin })) {
     const user = { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } };
     sessions.get(sessionId).history.push(user);
     update(sessionId, user);
+    if (text === 'Hook failure demo') {
+      const record = (value) => {
+        sessions.get(sessionId).history.push(value);
+        update(sessionId, value);
+      };
+      record({
+        sessionUpdate: 'tool_call',
+        toolCallId: `hook-${message.id}`,
+        title: 'Commit changes',
+        status: 'pending',
+        rawInput: { command: 'git commit -m test' },
+      });
+      record({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: `hook-${message.id}`,
+        status: 'failed',
+        content: [
+          {
+            type: 'content',
+            content: { type: 'text', text: 'PreToolUse:Bash says: ❌ GIT010: Old reason' },
+          },
+        ],
+      });
+      record({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: `hook-${message.id}`,
+        status: 'failed',
+        content: [
+          {
+            type: 'content',
+            content: { type: 'text', text: 'PreToolUse:Bash says: ❌ GIT010: Add -s -S flags' },
+          },
+        ],
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text.startsWith('Fix the hook-blocked action below.')) {
+      const reply = {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'I will add the required flags.' },
+      };
+      sessions.get(sessionId).history.push(reply);
+      update(sessionId, reply);
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Activity demo' || text === 'Activity failure demo') {
       const failureDemo = text === 'Activity failure demo';
       const record = (value) => {
