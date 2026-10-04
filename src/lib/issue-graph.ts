@@ -100,6 +100,11 @@ export function rebaseIssueGraph(previous: IssueGraphDraft | null, plan: Plan): 
   };
 }
 
+function aliasKey(reference: string): string {
+  const match = /^([^/#]+\/[^/#]+)#([1-9]\d*)$/.exec(reference);
+  return match ? `${match[1].toLowerCase()}#${match[2]}` : reference;
+}
+
 export function graphErrors(graph: IssueGraphDraft): string[] {
   const errors: string[] = [];
   if (!graph.source.trim()) errors.push('Issue graph has no source.');
@@ -113,11 +118,12 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
     errors.push('Enter a valid umbrella number.');
   const ids = new Set<string>();
   const numbers = new Set<string>();
-  const aliases = new Map(graph.issues.map((issue) => [issue.id, issue.id]));
+  const aliases = new Map(graph.issues.map((issue) => [aliasKey(issue.id), issue.id]));
+  for (const issue of graph.issues) aliases.set(issue.id, issue.id);
   for (const issue of graph.issues) {
     if (!issue.number) continue;
     const repo = issue.repository ?? graph.repository;
-    if (repo) aliases.set(`${repo}#${issue.number}`, issue.id);
+    if (repo) aliases.set(aliasKey(`${repo}#${issue.number}`), issue.id);
     if (!issue.repository || issue.repository === graph.repository)
       aliases.set(String(issue.number), issue.id);
   }
@@ -126,7 +132,7 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
     if (!issue.id.trim() || ids.has(issue.id))
       errors.push(`Duplicate or empty issue ID: ${issue.id || '(empty)'}.`);
     ids.add(issue.id);
-    if (aliases.get(issue.id) !== issue.id)
+    if (aliases.get(aliasKey(issue.id)) !== issue.id)
       errors.push(`Issue ID ${issue.id} conflicts with an issue reference.`);
     if (!issue.title.trim()) errors.push(`Enter a title for ${issue.id || 'the issue'}.`);
     if (issue.number !== undefined) {
@@ -139,7 +145,9 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
       if (local && issue.number === graph.umbrellaNumber)
         errors.push('An umbrella cannot be its own child.');
     }
-    const canonical = issue.dependsOn.map((dependency) => aliases.get(dependency) ?? dependency);
+    const canonical = issue.dependsOn.map(
+      (dependency) => aliases.get(aliasKey(dependency)) ?? dependency,
+    );
     if (new Set(canonical).size !== canonical.length)
       errors.push(`${issue.id} repeats a dependency.`);
   }
@@ -154,7 +162,7 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
     if (visited.has(id)) return;
     visiting.add(id);
     for (const dependency of byId.get(id)?.dependsOn ?? []) {
-      const local = aliases.get(dependency);
+      const local = aliases.get(aliasKey(dependency));
       if (local) visit(local);
       else if (!/^(?:[1-9]\d*|[^/#]+\/[^/#]+#[1-9]\d*)$/.test(dependency))
         errors.push(`${id} depends on missing issue ${dependency}.`);
