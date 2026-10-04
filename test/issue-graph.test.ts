@@ -87,6 +87,43 @@ await test('plan revision refreshes scope while retaining issue numbers', async 
   const updated = rebaseIssueGraph({ ...graph, umbrellaNumber: 9, replaceExisting: true }, plan);
   assert.equal(updated.issues[0].number, 3);
   assert.equal(updated.issues[0].title, 'Revised first');
-  assert.equal(updated.umbrellaNumber, 9);
+  assert.equal(updated.umbrellaNumber, undefined);
   assert.equal(updated.replaceExisting, true);
+});
+
+await test('issue ID and number are the same blocker', () => {
+  const duplicate = {
+    ...graph,
+    issues: [graph.issues[0], { ...graph.issues[1], dependsOn: ['a', '3'] }],
+  };
+  assert.match(graphErrors(duplicate).join(' '), /repeats a dependency/);
+});
+
+await test('revision to one issue releases an authored umbrella', async () => {
+  const { rebaseIssueGraph } = await import('../src/lib/issue-graph.ts');
+  const plan = {
+    title: 'One issue',
+    summary: 'Scope',
+    steps: [
+      {
+        id: 'a',
+        title: 'First',
+        detail: 'Scope',
+        files: [],
+        risk: 'low' as const,
+        status: 'proposed' as const,
+        origin: 'plan' as const,
+        touched: [],
+      },
+    ],
+    sessionID: 'session-1',
+    version: 3,
+    state: 'review' as const,
+    reviewReason: 'plan' as const,
+    outside: [],
+    createdAt: 1,
+  };
+  const updated = rebaseIssueGraph({ ...graph, umbrellaNumber: 9 }, plan);
+  assert.equal(updated.umbrellaNumber, undefined);
+  assert.equal(updated.issues[0].number, 3);
 });

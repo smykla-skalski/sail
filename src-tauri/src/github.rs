@@ -193,6 +193,15 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
     }
     let mut ids = HashSet::new();
     let mut numbers = HashSet::new();
+    let number_aliases: HashMap<String, &str> = graph
+        .issues
+        .iter()
+        .filter_map(|issue| {
+            issue
+                .number
+                .map(|number| (number.to_string(), issue.id.as_str()))
+        })
+        .collect();
     for issue in &graph.issues {
         if issue.id.trim().is_empty() || !ids.insert(issue.id.as_str()) {
             return Err(format!("Duplicate or empty issue ID: {}.", issue.id));
@@ -210,7 +219,11 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
         }
         let mut dependencies = HashSet::new();
         for dependency in &issue.depends_on {
-            if !dependencies.insert(dependency) {
+            let canonical = number_aliases
+                .get(dependency)
+                .copied()
+                .unwrap_or(dependency);
+            if !dependencies.insert(canonical) {
                 return Err(format!("{} repeats dependency {dependency}.", issue.id));
             }
         }
@@ -387,8 +400,10 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
     let umbrella_marker = marker(&graph.source, "umbrella");
     let umbrella = if let Some(number) = graph.umbrella_number {
         Some(github_issue(&repository, &target, number)?)
-    } else {
+    } else if graph.issues.len() > 1 {
         marked_issue(&all_issues, &umbrella_marker)?.cloned()
+    } else {
+        None
     };
     if let Some(value) = &umbrella {
         let issue = published_issue(value, "umbrella".into())?;
@@ -398,6 +413,7 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
     }
     let umbrella_number = umbrella.as_ref().and_then(|value| value["number"].as_u64());
     let mut existing = HashMap::new();
+    let mut old_parent = None;
     let mut resolved_numbers = std::collections::HashSet::new();
     for draft in &graph.issues {
         let value = if let Some(number) = draft.number {
@@ -415,25 +431,39 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
             }
             if let Some(parent) = issue_parent(&repository, &target, issue.number)? {
                 if Some(parent) != umbrella_number {
-                    return Err(format!(
-                        "Issue #{} already belongs to umbrella #{parent}.",
-                        issue.number
-                    ));
+                    let parent_issue = github_issue(&repository, &target, parent)?;
+                    let owned_parent = umbrella_number.is_none()
+                        && graph.issues.len() == 1
+                        && parent_issue["body"]
+                            .as_str()
+                            .is_some_and(|body| body.contains(&umbrella_marker));
+                    if owned_parent {
+                        old_parent = Some((
+                            parent,
+                            value["id"].as_u64().ok_or("GitHub issue has no ID.")?,
+                        ));
+                    } else {
+                        return Err(format!(
+                            "Issue #{} already belongs to umbrella #{parent}.",
+                            issue.number
+                        ));
+                    }
                 }
             }
             existing.insert(draft.id.clone(), value);
         }
     }
-    let recovered_managed = umbrella
+    let recovered_umbrella = umbrella
         .as_ref()
         .and_then(|value| value["body"].as_str())
-        .is_some_and(|body| body.contains(&umbrella_marker))
-        || existing.iter().any(|(id, value)| {
+        .is_some_and(|body| body.contains(&umbrella_marker));
+    let recovered_single = umbrella.is_none()
+        && existing.iter().any(|(id, value)| {
             value["body"]
                 .as_str()
                 .is_some_and(|body| body.contains(&marker(&graph.source, id)))
         });
-    let replace_existing = graph.replace_existing || recovered_managed;
+    let replace_existing = graph.replace_existing || recovered_umbrella || recovered_single;
     let mut resolved_graph = graph.clone();
     for draft in &mut resolved_graph.issues {
         if let Some(value) = existing.get(&draft.id) {
@@ -486,6 +516,14 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
         let mut issue = published_issue(&value, draft.id.clone())?;
         issue.depends_on = draft.depends_on.clone();
         issues.push((issue, value));
+    }
+    if let Some((parent, child_id)) = old_parent {
+        delete_issue_link(
+            &repository,
+            &format!("repos/{target}/issues/{parent}/sub_issue"),
+            "sub_issue_id",
+            child_id,
+        )?;
     }
     if let Some(parent_value) = &umbrella {
         let parent = published_issue(parent_value, "umbrella".into())?;
@@ -1293,6 +1331,9 @@ mod tests {
         graph.issues[0].depends_on = vec!["b".into()];
         assert!(validate_graph(&graph).unwrap_err().contains("cycle"));
         graph.issues[0].depends_on.clear();
+        graph.issues[1].depends_on = vec!["a".into(), "3".into()];
+        assert!(validate_graph(&graph).unwrap_err().contains("repeats"));
+        graph.issues[1].depends_on.clear();
         graph.issues[1].number = Some(3);
         assert!(validate_graph(&graph).unwrap_err().contains("duplicate"));
     }

@@ -75,7 +75,7 @@ export function rebaseIssueGraph(previous: IssueGraphDraft | null, plan: Plan): 
     return { ...previous, source: plan.sessionID };
   return {
     ...latest,
-    umbrellaNumber: previous.umbrellaNumber,
+    umbrellaNumber: latest.issues.length === 1 ? undefined : previous.umbrellaNumber,
     replaceExisting: previous.replaceExisting,
     issues: latest.issues.map((issue) => ({
       id: issue.id,
@@ -113,7 +113,11 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
       if (issue.number === graph.umbrellaNumber)
         errors.push('An umbrella cannot be its own child.');
     }
-    if (new Set(issue.dependsOn).size !== issue.dependsOn.length)
+    const aliases = new Map(
+      graph.issues.filter((item) => item.number).map((item) => [String(item.number), item.id]),
+    );
+    const canonical = issue.dependsOn.map((dependency) => aliases.get(dependency) ?? dependency);
+    if (new Set(canonical).size !== canonical.length)
       errors.push(`${issue.id} repeats a dependency.`);
   }
   const visiting = new Set<string>();
