@@ -108,6 +108,16 @@ describe('post-turn checks', () => {
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('repository check'));
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('personal check'));
     expect(readFileSync(join(repository, 'repository-runs.txt'), 'utf8')).toBe('run\n');
+    await $('[aria-label="Pending requests"]').click();
+    const failedCheck = $('//li[contains(@class, "inbox-result")][contains(., "Check failed")]');
+    await expect(failedCheck).toHaveText(expect.stringContaining('Check failed'));
+    await failedCheck.$('.inbox-open').click();
+    await browser.waitUntil(() =>
+      browser.execute(() => document.activeElement?.classList.contains('post-turn-check')),
+    );
+    await $('[aria-label="Pending requests"]').click();
+    await expect(failedCheck).not.toHaveAttribute('class', expect.stringContaining('unread'));
+    await $('[aria-label="Close pending requests"]').click();
     await $('.post-turn-check button').click();
     await browser.waitUntil(
       () => readFileSync(join(repository, 'personal-runs.txt'), 'utf8') === 'run\nrun\nrun\n',

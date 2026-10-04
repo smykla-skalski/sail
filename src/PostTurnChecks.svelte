@@ -10,6 +10,7 @@
   <article
     class="post-turn-check"
     data-check-id={check.id}
+    tabindex="-1"
     role="group"
     aria-label={`${check.source} post-turn check ${check.status}: ${check.command}`}
   >

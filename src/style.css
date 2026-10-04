@@ -2148,6 +2148,22 @@ button:disabled {
 .inbox-empty {
   color: var(--shell-muted);
 }
+.inbox-results-header {
+  margin-top: 24px;
+  padding-top: 18px;
+  border-top: 1px solid var(--shell-divider);
+}
+.inbox-group-heading {
+  margin: 18px 0 0;
+  color: var(--shell-muted);
+  font-size: 12px;
+}
+.inbox-group-heading + .inbox-list {
+  margin-top: 8px;
+}
+.inbox-result.unread {
+  border-color: var(--sui-primary);
+}
 .palette-search {
   display: flex;
   align-items: center;

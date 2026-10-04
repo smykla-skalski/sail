@@ -85,3 +85,15 @@ export function markAttentionRead(current: AttentionMap, key: string): Attention
   const value = current[key];
   return value?.unread ? { ...current, [key]: { ...value, unread: false } } : current;
 }
+
+export function preserveAttentionOnCheckOpen(
+  current: AttentionMap,
+  previous: AttentionMap,
+  key: string,
+): AttentionMap {
+  const before = previous[key];
+  const after = current[key];
+  if (!before || !after || before.status !== after.status || before.unread === after.unread)
+    return current;
+  return { ...current, [key]: { ...after, unread: before.unread } };
+}
