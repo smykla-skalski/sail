@@ -45,12 +45,19 @@
   import PaneTree from './PaneTree.svelte';
   import InboxPanel from './InboxPanel.svelte';
   import {
+    failedCheckOutcome,
     inboxLocations,
+    isInboxOutcome,
+    loadInboxOutcomes,
     loadInboxSeen,
+    markInboxOutcomeRead,
     maxInboxSeen,
     openCodeRequestTime,
+    recordInboxOutcome,
     sortInbox,
     type InboxItem,
+    type InboxCheck,
+    type InboxOutcome,
   } from './lib/inbox';
   import {
     locationName,
@@ -438,6 +445,7 @@
   let agentThreadListEnabled = $state(getSetting('sai-agent-thread-list-enabled') !== 'false');
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
   let inboxItems = $state<InboxItem[]>([]);
+  let inboxOutcomes = $state<InboxOutcome[]>(loadInboxOutcomes(getSetting('sai-inbox-outcomes')));
   let inboxLoading = $state(false);
   let inboxError = $state('');
   let inboxDialog: HTMLDialogElement;
@@ -2745,6 +2753,33 @@
     inboxRefreshTimer = setTimeout(() => void refreshInbox(), 150);
   }
 
+  function saveInboxOutcome(outcome: InboxOutcome) {
+    const next = recordInboxOutcome(inboxOutcomes, outcome);
+    if (next === inboxOutcomes) return;
+    inboxOutcomes = next;
+    setSetting('sai-inbox-outcomes', JSON.stringify(next));
+    scheduleInboxRefresh();
+  }
+
+  function recordTurnOutcome(
+    thread: AgentThread,
+    eventId: string,
+    status: 'done' | 'failed',
+    receivedAt = Date.now(),
+  ) {
+    saveInboxOutcome({
+      key: `turn:${threadKey(thread)}:${eventId}`,
+      kind: status === 'done' ? 'turn-completed' : 'turn-failed',
+      directory: thread.directory,
+      agentId: thread.agent,
+      sessionId: thread.sessionId,
+      text: status === 'done' ? `${thread.title} · completed` : `${thread.title} · failed`,
+      receivedAt,
+      eventId,
+      read: false,
+    });
+  }
+
   async function refreshInbox() {
     if (disposed) return;
     const generation = ++inboxGeneration;
@@ -2752,8 +2787,9 @@
     const locations = inboxLocations(projectCatalog);
     const byDirectory = new Map(locations.map((location) => [location.directory, location]));
     const source = client;
-    const [acpResult, ...openCodeResults] = await Promise.allSettled([
+    const [acpResult, checksResult, ...openCodeResults] = await Promise.allSettled([
       acp.pendingInbox(),
+      invoke<InboxCheck[]>('list_post_turn_checks').catch(() => []),
       ...(source
         ? locations.map(async (location) => {
             const [permissions, forms] = await Promise.all([
@@ -2852,6 +2888,27 @@
           receivedAt: openCodeRequestTime(form.id) ?? inboxTime(key),
         });
       }
+    }
+    const failedChecks =
+      checksResult.status === 'fulfilled'
+        ? checksResult.value
+            .map(failedCheckOutcome)
+            .filter((outcome): outcome is InboxOutcome => outcome !== null)
+        : [];
+    for (const outcome of [
+      ...inboxOutcomes.filter((item) => item.kind !== 'check-failed'),
+      ...failedChecks,
+    ]) {
+      const location = byDirectory.get(outcome.directory);
+      if (!location) continue;
+      const saved = inboxOutcomes.find((item) => item.key === outcome.key);
+      items.push({
+        ...location,
+        ...outcome,
+        read: saved?.receivedAt === outcome.receivedAt ? saved.read : false,
+        agent:
+          agentAvailability.find((agent) => agent.id === outcome.agentId)?.name ?? outcome.agentId,
+      });
     }
     inboxItems = sortInbox(items);
     inboxError =
@@ -4290,6 +4347,27 @@
 
   async function openInboxItem(item: InboxItem) {
     inboxDialog.close();
+    if (isInboxOutcome(item)) {
+      await jumpToRecentThread(JSON.stringify([item.agentId, item.directory, item.sessionId]));
+      const outcome: InboxOutcome = {
+        key: item.key,
+        kind: item.kind as InboxOutcome['kind'],
+        directory: item.directory,
+        agentId: item.agentId!,
+        sessionId: item.sessionId,
+        text: item.text,
+        receivedAt: item.receivedAt,
+        eventId: item.eventId,
+        read: false,
+      };
+      const previous = inboxOutcomes.filter((saved) => saved.key !== outcome.key);
+      const next = markInboxOutcomeRead(recordInboxOutcome(previous, outcome), item.key);
+      inboxOutcomes = next;
+      setSetting('sai-inbox-outcomes', JSON.stringify(next));
+      scheduleInboxRefresh();
+      await focusInboxOutcome(item);
+      return;
+    }
     if (item.kind === 'acp-permission') {
       const thread = agentThreads.find(
         (entry) =>
@@ -4305,6 +4383,34 @@
     await focusInboxRequest(item);
   }
 
+  async function focusInboxOutcome(item: InboxItem, attempts = 40): Promise<void> {
+    await tick();
+    if (item.kind === 'check-failed') {
+      const check = [...document.querySelectorAll<HTMLElement>('[data-check-id]')].find(
+        (element) => element.dataset.checkId === item.eventId && element.getClientRects().length,
+      );
+      if (check) {
+        check.scrollIntoView({ block: 'center' });
+        check.focus();
+        return;
+      }
+    }
+    const visibleMessages = [
+      ...document.querySelectorAll<HTMLElement>('.conversation .assistant-message[data-created]'),
+    ]
+      .filter((element) => element.getClientRects().length)
+      .filter((element) => Number(element.dataset.created) <= item.receivedAt);
+    const target = visibleMessages.at(-1);
+    if (target) {
+      target.scrollIntoView({ block: 'center' });
+      target.focus();
+      return;
+    }
+    if (attempts === 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return focusInboxOutcome(item, attempts - 1);
+  }
+
   async function decideInbox(item: InboxItem, optionId: string | null) {
     if (item.kind === 'acp-permission') {
       const thread = agentThreads.find(
@@ -4314,7 +4420,7 @@
           entry.directory === item.directory,
       );
       if (!thread) throw new Error('Thread is no longer available.');
-      await acp.permission(thread.agent, item.requestId, optionId);
+      await acp.permission(thread.agent, item.requestId!, optionId);
     } else if (item.kind === 'opencode-permission') {
       if (!client) throw new Error('OpenCode is not connected.');
       try {
@@ -5427,8 +5533,11 @@
       }
       for (const thread of agentThreads.filter(
         (item) => item.agent === event.agent && item.sessionId === sessionId,
-      ))
+      )) {
         updateAgentThreadStatus(thread, status, event.message.params?.notify !== false);
+        if (typeof turnId === 'string' && event.message.params?.notify !== false)
+          recordTurnOutcome(thread, turnId, status);
+      }
       for (const receipt of spawnReceipts.filter(
         (item) =>
           item.targetId === `acp:${event.agent}:${sessionId}` &&
@@ -6322,7 +6431,7 @@
             (item) =>
               item.sessionId === eventSession &&
               (!event.location?.directory || item.directory === event.location.directory),
-          ))
+          )) {
             updateAgentThreadStatus(
               thread,
               event.type === 'session.execution.started'
@@ -6332,6 +6441,17 @@
                   : 'done',
               event.type !== 'session.execution.interrupted',
             );
+            if (
+              event.type === 'session.execution.succeeded' ||
+              event.type === 'session.execution.failed'
+            )
+              recordTurnOutcome(
+                thread,
+                event.id,
+                event.type === 'session.execution.failed' ? 'failed' : 'done',
+                event.created,
+              );
+          }
         }
         if (
           eventSession === sessionID ||
@@ -7004,7 +7124,7 @@
       </div>
       <div class="topbar-actions">
         <Button variant="ghost" size="sm" aria-label="Pending requests" onclick={openInbox}
-          >Inbox ({inboxItems.length})</Button
+          >Inbox ({inboxItems.filter((item) => !isInboxOutcome(item) || !item.read).length})</Button
         >
         {#if directory}<Button
             variant="ghost"
@@ -7273,6 +7393,8 @@
                 {:else if message.type === 'assistant'}<article
                     class="message assistant-message"
                     data-message-id={message.id}
+                    data-created={message.time.created}
+                    tabindex="-1"
                   >
                     <div class="avatar agent-avatar">S.</div>
                     <div class="message-body">

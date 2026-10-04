@@ -54,8 +54,8 @@ describe('pending requests across projects', () => {
     await expect(entries[0]).toHaveText(expect.stringContaining(first.split('/').at(-1)!));
     await expect(entries[1]).toHaveText(expect.stringContaining(second.split('/').at(-1)!));
     await entries[0].$('.inbox-actions button').click();
-    await expect($$('.inbox-item')).toBeElementsArrayOfSize(1);
-    await $('.inbox-item .inbox-open').click();
+    await expect($$('.inbox-item:not(.inbox-result)')).toBeElementsArrayOfSize(1);
+    await $('.inbox-item:not(.inbox-result) .inbox-open').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await browser.waitUntil(() =>
       browser.execute(() => document.activeElement?.classList.contains('agent-permission')),
@@ -63,5 +63,48 @@ describe('pending requests across projects', () => {
     await $('.agent-permission button').click();
     await $('[aria-label="Pending requests"]').click();
     await expect($('.inbox-empty')).toHaveText('Nothing needs your input.');
+  });
+
+  it('keeps completed and failed turns as read or unread results', async () => {
+    await browser.execute((path) => {
+      sessionStorage.removeItem('sail-e2e-settings');
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sail-agent-threads');
+      localStorage.removeItem('sai-inbox-outcomes');
+      localStorage.setItem('sai-notifications-enabled', 'false');
+    }, realpathSync(first));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await $('.agent-composer textarea').waitForEnabled();
+    await $('.agent-composer textarea').setValue('Steer no-response follow-up');
+    await $('.agent-actions button').click();
+    await browser.waitUntil(async () => (await $$('.inbox-result')).length === 1);
+    await $('[aria-label="Pending requests"]').click();
+    await expect($('.inbox-result')).toHaveText(expect.stringContaining('Turn completed'));
+    await expect($('.inbox-result')).toHaveAttribute('class', expect.stringContaining('unread'));
+    await $('.inbox-result .inbox-open').click();
+    await expect($('.agent-message.assistant-message')).toBeDisplayed();
+    await browser.waitUntil(() =>
+      browser.execute(() => document.activeElement?.classList.contains('assistant-message')),
+    );
+    await $('[aria-label="Pending requests"]').click();
+    await expect($('.inbox-result')).not.toHaveAttribute(
+      'class',
+      expect.stringContaining('unread'),
+    );
+    await $('[aria-label="Close pending requests"]').click();
+    await $('.agent-composer textarea').setValue('Prompt failure');
+    await $('.agent-actions button').click();
+    await browser.waitUntil(async () => (await $$('.inbox-result')).length === 2);
+    await $('[aria-label="Pending requests"]').click();
+    await expect($$('.inbox-result')).toBeElementsArrayOfSize(2);
+    await expect($('.inbox-result')).toHaveText(expect.stringContaining('Turn failed'));
+    await browser.refresh();
+    await $('[aria-label="Pending requests"]').click();
+    await expect($$('.inbox-result')).toBeElementsArrayOfSize(2);
   });
 });

@@ -1447,6 +1447,8 @@
               class:assistant-message={entry.type !== 'user'}
               class:thought={entry.type === 'thought'}
               class="agent-message message"
+              data-created={entry.created}
+              tabindex="-1"
             >
               <div
                 class:agent-avatar={entry.type !== 'user'}
