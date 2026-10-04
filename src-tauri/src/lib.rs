@@ -890,9 +890,8 @@ async fn working_tree_revision(path: String) -> Result<String, String> {
             .filter(|record| record.len() >= 4)
         {
             let path = String::from_utf8_lossy(&record[3..]);
-            if let Ok(metadata) = Path::new(&root).join(path.as_ref()).symlink_metadata() {
-                metadata.len().hash(&mut hash);
-                metadata.modified().ok().hash(&mut hash);
+            let file_path = Path::new(&root).join(path.as_ref());
+            if let Ok(metadata) = file_path.symlink_metadata() {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -900,25 +899,39 @@ async fn working_tree_revision(path: String) -> Result<String, String> {
                 }
                 #[cfg(not(unix))]
                 metadata.permissions().readonly().hash(&mut hash);
+                if metadata.file_type().is_symlink() {
+                    std::fs::read_link(&file_path)
+                        .map_err(|error| error.to_string())?
+                        .hash(&mut hash);
+                } else if metadata.is_file() {
+                    let mut file =
+                        std::fs::File::open(&file_path).map_err(|error| error.to_string())?;
+                    let mut buffer = [0_u8; 8192];
+                    loop {
+                        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+                        if count == 0 {
+                            break;
+                        }
+                        buffer[..count].hash(&mut hash);
+                    }
+                }
             }
         }
-        let index = Command::new("git")
-            .args(["-C", &root, "rev-parse", "--git-path", "index"])
+        let head = Command::new("git")
+            .args(["-C", &root, "rev-parse", "HEAD"])
             .output()
             .map_err(|error| error.to_string())?;
-        if index.status.success() {
-            let path = String::from_utf8_lossy(&index.stdout);
-            let path = Path::new(path.trim());
-            let path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                Path::new(&root).join(path)
-            };
-            if let Ok(metadata) = path.metadata() {
-                metadata.len().hash(&mut hash);
-                metadata.modified().ok().hash(&mut hash);
-            }
+        if head.status.success() {
+            head.stdout.hash(&mut hash);
         }
+        let staged = Command::new("git")
+            .args(["-C", &root, "diff", "--cached", "--binary", "--no-ext-diff"])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !staged.status.success() {
+            return Err("Could not read staged working tree changes.".into());
+        }
+        staged.stdout.hash(&mut hash);
         Ok(format!("{:016x}", hash.finish()))
     })
     .await
@@ -1761,6 +1774,31 @@ mod tests {
         fs::set_permissions(&file, permissions).unwrap();
         let after = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
         assert_ne!(before, after);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_revision_ignores_index_metadata_refresh() {
+        let root =
+            std::env::temp_dir().join(format!("sail-revision-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        fs::write(root.join("file.txt"), "original\n").unwrap();
+        git(path, &["add", "file.txt"]);
+        git(path, &["commit", "-qm", "seed"]);
+        let before = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        let index = root.join(".git/index");
+        assert!(Command::new("touch").arg(index).status().unwrap().success());
+        let after = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        assert_eq!(before, after);
+        git(path, &["commit", "--allow-empty", "-qm", "next"]);
+        let committed = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        assert_ne!(after, committed);
         fs::remove_dir_all(root).unwrap();
     }
 
