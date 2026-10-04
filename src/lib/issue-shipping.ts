@@ -15,6 +15,7 @@ export interface ShipIssue {
   receiptId: string | null;
   threadId: string | null;
   pullRequest: string | null;
+  workerSettled?: boolean;
   archivePath?: string | null;
   error: string | null;
 }
@@ -74,6 +75,7 @@ export function createShipRun(
       receiptId: null,
       threadId: null,
       pullRequest: null,
+      workerSettled: false,
       archivePath: null,
       error: null,
     })),
@@ -87,7 +89,13 @@ export function readyShipIssues(run: ShipRun): ShipIssue[] {
     aliases.set(String(issue.number), issue);
     aliases.set(`${run.remote}#${issue.number}`, issue);
   }
-  const active = run.issues.filter((issue) => ['starting', 'working'].includes(issue.state)).length;
+  const active = run.issues.filter(
+    (issue) =>
+      ['starting', 'working'].includes(issue.state) ||
+      (issue.state === 'merged' &&
+        issue.workerSettled !== true &&
+        (!!issue.path || issue.workerSettled === false)),
+  ).length;
   return run.issues
     .filter(
       (issue) =>

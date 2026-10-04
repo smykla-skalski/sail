@@ -1815,9 +1815,19 @@
 
   async function refreshShippingIssue(run: ShipRun, issue: ShipIssue): Promise<void> {
     if (issue.state === 'merged') {
-      if (issue.path) {
+      if (issue.workerSettled && !issue.path) return;
+      if (!issue.workerSettled) {
         const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
-        if (receipt && !receiptIsSettled((await currentSpawnReceipt(receipt)).state)) return;
+        if (!receipt) {
+          await updateShipIssue(run, issue, {
+            error: 'Worker receipt is missing. Inspect its thread before cleanup.',
+          });
+          return;
+        }
+        if (!receiptIsSettled((await currentSpawnReceipt(receipt)).state)) return;
+        await updateShipIssue(run, issue, { workerSettled: true });
+      }
+      if (issue.path) {
         try {
           const archivePath = await invoke<string | null>('delete_worktree', {
             repository: run.repository,
@@ -1943,7 +1953,9 @@
     const protectedIds = new Set(
       shipRuns.flatMap((run) =>
         run.issues.flatMap((issue) =>
-          issue.receiptId && (issue.state !== 'merged' || issue.path) ? [issue.receiptId] : [],
+          issue.receiptId && (issue.state !== 'merged' || issue.workerSettled !== true)
+            ? [issue.receiptId]
+            : [],
         ),
       ),
     );

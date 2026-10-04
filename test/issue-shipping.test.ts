@@ -57,9 +57,22 @@ void test('launches ready issues within the limit and waits for merged dependenc
   shipping.issues[1].state = 'working';
   assert.deepEqual(readyShipIssues(shipping), []);
   shipping.issues[0].state = 'merged';
+  assert.deepEqual(readyShipIssues(shipping), []);
+  shipping.issues[0].workerSettled = true;
   assert.deepEqual(
     readyShipIssues(shipping).map((issue) => issue.id),
     ['dependent'],
+  );
+});
+
+void test('merged workers keep their slot until their turn settles', () => {
+  const shipping = run(1);
+  shipping.issues[0].state = 'merged';
+  assert.deepEqual(readyShipIssues(shipping), []);
+  shipping.issues[0].workerSettled = true;
+  assert.deepEqual(
+    readyShipIssues(shipping).map((issue) => issue.id),
+    ['second'],
   );
 });
 

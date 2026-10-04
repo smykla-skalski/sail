@@ -33,8 +33,7 @@ pub async fn shipping_pull_request(
             return Err("Invalid shipping branch.".to_string());
         }
         let worktree = Path::new(&repository);
-        let remote = branch_remote(worktree, &branch)?;
-        let (target, head) = pull_request_repos(worktree, &remote, &branch)?;
+        let target = target_repository(worktree)?;
         let output = gh_command(
             worktree,
             &[
@@ -43,7 +42,7 @@ pub async fn shipping_pull_request(
                 "--repo",
                 &target,
                 "--head",
-                &head,
+                &branch,
                 "--state",
                 "all",
                 "--json",
