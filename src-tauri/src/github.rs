@@ -62,6 +62,9 @@ struct IssueDraft {
 #[serde(rename_all = "camelCase")]
 struct IssueGraphDraft {
     umbrella_number: Option<u64>,
+    source: String,
+    #[serde(default)]
+    replace_existing: bool,
     title: String,
     body: String,
     issues: Vec<IssueDraft>,
@@ -115,7 +118,15 @@ fn published_issue(value: &serde_json::Value, id: String) -> Result<PublishedIss
         id,
         number,
         title: issue_field(value, "title")?,
-        body: value["body"].as_str().unwrap_or_default().to_string(),
+        body: value["body"]
+            .as_str()
+            .unwrap_or_default()
+            .split_once("\n\n<!-- sail-graph:")
+            .map_or_else(
+                || value["body"].as_str().unwrap_or_default(),
+                |(body, _)| body,
+            )
+            .to_string(),
         url: issue_field(value, "html_url")?,
         state: issue_field(value, "state")?.to_uppercase(),
         depends_on: Vec::new(),
@@ -168,6 +179,9 @@ fn issue_parent(directory: &Path, target: &str, number: u64) -> Result<Option<u6
 
 fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
     use std::collections::{HashMap, HashSet};
+    if graph.source.trim().is_empty() {
+        return Err("Issue graph has no source.".into());
+    }
     if graph.issues.is_empty() {
         return Err("Add at least one issue.".into());
     }
@@ -222,7 +236,16 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
             .get(id)
             .ok_or_else(|| format!("Missing issue {id}."))?;
         for dependency in &issue.depends_on {
-            visit(dependency, by_id, visiting, visited)?;
+            if by_id.contains_key(dependency.as_str()) {
+                visit(dependency, by_id, visiting, visited)?;
+            } else if dependency
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number > 0)
+                .is_none()
+            {
+                return Err(format!("Missing dependency {dependency}."));
+            }
         }
         visiting.remove(id);
         visited.insert(id);
@@ -256,68 +279,224 @@ fn create_issue(
     )
 }
 
+fn marker(source: &str, id: &str) -> String {
+    let key = format!("{source}:{id}");
+    let encoded = key
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("<!-- sail-graph:{encoded} -->")
+}
+
+fn marked_issue<'a>(
+    issues: &'a [serde_json::Value],
+    marker: &str,
+) -> Result<Option<&'a serde_json::Value>, String> {
+    let matches = issues
+        .iter()
+        .filter(|issue| {
+            issue["body"]
+                .as_str()
+                .is_some_and(|body| body.contains(marker))
+        })
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        return Err(format!("Multiple issues carry graph marker {marker}."));
+    }
+    Ok(matches.first().copied())
+}
+
+fn issue_body(body: &str, marker: &str) -> String {
+    format!("{}\n\n{marker}", body.trim_end())
+}
+
+fn save_issue(
+    directory: &Path,
+    target: &str,
+    existing: Option<serde_json::Value>,
+    title: &str,
+    body: &str,
+    marker: &str,
+) -> Result<serde_json::Value, String> {
+    let has_marker = existing.as_ref().is_none_or(|issue| {
+        issue["body"]
+            .as_str()
+            .is_some_and(|body| body.contains(marker))
+    });
+    let desired = if has_marker {
+        issue_body(body, marker)
+    } else {
+        body.to_string()
+    };
+    if let Some(issue) = existing {
+        if issue["title"].as_str() == Some(title) && issue["body"].as_str() == Some(&desired) {
+            return Ok(issue);
+        }
+        let number = issue["number"]
+            .as_u64()
+            .ok_or("GitHub issue has no number.")?;
+        issue_api(
+            directory,
+            &[
+                "-X",
+                "PATCH",
+                &format!("repos/{target}/issues/{number}"),
+                "-f",
+                &format!("title={title}"),
+                "-f",
+                &format!("body={desired}"),
+            ],
+        )
+    } else {
+        create_issue(directory, target, title, &desired)
+    }
+}
+
+fn delete_issue_link(directory: &Path, endpoint: &str, field: &str, id: u64) -> Result<(), String> {
+    gh_command(
+        directory,
+        &[
+            "api",
+            "-X",
+            "DELETE",
+            endpoint,
+            "-F",
+            &format!("{field}={id}"),
+        ],
+    )
+    .map(|_| ())
+}
+
 fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<PublishedGraph, String> {
     validate_graph(&graph)?;
     let (repository, target) = issue_repository(repository)?;
-    let umbrella = graph
-        .umbrella_number
-        .map(|number| github_issue(&repository, &target, number))
-        .transpose()?;
+    let needs_lookup =
+        graph.umbrella_number.is_none() || graph.issues.iter().any(|issue| issue.number.is_none());
+    let all_issues = if needs_lookup {
+        issue_pages(&repository, &format!("repos/{target}/issues?state=all"))?
+    } else {
+        Vec::new()
+    };
+    let umbrella_marker = marker(&graph.source, "umbrella");
+    let umbrella = if let Some(number) = graph.umbrella_number {
+        Some(github_issue(&repository, &target, number)?)
+    } else if graph.issues.len() > 1 {
+        marked_issue(&all_issues, &umbrella_marker)?.cloned()
+    } else {
+        None
+    };
     if let Some(value) = &umbrella {
         let issue = published_issue(value, "umbrella".into())?;
         if issue.state != "OPEN" {
             return Err(format!("Umbrella #{} is closed.", issue.number));
         }
     }
+    let umbrella_number = umbrella.as_ref().and_then(|value| value["number"].as_u64());
     let mut existing = HashMap::new();
+    let mut resolved_numbers = std::collections::HashSet::new();
     for draft in &graph.issues {
-        if let Some(number) = draft.number {
-            let value = github_issue(&repository, &target, number)?;
+        let value = if let Some(number) = draft.number {
+            Some(github_issue(&repository, &target, number)?)
+        } else {
+            marked_issue(&all_issues, &marker(&graph.source, &draft.id))?.cloned()
+        };
+        if let Some(value) = value {
             let issue = published_issue(&value, draft.id.clone())?;
-            if issue.state != "OPEN" {
-                return Err(format!("Issue #{number} is closed."));
+            if !resolved_numbers.insert(issue.number) {
+                return Err(format!("Issue #{} appears twice.", issue.number));
             }
-            if let Some(parent) = issue_parent(&repository, &target, number)? {
-                if Some(parent) != graph.umbrella_number {
+            if issue.state != "OPEN" {
+                return Err(format!("Issue #{} is closed.", issue.number));
+            }
+            if let Some(parent) = issue_parent(&repository, &target, issue.number)? {
+                if Some(parent) != umbrella_number {
                     return Err(format!(
-                        "Issue #{number} already belongs to umbrella #{parent}."
+                        "Issue #{} already belongs to umbrella #{parent}.",
+                        issue.number
                     ));
                 }
             }
             existing.insert(draft.id.clone(), value);
         }
     }
+    let mut external = HashMap::new();
+    for draft in &graph.issues {
+        for dependency in &draft.depends_on {
+            if graph.issues.iter().any(|issue| issue.id == *dependency) {
+                continue;
+            }
+            let number = dependency
+                .parse::<u64>()
+                .map_err(|_| format!("Missing dependency {dependency}."))?;
+            let value = github_issue(&repository, &target, number)?;
+            let issue = published_issue(&value, dependency.clone())?;
+            if draft.number == Some(issue.number) {
+                return Err(format!("Issue #{} cannot block itself.", issue.number));
+            }
+            if issue.state != "OPEN" {
+                return Err(format!("Dependency #{number} is closed."));
+            }
+            external.insert(dependency.clone(), value);
+        }
+    }
     let mut umbrella = umbrella;
-    if graph.issues.len() > 1 && umbrella.is_none() {
-        umbrella = Some(create_issue(
+    if graph.issues.len() > 1 {
+        umbrella = Some(save_issue(
             &repository,
             &target,
+            umbrella,
             &graph.title,
             &graph.body,
+            &umbrella_marker,
         )?);
     }
     let mut issues = Vec::new();
     for draft in &graph.issues {
-        let value = match existing.remove(&draft.id) {
-            Some(value) => value,
-            None => create_issue(&repository, &target, &draft.title, &draft.body)?,
-        };
+        let value = save_issue(
+            &repository,
+            &target,
+            existing.remove(&draft.id),
+            &draft.title,
+            &draft.body,
+            &marker(&graph.source, &draft.id),
+        )
+        .map_err(|error| format!("Cannot save {}: {error}", draft.id))?;
         let mut issue = published_issue(&value, draft.id.clone())?;
         issue.depends_on = draft.depends_on.clone();
         issues.push((issue, value));
     }
-    if let Some(umbrella) = &umbrella {
-        let parent = published_issue(umbrella, "umbrella".into())?;
+    if let Some(parent_value) = &umbrella {
+        let parent = published_issue(parent_value, "umbrella".into())?;
         let linked = issue_pages(
             &repository,
             &format!("repos/{target}/issues/{}/sub_issues", parent.number),
         )?;
-        let linked: std::collections::HashSet<u64> = linked
+        let wanted = issues
+            .iter()
+            .map(|(issue, _)| issue.number)
+            .collect::<std::collections::HashSet<_>>();
+        if graph.replace_existing {
+            for old in &linked {
+                let number = old["number"]
+                    .as_u64()
+                    .ok_or("GitHub subissue has no number.")?;
+                if !wanted.contains(&number) {
+                    delete_issue_link(
+                        &repository,
+                        &format!("repos/{target}/issues/{}/sub_issue", parent.number),
+                        "sub_issue_id",
+                        old["id"].as_u64().ok_or("GitHub subissue has no ID.")?,
+                    )?;
+                }
+            }
+        }
+        let linked_numbers = linked
             .iter()
             .filter_map(|value| value["number"].as_u64())
-            .collect();
+            .collect::<std::collections::HashSet<_>>();
         for (issue, value) in &issues {
-            if !linked.contains(&issue.number) {
+            if !linked_numbers.contains(&issue.number) {
                 issue_api(
                     &repository,
                     &[
@@ -330,14 +509,17 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
                             value["id"].as_u64().ok_or("GitHub issue has no ID.")?
                         ),
                     ],
-                )?;
+                )
+                .map_err(|error| {
+                    format!(
+                        "Cannot attach #{} to umbrella #{}: {error}",
+                        issue.number, parent.number
+                    )
+                })?;
             }
         }
     }
     for (issue, _) in &issues {
-        if issue.depends_on.is_empty() {
-            continue;
-        }
         let blocked_by = issue_pages(
             &repository,
             &format!(
@@ -345,20 +527,56 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
                 issue.number
             ),
         )?;
-        let blocked_by: std::collections::HashSet<u64> = blocked_by
+        let desired = issue
+            .depends_on
+            .iter()
+            .map(|dependency| {
+                let value = issues
+                    .iter()
+                    .find(|(candidate, _)| candidate.id == *dependency)
+                    .map(|(_, value)| value)
+                    .or_else(|| external.get(dependency))
+                    .ok_or("Missing dependency.")?;
+                Ok((
+                    value["number"]
+                        .as_u64()
+                        .ok_or("GitHub issue has no number.")?,
+                    value["id"].as_u64().ok_or("GitHub issue has no ID.")?,
+                ))
+            })
+            .collect::<Result<Vec<(u64, u64)>, String>>()?;
+        let wanted = desired
+            .iter()
+            .map(|(number, _)| *number)
+            .collect::<std::collections::HashSet<_>>();
+        if graph.replace_existing {
+            for old in &blocked_by {
+                let number = old["number"]
+                    .as_u64()
+                    .ok_or("GitHub dependency has no number.")?;
+                if !wanted.contains(&number) {
+                    let id = old["id"].as_u64().ok_or("GitHub dependency has no ID.")?;
+                    gh_command(
+                        &repository,
+                        &[
+                            "api",
+                            "-X",
+                            "DELETE",
+                            &format!(
+                                "repos/{target}/issues/{}/dependencies/blocked_by/{id}",
+                                issue.number
+                            ),
+                        ],
+                    )?;
+                }
+            }
+        }
+        let current = blocked_by
             .iter()
             .filter_map(|value| value["number"].as_u64())
-            .collect();
-        for dependency in &issue.depends_on {
-            let (_, blocker) = issues
-                .iter()
-                .find(|(candidate, _)| &candidate.id == dependency)
-                .ok_or("Missing dependency.")?;
-            if !blocked_by.contains(
-                &blocker["number"]
-                    .as_u64()
-                    .ok_or("GitHub issue has no number.")?,
-            ) {
+            .collect::<std::collections::HashSet<_>>();
+        for (number, id) in desired {
+            if !current.contains(&number) {
                 issue_api(
                     &repository,
                     &[
@@ -369,12 +587,12 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
                             issue.number
                         ),
                         "-F",
-                        &format!(
-                            "issue_id={}",
-                            blocker["id"].as_u64().ok_or("GitHub issue has no ID.")?
-                        ),
+                        &format!("issue_id={id}"),
                     ],
-                )?;
+                )
+                .map_err(|error| {
+                    format!("Cannot add blocker #{number} to #{}: {error}", issue.number)
+                })?;
             }
         }
     }
@@ -1001,12 +1219,32 @@ fn open_url(url: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_external_url, validate_graph, IssueDraft, IssueGraphDraft};
+    use super::{
+        marked_issue, marker, validate_external_url, validate_graph, IssueDraft, IssueGraphDraft,
+    };
+
+    #[test]
+    fn markers_recover_only_the_matching_issue() {
+        let first = marker("session", "first");
+        let second = marker("session", "second");
+        let issues = vec![
+            serde_json::json!({"number": 1, "body": format!("Scope\n\n{first}")}),
+            serde_json::json!({"number": 2, "body": format!("Scope\n\n{second}")}),
+        ];
+        assert_eq!(marked_issue(&issues, &first).unwrap().unwrap()["number"], 1);
+        assert!(marked_issue(&issues, &marker("other", "first"))
+            .unwrap()
+            .is_none());
+        let duplicates = vec![issues[0].clone(), issues[0].clone()];
+        assert!(marked_issue(&duplicates, &first).is_err());
+    }
 
     #[test]
     fn graph_rejects_cycles_and_duplicate_existing_issues() {
         let mut graph = IssueGraphDraft {
             umbrella_number: None,
+            source: "test".into(),
+            replace_existing: false,
             title: "Umbrella".into(),
             body: String::new(),
             issues: vec![

@@ -3,6 +3,7 @@ import test from 'node:test';
 import { graphErrors } from '../src/lib/issue-graph.ts';
 
 const graph = {
+  source: 'session-1',
   title: 'Umbrella',
   body: 'Scope',
   issues: [
@@ -35,4 +36,15 @@ await test('validates graph identity and dependencies', () => {
 
 await test('single issue needs no umbrella', () => {
   assert.deepEqual(graphErrors({ ...graph, title: '', issues: [graph.issues[0]] }), []);
+});
+
+await test('existing blockers outside the umbrella remain valid', () => {
+  assert.deepEqual(
+    graphErrors({ ...graph, issues: [{ ...graph.issues[0], dependsOn: ['82'] }] }),
+    [],
+  );
+  assert.match(
+    graphErrors({ ...graph, issues: [{ ...graph.issues[0], dependsOn: ['external'] }] }).join(' '),
+    /missing issue/,
+  );
 });

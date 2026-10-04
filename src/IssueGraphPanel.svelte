@@ -1,7 +1,9 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { getSetting, setSetting } from './lib/settings';
   import {
     graphErrors,
+    isIssueGraphDraft,
     splitPlan,
     type IssueGraphDraft,
     type PublishedGraph,
@@ -9,24 +11,37 @@
   import type { Plan } from './lib/plan';
 
   let { plan, directory }: { plan: Plan; directory: string } = $props();
-  let graph = $state<IssueGraphDraft>({ title: '', body: '', issues: [] });
+  let graph = $state<IssueGraphDraft>({ source: '', title: '', body: '', issues: [] });
   let source = $state('');
   let umbrellaInput = $state('');
   let loading = $state(false);
   let publishing = $state(false);
   let message = $state('');
   let published = $state<PublishedGraph | null>(null);
+  let approved = $state(false);
+  let approvedGraph = $state('');
+  let canPublish = $derived(approved && approvedGraph === JSON.stringify(graph));
   let errors = $derived(graphErrors(graph));
 
   $effect(() => {
-    const key = `${plan.sessionID}:${plan.version}`;
+    const key = `${directory}:${plan.sessionID}`;
     if (key !== source) {
       source = key;
-      graph = splitPlan(plan);
+      try {
+        const saved: unknown = JSON.parse(getSetting(`sail-issue-graph:${key}`) ?? 'null');
+        graph = isIssueGraphDraft(saved) ? saved : splitPlan(plan);
+      } catch {
+        graph = splitPlan(plan);
+      }
       umbrellaInput = '';
       published = null;
+      approved = false;
       message = '';
     }
+  });
+
+  $effect(() => {
+    if (source && graph.source) setSetting(`sail-issue-graph:${source}`, JSON.stringify(graph));
   });
 
   function parseNumber(value: string): number | undefined {
@@ -54,6 +69,8 @@
         umbrellaNumber: number,
       });
       graph = {
+        source: plan.sessionID,
+        replaceExisting: true,
         umbrellaNumber: number,
         title: loaded.umbrella?.title ?? '',
         body: loaded.umbrella?.body ?? '',
@@ -66,6 +83,7 @@
         })),
       };
       published = loaded;
+      approved = false;
       message = `Loaded ${loaded.issues.length} issues.`;
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
@@ -75,15 +93,12 @@
   }
 
   function addIssue() {
-    const used = new Set(graph.issues.map((issue) => issue.id));
-    let index = graph.issues.length + 1;
-    while (used.has(`issue-${index}`)) index++;
-    graph.issues.push({ id: `issue-${index}`, title: '', body: '', dependsOn: [] });
+    graph.issues.push({ id: crypto.randomUUID(), title: '', body: '', dependsOn: [] });
     published = null;
   }
 
   async function publish() {
-    if (errors.length || publishing) return;
+    if (errors.length || publishing || !canPublish) return;
     publishing = true;
     message = '';
     try {
@@ -92,6 +107,7 @@
         graph,
       });
       published = result;
+      approved = false;
       graph = {
         ...graph,
         umbrellaNumber: result.umbrella?.number,
@@ -182,13 +198,38 @@
           value={issue.dependsOn}
           onchange={(event) =>
             updateIssue(index, {
-              dependsOn: [...event.currentTarget.selectedOptions].map((option) => option.value),
+              dependsOn: [
+                ...issue.dependsOn.filter(
+                  (dependency) => !graph.issues.some((candidate) => candidate.id === dependency),
+                ),
+                ...[...event.currentTarget.selectedOptions].map((option) => option.value),
+              ],
             })}
         >
           {#each graph.issues.filter((candidate) => candidate.id !== issue.id) as candidate (candidate.id)}
             <option value={candidate.id}>{candidate.title || candidate.id}</option>
           {/each}
         </select></label
+      >
+      <label
+        >Other blocker numbers <input
+          aria-label={`Other blockers for ${issue.id}`}
+          value={issue.dependsOn
+            .filter((dependency) => !graph.issues.some((candidate) => candidate.id === dependency))
+            .join(', ')}
+          oninput={(event) =>
+            updateIssue(index, {
+              dependsOn: [
+                ...issue.dependsOn.filter((dependency) =>
+                  graph.issues.some((candidate) => candidate.id === dependency),
+                ),
+                ...event.currentTarget.value
+                  .split(',')
+                  .map((value) => value.trim())
+                  .filter(Boolean),
+              ],
+            })}
+        /></label
       >
       <button
         type="button"
@@ -203,7 +244,17 @@
   {#if errors.length}<ul class="errors">
       {#each errors as error (error)}<li>{error}</li>{/each}
     </ul>{/if}
-  <button type="button" onclick={publish} disabled={!!errors.length || publishing || loading}
+  <label
+    ><input
+      type="checkbox"
+      bind:checked={approved}
+      onchange={() => (approvedGraph = JSON.stringify(graph))}
+    /> I approve this issue split</label
+  >
+  <button
+    type="button"
+    onclick={publish}
+    disabled={!!errors.length || publishing || loading || !canPublish}
     >{publishing ? 'Publishing…' : 'Publish issue graph'}</button
   >
   {#if message}<p role="status">{message}</p>{/if}

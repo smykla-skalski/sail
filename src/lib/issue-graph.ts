@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { Plan } from './plan';
 
 export interface IssueDraft {
@@ -9,6 +10,8 @@ export interface IssueDraft {
 }
 
 export interface IssueGraphDraft {
+  source: string;
+  replaceExisting?: boolean;
   umbrellaNumber?: number;
   title: string;
   body: string;
@@ -26,8 +29,30 @@ export interface PublishedGraph {
   issues: PublishedIssue[];
 }
 
+const IssueGraphDraftSchema = z.object({
+  source: z.string(),
+  replaceExisting: z.boolean().optional(),
+  umbrellaNumber: z.number().optional(),
+  title: z.string(),
+  body: z.string(),
+  issues: z.array(
+    z.object({
+      id: z.string(),
+      number: z.number().optional(),
+      title: z.string(),
+      body: z.string(),
+      dependsOn: z.array(z.string()),
+    }),
+  ),
+});
+
+export function isIssueGraphDraft(value: unknown): value is IssueGraphDraft {
+  return IssueGraphDraftSchema.safeParse(value).success;
+}
+
 export function splitPlan(plan: Plan): IssueGraphDraft {
   return {
+    source: plan.sessionID,
     title: `☂️ ${plan.title}`,
     body: plan.summary,
     issues: plan.steps.map((step) => ({
@@ -41,6 +66,7 @@ export function splitPlan(plan: Plan): IssueGraphDraft {
 
 export function graphErrors(graph: IssueGraphDraft): string[] {
   const errors: string[] = [];
+  if (!graph.source.trim()) errors.push('Issue graph has no source.');
   if (!graph.issues.length) errors.push('Add at least one issue.');
   if (graph.issues.length > 1 && !graph.umbrellaNumber && !graph.title.trim())
     errors.push('Enter an umbrella title.');
@@ -78,8 +104,9 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
     if (visited.has(id)) return;
     visiting.add(id);
     for (const dependency of byId.get(id)?.dependsOn ?? []) {
-      if (!byId.has(dependency)) errors.push(`${id} depends on missing issue ${dependency}.`);
-      else visit(dependency);
+      if (!byId.has(dependency) && !/^[1-9]\d*$/.test(dependency))
+        errors.push(`${id} depends on missing issue ${dependency}.`);
+      else if (byId.has(dependency)) visit(dependency);
     }
     visiting.delete(id);
     visited.add(id);
