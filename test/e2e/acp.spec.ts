@@ -75,8 +75,10 @@ describe('ACP agent threads', () => {
     await expect($('.skill-menu')).toHaveText(
       expect.stringContaining('Implement and ship a GitHub issue'),
     );
-    await browser.keys('ArrowDown');
-    await browser.keys('Enter');
+    await expect($('.skill-menu')).toHaveText(expect.stringContaining('/ship-it'));
+    await $(
+      "//div[contains(@class,'skill-menu')]//button[strong[normalize-space()='/review']]",
+    ).click();
     expect(await $('.agent-composer textarea').getValue()).toBe('/review ');
     await $('.agent-composer textarea').setValue('/model');
     await browser.keys('Enter');
