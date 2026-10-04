@@ -43,7 +43,9 @@ export function skillQuery(draft: string): string | null {
 export function matchingSkills(skills: SkillChoice[], draft: string): SkillChoice[] {
   const query = skillQuery(draft);
   if (query === null) return [];
-  return skills.filter((skill) => skill.name.toLowerCase().includes(query)).slice(0, 12);
+  const matches = skills.filter((skill) => skill.name.toLowerCase().includes(query));
+  const gateCount = matches.filter((skill) => sailGateRules[skill.name.toLowerCase()]).length;
+  return matches.slice(0, 12 + gateCount);
 }
 
 export function promptSkill(skills: SkillChoice[], text: string): SkillChoice | undefined {

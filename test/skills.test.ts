@@ -69,6 +69,8 @@ void test('bundled choices stay visible with many installed skills and mixed cas
       .map((skill) => skill.name),
     ['Ship-It', 'adversarial-review', 'adversarial-test'],
   );
+  assert.equal(matchingSkills(merged, '/').length, 15);
+  assert.equal(matchingSkills(merged, '/').at(-1)?.name, 'skill-11');
   assert.match(resolveSkillPrompt(merged, '/Ship-It #42'), /Never run a gate inline/);
   assert.match(resolveSkillPrompt(merged, '/SHIP-IT #42'), /Never run a gate inline/);
 });
