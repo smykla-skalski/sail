@@ -21,6 +21,8 @@
   import ProjectSidebar from './ProjectSidebar.svelte';
   import type { GitHubIssue, PullRequestCheck } from './ProjectSidebar.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
+  import PostTurnChecks from './PostTurnChecks.svelte';
+  import { personalChecks, upsertCheck, type PostTurnCheck } from './lib/post-turn-checks';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import SkillMenu from './SkillMenu.svelte';
@@ -280,7 +282,16 @@
   const activeSpawnRequests = new SvelteSet<string>();
   const coordinationDeliveries = new SvelteMap<string, Promise<void>>();
   const coordinationAttempts = new SvelteMap<string, number>();
-  type WorktreeConfig = { setup: string; run: string; archive: string; copy: string[] };
+  type WorktreeConfig = {
+    setup: string;
+    run: string;
+    archive: string;
+    copy: string[];
+    postTurnChecks: string[];
+  };
+  let postTurnResults = $state<PostTurnCheck[]>([]);
+  const pendingPostTurnChecks = new SvelteSet<string>();
+  let personalPostTurnChecks = $state(personalChecks(getSetting('sai-post-turn-personal')));
   type TurnSnapshot = { id: string; kind: 'turn' | 'undo'; created: number };
   let selectedWorktreeConfig = $state<WorktreeConfig | null>(null);
   let configGeneration = 0;
@@ -1110,6 +1121,7 @@
       agentsError: agentDetectionError,
       notificationsEnabled,
       notificationSound,
+      personalPostTurnChecks,
       agentWorktreesEnabled,
       agentTerminalsEnabled,
       agentStatusEnabled,
@@ -1274,6 +1286,9 @@
         } else if (action.type === 'notification-sound') {
           notificationSound = action.value;
           setSetting('sai-notification-sound', String(action.value));
+        } else if (action.type === 'personal-post-turn-checks') {
+          personalPostTurnChecks = action.value;
+          setSetting('sai-post-turn-personal', JSON.stringify(action.value));
         } else if (action.type === 'agent-worktrees') {
           agentWorktreesEnabled = action.value;
           setSetting('sai-agent-worktrees-enabled', String(action.value));
@@ -1294,7 +1309,38 @@
         void sendSettingsState();
       }).then((unlisten) => (stopSettingsAction = unlisten));
     }
-    if (isTauri()) void detectAgents();
+    if (isTauri()) {
+      void invoke<PostTurnCheck[]>('list_post_turn_checks').then(
+        (checks) => {
+          postTurnResults = [
+            ...checks.filter(
+              (stored) =>
+                !postTurnResults.some(
+                  (current) =>
+                    JSON.stringify([
+                      current.directory,
+                      current.thread,
+                      current.turn,
+                      current.source,
+                      current.command,
+                    ]) ===
+                    JSON.stringify([
+                      stored.directory,
+                      stored.thread,
+                      stored.turn,
+                      stored.source,
+                      stored.command,
+                    ]),
+                ),
+            ),
+            ...postTurnResults,
+          ];
+          return undefined;
+        },
+        (cause) => (error = describe(cause)),
+      );
+      void detectAgents();
+    }
     if (isTauri()) {
       void listen<(typeof agentTerminals)[number]>('acp-terminal-created', ({ payload }) => {
         agentTerminals = [...agentTerminals, payload];
@@ -5222,6 +5268,93 @@
     }).catch(() => undefined);
   }
 
+  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false) {
+    const key = JSON.stringify([
+      check.directory,
+      check.thread,
+      check.turn,
+      check.source,
+      check.command,
+    ]);
+    if (
+      pendingPostTurnChecks.has(key) ||
+      (!retry &&
+        postTurnResults.some(
+          (item) =>
+            JSON.stringify([item.directory, item.thread, item.turn, item.source, item.command]) ===
+            key,
+        ))
+    )
+      return;
+    pendingPostTurnChecks.add(key);
+    try {
+      if (check.source === 'repository') {
+        const approved = await invoke<boolean>('is_post_turn_check_approved', {
+          directory: check.directory,
+          command: check.command,
+        });
+        if (!approved) {
+          const allow = await confirmInApp(
+            'Review repository post-turn check',
+            `Run this repository command in ${check.directory} after agent turns?\n\n${check.command}`,
+            'Approve command',
+          );
+          if (!allow) {
+            const canceled = await invoke<PostTurnCheck>('cancel_post_turn_check', check);
+            postTurnResults = upsertCheck(postTurnResults, canceled);
+            return;
+          }
+          await invoke('approve_post_turn_check', {
+            directory: check.directory,
+            command: check.command,
+          });
+        }
+      }
+      postTurnResults = upsertCheck(postTurnResults, { ...check, status: 'running' });
+      const result = await invoke<PostTurnCheck>('run_post_turn_check', { ...check, retry });
+      postTurnResults = upsertCheck(postTurnResults, result);
+    } catch (cause) {
+      postTurnResults = upsertCheck(postTurnResults, {
+        ...check,
+        status: 'failed',
+        output: describe(cause),
+        code: null,
+      });
+    } finally {
+      pendingPostTurnChecks.delete(key);
+    }
+  }
+
+  async function runCompletedChecks(path: string, thread: string, turn: string) {
+    if (!path || !thread || !turn) return;
+    const entries: { source: 'repository' | 'personal'; command: string }[] =
+      personalPostTurnChecks.map((command) => ({ source: 'personal', command }));
+    try {
+      const config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
+      entries.push(
+        ...(config?.postTurnChecks ?? []).map((command) => ({
+          source: 'repository' as const,
+          command,
+        })),
+      );
+    } catch (cause) {
+      error = `Could not load repository post-turn checks: ${describe(cause)}`;
+    }
+    for (const entry of entries) {
+      void runOnePostTurnCheck({
+        id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
+        updated: Date.now(),
+        directory: path,
+        thread,
+        turn,
+        ...entry,
+        status: 'running',
+        output: '',
+        code: null,
+      });
+    }
+  }
+
   function handleAgentEvent(event: AgentEvent) {
     if (event.message.method === 'session/update') {
       const params = event.message.params;
@@ -5294,6 +5427,18 @@
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
       if (typeof sessionId !== 'string' || (status !== 'done' && status !== 'failed')) return;
+      if (
+        status === 'done' &&
+        typeof turnId === 'string' &&
+        event.message.params?.notify !== false &&
+        !replayingAgentSessions[JSON.stringify([event.agent, sessionId])]
+      ) {
+        const thread = agentThreads.find(
+          (item) => item.agent === event.agent && item.sessionId === sessionId,
+        );
+        if (thread)
+          void runCompletedChecks(thread.directory, `acp:${event.agent}:${sessionId}`, turnId);
+      }
       for (const thread of agentThreads.filter(
         (item) => item.agent === event.agent && item.sessionId === sessionId,
       ))
@@ -6149,6 +6294,18 @@
         }
         const eventSession =
           'data' in event && 'sessionID' in event.data ? event.data.sessionID : undefined;
+        if (typeof eventSession === 'string' && event.type === 'session.execution.succeeded') {
+          const thread = [...sidebarOpenCodeThreads, ...nativeThreads].find(
+            (item) =>
+              item.sessionId === eventSession &&
+              (!event.location?.directory || item.directory === event.location.directory),
+          );
+          const path =
+            event.location?.directory ??
+            thread?.directory ??
+            (eventSession === sessionID ? directory : '');
+          if (path) void runCompletedChecks(path, `opencode:${eventSession}`, event.id);
+        }
         if (typeof eventSession === 'string' && event.type === 'session.text.delta') {
           for (const receipt of spawnReceipts.filter(
             (item) => item.targetId === `opencode:${eventSession}` && !receiptIsSettled(item.state),
@@ -7023,6 +7180,13 @@
                 onstatus={updateAgentThreadStatus}
                 onreplaychange={setAgentReplay}
                 onterminal={(id) => void openAgentTerminal(id)}
+                postTurnChecks={postTurnResults.filter(
+                  (check) =>
+                    acpThread &&
+                    check.directory === directory &&
+                    check.thread === `acp:${acpAgent}:${acpThread.sessionId}`,
+                )}
+                onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
               />
             {/key}
           {:else}
@@ -7167,6 +7331,13 @@
                   </div>
                 </article>
               {/each}
+              <PostTurnChecks
+                checks={postTurnResults.filter(
+                  (check) =>
+                    check.directory === directory && check.thread === `opencode:${sessionID}`,
+                )}
+                onretry={(check) => void runOnePostTurnCheck(check, true)}
+              />
               <SpawnActivity
                 receipts={spawnReceiptsForSource(
                   spawnReceipts,
@@ -7373,6 +7544,8 @@
       {setup}
       {coordinationMessages}
       {spawnReceipts}
+      postTurnChecks={postTurnResults}
+      onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
       {agentUsage}
       {agentRates}
       onentries={(id, entries, sessionId, ready) =>

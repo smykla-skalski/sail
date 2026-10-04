@@ -6,6 +6,8 @@
   import { Badge, Button } from '@smykla-skalski/sui';
   import Markdown from './Markdown.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
+  import PostTurnChecks from './PostTurnChecks.svelte';
+  import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
   import { toolInput } from './lib/tool-display';
@@ -88,6 +90,8 @@
     seedContext?: string;
     coordinationMessages?: CoordinationMessage[];
     spawnReceipts?: SpawnReceipt[];
+    postTurnChecks?: PostTurnCheck[];
+    onretrycheck?: (check: PostTurnCheck) => void;
   }
   let {
     agent,
@@ -115,6 +119,8 @@
     seedContext = '',
     coordinationMessages = [],
     spawnReceipts = [],
+    postTurnChecks = [],
+    onretrycheck = () => {},
   }: Props = $props();
   let mounted = $state(false);
   let ready = $state(false);
@@ -1451,6 +1457,7 @@
         </div>
       </article>
     {/each}
+    <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
     <SpawnActivity receipts={spawnReceipts} />
     {#if queued.length}<div class="queued-messages" role="status" aria-label="Queued messages">
         {#each queued as message, index (index)}

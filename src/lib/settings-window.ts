@@ -20,6 +20,7 @@ export type SettingsSnapshot = {
   agentsError: string;
   notificationsEnabled: boolean;
   notificationSound: boolean;
+  personalPostTurnChecks: string[];
   agentWorktreesEnabled: boolean;
   agentTerminalsEnabled: boolean;
   agentStatusEnabled: boolean;
@@ -32,6 +33,7 @@ export type SettingsAction =
   | { type: 'binary'; value: string }
   | { type: 'notifications'; value: boolean }
   | { type: 'notification-sound'; value: boolean }
+  | { type: 'personal-post-turn-checks'; value: string[] }
   | { type: 'agent-worktrees'; value: boolean }
   | { type: 'agent-terminals'; value: boolean }
   | { type: 'agent-status'; value: boolean }

@@ -71,6 +71,7 @@ mod child_watchdog;
 mod dev_servers;
 mod diagnostics;
 mod github;
+mod post_turn_checks;
 mod settings;
 mod terminal;
 mod worktree_config;
@@ -1436,6 +1437,7 @@ pub fn run() {
         .manage(acp::AgentManager::default())
         .manage(acp_terminal::AcpTerminalManager::default())
         .manage(terminal::TerminalManager::default())
+        .manage(post_turn_checks::CheckLock::default())
         .manage(browser_agent::BrowserManager::default())
         .manage(browser::CaptureStore::default())
         .invoke_handler(tauri::generate_handler![
@@ -1459,6 +1461,11 @@ pub fn run() {
             registered_worktrees,
             delete_worktree,
             worktree_config,
+            post_turn_checks::approve_post_turn_check,
+            post_turn_checks::is_post_turn_check_approved,
+            post_turn_checks::cancel_post_turn_check,
+            post_turn_checks::list_post_turn_checks,
+            post_turn_checks::run_post_turn_check,
             github::create_pull_request,
             github::list_open_issues,
             github::open_issue,

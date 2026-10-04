@@ -6,6 +6,8 @@
   import type { FormInfo, PermissionRequest } from '@opencode/client';
   import Markdown from './Markdown.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
+  import PostTurnChecks from './PostTurnChecks.svelte';
+  import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
@@ -37,6 +39,8 @@
     setup,
     coordinationMessages = [],
     spawnReceipts = [],
+    postTurnChecks = [],
+    onretrycheck,
     focused,
     focusPrompt,
     picked,
@@ -55,6 +59,8 @@
     setup: SetupReport | null;
     coordinationMessages?: CoordinationMessage[];
     spawnReceipts?: SpawnReceipt[];
+    postTurnChecks?: PostTurnCheck[];
+    onretrycheck: (check: PostTurnCheck) => void;
     focused: boolean;
     focusPrompt: boolean;
     picked?: BrowserAttachment;
@@ -679,6 +685,7 @@
         </div>
       </article>
     {/each}
+    <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
     <SpawnActivity receipts={spawnReceipts} />
     {#if running}<div class="agent-busy" role="status">
         OpenCode is working… <Button size="sm" variant="secondary" onclick={stop}>Stop</Button>

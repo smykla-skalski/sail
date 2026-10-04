@@ -15,6 +15,8 @@ pub struct WorktreeConfig {
     pub archive: String,
     #[serde(default)]
     pub copy: Vec<String>,
+    #[serde(default, rename = "postTurnChecks")]
+    pub post_turn_checks: Vec<String>,
 }
 
 pub fn read(directory: &Path) -> Result<Option<WorktreeConfig>, String> {
@@ -38,6 +40,13 @@ pub fn read(directory: &Path) -> Result<Option<WorktreeConfig>, String> {
     let value = std::fs::read(&path).map_err(|error| error.to_string())?;
     let config: WorktreeConfig = serde_json::from_slice(&value)
         .map_err(|error| format!("Invalid Sail worktree config: {error}"))?;
+    if config
+        .post_turn_checks
+        .iter()
+        .any(|command| command.trim().is_empty())
+    {
+        return Err("Post-turn check command cannot be empty.".to_string());
+    }
     for item in &config.copy {
         let path = Path::new(item);
         if item.is_empty()
