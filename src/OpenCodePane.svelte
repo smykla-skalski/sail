@@ -22,7 +22,7 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
-  import { recordImplementationModel } from './lib/implementation-models';
+  import { beginShipItRun, recordImplementationModel } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
@@ -435,6 +435,7 @@
   async function send(externalText?: string) {
     const external = externalText !== undefined;
     const text = (externalText ?? draft).trim();
+    beginShipItRun(directory, text);
     if (!client || (!text && (external || !files.length)) || !inputReady || sending) {
       if (external) throw new Error('Wait for the current OpenCode turn.');
       return;
@@ -478,6 +479,9 @@
       running = true;
       if (session) onstatus(summary(session), 'working');
       const promptRequest = runSerialOpenCodeTurn(id, async () => {
+        const implementingModel = chosenModel
+          ? `${chosenModel.providerID}:${chosenModel.id}`
+          : undefined;
         const before = await invoke<string>('working_tree_revision', { path: directory });
         await invoke('record_turn_snapshot', { path: directory, thread: `opencode:${id}` });
         const response = await source.session.prompt({
@@ -493,16 +497,10 @@
           delivery: queued ? 'steer' : undefined,
           files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
         });
-        if (chosenModel)
+        if (implementingModel)
           void source.session
             .wait({ sessionID: id })
-            .then(() =>
-              recordImplementationModel(
-                directory,
-                `${chosenModel.providerID}:${chosenModel.id}`,
-                before,
-              ),
-            )
+            .then(() => recordImplementationModel(directory, implementingModel, before))
             .catch((cause) => (error = `Could not track implementation model: ${describe(cause)}`));
         return response;
       });

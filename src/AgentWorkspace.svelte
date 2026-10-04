@@ -27,7 +27,7 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
-  import { recordImplementationModel } from './lib/implementation-models';
+  import { beginShipItRun, recordImplementationModel } from './lib/implementation-models';
   import {
     agentQueuePaused,
     queuedAgentMessages,
@@ -815,6 +815,7 @@
     const text =
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
+    beginShipItRun(directory, text);
     const command = text.toLowerCase();
     if (
       !external &&

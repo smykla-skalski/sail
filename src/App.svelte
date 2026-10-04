@@ -41,7 +41,11 @@
   import { bundledSkills } from './lib/bundled-skills';
   import { parseValidationSettings, validationSettingsKey } from './lib/cross-validation';
   import { selectValidationChoice, type ValidationChoice } from './lib/cross-validation';
-  import { implementationModels, recordImplementationModel } from './lib/implementation-models';
+  import {
+    beginShipItRun,
+    implementationModels,
+    recordImplementationModel,
+  } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import {
     prepareToolFailureDraft,
@@ -2674,6 +2678,7 @@
     receiptId?: string,
     validation = false,
   ) {
+    if (!validation) beginShipItRun(created.path, prompt);
     if (source.kind === 'acp') {
       const session = await acp.create(source.agent, created.path);
       const reportedModel = session.configOptions?.find(
@@ -6831,6 +6836,7 @@
     let current = selection;
     const path = directory;
     const text = draft.trim();
+    beginShipItRun(path, text);
     const queueTurn = running;
     const files = [...attachedFiles];
     let accepted = false;
@@ -6884,6 +6890,9 @@
         activityTool = '';
       }
       const promptRequest = runSerialOpenCodeTurn(id, async () => {
+        const implementingModel = chosenModel
+          ? `${chosenModel.providerID}:${chosenModel.id}`
+          : undefined;
         const before = await invoke<string>('working_tree_revision', { path });
         await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
         const response = await source.session.prompt({
@@ -6902,16 +6911,10 @@
             name: clipboardAttachmentNames.get(filePath) ?? filePath.split(/[\\/]/).at(-1),
           })),
         });
-        if (chosenModel)
+        if (implementingModel)
           void source.session
             .wait({ sessionID: id })
-            .then(() =>
-              recordImplementationModel(
-                path,
-                `${chosenModel.providerID}:${chosenModel.id}`,
-                before,
-              ),
-            )
+            .then(() => recordImplementationModel(path, implementingModel, before))
             .catch((cause) => (error = `Could not track implementation model: ${describe(cause)}`));
         return response;
       });
