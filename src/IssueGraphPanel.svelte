@@ -80,6 +80,7 @@
         umbrellaNumber: number,
       });
       graph = {
+        repository: loaded.umbrella?.repository,
         source: plan.sessionID,
         replaceExisting: true,
         loadedFromUmbrella: true,
@@ -87,8 +88,12 @@
         title: loaded.umbrella?.title ?? '',
         body: loaded.umbrella?.body ?? '',
         issues: loaded.issues.map((issue) => ({
-          id: String(issue.number),
+          id:
+            issue.repository && issue.repository !== loaded.umbrella?.repository
+              ? `${issue.repository}#${issue.number}`
+              : String(issue.number),
           number: issue.number,
+          repository: issue.repository,
           title: issue.title,
           body: issue.body,
           dependsOn: issue.dependsOn,
@@ -122,11 +127,13 @@
       approved = false;
       graph = {
         ...graph,
+        repository: result.umbrella?.repository ?? result.issues[0]?.repository,
         replaceExisting: true,
         umbrellaNumber: result.umbrella?.number,
         issues: result.issues.map((issue) => ({
           id: issue.id,
           number: issue.number,
+          repository: issue.repository,
           title: issue.title,
           body: issue.body,
           dependsOn: issue.dependsOn,

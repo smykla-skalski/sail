@@ -99,6 +99,31 @@ await test('issue ID and number are the same blocker', () => {
   assert.match(graphErrors(duplicate).join(' '), /repeats a dependency/);
 });
 
+await test('same issue number in another repository keeps its identity', () => {
+  const shared = {
+    ...graph,
+    repository: 'owner/main',
+    issues: [
+      { ...graph.issues[0], repository: 'owner/main' },
+      {
+        ...graph.issues[1],
+        id: 'owner/other#3',
+        number: 3,
+        repository: 'owner/other',
+        dependsOn: ['a'],
+      },
+    ],
+  };
+  assert.deepEqual(graphErrors(shared), []);
+  assert.deepEqual(
+    graphErrors({
+      ...shared,
+      issues: [{ ...shared.issues[0], dependsOn: ['owner/other#3'] }, shared.issues[1]],
+    }).filter((error) => error.includes('cycle')),
+    ['Dependency cycle includes a.'],
+  );
+});
+
 await test('revision to one issue releases an authored umbrella', async () => {
   const { rebaseIssueGraph } = await import('../src/lib/issue-graph.ts');
   const plan = {

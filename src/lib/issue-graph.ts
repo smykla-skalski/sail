@@ -4,12 +4,14 @@ import type { Plan } from './plan';
 export interface IssueDraft {
   id: string;
   number?: number;
+  repository?: string;
   title: string;
   body: string;
   dependsOn: string[];
 }
 
 export interface IssueGraphDraft {
+  repository?: string;
   source: string;
   replaceExisting?: boolean;
   loadedFromUmbrella?: boolean;
@@ -31,6 +33,7 @@ export interface PublishedGraph {
 }
 
 const IssueGraphDraftSchema = z.object({
+  repository: z.string().optional(),
   source: z.string(),
   replaceExisting: z.boolean().optional(),
   loadedFromUmbrella: z.boolean().optional(),
@@ -41,6 +44,7 @@ const IssueGraphDraftSchema = z.object({
     z.object({
       id: z.string(),
       number: z.number().optional(),
+      repository: z.string().optional(),
       title: z.string(),
       body: z.string(),
       dependsOn: z.array(z.string()),
@@ -82,6 +86,7 @@ export function rebaseIssueGraph(previous: IssueGraphDraft | null, plan: Plan): 
     return { ...previous, source: plan.sessionID };
   return {
     ...latest,
+    repository: previous.repository,
     umbrellaNumber: latest.issues.length === 1 ? undefined : previous.umbrellaNumber,
     replaceExisting: previous.replaceExisting,
     issues: latest.issues.map((issue) => ({
@@ -90,6 +95,7 @@ export function rebaseIssueGraph(previous: IssueGraphDraft | null, plan: Plan): 
       body: issue.body,
       dependsOn: issue.dependsOn,
       number: prior.get(issue.id)?.number,
+      repository: prior.get(issue.id)?.repository,
     })),
   };
 }
@@ -106,7 +112,7 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
   )
     errors.push('Enter a valid umbrella number.');
   const ids = new Set<string>();
-  const numbers = new Set<number>();
+  const numbers = new Set<string>();
   for (const issue of graph.issues) {
     if (!issue.id.trim() || ids.has(issue.id))
       errors.push(`Duplicate or empty issue ID: ${issue.id || '(empty)'}.`);
@@ -115,13 +121,17 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
     if (issue.number !== undefined) {
       if (!Number.isSafeInteger(issue.number) || issue.number <= 0)
         errors.push(`Invalid issue number for ${issue.id}.`);
-      if (numbers.has(issue.number)) errors.push(`Issue #${issue.number} appears twice.`);
-      numbers.add(issue.number);
-      if (issue.number === graph.umbrellaNumber)
+      const local = !issue.repository || issue.repository === graph.repository;
+      const key = `${local ? 'local' : issue.repository}#${issue.number}`;
+      if (numbers.has(key)) errors.push(`Issue #${issue.number} appears twice.`);
+      numbers.add(key);
+      if (local && issue.number === graph.umbrellaNumber)
         errors.push('An umbrella cannot be its own child.');
     }
     const aliases = new Map(
-      graph.issues.filter((item) => item.number).map((item) => [String(item.number), item.id]),
+      graph.issues
+        .filter((item) => item.number && (!item.repository || item.repository === graph.repository))
+        .map((item) => [String(item.number), item.id]),
     );
     const canonical = issue.dependsOn.map((dependency) => aliases.get(dependency) ?? dependency);
     if (new Set(canonical).size !== canonical.length)
@@ -131,7 +141,11 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
   const visited = new Set<string>();
   const byId = new Map(graph.issues.map((issue) => [issue.id, issue]));
   const byNumber = new Map(
-    graph.issues.filter((issue) => issue.number).map((issue) => [String(issue.number), issue.id]),
+    graph.issues
+      .filter(
+        (issue) => issue.number && (!issue.repository || issue.repository === graph.repository),
+      )
+      .map((issue) => [String(issue.number), issue.id]),
   );
   const visit = (id: string): void => {
     if (visiting.has(id)) {
@@ -143,7 +157,7 @@ export function graphErrors(graph: IssueGraphDraft): string[] {
     for (const dependency of byId.get(id)?.dependsOn ?? []) {
       const local = byId.has(dependency) ? dependency : byNumber.get(dependency);
       if (local) visit(local);
-      else if (!/^[1-9]\d*$/.test(dependency))
+      else if (!/^(?:[1-9]\d*|[^/#]+\/[^/#]+#[1-9]\d*)$/.test(dependency))
         errors.push(`${id} depends on missing issue ${dependency}.`);
     }
     visiting.delete(id);

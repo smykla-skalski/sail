@@ -53,6 +53,7 @@ pub struct GitHubIssue {
 struct IssueDraft {
     id: String,
     number: Option<u64>,
+    repository: Option<String>,
     title: String,
     body: String,
     depends_on: Vec<String>,
@@ -61,6 +62,7 @@ struct IssueDraft {
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IssueGraphDraft {
+    repository: Option<String>,
     umbrella_number: Option<u64>,
     source: String,
     #[serde(default)]
@@ -75,6 +77,7 @@ struct IssueGraphDraft {
 struct PublishedIssue {
     id: String,
     number: u64,
+    repository: String,
     title: String,
     body: String,
     url: String,
@@ -107,6 +110,81 @@ fn issue_field(value: &serde_json::Value, field: &str) -> Result<String, String>
         .ok_or_else(|| format!("GitHub issue has no {field}."))
 }
 
+fn issue_repository_name(value: &serde_json::Value) -> Result<String, String> {
+    let url = issue_field(value, "repository_url")?;
+    let name = url
+        .strip_prefix("https://api.github.com/repos/")
+        .ok_or("GitHub issue has an invalid repository.")?;
+    if name.split('/').count() != 2 || name.split('/').any(str::is_empty) {
+        return Err("GitHub issue has an invalid repository.".into());
+    }
+    Ok(name.to_string())
+}
+
+fn draft_repository<'a>(draft: &'a IssueDraft, target: &'a str) -> Result<&'a str, String> {
+    let name = draft.repository.as_deref().unwrap_or(target);
+    let (owner, repo) = name.split_once('/').ok_or("Invalid issue repository.")?;
+    let target_owner = target.split('/').next().unwrap_or_default();
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    };
+    if !owner.eq_ignore_ascii_case(target_owner) || !valid(owner) || !valid(repo) {
+        return Err("Subissues must belong to repositories under the same owner.".into());
+    }
+    if draft.number.is_none() && !name.eq_ignore_ascii_case(target) {
+        return Err("Choose an existing issue number for a different repository.".into());
+    }
+    Ok(name)
+}
+
+fn dependency_repository<'a>(
+    reference: &'a str,
+    target: &'a str,
+) -> Result<(&'a str, u64), String> {
+    let (repository, number) = if let Some((repository, number)) = reference.rsplit_once('#') {
+        (repository, number)
+    } else {
+        (target, reference)
+    };
+    let number = number
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| format!("Missing dependency {reference}."))?;
+    let probe = IssueDraft {
+        id: String::new(),
+        number: Some(number),
+        repository: Some(repository.to_string()),
+        title: String::new(),
+        body: String::new(),
+        depends_on: Vec::new(),
+    };
+    draft_repository(&probe, target)?;
+    Ok((repository, number))
+}
+
+fn issue_reference(repository: &str, number: u64, target: &str) -> String {
+    if repository.eq_ignore_ascii_case(target) {
+        number.to_string()
+    } else {
+        format!("{repository}#{number}")
+    }
+}
+
+fn value_reference(value: &serde_json::Value, target: &str) -> Result<String, String> {
+    let number = value["number"]
+        .as_u64()
+        .ok_or("GitHub issue has no number.")?;
+    Ok(issue_reference(
+        &issue_repository_name(value)?,
+        number,
+        target,
+    ))
+}
+
 fn published_issue(value: &serde_json::Value, id: String) -> Result<PublishedIssue, String> {
     let number = value["number"]
         .as_u64()
@@ -117,6 +195,7 @@ fn published_issue(value: &serde_json::Value, id: String) -> Result<PublishedIss
     Ok(PublishedIssue {
         id,
         number,
+        repository: issue_repository_name(value)?,
         title: issue_field(value, "title")?,
         body: value["body"]
             .as_str()
@@ -161,16 +240,20 @@ fn issue_pages(directory: &Path, endpoint: &str) -> Result<Vec<serde_json::Value
     Ok(entries)
 }
 
-fn issue_parent(directory: &Path, target: &str, number: u64) -> Result<Option<u64>, String> {
+fn issue_parent(
+    directory: &Path,
+    target: &str,
+    number: u64,
+) -> Result<Option<(String, u64)>, String> {
     let endpoint = format!("repos/{target}/issues/{number}/parent");
     match gh_command(directory, &["api", &endpoint]) {
         Ok(output) => {
             let parent: serde_json::Value = serde_json::from_str(&output)
                 .map_err(|_| "GitHub returned an invalid parent issue.".to_string())?;
-            parent["number"]
+            let number = parent["number"]
                 .as_u64()
-                .map(Some)
-                .ok_or("GitHub parent issue has no number.".into())
+                .ok_or("GitHub parent issue has no number.")?;
+            Ok(Some((issue_repository_name(&parent)?, number)))
         }
         Err(error) if error.contains("HTTP 404") => Ok(None),
         Err(error) => Err(format!("Cannot inspect parent of #{number}: {error}")),
@@ -196,6 +279,14 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
     let number_aliases: HashMap<String, &str> = graph
         .issues
         .iter()
+        .filter(|issue| {
+            issue.repository.as_ref().is_none_or(|repo| {
+                graph
+                    .repository
+                    .as_ref()
+                    .is_some_and(|target| repo.eq_ignore_ascii_case(target))
+            })
+        })
         .filter_map(|issue| {
             issue
                 .number
@@ -210,10 +301,24 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
             return Err(format!("Enter a title for {}.", issue.id));
         }
         if let Some(number) = issue.number {
-            if number == 0 || !numbers.insert(number) {
+            let local = issue.repository.as_ref().is_none_or(|repo| {
+                graph
+                    .repository
+                    .as_ref()
+                    .is_some_and(|target| repo.eq_ignore_ascii_case(target))
+            });
+            let key = (
+                if local {
+                    "local"
+                } else {
+                    issue.repository.as_deref().unwrap_or("local")
+                },
+                number,
+            );
+            if number == 0 || !numbers.insert(key) {
                 return Err(format!("Invalid or duplicate issue #{number}."));
             }
-            if Some(number) == graph.umbrella_number {
+            if local && Some(number) == graph.umbrella_number {
                 return Err("An umbrella cannot be its own child.".into());
             }
         }
@@ -236,6 +341,14 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
     let by_number: HashMap<u64, &str> = graph
         .issues
         .iter()
+        .filter(|issue| {
+            issue.repository.as_ref().is_none_or(|repo| {
+                graph
+                    .repository
+                    .as_ref()
+                    .is_some_and(|target| repo.eq_ignore_ascii_case(target))
+            })
+        })
         .filter_map(|issue| issue.number.map(|number| (number, issue.id.as_str())))
         .collect();
     fn visit<'a>(
@@ -261,6 +374,19 @@ fn validate_graph(graph: &IssueGraphDraft) -> Result<(), String> {
             {
                 if let Some(local) = by_number.get(&number) {
                     visit(local, by_id, by_number, visiting, visited)?;
+                }
+            } else if let Some((repository, number)) = dependency.rsplit_once('#') {
+                let valid_repo = repository.split_once('/').is_some_and(|(owner, name)| {
+                    !owner.is_empty() && !name.is_empty() && !name.contains('/')
+                });
+                if !valid_repo
+                    || number
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|number| *number > 0)
+                        .is_none()
+                {
+                    return Err(format!("Missing dependency {dependency}."));
                 }
             } else {
                 return Err(format!("Missing dependency {dependency}."));
@@ -387,9 +513,10 @@ fn delete_issue_link(directory: &Path, endpoint: &str, field: &str, id: u64) -> 
     .map(|_| ())
 }
 
-fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<PublishedGraph, String> {
-    validate_graph(&graph)?;
+fn publish_graph(repository: String, mut graph: IssueGraphDraft) -> Result<PublishedGraph, String> {
     let (repository, target) = issue_repository(repository)?;
+    graph.repository = Some(target.clone());
+    validate_graph(&graph)?;
     let needs_lookup =
         graph.umbrella_number.is_none() || graph.issues.iter().any(|issue| issue.number.is_none());
     let all_issues = if needs_lookup {
@@ -416,22 +543,30 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
     let mut old_parent = None;
     let mut resolved_numbers = std::collections::HashSet::new();
     for draft in &graph.issues {
+        let issue_repo = draft_repository(draft, &target)?;
         let value = if let Some(number) = draft.number {
-            Some(github_issue(&repository, &target, number)?)
+            Some(github_issue(&repository, issue_repo, number)?)
         } else {
             marked_issue(&all_issues, &marker(&graph.source, &draft.id))?.cloned()
         };
         if let Some(value) = value {
             let issue = published_issue(&value, draft.id.clone())?;
-            if !resolved_numbers.insert(issue.number) {
-                return Err(format!("Issue #{} appears twice.", issue.number));
+            if !resolved_numbers.insert((issue.repository.clone(), issue.number)) {
+                return Err(format!(
+                    "Issue {} appears twice.",
+                    issue_reference(&issue.repository, issue.number, &target)
+                ));
             }
             if issue.state != "OPEN" {
                 return Err(format!("Issue #{} is closed.", issue.number));
             }
-            if let Some(parent) = issue_parent(&repository, &target, issue.number)? {
-                if Some(parent) != umbrella_number {
-                    let parent_issue = github_issue(&repository, &target, parent)?;
+            if let Some((parent_repo, parent_number)) =
+                issue_parent(&repository, issue_repo, issue.number)?
+            {
+                if !parent_repo.eq_ignore_ascii_case(&target)
+                    || Some(parent_number) != umbrella_number
+                {
+                    let parent_issue = github_issue(&repository, &parent_repo, parent_number)?;
                     let owned_parent = umbrella_number.is_none()
                         && graph.issues.len() == 1
                         && parent_issue["body"]
@@ -439,13 +574,15 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
                             .is_some_and(|body| body.contains(&umbrella_marker));
                     if owned_parent {
                         old_parent = Some((
-                            parent,
+                            parent_repo.clone(),
+                            parent_number,
                             value["id"].as_u64().ok_or("GitHub issue has no ID.")?,
                         ));
                     } else {
                         return Err(format!(
-                            "Issue #{} already belongs to umbrella #{parent}.",
-                            issue.number
+                            "Issue {} already belongs to umbrella {}.",
+                            issue_reference(&issue.repository, issue.number, &target),
+                            issue_reference(&parent_repo, parent_number, &target)
                         ));
                     }
                 }
@@ -477,18 +614,74 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
             if graph.issues.iter().any(|issue| issue.id == *dependency) {
                 continue;
             }
-            let number = dependency
-                .parse::<u64>()
-                .map_err(|_| format!("Missing dependency {dependency}."))?;
-            let value = github_issue(&repository, &target, number)?;
+            let (dependency_repo, number) = dependency_repository(dependency, &target)?;
+            let value = github_issue(&repository, dependency_repo, number)?;
             let issue = published_issue(&value, dependency.clone())?;
-            if draft.number == Some(issue.number) {
+            if draft.number == Some(issue.number)
+                && draft_repository(draft, &target)?.eq_ignore_ascii_case(&issue.repository)
+            {
                 return Err(format!("Issue #{} cannot block itself.", issue.number));
             }
             if issue.state != "OPEN" {
                 return Err(format!("Dependency #{number} is closed."));
             }
             external.insert(dependency.clone(), value);
+        }
+    }
+    if !replace_existing {
+        if let Some(parent) = &umbrella {
+            let parent_number = parent["number"]
+                .as_u64()
+                .ok_or("GitHub umbrella has no number.")?;
+            let linked = issue_pages(
+                &repository,
+                &format!("repos/{target}/issues/{parent_number}/sub_issues"),
+            )?;
+            let wanted = existing
+                .values()
+                .filter_map(|value| value["id"].as_u64())
+                .collect::<std::collections::HashSet<_>>();
+            for child in linked {
+                let id = child["id"].as_u64().ok_or("GitHub subissue has no ID.")?;
+                if !wanted.contains(&id) {
+                    return Err(format!("Umbrella #{parent_number} already has child {}; load the umbrella before editing its split.", value_reference(&child, &target)?));
+                }
+            }
+        }
+        for draft in &graph.issues {
+            let Some(value) = existing.get(&draft.id) else {
+                continue;
+            };
+            let number = value["number"]
+                .as_u64()
+                .ok_or("GitHub issue has no number.")?;
+            let issue_repo = issue_repository_name(value)?;
+            let current = issue_pages(
+                &repository,
+                &format!("repos/{issue_repo}/issues/{number}/dependencies/blocked_by"),
+            )?;
+            let desired = draft
+                .depends_on
+                .iter()
+                .filter_map(|dependency| {
+                    existing
+                        .get(dependency)
+                        .or_else(|| external.get(dependency))
+                        .and_then(|value| value["id"].as_u64())
+                })
+                .collect::<std::collections::HashSet<_>>();
+            for blocker in current {
+                let id = blocker["id"]
+                    .as_u64()
+                    .ok_or("GitHub dependency has no ID.")?;
+                if !desired.contains(&id) {
+                    return Err(format!(
+                        "Issue {} already has blocker {}; load its umbrella before editing links.",
+                        issue_reference(&issue_repo, number, &target),
+                        value_reference(&blocker, &target)?
+                    ));
+                }
+            }
         }
     }
     let mut umbrella = umbrella;
@@ -504,9 +697,10 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
     }
     let mut issues = Vec::new();
     for draft in &graph.issues {
+        let issue_repo = draft_repository(draft, &target)?;
         let value = save_issue(
             &repository,
-            &target,
+            issue_repo,
             existing.remove(&draft.id),
             &draft.title,
             &draft.body,
@@ -517,10 +711,10 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
         issue.depends_on = draft.depends_on.clone();
         issues.push((issue, value));
     }
-    if let Some((parent, child_id)) = old_parent {
+    if let Some((parent_repo, parent, child_id)) = old_parent {
         delete_issue_link(
             &repository,
-            &format!("repos/{target}/issues/{parent}/sub_issue"),
+            &format!("repos/{parent_repo}/issues/{parent}/sub_issue"),
             "sub_issue_id",
             child_id,
         )?;
@@ -533,29 +727,28 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
         )?;
         let wanted = issues
             .iter()
-            .map(|(issue, _)| issue.number)
+            .filter_map(|(_, value)| value["id"].as_u64())
             .collect::<std::collections::HashSet<_>>();
         if replace_existing {
             for old in &linked {
-                let number = old["number"]
-                    .as_u64()
-                    .ok_or("GitHub subissue has no number.")?;
-                if !wanted.contains(&number) {
+                let id = old["id"].as_u64().ok_or("GitHub subissue has no ID.")?;
+                if !wanted.contains(&id) {
                     delete_issue_link(
                         &repository,
                         &format!("repos/{target}/issues/{}/sub_issue", parent.number),
                         "sub_issue_id",
-                        old["id"].as_u64().ok_or("GitHub subissue has no ID.")?,
+                        id,
                     )?;
                 }
             }
         }
-        let linked_numbers = linked
+        let linked_ids = linked
             .iter()
-            .filter_map(|value| value["number"].as_u64())
+            .filter_map(|value| value["id"].as_u64())
             .collect::<std::collections::HashSet<_>>();
         for (issue, value) in &issues {
-            if !linked_numbers.contains(&issue.number) {
+            let id = value["id"].as_u64().ok_or("GitHub issue has no ID.")?;
+            if !linked_ids.contains(&id) {
                 issue_api(
                     &repository,
                     &[
@@ -563,10 +756,7 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
                         "POST",
                         &format!("repos/{target}/issues/{}/sub_issues", parent.number),
                         "-F",
-                        &format!(
-                            "sub_issue_id={}",
-                            value["id"].as_u64().ok_or("GitHub issue has no ID.")?
-                        ),
+                        &format!("sub_issue_id={id}"),
                     ],
                 )
                 .map_err(|error| {
@@ -582,8 +772,8 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
         let blocked_by = issue_pages(
             &repository,
             &format!(
-                "repos/{target}/issues/{}/dependencies/blocked_by",
-                issue.number
+                "repos/{}/issues/{}/dependencies/blocked_by",
+                issue.repository, issue.number
             ),
         )?;
         let desired = issue
@@ -597,24 +787,19 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
                     .or_else(|| external.get(dependency))
                     .ok_or("Missing dependency.")?;
                 Ok((
-                    value["number"]
-                        .as_u64()
-                        .ok_or("GitHub issue has no number.")?,
+                    value_reference(value, &target)?,
                     value["id"].as_u64().ok_or("GitHub issue has no ID.")?,
                 ))
             })
-            .collect::<Result<Vec<(u64, u64)>, String>>()?;
+            .collect::<Result<Vec<(String, u64)>, String>>()?;
         let wanted = desired
             .iter()
-            .map(|(number, _)| *number)
+            .map(|(_, id)| *id)
             .collect::<std::collections::HashSet<_>>();
         if replace_existing {
             for old in &blocked_by {
-                let number = old["number"]
-                    .as_u64()
-                    .ok_or("GitHub dependency has no number.")?;
-                if !wanted.contains(&number) {
-                    let id = old["id"].as_u64().ok_or("GitHub dependency has no ID.")?;
+                let id = old["id"].as_u64().ok_or("GitHub dependency has no ID.")?;
+                if !wanted.contains(&id) {
                     gh_command(
                         &repository,
                         &[
@@ -622,8 +807,8 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
                             "-X",
                             "DELETE",
                             &format!(
-                                "repos/{target}/issues/{}/dependencies/blocked_by/{id}",
-                                issue.number
+                                "repos/{}/issues/{}/dependencies/blocked_by/{id}",
+                                issue.repository, issue.number
                             ),
                         ],
                     )?;
@@ -632,25 +817,28 @@ fn publish_graph(repository: String, graph: IssueGraphDraft) -> Result<Published
         }
         let current = blocked_by
             .iter()
-            .filter_map(|value| value["number"].as_u64())
+            .filter_map(|value| value["id"].as_u64())
             .collect::<std::collections::HashSet<_>>();
-        for (number, id) in desired {
-            if !current.contains(&number) {
+        for (reference, id) in desired {
+            if !current.contains(&id) {
                 issue_api(
                     &repository,
                     &[
                         "-X",
                         "POST",
                         &format!(
-                            "repos/{target}/issues/{}/dependencies/blocked_by",
-                            issue.number
+                            "repos/{}/issues/{}/dependencies/blocked_by",
+                            issue.repository, issue.number
                         ),
                         "-F",
                         &format!("issue_id={id}"),
                     ],
                 )
                 .map_err(|error| {
-                    format!("Cannot add blocker #{number} to #{}: {error}", issue.number)
+                    format!(
+                        "Cannot add blocker {reference} to #{}: {error}",
+                        issue.number
+                    )
                 })?;
             }
         }
@@ -696,22 +884,18 @@ pub async fn load_issue_graph(
         )?;
         let mut issues = Vec::new();
         for value in children {
+            let child_repo = issue_repository_name(&value)?;
             let number = value["number"]
                 .as_u64()
                 .ok_or("GitHub subissue has no number.")?;
-            let mut issue = published_issue(&value, number.to_string())?;
+            let mut issue = published_issue(&value, issue_reference(&child_repo, number, &target))?;
             let blockers = issue_pages(
                 &repository,
-                &format!("repos/{target}/issues/{number}/dependencies/blocked_by"),
+                &format!("repos/{child_repo}/issues/{number}/dependencies/blocked_by"),
             )?;
             issue.depends_on = blockers
                 .iter()
-                .map(|blocker| {
-                    blocker["number"]
-                        .as_u64()
-                        .map(|number| number.to_string())
-                        .ok_or("GitHub dependency has no number.".to_string())
-                })
+                .map(|blocker| value_reference(blocker, &target))
                 .collect::<Result<Vec<_>, _>>()?;
             issues.push(issue);
         }
@@ -1303,6 +1487,7 @@ mod tests {
         let mut graph = IssueGraphDraft {
             umbrella_number: None,
             source: "test".into(),
+            repository: None,
             replace_existing: false,
             title: "Umbrella".into(),
             body: String::new(),
@@ -1310,6 +1495,7 @@ mod tests {
                 IssueDraft {
                     id: "a".into(),
                     number: Some(3),
+                    repository: None,
                     title: "A".into(),
                     body: String::new(),
                     depends_on: vec![],
@@ -1317,6 +1503,7 @@ mod tests {
                 IssueDraft {
                     id: "b".into(),
                     number: Some(4),
+                    repository: None,
                     title: "B".into(),
                     body: String::new(),
                     depends_on: vec!["a".into()],
@@ -1336,6 +1523,41 @@ mod tests {
         graph.issues[1].depends_on.clear();
         graph.issues[1].number = Some(3);
         assert!(validate_graph(&graph).unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn graph_accepts_distinct_repositories_with_same_number() {
+        let graph = IssueGraphDraft {
+            repository: Some("owner/main".into()),
+            umbrella_number: Some(7),
+            source: "test".into(),
+            replace_existing: true,
+            title: "Umbrella".into(),
+            body: String::new(),
+            issues: vec![
+                IssueDraft {
+                    id: "local".into(),
+                    number: Some(3),
+                    repository: None,
+                    title: "Local".into(),
+                    body: String::new(),
+                    depends_on: vec![],
+                },
+                IssueDraft {
+                    id: "owner/other#3".into(),
+                    number: Some(3),
+                    repository: Some("owner/other".into()),
+                    title: "Other".into(),
+                    body: String::new(),
+                    depends_on: vec!["local".into()],
+                },
+            ],
+        };
+        assert!(validate_graph(&graph).is_ok());
+        assert_eq!(
+            super::dependency_repository("owner/other#3", "owner/main").unwrap(),
+            ("owner/other", 3)
+        );
     }
 
     #[test]
