@@ -4,6 +4,7 @@
   import {
     graphErrors,
     isIssueGraphDraft,
+    positiveIssueNumber,
     rebaseIssueGraph,
     type IssueGraphDraft,
     type PublishedGraph,
@@ -60,19 +61,13 @@
     if (source && graph.source) setSetting(`sai-issue-graph:${source}`, JSON.stringify(graph));
   });
 
-  function parseNumber(value: string): number | undefined {
-    if (!value.trim()) return undefined;
-    const number = Number(value);
-    return Number.isSafeInteger(number) && number > 0 ? number : 0;
-  }
-
   function updateIssue(index: number, change: Partial<IssueGraphDraft['issues'][number]>) {
     graph.issues[index] = { ...graph.issues[index], ...change };
     published = null;
   }
 
   async function loadUmbrella() {
-    const number = parseNumber(umbrellaInput);
+    const number = positiveIssueNumber(umbrellaInput);
     if (!number) {
       message = 'Enter a valid umbrella number.';
       return;
@@ -198,7 +193,7 @@
             min="1"
             value={issue.number ?? ''}
             oninput={(event) =>
-              updateIssue(index, { number: parseNumber(event.currentTarget.value) })}
+              updateIssue(index, { number: positiveIssueNumber(event.currentTarget.value) })}
           /></label
         >
         <label

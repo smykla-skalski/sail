@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { graphErrors } from '../src/lib/issue-graph.ts';
+import { graphErrors, positiveIssueNumber } from '../src/lib/issue-graph.ts';
 
 const graph = {
   source: 'session-1',
@@ -126,4 +126,11 @@ await test('revision to one issue releases an authored umbrella', async () => {
   const updated = rebaseIssueGraph({ ...graph, umbrellaNumber: 9 }, plan);
   assert.equal(updated.umbrellaNumber, undefined);
   assert.equal(updated.issues[0].number, 3);
+});
+
+await test('issue number input accepts Svelte numeric binding values', () => {
+  assert.equal(positiveIssueNumber(207), 207);
+  assert.equal(positiveIssueNumber('207'), 207);
+  assert.equal(positiveIssueNumber(''), undefined);
+  assert.equal(positiveIssueNumber(-1), 0);
 });

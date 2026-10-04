@@ -48,6 +48,13 @@ const IssueGraphDraftSchema = z.object({
   ),
 });
 
+export function positiveIssueNumber(value: string | number): number | undefined {
+  const text = String(value).trim();
+  if (!text) return undefined;
+  const number = Number(text);
+  return Number.isSafeInteger(number) && number > 0 ? number : 0;
+}
+
 export function isIssueGraphDraft(value: unknown): value is IssueGraphDraft {
   return IssueGraphDraftSchema.safeParse(value).success;
 }
