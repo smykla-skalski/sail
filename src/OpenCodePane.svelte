@@ -99,7 +99,7 @@
   let pendingForms = $state<FormInfo[]>([]);
   let draft = $state('');
   const failureRequests = new SvelteMap<string, string>();
-  let skills = $state<SkillChoice[]>([]);
+  let skills = $state<SkillChoice[]>(bundledSkills);
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
   const skillMatches = $derived(matchingSkills(skills, draft));

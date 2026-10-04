@@ -37,3 +37,12 @@ void test('bundled skills fill missing names without replacing installed skills'
   assert.match(resolveSkillPrompt(merged, '/adversarial-test --base main'), /Test now/);
   assert.equal(resolveSkillPrompt(merged, '/unknown'), '/unknown');
 });
+
+void test('an installed shipping skill still receives the fresh session gate', () => {
+  const installed = [{ id: 'old', name: 'ship-it', description: 'Installed' }];
+  const merged = mergeSkills(installed, [
+    { name: 'ship-it', description: 'Bundled', instructions: 'Bundle content' },
+  ]);
+  assert.deepEqual(merged, installed);
+  assert.match(resolveSkillPrompt(merged, '/ship-it #42'), /Never run a gate inline/);
+});

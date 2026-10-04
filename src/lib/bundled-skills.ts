@@ -1,4 +1,4 @@
-import type { SkillChoice } from './skills';
+import { sailGateRule, type SkillChoice } from './skills';
 import shipIt from '../../skills/ship-it/SKILL.md?raw';
 import shipInputs from '../../skills/ship-it/references/inputs.md?raw';
 import shipFallbacks from '../../skills/ship-it/references/fallbacks.md?raw';
@@ -9,14 +9,12 @@ import findingsAdversary from '../../skills/adversarial-review/references/findin
 import manualTest from '../../skills/adversarial-test/SKILL.md?raw';
 import testAdversary from '../../skills/adversarial-test/references/test-adversary.md?raw';
 
-const gateRule = `Sail gate rule: run every adversarial pass in a NEW subagent session. Do not run a pass inline or reuse a session. If a fresh session cannot launch, pause and tell the user which gate failed and why. Report the failure visibly in the current thread. This rule overrides any inline fallback in the source material.`;
-
 export const bundledSkills: SkillChoice[] = [
   {
     name: 'ship-it',
     description: 'Implement, review, test, and ship one change',
     instructions: [
-      gateRule,
+      sailGateRule,
       shipIt,
       'Reference: inputs.md',
       shipInputs,
@@ -30,7 +28,7 @@ export const bundledSkills: SkillChoice[] = [
     name: 'adversarial-review',
     description: 'Review a change in two fresh opposed sessions',
     instructions: [
-      gateRule,
+      sailGateRule,
       review,
       'Code Adversary mandate:',
       codeAdversary,
@@ -41,6 +39,6 @@ export const bundledSkills: SkillChoice[] = [
   {
     name: 'adversarial-test',
     description: 'Manually test a change in a fresh session',
-    instructions: [gateRule, manualTest, 'Test Adversary mandate:', testAdversary].join('\n\n'),
+    instructions: [sailGateRule, manualTest, 'Test Adversary mandate:', testAdversary].join('\n\n'),
   },
 ];
