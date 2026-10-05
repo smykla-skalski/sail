@@ -86,13 +86,13 @@
     </div>
   </header>
   {#if error}<p class="ship-error" role="alert">{error}</p>{/if}
-  {#if repository}<label class="ship-run-select"
-      >Repository
-      <select bind:value={scope}>
-        <option value="current">Current repository</option>
-        <option value="all">All repositories</option>
-      </select>
-    </label>{/if}
+  {#if repository}<div class="ship-scope" role="group" aria-label="Repository scope">
+      <button aria-pressed={scope === 'current'} onclick={() => (scope = 'current')}
+        >Current repository</button
+      ><button aria-pressed={scope === 'all'} onclick={() => (scope = 'all')}
+        >All repositories</button
+      >
+    </div>{/if}
   {#if !run}
     <section class="ship-empty">
       <h3>No Ship runs yet</h3>
@@ -310,6 +310,16 @@
     gap: 12px;
     margin: 20px 0;
     align-items: center;
+  }
+  .ship-scope {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 16px;
+  }
+  .ship-scope button[aria-pressed='true'] {
+    border-color: var(--sui-primary);
+    color: var(--sui-primary);
   }
   select {
     min-width: 0;

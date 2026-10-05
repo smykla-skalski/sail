@@ -9012,7 +9012,7 @@
       onterminalownerlost={(id) => savePaneLayout(updatePane(paneLayout, id, { owner: undefined }))}
       onagentterminal={(id) => void openAgentTerminal(id)}
     />
-    {#if mainShipFallback && detailsOpen && activeSideTab === 'ship'}<section
+    {#if mainShipFallback && detailsOpen && activeSideTab === 'ship' && (!mobileLayout || mobileView === 'details')}<section
         class="ship-fallback"
         aria-label="Ship run details"
       >

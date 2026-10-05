@@ -153,9 +153,9 @@ describe('native Ship run history', () => {
     await expect($('.side-tabs')).toHaveText(expect.stringContaining('Ship runs (2)'));
     await expect($('.ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('Ship dashboard fixture'));
-    await $('.ship-panel select').selectByAttribute('value', 'all');
+    await $('.ship-scope button:nth-child(2)').click();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('Other project fixture'));
-    await $('.ship-panel select').selectByAttribute('value', 'current');
+    await $('.ship-scope button:first-child').click();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('1 / 3 merged'));
     await expect($('.ship-panel')).toHaveText(expect.stringContaining('Umbrella #40'));
     await expect($('.ship-graph')).toHaveText(expect.stringContaining('Blocked'));
@@ -233,6 +233,12 @@ describe('native Ship run history', () => {
     );
     await expect($('.ship-fallback .ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('Ship dashboard fixture'));
+    await browser.setWindowSize(700, 850);
+    await $('.mobile-switcher button:nth-child(2)').click();
+    await expect($('.ship-fallback')).not.toExist();
+    await $('.mobile-switcher button:nth-child(3)').click();
+    await expect($('.ship-fallback .ship-panel')).toBeDisplayed();
     await $('[aria-label="Close Ship runs"]').click();
+    await browser.setWindowSize(1280, 850);
   });
 });
