@@ -193,6 +193,10 @@ describe('ACP agent threads', () => {
     await $('.agent-composer textarea').setValue('Delayed approval');
     await $('.agent-actions button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await expect($('.agent-working-message')).toHaveText(expect.stringContaining('Claude'));
+    await expect($('.agent-working-message .agent-busy')).toHaveText(
+      expect.stringContaining('Stop'),
+    );
     await $('.agent-launches button:nth-child(2)').click();
     await browser.pause(1800);
     await selectClaudeThread('Delayed approval');
