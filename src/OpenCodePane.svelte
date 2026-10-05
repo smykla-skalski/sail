@@ -111,7 +111,7 @@
   const failureRequests = new SvelteMap<string, string>();
   let skills = $state<SkillChoice[]>(bundledSkills);
   let skillSelected = $state(0);
-  const adoptedShipMessages = new Set<string>();
+  const adoptedShipMessages = new SvelteSet<string>();
   $effect(() => {
     if (!onshipit || !activeID || !running) return;
     const saved = savedShipItIssue(directory);

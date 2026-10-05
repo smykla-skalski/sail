@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from 'svelte';
-  import { SvelteMap } from 'svelte/reactivity';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { Badge, Button } from '@smykla-skalski/sui';
@@ -167,7 +167,7 @@
       });
   });
   let queued = $state<QueuedAgentMessage[]>([]);
-  const adoptedShipMessages = new Set<string>();
+  const adoptedShipMessages = new SvelteSet<string>();
   let queuePaused = $state(false);
   let steering = $state(false);
   function diagnostic(event: DiagnosticEvent, sessionId = activeSessionId, turnId = activeTurnId) {

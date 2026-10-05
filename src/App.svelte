@@ -84,6 +84,7 @@
     activeImplementationModels,
     beginImplementationTurn,
     beginShipItRun,
+    hasPendingImplementationTurn,
     implementationAttributionUncertain,
     implementationModels,
     recoverImplementationModels,
@@ -475,6 +476,14 @@
   let agentAvailability = $state<AgentAvailability[]>([]);
   let agentDetectionError = $state('');
   let agentThreads = $state<AgentThread[]>(savedAgentThreads);
+  $effect(() => {
+    for (const thread of agentThreads) {
+      if (!hasPendingImplementationTurn(thread.directory)) continue;
+      const issue = savedShipItIssue(thread.directory);
+      if (issue)
+        void adoptDirectShipRun(issue, thread.directory, `acp:${thread.agent}:${thread.sessionId}`);
+    }
+  });
   let agentUsage = $state<Record<string, AgentUsage>>({});
   let agentRates = $state<Record<string, RateWindow[]>>({});
   let replayingAgentSessions = $state<Record<string, number>>({});
@@ -741,7 +750,7 @@
     if (!side.parentThreadId && thread) sideChat = { ...side, parentThreadId: thread.sessionId };
   });
   let messages = $state<SessionMessageInfo[]>([]);
-  const adoptedDirectMessages = new Set<string>();
+  const adoptedDirectMessages = new SvelteSet<string>();
   let olderMessageCursor = $state<string | null>(null);
   let loadingOlder = $state(false);
   let restoringTimelineSelection: number | null = null;

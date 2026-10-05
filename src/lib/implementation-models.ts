@@ -36,6 +36,10 @@ function pendingTurns(directory: string): PendingTurn[] {
   }
 }
 
+export function hasPendingImplementationTurn(directory: string): boolean {
+  return pendingTurns(directory).length > 0;
+}
+
 function savePendingTurns(directory: string, turns: PendingTurn[]): void {
   setSetting(pendingKey(directory), JSON.stringify(turns));
 }

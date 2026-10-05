@@ -146,7 +146,10 @@ void test('adopts an already-running direct Ship It thread', () => {
   assert.equal(issue.url, 'https://github.com/kumahq/kuma/issues/18976');
   assert.equal(issue.state, 'working');
   assert.equal(issue.stage, 'implementing');
-  assert.equal(shipOwner(adopted, '/repo/worktrees/gateway-fix', 'acp:codex:running-thread')?.issue, issue);
+  assert.equal(
+    shipOwner(adopted, '/repo/worktrees/gateway-fix', 'acp:codex:running-thread')?.issue,
+    issue,
+  );
 });
 
 void test('does not duplicate a recovered direct Ship It thread', () => {

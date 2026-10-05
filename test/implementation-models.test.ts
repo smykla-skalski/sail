@@ -9,6 +9,7 @@ import {
   implementationModels,
   recoverImplementationModels,
   recordImplementationModel,
+  savedShipItIssue,
   settledImplementationAttribution,
 } from '../src/lib/implementation-models.ts';
 
@@ -84,7 +85,11 @@ void test('model history survives equivalent references and rejects a second iss
     value: { __TAURI_INTERNALS__: { invoke: async () => 'example/repo' } },
   });
   const directory = '/test/reused-worktree';
-  await beginShipItRun(directory, '/ship-it #1');
+  assert.deepEqual(await beginShipItRun(directory, '/ship-it #1'), {
+    repository: 'example/repo',
+    number: 1,
+  });
+  assert.deepEqual(savedShipItIssue(directory), { repository: 'example/repo', number: 1 });
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-a']));
   await beginShipItRun(directory, '/ship-it #1');
   assert.deepEqual(implementationModels(directory), ['model-a']);
