@@ -216,5 +216,23 @@ describe('native Ship run history', () => {
     await expect($('.ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('Ship dashboard fixture'));
     await $('[aria-label="Close Ship runs"]').click();
+
+    await browser.tauri.execute(async ({ core }, path) => {
+      await core.invoke('save_setting', {
+        key: 'sai-pane-layouts',
+        value: JSON.stringify({ [path]: { id: 'main', agent: null, thread: null } }),
+      });
+      await core.invoke('save_setting', { key: `sai-main-pane-empty:${path}`, value: 'true' });
+    }, repository);
+    await browser.refresh();
+    await expect($('.pane-picker')).toBeDisplayed();
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
+      ),
+    );
+    await expect($('.ship-fallback .ship-panel')).toBeDisplayed();
+    await expect($('.ship-summary')).toHaveText(expect.stringContaining('Ship dashboard fixture'));
+    await $('[aria-label="Close Ship runs"]').click();
   });
 });

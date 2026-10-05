@@ -869,10 +869,21 @@ button:disabled {
   background: var(--sui-success);
 }
 .main-area {
+  position: relative;
   display: flex;
   flex: 1;
   flex-direction: column;
   min-width: 0;
+}
+.ship-fallback {
+  position: absolute;
+  z-index: 2;
+  top: var(--topbar-height);
+  right: 0;
+  bottom: 0;
+  width: min(420px, 100%);
+  border-left: 1px solid var(--shell-divider);
+  box-shadow: -8px 0 24px #0002;
 }
 .agent-launches {
   display: flex;

@@ -708,6 +708,9 @@
       !newSessionMode
     );
   });
+  let mainShipFallback = $derived(
+    showMainPicker || !!leaves(paneLayout).find((pane) => pane.id === 'main')?.kind,
+  );
   $effect(() => {
     const side = sideChat;
     if (!side) return;
@@ -873,7 +876,7 @@
   async function showMobileView(view: 'sessions' | 'chat' | 'details') {
     if (view === 'sessions') sidebarVisible = true;
     saveViewState();
-    if (view === 'details' && !sessionID && !acpAgent) showShipRuns();
+    if (view === 'details' && (mainShipFallback || (!sessionID && !acpAgent))) showShipRuns();
     if (acpAgent) {
       agentChangesOpen = view === 'details';
       if (agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
@@ -908,6 +911,10 @@
         : [...changesPanes, focusedPane];
       return;
     }
+    if (mainShipFallback) {
+      toggleShipRuns();
+      return;
+    }
     if (acpAgent) {
       if (agentChangesOpen && activeSideTab === 'ship') {
         sideTab = 'changes';
@@ -921,11 +928,7 @@
       return;
     }
     if (!sessionID) {
-      const visible = detailsOpen && activeSideTab === 'ship';
-      detailsOpen = !visible;
-      sideTab = 'ship';
-      if (window.matchMedia('(max-width: 850px)').matches)
-        mobileView = visible ? 'chat' : 'details';
+      toggleShipRuns();
       return;
     }
     const narrow = window.matchMedia('(max-width: 850px)').matches;
@@ -1260,6 +1263,13 @@
     detailsOpen = true;
     if (acpAgent) agentChangesOpen = true;
     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
+  }
+
+  function toggleShipRuns() {
+    const visible = detailsOpen && activeSideTab === 'ship';
+    detailsOpen = !visible;
+    sideTab = 'ship';
+    if (window.matchMedia('(max-width: 850px)').matches) mobileView = visible ? 'chat' : 'details';
   }
 
   function closeShipRuns() {
@@ -8431,7 +8441,9 @@
             ? changesPanes.includes(focusedPane)
             : acpAgent
               ? agentChangesOpen
-              : detailsOpen && (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship')}
+              : detailsOpen &&
+                (mainShipFallback ||
+                  (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship'))}
           title={sessionID || acpAgent ? 'Toggle Changes (⌘L)' : 'Toggle details (⌘L)'}
           >{sessionID || acpAgent ? 'Changes' : 'Details'}</Button
         >
@@ -9000,6 +9012,23 @@
       onterminalownerlost={(id) => savePaneLayout(updatePane(paneLayout, id, { owner: undefined }))}
       onagentterminal={(id) => void openAgentTerminal(id)}
     />
+    {#if mainShipFallback && detailsOpen && activeSideTab === 'ship'}<section
+        class="ship-fallback"
+        aria-label="Ship run details"
+      >
+        <ShipPanel
+          repository={coordinationProject(directory) ?? directory}
+          runs={shipRuns}
+          busy={shippingBusy}
+          onclose={closeShipRuns}
+          onrefresh={() => tickShippingRuns(true)}
+          onopen={openShipTarget}
+          onsettings={async () => {
+            closeShipRuns();
+            await openSettings();
+          }}
+        />
+      </section>{/if}
   </div>
 </div>
 <ConfirmDialog request={confirmation} onanswer={answerConfirmation} />
