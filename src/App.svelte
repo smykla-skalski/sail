@@ -1976,6 +1976,10 @@
       }
       if (issue.path) {
         try {
+          await updateShipIssue(run, issue, {
+            models: implementationModels(issue.path),
+            modelUncertain: implementationAttributionUncertain(issue.path),
+          });
           const archivePath = await invoke<string | null>('delete_worktree', {
             repository: run.repository,
             worktree: issue.path,
