@@ -3413,7 +3413,7 @@
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out before the agent could start.');
       const requireResponseTime = async () => {
-        if (Date.now() >= responseDeadline)
+        if (Date.now() + 30_000 >= responseDeadline)
           throw new Error('Agent spawn timed out before the agent could start.');
       };
       const started = await startCoordinatedThread(
