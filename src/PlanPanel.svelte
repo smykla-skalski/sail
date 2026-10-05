@@ -65,10 +65,31 @@
   let currentQuestions = '';
   let currentScope = '';
   let currentBatch: PlanQuestions | null = null;
+  let diagramValidity = $state<Record<string, boolean>>({});
 
   let plan = $derived(snapshot.plan);
   let questions = $derived(snapshot.questions);
-  let canExecute = $derived(!!plan && canExecutePlan(plan, decisions));
+  let diagramTargets = $derived.by(() => {
+    if (!plan) return [];
+    return [
+      ...(plan.diagram ? [{ id: 'plan', title: 'Plan overview' }] : []),
+      ...(plan.sequence ? [{ id: 'sequence', title: 'Runtime sequence' }] : []),
+      ...(plan.diagrams ?? []).map((extra, index) => ({
+        id: `extra:${index}`,
+        title: extra.title,
+      })),
+      ...plan.steps
+        .filter((step) => !!step.diagram)
+        .map((step) => ({ id: `step:${step.id}`, title: `${step.title} diagram` })),
+    ];
+  });
+  let invalidDiagrams = $derived(
+    diagramTargets.filter((diagram) => diagramValidity[diagram.id] === false),
+  );
+  let diagramsValid = $derived(
+    diagramTargets.every((diagram) => diagramValidity[diagram.id] === true),
+  );
+  let canExecute = $derived(!!plan && diagramsValid && canExecutePlan(plan, decisions));
   let skipped = $derived(plan ? skippedSteps(plan, decisions) : []);
   let execution = $derived(plan ? executionSummary(plan, directory) : null);
 
@@ -131,6 +152,7 @@
       note = '';
       editing = {};
       reviewErrors = {};
+      diagramValidity = {};
       confirming = false;
       reviewStatus = '';
       if (key) loadPlanDraft(key);
@@ -411,6 +433,13 @@
       pending = false;
     }
   }
+
+  async function requestDiagramFix() {
+    if (!plan || plan.state !== 'review' || pending) return;
+    const titles = invalidDiagrams.map((diagram) => diagram.title).join(', ');
+    note = `The following Mermaid diagrams are invalid: ${titles}. Correct their Mermaid syntax and validate every diagram before resubmitting the plan.`;
+    await sendReview('revise');
+  }
 </script>
 
 <aside class="plan-panel" aria-label="Plan review" bind:this={panelElement}>
@@ -596,12 +625,37 @@
                 >{/each}
             </p>{/if}
         </section>{/if}
-      {#if plan.diagram}<Diagram source={plan.diagram} title="Plan overview" {dark} />{/if}
+      {#if invalidDiagrams.length}<section class="diagram-validation" role="alert">
+          <strong>Invalid Mermaid diagram{invalidDiagrams.length === 1 ? '' : 's'}</strong>
+          <p>{invalidDiagrams.map((diagram) => diagram.title).join(', ')}</p>
+          {#if plan.state === 'review'}<Button
+              size="sm"
+              variant="secondary"
+              disabled={pending}
+              onclick={() => void requestDiagramFix()}>Fix invalid diagrams</Button
+            >{/if}
+        </section>{/if}
+      {#if plan.diagram}<Diagram
+          source={plan.diagram}
+          title="Plan overview"
+          {dark}
+          onvalidation={(valid) => (diagramValidity.plan = valid)}
+        />{/if}
       {#if plan.sequence}<h4 class="diagram-heading">Runtime sequence</h4>
-        <Diagram source={plan.sequence} title="Runtime sequence" {dark} />{/if}
-      {#each plan.diagrams ?? [] as extra (extra.title)}
+        <Diagram
+          source={plan.sequence}
+          title="Runtime sequence"
+          {dark}
+          onvalidation={(valid) => (diagramValidity.sequence = valid)}
+        />{/if}
+      {#each plan.diagrams ?? [] as extra, index (extra.title)}
         <h4 class="diagram-heading">{extra.title}</h4>
-        <Diagram source={extra.source} title={extra.title} {dark} />
+        <Diagram
+          source={extra.source}
+          title={extra.title}
+          {dark}
+          onvalidation={(valid) => (diagramValidity[`extra:${index}`] = valid)}
+        />
       {/each}
 
       {#if plan.alternatives?.length}
@@ -714,6 +768,7 @@
                 source={step.diagram}
                 title={`${step.title} diagram`}
                 {dark}
+                onvalidation={(valid) => (diagramValidity[`step:${step.id}`] = valid)}
               />{/if}
           </details>
           {#if plan.state === 'review'}
@@ -913,13 +968,20 @@
   }
   .execution-progress,
   .run-digest,
-  .execution-alert {
+  .execution-alert,
+  .diagram-validation {
     margin: 12px 0 20px;
     padding: 12px;
     border: 1px solid var(--shell-divider);
     border-radius: 8px;
     font-size: 12px;
     line-height: 1.5;
+  }
+  .diagram-validation {
+    border-color: var(--sui-danger);
+  }
+  .diagram-validation p {
+    margin: 4px 0 8px;
   }
   .execution-progress > div {
     display: flex;
