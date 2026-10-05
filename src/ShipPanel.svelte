@@ -41,7 +41,13 @@
   const run = $derived(visible.find((item) => item.id === selectedRun) ?? visible.at(-1));
   const issue = $derived(run?.issues.find((item) => item.id === selectedIssue) ?? run?.issues[0]);
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
-  const activeIssues = $derived(run?.issues.filter((item) => item.state !== 'merged') ?? []);
+  const issues = $derived(run?.issues ?? []);
+
+  function issueLabel(item: ShipIssue): string {
+    return item.title === `Issue #${item.number}`
+      ? `#${item.number}`
+      : `#${item.number} ${item.title}`;
+  }
 
   $effect(() => {
     if (active && !wasActive) error = '';
@@ -149,10 +155,10 @@
     <section class="ship-now" aria-label="Current shipping activity">
       <div>
         <h3>Happening now</h3>
-        <p>Live worker, gate, blocker, and merge state.</p>
+        <p>Latest worker, gate, blocker, and merge state for every issue.</p>
       </div>
       <div class="ship-now-list">
-        {#each activeIssues as item (item.id)}
+        {#each issues as item (item.id)}
           {@const activity = shipActivity(run, item)}
           <button
             class="ship-now-item"
@@ -160,7 +166,7 @@
             aria-pressed={item.id === issue?.id}
             onclick={() => selectIssue(item.id)}
           >
-            <strong>#{item.number} {item.title}</strong>
+            <strong>{issueLabel(item)}</strong>
             <span>{activity.title}</span>
             <small>{activity.detail}</small>
             {#if activity.at}<time datetime={new Date(activity.at).toISOString()}
@@ -171,50 +177,13 @@
       </div>
     </section>
     <div class="ship-content">
-      <nav class="ship-graph" aria-label="Issue dependency graph">
-        {#each run.issues as item (item.id)}
-          <div
-            class="ship-node"
-            class:selected={item.id === issue?.id}
-            data-state={shipStatus(run, item)}
-          >
-            <button
-              class="ship-node-select"
-              aria-pressed={item.id === issue?.id}
-              onclick={() => selectIssue(item.id)}
-              ><strong>#{item.number} {item.title}</strong><span class="ship-status"
-                >{shipStatus(run, item)}</span
-              ></button
-            >
-            {@render dependencies(run, item)}
-          </div>
-        {/each}
-      </nav>
       {#if issue}
-        {@const activity = shipActivity(run, issue)}
         <section
           class="ship-issue-detail"
           tabindex="-1"
           aria-label={`Issue ${issue.number} details`}
         >
-          <h3>
-            <a href={issue.url} target="_blank" rel="noreferrer">#{issue.number} {issue.title}</a>
-          </h3>
-          <p>
-            <strong>{shipStatus(run, issue)}</strong> · Stage: {issue.stage?.replaceAll('_', ' ') ??
-              issue.state.replaceAll('_', ' ')} · GitHub issue: {issue.issueState ?? 'Unknown'}
-          </p>
-          <section
-            class="ship-current"
-            data-state={activity.state}
-            aria-label="Current issue activity"
-          >
-            <strong>Now: {activity.title}</strong>
-            <span>{activity.detail}</span>
-            {#if activity.at}<time datetime={new Date(activity.at).toISOString()}
-                >Last signal {new Date(activity.at).toLocaleString()}</time
-              >{/if}
-          </section>
+          <h3>Issue details</h3>
           {#if issue.blockedReason || issue.error}<p class="ship-error" role="status">
               {issue.blockedReason || issue.error}
             </p>{/if}
@@ -232,6 +201,7 @@
               : 'Not refreshed yet'}
           </p>
           <div class="ship-actions">
+            <a href={issue.url} target="_blank" rel="noreferrer">Open GitHub issue</a>
             <button disabled={!issue.path} onclick={() => act(() => onopen(issue!.path!))}
               >Open worktree</button
             >
@@ -341,24 +311,20 @@
     display: grid;
     gap: 8px;
   }
-  .ship-now-item,
-  .ship-current {
+  .ship-now-item {
     display: grid;
     gap: 4px;
     padding: 12px;
     text-align: left;
     border-left: 3px solid var(--sui-primary);
   }
-  .ship-now-item[data-state='blocked'],
-  .ship-current[data-state='blocked'] {
+  .ship-now-item[data-state='blocked'] {
     border-left-color: var(--sui-danger);
   }
-  .ship-now-item[data-state='waiting'],
-  .ship-current[data-state='waiting'] {
+  .ship-now-item[data-state='waiting'] {
     border-left-color: var(--sui-warning, var(--sui-primary));
   }
-  .ship-now-item time,
-  .ship-current time {
+  .ship-now-item time {
     opacity: 0.7;
     font-size: 12px;
   }
@@ -429,29 +395,6 @@
     grid-template-columns: minmax(0, 1fr);
     gap: 24px;
     margin-top: 20px;
-  }
-  .ship-current {
-    margin: 16px 0;
-  }
-  .ship-node {
-    padding: 12px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-    margin-bottom: 12px;
-  }
-  .ship-node.selected {
-    border-color: var(--sui-primary);
-  }
-  .ship-node-select {
-    display: grid;
-    gap: 8px;
-    width: 100%;
-    text-align: left;
-    border: 0;
-    padding: 0 0 8px;
-  }
-  .ship-status {
-    font-size: 12px;
   }
   .ship-dependencies {
     display: grid;
