@@ -49,6 +49,9 @@ void test('an installed shipping skill defaults gates to the implementation sess
   const prompt = resolveSkillPrompt(merged, '/ship-it #42');
   assert.match(prompt, /Sail default gate rule/);
   assert.match(prompt, /Do not call validation_gate/);
+  assert.match(prompt, /Sail progress reporting/);
+  assert.match(prompt, /stage, status: "running"/);
+  assert.match(prompt, /stages implementing, reviewing, testing, pull_request, ci, and merging/);
 });
 
 void test('bundled choices stay visible with many installed skills and mixed case', () => {
