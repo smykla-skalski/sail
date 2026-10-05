@@ -164,6 +164,22 @@ describe('provider selected agent spawn', () => {
     });
     expect(invalid.isError).toBe(true);
     expect(invalid.content[0].text).toContain('Choose Claude, Codex, or OpenCode');
+
+    const manualWorktree = callMcp(
+      config,
+      sessionId,
+      { name: 'manual-approval', prompt: 'Clipboard fixture manual worktree' },
+      'worktree_create',
+    );
+    await expect($('.worktree-approval-dialog')).toBeDisplayed();
+    await expect($('.worktree-approval-dialog')).toHaveText(
+      expect.stringContaining('Clipboard fixture manual worktree'),
+    );
+    await $('.worktree-approval-actions button:first-child').click();
+    const rejectedWorktree = await manualWorktree;
+    expect(rejectedWorktree.isError).toBe(true);
+    expect(rejectedWorktree.content[0].text).toContain('User declined the worktree request');
+
     const pendingReceiptId = randomUUID();
     const pendingAccessKey = randomUUID();
     const spawnNew = callMcp(config, sessionId, {
