@@ -15,8 +15,8 @@ browser. Read the tool schemas before calling them.
 
 - Use `worktree_list` to find project worktrees and live agent threads. Use
   `worktree_info` for details about a listed path.
-- Use `agent_spawn` to start Claude, Codex, or OpenCode. The default target is a
-  new worktree; an existing target shares files and can require user approval.
+- Use `agent_spawn` to start Claude, Codex, or OpenCode without interactive
+  approval. The default target is a new worktree; an existing target shares files.
   Use `worktree_create` when the user should choose a new worktree in Sail.
 - For an assigned Ship issue, use `ship_progress` to report `stage` (implementing,
   reviewing, testing, pull_request, ci, merging) and `status` (running or blocked).

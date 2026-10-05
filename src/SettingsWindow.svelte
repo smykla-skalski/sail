@@ -424,7 +424,7 @@
             onchange={(event) =>
               send({ type: 'agent-worktrees', value: event.currentTarget.checked })}
           />
-          Create worktrees and start threads with approval
+          Allow agents to create worktrees and start threads
         </label>
         <label class="attention-setting">
           <input

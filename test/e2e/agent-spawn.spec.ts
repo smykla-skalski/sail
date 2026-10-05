@@ -85,17 +85,18 @@ describe('provider selected agent spawn', () => {
   });
   after(() => rmSync(repository, { recursive: true, force: true }));
 
-  it('selects Codex in a new worktree and asks before sharing an existing one', async () => {
+  it('starts selected providers without approval', async () => {
     const path = realpathSync(repository);
     await browser.execute((directory) => {
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
       localStorage.setItem('sai-directory', directory);
       localStorage.setItem(
         'sai-project-catalog',
         JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
       );
       localStorage.removeItem('sail-agent-threads');
+      localStorage.removeItem('sai-agent-spawn-receipts');
       localStorage.setItem('sai-notifications-enabled', 'false');
-      sessionStorage.setItem('sail-e2e-settings', 'enabled');
     }, path);
     await browser.tauri.execute(async ({ core }, directory) => {
       await core.invoke('save_setting', { key: 'sai-directory', value: directory });
@@ -104,6 +105,7 @@ describe('provider selected agent spawn', () => {
         value: JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
       });
       await core.invoke('save_setting', { key: 'sail-agent-threads', value: null });
+      await core.invoke('save_setting', { key: 'sai-agent-spawn-receipts', value: null });
       await core.invoke('save_setting', { key: 'sai-notifications-enabled', value: 'false' });
     }, path);
     await browser.refresh();
@@ -122,7 +124,16 @@ describe('provider selected agent spawn', () => {
       () =>
         browser.execute(() => {
           const saved: unknown = JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]');
-          return Array.isArray(saved) && saved.length > 0;
+          return (
+            Array.isArray(saved) &&
+            saved.some(
+              (thread) =>
+                typeof thread === 'object' &&
+                thread !== null &&
+                'title' in thread &&
+                thread.title === 'Clipboard fixture source',
+            )
+          );
         }),
       { timeout: 15_000 },
     );
@@ -162,6 +173,22 @@ describe('provider selected agent spawn', () => {
     });
     expect(invalid.isError).toBe(true);
     expect(invalid.content[0].text).toContain('Choose Claude, Codex, or OpenCode');
+
+    const manualWorktree = callMcp(
+      config,
+      sessionId,
+      { name: 'manual-approval', prompt: 'Clipboard fixture manual worktree' },
+      'worktree_create',
+    );
+    await expect($('.worktree-approval-dialog')).toBeDisplayed();
+    await expect($('.worktree-approval-dialog')).toHaveText(
+      expect.stringContaining('Clipboard fixture manual worktree'),
+    );
+    await $('.worktree-approval-actions button:first-child').click();
+    const rejectedWorktree = await manualWorktree;
+    expect(rejectedWorktree.isError).toBe(true);
+    expect(rejectedWorktree.content[0].text).toContain('User declined the worktree request');
+
     const pendingReceiptId = randomUUID();
     const pendingAccessKey = randomUUID();
     const spawnNew = callMcp(config, sessionId, {
@@ -170,17 +197,8 @@ describe('provider selected agent spawn', () => {
       receiptId: pendingReceiptId,
       accessKey: pendingAccessKey,
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await expect($('.worktree-approval-dialog')).toHaveText(expect.stringContaining('codex'));
-    const queued = await callMcp(
-      config,
-      sessionId,
-      { receiptId: pendingReceiptId, accessKey: pendingAccessKey },
-      'agent_status',
-    );
-    expect(JSON.parse(queued.content[0].text)).toMatchObject({ state: 'queued' });
-    await $('.worktree-approval-actions button:last-child').click();
     const newResult = await spawnNew;
+    await expect($('.worktree-approval-dialog')).not.toBeDisplayed();
     expect(newResult.isError).not.toBe(true);
     const started = z
       .object({
@@ -241,23 +259,8 @@ describe('provider selected agent spawn', () => {
       prompt: 'Clipboard fixture shared',
       target: { kind: 'existing', path },
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await expect($('.worktree-approval-dialog')).toHaveText(
-      expect.stringContaining('share this worktree’s files'),
-    );
-    await $('.worktree-approval-actions button:first-child').click();
-    const denied = await spawnShared;
-    expect(denied.isError).toBe(true);
-    expect(denied.content[0].text).toContain('User declined');
-
-    const approvedShared = callMcp(config, sessionId, {
-      provider: 'claude',
-      prompt: 'Clipboard fixture approved shared',
-      target: { kind: 'existing', path },
-    });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await $('.worktree-approval-actions button:last-child').click();
-    const sharedResult = await approvedShared;
+    const sharedResult = await spawnShared;
+    await expect($('.worktree-approval-dialog')).not.toBeDisplayed();
     expect(sharedResult.isError).not.toBe(true);
     const shared = z
       .object({
@@ -272,23 +275,13 @@ describe('provider selected agent spawn', () => {
     expect(shared.worktreeId).toBe(path);
     expect(shared.path).toBe(path);
 
-    let openCodeFinished = false;
     const spawnOpenCode = callMcp(config, sessionId, {
       provider: 'opencode',
       prompt: 'Clipboard fixture OpenCode',
       target: { kind: 'existing', path },
-    }).then((spawnResponse) => {
-      openCodeFinished = true;
-      return spawnResponse;
     });
-    await browser.waitUntil(
-      async () => openCodeFinished || (await $('.worktree-approval-dialog').isDisplayed()),
-      { timeout: 15_000 },
-    );
-    if (await $('.worktree-approval-dialog').isDisplayed()) {
-      await $('.worktree-approval-actions button:last-child').click();
-    }
     const openCodeResult = await spawnOpenCode;
+    await expect($('.worktree-approval-dialog')).not.toBeDisplayed();
     if (openCodeResult.isError) {
       expect(openCodeResult.content[0].text).toContain(
         'Complete OpenCode setup in the target worktree before spawning',
@@ -345,8 +338,6 @@ describe('provider selected agent spawn', () => {
       prompt: 'Delayed approval',
       target: { kind: 'existing', path },
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await $('.worktree-approval-actions button:last-child').click();
     const waitingLaunch = z
       .object({ receiptId: z.string(), accessKey: z.string() })
       .parse(JSON.parse((await spawnWaiting).content[0].text));
@@ -383,8 +374,6 @@ describe('provider selected agent spawn', () => {
       prompt: 'Prompt failure',
       target: { kind: 'existing', path },
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await $('.worktree-approval-actions button:last-child').click();
     const failedLaunch = z
       .object({ receiptId: z.string(), accessKey: z.string() })
       .parse(JSON.parse((await spawnFailure).content[0].text));
@@ -449,6 +438,89 @@ describe('provider selected agent spawn', () => {
       'agent_status',
     );
     expect(JSON.parse(unavailable.content[0].text)).toMatchObject({ state: 'unavailable' });
+  });
+
+  it('keeps queued launches from creating worktrees before their turn', async () => {
+    const path = realpathSync(repository);
+    mkdirSync(join(repository, '.sail'), { recursive: true });
+    writeFileSync(join(repository, '.sail', 'worktree.json'), JSON.stringify({ setup: 'sleep 2' }));
+    execFileSync('git', ['-C', repository, 'add', '.sail/worktree.json']);
+    execFileSync('git', [
+      '-C',
+      repository,
+      '-c',
+      'user.name=Sail Test',
+      '-c',
+      'user.email=sail@example.test',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-qm',
+      'delayed setup',
+    ]);
+    const saved = await browser.execute(() => localStorage.getItem('sail-agent-threads'));
+    const sourceThread = z
+      .array(agentThread)
+      .parse(JSON.parse(saved ?? '[]'))
+      .find((thread) => thread.directory === path && thread.title === 'Clipboard fixture source');
+    if (!sourceThread) throw new Error('Source thread was not restored');
+    const config = await browser.tauri.execute(
+      async ({ core }, input) => core.invoke<McpConfig>('browser_mcp_config', input),
+      { directory: path, agent: sourceThread.agent },
+    );
+    const firstReceiptId = randomUUID();
+    const firstAccessKey = randomUUID();
+    const first = callMcp(config, sourceThread.sessionId, {
+      provider: 'codex',
+      prompt: 'Clipboard fixture queued predecessor',
+      receiptId: firstReceiptId,
+      accessKey: firstAccessKey,
+      target: { kind: 'new', name: 'queued-predecessor' },
+    });
+    await browser.waitUntil(
+      () =>
+        browser.execute((receiptId) => {
+          const receipts: Array<{ receiptId?: string; worktreeId?: string | null }> = JSON.parse(
+            localStorage.getItem('sai-agent-spawn-receipts') ?? '[]',
+          );
+          return Boolean(receipts.find((receipt) => receipt.receiptId === receiptId)?.worktreeId);
+        }, firstReceiptId),
+      { timeout: 15_000 },
+    );
+    await browser.execute(() => {
+      const original = window.setTimeout.bind(window);
+      const capped: typeof window.setTimeout = (handler, timeout, ...args) =>
+        original(handler, timeout && timeout >= 100_000 ? 25 : timeout, ...args);
+      window.sailQueueTestTimeout = original;
+      window.setTimeout = capped;
+    });
+    const timedOut = await callMcp(config, sourceThread.sessionId, {
+      provider: 'codex',
+      prompt: 'Clipboard fixture queued timeout',
+      receiptId: randomUUID(),
+      accessKey: randomUUID(),
+      target: { kind: 'new', name: 'queued-timeout' },
+    });
+    await browser.execute(() => {
+      window.setTimeout = window.sailQueueTestTimeout;
+      delete window.sailQueueTestTimeout;
+    });
+    expect(timedOut.isError).toBe(true);
+    expect(timedOut.content[0].text).toContain('Agent spawn timed out while waiting to launch.');
+    expect(
+      execFileSync('git', ['-C', repository, 'worktree', 'list', '--porcelain'], {
+        encoding: 'utf8',
+      }),
+    ).not.toContain('queued-timeout');
+
+    const firstResult = await first;
+    expect(firstResult.isError).not.toBe(true);
+    const after = await callMcp(config, sourceThread.sessionId, {
+      provider: 'claude',
+      prompt: 'Clipboard fixture queued after',
+      target: { kind: 'new', name: 'queued-after' },
+    });
+    expect(after.isError).not.toBe(true);
   });
 
   it('routes MCP validation gates and enforces strict model selection', async () => {
@@ -644,8 +716,6 @@ describe('provider selected agent spawn', () => {
       prompt: 'Clipboard fixture no launch',
       target: { kind: 'new', name: 'failing-setup' },
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await $('.worktree-approval-actions button:last-child').click();
     const result = await spawnNew;
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Worktree setup exited with code 7');

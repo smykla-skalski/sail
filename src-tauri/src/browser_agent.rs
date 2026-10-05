@@ -1107,7 +1107,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "agent_spawn",
-        "Start Claude, Codex, or OpenCode with a prompt in a new worktree by default. An explicit existing target shares its files and may require approval. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
+        "Start Claude, Codex, or OpenCode with a prompt in a new worktree by default. An explicit existing target shares its files. Agent spawns start without interactive approval. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
         "provider,prompt",
     ),
     (
