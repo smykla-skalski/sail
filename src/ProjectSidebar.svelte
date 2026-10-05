@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { checkState } from './lib/pull-request-checks';
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import PathPicker from './PathPicker.svelte';
@@ -28,6 +29,7 @@
   export type GitHubIssue = { number: number; title: string; body: string; url: string };
 
   type Props = {
+    onship: (repository: string) => void;
     catalog: ProjectCatalog;
     directory: string;
     disabled: boolean;
@@ -90,6 +92,7 @@
     | { kind: 'agent'; thread: AgentThread };
 
   let {
+    onship,
     catalog,
     directory,
     disabled,
@@ -260,23 +263,6 @@
     return thread.agent === 'opencode'
       ? 'OpenCode'
       : (agents.find((agent) => agent.id === thread.agent)?.name ?? thread.agent);
-  }
-
-  function checkState(check: PullRequestCheck) {
-    if (
-      [
-        'FAILURE',
-        'ERROR',
-        'TIMED_OUT',
-        'CANCELLED',
-        'ACTION_REQUIRED',
-        'STALE',
-        'STARTUP_FAILURE',
-      ].includes(check.state)
-    )
-      return 'failing';
-    if (['SUCCESS', 'EXPECTED', 'NEUTRAL', 'SKIPPED'].includes(check.state)) return 'passing';
-    return 'pending';
   }
 
   function hasActionsLog(url: string) {
@@ -896,6 +882,7 @@
                 id={repositoryWorktreesID(path)}
                 hidden={repositoryCollapsed(path)}
               >
+                <button class="project-ship" onclick={() => onship(path)}>Ship runs</button>
                 <div class:active={path === directory} class="project-worktree-row" role="group">
                   <button
                     class="project-worktree-select project-default-worktree-select"
@@ -1030,6 +1017,7 @@
               id={repositoryWorktreesID(path)}
               hidden={repositoryCollapsed(path)}
             >
+              <button class="project-ship" onclick={() => onship(path)}>Ship runs</button>
               <div class:active={path === directory} class="project-worktree-row" role="group">
                 <button
                   class="project-worktree-select project-default-worktree-select"

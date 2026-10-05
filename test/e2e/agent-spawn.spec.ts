@@ -95,6 +95,16 @@ describe('provider selected agent spawn', () => {
       );
       localStorage.removeItem('sail-agent-threads');
       localStorage.setItem('sai-notifications-enabled', 'false');
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+    }, path);
+    await browser.tauri.execute(async ({ core }, directory) => {
+      await core.invoke('save_setting', { key: 'sai-directory', value: directory });
+      await core.invoke('save_setting', {
+        key: 'sai-project-catalog',
+        value: JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+      });
+      await core.invoke('save_setting', { key: 'sail-agent-threads', value: null });
+      await core.invoke('save_setting', { key: 'sai-notifications-enabled', value: 'false' });
     }, path);
     await browser.refresh();
     await expect($('.agent-launches button')).toBeEnabled();
@@ -474,7 +484,7 @@ describe('provider selected agent spawn', () => {
       sourceThread.sessionId,
       {
         gate: 'code-adversary',
-        prompt: 'Clipboard fixture validation gate',
+        prompt: 'Ship gate fixture validation gate',
         implementingModels: ['test'],
       },
       'validation_gate',
@@ -492,6 +502,25 @@ describe('provider selected agent spawn', () => {
       path,
     });
     expect(started.threadId).not.toBe(`acp:${sourceThread.agent}:${sourceThread.sessionId}`);
+    const forged = await callMcp(
+      config,
+      sourceThread.sessionId,
+      { verdict: 'CLEAN' },
+      'ship_progress',
+    );
+    expect(forged.isError).toBe(true);
+    const gateConfig = await browser.tauri.execute(
+      async ({ core }, input) => core.invoke<McpConfig>('browser_mcp_config', input),
+      { directory: path, agent: 'claude' },
+    );
+    const report = await callMcp(
+      gateConfig,
+      started.threadId.slice('acp:claude:'.length),
+      { verdict: 'CLEAN' },
+      'ship_progress',
+    );
+    expect(report.isError).not.toBe(true);
+
     const completed = await callMcp(
       config,
       sourceThread.sessionId,
@@ -499,7 +528,11 @@ describe('provider selected agent spawn', () => {
       'agent_wait',
     );
     expect(completed.isError).not.toBe(true);
-    expect(JSON.parse(completed.content[0].text)).toMatchObject({ state: 'completed' });
+    expect(JSON.parse(completed.content[0].text)).toMatchObject({
+      state: 'completed',
+      model: 'fast',
+      validation: { verdict: 'CLEAN', gate: 'code-adversary' },
+    });
     const rejected = await callMcp(
       config,
       sourceThread.sessionId,
@@ -512,18 +545,18 @@ describe('provider selected agent spawn', () => {
     );
     expect(rejected.isError).toBe(true);
     expect(rejected.content[0].text).toContain('Strict different-model routing is enabled');
-    await browser.execute(() =>
-      localStorage.setItem(
-        'sai-cross-validation',
-        JSON.stringify({
+    await browser.tauri.execute(async ({ core }) => {
+      await core.invoke('save_setting', {
+        key: 'sai-cross-validation',
+        value: JSON.stringify({
           choices: [
             { agent: 'claude', model: 'test' },
             { agent: 'claude', model: 'fast' },
           ],
           strictDifferentModel: false,
         }),
-      ),
-    );
+      });
+    });
     await browser.refresh();
     await expect($('.agent-launches button')).toBeEnabled();
     const dispatchFailure = await callMcp(
@@ -562,7 +595,7 @@ describe('provider selected agent spawn', () => {
     const attempts = z
       .array(z.object({ prompt: z.string().nullable().optional() }))
       .parse(JSON.parse(savedReceipts ?? '[]'))
-      .filter((receipt) => receipt.prompt === 'Gate prompt model unavailable');
+      .filter((receipt) => receipt.prompt?.startsWith('Gate prompt model unavailable'));
     expect(attempts).toHaveLength(1);
   });
 

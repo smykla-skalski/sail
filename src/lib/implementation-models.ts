@@ -111,6 +111,16 @@ export async function recoverImplementationModels(directory: string): Promise<vo
   );
 }
 
+export async function settledImplementationAttribution(directory: string) {
+  await recoverImplementationModels(directory);
+  if (pendingTurns(directory).length)
+    throw new Error('Implementation attribution is still settling.');
+  return {
+    models: implementationModels(directory),
+    modelUncertain: implementationAttributionUncertain(directory),
+  };
+}
+
 export async function activeImplementationModels(
   directory: string,
   sourceId?: string,

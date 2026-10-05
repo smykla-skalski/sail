@@ -1,5 +1,6 @@
 import type { PublishedGraph } from './issue-graph';
 import type { SpawnState } from './agent-results';
+import type { ShipEvent, ShipGate, ShipCheck } from './ship-progress';
 
 export type ShipIssueState =
   'pending' | 'starting' | 'working' | 'awaiting_merge' | 'failed' | 'merged';
@@ -21,6 +22,18 @@ export interface ShipIssue {
   setupCompleted?: boolean;
   archivePath?: string | null;
   error: string | null;
+  stage?: string;
+  blockedReason?: string | null;
+  models?: string[];
+  workerModel?: string;
+  workerState?: SpawnState;
+  modelUncertain?: boolean;
+  gates?: ShipGate[];
+  events?: ShipEvent[];
+  issueState?: 'OPEN' | 'CLOSED';
+  checks?: ShipCheck[];
+  refreshedAt?: number;
+  refreshError?: string | null;
 }
 
 export interface ShipRun {
@@ -33,6 +46,7 @@ export interface ShipRun {
   approvedAt: number;
   externalClosed: Record<string, boolean>;
   issues: ShipIssue[];
+  umbrella?: { number: number; title: string; url: string };
 }
 
 export function shippingWorkerSettled(state: SpawnState): boolean {
@@ -77,6 +91,9 @@ export function createShipRun(
     limit,
     approvedAt,
     externalClosed: {},
+    umbrella: graph.umbrella
+      ? { number: graph.umbrella.number, title: graph.umbrella.title, url: graph.umbrella.url }
+      : undefined,
     issues: graph.issues.map((issue) => ({
       id: issue.id,
       number: issue.number,
