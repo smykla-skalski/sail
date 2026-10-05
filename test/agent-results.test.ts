@@ -2,9 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acpReceiptState,
+  activeSubagentsForSource,
+  isSubagentThread,
   loadSpawnReceipts,
   receiptForSource,
   receiptIsSettled,
+  receiptSourceId,
+  runningSubagentsForSource,
   saveBoundedReceipt,
   spawnReceiptsForSource,
   withSpawnResponses,
@@ -125,6 +129,29 @@ await test('conversation activity belongs only to its launching thread', () => {
     [receipt],
   );
   assert.deepEqual(spawnReceiptsForSource([receipt], null, '/repo'), []);
+});
+
+await test('active child activity and thread identity use both session and directory', () => {
+  const working = { ...receipt, state: 'working' as const };
+  assert.equal(receiptSourceId('codex', 'target'), receipt.targetId);
+  assert.equal(receiptSourceId('opencode', 'target'), 'opencode:target');
+  assert.deepEqual(activeSubagentsForSource([receipt, working], receipt.sourceId, '/repo'), [
+    working,
+  ]);
+  assert.deepEqual(
+    runningSubagentsForSource(
+      [
+        { ...working, turnId: null },
+        { ...working, receiptId: 'queued', state: 'queued', targetId: null },
+      ],
+      receipt.sourceId,
+      '/repo',
+    ),
+    [{ ...working, turnId: null }],
+  );
+  assert.deepEqual(activeSubagentsForSource([working], receipt.sourceId, '/other'), []);
+  assert.equal(isSubagentThread([receipt], receipt.targetId!, '/repo/task'), true);
+  assert.equal(isSubagentThread([receipt], receipt.targetId!, '/other'), false);
 });
 
 await test('subagent replies keep their place before later parent messages', () => {

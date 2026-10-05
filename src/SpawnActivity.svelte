@@ -16,20 +16,35 @@
 </script>
 
 {#if active.length}
-  <section class="spawn-activity" aria-label="Running subagents">
+  <section class="spawn-activity" aria-label="Subagent activity">
     <h2>Subagents ({active.length})</h2>
     {#each active as receipt (receipt.receiptId)}
-      <div class="spawn-active" role="status">
+      <article
+        class="spawn-active"
+        role="status"
+        aria-label={`${label(receipt)} subagent ${receipt.state}`}
+      >
         <div class="spawn-heading">
-          <strong>{label(receipt)}</strong>
-          <span>{receipt.state}</span>
+          <span class="spawn-avatar" aria-hidden="true">↳</span>
+          <strong>{label(receipt)} <span class="spawn-kind">subagent</span></strong>
+          <span class="spawn-state">{receipt.state}</span>
         </div>
-        {#if receipt.prompt}<p class="spawn-prompt">{receipt.prompt}</p>{/if}
-        {#if receipt.activity}<p class="spawn-activity-line">{receipt.activity}</p>{/if}
+        <p class="spawn-activity-line">
+          {receipt.activity ??
+            (receipt.result
+              ? 'Writing response…'
+              : receipt.state === 'queued' || receipt.state === 'starting'
+                ? 'Waiting to start…'
+                : 'Starting task…')}
+        </p>
         {#if receipt.result}<div class="spawn-output">
             <Markdown source={receipt.result} />
           </div>{/if}
-      </div>
+        {#if receipt.prompt}<details class="spawn-prompt">
+            <summary>Task</summary>
+            <p>{receipt.prompt}</p>
+          </details>{/if}
+      </article>
     {/each}
   </section>
 {/if}
@@ -43,29 +58,54 @@
     font-size: 0.85rem;
   }
   .spawn-active {
+    width: min(100%, 720px);
     margin-bottom: 8px;
     padding: 10px 12px;
-    border: 1px solid var(--sui-primary);
+    border: 1px solid color-mix(in srgb, var(--sui-primary) 35%, transparent);
+    border-left: 3px solid var(--sui-primary);
     border-radius: 8px;
+    background: color-mix(in srgb, var(--sui-primary) 5%, var(--sui-surface));
   }
   .spawn-heading {
     display: flex;
-    justify-content: space-between;
+    align-items: center;
     gap: 12px;
-    text-transform: capitalize;
   }
-  .spawn-heading span,
+  .spawn-heading strong {
+    flex: 1;
+  }
+  .spawn-avatar {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 7px;
+    color: var(--sui-primary);
+    background: color-mix(in srgb, var(--sui-primary) 15%, transparent);
+  }
+  .spawn-kind,
+  .spawn-state,
   .spawn-prompt {
     color: var(--sui-muted);
   }
+  .spawn-kind {
+    font-weight: 400;
+  }
+  .spawn-state {
+    text-transform: capitalize;
+  }
   .spawn-activity-line {
-    margin: 6px 0;
+    margin: 8px 0 0 36px;
   }
   .spawn-prompt {
-    margin: 6px 0;
+    margin: 8px 0 0 36px;
     overflow-wrap: anywhere;
   }
+  .spawn-prompt p {
+    margin: 6px 0 0;
+  }
   .spawn-output {
+    margin: 8px 0 0 36px;
     max-height: 240px;
     overflow: auto;
   }

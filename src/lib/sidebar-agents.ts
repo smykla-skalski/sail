@@ -1,6 +1,12 @@
 import type { AgentThread } from './acp';
 import type { AttentionMap, ThreadStatus } from './attention';
 import { threadKey } from './recent-threads.ts';
+import {
+  activeSubagentsForSource,
+  receiptSourceId,
+  runningSubagentsForSource,
+  type SpawnReceipt,
+} from './agent-results.ts';
 
 export type SidebarSessionSource = {
   session: {
@@ -78,10 +84,11 @@ export function sidebarThreadStatus(
   acpActivityReady: boolean,
   nativeActivityReady: boolean,
   nativeUnavailableDirectories: string[],
+  spawnReceipts: SpawnReceipt[] = [],
 ): ThreadStatus | null {
   const key = threadKey(thread);
   const saved = attention[key]?.status;
-  const status =
+  let status: ThreadStatus | null =
     thread.agent === 'opencode' && saved !== 'working' && saved !== 'waiting'
       ? (openCodeOutcomes[key] ?? saved ?? null)
       : (saved ?? null);
@@ -91,6 +98,26 @@ export function sidebarThreadStatus(
       ? !nativeActivityReady || nativeUnavailableDirectories.includes(thread.directory)
       : !acpActivityReady)
   )
-    return null;
+    status = null;
+  if (status !== 'working' && status !== 'waiting' && status !== 'failed') {
+    const active = activeSubagentsForSource(
+      spawnReceipts,
+      receiptSourceId(thread.agent, thread.sessionId),
+      thread.directory,
+    );
+    if (active.length) {
+      const confirmed = runningSubagentsForSource(
+        spawnReceipts,
+        receiptSourceId(thread.agent, thread.sessionId),
+        thread.directory,
+      ).some((receipt) =>
+        receipt.provider === 'opencode'
+          ? nativeActivityReady &&
+            !nativeUnavailableDirectories.includes(receipt.targetDirectory ?? '')
+          : acpActivityReady,
+      );
+      status = confirmed ? 'working' : null;
+    }
+  }
   return status;
 }
