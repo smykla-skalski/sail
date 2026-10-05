@@ -13,6 +13,66 @@ use std::time::{Duration, Instant};
 use tauri::Emitter;
 use tauri::{Manager, State};
 
+static SHIPPING_WORKTREE_LOCK: Mutex<()> = Mutex::new(());
+
+fn existing_shipping_worktree(
+    repository: &Path,
+    name: &str,
+) -> Result<Option<CreatedWorktree>, String> {
+    let listed = git_reference(repository, &["worktree", "list", "--porcelain", "-z"])
+        .ok_or("Cannot inspect shipping worktrees.")?;
+    let existing = parse_registered_worktrees(&listed)
+        .into_iter()
+        .find(|entry| entry.present && entry.branch.as_deref() == Some(name));
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(existing.path)
+        .canonicalize()
+        .map_err(|_| "Shipping worktree is missing.")?;
+    let setup = worktree_config::read(&path)?
+        .map(|config| config.setup)
+        .unwrap_or_default();
+    Ok(Some(CreatedWorktree {
+        path: path.to_string_lossy().into_owned(),
+        branch: name.to_string(),
+        base: worktree_base(repository),
+        setup,
+    }))
+}
+
+fn shipping_fetch_source(repository: &Path, target: &str) -> Result<(String, bool), String> {
+    let remotes = git_reference(repository, &["remote"]).ok_or("Cannot list Git remotes.")?;
+    for remote in remotes.lines() {
+        let Some(url) = git_reference(repository, &["remote", "get-url", remote]) else {
+            continue;
+        };
+        if github::github_remote(&url).is_some_and(|name| name.eq_ignore_ascii_case(target)) {
+            return Ok((remote.to_string(), true));
+        }
+    }
+    let origin = git_reference(repository, &["remote", "get-url", "origin"])
+        .ok_or("Cannot find origin remote.")?;
+    if origin.starts_with("git@") || origin.starts_with("ssh://") {
+        Ok((format!("git@github.com:{target}.git"), false))
+    } else {
+        Ok((format!("https://github.com/{target}.git"), false))
+    }
+}
+
+fn shipping_default_branch(repository: &Path, source: &str) -> Result<String, String> {
+    let advertised = git_reference(repository, &["ls-remote", "--symref", source, "HEAD"])
+        .ok_or("Cannot read issue repository's default branch.")?;
+    let branch = advertised
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("ref: refs/heads/")?
+                .strip_suffix("\tHEAD")
+        })
+        .ok_or("Issue repository does not advertise a default branch.")?;
+    Ok(branch.to_string())
+}
+
 #[cfg(any(target_os = "macos", windows))]
 fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
@@ -1198,6 +1258,121 @@ async fn create_worktree(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+async fn create_shipping_worktree(
+    repository: String,
+    name: String,
+) -> Result<CreatedWorktree, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lock = SHIPPING_WORKTREE_LOCK
+            .lock()
+            .map_err(|_| "Shipping worktree creation is unavailable.")?;
+        let checked = validate_repository(repository.clone())?;
+        if let Some(existing) = existing_shipping_worktree(Path::new(&checked), &name)? {
+            return Ok(existing);
+        }
+        let target = github::target_repository(Path::new(&checked))?;
+        let (source, configured_remote) = shipping_fetch_source(Path::new(&checked), &target)?;
+        let branch = shipping_default_branch(Path::new(&checked), &source)?;
+        let default_ref = if configured_remote {
+            format!("refs/remotes/{source}/{branch}")
+        } else {
+            "refs/sail-shipping/default".to_string()
+        };
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&checked)
+            .args([
+                "fetch",
+                &source,
+                &format!("+refs/heads/{branch}:{default_ref}"),
+            ])
+            .output()
+            .map_err(|error| format!("Cannot fetch default branch: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Cannot fetch default branch: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        add_worktree(repository, name, None, Some(default_ref))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn find_shipping_worktree(
+    repository: String,
+    name: String,
+) -> Result<Option<CreatedWorktree>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = validate_repository(repository)?;
+        existing_shipping_worktree(Path::new(&repository), &name)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn run_shipping_setup(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = validate_repository(path)?;
+        let command = worktree_config::read(Path::new(&path))?
+            .ok_or("Worktree setup is no longer configured.")?
+            .setup;
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        let flag = if cfg!(windows) { "/C" } else { "-c" };
+        let log_path =
+            std::env::temp_dir().join(format!("sail-shipping-setup-{}.log", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let log = std::fs::File::create(&log_path)
+                .map_err(|error| format!("Cannot capture worktree setup: {error}"))?;
+            let mut process = Command::new(shell);
+            process.args([flag, &command]).current_dir(path);
+            #[cfg(unix)]
+            process.process_group(0);
+            let mut child = process
+                .stdout(Stdio::from(log.try_clone().map_err(|error| {
+                    format!("Cannot capture worktree setup: {error}")
+                })?))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .map_err(|error| format!("Cannot start worktree setup: {error}"))?;
+            let started = Instant::now();
+            loop {
+                let status = match child.try_wait() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        stop_child(&mut child);
+                        return Err(format!("Cannot inspect worktree setup: {error}"));
+                    }
+                };
+                if let Some(status) = status {
+                    if status.success() {
+                        return Ok(());
+                    }
+                    let output = std::fs::read(&log_path).unwrap_or_default();
+                    return Err(format!(
+                        "Worktree setup failed: {}",
+                        String::from_utf8_lossy(&output[output.len().saturating_sub(8192)..])
+                            .trim()
+                    ));
+                }
+                if started.elapsed() >= Duration::from_secs(600) {
+                    stop_child(&mut child);
+                    return Err("Worktree setup timed out after 10 minutes.".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })();
+        let _ = std::fs::remove_file(log_path);
+        result
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn add_worktree(
     repository: String,
     name: String,
@@ -1323,10 +1498,110 @@ async fn delete_worktree(
     repository: String,
     worktree: String,
     force: Option<bool>,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || remove_worktree(repository, worktree, force))
-        .await
-        .map_err(|error| error.to_string())?
+    archive_ignored: Option<bool>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if archive_ignored == Some(true) {
+            archive_ignored_and_remove(repository, worktree)
+        } else {
+            remove_worktree(repository, worktree, force)?;
+            Ok(None)
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn archive_ignored_and_remove(
+    repository: String,
+    worktree: String,
+) -> Result<Option<String>, String> {
+    const IGNORED: &str = "Worktree has ignored files. Move or remove them before deleting.";
+    let worktree = PathBuf::from(worktree);
+    let parent = worktree.parent().ok_or("Worktree parent is missing.")?;
+    let archive = parent
+        .join(".sail-shipping-archive")
+        .join(worktree.file_name().ok_or("Worktree name is missing.")?);
+    let saved_archive = || {
+        archive
+            .exists()
+            .then(|| archive.to_string_lossy().into_owned())
+    };
+    if !worktree.exists() {
+        validate_repository(repository)?;
+        return Ok(saved_archive());
+    }
+    match remove_worktree(
+        repository.clone(),
+        worktree.to_string_lossy().into_owned(),
+        None,
+    ) {
+        Ok(()) => return Ok(saved_archive()),
+        Err(error) if error == IGNORED => {}
+        Err(error) => return Err(error),
+    }
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--ignored",
+            "--untracked-files=normal",
+            "-z",
+        ])
+        .output()
+        .map_err(|error| format!("Cannot inspect worktree files before cleanup: {error}"))?;
+    if !status.status.success() {
+        return Err("Cannot inspect worktree files before cleanup.".to_string());
+    }
+    let mut ignored = Vec::new();
+    for entry in status
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        if !entry.starts_with(b"!! ") {
+            return Err(
+                "Worktree has changes outside ignored files. Inspect them before cleanup."
+                    .to_string(),
+            );
+        }
+        let path = PathBuf::from(
+            String::from_utf8(entry[3..].to_vec())
+                .map_err(|_| "Cannot archive a non-UTF-8 ignored path.")?,
+        );
+        if !path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("Cannot archive an invalid ignored path.".to_string());
+        }
+        ignored.push(path);
+    }
+    if ignored.is_empty() {
+        return Err("Ignored worktree files changed during cleanup. Retry.".to_string());
+    }
+    for relative in ignored {
+        let destination = archive.join(&relative);
+        if destination.exists() {
+            return Err(format!(
+                "Ignored file archive already contains {}. Inspect {} before retrying.",
+                relative.display(),
+                archive.display()
+            ));
+        }
+        std::fs::create_dir_all(destination.parent().ok_or("Invalid archive path.")?)
+            .map_err(|error| format!("Cannot prepare ignored file archive: {error}"))?;
+        std::fs::rename(worktree.join(relative), destination).map_err(|error| {
+            format!(
+                "Cannot archive ignored worktree files to {}: {error}",
+                archive.display()
+            )
+        })?;
+    }
+    remove_worktree(repository, worktree.to_string_lossy().into_owned(), None)?;
+    Ok(saved_archive())
 }
 
 fn remove_worktree(
@@ -1459,6 +1734,9 @@ pub fn run() {
             git_change_action,
             diff_file_contents,
             create_worktree,
+            create_shipping_worktree,
+            find_shipping_worktree,
+            run_shipping_setup,
             registered_worktrees,
             delete_worktree,
             worktree_config,
@@ -1473,6 +1751,9 @@ pub fn run() {
             github::open_issue,
             github::publish_issue_graph,
             github::load_issue_graph,
+            github::shipping_target_repository,
+            github::shipping_pull_request,
+            github::shipping_dependency_closed,
             github::pull_request_checks,
             github::failed_check_log,
             github::open_pull_request,
@@ -1573,9 +1854,10 @@ mod tests {
     #[cfg(unix)]
     use super::working_tree_revision;
     use super::{
-        add_worktree, git_change_action, git_patch, normalize_picker_path,
-        parse_registered_worktrees, registered_worktrees, remove_worktree, repository_namespace,
-        server_args, version_number, working_tree_diff,
+        add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
+        git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
+        remove_worktree, repository_namespace, server_args, shipping_default_branch,
+        shipping_fetch_source, version_number, working_tree_diff,
     };
     use std::fs;
     #[cfg(unix)]
@@ -1668,6 +1950,117 @@ mod tests {
     }
 
     #[test]
+    fn recovers_shipping_worktree_after_interrupted_launch() {
+        let root =
+            std::env::temp_dir().join(format!("sail-shipping-test-{}", uuid::Uuid::new_v4()));
+        let repository = root.join("repository");
+        let child = root.join("child");
+        fs::create_dir_all(&repository).unwrap();
+        let repository = repository.canonicalize().unwrap();
+        let repository_path = repository.to_str().unwrap();
+        git(repository_path, &["init", "-q"]);
+        git(
+            repository_path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "seed",
+            ],
+        );
+        assert!(existing_shipping_worktree(&repository, "ship-issue-7-test")
+            .unwrap()
+            .is_none());
+        git(
+            repository_path,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "ship-issue-7-test",
+                child.to_str().unwrap(),
+            ],
+        );
+        let recovered = existing_shipping_worktree(&repository, "ship-issue-7-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.path,
+            child.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(recovered.branch, "ship-issue-7-test");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shipping_uses_advertised_default_without_local_origin_head() {
+        let root = std::env::temp_dir().join(format!("sail-default-test-{}", uuid::Uuid::new_v4()));
+        let remote = root.join("remote.git");
+        let repository = root.join("repository");
+        fs::create_dir_all(&root).unwrap();
+        git(
+            root.to_str().unwrap(),
+            &["init", "--bare", "-q", remote.to_str().unwrap()],
+        );
+        git(
+            remote.to_str().unwrap(),
+            &["symbolic-ref", "HEAD", "refs/heads/develop"],
+        );
+        fs::create_dir_all(&repository).unwrap();
+        let repository_path = repository.to_str().unwrap();
+        git(repository_path, &["init", "-q"]);
+        git(
+            repository_path,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(
+            repository_path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "seed",
+            ],
+        );
+        git(repository_path, &["branch", "-M", "develop"]);
+        git(repository_path, &["push", "-q", "origin", "develop"]);
+        git(repository_path, &["checkout", "-qb", "feature"]);
+        assert_eq!(
+            shipping_default_branch(&repository, "origin").unwrap(),
+            "develop"
+        );
+        git(
+            repository_path,
+            &["remote", "set-url", "origin", "git@github.com:me/fork.git"],
+        );
+        git(
+            repository_path,
+            &["remote", "add", "upstream", "git@github.com:owner/repo.git"],
+        );
+        assert_eq!(
+            shipping_fetch_source(&repository, "owner/repo").unwrap(),
+            ("upstream".to_string(), true)
+        );
+        assert_eq!(
+            shipping_fetch_source(&repository, "other/repo").unwrap(),
+            ("git@github.com:other/repo.git".to_string(), false)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn worktree_removal_detects_ignored_directories_and_force_removes_them() {
         let root = std::env::temp_dir().join(format!("sail-delete-test-{}", uuid::Uuid::new_v4()));
         let repository = root.join("repository");
@@ -1706,8 +2099,38 @@ mod tests {
         let result = remove_worktree(repository_path.into(), created.path.clone(), None);
         assert!(result.unwrap_err().contains("ignored files"));
         assert!(ignored.exists());
-        remove_worktree(repository_path.into(), created.path.clone(), Some(true)).unwrap();
+        let untracked = Path::new(&created.path).join("notes.txt");
+        fs::write(&untracked, "keep").unwrap();
+        assert!(
+            archive_ignored_and_remove(repository_path.into(), created.path.clone())
+                .unwrap_err()
+                .contains("changes outside ignored")
+        );
+        assert!(ignored.exists());
+        fs::remove_file(untracked).unwrap();
+        let archive = archive_ignored_and_remove(repository_path.into(), created.path.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(Path::new(&archive).join("node_modules/package/file.js")).unwrap(),
+            "content"
+        );
         assert!(!Path::new(&created.path).exists());
+        assert_eq!(
+            archive_ignored_and_remove(repository_path.into(), created.path.clone()).unwrap(),
+            Some(archive)
+        );
+        let forced = add_worktree(
+            repository_path.into(),
+            "forced".into(),
+            Some(parent.to_string_lossy().into_owned()),
+            Some("HEAD".into()),
+        )
+        .unwrap();
+        fs::create_dir_all(Path::new(&forced.path).join("node_modules")).unwrap();
+        fs::write(Path::new(&forced.path).join("node_modules/file"), "content").unwrap();
+        remove_worktree(repository_path.into(), forced.path.clone(), Some(true)).unwrap();
+        assert!(!Path::new(&forced.path).exists());
         fs::remove_dir_all(root).unwrap();
     }
 

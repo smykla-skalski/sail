@@ -112,6 +112,20 @@ await test('receipts survive restart with bounded results and honest states', ()
   assert.deepEqual(loadSpawnReceipts(JSON.stringify([{ ...receipt, targetId: 1 }])), []);
 });
 
+await test('shipping receipts survive unrelated spawn traffic', () => {
+  const protectedIds = new Set(['shipping']);
+  let saved = saveBoundedReceipt(
+    [],
+    { ...receipt, receiptId: 'shipping', state: 'working' },
+    protectedIds,
+  );
+  for (let index = 0; index < 250; index++)
+    saved = saveBoundedReceipt(saved, { ...receipt, receiptId: `ordinary-${index}` }, protectedIds);
+  assert.equal(saved.length, 201);
+  assert.equal(saved.at(-1)?.receiptId, 'shipping');
+  assert.equal(loadSpawnReceipts(JSON.stringify(saved)).at(-1)?.state, 'working');
+});
+
 await test('conversation activity belongs only to its launching thread', () => {
   const otherSession = { ...receipt, receiptId: 'other-session', sourceId: 'acp:claude:other' };
   const otherDirectory = { ...receipt, receiptId: 'other-directory', sourceDirectory: '/other' };
