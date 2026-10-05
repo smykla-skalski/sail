@@ -27,6 +27,7 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
+  import { trackImplementationSteer } from './lib/implementation-steering';
   import {
     beginImplementationTurn,
     beginShipItRun,
@@ -833,7 +834,7 @@
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
     try {
-      beginShipItRun(directory, text);
+      await beginShipItRun(directory, text);
     } catch (cause) {
       error = describe(cause);
       return;
@@ -1116,7 +1117,33 @@
     const turnAgent = agent;
     const turnDirectory = directory;
     const current = generation;
+    const steerModel = modelOption?.currentValue || thread?.model;
     const [next, ...remaining] = queued;
+    steering = true;
+    let tracked;
+    try {
+      tracked = await trackImplementationSteer(
+        turnDirectory,
+        steerModel,
+        turnAgent,
+        sessionId,
+        activeTurnId,
+        () =>
+          acp.steer(
+            turnAgent,
+            sessionId,
+            withAttachedFiles(resolveSkillPrompt(skills, next.text, steerModel), next.attachments),
+            promptImagePaths(next.images, next.attachments),
+          ),
+      );
+    } catch (cause) {
+      steering = false;
+      error = describe(cause);
+      return;
+    }
+    void tracked.completed.catch((cause) => {
+      error = describe(cause);
+    });
     const entryId = crypto.randomUUID();
     flushUpdates();
     entries = [...entries, { id: entryId, type: 'user', text: next.text, created: Date.now() }];
@@ -1129,18 +1156,7 @@
     });
     const steer = { sessionId, turnId: activeTurnId, message: next, requeued: false, finish };
     inFlightSteer = steer;
-    steering = true;
-    const request = acp
-      .steer(
-        turnAgent,
-        sessionId,
-        withAttachedFiles(
-          resolveSkillPrompt(skills, next.text, modelOption?.currentValue || undefined),
-          next.attachments,
-        ),
-        promptImagePaths(next.images, next.attachments),
-      )
-      .catch(() => ({ outcome: 'failed' as const }));
+    const request = tracked.response.catch(() => ({ outcome: 'failed' as const }));
     const { outcome } = await Promise.race([request, completed]);
     inFlightSteer = null;
     const delivered = outcome === 'injected' || outcome === 'startedNewTurn';

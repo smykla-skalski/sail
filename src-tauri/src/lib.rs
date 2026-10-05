@@ -1494,6 +1494,7 @@ pub fn run() {
             github::create_pull_request,
             github::list_open_issues,
             github::open_issue,
+            github::github_issue_repository,
             github::publish_issue_graph,
             github::load_issue_graph,
             github::pull_request_checks,

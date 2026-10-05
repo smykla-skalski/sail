@@ -441,7 +441,7 @@
     const external = externalText !== undefined;
     const text = (externalText ?? draft).trim();
     try {
-      beginShipItRun(directory, text);
+      await beginShipItRun(directory, text);
     } catch (cause) {
       error = describe(cause);
       return;

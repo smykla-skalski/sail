@@ -129,7 +129,7 @@ export async function activeImplementationModels(
     : null;
 }
 
-export function beginShipItRun(directory: string, prompt: string): void {
+export async function beginShipItRun(directory: string, prompt: string): Promise<void> {
   const firstLine = prompt.split('\n')[0].trim();
   if (!/^\/ship-it(?:\s|$)/i.test(firstLine)) return;
   const issue =
@@ -137,8 +137,19 @@ export function beginShipItRun(directory: string, prompt: string): void {
       firstLine,
     )?.[1];
   if (!issue) return;
-  const identity = `#${issue.match(/\d+$/)![0]}`;
-  const previous = getSetting(runKey(directory));
+  const canonical = async (reference: string): Promise<string> => {
+    const number = Number(reference.match(/\d+$/)![0]);
+    if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Choose an issue.');
+    const qualified = /^(?:https?:\/\/github\.com\/)?([^/\s]+\/[^/#\s]+)(?:\/issues\/|#)/i.exec(
+      reference,
+    );
+    if (qualified) return `${qualified[1].toLowerCase()}#${number}`;
+    const repository = await invoke<string>('github_issue_repository', { repository: directory });
+    return `${repository.toLowerCase()}#${number}`;
+  };
+  const identity = await canonical(issue);
+  const saved = getSetting(runKey(directory));
+  const previous = saved ? await canonical(saved) : undefined;
   if (previous && previous !== identity)
     throw new Error(`This worktree tracks ${previous}. Start ${identity} in a new worktree.`);
   setSetting(runKey(directory), identity);

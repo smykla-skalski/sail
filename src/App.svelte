@@ -1,4 +1,10 @@
 <script lang="ts">
+  class ValidationCandidateUnavailable extends Error {
+    constructor(candidate: string, cause: unknown) {
+      super(`${candidate} is unavailable: ${describe(cause)}`, { cause });
+    }
+  }
+
   import { onMount, tick } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke, isTauri } from '@tauri-apps/api/core';
@@ -2520,6 +2526,7 @@
       } catch (cause) {
         updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
         if (
+          !(cause instanceof ValidationCandidateUnavailable) &&
           !/^(Provider .+ is unavailable|Model .+ is unavailable|Cannot verify .+ selected model)/.test(
             describe(cause),
           )
@@ -2766,9 +2773,12 @@
     validation = false,
     beforePrompt?: () => Promise<void>,
   ) {
-    if (!validation) beginShipItRun(created.path, prompt);
+    if (!validation) await beginShipItRun(created.path, prompt);
     if (source.kind === 'acp') {
-      const session = await acp.create(source.agent, created.path);
+      const session = await acp.create(source.agent, created.path).catch((cause) => {
+        if (!validation) throw cause;
+        throw new ValidationCandidateUnavailable(source.agent, cause);
+      });
       const reportedModel = session.configOptions?.find(
         (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
       )?.currentValue;
@@ -2778,12 +2788,12 @@
         );
         if (!modelOption?.options.some((option) => option.value === source.model))
           throw new Error(`Model ${source.model} is unavailable in ${source.agent}.`);
-        const changed = await acp.setConfig(
-          source.agent,
-          session.sessionId,
-          modelOption.id,
-          source.model,
-        );
+        const changed = await acp
+          .setConfig(source.agent, session.sessionId, modelOption.id, source.model)
+          .catch((cause) => {
+            if (!validation) throw cause;
+            throw new ValidationCandidateUnavailable(`${source.agent} / ${source.model}`, cause);
+          });
         const actual = changed.configOptions?.find((option) => option.id === modelOption.id);
         if (actual?.currentValue !== source.model)
           throw new Error(`Cannot verify ${source.agent} selected model ${source.model}.`);
@@ -2867,13 +2877,21 @@
     }
     if (!client) throw new Error('OpenCode is unavailable for the new thread.');
     await ensureOpenCodeBrowser(created.path);
-    const session = await client.session.create({
-      location: { directory: created.path },
-      metadata: { saiHarness: true },
-      title: prompt.slice(0, 60),
-      agent: source.agent === 'OpenCode' ? undefined : source.agent,
-      model: source.model,
-    });
+    const session = await client.session
+      .create({
+        location: { directory: created.path },
+        metadata: { saiHarness: true },
+        title: prompt.slice(0, 60),
+        agent: source.agent === 'OpenCode' ? undefined : source.agent,
+        model: source.model,
+      })
+      .catch((cause) => {
+        if (!validation) throw cause;
+        throw new ValidationCandidateUnavailable(
+          `OpenCode / ${source.model?.providerID}:${source.model?.id}`,
+          cause,
+        );
+      });
     if (
       source.model &&
       (session.model?.providerID !== source.model.providerID ||
@@ -6958,7 +6976,7 @@
     const path = directory;
     const text = draft.trim();
     try {
-      beginShipItRun(path, text);
+      await beginShipItRun(path, text);
     } catch (cause) {
       error = describe(cause);
       return;
