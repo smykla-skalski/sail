@@ -440,6 +440,89 @@ describe('provider selected agent spawn', () => {
     expect(JSON.parse(unavailable.content[0].text)).toMatchObject({ state: 'unavailable' });
   });
 
+  it('keeps queued launches from creating worktrees before their turn', async () => {
+    const path = realpathSync(repository);
+    mkdirSync(join(repository, '.sail'), { recursive: true });
+    writeFileSync(join(repository, '.sail', 'worktree.json'), JSON.stringify({ setup: 'sleep 2' }));
+    execFileSync('git', ['-C', repository, 'add', '.sail/worktree.json']);
+    execFileSync('git', [
+      '-C',
+      repository,
+      '-c',
+      'user.name=Sail Test',
+      '-c',
+      'user.email=sail@example.test',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-qm',
+      'delayed setup',
+    ]);
+    const saved = await browser.execute(() => localStorage.getItem('sail-agent-threads'));
+    const sourceThread = z
+      .array(agentThread)
+      .parse(JSON.parse(saved ?? '[]'))
+      .find((thread) => thread.directory === path && thread.title === 'Clipboard fixture source');
+    if (!sourceThread) throw new Error('Source thread was not restored');
+    const config = await browser.tauri.execute(
+      async ({ core }, input) => core.invoke<McpConfig>('browser_mcp_config', input),
+      { directory: path, agent: sourceThread.agent },
+    );
+    const firstReceiptId = randomUUID();
+    const firstAccessKey = randomUUID();
+    const first = callMcp(config, sourceThread.sessionId, {
+      provider: 'codex',
+      prompt: 'Clipboard fixture queued predecessor',
+      receiptId: firstReceiptId,
+      accessKey: firstAccessKey,
+      target: { kind: 'new', name: 'queued-predecessor' },
+    });
+    await browser.waitUntil(
+      () =>
+        browser.execute((receiptId) => {
+          const receipts: Array<{ receiptId?: string; worktreeId?: string | null }> = JSON.parse(
+            localStorage.getItem('sai-agent-spawn-receipts') ?? '[]',
+          );
+          return Boolean(receipts.find((receipt) => receipt.receiptId === receiptId)?.worktreeId);
+        }, firstReceiptId),
+      { timeout: 15_000 },
+    );
+    await browser.execute(() => {
+      const original = window.setTimeout.bind(window);
+      const capped: typeof window.setTimeout = (handler, timeout, ...args) =>
+        original(handler, timeout && timeout >= 100_000 ? 25 : timeout, ...args);
+      window.sailQueueTestTimeout = original;
+      window.setTimeout = capped;
+    });
+    const timedOut = await callMcp(config, sourceThread.sessionId, {
+      provider: 'codex',
+      prompt: 'Clipboard fixture queued timeout',
+      receiptId: randomUUID(),
+      accessKey: randomUUID(),
+      target: { kind: 'new', name: 'queued-timeout' },
+    });
+    await browser.execute(() => {
+      window.setTimeout = window.sailQueueTestTimeout;
+      delete window.sailQueueTestTimeout;
+    });
+    expect(timedOut.isError).toBe(true);
+    expect(timedOut.content[0].text).toContain('Agent spawn timed out while waiting to launch.');
+    expect(
+      execFileSync('git', ['-C', repository, 'worktree', 'list', '--porcelain'], {
+        encoding: 'utf8',
+      }),
+    ).not.toContain('queued-timeout');
+
+    const firstResult = await first;
+    expect(firstResult.isError).not.toBe(true);
+    const after = await callMcp(config, sourceThread.sessionId, {
+      provider: 'claude',
+      prompt: 'Clipboard fixture queued after',
+      target: { kind: 'new', name: 'queued-after' },
+    });
+    expect(after.isError).not.toBe(true);
+  });
+
   it('routes MCP validation gates and enforces strict model selection', async () => {
     const path = realpathSync(repository);
     const settings = JSON.stringify({
