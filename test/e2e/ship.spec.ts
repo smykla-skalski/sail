@@ -167,6 +167,8 @@ describe('native Ship run history', () => {
     await expect($('.ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('1 / 3 merged'));
     await expect($('.ship-panel')).toHaveText(expect.stringContaining('Umbrella #40'));
+    await expect($('.ship-now')).toHaveText(expect.stringContaining('Happening now'));
+    await expect($('.ship-now')).toHaveText(expect.stringContaining('Shipping failed'));
     await expect($('.ship-graph')).toHaveText(expect.stringContaining('Blocked'));
     await expect(
       $('.ship-graph a[href="https://github.com/owner/repo/issues/123"]'),
@@ -179,6 +181,7 @@ describe('native Ship run history', () => {
     await expect($('.ship-issue-detail')).toHaveText(
       expect.stringContaining('model-implementation'),
     );
+    await expect($('.ship-current')).toHaveText(expect.stringContaining('Shipping failed'));
     await expect($('.ship-gates')).toHaveText(expect.stringContaining('codex / model-test'));
     await expect($('.ship-gates')).toHaveText(expect.stringContaining('FAIL'));
     await expect($('.ship-checks summary')).toHaveText('CI: Failed');

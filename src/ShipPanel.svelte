@@ -6,6 +6,7 @@
     dependencyIssue,
     dependencyUrl,
     gateNames,
+    shipActivity,
     shipStatus,
   } from './lib/ship-progress';
 
@@ -40,6 +41,7 @@
   const run = $derived(visible.find((item) => item.id === selectedRun) ?? visible.at(-1));
   const issue = $derived(run?.issues.find((item) => item.id === selectedIssue) ?? run?.issues[0]);
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
+  const activeIssues = $derived(run?.issues.filter((item) => item.state !== 'merged') ?? []);
 
   $effect(() => {
     if (active && !wasActive) error = '';
@@ -144,6 +146,30 @@
         </p>
       </div>
     </section>
+    <section class="ship-now" aria-label="Current shipping activity">
+      <div>
+        <h3>Happening now</h3>
+        <p>Live worker, gate, blocker, and merge state.</p>
+      </div>
+      <div class="ship-now-list">
+        {#each activeIssues as item (item.id)}
+          {@const activity = shipActivity(run, item)}
+          <button
+            class="ship-now-item"
+            data-state={activity.state}
+            aria-pressed={item.id === issue?.id}
+            onclick={() => selectIssue(item.id)}
+          >
+            <strong>#{item.number} {item.title}</strong>
+            <span>{activity.title}</span>
+            <small>{activity.detail}</small>
+            {#if activity.at}<time datetime={new Date(activity.at).toISOString()}
+                >Last signal {new Date(activity.at).toLocaleTimeString()}</time
+              >{/if}
+          </button>
+        {:else}<p class="ship-muted">No shipping work is active.</p>{/each}
+      </div>
+    </section>
     <div class="ship-content">
       <nav class="ship-graph" aria-label="Issue dependency graph">
         {#each run.issues as item (item.id)}
@@ -164,7 +190,9 @@
           </div>
         {/each}
       </nav>
-      {#if issue}<section
+      {#if issue}
+        {@const activity = shipActivity(run, issue)}
+        <section
           class="ship-issue-detail"
           tabindex="-1"
           aria-label={`Issue ${issue.number} details`}
@@ -176,6 +204,17 @@
             <strong>{shipStatus(run, issue)}</strong> · Stage: {issue.stage?.replaceAll('_', ' ') ??
               issue.state.replaceAll('_', ' ')} · GitHub issue: {issue.issueState ?? 'Unknown'}
           </p>
+          <section
+            class="ship-current"
+            data-state={activity.state}
+            aria-label="Current issue activity"
+          >
+            <strong>Now: {activity.title}</strong>
+            <span>{activity.detail}</span>
+            {#if activity.at}<time datetime={new Date(activity.at).toISOString()}
+                >Last signal {new Date(activity.at).toLocaleString()}</time
+              >{/if}
+          </section>
           {#if issue.blockedReason || issue.error}<p class="ship-error" role="status">
               {issue.blockedReason || issue.error}
             </p>{/if}
@@ -216,7 +255,11 @@
           <p>Worker: {run.provider} / {issue.workerModel ?? 'Unknown model'}</p>
           <p>
             Models that changed files: {issue.models?.join(', ') ||
-              'Not recorded'}{issue.modelUncertain ? ' · Attribution uncertain' : ''}
+              (issue.workerModel
+                ? `Awaiting file-change attribution from ${issue.workerModel}`
+                : 'Awaiting worker model attribution')}{issue.modelUncertain
+              ? ' · Attribution uncertain'
+              : ''}
           </p>
           <h4>Validation gates</h4>
           <ol class="ship-gates">
@@ -285,6 +328,40 @@
     gap: 20px;
     align-items: start;
   }
+  .ship-now {
+    display: grid;
+    gap: 12px;
+    margin-top: 20px;
+  }
+  .ship-now h3,
+  .ship-now p {
+    margin: 0;
+  }
+  .ship-now-list {
+    display: grid;
+    gap: 8px;
+  }
+  .ship-now-item,
+  .ship-current {
+    display: grid;
+    gap: 4px;
+    padding: 12px;
+    text-align: left;
+    border-left: 3px solid var(--sui-primary);
+  }
+  .ship-now-item[data-state='blocked'],
+  .ship-current[data-state='blocked'] {
+    border-left-color: var(--sui-danger);
+  }
+  .ship-now-item[data-state='waiting'],
+  .ship-current[data-state='waiting'] {
+    border-left-color: var(--sui-warning, var(--sui-primary));
+  }
+  .ship-now-item time,
+  .ship-current time {
+    opacity: 0.7;
+    font-size: 12px;
+  }
   h2,
   h3 {
     margin: 0 0 8px;
@@ -352,6 +429,9 @@
     grid-template-columns: minmax(0, 1fr);
     gap: 24px;
     margin-top: 20px;
+  }
+  .ship-current {
+    margin: 16px 0;
   }
   .ship-node {
     padding: 12px;

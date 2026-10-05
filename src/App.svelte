@@ -1909,6 +1909,11 @@
       : threadId.startsWith('acp:claude:')
         ? 'claude'
         : 'codex';
+    const [, agent, sessionId] = /^acp:([^:]+):(.+)$/.exec(threadId) ?? [];
+    const workerModel = agentThreads.find(
+      (thread) =>
+        thread.agent === agent && thread.sessionId === sessionId && thread.directory === path,
+    )?.model;
     const adopted = createDirectShipRun(shipRuns, {
       id: crypto.randomUUID(),
       directory: path,
@@ -1916,6 +1921,7 @@
       number: issue.number,
       provider,
       threadId,
+      workerModel,
       approvedAt: Date.now(),
     });
     if (adopted === shipRuns) return;

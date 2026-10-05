@@ -6,6 +6,7 @@ import {
   ciStatus,
   dependencyUrl,
   shipGatesSettled,
+  shipActivity,
   reconciledShipGates,
   refreshedPullRequest,
   persistShipRefresh,
@@ -155,6 +156,90 @@ void test('dependency failure blocks only dependents and merged dependencies bec
   assert.equal(shipStatus(run, run.issues[1]), 'Blocked');
   run.issues[0].state = 'merged';
   assert.equal(shipStatus(run, run.issues[1]), 'Queued');
+});
+
+void test('shows the active validation gate before the worker stage', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, {
+    state: 'working',
+    stage: 'testing',
+    gates: [
+      {
+        id: 'test-gate',
+        gate: 'test-adversary',
+        requestedModel: 'gpt-5.6-luna',
+        provider: 'codex',
+        model: 'gpt-5.6-luna',
+        threadId: 'gate-thread',
+        directory: '/worktree',
+        state: 'working',
+        created: 10,
+        updated: 20,
+        error: null,
+      },
+    ],
+  });
+
+  assert.deepEqual(shipActivity(run, issue), {
+    state: 'active',
+    title: 'Test Adversary — Working',
+    detail: 'Validation gate · codex / gpt-5.6-luna',
+    at: 20,
+  });
+});
+
+void test('shows the implementation stage and model while the worker is running', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, {
+    state: 'working',
+    stage: 'reviewing',
+    workerModel: 'gpt-5.6-luna',
+    workerState: 'working',
+    events: [{ at: 30, stage: 'reviewing' }],
+  });
+
+  assert.deepEqual(shipActivity(run, issue), {
+    state: 'active',
+    title: 'Reviewing',
+    detail: 'Worker running · gpt-5.6-luna',
+    at: 30,
+  });
+});
+
+void test('shows the blocking reason instead of a generic stage', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, {
+    state: 'working',
+    stage: 'testing',
+    blockedReason: 'Regression reproduced in the gateway test.',
+    events: [{ at: 40, stage: 'testing', reason: 'Regression reproduced in the gateway test.' }],
+  });
+
+  assert.deepEqual(shipActivity(run, issue), {
+    state: 'blocked',
+    title: 'Blocked during Testing',
+    detail: 'Regression reproduced in the gateway test.',
+    at: 40,
+  });
+});
+
+void test('shows merge and CI as the current wait state', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, {
+    state: 'awaiting_merge',
+    checks: [{ name: 'build', state: 'PENDING', url: 'https://example.test/build' }],
+  });
+
+  assert.deepEqual(shipActivity(run, issue), {
+    state: 'waiting',
+    title: 'Awaiting merge',
+    detail: 'Pull request open · CI Pending',
+    at: undefined,
+  });
 });
 
 void test('reports require both the assigned worker and its worktree identity', () => {

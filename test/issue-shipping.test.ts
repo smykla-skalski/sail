@@ -138,6 +138,7 @@ void test('adopts an already-running direct Ship It thread', () => {
     number: 18976,
     provider: 'codex',
     threadId: 'acp:codex:running-thread',
+    workerModel: 'gpt-5.6-luna',
     approvedAt: 100,
   });
 
@@ -146,13 +147,14 @@ void test('adopts an already-running direct Ship It thread', () => {
   assert.equal(issue.url, 'https://github.com/kumahq/kuma/issues/18976');
   assert.equal(issue.state, 'working');
   assert.equal(issue.stage, 'implementing');
+  assert.equal(issue.workerModel, 'gpt-5.6-luna');
   assert.equal(
     shipOwner(adopted, '/repo/worktrees/gateway-fix', 'acp:codex:running-thread')?.issue,
     issue,
   );
 });
 
-void test('does not duplicate a recovered direct Ship It thread', () => {
+void test('fills in the recovered direct worker model without duplicating the run', () => {
   const input = {
     id: 'direct-run',
     directory: '/repo/worktrees/gateway-fix',
@@ -164,7 +166,13 @@ void test('does not duplicate a recovered direct Ship It thread', () => {
   };
   const adopted = adoptDirectShipRun([], input);
 
-  assert.equal(adoptDirectShipRun(adopted, { ...input, id: 'second-run' }), adopted);
+  const recovered = adoptDirectShipRun(adopted, {
+    ...input,
+    id: 'second-run',
+    workerModel: 'gpt-5.6-luna',
+  });
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].issues[0].workerModel, 'gpt-5.6-luna');
 });
 
 void test('external blocker waits until GitHub reports it closed', () => {

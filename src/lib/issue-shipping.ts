@@ -56,18 +56,32 @@ export type DirectShipRunInput = {
   number: number;
   provider: ShipRun['provider'];
   threadId: string;
+  workerModel?: string;
   approvedAt: number;
 };
 
 export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): ShipRun[] {
-  if (
-    runs.some((run) =>
-      run.issues.some(
-        (issue) => issue.path === input.directory && issue.threadId === input.threadId,
-      ),
-    )
-  )
-    return runs;
+  const existing = runs.find((run) =>
+    run.issues.some((issue) => issue.path === input.directory && issue.threadId === input.threadId),
+  );
+  if (existing) {
+    const existingIssue = existing.issues.find(
+      (issue) => issue.path === input.directory && issue.threadId === input.threadId,
+    );
+    if (!input.workerModel || existingIssue?.workerModel) return runs;
+    return runs.map((run) =>
+      run !== existing
+        ? run
+        : {
+            ...run,
+            issues: run.issues.map((issue) =>
+              issue.path === input.directory && issue.threadId === input.threadId
+                ? { ...issue, workerModel: input.workerModel }
+                : issue,
+            ),
+          },
+    );
+  }
   return [
     ...runs,
     {
@@ -93,6 +107,7 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
           threadId: input.threadId,
           pullRequest: null,
           workerSettled: false,
+          workerModel: input.workerModel,
           error: null,
           stage: 'implementing',
           events: [{ at: input.approvedAt, stage: 'implementing' }],
