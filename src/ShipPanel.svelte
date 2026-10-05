@@ -10,6 +10,7 @@
   } from './lib/ship-progress';
 
   let {
+    repository,
     runs,
     busy,
     onclose,
@@ -17,6 +18,7 @@
     onopen,
     onsettings,
   }: {
+    repository: string;
     runs: ShipRun[];
     busy: boolean;
     onclose: () => void;
@@ -25,9 +27,12 @@
     onsettings: () => Promise<void>;
   } = $props();
   let error = $state('');
+  let scope = $state<'current' | 'all'>('current');
   let selectedRun = $state('');
   let selectedIssue = $state('');
-  const visible = $derived(runs);
+  const visible = $derived(
+    runs.filter((run) => scope === 'all' || !repository || run.repository === repository),
+  );
   const run = $derived(visible.find((item) => item.id === selectedRun) ?? visible.at(-1));
   const issue = $derived(run?.issues.find((item) => item.id === selectedIssue) ?? run?.issues[0]);
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
@@ -69,7 +74,7 @@
   <header>
     <div>
       <h2 id="ship-title">Ship runs</h2>
-      <p>All repositories</p>
+      <p>{scope === 'all' || !repository ? 'All repositories' : repository}</p>
     </div>
     <div class="ship-actions">
       <button onclick={() => act(onrefresh)} disabled={busy}
@@ -80,6 +85,13 @@
     </div>
   </header>
   {#if error}<p class="ship-error" role="alert">{error}</p>{/if}
+  {#if repository}<label class="ship-run-select"
+      >Repository
+      <select bind:value={scope}>
+        <option value="current">Current repository</option>
+        <option value="all">All repositories</option>
+      </select>
+    </label>{/if}
   {#if !run}
     <section class="ship-empty">
       <h3>No Ship runs yet</h3>

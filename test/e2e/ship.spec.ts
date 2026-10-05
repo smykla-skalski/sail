@@ -109,11 +109,24 @@ describe('native Ship run history', () => {
         },
       ],
     };
+    const otherRun: ShipRun = {
+      ...run,
+      id: 'other-project-run',
+      repository: join(repository, 'other-project'),
+      remote: 'fixture/other',
+      approvedAt: 2,
+      umbrella: {
+        number: 50,
+        title: 'Other project fixture',
+        url: 'https://github.com/fixture/other/issues/50',
+      },
+      issues: [],
+    };
     await browser.tauri.execute(
       async ({ core }, input) => {
         await core.invoke('save_setting', {
           key: 'sai-ship-runs',
-          value: JSON.stringify([input.run]),
+          value: JSON.stringify([input.run, input.otherRun]),
         });
         await core.invoke('save_setting', {
           key: 'sai-project-catalog',
@@ -121,7 +134,7 @@ describe('native Ship run history', () => {
         });
         await core.invoke('save_setting', { key: 'sai-directory', value: input.repository });
       },
-      { run, repository },
+      { run, otherRun, repository },
     );
     await browser.execute(() => {
       localStorage.clear();
@@ -137,8 +150,12 @@ describe('native Ship run history', () => {
       ),
     );
     await expect($('#session-details')).toBeDisplayed();
-    await expect($('.side-tabs')).toHaveText(expect.stringContaining('Ship runs (1)'));
+    await expect($('.side-tabs')).toHaveText(expect.stringContaining('Ship runs (2)'));
     await expect($('.ship-panel')).toBeDisplayed();
+    await expect($('.ship-summary')).toHaveText(expect.stringContaining('Ship dashboard fixture'));
+    await $('.ship-panel select').selectByAttribute('value', 'all');
+    await expect($('.ship-summary')).toHaveText(expect.stringContaining('Other project fixture'));
+    await $('.ship-panel select').selectByAttribute('value', 'current');
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('1 / 3 merged'));
     await expect($('.ship-panel')).toHaveText(expect.stringContaining('Umbrella #40'));
     await expect($('.ship-graph')).toHaveText(expect.stringContaining('Blocked'));

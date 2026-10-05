@@ -8904,6 +8904,7 @@
                 </div>{/if}
               <div class:inactive={activeSideTab !== 'ship'} class="side-view">
                 <ShipPanel
+                  repository={coordinationProject(directory) ?? directory}
                   runs={shipRuns}
                   busy={shippingBusy}
                   onclose={closeShipRuns}
