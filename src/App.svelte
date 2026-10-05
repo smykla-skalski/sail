@@ -3412,11 +3412,17 @@
           : { kind: 'acp', agent: chosenProvider, title: source.title };
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out before the agent could start.');
+      const requireResponseTime = async () => {
+        if (Date.now() >= responseDeadline)
+          throw new Error('Agent spawn timed out before the agent could start.');
+      };
       const started = await startCoordinatedThread(
         destination,
         selectedSource,
         prompt.trim(),
         receiptId,
+        false,
+        requireResponseTime,
       );
       activeSpawnRequests.delete(receiptId);
       return {
