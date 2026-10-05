@@ -349,7 +349,7 @@
     if (
       pane.agent === 'opencode'
         ? !nativeDetailsVisible || nativeTab !== 'changes'
-        : !changesPanes.includes(pane.id)
+        : !changesPanes.includes(pane.id) || acpTab !== 'changes'
     )
       return;
     void refreshDiff();
