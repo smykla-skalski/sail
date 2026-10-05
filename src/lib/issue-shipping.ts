@@ -17,6 +17,8 @@ export interface ShipIssue {
   threadId: string | null;
   pullRequest: string | null;
   workerSettled?: boolean;
+  setupStarted?: boolean;
+  setupCompleted?: boolean;
   archivePath?: string | null;
   error: string | null;
 }
@@ -35,6 +37,13 @@ export interface ShipRun {
 
 export function shippingWorkerSettled(state: SpawnState): boolean {
   return ['completed', 'failed', 'interrupted'].includes(state);
+}
+
+export function shippingSetupAction(issue: ShipIssue, setup: string): 'run' | 'skip' {
+  if (!setup.trim() || issue.setupCompleted) return 'skip';
+  if (issue.setupStarted)
+    throw new Error('Worktree setup was interrupted. Inspect its worktree before retrying.');
+  return 'run';
 }
 
 export function createShipRun(
@@ -81,6 +90,8 @@ export function createShipRun(
       threadId: null,
       pullRequest: null,
       workerSettled: false,
+      setupStarted: false,
+      setupCompleted: false,
       archivePath: null,
       error: null,
     })),

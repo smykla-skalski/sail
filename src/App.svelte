@@ -20,6 +20,7 @@
     createShipRun,
     readyShipIssues,
     shippingWorkerSettled,
+    shippingSetupAction,
     type ShipIssue,
     type ShipRun,
   } from './lib/issue-shipping';
@@ -1763,7 +1764,11 @@
       });
       await updateShipIssue(run, issue, { path: created.path, branch: created.branch });
       saveProjectCatalog(addWorktree(projectCatalog, run.repository, created));
-      if (created.setup.trim()) await invoke('run_shipping_setup', { path: created.path });
+      if (shippingSetupAction(issue, created.setup) === 'run') {
+        await updateShipIssue(run, issue, { setupStarted: true });
+        await invoke('run_shipping_setup', { path: created.path });
+        await updateShipIssue(run, issue, { setupCompleted: true });
+      }
       if (run.provider === 'opencode') {
         if (!client || runtimeState !== 'connected') throw new Error('OpenCode is unavailable.');
         const report = await inspectRepository(client, created.path);

@@ -5,6 +5,7 @@ import {
   readyShipIssues,
   shipIssueStatus,
   shippingWorkerSettled,
+  shippingSetupAction,
 } from '../src/lib/issue-shipping.ts';
 import type { PublishedGraph } from '../src/lib/issue-graph.ts';
 
@@ -108,6 +109,15 @@ void test('unavailable worker does not prove its turn has stopped', () => {
   assert.equal(shippingWorkerSettled('completed'), true);
   assert.equal(shippingWorkerSettled('failed'), true);
   assert.equal(shippingWorkerSettled('interrupted'), true);
+});
+
+void test('interrupted setup cannot rerun a non-idempotent command', () => {
+  const issue = run().issues[0];
+  assert.equal(shippingSetupAction(issue, 'mkdir build'), 'run');
+  issue.setupStarted = true;
+  assert.throws(() => shippingSetupAction(issue, 'mkdir build'), /setup was interrupted/);
+  issue.setupCompleted = true;
+  assert.equal(shippingSetupAction(issue, 'mkdir build'), 'skip');
 });
 
 void test('approved snapshot survives serialization and does not expand to new issues', () => {
