@@ -144,4 +144,39 @@ describe('recent thread shortcuts', () => {
     );
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Thread one'));
   });
+
+  it('hides a thread until it is reopened without deleting its conversation', async () => {
+    await browser.setWindowSize(1280, 850);
+    const path = realpathSync(first);
+    await browser.execute((directory) => {
+      localStorage.removeItem('sail-agent-threads');
+      localStorage.removeItem('sai-recent-agent-threads');
+      localStorage.removeItem('sai-hidden-sidebar-threads');
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.setItem('sai-directory', directory);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+      );
+    }, path);
+    await browser.refresh();
+    await expect($('.agent-launches button')).toBeEnabled();
+    await createThread('Hidden thread');
+    const row = $('.project-agent-row[aria-label*="Hidden thread"]');
+    await expect(row).toBeDisplayed();
+
+    await row.click({ button: 'right' });
+    await expect($('.project-menu')).toBeDisplayed();
+    await $('.project-menu button[role="menuitem"]').click();
+    await expect(row).not.toExist();
+    const saved = await browser.execute(() => localStorage.getItem('sail-agent-threads'));
+    expect(saved).toContain('Hidden thread');
+
+    await browser.refresh();
+    await expect(row).not.toExist();
+    await expect($('.agent-launches button')).toBeEnabled();
+    await browser.keys(['Meta', '1']);
+    await expect(row).toBeDisplayed();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Hidden thread'));
+  });
 });
