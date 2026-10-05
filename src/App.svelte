@@ -21,6 +21,15 @@
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import type { PublishedGraph } from './lib/issue-graph';
+  import {
+    createShipRun,
+    readyShipIssues,
+    shippingWorkerSettled,
+    shippingSetupAction,
+    type ShipIssue,
+    type ShipRun,
+  } from './lib/issue-shipping';
   import DiffPanel from './DiffPanel.svelte';
   import HistoryPanel from './HistoryPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
@@ -178,7 +187,13 @@
     withSpawnResponses,
     type SpawnReceipt,
   } from './lib/agent-results';
-  import { getSetting, removeSetting, setSetting, settingsError } from './lib/settings';
+  import {
+    getSetting,
+    removeSetting,
+    setSetting,
+    setSettingDurable,
+    settingsError,
+  } from './lib/settings';
   import {
     commandsForDirectory,
     loadSavedCommands,
@@ -232,6 +247,10 @@
   let projectCatalog = $state<ProjectCatalog>(
     loadProjectCatalog(getSetting('sai-project-catalog'), savedDirectory),
   );
+  let shipRuns = $state<ShipRun[]>(loadShipRuns());
+  let shippingBusy = false;
+  const activeShipLaunches = new SvelteSet<string>();
+  let acpRecoveryReady = false;
   let worktreeCreations = $state<WorktreeCreation[]>([]);
   let worktreeDeletions = $state<Record<string, string>>({});
   type WorktreeCreationRequest = {
@@ -1419,7 +1438,12 @@
           if (disposed) unlisten();
           else {
             unlistenAgentEvents = unlisten;
-            void recoverInterruptedAgentTurns().then(() => restoreAgentActivity());
+            void recoverInterruptedAgentTurns()
+              .then(() => restoreAgentActivity())
+              .finally(() => {
+                acpRecoveryReady = true;
+                void tickShippingRuns();
+              });
             scheduleInboxRefresh();
           }
           return undefined;
@@ -1435,6 +1459,8 @@
       updateAttentionBadge();
     }
     void initialize();
+    const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
+    void tickShippingRuns();
     healthTimer = setInterval(() => void checkRuntime(), 5000);
     const sidebarRefreshTimer = setInterval(() => {
       if (client) void refreshSidebarOpenCodeThreads(client, JSON.parse(sidebarDirectoryKey));
@@ -1464,6 +1490,7 @@
       disposed = true;
       finishWorktreeApproval(false);
       clearInterval(coordinationRetry);
+      clearInterval(shippingTimer);
       eventController?.abort();
       clearTimeout(refreshTimer);
       clearTimeout(diffTimer);
@@ -1670,8 +1697,346 @@
     scheduleInboxRefresh();
   }
 
+  function loadShipRuns(): ShipRun[] {
+    try {
+      const value: unknown = JSON.parse(getSetting('sai-ship-runs') ?? '[]');
+      return Array.isArray(value)
+        ? value.filter(
+            (item): item is ShipRun =>
+              !!item &&
+              typeof item === 'object' &&
+              typeof item.id === 'string' &&
+              typeof item.repository === 'string' &&
+              Array.isArray(item.issues),
+          )
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async function saveShipRuns(): Promise<void> {
+    const value = JSON.stringify(shipRuns);
+    await setSettingDurable('sai-ship-runs', value);
+  }
+
+  async function updateShipIssue(
+    run: ShipRun,
+    issue: ShipIssue,
+    changes: Partial<ShipIssue>,
+  ): Promise<void> {
+    const current = run.issues.find((item) => item.id === issue.id);
+    if (!current) return;
+    const previous = Object.fromEntries(
+      Object.keys(changes).map((key) => [key, current[key as keyof ShipIssue]]),
+    ) as Partial<ShipIssue>;
+    Object.assign(current, changes);
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      Object.assign(current, previous);
+      setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+      throw cause;
+    }
+  }
+
+  async function startShippingRun(
+    graph: PublishedGraph,
+    provider: ShipRun['provider'],
+    limit: number,
+    source: string,
+  ): Promise<void> {
+    const repository = coordinationProject(directory) ?? directory;
+    const remote = graph.issues[0]?.repository ?? '';
+    if (!repository || !remote) throw new Error('Select a published repository issue graph.');
+    const checkoutRemote = await invoke<string>('shipping_target_repository', { repository });
+    if (checkoutRemote.toLowerCase() !== remote.toLowerCase())
+      throw new Error(`Select a ${remote} checkout to ship this issue graph.`);
+    if (shipRuns.some((run) => run.repository === repository && run.source === source))
+      throw new Error('This plan already has a shipping run.');
+    const run = createShipRun(
+      graph,
+      repository,
+      remote,
+      source,
+      provider,
+      limit,
+      crypto.randomUUID(),
+      Date.now(),
+    );
+    if (
+      shipRuns.some((existing) =>
+        existing.issues.some((item) => run.issues.some((issue) => issue.url === item.url)),
+      )
+    )
+      throw new Error('An issue in this plan already has a shipping run.');
+    shipRuns.push(run);
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      shipRuns = shipRuns.filter((item) => item.id !== run.id);
+      setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+      throw cause;
+    }
+    void tickShippingRuns();
+  }
+
+  async function launchShipIssue(run: ShipRun, issue: ShipIssue): Promise<void> {
+    const receiptId = crypto.randomUUID();
+    await updateShipIssue(run, issue, { state: 'starting', receiptId });
+    try {
+      const created = await invoke<CreatedWorktree>('create_shipping_worktree', {
+        repository: run.repository,
+        name: issue.branch,
+      });
+      await updateShipIssue(run, issue, { path: created.path, branch: created.branch });
+      saveProjectCatalog(addWorktree(projectCatalog, run.repository, created));
+      if (shippingSetupAction(issue, created.setup) === 'run') {
+        await updateShipIssue(run, issue, { setupStarted: true });
+        await invoke('run_shipping_setup', { path: created.path });
+        await updateShipIssue(run, issue, { setupCompleted: true });
+      }
+      if (run.provider === 'opencode') {
+        if (!client || runtimeState !== 'connected') throw new Error('OpenCode is unavailable.');
+        const report = await inspectRepository(client, created.path);
+        if (!report.workReady) throw new Error('Complete OpenCode setup in this worktree.');
+      } else {
+        const available = (await acp.agents()).find((agent) => agent.id === run.provider);
+        if (!available?.available)
+          throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
+        await acp.connect(run.provider);
+      }
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread.`;
+      saveSpawnReceipt({
+        receiptId,
+        accessKey: crypto.randomUUID(),
+        requestId: `ship:${run.id}:${issue.id}`,
+        project: run.repository,
+        sourceId: `ship:${run.id}`,
+        sourceDirectory: run.repository,
+        targetId: null,
+        turnId: null,
+        targetDirectory: created.path,
+        worktreeId: created.path,
+        provider: run.provider,
+        prompt,
+        state: 'starting',
+        created: Date.now(),
+        updated: Date.now(),
+        result: null,
+        error: null,
+      });
+      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      const started = await startCoordinatedThread(
+        created,
+        run.provider === 'opencode'
+          ? { kind: 'opencode', agent: 'OpenCode', title: issue.title }
+          : { kind: 'acp', agent: run.provider, title: issue.title },
+        prompt,
+        receiptId,
+      );
+      await updateShipIssue(run, issue, { state: 'working', threadId: started.threadId });
+    } catch (cause) {
+      const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+      if (receipt && !receipt.turnId) {
+        updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      }
+      await updateShipIssue(run, issue, { state: 'failed', error: describe(cause) });
+    }
+  }
+
+  function scheduleShipLaunch(run: ShipRun, issue: ShipIssue): void {
+    const key = `${run.id}:${issue.id}`;
+    if (activeShipLaunches.has(key)) return;
+    activeShipLaunches.add(key);
+    void launchShipIssue(run, issue)
+      .catch((cause) => (error = describe(cause)))
+      .finally(() => activeShipLaunches.delete(key));
+  }
+
+  async function refreshShippingDependency(run: ShipRun, dependency: string): Promise<void> {
+    try {
+      const closed = await invoke<boolean>('shipping_dependency_closed', {
+        repository: run.repository,
+        reference: dependency,
+      });
+      if (run.externalClosed[dependency] !== closed) {
+        const previous = run.externalClosed[dependency];
+        run.externalClosed[dependency] = closed;
+        try {
+          await saveShipRuns();
+        } catch (cause) {
+          run.externalClosed[dependency] = previous;
+          setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+          throw cause;
+        }
+      }
+    } catch (cause) {
+      error = describe(cause);
+      if (run.externalClosed[dependency]) {
+        run.externalClosed[dependency] = false;
+        await saveShipRuns().catch((failure) => (error = describe(failure)));
+      }
+    }
+  }
+
+  async function refreshShippingIssue(run: ShipRun, issue: ShipIssue): Promise<void> {
+    if (issue.state === 'merged') {
+      if (issue.workerSettled && !issue.path) return;
+      if (!issue.workerSettled) {
+        const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+        if (!receipt) {
+          await updateShipIssue(run, issue, {
+            error: 'Worker receipt is missing. Inspect its thread before cleanup.',
+          });
+          return;
+        }
+        if (!shippingWorkerSettled((await currentSpawnReceipt(receipt)).state)) return;
+        await updateShipIssue(run, issue, { workerSettled: true });
+      }
+      if (issue.path) {
+        try {
+          const archivePath = await invoke<string | null>('delete_worktree', {
+            repository: run.repository,
+            worktree: issue.path,
+            force: false,
+            archiveIgnored: true,
+          });
+          saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
+          await updateShipIssue(run, issue, { path: null, archivePath, error: null });
+        } catch (cause) {
+          await updateShipIssue(run, issue, { error: `Cleanup: ${describe(cause)}` });
+        }
+      }
+      return;
+    }
+    if (issue.state === 'pending') return;
+    if (issue.state === 'starting' && activeShipLaunches.has(`${run.id}:${issue.id}`)) return;
+    if (run.provider === 'opencode' && !client && ['starting', 'working'].includes(issue.state))
+      return;
+    const pr = await invoke<{
+      url: string;
+      state: string;
+      mergedAt: string | null;
+    } | null>('shipping_pull_request', {
+      repository: run.repository,
+      branch: issue.branch,
+    }).catch((cause) => {
+      error = describe(cause);
+      return undefined;
+    });
+    if (pr === undefined) return;
+    if (pr?.url && pr.url !== issue.pullRequest)
+      await updateShipIssue(run, issue, { pullRequest: pr.url });
+    if (pr?.mergedAt) {
+      await updateShipIssue(run, issue, { state: 'merged', error: null });
+      return;
+    }
+    if (pr?.state === 'CLOSED') {
+      const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+      if (receipt && !shippingWorkerSettled(receipt.state)) await currentSpawnReceipt(receipt);
+      await updateShipIssue(run, issue, {
+        state: 'failed',
+        error: 'Pull request closed without merging.',
+      });
+      return;
+    }
+    const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+    if (issue.state === 'failed') {
+      if (receipt && !shippingWorkerSettled(receipt.state)) await currentSpawnReceipt(receipt);
+      if (
+        issue.error === 'Worker finished without a pull request. Inspect its thread.' &&
+        receipt?.state === 'completed' &&
+        pr?.url
+      )
+        await updateShipIssue(run, issue, { state: 'awaiting_merge', error: null });
+      return;
+    }
+    if (issue.state === 'starting') {
+      if (!receipt || !receipt.targetId || (receipt.provider !== 'opencode' && !receipt.turnId)) {
+        const existing = await invoke<CreatedWorktree | null>('find_shipping_worktree', {
+          repository: run.repository,
+          name: issue.branch,
+        });
+        if (existing && issue.path !== existing.path)
+          await updateShipIssue(run, issue, { path: existing.path });
+        scheduleShipLaunch(run, issue);
+      } else {
+        if (receipt.provider === 'opencode') await recoverShippingOpenCodePrompt(receipt);
+        else await recoverShippingAcpPrompt(receipt);
+        await updateShipIssue(run, issue, { state: 'working', threadId: receipt.targetId });
+      }
+    } else if (issue.state === 'working') {
+      if (!receipt)
+        await updateShipIssue(run, issue, {
+          state: 'failed',
+          error: 'Worker receipt is missing. Inspect its thread.',
+        });
+      else {
+        const current = await currentSpawnReceipt(receipt);
+        if (current.state === 'completed') {
+          if (pr?.url) await updateShipIssue(run, issue, { state: 'awaiting_merge', error: null });
+          else if (Date.now() - current.updated > 60_000)
+            await updateShipIssue(run, issue, {
+              state: 'failed',
+              error: 'Worker finished without a pull request. Inspect its thread.',
+            });
+        } else if (['failed', 'interrupted'].includes(current.state))
+          await updateShipIssue(run, issue, {
+            state: 'failed',
+            error: current.error ?? `Worker ${current.state}.`,
+          });
+      }
+    }
+  }
+
+  async function refreshShippingRun(run: ShipRun): Promise<void> {
+    run.externalClosed ??= {};
+    const aliases = new Set(
+      run.issues.flatMap((issue) => [
+        issue.id,
+        String(issue.number),
+        `${run.remote}#${issue.number}`,
+      ]),
+    );
+    await Promise.all(
+      [...new Set(run.issues.flatMap((issue) => issue.dependsOn))]
+        .filter((dependency) => !aliases.has(dependency))
+        .map((dependency) => refreshShippingDependency(run, dependency)),
+    );
+    await Promise.all(run.issues.map((issue) => refreshShippingIssue(run, issue)));
+    const unsettledReceiptIds = new Set(
+      spawnReceipts
+        .filter((receipt) => !shippingWorkerSettled(receipt.state))
+        .map((receipt) => receipt.receiptId),
+    );
+    for (const issue of readyShipIssues(run, unsettledReceiptIds)) scheduleShipLaunch(run, issue);
+  }
+
+  async function tickShippingRuns(): Promise<void> {
+    if (shippingBusy || disposed || !isTauri() || !acpRecoveryReady) return;
+    shippingBusy = true;
+    try {
+      await Promise.all(shipRuns.map((run) => refreshShippingRun(run)));
+    } catch (cause) {
+      error = describe(cause);
+    } finally {
+      shippingBusy = false;
+    }
+  }
+
   function saveSpawnReceipt(receipt: SpawnReceipt) {
-    spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt);
+    const protectedIds = new Set(
+      shipRuns.flatMap((run) =>
+        run.issues.flatMap((issue) =>
+          issue.receiptId && (issue.state !== 'merged' || issue.workerSettled !== true)
+            ? [issue.receiptId]
+            : [],
+        ),
+      ),
+    );
+    spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
   }
 
@@ -1680,6 +2045,7 @@
     if (!current) return;
     if (
       receiptIsSettled(current.state) &&
+      !(current.requestId.startsWith('ship:') && current.state === 'unavailable') &&
       changes.state &&
       ['working', 'waiting', 'unavailable'].includes(changes.state)
     )
@@ -1734,7 +2100,12 @@
   }
 
   async function currentSpawnReceipt(receipt: SpawnReceipt): Promise<SpawnReceipt> {
-    if (receiptIsSettled(receipt.state)) return receipt;
+    if (
+      receiptIsSettled(receipt.state) &&
+      !(receipt.requestId.startsWith('ship:') && receipt.state === 'unavailable')
+    )
+      return receipt;
+    if (activeSpawnRequests.has(receipt.receiptId)) return receipt;
     if (
       !receipt.targetId ||
       !receipt.targetDirectory ||
@@ -1772,6 +2143,9 @@
         else if (session.outcome) await settleOpenCodeReceipt(receipt, client, session.outcome);
         else if (inbox.some((item) => item.id === receipt.turnId))
           updateSpawnReceipt(receipt.receiptId, { state: 'queued' });
+        else if (!receipt.turnId && inbox.length === 1)
+          updateSpawnReceipt(receipt.receiptId, { state: 'queued', turnId: inbox[0].id });
+        else if (receipt.state === 'starting') return receipt;
         else await settleOpenCodeReceipt(receipt, client, session.outcome);
       } catch {
         updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
@@ -1780,6 +2154,106 @@
       updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
     }
     return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
+  }
+
+  async function recoverShippingOpenCodePrompt(receipt: SpawnReceipt): Promise<void> {
+    if (!client || !receipt.targetId || !receipt.prompt) return;
+    const source = client;
+    const sessionId = receipt.targetId.slice('opencode:'.length);
+    activeSpawnRequests.add(receipt.receiptId);
+    try {
+      const [session, page, inbox, active] = await Promise.all([
+        source.session.get({ sessionID: sessionId }),
+        source.message.list({ sessionID: sessionId, limit: 50, order: 'desc' }),
+        source.session.inbox.list({ sessionID: sessionId }),
+        source.session.active(),
+      ]);
+      if (session.location.directory !== receipt.targetDirectory)
+        throw new Error('Target session moved to another worktree.');
+      const promptSeen = page.data.some(
+        (message) => message.type === 'user' && message.text === receipt.prompt,
+      );
+      if (promptSeen || inbox.length || active[sessionId]?.type === 'running' || session.outcome)
+        return;
+      const turnId = receipt.turnId ?? crypto.randomUUID();
+      if (!receipt.turnId) {
+        updateSpawnReceipt(receipt.receiptId, { turnId });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      }
+      const startingPrompt = source.session.prompt({
+        sessionID: sessionId,
+        text: receipt.prompt,
+        id: turnId,
+      });
+      const inboxItem = await startingPrompt;
+      updateSpawnReceipt(receipt.receiptId, { state: 'queued', turnId: inboxItem.id });
+    } finally {
+      activeSpawnRequests.delete(receipt.receiptId);
+    }
+  }
+
+  async function recoverShippingAcpPrompt(receipt: SpawnReceipt): Promise<void> {
+    if (!receipt.targetId || !receipt.targetDirectory || !receipt.turnId || !receipt.prompt) return;
+    const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
+    const [agentActivity, interrupted] = await Promise.all([
+      acp.activity(),
+      acp.interruptedTurns(),
+    ]);
+    const state = agentActivity[receipt.provider];
+    if (
+      state?.activeTurns[sessionId] === receipt.turnId ||
+      state?.finished[sessionId]?.turnId === receipt.turnId ||
+      interrupted.some(
+        (turn) =>
+          turn.agent === receipt.provider &&
+          turn.sessionId === sessionId &&
+          turn.turnId === receipt.turnId,
+      )
+    )
+      return;
+    activeSpawnRequests.add(receipt.receiptId);
+    try {
+      const info = await acp.connect(receipt.provider);
+      const capabilities = info.agentCapabilities;
+      const sessionCapabilities =
+        capabilities && typeof capabilities === 'object' && 'sessionCapabilities' in capabilities
+          ? capabilities.sessionCapabilities
+          : null;
+      const canResume =
+        sessionCapabilities &&
+        typeof sessionCapabilities === 'object' &&
+        'resume' in sessionCapabilities;
+      if (canResume) await acp.resume(receipt.provider, receipt.targetDirectory, sessionId);
+      else await acp.load(receipt.provider, receipt.targetDirectory, sessionId);
+      const turn = acp.prompt(receipt.provider, sessionId, receipt.prompt, receipt.turnId);
+      activeSpawnTargets.set(receipt.targetId, receipt.receiptId);
+      void turn.then(
+        (outcome) => {
+          const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
+          updateSpawnReceipt(receipt.receiptId, {
+            state:
+              outcome.stopReason === 'cancelled' || current?.state === 'interrupted'
+                ? 'interrupted'
+                : 'completed',
+            result: spawnOutput.get(receipt.receiptId) ?? current?.result ?? null,
+          });
+          spawnOutput.delete(receipt.receiptId);
+          if (activeSpawnTargets.get(receipt.targetId!) === receipt.receiptId)
+            activeSpawnTargets.delete(receipt.targetId!);
+          return undefined;
+        },
+        (cause) => {
+          updateSpawnReceipt(receipt.receiptId, { state: 'failed', error: describe(cause) });
+          return undefined;
+        },
+      );
+      await awaitCoordinationStart(turn, async () => {
+        const current = (await acp.activity())[receipt.provider];
+        return current?.activeTurns[sessionId] === receipt.turnId;
+      });
+    } finally {
+      activeSpawnRequests.delete(receipt.receiptId);
+    }
   }
 
   async function reconcileOpenCodeSpawnReceipts() {
@@ -1795,6 +2269,12 @@
     agentActivity: Awaited<ReturnType<typeof acp.activity>>[AgentId] | null,
   ) {
     const state = acpReceiptState(receipt, agentActivity);
+    if (
+      receipt.requestId.startsWith('ship:') &&
+      receipt.state === 'starting' &&
+      state === 'unavailable'
+    )
+      return;
     if (state === 'working' || state === 'waiting') {
       updateSpawnReceipt(receipt.receiptId, { state });
       activeSpawnTargets.set(receipt.targetId!, receipt.receiptId);
@@ -2851,6 +3331,8 @@
           targetDirectory: created.path,
           worktreeId: created.path,
         });
+      if (receiptId)
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       await invoke('record_turn_snapshot', {
         path: created.path,
         thread: `acp:${source.agent}:${session.sessionId}`,
@@ -2866,6 +3348,8 @@
       updateAgentThreadStatus(thread, 'working');
       const turnId = crypto.randomUUID();
       if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', turnId });
+      if (receiptId)
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       if (receiptId) activeSpawnTargets.set(`acp:${source.agent}:${session.sessionId}`, receiptId);
       const turn = acp.prompt(source.agent, session.sessionId, prompt, turnId);
       const finished = turn.then(
@@ -2951,6 +3435,8 @@
         targetDirectory: created.path,
         worktreeId: created.path,
       });
+    if (receiptId)
+      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
     rememberRecentThread({
       agent: 'opencode',
       sessionId: session.id,
@@ -2969,8 +3455,17 @@
           session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
           `opencode:${session.id}`,
         );
+    const turnId = receiptId ? crypto.randomUUID() : undefined;
+    if (receiptId) {
+      updateSpawnReceipt(receiptId, { turnId: turnId! });
+      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+    }
     await beforePrompt?.();
-    const startingPrompt = promptClient.session.prompt({ sessionID: session.id, text: prompt });
+    const startingPrompt = promptClient.session.prompt({
+      sessionID: session.id,
+      text: prompt,
+      id: turnId,
+    });
     if (receiptId)
       void startingPrompt
         .then(async (inbox) => {
@@ -5620,7 +6115,15 @@
           saveAgentThread(thread);
         }
         const recoveredThread = thread;
+        const alreadyActive = async () => {
+          const current = (await acp.activity())[turn.agent];
+          return current?.activeTurns[turn.sessionId] === turn.turnId;
+        };
         try {
+          if (await alreadyActive()) {
+            updateAgentThreadStatus(recoveredThread, 'working');
+            return;
+          }
           const info = await acp.connect(turn.agent);
           const capabilities = info.agentCapabilities;
           const sessionCapabilities =
@@ -5636,6 +6139,10 @@
           if (canResume) await acp.resume(turn.agent, turn.directory, turn.sessionId);
           else await acp.load(turn.agent, turn.directory, turn.sessionId);
           if (disposed) return;
+          if (await alreadyActive()) {
+            updateAgentThreadStatus(recoveredThread, 'working');
+            return;
+          }
           await invoke('record_turn_snapshot', {
             path: turn.directory,
             thread: `acp:${turn.agent}:${turn.sessionId}`,
@@ -5659,8 +6166,11 @@
                 );
             } catch (cause) {
               if (!disposed) {
-                updateAgentThreadStatus(recoveredThread, 'failed');
-                error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+                if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
+                else {
+                  updateAgentThreadStatus(recoveredThread, 'failed');
+                  error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+                }
               }
             }
           })();
@@ -5669,8 +6179,11 @@
             return !!state?.active.includes(turn.sessionId);
           });
         } catch (cause) {
-          updateAgentThreadStatus(recoveredThread, 'failed');
-          error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+          if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
+          else {
+            updateAgentThreadStatus(recoveredThread, 'failed');
+            error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+          }
         }
       }),
     );
@@ -8107,6 +8620,13 @@
                     {dark}
                     onchanged={() => refreshSession()}
                     onselectfile={selectDiffPath}
+                    shipRun={shipRuns.find(
+                      (run) =>
+                        run.repository === (coordinationProject(directory) ?? directory) &&
+                        run.source === snapshot.plan?.sessionID,
+                    ) ?? null}
+                    onship={(graph, provider, limit) =>
+                      startShippingRun(graph, provider, limit, snapshot.plan?.sessionID ?? '')}
                   />
                 </div>{/if}
               <div class:inactive={!acpAgent && activeSideTab !== 'changes'} class="side-view">
@@ -8144,6 +8664,7 @@
       pane={paneLayout}
       focused={focusedPane}
       {directory}
+      project={coordinationProject(directory) ?? directory}
       {dark}
       agents={paneAgents}
       {sideChat}
@@ -8151,6 +8672,8 @@
       {setup}
       {coordinationMessages}
       {spawnReceipts}
+      {shipRuns}
+      onship={(graph, provider, limit, source) => startShippingRun(graph, provider, limit, source)}
       postTurnChecks={postTurnResults}
       onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
       {agentUsage}
