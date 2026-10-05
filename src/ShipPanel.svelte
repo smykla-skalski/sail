@@ -11,6 +11,7 @@
 
   let {
     repository,
+    active = true,
     runs,
     busy,
     onclose,
@@ -19,6 +20,7 @@
     onsettings,
   }: {
     repository: string;
+    active?: boolean;
     runs: ShipRun[];
     busy: boolean;
     onclose: () => void;
@@ -31,12 +33,18 @@
   let scope = $state<'current' | 'all'>('current');
   let selectedRun = $state('');
   let selectedIssue = $state('');
+  let wasActive = false;
   const visible = $derived(
     runs.filter((run) => scope === 'all' || !repository || run.repository === repository),
   );
   const run = $derived(visible.find((item) => item.id === selectedRun) ?? visible.at(-1));
   const issue = $derived(run?.issues.find((item) => item.id === selectedIssue) ?? run?.issues[0]);
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
+
+  $effect(() => {
+    if (active && !wasActive) error = '';
+    wasActive = active;
+  });
 
   async function act(action: () => Promise<void>) {
     error = '';

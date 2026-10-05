@@ -8156,6 +8156,25 @@
       !event.ctrlKey &&
       !event.altKey &&
       !event.shiftKey &&
+      focusedPane === 'main' &&
+      detailsOpen &&
+      activeSideTab === 'ship' &&
+      (!mobileLayout || mobileView === 'details') &&
+      !document.querySelector('dialog[open]')
+    ) {
+      event.preventDefault();
+      closeShipRuns();
+      return;
+    }
+    if (
+      event.key === 'Escape' &&
+      !event.defaultPrevented &&
+      !event.repeat &&
+      !event.isComposing &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.shiftKey &&
       !acpAgent &&
       focusedPane === 'main' &&
       running &&
@@ -8922,6 +8941,9 @@
               <div class:inactive={activeSideTab !== 'ship'} class="side-view">
                 <ShipPanel
                   repository={coordinationProject(directory) ?? directory}
+                  active={activeSideTab === 'ship' &&
+                    detailsOpen &&
+                    (acpAgent ? agentChangesOpen : true)}
                   runs={shipRuns}
                   busy={shippingBusy}
                   onclose={closeShipRuns}

@@ -86,7 +86,7 @@ describe('native Ship run history', () => {
           dependsOn: ['first', 'owner/repo#123'],
           state: 'pending',
           branch: 'second',
-          path: null,
+          path: join(repository, 'missing-worktree'),
           receiptId: null,
           threadId: null,
           pullRequest: null,
@@ -142,6 +142,7 @@ describe('native Ship run history', () => {
       sessionStorage.setItem('sail-e2e-settings', 'enabled');
     });
     await browser.refresh();
+    await expect($('.app-shell')).toBeDisplayed();
     await expect($('.ship-launch')).not.toExist();
     await expect($('.project-ship')).not.toExist();
     await browser.execute(() =>
@@ -156,6 +157,14 @@ describe('native Ship run history', () => {
     await $('.ship-scope button:nth-child(2)').click();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('Other project fixture'));
     await $('.ship-scope button:first-child').click();
+    await browser.keys('Escape');
+    await expect($('.ship-panel')).not.toBeDisplayed();
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
+      ),
+    );
+    await expect($('.ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('1 / 3 merged'));
     await expect($('.ship-panel')).toHaveText(expect.stringContaining('Umbrella #40'));
     await expect($('.ship-graph')).toHaveText(expect.stringContaining('Blocked'));
@@ -191,9 +200,20 @@ describe('native Ship run history', () => {
     await expect($('.ship-gates')).toHaveText(
       expect.stringContaining('Reproduced fixture failure'),
     );
+    await $('.ship-node:nth-child(2) .ship-node-select').click();
+    await $('.ship-issue-detail .ship-actions button').click();
+    await expect($('.ship-panel > .ship-error[role="alert"]')).toExist();
+    await $('[aria-label="Close Ship runs"]').click();
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
+      ),
+    );
+    await expect($('.ship-panel > .ship-error[role="alert"]')).not.toExist();
     await $('[aria-label="Close Ship runs"]').click();
     await browser.execute(() => localStorage.clear());
     await browser.refresh();
+    await expect($('.app-shell')).toBeDisplayed();
     await browser.execute(() =>
       window.dispatchEvent(
         new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
