@@ -99,6 +99,25 @@ export function dependencyIssue(run: ShipRun, reference: string): ShipIssue | un
   );
 }
 
+const closedBeforeLaunch = 'Issue closed before its worker launched.';
+
+export function refreshedIssueState(issue: ShipIssue, closed: boolean): Partial<ShipIssue> {
+  const issueState = closed ? 'CLOSED' : 'OPEN';
+  if (closed && issue.state === 'pending')
+    return { issueState, state: 'failed', error: closedBeforeLaunch };
+  if (
+    !closed &&
+    issue.state === 'failed' &&
+    issue.error === closedBeforeLaunch &&
+    !issue.receiptId &&
+    !issue.threadId &&
+    !issue.path &&
+    !issue.pullRequest
+  )
+    return { issueState, state: 'pending', error: null };
+  return { issueState };
+}
+
 export function shipStatus(run: ShipRun, issue: ShipIssue): string {
   if (issue.state === 'merged') return 'Merged';
   if (issue.state === 'failed') return 'Failed';

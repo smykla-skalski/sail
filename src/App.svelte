@@ -27,6 +27,7 @@
     gateSnapshot,
     loadShipRuns,
     parseShipReport,
+    refreshedIssueState,
     shipOwner,
     validateGateVerdict,
   } from './lib/ship-progress';
@@ -1950,12 +1951,9 @@
         reference: String(issue.number),
       });
       await updateShipIssue(run, issue, {
-        issueState: closed ? 'CLOSED' : 'OPEN',
+        ...refreshedIssueState(issue, closed),
         refreshError: null,
         refreshedAt: Date.now(),
-        ...(closed && issue.state === 'pending'
-          ? { state: 'failed' as const, error: 'Issue closed before its worker launched.' }
-          : {}),
       });
     } catch (cause) {
       await updateShipIssue(run, issue, { refreshError: describe(cause) });

@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createShipRun } from '../src/lib/issue-shipping.ts';
+import { createShipRun, readyShipIssues } from '../src/lib/issue-shipping.ts';
 import {
   appendShipEvent,
   ciStatus,
   gateSnapshot,
   loadShipRuns,
   parseShipReport,
+  refreshedIssueState,
   shipOwner,
   shipStatus,
   validateGateVerdict,
@@ -16,6 +17,32 @@ import {
   saveBoundedReceipt,
   type SpawnReceipt,
 } from '../src/lib/agent-results.ts';
+
+void test('reopened queued issues recover across restart without retrying worker failures', () => {
+  const run = fixture();
+  Object.assign(run.issues[0], refreshedIssueState(run.issues[0], true));
+  assert.equal(run.issues[0].state, 'failed');
+  assert.deepEqual(readyShipIssues(run), []);
+  const restored = loadShipRuns(JSON.stringify([run]))[0];
+  Object.assign(restored.issues[0], refreshedIssueState(restored.issues[0], false));
+  assert.equal(restored.issues[0].error, null);
+  assert.deepEqual(
+    readyShipIssues(restored).map((issue) => issue.id),
+    ['first'],
+  );
+  for (const change of [
+    { error: 'Worker failed.' },
+    { receiptId: 'receipt' },
+    { threadId: 'thread' },
+    { path: '/worktree' },
+    { pullRequest: 'https://github.com/a/b/pull/1' },
+  ]) {
+    const failed = { ...run.issues[0], ...change };
+    Object.assign(failed, refreshedIssueState(failed, false));
+    assert.equal(failed.state, 'failed');
+    assert.equal(failed.issueState, 'OPEN');
+  }
+});
 
 function fixture() {
   return createShipRun(
