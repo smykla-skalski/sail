@@ -52,6 +52,8 @@ void test('an installed shipping skill defaults gates to the implementation sess
   assert.match(prompt, /Sail progress reporting/);
   assert.match(prompt, /stage, status: "running"/);
   assert.match(prompt, /stages implementing, reviewing, testing, pull_request, ci, and merging/);
+  assert.match(prompt, /After each completed Code Adversary/);
+  assert.match(prompt, /gate, verdict, reason/);
 });
 
 void test('bundled choices stay visible with many installed skills and mixed case', () => {

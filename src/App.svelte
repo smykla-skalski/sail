@@ -1961,7 +1961,7 @@
           throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
         await acp.connect(run.provider);
       }
-      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread. Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, merging), with status running or blocked and a reason when blocked.`;
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread. Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, merging), with status running or blocked and a reason when blocked. After every completed adversary pass, use ship_progress with its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.`;
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -3153,8 +3153,46 @@
           item.targetId === sourceId &&
           item.targetDirectory === request.directory,
       );
-      if (!receipt?.validation)
-        throw new Error('Only a validation session can report its own verdict.');
+      if (!receipt?.validation) {
+        if (!('gate' in report))
+          throw new Error('The implementation session must identify the completed inline gate.');
+        const owner = shipOwner(shipRuns, request.directory, sourceId);
+        if (!owner)
+          throw new Error('Only the assigned Ship worker can report inline gate verdicts.');
+        validateGateVerdict(report.gate, report.verdict);
+        const now = Date.now();
+        const model = resolvedWorkerModel(owner.issue) ?? null;
+        await updateShipIssue(owner.run, owner.issue, {
+          stage: report.gate === 'test-adversary' ? 'testing' : 'reviewing',
+          blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
+            ? report.reason
+            : null,
+          gates: [
+            ...(owner.issue.gates ?? []),
+            {
+              id: `inline:${sourceId}:${report.gate}:${crypto.randomUUID()}`,
+              gate: report.gate,
+              requestedModel: model ?? 'implementation session',
+              provider: owner.run.provider,
+              model,
+              threadId: sourceId,
+              directory: request.directory,
+              state: 'completed',
+              created: now,
+              updated: now,
+              error: null,
+              verdict: report.verdict,
+              reason: report.reason,
+            },
+          ],
+          events: appendShipEvent(
+            owner.issue.events,
+            `${report.gate}: ${report.verdict}`,
+            report.reason,
+          ),
+        });
+        return { status: 'recorded' };
+      }
       if (shippingWorkerSettled(receipt.state))
         throw new Error('This validation attempt has already finished.');
       validateGateVerdict(receipt.validation.gate, report.verdict);

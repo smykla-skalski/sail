@@ -269,6 +269,10 @@ void test('accepts typed stage and verdict reports, with gate-specific verdicts'
     reason: 'Check failed',
   });
   assert.deepEqual(parseShipReport({ verdict: 'CLEAN' }), { verdict: 'CLEAN' });
+  assert.deepEqual(parseShipReport({ gate: 'code-adversary', verdict: 'CLEAN' }), {
+    gate: 'code-adversary',
+    verdict: 'CLEAN',
+  });
   assert.throws(() => validateGateVerdict('code-adversary', 'PASS'));
   assert.throws(() => validateGateVerdict('test-adversary', 'CLEAN'));
   assert.doesNotThrow(() => validateGateVerdict('test-adversary', 'PASS'));

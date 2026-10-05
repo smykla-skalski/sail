@@ -1117,7 +1117,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "ship_progress",
-        "Report your assigned Ship issue stage, or your own validation verdict. Structured reports appear in the native Ship view. Blocked or failing reports require a reason.",
+        "Report your assigned Ship issue stage, an inline gate verdict, or your own validation verdict. Structured reports appear in the native Ship view. Blocked or failing reports require a reason.",
         "",
     ),
     (
@@ -1255,9 +1255,10 @@ pub fn run_mcp_stdio() {
                         "type":"object","properties":{
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging"]},
                             "status":{"type":"string","enum":["running","blocked"]},
+                            "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
                             "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","FAIL","BLOCKED"]},
                             "reason":{"type":"string","maxLength":2000}
-                        },"oneOf":[{"required":["stage","status"]},{"required":["verdict"]}]
+                        },"oneOf":[{"required":["stage","status"]},{"required":["gate","verdict"]},{"required":["verdict"]}]
                     }});
                 }
                 if *name == "agent_wait" {

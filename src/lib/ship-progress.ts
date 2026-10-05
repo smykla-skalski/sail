@@ -63,6 +63,13 @@ const reportSchema = z.union([
       reason: z.string().max(2000).optional(),
     })
     .strict(),
+  z
+    .object({
+      gate: z.enum(gateNames),
+      verdict: z.enum(verdicts),
+      reason: z.string().max(2000).optional(),
+    })
+    .strict(),
   z.object({ verdict: z.enum(verdicts), reason: z.string().max(2000).optional() }).strict(),
 ]);
 
