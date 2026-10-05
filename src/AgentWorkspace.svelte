@@ -1593,9 +1593,15 @@
             >Retry queue</Button
           >{/if}
       </div>{/if}
-    {#if isBusy}<div class="agent-busy" role="status">
-        {name} is working… <Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
-      </div>{/if}
+    {#if isBusy}<article class="agent-message message assistant-message agent-working-message">
+        <div class="avatar agent-avatar">S.</div>
+        <div class="message-body">
+          <div class="message-author">{name}</div>
+          <div class="agent-busy" role="status">
+            <span>Working…</span><Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
+          </div>
+        </div>
+      </article>{/if}
   </div>
   <div class="agent-composer composer-wrap">
     <div class="composer">
