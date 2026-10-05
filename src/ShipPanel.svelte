@@ -273,6 +273,11 @@
     background: var(--sui-surface);
     color: var(--sui-foreground);
   }
+  :global(.native-details) .ship-panel {
+    flex: 1;
+    min-height: 0;
+    height: auto;
+  }
   header,
   .ship-summary {
     display: flex;
