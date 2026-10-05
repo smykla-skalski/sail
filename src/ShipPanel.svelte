@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import type { ShipIssue, ShipRun } from './lib/issue-shipping';
+  import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './lib/issue-shipping';
   import {
     ciStatus,
     dependencyIssue,
@@ -222,11 +222,11 @@
           {#if issue.archivePath}<p class="ship-path">Archived files: {issue.archivePath}</p>{/if}
           {@render dependencies(run, issue)}
           <h4>Implementation</h4>
-          <p>Worker: {run.provider} / {issue.workerModel ?? 'Unknown model'}</p>
+          <p>Worker: {run.provider} / {resolvedWorkerModel(issue) ?? 'Unknown model'}</p>
           <p>
             Models that changed files: {issue.models?.join(', ') ||
-              (issue.workerModel
-                ? `Awaiting file-change attribution from ${issue.workerModel}`
+              (resolvedWorkerModel(issue)
+                ? `Awaiting file-change attribution from ${resolvedWorkerModel(issue)}`
                 : 'Awaiting worker model attribution')}{issue.modelUncertain
               ? ' · Attribution uncertain'
               : ''}

@@ -43,6 +43,7 @@
     createShipRun,
     isDirectShipRun,
     readyShipIssues,
+    resolvedWorkerModel,
     shippingWorkerSettled,
     shippingSetupAction,
     type ShipIssue,
@@ -2057,11 +2058,13 @@
     if (path) {
       const models = implementationModels(path);
       const modelUncertain = implementationAttributionUncertain(path);
+      const workerModel = resolvedWorkerModel({ ...issue, models });
       if (
         JSON.stringify(models) !== JSON.stringify(issue.models) ||
-        modelUncertain !== issue.modelUncertain
+        modelUncertain !== issue.modelUncertain ||
+        workerModel !== issue.workerModel
       )
-        await update({ models, modelUncertain });
+        await update({ models, modelUncertain, workerModel });
     }
     issue.gates = reconciledShipGates(issue, spawnReceipts);
     await Promise.all(

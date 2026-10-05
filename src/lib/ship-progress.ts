@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ShipIssue, ShipRun } from './issue-shipping';
+import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './issue-shipping.ts';
 import type { SpawnReceipt, SpawnState } from './agent-results';
 import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
@@ -217,7 +217,8 @@ function titleCase(value: string): string {
 }
 
 function workerDetail(issue: ShipIssue): string {
-  const worker = issue.workerModel ? ` · ${issue.workerModel}` : '';
+  const model = resolvedWorkerModel(issue);
+  const worker = model ? ` · ${model}` : '';
   if (issue.workerState === 'waiting') return `Worker needs input${worker}`;
   if (issue.workerState === 'unavailable') return `Reconnecting worker${worker}`;
   return `Worker running${worker}`;

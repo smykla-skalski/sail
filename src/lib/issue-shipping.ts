@@ -121,6 +121,11 @@ export function isDirectShipRun(run: ShipRun): boolean {
   return run.source.startsWith('direct:');
 }
 
+export function resolvedWorkerModel(issue: ShipIssue): string | undefined {
+  if (issue.workerModel) return issue.workerModel;
+  return issue.models?.length === 1 ? issue.models[0] : undefined;
+}
+
 export function shippingWorkerSettled(state: SpawnState): boolean {
   return ['completed', 'failed', 'interrupted'].includes(state);
 }

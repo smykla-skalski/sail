@@ -4,6 +4,7 @@ import {
   adoptDirectShipRun,
   createShipRun,
   readyShipIssues,
+  resolvedWorkerModel,
   shipIssueStatus,
   shippingWorkerSettled,
   shippingSetupAction,
@@ -173,6 +174,20 @@ void test('fills in the recovered direct worker model without duplicating the ru
   });
   assert.equal(recovered.length, 1);
   assert.equal(recovered[0].issues[0].workerModel, 'gpt-5.6-luna');
+});
+
+void test('uses one recorded implementation model as the missing worker model', () => {
+  const issue = run().issues[0];
+  issue.models = ['kong-ai-gateway:zai-org/GLM-5.3'];
+
+  assert.equal(resolvedWorkerModel(issue), 'kong-ai-gateway:zai-org/GLM-5.3');
+});
+
+void test('does not guess a worker model when multiple models changed files', () => {
+  const issue = run().issues[0];
+  issue.models = ['model-a', 'model-b'];
+
+  assert.equal(resolvedWorkerModel(issue), undefined);
 });
 
 void test('external blocker waits until GitHub reports it closed', () => {
