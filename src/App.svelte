@@ -3166,21 +3166,8 @@
     });
     activeSpawnRequests.add(receiptId);
 
-    const approval = browserApprovalQueue.then(() =>
-      confirmWorktreeApproval(request.expiresAt, {
-        agent: source.agent,
-        title: source.title,
-        name: String(name),
-        project,
-        prompt: prompt.trim(),
-        provider: chosenProvider,
-        existingPath: destination?.path,
-      }),
-    );
-    browserApprovalQueue = approval.catch(() => undefined);
-    if (!(await approval)) throw new Error('User declined the agent spawn request.');
     if (Date.now() >= request.expiresAt)
-      throw new Error('The agent spawn request expired before approval.');
+      throw new Error('The agent spawn request expired before launch.');
     await coordinationSource(request);
     updateSpawnReceipt(receiptId, { state: 'starting' });
 

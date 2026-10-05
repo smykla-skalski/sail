@@ -85,15 +85,18 @@ describe('provider selected agent spawn', () => {
   });
   after(() => rmSync(repository, { recursive: true, force: true }));
 
-  it('selects Codex in a new worktree and asks before sharing an existing one', async () => {
+  it('starts selected providers without approval', async () => {
     const path = realpathSync(repository);
     await browser.execute((directory) => {
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+      localStorage.removeItem('sail-settings-migrated-v1');
       localStorage.setItem('sai-directory', directory);
       localStorage.setItem(
         'sai-project-catalog',
         JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
       );
       localStorage.removeItem('sail-agent-threads');
+      localStorage.removeItem('sai-agent-spawn-receipts');
       localStorage.setItem('sai-notifications-enabled', 'false');
     }, path);
     await browser.refresh();
@@ -112,7 +115,16 @@ describe('provider selected agent spawn', () => {
       () =>
         browser.execute(() => {
           const saved: unknown = JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]');
-          return Array.isArray(saved) && saved.length > 0;
+          return (
+            Array.isArray(saved) &&
+            saved.some(
+              (thread) =>
+                typeof thread === 'object' &&
+                thread !== null &&
+                'title' in thread &&
+                thread.title === 'Clipboard fixture source',
+            )
+          );
         }),
       { timeout: 15_000 },
     );
@@ -160,17 +172,8 @@ describe('provider selected agent spawn', () => {
       receiptId: pendingReceiptId,
       accessKey: pendingAccessKey,
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await expect($('.worktree-approval-dialog')).toHaveText(expect.stringContaining('codex'));
-    const queued = await callMcp(
-      config,
-      sessionId,
-      { receiptId: pendingReceiptId, accessKey: pendingAccessKey },
-      'agent_status',
-    );
-    expect(JSON.parse(queued.content[0].text)).toMatchObject({ state: 'queued' });
-    await $('.worktree-approval-actions button:last-child').click();
     const newResult = await spawnNew;
+    await expect($('.worktree-approval-dialog')).not.toBeDisplayed();
     expect(newResult.isError).not.toBe(true);
     const started = z
       .object({
@@ -231,23 +234,8 @@ describe('provider selected agent spawn', () => {
       prompt: 'Clipboard fixture shared',
       target: { kind: 'existing', path },
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await expect($('.worktree-approval-dialog')).toHaveText(
-      expect.stringContaining('share this worktree’s files'),
-    );
-    await $('.worktree-approval-actions button:first-child').click();
-    const denied = await spawnShared;
-    expect(denied.isError).toBe(true);
-    expect(denied.content[0].text).toContain('User declined');
-
-    const approvedShared = callMcp(config, sessionId, {
-      provider: 'claude',
-      prompt: 'Clipboard fixture approved shared',
-      target: { kind: 'existing', path },
-    });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await $('.worktree-approval-actions button:last-child').click();
-    const sharedResult = await approvedShared;
+    const sharedResult = await spawnShared;
+    await expect($('.worktree-approval-dialog')).not.toBeDisplayed();
     expect(sharedResult.isError).not.toBe(true);
     const shared = z
       .object({
@@ -262,23 +250,13 @@ describe('provider selected agent spawn', () => {
     expect(shared.worktreeId).toBe(path);
     expect(shared.path).toBe(path);
 
-    let openCodeFinished = false;
     const spawnOpenCode = callMcp(config, sessionId, {
       provider: 'opencode',
       prompt: 'Clipboard fixture OpenCode',
       target: { kind: 'existing', path },
-    }).then((spawnResponse) => {
-      openCodeFinished = true;
-      return spawnResponse;
     });
-    await browser.waitUntil(
-      async () => openCodeFinished || (await $('.worktree-approval-dialog').isDisplayed()),
-      { timeout: 15_000 },
-    );
-    if (await $('.worktree-approval-dialog').isDisplayed()) {
-      await $('.worktree-approval-actions button:last-child').click();
-    }
     const openCodeResult = await spawnOpenCode;
+    await expect($('.worktree-approval-dialog')).not.toBeDisplayed();
     if (openCodeResult.isError) {
       expect(openCodeResult.content[0].text).toContain(
         'Complete OpenCode setup in the target worktree before spawning',
@@ -335,8 +313,6 @@ describe('provider selected agent spawn', () => {
       prompt: 'Delayed approval',
       target: { kind: 'existing', path },
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await $('.worktree-approval-actions button:last-child').click();
     const waitingLaunch = z
       .object({ receiptId: z.string(), accessKey: z.string() })
       .parse(JSON.parse((await spawnWaiting).content[0].text));
@@ -373,8 +349,6 @@ describe('provider selected agent spawn', () => {
       prompt: 'Prompt failure',
       target: { kind: 'existing', path },
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await $('.worktree-approval-actions button:last-child').click();
     const failedLaunch = z
       .object({ receiptId: z.string(), accessKey: z.string() })
       .parse(JSON.parse((await spawnFailure).content[0].text));
@@ -563,7 +537,7 @@ describe('provider selected agent spawn', () => {
       .array(z.object({ prompt: z.string().nullable().optional() }))
       .parse(JSON.parse(savedReceipts ?? '[]'))
       .filter((receipt) => receipt.prompt === 'Gate prompt model unavailable');
-    expect(attempts).toHaveLength(1);
+    expect(attempts).toHaveLength(2);
   });
 
   it('reports setup failure without creating an agent thread', async () => {
@@ -611,8 +585,6 @@ describe('provider selected agent spawn', () => {
       prompt: 'Clipboard fixture no launch',
       target: { kind: 'new', name: 'failing-setup' },
     });
-    await expect($('.worktree-approval-dialog')).toBeDisplayed();
-    await $('.worktree-approval-actions button:last-child').click();
     const result = await spawnNew;
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Worktree setup exited with code 7');
