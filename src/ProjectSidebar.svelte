@@ -17,7 +17,7 @@
   import type { ProjectCatalog, ProjectWorktree, WorktreeCreation } from './lib/projects';
   import { ungroupedRepositories } from './lib/projects';
   import { getSetting, setSetting } from './lib/settings';
-  import { issueBranch } from './lib/github-issues';
+  import { issueBranch, worktreeBranchName } from './lib/github-issues';
 
   export type PullRequestCheck = { name: string; state: string; url: string };
   type PullRequestChecks = { number: number; url: string; checks: PullRequestCheck[] };
@@ -50,6 +50,7 @@
     onselect: (path: string) => void;
     onselectdefault: (path: string) => void;
     onselectthread: (key: string) => void;
+    onremovethread: (thread: AgentThread) => void;
     onaddrepository: (groupID: string | null) => void;
     onaddgroup: (name: string) => void;
     onrenamegroup: (id: string, name: string) => void;
@@ -85,7 +86,8 @@
   type MenuTarget =
     | { kind: 'group'; id: string; name: string }
     | { kind: 'repository'; path: string; groupID: string | null }
-    | { kind: 'worktree'; repository: string; worktree: ProjectWorktree };
+    | { kind: 'worktree'; repository: string; worktree: ProjectWorktree }
+    | { kind: 'agent'; thread: AgentThread };
 
   let {
     catalog,
@@ -110,6 +112,7 @@
     onselect,
     onselectdefault,
     onselectthread,
+    onremovethread,
     onaddrepository,
     onaddgroup,
     onrenamegroup,
@@ -140,6 +143,7 @@
   let worktreeDialog: HTMLDialogElement;
   let worktreeNameInput = $state<HTMLInputElement>();
   let worktreeName = $state('');
+  let worktreeBranch = $derived(worktreeBranchName(worktreeName));
   let worktreeDestination = $state<string | null>(null);
   let choosingDestination = $state(false);
   let worktreeBase = $state('');
@@ -355,6 +359,7 @@
   function menuKey(target: MenuTarget) {
     if (target.kind === 'group') return `group:${target.id}`;
     if (target.kind === 'repository') return `repository:${target.path}`;
+    if (target.kind === 'agent') return `agent:${threadKey(target.thread)}`;
     return `worktree:${target.worktree.path}`;
   }
 
@@ -509,10 +514,13 @@
   }
 
   function createWorktree(path: string) {
-    if (!worktreeName.trim()) return;
+    if (!worktreeBranch) {
+      worktreeError = 'Enter a name with at least one letter or number.';
+      return;
+    }
     if (
       worktreeCreations.some(
-        (creation) => creation.repository === path && creation.name === worktreeName.trim(),
+        (creation) => creation.repository === path && creation.name === worktreeBranch,
       )
     ) {
       worktreeError = 'This worktree already has a pending entry. Retry or dismiss it first.';
@@ -525,7 +533,7 @@
     worktreeError = '';
     const pending = oncreateworktree(
       path,
-      worktreeName.trim(),
+      worktreeBranch,
       worktreeDestination,
       worktreeBase.trim() || null,
       worktreeAgent || null,
@@ -698,6 +706,10 @@
         {@const status = threadStatus(thread)}
         {@const child = subagentThread(thread)}
         {@const activeChildren = activeSubagentCount(thread)}
+        {@const selectable =
+          thread.agent === 'opencode'
+            ? openCodeAvailable
+            : agents.some((agent) => agent.id === thread.agent && agent.available)}
         <button
           class:active={selectedThread === key}
           class:subagent={child}
@@ -705,10 +717,14 @@
           aria-current={selectedThread === key ? 'page' : undefined}
           aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}, ${statusLabel(status)}${activeChildren ? `, ${activeChildren} subagent${activeChildren === 1 ? '' : 's'} active` : ''}`}
           title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
-          disabled={thread.agent === 'opencode'
-            ? !openCodeAvailable
-            : !agents.some((agent) => agent.id === thread.agent && agent.available)}
-          onclick={() => onselectthread(key)}
+          aria-disabled={!selectable}
+          oncontextmenu={(event) => openMenu({ kind: 'agent', thread }, event)}
+          onmousedown={(event) => {
+            if (event.button === 2) void openMenu({ kind: 'agent', thread }, event);
+          }}
+          onclick={() => {
+            if (selectable) onselectthread(key);
+          }}
         >
           <span class="project-agent-provider"
             >{#if child}<span aria-hidden="true">↳</span>{/if}<HarnessIcon
@@ -1112,7 +1128,9 @@
       ? `Manage ${target.name}`
       : target.kind === 'repository'
         ? `Manage ${repositoryName(target.path)}`
-        : `Manage worktree ${target.worktree.branch}`}
+        : target.kind === 'agent'
+          ? `Manage ${providerName(target.thread)} thread ${target.thread.title}`
+          : `Manage worktree ${target.worktree.branch}`}
     style={`left: ${menuX}px; top: ${menuY}px`}
     bind:this={menuElement}
     onkeydown={navigateMenu}
@@ -1179,6 +1197,17 @@
           : 'Remove from sidebar'}
         onclick={() => {
           onremoverepository(target.path);
+          closeMenu();
+        }}>Remove from sidebar</button
+      >
+    {:else if target.kind === 'agent'}
+      <div class="project-menu-title" title={target.thread.title}>{target.thread.title}</div>
+      <button
+        role="menuitem"
+        class="danger"
+        aria-label={`Remove ${providerName(target.thread)} thread ${target.thread.title} from sidebar`}
+        onclick={() => {
+          onremovethread(target.thread);
           closeMenu();
         }}>Remove from sidebar</button
       >
@@ -1284,7 +1313,7 @@
           <button type="button" onclick={() => (selectedIssue = null)}>Clear</button>
         </p>{/if}
       <label
-        >New branch name
+        >Worktree or branch name
         <input
           aria-label={`Worktree name for ${repositoryName(creatingWorktreeFor)}`}
           placeholder="e.g. my-feature"
@@ -1292,6 +1321,9 @@
           bind:this={worktreeNameInput}
         />
       </label>
+      {#if worktreeBranch && worktreeBranch !== worktreeName.trim()}<p class="worktree-issue-note">
+          Branch: {worktreeBranch}
+        </p>{/if}
       <label
         >Base branch <span>(optional)</span>
         <input

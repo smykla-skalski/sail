@@ -272,7 +272,7 @@ button:disabled {
 .project-agent-row.active {
   background: var(--shell-selected);
 }
-.project-agent-row:disabled {
+.project-agent-row[aria-disabled='true'] {
   opacity: 0.55;
   cursor: default;
 }
