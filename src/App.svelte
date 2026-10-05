@@ -1914,7 +1914,7 @@
               state: 'failed',
               error: 'Worker finished without a pull request. Inspect its thread.',
             });
-        } else if (['failed', 'interrupted', 'unavailable'].includes(current.state))
+        } else if (['failed', 'interrupted'].includes(current.state))
           await updateShipIssue(run, issue, {
             state: 'failed',
             error: current.error ?? `Worker ${current.state}.`,
