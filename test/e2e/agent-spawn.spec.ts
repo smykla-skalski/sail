@@ -95,6 +95,16 @@ describe('provider selected agent spawn', () => {
       );
       localStorage.removeItem('sail-agent-threads');
       localStorage.setItem('sai-notifications-enabled', 'false');
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+    }, path);
+    await browser.tauri.execute(async ({ core }, directory) => {
+      await core.invoke('save_setting', { key: 'sai-directory', value: directory });
+      await core.invoke('save_setting', {
+        key: 'sai-project-catalog',
+        value: JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+      });
+      await core.invoke('save_setting', { key: 'sail-agent-threads', value: null });
+      await core.invoke('save_setting', { key: 'sai-notifications-enabled', value: 'false' });
     }, path);
     await browser.refresh();
     await expect($('.agent-launches button')).toBeEnabled();
