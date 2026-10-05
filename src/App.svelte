@@ -3322,7 +3322,21 @@
     const responseDeadline = request.expiresAt + 180_000;
     const previousSpawn = agentSpawnQueue;
     const launched = (async () => {
-      await previousSpawn.catch(() => undefined);
+      const queueRemaining = responseDeadline - Date.now();
+      if (queueRemaining <= 0) throw new Error('Agent spawn timed out while waiting to launch.');
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error('Agent spawn timed out while waiting to launch.')),
+          queueRemaining,
+        );
+        void previousSpawn
+          .catch(() => undefined)
+          .then(() => {
+            clearTimeout(timer);
+            resolve();
+            return undefined;
+          });
+      });
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out while waiting to launch.');
       await coordinationSource(request);
