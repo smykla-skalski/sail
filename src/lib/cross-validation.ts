@@ -7,6 +7,13 @@ function modelId(value: string): string {
   return value.slice(value.indexOf(':') + 1).toLowerCase();
 }
 
+export function hasUnresolvedModelAlias(value: string): boolean {
+  return (
+    /^(default|auto|latest|sonnet|opus|haiku|fable)(?:\[.*\])?$/.test(modelId(value)) ||
+    /(?:^|-)latest$/.test(modelId(value))
+  );
+}
+
 export function parseValidationSettings(raw: string | null): ValidationSettings {
   try {
     const value: unknown = JSON.parse(raw ?? 'null');
@@ -44,8 +51,23 @@ export function selectValidationChoice(
   );
   if (!eligible.length)
     return { choice: null, reason: 'None of the selected cross-validation models is available.' };
+  if (settings.strictDifferentModel && implementingModels.some(hasUnresolvedModelAlias))
+    return {
+      choice: null,
+      reason:
+        'Cannot verify the actual implementation model behind an alias. Choose concrete model IDs before strict validation.',
+    };
+  const verified = eligible.filter((choice) => !hasUnresolvedModelAlias(choice.model));
+  if (settings.strictDifferentModel && !verified.length)
+    return {
+      choice: null,
+      reason:
+        'Cannot verify the actual selected model behind an alias. Select a concrete model ID for strict validation.',
+    };
   const used = new Set(implementingModels.map(modelId));
-  const different = eligible.find((choice) => !used.has(modelId(choice.model)));
+  const different = implementingModels.some(hasUnresolvedModelAlias)
+    ? undefined
+    : verified.find((choice) => !used.has(modelId(choice.model)));
   if (different) return { choice: different, reason: null };
   if (settings.strictDifferentModel)
     return {

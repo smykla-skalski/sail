@@ -55,7 +55,11 @@
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
   import { parseValidationSettings, validationSettingsKey } from './lib/cross-validation';
-  import { selectValidationChoice, type ValidationChoice } from './lib/cross-validation';
+  import {
+    hasUnresolvedModelAlias,
+    selectValidationChoice,
+    type ValidationChoice,
+  } from './lib/cross-validation';
   import {
     abandonImplementationTurn,
     activeImplementationModels,
@@ -3284,6 +3288,13 @@
     validation = false,
     beforePrompt?: () => Promise<void>,
   ) {
+    if (validation) {
+      const model = source.kind === 'acp' ? source.model : source.model?.id;
+      if (!model || hasUnresolvedModelAlias(model))
+        throw new ValidationCandidateUnavailable(
+          'Cannot verify the actual validation model behind an alias. Select a concrete model ID.',
+        );
+    }
     if (!validation) await beginShipItRun(created.path, prompt);
     if (source.kind === 'acp') {
       const session = await acp.create(source.agent, created.path).catch((cause) => {

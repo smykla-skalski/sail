@@ -66,3 +66,33 @@ void test('empty or corrupt settings pause instead of broadening the pool', () =
   );
   assert.match(validationInstructions(settings), /Report the actual provider and model/);
 });
+
+void test('strict routing pauses for unresolved implementation or selected aliases', () => {
+  for (const model of ['default', 'sonnet', 'opus[1m]', 'anthropic:claude-sonnet-latest']) {
+    const concrete = {
+      choices: [{ agent: 'codex', model: 'gpt-5.4' }],
+      strictDifferentModel: true,
+    };
+    assert.equal(selectValidationChoice(concrete, concrete.choices, [model]).choice, null);
+    assert.match(
+      selectValidationChoice(concrete, concrete.choices, [model]).reason ?? '',
+      /Cannot verify/,
+    );
+    const alias = { choices: [{ agent: 'claude', model }], strictDifferentModel: true };
+    assert.equal(selectValidationChoice(alias, alias.choices, ['gpt-5.4']).choice, null);
+  }
+});
+
+void test('aliases never count as verified different models', () => {
+  const pool = {
+    choices: [
+      { agent: 'claude', model: 'sonnet' },
+      { agent: 'codex', model: 'gpt-5.4' },
+    ],
+    strictDifferentModel: true,
+  };
+  assert.equal(
+    selectValidationChoice(pool, pool.choices, ['claude-sonnet-4-6']).choice?.model,
+    'gpt-5.4',
+  );
+});
