@@ -6,6 +6,7 @@ import {
   ciStatus,
   dependencyUrl,
   shipGatesSettled,
+  reconciledShipGates,
   refreshedPullRequest,
   persistShipRefresh,
   gateSnapshot,
@@ -325,4 +326,49 @@ void test('a rejected refresh drains remaining updates and flushes before report
   slow.resolve();
   await failure;
   assert.equal(writes, 1);
+});
+
+void test('restart reconciles settled and newly recorded receipts before deciding cleanup', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/worktree';
+  issue.threadId = 'worker';
+  const receipt: SpawnReceipt = {
+    receiptId: 'gate',
+    accessKey: 'secret',
+    requestId: 'request',
+    project: '/repo',
+    sourceId: 'worker',
+    sourceDirectory: '/worktree',
+    targetId: 'gate-thread',
+    turnId: 'turn',
+    targetDirectory: '/worktree',
+    worktreeId: '/worktree',
+    provider: 'claude',
+    prompt: '',
+    state: 'working',
+    created: 1,
+    updated: 1,
+    result: null,
+    error: null,
+    model: 'test',
+    validation: { gate: 'code-adversary', requestedModel: 'test' },
+  };
+  issue.gates = reconciledShipGates(issue, [receipt]);
+  assert.equal(issue.gates.length, 1);
+  assert.equal(shipGatesSettled(issue), false);
+  const completed = {
+    ...receipt,
+    state: 'completed' as const,
+    updated: 2,
+    validation: { ...receipt.validation!, verdict: 'CLEAN' as const },
+  };
+  issue.gates = reconciledShipGates(issue, [completed]);
+  assert.equal(shipGatesSettled(issue), true);
+  assert.equal(issue.gates[0].verdict, 'CLEAN');
+  issue.gates = reconciledShipGates(issue, []);
+  assert.equal(issue.gates[0].verdict, 'CLEAN');
+  issue.gates = reconciledShipGates(issue, [
+    { ...receipt, receiptId: 'foreign', sourceId: 'other' },
+  ]);
+  assert.equal(issue.gates.length, 1);
 });

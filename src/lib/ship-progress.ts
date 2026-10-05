@@ -117,6 +117,20 @@ export function shipGatesSettled(issue: ShipIssue): boolean {
   return (issue.gates ?? []).every((gate) => shippingWorkerSettled(gate.state));
 }
 
+export function reconciledShipGates(issue: ShipIssue, receipts: SpawnReceipt[]): ShipGate[] {
+  const gates = new Map((issue.gates ?? []).map((gate) => [gate.id, gate]));
+  for (const receipt of receipts) {
+    if (
+      !gates.has(receipt.receiptId) &&
+      !(receipt.sourceId === issue.threadId && receipt.sourceDirectory === issue.path)
+    )
+      continue;
+    const snapshot = gateSnapshot(receipt);
+    if (snapshot) gates.set(snapshot.id, snapshot);
+  }
+  return [...gates.values()].toSorted((a, b) => a.created - b.created);
+}
+
 export function refreshedPullRequest(
   issue: ShipIssue,
   pr: ShippingPullRequest | null,

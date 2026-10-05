@@ -30,6 +30,7 @@
     refreshedIssueState,
     refreshedPullRequest,
     shipGatesSettled,
+    reconciledShipGates,
     persistShipRefresh,
     settleShipRefresh,
     type ShippingPullRequest,
@@ -1923,12 +1924,14 @@
       )
         await update({ models, modelUncertain });
     }
+    issue.gates = reconciledShipGates(issue, spawnReceipts);
     await Promise.all(
       (issue.gates ?? []).map(async (gate) => {
         const receipt = spawnReceipts.find((item) => item.receiptId === gate.id);
         if (receipt && !shippingWorkerSettled(receipt.state)) await currentSpawnReceipt(receipt);
       }),
     );
+    issue.gates = reconciledShipGates(issue, spawnReceipts);
     try {
       const closed = await invoke<boolean>('shipping_dependency_closed', {
         repository: run.repository,
