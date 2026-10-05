@@ -9,7 +9,36 @@ import {
   implementationModels,
   recoverImplementationModels,
   recordImplementationModel,
+  settledImplementationAttribution,
 } from '../src/lib/implementation-models.ts';
+
+for (const model of ['provider:model-a', undefined]) {
+  void test(`archive attribution recovers an interrupted ${model ?? 'unknown'} model`, async () => {
+    const values = new Map<string, string>();
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => values.set(key, value),
+      },
+    });
+    let revision = 'before';
+    Object.defineProperty(globalThis, 'window', {
+      configurable: true,
+      value: { __TAURI_INTERNALS__: { invoke: async () => revision } },
+    });
+    const directory = `/test/archive-${model ?? 'unknown'}`;
+    const turn = await beginImplementationTurn(directory, model, 'worker');
+    abandonImplementationTurn(directory, turn);
+    revision = 'committed-after-restart';
+    const snapshot = await settledImplementationAttribution(directory);
+    assert.deepEqual(snapshot, {
+      models: model ? [model] : [],
+      modelUncertain: !model,
+    });
+    assert.deepEqual(JSON.parse(values.get(`sai-implementation-pending:${directory}`)!), []);
+  });
+}
 
 void test('model history survives equivalent references and rejects a second issue', async () => {
   const values = new Map<string, string>();

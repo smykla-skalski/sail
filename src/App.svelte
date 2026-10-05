@@ -78,6 +78,7 @@
     implementationAttributionUncertain,
     implementationModels,
     recoverImplementationModels,
+    settledImplementationAttribution,
     recordImplementationModel,
   } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
@@ -1976,10 +1977,7 @@
       }
       if (issue.path) {
         try {
-          await updateShipIssue(run, issue, {
-            models: implementationModels(issue.path),
-            modelUncertain: implementationAttributionUncertain(issue.path),
-          });
+          await updateShipIssue(run, issue, await settledImplementationAttribution(issue.path));
           const archivePath = await invoke<string | null>('delete_worktree', {
             repository: run.repository,
             worktree: issue.path,

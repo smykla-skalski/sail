@@ -545,18 +545,18 @@ describe('provider selected agent spawn', () => {
     );
     expect(rejected.isError).toBe(true);
     expect(rejected.content[0].text).toContain('Strict different-model routing is enabled');
-    await browser.execute(() =>
-      localStorage.setItem(
-        'sai-cross-validation',
-        JSON.stringify({
+    await browser.tauri.execute(async ({ core }) => {
+      await core.invoke('save_setting', {
+        key: 'sai-cross-validation',
+        value: JSON.stringify({
           choices: [
             { agent: 'claude', model: 'test' },
             { agent: 'claude', model: 'fast' },
           ],
           strictDifferentModel: false,
         }),
-      ),
-    );
+      });
+    });
     await browser.refresh();
     await expect($('.agent-launches button')).toBeEnabled();
     const dispatchFailure = await callMcp(
