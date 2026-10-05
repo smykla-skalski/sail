@@ -3,9 +3,10 @@
     source: string;
     dark: boolean;
     title?: string;
+    onvalidation?: (valid: boolean) => void;
   }
 
-  let { source, dark, title = 'Plan diagram' }: Props = $props();
+  let { source, dark, title = 'Plan diagram', onvalidation }: Props = $props();
   let imageUrl = $state('');
   let error = $state('');
   let zoom = $state(100);
@@ -29,6 +30,16 @@
           securityLevel: 'strict',
           theme: dark ? 'dark' : 'neutral',
         });
+        try {
+          await mermaid.parse(source);
+        } catch {
+          if (current === generation) {
+            error = 'Diagram preview is unavailable.';
+            onvalidation?.(false);
+          }
+          return;
+        }
+        if (current === generation) onvalidation?.(true);
         const rendered = await mermaid.render(
           `sai-plan-${current}-${Math.random().toString(36).slice(2)}`,
           source,
