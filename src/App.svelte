@@ -1769,9 +1769,15 @@
       updateSpawnReceipt(receipt.receiptId, { state });
       activeSpawnTargets.set(receipt.targetId!, receipt.receiptId);
     } else {
+      const sessionId = receipt.targetId?.slice(`acp:${receipt.provider}:`.length);
+      const outcome = sessionId ? agentActivity?.finished[sessionId] : undefined;
       updateSpawnReceipt(receipt.receiptId, {
         state,
         result: spawnOutput.get(receipt.receiptId) ?? receipt.result,
+        error:
+          state === 'failed' && outcome?.turnId === receipt.turnId
+            ? (outcome.error ?? receipt.error)
+            : receipt.error,
       });
       if (state === 'completed' && !spawnOutput.has(receipt.receiptId))
         void recoverAcpSpawnResult(receipt).catch(() => undefined);
@@ -5898,6 +5904,10 @@
                 ? 'interrupted'
                 : 'completed',
           result: spawnOutput.get(receipt.receiptId) ?? receipt.result,
+          error:
+            typeof event.message.params?.error === 'string'
+              ? event.message.params.error
+              : receipt.error,
         });
     } else if (event.message.method === 'session/request_permission') {
       const sessionId = event.message.params?.sessionId;
@@ -6975,13 +6985,24 @@
     let current = selection;
     const path = directory;
     const text = draft.trim();
+    let id = sessionID;
+    const requestedModel = chosenModel
+      ? {
+          id: chosenModel.id,
+          providerID: chosenModel.providerID,
+          variant: selectedVariant || undefined,
+        }
+      : undefined;
+    const requestedAgent = selectedAgentID || undefined;
+    const queueTurn = running;
+    const sourceSkills = skills;
     try {
       await beginShipItRun(path, text);
     } catch (cause) {
       error = describe(cause);
       return;
     }
-    const queueTurn = running;
+    if (current !== selection || path !== directory) return;
     const files = [...attachedFiles];
     let accepted = false;
     for (const file of files) {
@@ -6993,17 +7014,10 @@
     sending = true;
     error = '';
     try {
-      let id = sessionID;
       if (!id) {
-        const session = await client.session.create({
-          agent: selectedAgentID || undefined,
-          model: chosenModel
-            ? {
-                id: chosenModel.id,
-                providerID: chosenModel.providerID,
-                variant: selectedVariant || undefined,
-              }
-            : undefined,
+        const session = await source.session.create({
+          agent: requestedAgent,
+          model: requestedModel,
           location: { directory: path },
           metadata: { saiHarness: true },
           title: text ? (text.length > 60 ? `${text.slice(0, 57)}…` : text) : 'New work',
@@ -7022,7 +7036,7 @@
         text &&
         (currentSession?.title === 'New plan' || currentSession?.title === 'New work')
       ) {
-        await client.session.update({
+        await source.session.update({
           sessionID: id,
           title: text.length > 60 ? `${text.slice(0, 57)}…` : text,
         });
@@ -7033,23 +7047,27 @@
         activity = 'Thinking';
         activityTool = '';
       }
-      const promptRequest = runSerialOpenCodeTurn(id, async () => {
-        const implementingModel = chosenModel
-          ? `${chosenModel.providerID}:${chosenModel.id}`
+      const targetId = id;
+      const promptRequest = runSerialOpenCodeTurn(targetId, async () => {
+        const target = await source.session.get({ sessionID: targetId });
+        if (target.location.directory !== path)
+          throw new Error('Target session moved to another worktree.');
+        const implementingModel = target.model
+          ? `${target.model.providerID}:${target.model.id}`
           : undefined;
-        await invoke('record_turn_snapshot', { path, thread: `opencode:${id}` });
-        const tracking = await beginImplementationTurn(path, implementingModel, `opencode:${id}`);
+        await invoke('record_turn_snapshot', { path, thread: `opencode:${targetId}` });
+        const tracking = await beginImplementationTurn(
+          path,
+          implementingModel,
+          `opencode:${targetId}`,
+        );
         let response;
         try {
           response = await source.session.prompt({
-            sessionID: id,
-            text: resolveSkillPrompt(
-              skills,
-              text,
-              chosenModel ? `${chosenModel.providerID}:${chosenModel.id}` : undefined,
-            ),
-            skills: promptSkill(skills, text)?.id
-              ? [{ id: promptSkill(skills, text)!.id! }]
+            sessionID: targetId,
+            text: resolveSkillPrompt(sourceSkills, text, implementingModel),
+            skills: promptSkill(sourceSkills, text)?.id
+              ? [{ id: promptSkill(sourceSkills, text)!.id! }]
               : undefined,
             delivery: queueTurn ? 'steer' : undefined,
             files: files.map((filePath) => ({
@@ -7062,7 +7080,7 @@
           throw cause;
         }
         void source.session
-          .wait({ sessionID: id })
+          .wait({ sessionID: targetId })
           .then(
             () => recordImplementationModel(path, implementingModel, tracking),
             () => recordImplementationModel(path, implementingModel, tracking),

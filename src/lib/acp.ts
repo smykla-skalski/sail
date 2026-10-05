@@ -161,7 +161,10 @@ export interface AgentActivity {
   activeTurns: Record<string, string>;
   waiting: string[];
   sessions: string[];
-  finished: Record<string, { status: 'done' | 'failed'; notify: boolean; turnId: string }>;
+  finished: Record<
+    string,
+    { status: 'done' | 'failed'; notify: boolean; turnId: string; error?: string | null }
+  >;
 }
 
 export interface AcpPendingInboxItem {
