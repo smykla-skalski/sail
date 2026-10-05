@@ -122,6 +122,14 @@ export function receiptIsSettled(state: SpawnState): boolean {
   return ['completed', 'failed', 'interrupted', 'unavailable'].includes(state);
 }
 
+export function receiptNeedsRefresh(receipt: SpawnReceipt): boolean {
+  return (
+    !receiptIsSettled(receipt.state) ||
+    (receipt.state === 'unavailable' &&
+      (!!receipt.validation || receipt.requestId.startsWith('ship:')))
+  );
+}
+
 export function spawnReceiptsForSource(
   receipts: SpawnReceipt[],
   sourceId: string | null,

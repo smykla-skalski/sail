@@ -194,6 +194,7 @@
     acpReceiptState,
     loadSpawnReceipts,
     receiptForSource,
+    receiptNeedsRefresh,
     receiptIsSettled,
     saveBoundedReceipt,
     spawnReceiptsForSource,
@@ -2135,8 +2136,7 @@
     const current = spawnReceipts.find((item) => item.receiptId === id);
     if (!current) return;
     if (
-      receiptIsSettled(current.state) &&
-      !(current.requestId.startsWith('ship:') && current.state === 'unavailable') &&
+      !receiptNeedsRefresh(current) &&
       changes.state &&
       ['working', 'waiting', 'unavailable'].includes(changes.state)
     )
@@ -2191,11 +2191,7 @@
   }
 
   async function currentSpawnReceipt(receipt: SpawnReceipt): Promise<SpawnReceipt> {
-    if (
-      receiptIsSettled(receipt.state) &&
-      !(receipt.requestId.startsWith('ship:') && receipt.state === 'unavailable')
-    )
-      return receipt;
+    if (!receiptNeedsRefresh(receipt)) return receipt;
     if (activeSpawnRequests.has(receipt.receiptId)) return receipt;
     if (
       !receipt.targetId ||
@@ -2350,7 +2346,7 @@
   async function reconcileOpenCodeSpawnReceipts() {
     await Promise.all(
       spawnReceipts
-        .filter((receipt) => receipt.provider === 'opencode' && !receiptIsSettled(receipt.state))
+        .filter((receipt) => receipt.provider === 'opencode' && receiptNeedsRefresh(receipt))
         .map((receipt) => currentSpawnReceipt(receipt)),
     );
   }
