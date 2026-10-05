@@ -869,10 +869,21 @@ button:disabled {
   background: var(--sui-success);
 }
 .main-area {
+  position: relative;
   display: flex;
   flex: 1;
   flex-direction: column;
   min-width: 0;
+}
+.ship-fallback {
+  position: absolute;
+  z-index: 2;
+  top: var(--topbar-height);
+  right: 0;
+  bottom: 0;
+  width: min(420px, 100%);
+  border-left: 1px solid var(--shell-divider);
+  box-shadow: -8px 0 24px #0002;
 }
 .agent-launches {
   display: flex;
@@ -1442,6 +1453,7 @@ button:disabled {
 }
 .side-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   padding: 6px 12px;
   border-left: 1px solid var(--shell-divider);
@@ -1922,7 +1934,8 @@ button:disabled {
     overflow: hidden;
   }
   .workspace .chat-area,
-  .workspace .side-area {
+  .workspace .side-area,
+  .pane-agent-content > .native-details {
     display: none;
     height: 100%;
   }
@@ -1930,8 +1943,12 @@ button:disabled {
     display: none;
   }
   .app-shell[data-mobile-view='chat'] .chat-area,
-  .app-shell[data-mobile-view='details'] .workspace:not(.closed) .side-area {
+  .app-shell[data-mobile-view='details'] .workspace:not(.closed) .side-area,
+  .app-shell[data-mobile-view='details'] .pane-leaf.focused .pane-agent-content > .native-details {
     display: flex;
+  }
+  .app-shell[data-mobile-view='details'] .pane-leaf.focused .pane-agent-content > .agent-workspace {
+    display: none;
   }
   .app-shell[data-mobile-view='sessions'] .workspace {
     visibility: hidden;
@@ -2460,18 +2477,4 @@ button:disabled {
   gap: 12px;
   padding: 6px 10px;
   border-top: 1px solid var(--shell-divider);
-}
-
-.ship-launch,
-.project-ship {
-  color: var(--sui-primary);
-  background: var(--sui-surface);
-  border: 1px solid var(--shell-divider);
-  border-radius: 6px;
-  padding: 8px 10px;
-  margin: 8px 0;
-  text-align: left;
-}
-.project-ship {
-  margin-left: 20px;
 }

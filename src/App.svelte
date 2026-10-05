@@ -273,8 +273,6 @@
   );
   let shipRuns = $state<ShipRun[]>(loadShipRuns(getSetting('sai-ship-runs')));
   let shippingBusy = $state(false);
-  let shipPanelOpen = $state(false);
-  let shipRepository = $state('');
   const activeShipLaunches = new SvelteSet<string>();
   let acpRecoveryReady = false;
   let worktreeCreations = $state<WorktreeCreation[]>([]);
@@ -711,6 +709,9 @@
       !newSessionMode
     );
   });
+  let mainShipFallback = $derived(
+    showMainPicker || !!leaves(paneLayout).find((pane) => pane.id === 'main')?.kind,
+  );
   $effect(() => {
     const side = sideChat;
     if (!side) return;
@@ -759,7 +760,7 @@
   let historyLoading = $state(false);
   let historyError = $state('');
   let selectedFilePath = $state<string | null>(null);
-  type SideTab = 'plan' | 'changes' | 'history';
+  type SideTab = 'plan' | 'changes' | 'history' | 'ship';
   let sideTab = $state<SideTab>('plan');
   let detailsOpen = $state(true);
   let diffRefresh = 0;
@@ -876,15 +877,37 @@
   async function showMobileView(view: 'sessions' | 'chat' | 'details') {
     if (view === 'sessions') sidebarVisible = true;
     saveViewState();
-    if (acpAgent) {
+    if (view === 'details') {
+      const pane =
+        focusedPane === 'main' ? null : leaves(paneLayout).find((item) => item.id === focusedPane);
+      if (pane?.agent) {
+        if (!changesPanes.includes(focusedPane)) changesPanes = [...changesPanes, focusedPane];
+      } else if (mainShipFallback || (!sessionID && !acpAgent)) {
+        showShipRuns();
+      }
+    }
+    if (acpAgent && focusedPane === 'main') {
       agentChangesOpen = view === 'details';
-      if (agentChangesOpen) void refreshAgentDiff();
+      if (agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
     }
     if (view === 'details') detailsOpen = true;
     mobileView = view;
     await tick();
-    if (window.matchMedia('(max-width: 850px)').matches)
-      (view === 'sessions' ? sidebarElement : view === 'details' ? detailsArea : chatArea)?.focus();
+    if (window.matchMedia('(max-width: 850px)').matches) {
+      const target =
+        view === 'sessions'
+          ? sidebarElement
+          : view === 'chat'
+            ? focusedPane === 'main'
+              ? chatArea
+              : document.querySelector<HTMLElement>('.pane-leaf.focused .agent-workspace textarea')
+            : focusedPane === 'main'
+              ? detailsArea
+              : document.querySelector<HTMLElement>(
+                  '.pane-leaf.focused .native-details button.active',
+                );
+      target?.focus();
+    }
   }
 
   async function switchSideTab(tab: SideTab) {
@@ -892,24 +915,44 @@
     sideTab = tab;
     await tick();
     restoreSideScroll(viewStates.get(viewKey())?.sideScroll[activeSideTab as SideTab]);
-    if (tab === 'changes') void refreshDiff();
+    if (tab === 'changes') {
+      if (acpAgent) void refreshAgentDiff();
+      else void refreshDiff();
+    }
   }
 
   async function toggleChanges() {
     if (focusedPane !== 'main') {
+      const pane = leaves(paneLayout).find((item) => item.id === focusedPane);
+      if (!pane?.agent) {
+        showShipRuns();
+        return;
+      }
       changesPanes = changesPanes.includes(focusedPane)
         ? changesPanes.filter((id) => id !== focusedPane)
         : [...changesPanes, focusedPane];
       return;
     }
+    if (mainShipFallback) {
+      toggleShipRuns();
+      return;
+    }
     if (acpAgent) {
+      if (agentChangesOpen && activeSideTab === 'ship') {
+        sideTab = 'changes';
+        void refreshAgentDiff();
+        return;
+      }
       agentChangesOpen = !agentChangesOpen;
       if (window.matchMedia('(max-width: 850px)').matches)
         mobileView = agentChangesOpen ? 'details' : 'chat';
       if (agentChangesOpen) void refreshAgentDiff();
       return;
     }
-    if (!sessionID) return;
+    if (!sessionID) {
+      toggleShipRuns();
+      return;
+    }
     const narrow = window.matchMedia('(max-width: 850px)').matches;
     const visible =
       detailsOpen && activeSideTab === 'changes' && (!narrow || mobileView === 'details');
@@ -1225,8 +1268,38 @@
   );
   let showPlanPanel = $derived(!!snapshot.plan || !!snapshot.questions);
   let activeSideTab = $derived(
-    showPlanPanel && sideTab === 'plan' ? 'plan' : sideTab === 'history' ? 'history' : 'changes',
+    sideTab === 'ship'
+      ? 'ship'
+      : acpAgent
+        ? 'changes'
+        : showPlanPanel && sideTab === 'plan'
+          ? 'plan'
+          : sideTab === 'history'
+            ? 'history'
+            : 'changes',
   );
+
+  function showShipRuns() {
+    focusMainPane();
+    sideTab = 'ship';
+    detailsOpen = true;
+    if (acpAgent) agentChangesOpen = true;
+    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
+  }
+
+  function toggleShipRuns() {
+    const visible = detailsOpen && activeSideTab === 'ship';
+    detailsOpen = !visible;
+    sideTab = 'ship';
+    if (window.matchMedia('(max-width: 850px)').matches) mobileView = visible ? 'chat' : 'details';
+  }
+
+  function closeShipRuns() {
+    detailsOpen = false;
+    agentChangesOpen = false;
+    sideTab = 'changes';
+    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'chat';
+  }
   let diffAnnotations = $derived(annotateDiffs(diffs, snapshot.plan, directory));
 
   function setTheme(value: boolean) {
@@ -1495,7 +1568,7 @@
     }, 30_000);
     diffPollTimer = setInterval(() => {
       const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
-      if (acpAgent && agentChangesOpen && visible && !diffLoading) {
+      if (acpAgent && agentChangesOpen && activeSideTab === 'changes' && visible && !diffLoading) {
         void refreshAgentDiff(true);
         return;
       }
@@ -1792,8 +1865,7 @@
       setSetting('sai-ship-runs', JSON.stringify(shipRuns));
       throw cause;
     }
-    shipRepository = repository;
-    shipPanelOpen = true;
+    showShipRuns();
     void tickShippingRuns();
   }
 
@@ -5390,7 +5462,7 @@
         throw new Error('This session’s agent is unavailable.');
       await jumpToRecentThread(threadKey(thread));
     } else await loadProject(path);
-    shipPanelOpen = false;
+    closeShipRuns();
   }
 
   function openInbox() {
@@ -8128,6 +8200,44 @@
       !event.ctrlKey &&
       !event.altKey &&
       !event.shiftKey &&
+      focusedPane !== 'main' &&
+      focusedLeaf?.agent !== 'opencode' &&
+      document.querySelector('.pane-leaf.focused [data-detail-tab="ship"].active') &&
+      (!mobileLayout || mobileView === 'details') &&
+      !document.querySelector('dialog[open]')
+    ) {
+      event.preventDefault();
+      changesPanes = changesPanes.filter((id) => id !== focusedPane);
+      return;
+    }
+    if (
+      event.key === 'Escape' &&
+      !event.defaultPrevented &&
+      !event.repeat &&
+      !event.isComposing &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      focusedPane === 'main' &&
+      detailsOpen &&
+      activeSideTab === 'ship' &&
+      (!mobileLayout || mobileView === 'details') &&
+      !document.querySelector('dialog[open]')
+    ) {
+      event.preventDefault();
+      closeShipRuns();
+      return;
+    }
+    if (
+      event.key === 'Escape' &&
+      !event.defaultPrevented &&
+      !event.repeat &&
+      !event.isComposing &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.shiftKey &&
       !acpAgent &&
       focusedPane === 'main' &&
       running &&
@@ -8138,7 +8248,6 @@
       return;
     }
     if (
-      (focusedPane === 'main' && !acpAgent && !sessionID) ||
       event.repeat ||
       event.key.toLowerCase() !== 'l' ||
       !(event.metaKey || event.ctrlKey) ||
@@ -8171,7 +8280,7 @@
 
   function focusWorkspace() {
     for (const pane of leaves(paneLayout)) if (pane.thread) markThreadRead(pane.thread);
-    if (acpAgent && agentChangesOpen) void refreshAgentDiff();
+    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
     else if (!acpAgent && detailsOpen && activeSideTab === 'changes') void refreshDiff();
   }
 
@@ -8191,20 +8300,6 @@
       : '';
   }
 </script>
-
-<ShipPanel
-  open={shipPanelOpen}
-  repository={shipRepository}
-  runs={shipRuns}
-  busy={shippingBusy}
-  onclose={() => (shipPanelOpen = false)}
-  onrefresh={() => tickShippingRuns(true)}
-  onopen={openShipTarget}
-  onsettings={async () => {
-    shipPanelOpen = false;
-    await openSettings();
-  }}
-/>
 
 <svelte:head><title>Sail · Plan workspace</title></svelte:head>
 <svelte:window
@@ -8234,10 +8329,6 @@
     <div class="brand"><span class="brand-mark">S.</span><span>Sail</span></div>
     <div class="sidebar-content">
       <ProjectSidebar
-        onship={(repository) => {
-          shipRepository = repository;
-          shipPanelOpen = true;
-        }}
         catalog={projectCatalog}
         {directory}
         disabled={runtimeState !== 'connected' &&
@@ -8279,13 +8370,6 @@
         onsendchecklog={sendFailedCheckLog}
       />
     </div>
-    <button
-      class="ship-launch"
-      onclick={() => {
-        shipRepository = '';
-        shipPanelOpen = true;
-      }}>Ship runs · {shipRuns.length}</button
-    >
     <div class="sidebar-footer">
       <button
         class="settings-launch"
@@ -8330,10 +8414,8 @@
         <button aria-pressed={mobileView === 'chat'} onclick={() => showMobileView('chat')}
           >Chat</button
         >
-        <button
-          aria-pressed={mobileView === 'details'}
-          disabled={!sessionID && !acpAgent}
-          onclick={() => showMobileView('details')}>Details</button
+        <button aria-pressed={mobileView === 'details'} onclick={() => showMobileView('details')}
+          >Details</button
         >
       </nav>
       <div class="breadcrumb">
@@ -8432,18 +8514,21 @@
             onclick={() => void openSnapshots()}>Restore</Button
           >{/if}
         <Button variant="ghost" size="sm" onclick={openCommandsDialog}>Commands</Button>
-        {#if sessionID || acpAgent || focusedPane !== 'main'}<Button
-            variant="ghost"
-            size="sm"
-            onclick={toggleChanges}
-            aria-controls="session-details"
-            aria-expanded={focusedPane !== 'main'
-              ? changesPanes.includes(focusedPane)
-              : acpAgent
-                ? agentChangesOpen
-                : detailsOpen && activeSideTab === 'changes'}
-            title="Toggle Changes (⌘L)">Changes</Button
-          >{/if}
+        <Button
+          variant="ghost"
+          size="sm"
+          onclick={toggleChanges}
+          aria-controls="session-details"
+          aria-expanded={focusedPane !== 'main'
+            ? changesPanes.includes(focusedPane)
+            : acpAgent
+              ? agentChangesOpen
+              : detailsOpen &&
+                (mainShipFallback ||
+                  (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship'))}
+          title={sessionID || acpAgent ? 'Toggle Changes (⌘L)' : 'Toggle details (⌘L)'}
+          >{sessionID || acpAgent ? 'Changes' : 'Details'}</Button
+        >
       </div>
     </header>
     {#if $settingsError}<p class="notice error" role="alert">{$settingsError}</p>{/if}
@@ -8462,7 +8547,9 @@
       </div>{/if}
     {#snippet mainPaneContent()}
       <div
-        class:single={acpAgent ? !agentChangesOpen : !sessionID || !detailsOpen}
+        class:single={acpAgent
+          ? !agentChangesOpen
+          : !detailsOpen || (!sessionID && activeSideTab !== 'ship')}
         class:closed={acpAgent ? !agentChangesOpen : !detailsOpen}
         class="workspace"
         style={`--details-width: ${visibleDetailsWidth}px`}
@@ -8815,7 +8902,7 @@
               </div>{/if}
           {/if}
         </main>
-        {#if sessionID || acpAgent}<div
+        {#if sessionID || acpAgent || activeSideTab === 'ship'}<div
             class="details-resizer"
             role="slider"
             tabindex="0"
@@ -8841,19 +8928,23 @@
             bind:this={detailsArea}
           >
             <nav class="side-tabs" aria-label="Session detail tabs">
-              {#if !acpAgent && showPlanPanel}<button
+              {#if !acpAgent && showPlanPanel && sessionID}<button
                   class:active={activeSideTab === 'plan'}
                   aria-current={activeSideTab === 'plan' ? 'page' : undefined}
                   onclick={() => switchSideTab('plan')}>Plan</button
-                >{/if}<button
-                class:active={acpAgent || activeSideTab === 'changes'}
-                aria-current={acpAgent || activeSideTab === 'changes' ? 'page' : undefined}
-                onclick={toggleChanges}>Changes ({diffs.length})</button
-              >{#if !acpAgent}<button
+                >{/if}{#if sessionID || acpAgent}<button
+                  class:active={activeSideTab === 'changes'}
+                  aria-current={activeSideTab === 'changes' ? 'page' : undefined}
+                  onclick={toggleChanges}>Changes ({diffs.length})</button
+                >{/if}{#if !acpAgent && sessionID}<button
                   class:active={activeSideTab === 'history'}
                   aria-current={activeSideTab === 'history' ? 'page' : undefined}
                   onclick={() => switchSideTab('history')}>History</button
-                >{/if}
+                >{/if}<button
+                class:active={activeSideTab === 'ship'}
+                aria-current={activeSideTab === 'ship' ? 'page' : undefined}
+                onclick={() => switchSideTab('ship')}>Ship runs ({shipRuns.length})</button
+              >
             </nav>
             <div class="side-panel-body">
               {#if !acpAgent && showPlanPanel}<div
@@ -8877,25 +8968,31 @@
                       startShippingRun(graph, provider, limit, snapshot.plan?.sessionID ?? '')}
                   />
                 </div>{/if}
-              <div class:inactive={!acpAgent && activeSideTab !== 'changes'} class="side-view">
-                <DiffPanel
-                  {directory}
-                  files={diffs}
-                  annotations={acpAgent ? {} : diffAnnotations}
-                  selected={selectedFilePath}
-                  loading={diffLoading}
-                  error={diffError}
-                  onselect={(file) => (selectedFilePath = file)}
-                  onrefresh={() => (acpAgent ? refreshAgentDiff() : refreshDiff())}
-                  onclose={toggleChanges}
-                  scope={diffCommentKey('main')}
-                  comments={diffComments[diffCommentKey('main')] ?? []}
-                  oncomments={updateDiffComments}
-                  oncommentssent={removeSentDiffComments}
-                  onsendcomments={(scope, text) => sendDiffComments('main', scope, text)}
-                />
-              </div>
-              {#if !acpAgent}<div class:inactive={activeSideTab !== 'history'} class="side-view">
+              {#if sessionID || acpAgent}<div
+                  class:inactive={activeSideTab !== 'changes'}
+                  class="side-view"
+                >
+                  <DiffPanel
+                    {directory}
+                    files={diffs}
+                    annotations={acpAgent ? {} : diffAnnotations}
+                    selected={selectedFilePath}
+                    loading={diffLoading}
+                    error={diffError}
+                    onselect={(file) => (selectedFilePath = file)}
+                    onrefresh={() => (acpAgent ? refreshAgentDiff() : refreshDiff())}
+                    onclose={toggleChanges}
+                    scope={diffCommentKey('main')}
+                    comments={diffComments[diffCommentKey('main')] ?? []}
+                    oncomments={updateDiffComments}
+                    oncommentssent={removeSentDiffComments}
+                    onsendcomments={(scope, text) => sendDiffComments('main', scope, text)}
+                  />
+                </div>{/if}
+              {#if !acpAgent && sessionID}<div
+                  class:inactive={activeSideTab !== 'history'}
+                  class="side-view"
+                >
                   <HistoryPanel
                     events={historyEvents}
                     session={currentSession}
@@ -8904,6 +9001,23 @@
                     onrefresh={() => refreshHistory()}
                   />
                 </div>{/if}
+              <div class:inactive={activeSideTab !== 'ship'} class="side-view">
+                <ShipPanel
+                  repository={coordinationProject(directory) ?? directory}
+                  active={activeSideTab === 'ship' &&
+                    detailsOpen &&
+                    (acpAgent ? agentChangesOpen : true)}
+                  runs={shipRuns}
+                  busy={shippingBusy}
+                  onclose={closeShipRuns}
+                  onrefresh={() => tickShippingRuns(true)}
+                  onopen={openShipTarget}
+                  onsettings={async () => {
+                    closeShipRuns();
+                    await openSettings();
+                  }}
+                />
+              </div>
             </div>
           </section>{/if}
       </div>
@@ -8921,6 +9035,10 @@
       {coordinationMessages}
       {spawnReceipts}
       {shipRuns}
+      {shippingBusy}
+      onshiprefresh={() => tickShippingRuns(true)}
+      onshipopen={openShipTarget}
+      onshipsettings={openSettings}
       onship={(graph, provider, limit, source) => startShippingRun(graph, provider, limit, source)}
       postTurnChecks={postTurnResults}
       onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
@@ -8979,6 +9097,23 @@
       onterminalownerlost={(id) => savePaneLayout(updatePane(paneLayout, id, { owner: undefined }))}
       onagentterminal={(id) => void openAgentTerminal(id)}
     />
+    {#if mainShipFallback && detailsOpen && activeSideTab === 'ship' && (!mobileLayout || mobileView === 'details')}<section
+        class="ship-fallback"
+        aria-label="Ship run details"
+      >
+        <ShipPanel
+          repository={coordinationProject(directory) ?? directory}
+          runs={shipRuns}
+          busy={shippingBusy}
+          onclose={closeShipRuns}
+          onrefresh={() => tickShippingRuns(true)}
+          onopen={openShipTarget}
+          onsettings={async () => {
+            closeShipRuns();
+            await openSettings();
+          }}
+        />
+      </section>{/if}
   </div>
 </div>
 <ConfirmDialog request={confirmation} onanswer={answerConfirmation} />

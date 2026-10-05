@@ -10,8 +10,8 @@
   } from './lib/ship-progress';
 
   let {
-    open,
     repository,
+    active = true,
     runs,
     busy,
     onclose,
@@ -19,8 +19,8 @@
     onopen,
     onsettings,
   }: {
-    open: boolean;
     repository: string;
+    active?: boolean;
     runs: ShipRun[];
     busy: boolean;
     onclose: () => void;
@@ -28,21 +28,22 @@
     onopen: (path: string, threadId?: string | null) => Promise<void>;
     onsettings: () => Promise<void>;
   } = $props();
-  let dialog: HTMLDialogElement;
   let error = $state('');
+  let panel: HTMLDivElement;
+  let scope = $state<'current' | 'all'>('current');
   let selectedRun = $state('');
   let selectedIssue = $state('');
-  const visible = $derived(runs.filter((run) => !repository || run.repository === repository));
+  let wasActive = false;
+  const visible = $derived(
+    runs.filter((run) => scope === 'all' || !repository || run.repository === repository),
+  );
   const run = $derived(visible.find((item) => item.id === selectedRun) ?? visible.at(-1));
   const issue = $derived(run?.issues.find((item) => item.id === selectedIssue) ?? run?.issues[0]);
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
 
   $effect(() => {
-    if (!dialog) return;
-    if (open && !dialog.open) {
-      error = '';
-      dialog.showModal();
-    } else if (!open && dialog.open) dialog.close();
+    if (active && !wasActive) error = '';
+    wasActive = active;
   });
 
   async function act(action: () => Promise<void>) {
@@ -57,7 +58,7 @@
   async function selectIssue(id: string) {
     selectedIssue = id;
     await tick();
-    dialog.querySelector<HTMLElement>('.ship-issue-detail')?.focus();
+    panel.querySelector<HTMLElement>('.ship-issue-detail')?.focus();
   }
 </script>
 
@@ -78,11 +79,11 @@
     </div>{:else}<small>Independent issue</small>{/if}
 {/snippet}
 
-<dialog class="ship-panel" bind:this={dialog} {onclose} aria-labelledby="ship-title">
+<div class="ship-panel" bind:this={panel} aria-label="Ship runs">
   <header>
     <div>
-      <h2 id="ship-title">Ship runs</h2>
-      <p>{repository || 'All repositories'}</p>
+      <h2>Ship runs</h2>
+      <p>{scope === 'all' || !repository ? 'All repositories' : repository}</p>
     </div>
     <div class="ship-actions">
       <button onclick={() => act(onrefresh)} disabled={busy}
@@ -93,6 +94,13 @@
     </div>
   </header>
   {#if error}<p class="ship-error" role="alert">{error}</p>{/if}
+  {#if repository}<div class="ship-scope" role="group" aria-label="Repository scope">
+      <button aria-pressed={scope === 'current'} onclick={() => (scope = 'current')}
+        >Current repository</button
+      ><button aria-pressed={scope === 'all'} onclick={() => (scope = 'all')}
+        >All repositories</button
+      >
+    </div>{/if}
   {#if !run}
     <section class="ship-empty">
       <h3>No Ship runs yet</h3>
@@ -254,25 +262,26 @@
         </section>{/if}
     </div>
   {/if}
-</dialog>
+</div>
 
 <style>
   .ship-panel {
-    width: min(1120px, 94vw);
-    max-height: 90vh;
-    padding: 24px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 12px;
+    box-sizing: border-box;
+    height: 100%;
+    overflow: auto;
+    padding: 16px;
     background: var(--sui-surface);
     color: var(--sui-foreground);
   }
-  .ship-panel::backdrop {
-    background: #0008;
+  :global(.native-details) .ship-panel {
+    flex: 1;
+    min-height: 0;
+    height: auto;
   }
   header,
   .ship-summary {
     display: flex;
-    justify-content: space-between;
+    flex-direction: column;
     gap: 20px;
     align-items: start;
   }
@@ -310,9 +319,20 @@
   }
   .ship-run-select {
     display: flex;
+    flex-wrap: wrap;
     gap: 12px;
     margin: 20px 0;
     align-items: center;
+  }
+  .ship-scope {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 16px;
+  }
+  .ship-scope button[aria-pressed='true'] {
+    border-color: var(--sui-primary);
+    color: var(--sui-primary);
   }
   select {
     min-width: 0;
@@ -329,7 +349,7 @@
   }
   .ship-content {
     display: grid;
-    grid-template-columns: minmax(240px, 1fr) minmax(0, 2fr);
+    grid-template-columns: minmax(0, 1fr);
     gap: 24px;
     margin-top: 20px;
   }
@@ -398,14 +418,5 @@
   }
   .ship-empty {
     padding: 40px 0;
-  }
-  @media (max-width: 750px) {
-    header,
-    .ship-summary {
-      flex-direction: column;
-    }
-    .ship-content {
-      grid-template-columns: 1fr;
-    }
   }
 </style>

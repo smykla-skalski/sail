@@ -8,6 +8,7 @@
   import DiffPanel from './DiffPanel.svelte';
   import PlanPanel from './PlanPanel.svelte';
   import HistoryPanel from './HistoryPanel.svelte';
+  import ShipPanel from './ShipPanel.svelte';
   import EmptyPanePicker from './EmptyPanePicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
   import TerminalPane from './TerminalPane.svelte';
@@ -50,6 +51,10 @@
     coordinationMessages: CoordinationMessage[];
     spawnReceipts: SpawnReceipt[];
     shipRuns: ShipRun[];
+    shippingBusy: boolean;
+    onshiprefresh: () => Promise<void>;
+    onshipopen: (path: string, threadId?: string | null) => Promise<void>;
+    onshipsettings: () => Promise<void>;
     onship: (
       graph: PublishedGraph,
       provider: ShipRun['provider'],
@@ -116,6 +121,10 @@
     coordinationMessages,
     spawnReceipts,
     shipRuns,
+    shippingBusy,
+    onshiprefresh,
+    onshipopen,
+    onshipsettings,
     onship,
     postTurnChecks,
     onretrycheck,
@@ -182,10 +191,43 @@
   let nativeSession = $state<SessionInfo>();
   let nativeHistoryError = $state('');
   let nativeDetailsOpen = $state(false);
-  let nativeTab = $state<'plan' | 'changes' | 'history'>('changes');
+  let nativeTab = $state<'plan' | 'changes' | 'history' | 'ship'>('changes');
+  let acpTab = $state<'changes' | 'ship'>('changes');
   let nativeDetailsGeneration = 0;
   const nativeDetailsVisible = $derived(nativeDetailsOpen || changesPanes.includes(pane.id));
   let previousChangesOpen = false;
+  let previousAcpOpen = false;
+
+  function closeNativeDetails() {
+    nativeDetailsOpen = false;
+    if (changesPanes.includes(pane.id)) onchanges(pane.id);
+  }
+
+  function closeAcpDetails() {
+    if (changesPanes.includes(pane.id)) onchanges(pane.id);
+  }
+
+  function closeOpenCodeShipOnEscape(event: KeyboardEvent) {
+    if (
+      event.key !== 'Escape' ||
+      event.defaultPrevented ||
+      event.repeat ||
+      event.isComposing ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey ||
+      event.shiftKey ||
+      'direction' in pane ||
+      pane.id !== focused ||
+      pane.agent !== 'opencode' ||
+      !nativeDetailsVisible ||
+      nativeTab !== 'ship' ||
+      document.querySelector('dialog[open]')
+    )
+      return;
+    event.preventDefault();
+    closeNativeDetails();
+  }
 
   async function refreshNativeDetails() {
     if (!client || 'direction' in pane || !pane.thread || pane.agent !== 'opencode') return;
@@ -249,6 +291,13 @@
   });
 
   $effect(() => {
+    if ('direction' in pane || !pane.agent || pane.agent === 'opencode') return;
+    const open = changesPanes.includes(pane.id);
+    if (open && !previousAcpOpen) acpTab = 'changes';
+    previousAcpOpen = open;
+  });
+
+  $effect(() => {
     if ('direction' in pane || pane.agent !== 'opencode' || !pane.thread || !client) return;
     const source = client;
     const id = pane.thread.sessionId;
@@ -300,7 +349,7 @@
     if (
       pane.agent === 'opencode'
         ? !nativeDetailsVisible || nativeTab !== 'changes'
-        : !changesPanes.includes(pane.id)
+        : !changesPanes.includes(pane.id) || acpTab !== 'changes'
     )
       return;
     void refreshDiff();
@@ -340,6 +389,8 @@
   }
 </script>
 
+<svelte:window onkeydown={closeOpenCodeShipOnEscape} />
+
 {#if 'direction' in pane}
   <div
     class="pane-split"
@@ -354,6 +405,10 @@
       {coordinationMessages}
       {spawnReceipts}
       {shipRuns}
+      {shippingBusy}
+      {onshiprefresh}
+      {onshipopen}
+      {onshipsettings}
       {onship}
       {postTurnChecks}
       {onretrycheck}
@@ -437,6 +492,10 @@
       {coordinationMessages}
       {spawnReceipts}
       {shipRuns}
+      {shippingBusy}
+      {onshiprefresh}
+      {onshipopen}
+      {onshipsettings}
       {onship}
       {postTurnChecks}
       {onretrycheck}
@@ -648,11 +707,11 @@
                     class:active={nativeTab === 'history'}
                     onclick={() => (nativeTab = 'history')}>History</button
                   ><button
-                    aria-label="Close OpenCode details"
-                    onclick={() => {
-                      nativeDetailsOpen = false;
-                      if (changesPanes.includes(pane.id)) onchanges(pane.id);
-                    }}>×</button
+                    data-detail-tab="ship"
+                    class:active={nativeTab === 'ship'}
+                    onclick={() => (nativeTab = 'ship')}>Ship runs ({shipRuns.length})</button
+                  ><button aria-label="Close OpenCode details" onclick={closeNativeDetails}
+                    >×</button
                   >
                 </nav>
                 {#if nativeTab === 'plan'}
@@ -674,6 +733,19 @@
                       nativeTab = 'changes';
                     }}
                   />
+                {:else if nativeTab === 'ship'}
+                  <ShipPanel
+                    repository={project}
+                    runs={shipRuns}
+                    busy={shippingBusy}
+                    onclose={closeNativeDetails}
+                    onrefresh={onshiprefresh}
+                    onopen={async (path, threadId) => {
+                      await onshipopen(path, threadId);
+                      closeNativeDetails();
+                    }}
+                    onsettings={onshipsettings}
+                  />
                 {:else if nativeTab === 'history'}
                   <HistoryPanel
                     events={nativeHistory}
@@ -692,10 +764,7 @@
                     error={diffError}
                     onselect={(file) => (selectedFile = file)}
                     onrefresh={refreshDiff}
-                    onclose={() => {
-                      nativeDetailsOpen = false;
-                      if (changesPanes.includes(pane.id)) onchanges(pane.id);
-                    }}
+                    onclose={closeNativeDetails}
                     scope={`${directory}\0${pane.id}\0opencode:${pane.thread?.sessionId ?? 'new'}`}
                     comments={diffComments[
                       `${directory}\0${pane.id}\0opencode:${pane.thread?.sessionId ?? 'new'}`
@@ -755,24 +824,50 @@
               onterminal={onagentterminal}
             />
             {#if changesPanes.includes(pane.id)}
-              <DiffPanel
-                {directory}
-                files={diffs}
-                annotations={{}}
-                selected={selectedFile}
-                loading={diffLoading}
-                error={diffError}
-                onselect={(file) => (selectedFile = file)}
-                onrefresh={refreshDiff}
-                onclose={() => onchanges(pane.id)}
-                scope={`${directory}\0${pane.id}\0acp:${pane.agent}:${pane.thread?.sessionId ?? 'new'}`}
-                comments={diffComments[
-                  `${directory}\0${pane.id}\0acp:${pane.agent}:${pane.thread?.sessionId ?? 'new'}`
-                ] ?? []}
-                oncomments={ondiffcomments}
-                oncommentssent={ondiffcommentssent}
-                onsendcomments={(scope, text) => onsenddiffcomments(pane.id, scope, text)}
-              />
+              <section class="native-details side-area" aria-label="Agent details">
+                <nav class="side-tabs" aria-label="Agent detail tabs">
+                  <button class:active={acpTab === 'changes'} onclick={() => (acpTab = 'changes')}
+                    >Changes ({diffs.length})</button
+                  ><button
+                    data-detail-tab="ship"
+                    class:active={acpTab === 'ship'}
+                    onclick={() => (acpTab = 'ship')}>Ship runs ({shipRuns.length})</button
+                  ><button aria-label="Close agent details" onclick={closeAcpDetails}>×</button>
+                </nav>
+                {#if acpTab === 'ship'}
+                  <ShipPanel
+                    repository={project}
+                    runs={shipRuns}
+                    busy={shippingBusy}
+                    onclose={closeAcpDetails}
+                    onrefresh={onshiprefresh}
+                    onopen={async (path, threadId) => {
+                      await onshipopen(path, threadId);
+                      closeAcpDetails();
+                    }}
+                    onsettings={onshipsettings}
+                  />
+                {:else}
+                  <DiffPanel
+                    {directory}
+                    files={diffs}
+                    annotations={{}}
+                    selected={selectedFile}
+                    loading={diffLoading}
+                    error={diffError}
+                    onselect={(file) => (selectedFile = file)}
+                    onrefresh={refreshDiff}
+                    onclose={closeAcpDetails}
+                    scope={`${directory}\0${pane.id}\0acp:${pane.agent}:${pane.thread?.sessionId ?? 'new'}`}
+                    comments={diffComments[
+                      `${directory}\0${pane.id}\0acp:${pane.agent}:${pane.thread?.sessionId ?? 'new'}`
+                    ] ?? []}
+                    oncomments={ondiffcomments}
+                    oncommentssent={ondiffcommentssent}
+                    onsendcomments={(scope, text) => onsenddiffcomments(pane.id, scope, text)}
+                  />
+                {/if}
+              </section>
             {/if}
           </div>
         {/key}

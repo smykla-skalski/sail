@@ -126,6 +126,14 @@ describe('ACP agent threads', () => {
       expect.stringContaining('agent-change.txt'),
     );
     await $('.workspace .side-area button[aria-label="Close Changes"]').click();
+    await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await $('.workspace .side-area .side-tabs button:nth-child(2)').click();
+    await $('.workspace .side-area button[aria-label="Close Ship runs"]').click();
+    await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
+    await expect($('.workspace .side-area')).toHaveText(
+      expect.stringContaining('agent-change.txt'),
+    );
+    await $('.workspace .side-area button[aria-label="Close Changes"]').click();
 
     await $('.agent-launches button:nth-child(2)').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Codex'));
