@@ -474,7 +474,7 @@ describe('provider selected agent spawn', () => {
       sourceThread.sessionId,
       {
         gate: 'code-adversary',
-        prompt: 'Clipboard fixture validation gate',
+        prompt: 'Ship gate fixture validation gate',
         implementingModels: ['test'],
       },
       'validation_gate',
@@ -492,6 +492,25 @@ describe('provider selected agent spawn', () => {
       path,
     });
     expect(started.threadId).not.toBe(`acp:${sourceThread.agent}:${sourceThread.sessionId}`);
+    const forged = await callMcp(
+      config,
+      sourceThread.sessionId,
+      { verdict: 'CLEAN' },
+      'ship_progress',
+    );
+    expect(forged.isError).toBe(true);
+    const gateConfig = await browser.tauri.execute(
+      async ({ core }, input) => core.invoke<McpConfig>('browser_mcp_config', input),
+      { directory: path, agent: 'claude' },
+    );
+    const report = await callMcp(
+      gateConfig,
+      started.threadId.slice('acp:claude:'.length),
+      { verdict: 'CLEAN' },
+      'ship_progress',
+    );
+    expect(report.isError).not.toBe(true);
+
     const completed = await callMcp(
       config,
       sourceThread.sessionId,
@@ -499,7 +518,11 @@ describe('provider selected agent spawn', () => {
       'agent_wait',
     );
     expect(completed.isError).not.toBe(true);
-    expect(JSON.parse(completed.content[0].text)).toMatchObject({ state: 'completed' });
+    expect(JSON.parse(completed.content[0].text)).toMatchObject({
+      state: 'completed',
+      model: 'fast',
+      validation: { verdict: 'CLEAN', gate: 'code-adversary' },
+    });
     const rejected = await callMcp(
       config,
       sourceThread.sessionId,
@@ -562,7 +585,7 @@ describe('provider selected agent spawn', () => {
     const attempts = z
       .array(z.object({ prompt: z.string().nullable().optional() }))
       .parse(JSON.parse(savedReceipts ?? '[]'))
-      .filter((receipt) => receipt.prompt === 'Gate prompt model unavailable');
+      .filter((receipt) => receipt.prompt?.startsWith('Gate prompt model unavailable'));
     expect(attempts).toHaveLength(1);
   });
 

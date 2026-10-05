@@ -1,3 +1,5 @@
+import { gateMetadataSchema, type GateMetadata } from './ship-progress.ts';
+
 export type SpawnState =
   | 'queued'
   | 'starting'
@@ -27,6 +29,8 @@ export type SpawnReceipt = {
   result: string | null;
   error: string | null;
   activity?: string;
+  model?: string;
+  validation?: GateMetadata;
 };
 
 const states = new Set<SpawnState>([
@@ -67,6 +71,10 @@ export function loadSpawnReceipts(raw: string | null): SpawnReceipt[] {
         (item.error === null || typeof item.error === 'string') &&
         (item.activity === undefined || typeof item.activity === 'string'),
     );
+    for (const receipt of receipts) {
+      if (typeof receipt.model !== 'string') delete receipt.model;
+      if (!gateMetadataSchema.safeParse(receipt.validation).success) delete receipt.validation;
+    }
     return receipts;
   } catch {
     return [];
