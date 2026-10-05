@@ -198,7 +198,7 @@ for (const [states, expected] of [
   [['CANCELLED'], 'Failed'],
   [['TIMED_OUT'], 'Failed'],
   [['STARTUP_FAILURE'], 'Failed'],
-  [['EXPECTED', 'NEUTRAL'], 'Passed'],
+  [['EXPECTED', 'NEUTRAL'], 'Pending'],
   [['NEW_STATE'], 'Pending'],
 ] as const) {
   void test(`CI ${states?.join(',') ?? 'unknown'} displays ${expected}`, () => {

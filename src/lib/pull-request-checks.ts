@@ -11,6 +11,6 @@ export function checkState(check: { state: string }): 'failing' | 'passing' | 'p
     ].includes(check.state)
   )
     return 'failing';
-  if (['SUCCESS', 'EXPECTED', 'NEUTRAL', 'SKIPPED'].includes(check.state)) return 'passing';
+  if (['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.state)) return 'passing';
   return 'pending';
 }
