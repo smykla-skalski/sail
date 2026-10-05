@@ -344,6 +344,7 @@
     | { kind: 'acp'; agent: string; model?: string; title: string }
     | { kind: 'opencode'; agent: string; model?: ModelRef; title: string };
   let browserApprovalQueue: Promise<unknown> = Promise.resolve();
+  let agentSpawnQueue: Promise<unknown> = Promise.resolve();
   let worktreeApprovalDialog: HTMLDialogElement;
   let worktreeApproval = $state<{
     agent: string;
@@ -2947,8 +2948,15 @@
         throw cause;
       }
     }
-    if (request.name === 'agent_spawn')
-      return spawnCoordinatedAgent(request, project, source, sourceId);
+    if (request.name === 'agent_spawn') {
+      const previousSpawn = agentSpawnQueue;
+      const spawned = (async () => {
+        await previousSpawn.catch(() => undefined);
+        return spawnCoordinatedAgent(request, project, source, sourceId);
+      })();
+      agentSpawnQueue = spawned.catch(() => undefined);
+      return spawned;
+    }
     if (!agentWorktreesEnabled) throw new Error('Agent worktree creation is disabled in settings.');
     const name = request.arguments.name;
     const prompt = request.arguments.prompt;
