@@ -6,6 +6,7 @@ import {
   sidebarThreadStatus,
   type SidebarSessionSource,
 } from '../src/lib/sidebar-agents.ts';
+import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 
 await test('sidebar groups every thread by checkout and keeps distinct sessions', () => {
   const grouped = groupSidebarThreads([
@@ -55,6 +56,77 @@ await test('fresh OpenCode outcome replaces stale saved terminal status', () => 
       [],
     ),
     'done',
+  );
+});
+
+await test('active subagent keeps a finished parent visibly working', () => {
+  const thread = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'parent',
+    title: 'Parent',
+    updated: 1,
+  };
+  const key = JSON.stringify(['codex', '/repo', 'parent']);
+  const receipt: SpawnReceipt = {
+    receiptId: 'one',
+    accessKey: 'key',
+    requestId: 'request',
+    project: '/repo',
+    sourceId: 'acp:codex:parent',
+    sourceDirectory: '/repo',
+    targetId: 'acp:codex:child',
+    turnId: 'turn',
+    targetDirectory: '/repo/task',
+    worktreeId: '/repo/task',
+    provider: 'codex',
+    prompt: 'Task',
+    state: 'working',
+    created: 1,
+    updated: 2,
+    result: null,
+    error: null,
+  };
+  const status = (receipts: SpawnReceipt[], ready = true) =>
+    sidebarThreadStatus(
+      thread,
+      { [key]: { status: 'done', unread: false } },
+      {},
+      ready,
+      true,
+      [],
+      receipts,
+    );
+  assert.equal(status([receipt]), 'working');
+  assert.equal(status([{ ...receipt, state: 'waiting' }]), 'waiting');
+  assert.equal(status([{ ...receipt, turnId: null }]), 'working');
+  assert.equal(
+    sidebarThreadStatus(
+      thread,
+      { [key]: { status: 'failed', unread: false } },
+      {},
+      true,
+      true,
+      [],
+      [receipt],
+    ),
+    'failed',
+  );
+  assert.equal(status([{ ...receipt, state: 'completed' }]), 'done');
+  assert.equal(status([{ ...receipt, state: 'queued', targetId: null, turnId: null }]), null);
+  assert.equal(status([{ ...receipt, sourceDirectory: '/other' }]), 'done');
+  assert.equal(status([receipt], false), null);
+  assert.equal(
+    sidebarThreadStatus(
+      { ...thread, agent: 'opencode' },
+      { [JSON.stringify(['opencode', '/repo', 'parent'])]: { status: 'done', unread: false } },
+      {},
+      true,
+      false,
+      [],
+      [{ ...receipt, sourceId: 'opencode:parent' }],
+    ),
+    'working',
   );
 });
 
