@@ -2948,15 +2948,8 @@
         throw cause;
       }
     }
-    if (request.name === 'agent_spawn') {
-      const previousSpawn = agentSpawnQueue;
-      const spawned = (async () => {
-        await previousSpawn.catch(() => undefined);
-        return spawnCoordinatedAgent(request, project, source, sourceId);
-      })();
-      agentSpawnQueue = spawned.catch(() => undefined);
-      return spawned;
-    }
+    if (request.name === 'agent_spawn')
+      return spawnCoordinatedAgent(request, project, source, sourceId);
     if (!agentWorktreesEnabled) throw new Error('Agent worktree creation is disabled in settings.');
     const name = request.arguments.name;
     const prompt = request.arguments.prompt;
@@ -3325,105 +3318,113 @@
 
     if (Date.now() >= request.expiresAt)
       throw new Error('The agent spawn request expired before launch.');
-    await coordinationSource(request);
-    updateSpawnReceipt(receiptId, { state: 'starting' });
+    const previousSpawn = agentSpawnQueue;
+    const launched = (async () => {
+      await previousSpawn.catch(() => undefined);
+      await coordinationSource(request);
+      updateSpawnReceipt(receiptId, { state: 'starting' });
 
-    if (destination) {
-      const targetPath = destination.path;
-      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
-        repository: project,
-        paths: [targetPath],
-      });
-      if (!registered.some((worktree) => worktree.path === targetPath))
-        throw new Error('Target worktree is no longer registered with Git.');
-    }
+      if (destination) {
+        const targetPath = destination.path;
+        const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+          repository: project,
+          paths: [targetPath],
+        });
+        if (!registered.some((worktree) => worktree.path === targetPath))
+          throw new Error('Target worktree is no longer registered with Git.');
+      }
 
-    if (chosenProvider !== 'opencode') await acp.connect(chosenProvider);
-    if (!destination) {
-      const created = await invoke<{ path: string; branch: string; setup: string }>(
-        'create_worktree',
-        { repository: project, name, destinationParent: null, baseRef: null },
-      );
-      saveProjectCatalog(addWorktree(projectCatalog, project, created));
-      destination = created;
-      updateSpawnReceipt(receiptId, {
-        worktreeId: created.path,
-        targetDirectory: created.path,
-      });
-      if (created.setup) {
-        let setupTimedOut = false;
-        try {
-          await loadProject(created.path);
-          if (directory !== created.path) throw new Error('Worktree changed before setup started.');
-          const paneId = splitFocusedPane('row', 'terminal', created.setup);
-          if (!paneId) throw new Error('Enlarge a pane before running worktree setup.');
-          await new Promise<void>((resolve, reject) => {
-            const remaining = request.expiresAt + 90_000 - Date.now();
-            let expired = false;
-            const timer = setTimeout(
-              () => {
-                expired = true;
-                setupTimedOut = true;
-                reject(new Error('Agent spawn timed out before worktree setup completed.'));
-              },
-              Math.max(0, remaining),
-            );
-            coordinationSetupWaiters.set(paneId, (code) => {
-              clearTimeout(timer);
-              if (expired) {
-                saveProjectCatalog(
-                  setWorktreeSetupStatus(
-                    projectCatalog,
-                    project,
-                    created.path,
-                    code === 0 ? 'ready' : 'failed',
-                  ),
-                );
-                return;
-              }
-              if (code === 0) resolve();
-              else reject(new Error(`Worktree setup exited with code ${code}. Agent not started.`));
+      if (chosenProvider !== 'opencode') await acp.connect(chosenProvider);
+      if (!destination) {
+        const created = await invoke<{ path: string; branch: string; setup: string }>(
+          'create_worktree',
+          { repository: project, name, destinationParent: null, baseRef: null },
+        );
+        saveProjectCatalog(addWorktree(projectCatalog, project, created));
+        destination = created;
+        updateSpawnReceipt(receiptId, {
+          worktreeId: created.path,
+          targetDirectory: created.path,
+        });
+        if (created.setup) {
+          let setupTimedOut = false;
+          try {
+            await loadProject(created.path);
+            if (directory !== created.path)
+              throw new Error('Worktree changed before setup started.');
+            const paneId = splitFocusedPane('row', 'terminal', created.setup);
+            if (!paneId) throw new Error('Enlarge a pane before running worktree setup.');
+            await new Promise<void>((resolve, reject) => {
+              const remaining = request.expiresAt + 90_000 - Date.now();
+              let expired = false;
+              const timer = setTimeout(
+                () => {
+                  expired = true;
+                  setupTimedOut = true;
+                  reject(new Error('Agent spawn timed out before worktree setup completed.'));
+                },
+                Math.max(0, remaining),
+              );
+              coordinationSetupWaiters.set(paneId, (code) => {
+                clearTimeout(timer);
+                if (expired) {
+                  saveProjectCatalog(
+                    setWorktreeSetupStatus(
+                      projectCatalog,
+                      project,
+                      created.path,
+                      code === 0 ? 'ready' : 'failed',
+                    ),
+                  );
+                  return;
+                }
+                if (code === 0) resolve();
+                else
+                  reject(new Error(`Worktree setup exited with code ${code}. Agent not started.`));
+              });
             });
-          });
-          saveProjectCatalog(
-            setWorktreeSetupStatus(projectCatalog, project, created.path, 'ready'),
-          );
-        } catch (cause) {
-          if (!setupTimedOut)
             saveProjectCatalog(
-              setWorktreeSetupStatus(projectCatalog, project, created.path, 'failed'),
+              setWorktreeSetupStatus(projectCatalog, project, created.path, 'ready'),
             );
-          throw cause;
+          } catch (cause) {
+            if (!setupTimedOut)
+              saveProjectCatalog(
+                setWorktreeSetupStatus(projectCatalog, project, created.path, 'failed'),
+              );
+            throw cause;
+          }
         }
       }
-    }
 
-    if (chosenProvider === 'opencode') {
-      const report = await inspectRepository(client!, destination.path);
-      if (!report.workReady)
-        throw new Error('Complete OpenCode setup in the target worktree before spawning.');
-    }
-    await coordinationSource(request);
-    const selectedSource: CoordinationSource =
-      chosenProvider === 'opencode'
-        ? { kind: 'opencode', agent: 'OpenCode', title: source.title }
-        : { kind: 'acp', agent: chosenProvider, title: source.title };
-    const started = await startCoordinatedThread(
-      destination,
-      selectedSource,
-      prompt.trim(),
-      receiptId,
-    );
-    activeSpawnRequests.delete(receiptId);
-    return {
-      ...started,
-      worktreeId: destination.path,
-      receiptId,
-      accessKey: receiptAccessKey,
-      sourceId,
-      targetId: started.threadId,
-      status: 'started',
-    };
+      if (chosenProvider === 'opencode') {
+        const report = await inspectRepository(client!, destination.path);
+        if (!report.workReady)
+          throw new Error('Complete OpenCode setup in the target worktree before spawning.');
+      }
+      await coordinationSource(request);
+      const selectedSource: CoordinationSource =
+        chosenProvider === 'opencode'
+          ? { kind: 'opencode', agent: 'OpenCode', title: source.title }
+          : { kind: 'acp', agent: chosenProvider, title: source.title };
+      const started = await startCoordinatedThread(
+        destination,
+        selectedSource,
+        prompt.trim(),
+        receiptId,
+      );
+      activeSpawnRequests.delete(receiptId);
+      return {
+        ...started,
+        worktreeId: destination.path,
+        receiptId,
+        accessKey: receiptAccessKey,
+        sourceId,
+        targetId: started.threadId,
+        status: 'started',
+      };
+    })();
+    agentSpawnQueue = launched.catch(() => undefined);
+    return launched;
   }
 
   async function startCoordinatedThread(
