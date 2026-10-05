@@ -1453,6 +1453,7 @@ button:disabled {
 }
 .side-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   padding: 6px 12px;
   border-left: 1px solid var(--shell-divider);
@@ -1933,7 +1934,8 @@ button:disabled {
     overflow: hidden;
   }
   .workspace .chat-area,
-  .workspace .side-area {
+  .workspace .side-area,
+  .pane-agent-content > .native-details {
     display: none;
     height: 100%;
   }
@@ -1941,8 +1943,12 @@ button:disabled {
     display: none;
   }
   .app-shell[data-mobile-view='chat'] .chat-area,
-  .app-shell[data-mobile-view='details'] .workspace:not(.closed) .side-area {
+  .app-shell[data-mobile-view='details'] .workspace:not(.closed) .side-area,
+  .app-shell[data-mobile-view='details'] .pane-leaf.focused .pane-agent-content > .native-details {
     display: flex;
+  }
+  .app-shell[data-mobile-view='details'] .pane-leaf.focused .pane-agent-content > .agent-workspace {
+    display: none;
   }
   .app-shell[data-mobile-view='sessions'] .workspace {
     visibility: hidden;

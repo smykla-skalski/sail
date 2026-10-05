@@ -260,5 +260,72 @@ describe('native Ship run history', () => {
     await expect($('.ship-fallback .ship-panel')).toBeDisplayed();
     await $('[aria-label="Close Ship runs"]').click();
     await browser.setWindowSize(1280, 850);
+
+    await browser.keys(['Meta', 'd']);
+    await expect($('.pane-leaf.focused [data-pane-picker]')).toBeDisplayed();
+    await $('.pane-leaf.focused [data-pane-picker]').click();
+    try {
+      await expect($('.pane-leaf.focused [data-agent-choice]:not(:disabled)')).toBeDisplayed();
+    } catch (cause) {
+      console.error('Ship split agent picker diagnostic', {
+        picker: await $('.pane-leaf.focused .pane-picker').getText(),
+        focused: await $('.pane-leaf.focused').getAttribute('data-pane-id'),
+        choices: await browser.execute(() =>
+          [...document.querySelectorAll('.pane-leaf.focused [data-agent-choice]')].map(
+            (element) => ({
+              text: element.textContent,
+              disabled: element instanceof HTMLButtonElement ? element.disabled : null,
+            }),
+          ),
+        ),
+      });
+      throw cause;
+    }
+    await $('.pane-leaf.focused [data-agent-choice]:not(:disabled)').click();
+    await expect($('.pane-leaf.focused .agent-workspace')).toBeDisplayed();
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
+      ),
+    );
+    await expect($('.pane-leaf.focused .native-details')).toBeDisplayed();
+    await $('.pane-leaf.focused .native-details .side-tabs button:nth-child(2)').click();
+    await expect($('.pane-leaf.focused .ship-panel')).toBeDisplayed();
+    await browser.keys('Escape');
+    await expect($('.pane-leaf.focused .native-details')).not.toExist();
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
+      ),
+    );
+    await browser.setWindowSize(700, 850);
+    await $('.mobile-switcher button:nth-child(3)').click();
+    await expect($('.pane-leaf.focused .native-details')).toBeDisplayed();
+    await expect($('.pane-leaf.focused .native-details button.active')).toBeFocused();
+    await expect($('.ship-fallback')).not.toExist();
+    await $('.mobile-switcher button:nth-child(2)').click();
+    await expect($('.pane-leaf.focused .native-details')).not.toBeDisplayed();
+    try {
+      await expect($('.pane-leaf.focused .agent-workspace')).toBeDisplayed();
+    } catch (cause) {
+      console.error(
+        'Ship mobile Chat diagnostic',
+        await browser.execute(() => ({
+          view: document.querySelector('.app-shell')?.getAttribute('data-mobile-view'),
+          panes: [...document.querySelectorAll('.pane-leaf')].map((pane) => ({
+            id: pane.getAttribute('data-pane-id'),
+            focused: pane.classList.contains('focused'),
+            agent: pane.querySelector('.agent-workspace') !== null,
+            details: pane.querySelector('.native-details') !== null,
+          })),
+        })),
+      );
+      throw cause;
+    }
+    await $('.mobile-switcher button:nth-child(3)').click();
+    await expect($('.pane-leaf.focused .native-details')).toBeDisplayed();
+    await $('.mobile-switcher button:nth-child(1)').click();
+    await expect($('.pane-leaf.focused .native-details')).not.toBeDisplayed();
+    await browser.setWindowSize(1280, 850);
   });
 });

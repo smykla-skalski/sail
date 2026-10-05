@@ -207,6 +207,28 @@
     if (changesPanes.includes(pane.id)) onchanges(pane.id);
   }
 
+  function closeOpenCodeShipOnEscape(event: KeyboardEvent) {
+    if (
+      event.key !== 'Escape' ||
+      event.defaultPrevented ||
+      event.repeat ||
+      event.isComposing ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey ||
+      event.shiftKey ||
+      'direction' in pane ||
+      pane.id !== focused ||
+      pane.agent !== 'opencode' ||
+      !nativeDetailsVisible ||
+      nativeTab !== 'ship' ||
+      document.querySelector('dialog[open]')
+    )
+      return;
+    event.preventDefault();
+    closeNativeDetails();
+  }
+
   async function refreshNativeDetails() {
     if (!client || 'direction' in pane || !pane.thread || pane.agent !== 'opencode') return;
     const id = pane.thread.sessionId;
@@ -366,6 +388,8 @@
     onratio(pane.id, clampPaneRatio(visibleRatio + change, splitSpan));
   }
 </script>
+
+<svelte:window onkeydown={closeOpenCodeShipOnEscape} />
 
 {#if 'direction' in pane}
   <div
@@ -682,8 +706,10 @@
                   ><button
                     class:active={nativeTab === 'history'}
                     onclick={() => (nativeTab = 'history')}>History</button
-                  ><button class:active={nativeTab === 'ship'} onclick={() => (nativeTab = 'ship')}
-                    >Ship runs ({shipRuns.length})</button
+                  ><button
+                    data-detail-tab="ship"
+                    class:active={nativeTab === 'ship'}
+                    onclick={() => (nativeTab = 'ship')}>Ship runs ({shipRuns.length})</button
                   ><button aria-label="Close OpenCode details" onclick={closeNativeDetails}
                     >×</button
                   >
@@ -802,8 +828,10 @@
                 <nav class="side-tabs" aria-label="Agent detail tabs">
                   <button class:active={acpTab === 'changes'} onclick={() => (acpTab = 'changes')}
                     >Changes ({diffs.length})</button
-                  ><button class:active={acpTab === 'ship'} onclick={() => (acpTab = 'ship')}
-                    >Ship runs ({shipRuns.length})</button
+                  ><button
+                    data-detail-tab="ship"
+                    class:active={acpTab === 'ship'}
+                    onclick={() => (acpTab = 'ship')}>Ship runs ({shipRuns.length})</button
                   ><button aria-label="Close agent details" onclick={closeAcpDetails}>×</button>
                 </nav>
                 {#if acpTab === 'ship'}

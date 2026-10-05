@@ -876,16 +876,37 @@
   async function showMobileView(view: 'sessions' | 'chat' | 'details') {
     if (view === 'sessions') sidebarVisible = true;
     saveViewState();
-    if (view === 'details' && (mainShipFallback || (!sessionID && !acpAgent))) showShipRuns();
-    if (acpAgent) {
+    if (view === 'details') {
+      const pane =
+        focusedPane === 'main' ? null : leaves(paneLayout).find((item) => item.id === focusedPane);
+      if (pane?.agent) {
+        if (!changesPanes.includes(focusedPane)) changesPanes = [...changesPanes, focusedPane];
+      } else if (mainShipFallback || (!sessionID && !acpAgent)) {
+        showShipRuns();
+      }
+    }
+    if (acpAgent && focusedPane === 'main') {
       agentChangesOpen = view === 'details';
       if (agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
     }
     if (view === 'details') detailsOpen = true;
     mobileView = view;
     await tick();
-    if (window.matchMedia('(max-width: 850px)').matches)
-      (view === 'sessions' ? sidebarElement : view === 'details' ? detailsArea : chatArea)?.focus();
+    if (window.matchMedia('(max-width: 850px)').matches) {
+      const target =
+        view === 'sessions'
+          ? sidebarElement
+          : view === 'chat'
+            ? focusedPane === 'main'
+              ? chatArea
+              : document.querySelector<HTMLElement>('.pane-leaf.focused .agent-workspace textarea')
+            : focusedPane === 'main'
+              ? detailsArea
+              : document.querySelector<HTMLElement>(
+                  '.pane-leaf.focused .native-details button.active',
+                );
+      target?.focus();
+    }
   }
 
   async function switchSideTab(tab: SideTab) {
@@ -1275,6 +1296,7 @@
   function closeShipRuns() {
     detailsOpen = false;
     agentChangesOpen = false;
+    sideTab = 'changes';
     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'chat';
   }
   let diffAnnotations = $derived(annotateDiffs(diffs, snapshot.plan, directory));
@@ -8145,6 +8167,25 @@
         ++recentJumpGeneration;
         focusPaneForTyping(next);
       }
+      return;
+    }
+    if (
+      event.key === 'Escape' &&
+      !event.defaultPrevented &&
+      !event.repeat &&
+      !event.isComposing &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      focusedPane !== 'main' &&
+      focusedLeaf?.agent !== 'opencode' &&
+      document.querySelector('.pane-leaf.focused [data-detail-tab="ship"].active') &&
+      (!mobileLayout || mobileView === 'details') &&
+      !document.querySelector('dialog[open]')
+    ) {
+      event.preventDefault();
+      changesPanes = changesPanes.filter((id) => id !== focusedPane);
       return;
     }
     if (
