@@ -192,10 +192,12 @@
   } from './lib/coordination';
   import {
     acpReceiptState,
+    activeSubagentsForSource,
     loadSpawnReceipts,
     receiptForSource,
     receiptNeedsRefresh,
     receiptIsSettled,
+    receiptSourceId,
     saveBoundedReceipt,
     spawnReceiptsForSource,
     withSpawnResponses,
@@ -3639,7 +3641,7 @@
     if (receiptId)
       void startingPrompt
         .then(async (inbox) => {
-          updateSpawnReceipt(receiptId, { state: 'queued', turnId: inbox.id });
+          updateSpawnReceipt(receiptId, { turnId: inbox.id });
           try {
             await promptClient.session.wait({ sessionID: session.id });
             if (tracking)
@@ -6461,10 +6463,22 @@
 
   function showThreadAttentionNotification(thread: AgentThread, status: ThreadStatus) {
     if (!notificationsEnabled || !isTauri()) return;
+    const children = activeSubagentsForSource(
+      spawnReceipts,
+      receiptSourceId(thread.agent, thread.sessionId),
+      thread.directory,
+    );
     void invoke('show_attention_notification', {
       threadKey: threadKey(thread),
       title: thread.title,
-      body: status === 'waiting' ? 'Needs your input' : 'Finished',
+      body:
+        status === 'waiting'
+          ? 'Needs your input'
+          : children.some((child) => child.state === 'waiting')
+            ? 'Subagent needs your input'
+            : children.length
+              ? 'Subagents are still active'
+              : 'Finished',
       sound: notificationSound,
     }).catch(() => undefined);
   }
@@ -6575,7 +6589,7 @@
               !receiptIsSettled(item.state),
           )) {
             const result = `${receipt.result ?? ''}${text}`.slice(-16_000);
-            updateSpawnReceipt(receipt.receiptId, { result });
+            updateSpawnReceipt(receipt.receiptId, { result, activity: 'Writing response…' });
             spawnOutput.set(receipt.receiptId, result);
           }
         const toolTitle =
@@ -7517,6 +7531,7 @@
           ))
             updateSpawnReceipt(receipt.receiptId, {
               result: `${receipt.result ?? ''}${event.data.delta}`.slice(-16_000),
+              activity: 'Writing response…',
             });
         }
         if (typeof eventSession === 'string' && event.type === 'session.execution.started')
@@ -8217,6 +8232,7 @@
         threads={sidebarThreads}
         attention={threadAttention}
         openCodeOutcomes={sidebarOpenCodeOutcomes}
+        {spawnReceipts}
         {acpActivityReady}
         {nativeActivityReady}
         {nativeUnavailableDirectories}

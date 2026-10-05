@@ -8,6 +8,12 @@
   import type { AttentionMap, ThreadStatus } from './lib/attention';
   import { threadKey } from './lib/recent-threads';
   import { sidebarThreadStatus } from './lib/sidebar-agents';
+  import {
+    isSubagentThread,
+    receiptSourceId,
+    runningSubagentsForSource,
+    type SpawnReceipt,
+  } from './lib/agent-results';
   import type { ProjectCatalog, ProjectWorktree, WorktreeCreation } from './lib/projects';
   import { ungroupedRepositories } from './lib/projects';
   import { getSetting, setSetting } from './lib/settings';
@@ -30,6 +36,7 @@
     threads: Record<string, AgentThread[]>;
     attention: AttentionMap;
     openCodeOutcomes: Record<string, ThreadStatus>;
+    spawnReceipts: SpawnReceipt[];
     acpActivityReady: boolean;
     nativeActivityReady: boolean;
     nativeUnavailableDirectories: string[];
@@ -92,6 +99,7 @@
     threads,
     attention,
     openCodeOutcomes,
+    spawnReceipts,
     acpActivityReady,
     nativeActivityReady,
     nativeUnavailableDirectories,
@@ -222,6 +230,23 @@
       acpActivityReady,
       nativeActivityReady,
       nativeUnavailableDirectories,
+      spawnReceipts,
+    );
+  }
+
+  function activeSubagentCount(thread: AgentThread): number {
+    return runningSubagentsForSource(
+      spawnReceipts,
+      receiptSourceId(thread.agent, thread.sessionId),
+      thread.directory,
+    ).length;
+  }
+
+  function subagentThread(thread: AgentThread): boolean {
+    return isSubagentThread(
+      spawnReceipts,
+      receiptSourceId(thread.agent, thread.sessionId),
+      thread.directory,
     );
   }
 
@@ -681,16 +706,19 @@
       {#each threads[path] as thread (threadKey(thread))}
         {@const key = threadKey(thread)}
         {@const status = threadStatus(thread)}
+        {@const child = subagentThread(thread)}
+        {@const activeChildren = activeSubagentCount(thread)}
         {@const selectable =
           thread.agent === 'opencode'
             ? openCodeAvailable
             : agents.some((agent) => agent.id === thread.agent && agent.available)}
         <button
           class:active={selectedThread === key}
+          class:subagent={child}
           class="project-agent-row"
           aria-current={selectedThread === key ? 'page' : undefined}
-          aria-label={`${providerName(thread)}: ${thread.title}, ${statusLabel(status)}`}
-          title={`${providerName(thread)} · ${thread.title} · ${statusLabel(status)}`}
+          aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}, ${statusLabel(status)}${activeChildren ? `, ${activeChildren} subagent${activeChildren === 1 ? '' : 's'} active` : ''}`}
+          title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
           aria-disabled={!selectable}
           oncontextmenu={(event) => openMenu({ kind: 'agent', thread }, event)}
           onmousedown={(event) => {
@@ -701,10 +729,20 @@
           }}
         >
           <span class="project-agent-provider"
-            ><HarnessIcon agent={thread.agent} size={13} />{providerName(thread)}</span
+            >{#if child}<span aria-hidden="true">↳</span>{/if}<HarnessIcon
+              agent={thread.agent}
+              size={13}
+            />{providerName(thread)}{#if child}<span class="project-subagent-tag">Subagent</span
+              >{/if}</span
           >
           <span class="project-agent-title">{thread.title}</span>
-          <span class={`project-agent-status ${status ?? 'unknown'}`}>{statusLabel(status)}</span>
+          <span class={`project-agent-status ${status ?? 'unknown'}`}
+            >{activeChildren && status === 'working'
+              ? 'Subagents working'
+              : activeChildren && status === 'failed'
+                ? 'Failed · subagents working'
+                : statusLabel(status)}</span
+          >
         </button>
       {/each}
     </div>

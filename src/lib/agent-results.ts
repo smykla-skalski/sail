@@ -141,6 +141,40 @@ export function spawnReceiptsForSource(
   );
 }
 
+export function receiptSourceId(agent: string, sessionId: string): string {
+  return agent === 'opencode' ? `opencode:${sessionId}` : `acp:${agent}:${sessionId}`;
+}
+
+export function activeSubagentsForSource(
+  receipts: SpawnReceipt[],
+  sourceId: string,
+  directory: string,
+): SpawnReceipt[] {
+  return spawnReceiptsForSource(receipts, sourceId, directory).filter(
+    (receipt) => !receiptIsSettled(receipt.state),
+  );
+}
+
+export function runningSubagentsForSource(
+  receipts: SpawnReceipt[],
+  sourceId: string,
+  directory: string,
+): SpawnReceipt[] {
+  return activeSubagentsForSource(receipts, sourceId, directory).filter(
+    (receipt) => !!receipt.targetId && (receipt.state === 'working' || receipt.state === 'waiting'),
+  );
+}
+
+export function isSubagentThread(
+  receipts: SpawnReceipt[],
+  targetId: string,
+  directory: string,
+): boolean {
+  return receipts.some(
+    (receipt) => receipt.targetId === targetId && receipt.targetDirectory === directory,
+  );
+}
+
 export type SpawnTimelineEntry<T> =
   T | { type: 'spawn-response'; id: string; receipt: SpawnReceipt };
 
