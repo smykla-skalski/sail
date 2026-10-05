@@ -927,62 +927,85 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
 async fn working_tree_revision(path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = validate_repository(path)?;
-        let output = Command::new("git")
-            .args([
-                "-C",
-                &root,
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--no-renames",
-                "--untracked-files=all",
-            ])
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err("Could not read working tree changes.".into());
-        }
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        output.stdout.hash(&mut hash);
-        for record in output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|record| record.len() >= 4)
-        {
-            let path = String::from_utf8_lossy(&record[3..]);
-            if let Ok(metadata) = Path::new(&root).join(path.as_ref()).symlink_metadata() {
-                metadata.len().hash(&mut hash);
-                metadata.modified().ok().hash(&mut hash);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    metadata.permissions().mode().hash(&mut hash);
-                }
-                #[cfg(not(unix))]
-                metadata.permissions().readonly().hash(&mut hash);
-            }
-        }
-        let index = Command::new("git")
-            .args(["-C", &root, "rev-parse", "--git-path", "index"])
-            .output()
-            .map_err(|error| error.to_string())?;
-        if index.status.success() {
-            let path = String::from_utf8_lossy(&index.stdout);
-            let path = Path::new(path.trim());
-            let path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                Path::new(&root).join(path)
-            };
-            if let Ok(metadata) = path.metadata() {
-                metadata.len().hash(&mut hash);
-                metadata.modified().ok().hash(&mut hash);
-            }
-        }
-        Ok(format!("{:016x}", hash.finish()))
+        git_directory_revision(Path::new(&root))
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn git_directory_revision(root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("Could not read working tree changes.".into());
+    }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    output.stdout.hash(&mut hash);
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| record.len() >= 4)
+    {
+        let path = String::from_utf8_lossy(&record[3..]);
+        let file_path = root.join(path.as_ref());
+        if let Ok(metadata) = file_path.symlink_metadata() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode().hash(&mut hash);
+            }
+            #[cfg(not(unix))]
+            metadata.permissions().readonly().hash(&mut hash);
+            if metadata.file_type().is_symlink() {
+                std::fs::read_link(&file_path)
+                    .map_err(|error| error.to_string())?
+                    .hash(&mut hash);
+            } else if metadata.is_file() {
+                let mut file =
+                    std::fs::File::open(&file_path).map_err(|error| error.to_string())?;
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+                    if count == 0 {
+                        break;
+                    }
+                    buffer[..count].hash(&mut hash);
+                }
+            } else if metadata.is_dir() && file_path.join(".git").exists() {
+                git_directory_revision(&file_path)?.hash(&mut hash);
+            }
+        }
+    }
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if head.status.success() {
+        head.stdout.hash(&mut hash);
+    }
+    let staged = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--cached", "--binary", "--no-ext-diff"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !staged.status.success() {
+        return Err("Could not read staged working tree changes.".into());
+    }
+    staged.stdout.hash(&mut hash);
+    Ok(format!("{:016x}", hash.finish()))
 }
 
 fn selected_hunk(patch: &str, ordinal: usize) -> Result<String, String> {
@@ -1749,6 +1772,7 @@ pub fn run() {
             github::create_pull_request,
             github::list_open_issues,
             github::open_issue,
+            github::github_issue_repository,
             github::publish_issue_graph,
             github::load_issue_graph,
             github::shipping_target_repository,
@@ -1851,7 +1875,6 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
     use super::working_tree_revision;
     use super::{
         add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
@@ -2183,6 +2206,71 @@ mod tests {
         permissions.set_mode(permissions.mode() ^ 0o111);
         fs::set_permissions(&file, permissions).unwrap();
         let after = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        assert_ne!(before, after);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_revision_ignores_index_metadata_refresh() {
+        let root =
+            std::env::temp_dir().join(format!("sail-revision-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        fs::write(root.join("file.txt"), "original\n").unwrap();
+        git(path, &["add", "file.txt"]);
+        git(path, &["commit", "-qm", "seed"]);
+        let before = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        let index = root.join(".git/index");
+        assert!(Command::new("touch").arg(index).status().unwrap().success());
+        let after = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        assert_eq!(before, after);
+        git(path, &["commit", "--allow-empty", "-qm", "next"]);
+        let committed = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        assert_ne!(after, committed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn working_tree_revision_detects_edits_in_dirty_submodules() {
+        let root =
+            std::env::temp_dir().join(format!("sail-revision-test-{}", uuid::Uuid::new_v4()));
+        let source = root.join("source");
+        let parent = root.join("parent");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let source_path = source.to_str().unwrap();
+        let parent_path = parent.to_str().unwrap();
+        for path in [source_path, parent_path] {
+            git(path, &["init", "-q"]);
+            git(path, &["config", "user.name", "Sail Test"]);
+            git(path, &["config", "user.email", "sail@example.test"]);
+        }
+        fs::write(source.join("file.txt"), "original\n").unwrap();
+        git(source_path, &["add", "file.txt"]);
+        git(source_path, &["commit", "-qm", "seed"]);
+        git(
+            parent_path,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source_path,
+                "nested",
+            ],
+        );
+        git(parent_path, &["commit", "-qm", "submodule"]);
+        fs::write(parent.join("nested/file.txt"), "first\n").unwrap();
+        let before =
+            tauri::async_runtime::block_on(working_tree_revision(parent_path.into())).unwrap();
+        fs::write(parent.join("nested/file.txt"), "second\n").unwrap();
+        let after =
+            tauri::async_runtime::block_on(working_tree_revision(parent_path.into())).unwrap();
         assert_ne!(before, after);
         fs::remove_dir_all(root).unwrap();
     }

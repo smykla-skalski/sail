@@ -1234,6 +1234,13 @@ pub(crate) fn github_remote(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+#[tauri::command]
+pub async fn github_issue_repository(repository: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || issue_repository(repository).map(|(_, name)| name))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 fn gh_command(directory: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new(gh_binary())
         .current_dir(directory)

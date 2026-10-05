@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const sessions = new Map();
 const permissions = new Map();
@@ -12,6 +13,7 @@ let nextTerminalRequest = 3000;
 const agent = process.argv[2];
 let authenticated = agent !== 'codex';
 let nextSession = 0;
+const sessionRun = process.env.SAIL_ACP_TEST_UNIQUE_SESSIONS ? `-${process.pid}` : '';
 let nextPermission = 1000;
 
 function send(message) {
@@ -160,8 +162,12 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, error: { code: -32000, message: 'Authentication required' } });
       continue;
     }
-    const sessionId = `${agent}-test-${++nextSession}`;
-    sessions.set(sessionId, { history: [], config: { model: 'test', effort: 'medium' } });
+    const sessionId = `${agent}-test${sessionRun}-${++nextSession}`;
+    sessions.set(sessionId, {
+      cwd: message.params.cwd,
+      history: [],
+      config: { model: 'test', effort: 'medium' },
+    });
     update(sessionId, { sessionUpdate: 'available_commands_update', availableCommands });
     setTimeout(
       () =>
@@ -207,6 +213,31 @@ for await (const line of createInterface({ input: process.stdin })) {
     send({ id: message.id, result: { configOptions: configOptions(sessionId) } });
   } else if (message.method === '_session/steering') {
     const { sessionId } = message.params;
+    if (sessions.get(sessionId).newTurnSteer) {
+      const status = (type) =>
+        update(sessionId, {
+          sessionUpdate: 'session_info_update',
+          _meta: { codex: { threadStatus: { type } } },
+        });
+      status('idle');
+      send({ id: activePrompts.get(sessionId), result: { stopReason: 'end_turn' } });
+      setTimeout(() => {
+        status('active');
+        update(sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Detached steering turn started.' },
+        });
+        send({ id: message.id, result: { outcome: 'startedNewTurn' } });
+        setTimeout(() => {
+          writeFileSync(
+            join(sessions.get(sessionId).cwd, 'steer-attribution.txt'),
+            'steered edit\n',
+          );
+          status('idle');
+        }, 1500);
+      }, 200);
+      continue;
+    }
     if (!activePrompts.has(sessionId)) {
       send({ id: message.id, result: { outcome: 'promptRequired' } });
       continue;
@@ -224,6 +255,33 @@ for await (const line of createInterface({ input: process.stdin })) {
     const { sessionId } = message.params;
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    if (text === 'Gate prompt model unavailable') {
+      send({ id: message.id, error: { code: -1, message: 'Model x is unavailable' } });
+      continue;
+    }
+    if (text === 'Detached steer follow-up') {
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Steer new-turn demo') {
+      sessions.get(sessionId).newTurnSteer = true;
+      update(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: `steer-new-turn-${message.id}`,
+        title: 'Finish before steering starts a new turn',
+        status: 'in_progress',
+      });
+      setTimeout(
+        () =>
+          update(sessionId, {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: `steer-new-turn-${message.id}`,
+            status: 'completed',
+          }),
+        1500,
+      );
+      continue;
+    }
     if (text === 'Steer demo' || text === 'Steer parallel demo') {
       const parallel = text === 'Steer parallel demo';
       const finish = () => {

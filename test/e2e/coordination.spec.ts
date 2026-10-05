@@ -42,6 +42,14 @@ describe('agent coordination bridge', () => {
     expect(initialization.result.instructions).toContain('# Sail');
     expect(initialization.result.instructions).toContain('agent_spawn');
     expect(tools.result.tools.map((tool: { name: string }) => tool.name)).toContain('sail_skill');
+    expect(tools.result.tools).toContainEqual(
+      expect.objectContaining({
+        name: 'validation_gate',
+        inputSchema: expect.objectContaining({
+          required: ['gate', 'prompt', 'implementingModels'],
+        }),
+      }),
+    );
     expect(skill.result.content[0].text).toBe(initialization.result.instructions);
   });
 

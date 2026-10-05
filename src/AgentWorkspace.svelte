@@ -27,6 +27,12 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
+  import { trackImplementationSteer } from './lib/implementation-steering';
+  import {
+    beginImplementationTurn,
+    beginShipItRun,
+    recordImplementationModel,
+  } from './lib/implementation-models';
   import {
     agentQueuePaused,
     queuedAgentMessages,
@@ -606,8 +612,13 @@
           historyLoaded = true;
           rememberTranscript();
         }
-        if (current === generation)
+        if (current === generation) {
           configOptions = (session.configOptions as AgentConfigOption[] | undefined) ?? [];
+          const selectedModel = configOptions.find(
+            (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+          )?.currentValue;
+          if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
+        }
         if (current === generation && Array.isArray(session.availableCommands))
           updateSkills(session.availableCommands);
         if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
@@ -653,6 +664,9 @@
       const session = await acp.create(sessionAgent, sessionDirectory);
       const created: AgentThread = {
         agent: sessionAgent,
+        model: session.configOptions?.find(
+          (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+        )?.currentValue,
         sessionId: session.sessionId,
         directory: sessionDirectory,
         title,
@@ -755,8 +769,13 @@
         const update = params.update;
         if (!update || typeof update !== 'object') return;
         const data = update as Record<string, unknown>;
-        if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions))
+        if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions)) {
           configOptions = data.configOptions as AgentConfigOption[];
+          const selectedModel = configOptions.find(
+            (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+          )?.currentValue;
+          if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
+        }
         if (
           data.sessionUpdate === 'available_commands_update' &&
           Array.isArray(data.availableCommands)
@@ -814,6 +833,12 @@
     const text =
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
+    try {
+      await beginShipItRun(directory, text);
+    } catch (cause) {
+      error = describe(cause);
+      return;
+    }
     const command = text.toLowerCase();
     if (
       !external &&
@@ -877,7 +902,8 @@
       phase = 'config';
       if (settingConfig) await settingConfig;
       if (configFailure) throw new Error(configFailure);
-      if (activityThread) onactivity(activityThread);
+      if (activityThread)
+        onactivity({ ...activityThread, model: modelOption?.currentValue || activityThread.model });
       const id = activityThread?.sessionId ?? activeSessionId;
       deliverySessionId = id;
       if (stopRequested) {
@@ -899,19 +925,32 @@
           thread: `acp:${turnAgent}:${id}`,
         });
       }
-      const skillText = resolveSkillPrompt(skills, text);
+      const skillText = resolveSkillPrompt(skills, text, modelOption?.currentValue || undefined);
+      const implementationModel = modelOption?.currentValue;
+      const tracking = await beginImplementationTurn(
+        turnDirectory,
+        implementationModel,
+        `acp:${turnAgent}:${id}`,
+      );
       const promptText =
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
           : skillText;
       phase = 'prompt';
-      const result = await acp.prompt(
-        turnAgent,
-        id!,
-        withAttachedFiles(promptText, sentClipboard),
-        turnId,
-        promptImagePaths(sentImages, sentClipboard),
-      );
+      let result;
+      try {
+        result = await acp.prompt(
+          turnAgent,
+          id!,
+          withAttachedFiles(promptText, sentClipboard),
+          turnId,
+          promptImagePaths(sentImages, sentClipboard),
+        );
+        await recordImplementationModel(turnDirectory, implementationModel, tracking);
+      } catch (cause) {
+        await recordImplementationModel(turnDirectory, implementationModel, tracking);
+        throw cause;
+      }
       if (recoveredDraft && result.stopReason !== 'cancelled' && !stopRequested)
         recoveredDraft = false;
       if (result.stopReason === 'cancelled' || stopRequested) notifyOnDone = false;
@@ -1078,7 +1117,33 @@
     const turnAgent = agent;
     const turnDirectory = directory;
     const current = generation;
+    const steerModel = modelOption?.currentValue || thread?.model;
     const [next, ...remaining] = queued;
+    steering = true;
+    let tracked;
+    try {
+      tracked = await trackImplementationSteer(
+        turnDirectory,
+        steerModel,
+        turnAgent,
+        sessionId,
+        activeTurnId,
+        () =>
+          acp.steer(
+            turnAgent,
+            sessionId,
+            withAttachedFiles(resolveSkillPrompt(skills, next.text, steerModel), next.attachments),
+            promptImagePaths(next.images, next.attachments),
+          ),
+      );
+    } catch (cause) {
+      steering = false;
+      error = describe(cause);
+      return;
+    }
+    void tracked.completed.catch((cause) => {
+      error = describe(cause);
+    });
     const entryId = crypto.randomUUID();
     flushUpdates();
     entries = [...entries, { id: entryId, type: 'user', text: next.text, created: Date.now() }];
@@ -1091,15 +1156,7 @@
     });
     const steer = { sessionId, turnId: activeTurnId, message: next, requeued: false, finish };
     inFlightSteer = steer;
-    steering = true;
-    const request = acp
-      .steer(
-        turnAgent,
-        sessionId,
-        withAttachedFiles(resolveSkillPrompt(skills, next.text), next.attachments),
-        promptImagePaths(next.images, next.attachments),
-      )
-      .catch(() => ({ outcome: 'failed' as const }));
+    const request = tracked.response.catch(() => ({ outcome: 'failed' as const }));
     const { outcome } = await Promise.race([request, completed]);
     inFlightSteer = null;
     const delivered = outcome === 'injected' || outcome === 'startedNewTurn';
@@ -1193,6 +1250,10 @@
           configOptions.map((option) =>
             option.id === configId ? Object.assign({}, option, { currentValue: value }) : option,
           );
+        const selectedModel = configOptions.find(
+          (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+        )?.currentValue;
+        if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
       } catch (cause) {
         if (activeSessionId !== sessionId) return;
         configFailure = describe(cause);

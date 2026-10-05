@@ -33,6 +33,7 @@ fn main() {
             "create_pull_request",
             "list_open_issues",
             "open_issue",
+            "github_issue_repository",
             "publish_issue_graph",
             "load_issue_graph",
             "shipping_target_repository",

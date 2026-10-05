@@ -1,5 +1,6 @@
 import type { AgentAvailability } from './acp';
 import type { SetupReport } from './onboarding';
+import type { ValidationSettings } from './cross-validation';
 
 export const settingsRequest = 'sail:settings-request';
 export const settingsState = 'sail:settings-state';
@@ -18,6 +19,7 @@ export type SettingsSnapshot = {
   busy: boolean;
   agents: AgentAvailability[];
   agentsError: string;
+  crossValidation: ValidationSettings;
   notificationsEnabled: boolean;
   notificationSound: boolean;
   personalPostTurnChecks: string[];
@@ -40,4 +42,5 @@ export type SettingsAction =
   | { type: 'agent-thread-list'; value: boolean }
   | { type: 'agent-messages'; value: boolean }
   | { type: 'detect-agents' }
+  | { type: 'cross-validation'; value: ValidationSettings }
   | { type: 'restart-setup' };

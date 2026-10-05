@@ -320,6 +320,7 @@ struct ActivePrompt {
 pub struct PromptOutcome {
     status: &'static str,
     notify: bool,
+    error: Option<String>,
     #[serde(rename = "turnId")]
     turn_id: String,
 }
@@ -1087,6 +1088,7 @@ pub async fn acp_prompt(
                     PromptOutcome {
                         status,
                         notify,
+                        error: result.as_ref().err().cloned(),
                         turn_id: turn_id.clone(),
                     },
                 );
@@ -1103,7 +1105,8 @@ pub async fn acp_prompt(
                 AgentEvent {
                     agent,
                     message: json!({"method":"sail/prompt_finished","params":{
-                        "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify
+                        "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
+                        "error":result.as_ref().err()
                     }}),
                 },
             );

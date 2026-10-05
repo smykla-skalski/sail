@@ -386,6 +386,46 @@ describe('ACP agent threads', () => {
     );
   });
 
+  it('attributes delayed edits when steering starts a detached turn', async () => {
+    const path = realpathSync(repository);
+    await browser.execute((directory) => {
+      localStorage.removeItem(`sai-implementation-models:${directory}`);
+    }, path);
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Steer new-turn demo');
+    await $('.agent-actions button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await $('.agent-composer textarea').setValue('Detached steer follow-up');
+    await $('.agent-actions button').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Detached steering turn started.'),
+    );
+    const beforeEdit = await browser.execute(
+      (directory) => ({
+        models: JSON.parse(localStorage.getItem(`sai-implementation-models:${directory}`) ?? '[]'),
+        pending: JSON.parse(
+          localStorage.getItem(`sai-implementation-pending:${directory}`) ?? '[]',
+        ),
+      }),
+      path,
+    );
+    expect(beforeEdit.models).toHaveLength(0);
+    expect(beforeEdit.pending.length).toBeGreaterThan(0);
+    await browser.waitUntil(async () => {
+      const saved = await browser.execute(
+        (directory) => localStorage.getItem(`sai-implementation-models:${directory}`),
+        path,
+      );
+      return JSON.parse(saved ?? '[]').includes('test');
+    });
+    const pending = await browser.execute(
+      (directory) => localStorage.getItem(`sai-implementation-pending:${directory}`),
+      path,
+    );
+    expect(JSON.parse(pending ?? '[]')).toHaveLength(0);
+  });
+
   it('waits for both parallel tools before steering once', async () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));

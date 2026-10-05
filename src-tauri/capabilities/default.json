@@ -35,6 +35,7 @@
     "allow-create-pull-request",
     "allow-list-open-issues",
     "allow-open-issue",
+    "allow-github-issue-repository",
     "allow-publish-issue-graph",
     "allow-load-issue-graph",
     "allow-shipping-pull-request",

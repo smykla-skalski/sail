@@ -22,6 +22,12 @@
     type SkillChoice,
   } from './lib/skills';
   import { bundledSkills } from './lib/bundled-skills';
+  import {
+    abandonImplementationTurn,
+    beginImplementationTurn,
+    beginShipItRun,
+    recordImplementationModel,
+  } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
@@ -158,6 +164,7 @@
   let loading = $state(false);
   let loadingOlder = $state(false);
   let sending = $state(false);
+  let configuring = $state(false);
   let running = $state(false);
   let pickerOpen = $state<'agent' | 'model' | 'effort' | null>(null);
   let filePickerOpen = $state(false);
@@ -183,7 +190,7 @@
     if (spawnRevision && following) void follow();
   });
   let stopRequested = false;
-  const busy = $derived(sending || running);
+  const busy = $derived(sending || running || configuring);
   const contextUsage = $derived(openCodeContextUsage(messages, setup?.models ?? []));
   const inputReady = $derived(
     !!setup?.workReady || (session?.agent === 'architect' && !!setup?.planReady),
@@ -434,14 +441,29 @@
   async function send(externalText?: string) {
     const external = externalText !== undefined;
     const text = (externalText ?? draft).trim();
-    if (!client || (!text && (external || !files.length)) || !inputReady || sending) {
+    const turnDirectory = directory;
+    const current = generation;
+    try {
+      await beginShipItRun(turnDirectory, text);
+    } catch (cause) {
+      error = describe(cause);
+      return;
+    }
+    if (
+      !client ||
+      (!text && (external || !files.length)) ||
+      !inputReady ||
+      sending ||
+      configuring ||
+      current !== generation ||
+      turnDirectory !== directory
+    ) {
       if (external) throw new Error('Wait for the current OpenCode turn.');
       return;
     }
     const source = client;
     const paths = external ? [] : [...files];
     for (const path of paths) if (pickedImages.has(path)) inFlightCaptures.add(path);
-    const current = generation;
     let accepted = false;
     if (!external) {
       draft = '';
@@ -463,7 +485,7 @@
                 variant: selectedVariant || undefined,
               }
             : undefined,
-          location: { directory },
+          location: { directory: turnDirectory },
           metadata: { saiHarness: true },
           title: text ? (text.length > 60 ? `${text.slice(0, 57)}…` : text) : 'New work',
         });
@@ -477,16 +499,44 @@
       running = true;
       if (session) onstatus(summary(session), 'working');
       const promptRequest = runSerialOpenCodeTurn(id, async () => {
-        await invoke('record_turn_snapshot', { path: directory, thread: `opencode:${id}` });
-        return source.session.prompt({
-          sessionID: id,
-          text: resolveSkillPrompt(skills, text),
-          skills: promptSkill(skills, text)?.id
-            ? [{ id: promptSkill(skills, text)!.id! }]
-            : undefined,
-          delivery: queued ? 'steer' : undefined,
-          files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
-        });
+        const target = await source.session.get({ sessionID: id });
+        if (target.location.directory !== turnDirectory)
+          throw new Error('Target session moved to another worktree.');
+        const implementingModel = target.model
+          ? `${target.model.providerID}:${target.model.id}`
+          : undefined;
+        await invoke('record_turn_snapshot', { path: turnDirectory, thread: `opencode:${id}` });
+        const tracking = await beginImplementationTurn(
+          turnDirectory,
+          implementingModel,
+          `opencode:${id}`,
+        );
+        let response;
+        try {
+          response = await source.session.prompt({
+            sessionID: id,
+            text: resolveSkillPrompt(skills, text, implementingModel),
+            skills: promptSkill(skills, text)?.id
+              ? [{ id: promptSkill(skills, text)!.id! }]
+              : undefined,
+            delivery: queued ? 'steer' : undefined,
+            files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
+          });
+        } catch (cause) {
+          await recordImplementationModel(turnDirectory, implementingModel, tracking);
+          throw cause;
+        }
+        void source.session
+          .wait({ sessionID: id })
+          .then(
+            () => recordImplementationModel(turnDirectory, implementingModel, tracking),
+            () => recordImplementationModel(turnDirectory, implementingModel, tracking),
+          )
+          .catch((cause) => {
+            abandonImplementationTurn(turnDirectory, tracking);
+            error = `Could not track implementation model: ${describe(cause)}`;
+          });
+        return response;
       });
       sending = false;
       await promptRequest;
@@ -554,6 +604,7 @@
     }
     if (kind === 'effort') selectedVariant = value;
     if (!id) return;
+    configuring = true;
     try {
       if (kind === 'agent') await client.session.switchAgent({ sessionID: id, agent: value });
       else {
@@ -578,6 +629,8 @@
       selectedModel = previous.selectedModel;
       selectedVariant = previous.selectedVariant;
       error = describe(cause);
+    } finally {
+      configuring = false;
     }
   }
 
@@ -821,7 +874,7 @@
           >
           <Button
             onclick={() => void send()}
-            disabled={sending || (!draft.trim() && !files.length) || !inputReady}
+            disabled={sending || configuring || (!draft.trim() && !files.length) || !inputReady}
             >{running ? 'Queue ↗' : 'Send ↗'}</Button
           >
         </div>

@@ -8,6 +8,7 @@
   import { getSetting } from './lib/settings';
   import { openExternalLink } from './lib/external-link';
   import type { SetupCheck, SetupReport } from './lib/onboarding';
+  import type { ValidationChoice } from './lib/cross-validation';
   import {
     settingsAction,
     settingsRequest,
@@ -22,6 +23,8 @@
   let personalChecksDirty = $state(false);
   let binaryDirty = $state(false);
   let selectedSection = $state<'general' | 'opencode' | 'agents'>('general');
+  let validationAgent = $state('');
+  let validationModel = $state('');
   let themePickerOpen = $state(false);
   let requestError = $state('');
   type HookEntry = {
@@ -77,6 +80,53 @@
     void emitTo('main', settingsAction, action).catch((cause: unknown) => {
       requestError = String(cause);
     });
+  }
+
+  function addValidationChoice() {
+    const agent = validationAgent.trim();
+    const model = validationModel.trim();
+    if (!snapshot || !agent || !model) return;
+    if (
+      snapshot.crossValidation.choices.some((item) => item.agent === agent && item.model === model)
+    )
+      return;
+    send({
+      type: 'cross-validation',
+      value: {
+        ...snapshot.crossValidation,
+        choices: [...snapshot.crossValidation.choices, { agent, model }],
+      },
+    });
+    validationModel = '';
+  }
+
+  function removeValidationChoice(choice: ValidationChoice) {
+    if (!snapshot) return;
+    send({
+      type: 'cross-validation',
+      value: {
+        ...snapshot.crossValidation,
+        choices: snapshot.crossValidation.choices.filter(
+          (item) => item.agent !== choice.agent || item.model !== choice.model,
+        ),
+      },
+    });
+  }
+
+  function validationReason(choice: ValidationChoice): string | null {
+    if (!snapshot) return 'Checking availability';
+    if (choice.agent === 'opencode') {
+      if (snapshot.runtimeState !== 'connected')
+        return snapshot.runtimeError || 'OpenCode is disconnected';
+      if (
+        !snapshot.setup?.models.some((model) => `${model.providerID}:${model.id}` === choice.model)
+      )
+        return 'Model is not enabled or its provider is disconnected in this worktree';
+      return null;
+    }
+    const agent = snapshot.agents.find((item) => item.id === choice.agent);
+    if (!agent?.available) return agent?.reason || 'Agent is unavailable';
+    return null;
   }
 
   function keydown(event: KeyboardEvent) {
@@ -253,6 +303,66 @@
             <strong>{agent.name}</strong>: {agent.binaryPath ?? agent.reason ?? 'Unavailable'}
           </p>{/each}
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
+      </section>
+      <section class="settings-card">
+        <h2>Ship It cross-validation</h2>
+        <p>
+          Select the agents and exact models allowed to review and test changes. Claude and Codex
+          model IDs must match their model selector.
+        </p>
+        <label class="attention-setting">
+          <input
+            type="checkbox"
+            checked={snapshot?.crossValidation.strictDifferentModel ?? false}
+            onchange={(event) =>
+              snapshot &&
+              send({
+                type: 'cross-validation',
+                value: {
+                  ...snapshot.crossValidation,
+                  strictDifferentModel: event.currentTarget.checked,
+                },
+              })}
+          />
+          Require a model different from every implementation model
+        </label>
+        {#each snapshot?.crossValidation.choices ?? [] as choice (`${choice.agent}:${choice.model}`)}
+          <p class="runtime-binary">
+            <strong>{choice.agent} · {choice.model}</strong>
+            {#if validationReason(choice)}<span role="status">
+                — {validationReason(choice)}</span
+              >{:else}<span> — agent available; model verified at gate</span>{/if}
+            <Button size="sm" onclick={() => removeValidationChoice(choice)}>Remove</Button>
+          </p>
+        {:else}<p role="status">No cross-validation models selected. Gates will pause.</p>{/each}
+        <label for="validation-agent">Agent</label>
+        <select id="validation-agent" bind:value={validationAgent}>
+          <option value="">Select an agent</option>
+          {#each snapshot?.agents ?? [] as agent (agent.id)}<option value={agent.id}
+              >{agent.name}</option
+            >{/each}
+          <option value="opencode">OpenCode</option>
+        </select>
+        <label for="validation-model">Model ID</label>
+        <input
+          id="validation-model"
+          type="text"
+          bind:value={validationModel}
+          list="validation-models"
+          placeholder={validationAgent === 'opencode' ? 'provider:model' : 'Exact model ID'}
+        />
+        <datalist id="validation-models">
+          {#if validationAgent === 'opencode'}
+            {#each snapshot?.setup?.models ?? [] as model (`${model.providerID}:${model.id}`)}
+              <option value={`${model.providerID}:${model.id}`}>{model.name}</option>
+            {/each}
+          {/if}
+        </datalist>
+        <Button
+          size="sm"
+          disabled={!validationAgent || !validationModel.trim()}
+          onclick={addValidationChoice}>Add model</Button
+        >
       </section>
       <section class="settings-card hook-inspector">
         <h2>Configured hooks and plugins</h2>

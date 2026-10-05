@@ -441,6 +441,131 @@ describe('provider selected agent spawn', () => {
     expect(JSON.parse(unavailable.content[0].text)).toMatchObject({ state: 'unavailable' });
   });
 
+  it('routes MCP validation gates and enforces strict model selection', async () => {
+    const path = realpathSync(repository);
+    const settings = JSON.stringify({
+      choices: [
+        { agent: 'claude', model: 'broken' },
+        { agent: 'claude', model: 'test' },
+        { agent: 'claude', model: 'fast' },
+      ],
+      strictDifferentModel: true,
+    });
+    await browser.execute((value) => localStorage.setItem('sai-cross-validation', value), settings);
+    await browser.tauri.execute(
+      async ({ core }, value) =>
+        core.invoke('save_setting', { key: 'sai-cross-validation', value }),
+      settings,
+    );
+    await browser.refresh();
+    await expect($('.agent-launches button')).toBeEnabled();
+    const saved = await browser.execute(() => localStorage.getItem('sail-agent-threads'));
+    const sourceThread = z
+      .array(agentThread)
+      .parse(JSON.parse(saved ?? '[]'))
+      .find((thread) => thread.directory === path && thread.title === 'Clipboard fixture source');
+    if (!sourceThread) throw new Error('Source thread was not restored');
+    const config = await browser.tauri.execute(
+      async ({ core }, input) => core.invoke<McpConfig>('browser_mcp_config', input),
+      { directory: path, agent: sourceThread.agent },
+    );
+    const result = await callMcp(
+      config,
+      sourceThread.sessionId,
+      {
+        gate: 'code-adversary',
+        prompt: 'Clipboard fixture validation gate',
+        implementingModels: ['test'],
+      },
+      'validation_gate',
+    );
+    expect(result.isError).not.toBe(true);
+    const started = z
+      .object({ receiptId: z.string(), accessKey: z.string(), threadId: z.string() })
+      .passthrough()
+      .parse(JSON.parse(result.content[0].text));
+    expect(started).toMatchObject({
+      status: 'started',
+      provider: 'claude',
+      model: 'fast',
+      gate: 'code-adversary',
+      path,
+    });
+    expect(started.threadId).not.toBe(`acp:${sourceThread.agent}:${sourceThread.sessionId}`);
+    const completed = await callMcp(
+      config,
+      sourceThread.sessionId,
+      { receiptId: started.receiptId, accessKey: started.accessKey, timeoutMs: 10_000 },
+      'agent_wait',
+    );
+    expect(completed.isError).not.toBe(true);
+    expect(JSON.parse(completed.content[0].text)).toMatchObject({ state: 'completed' });
+    const rejected = await callMcp(
+      config,
+      sourceThread.sessionId,
+      {
+        gate: 'findings-adversary',
+        prompt: 'Clipboard fixture strict gate',
+        implementingModels: ['test', 'fast'],
+      },
+      'validation_gate',
+    );
+    expect(rejected.isError).toBe(true);
+    expect(rejected.content[0].text).toContain('Strict different-model routing is enabled');
+    await browser.execute(() =>
+      localStorage.setItem(
+        'sai-cross-validation',
+        JSON.stringify({
+          choices: [
+            { agent: 'claude', model: 'test' },
+            { agent: 'claude', model: 'fast' },
+          ],
+          strictDifferentModel: false,
+        }),
+      ),
+    );
+    await browser.refresh();
+    await expect($('.agent-launches button')).toBeEnabled();
+    const dispatchFailure = await callMcp(
+      config,
+      sourceThread.sessionId,
+      {
+        gate: 'test-adversary',
+        prompt: 'Gate prompt model unavailable',
+        implementingModels: [],
+      },
+      'validation_gate',
+    );
+    if (dispatchFailure.isError) {
+      expect(dispatchFailure.content[0].text).toContain('Model x is unavailable');
+    } else {
+      const receipt = z
+        .object({ receiptId: z.string(), accessKey: z.string() })
+        .parse(JSON.parse(dispatchFailure.content[0].text));
+      const outcome = await callMcp(
+        config,
+        sourceThread.sessionId,
+        {
+          ...receipt,
+          timeoutMs: 10_000,
+        },
+        'agent_wait',
+      );
+      expect(JSON.parse(outcome.content[0].text)).toMatchObject({
+        state: 'failed',
+        error: expect.stringContaining('Model x is unavailable'),
+      });
+    }
+    const savedReceipts = await browser.execute(() =>
+      localStorage.getItem('sai-agent-spawn-receipts'),
+    );
+    const attempts = z
+      .array(z.object({ prompt: z.string().nullable().optional() }))
+      .parse(JSON.parse(savedReceipts ?? '[]'))
+      .filter((receipt) => receipt.prompt === 'Gate prompt model unavailable');
+    expect(attempts).toHaveLength(1);
+  });
+
   it('reports setup failure without creating an agent thread', async () => {
     const path = realpathSync(repository);
     mkdirSync(join(repository, '.sail'), { recursive: true });

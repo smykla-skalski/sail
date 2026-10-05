@@ -18,6 +18,9 @@ browser. Read the tool schemas before calling them.
 - Use `agent_spawn` to start Claude, Codex, or OpenCode. The default target is a
   new worktree; an existing target shares files and can require user approval.
   Use `worktree_create` when the user should choose a new worktree in Sail.
+- Use `validation_gate` for each Ship It review or test pass. Pass the gate name,
+  prompt, and every implementation model. It selects an allowed model and starts
+  a fresh session in this worktree. Wait for its receipt before the next pass.
 - Keep the `receiptId` and `accessKey` returned by `agent_spawn` together. Pass
   both to `agent_status`, `agent_wait`, or `agent_result`. Wait for completion
   before relying on another agent's work.
