@@ -27,6 +27,7 @@
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import type { PublishedGraph } from './lib/issue-graph';
   import type { ShipRun } from './lib/issue-shipping';
+  import type { ShipItIssue } from './lib/implementation-models';
   import { threadKey } from './lib/recent-threads';
   import { getPlan, getHistory, type PlanSnapshot, type HistoryEntry } from './lib/plan';
   import { annotateDiffs } from './lib/diff';
@@ -61,6 +62,7 @@
       limit: number,
       source: string,
     ) => Promise<void>;
+    onshipit: (issue: ShipItIssue, directory: string, threadId: string) => Promise<void>;
     postTurnChecks: PostTurnCheck[];
     onretrycheck: (check: PostTurnCheck) => void;
     agentUsage: Record<string, AgentUsage>;
@@ -126,6 +128,7 @@
     onshipopen,
     onshipsettings,
     onship,
+    onshipit,
     postTurnChecks,
     onretrycheck,
     agentUsage,
@@ -410,6 +413,7 @@
       {onshipopen}
       {onshipsettings}
       {onship}
+      {onshipit}
       {postTurnChecks}
       {onretrycheck}
       {agentUsage}
@@ -497,6 +501,7 @@
       {onshipopen}
       {onshipsettings}
       {onship}
+      {onshipit}
       {postTurnChecks}
       {onretrycheck}
       {agentUsage}
@@ -693,6 +698,7 @@
               }}
               {onusage}
               {onstatus}
+              {onshipit}
             />
             {#if nativeDetailsVisible}
               <section class="native-details side-area" aria-label="OpenCode session details">
@@ -822,6 +828,7 @@
               {onstatus}
               {onreplaychange}
               onterminal={onagentterminal}
+              {onshipit}
             />
             {#if changesPanes.includes(pane.id)}
               <section class="native-details side-area" aria-label="Agent details">

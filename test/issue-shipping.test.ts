@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  adoptDirectShipRun,
   createShipRun,
   readyShipIssues,
   shipIssueStatus,
   shippingWorkerSettled,
   shippingSetupAction,
 } from '../src/lib/issue-shipping.ts';
+import { shipOwner } from '../src/lib/ship-progress.ts';
 import type { PublishedGraph } from '../src/lib/issue-graph.ts';
 
 const graph: PublishedGraph = {
@@ -126,6 +128,40 @@ void test('approved snapshot survives serialization and does not expand to new i
   assert.equal(JSON.parse(JSON.stringify(shipping)).issues.length, 3);
   graph.issues.pop();
   assert.equal(shipping.issues[0].branch, 'ship-issue-11-run-id-1');
+});
+
+void test('adopts an already-running direct Ship It thread', () => {
+  const adopted = adoptDirectShipRun([], {
+    id: 'direct-run',
+    directory: '/repo/worktrees/gateway-fix',
+    repository: 'kumahq/kuma',
+    number: 18976,
+    provider: 'codex',
+    threadId: 'acp:codex:running-thread',
+    approvedAt: 100,
+  });
+
+  const issue = adopted[0].issues[0];
+  assert.equal(adopted[0].remote, 'kumahq/kuma');
+  assert.equal(issue.url, 'https://github.com/kumahq/kuma/issues/18976');
+  assert.equal(issue.state, 'working');
+  assert.equal(issue.stage, 'implementing');
+  assert.equal(shipOwner(adopted, '/repo/worktrees/gateway-fix', 'acp:codex:running-thread')?.issue, issue);
+});
+
+void test('does not duplicate a recovered direct Ship It thread', () => {
+  const input = {
+    id: 'direct-run',
+    directory: '/repo/worktrees/gateway-fix',
+    repository: 'kumahq/kuma',
+    number: 18976,
+    provider: 'codex' as const,
+    threadId: 'acp:codex:running-thread',
+    approvedAt: 100,
+  };
+  const adopted = adoptDirectShipRun([], input);
+
+  assert.equal(adoptDirectShipRun(adopted, { ...input, id: 'second-run' }), adopted);
 });
 
 void test('external blocker waits until GitHub reports it closed', () => {

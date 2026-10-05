@@ -47,6 +47,16 @@ export type ImplementationTurn = {
   owner: string | undefined;
   peers: Set<ImplementationTurn>;
 };
+
+export type ShipItIssue = {
+  repository: string;
+  number: number;
+};
+
+export function savedShipItIssue(directory: string): ShipItIssue | null {
+  const match = /^([^#]+)#([1-9]\d*)$/.exec(getSetting(runKey(directory)) ?? '');
+  return match ? { repository: match[1], number: Number(match[2]) } : null;
+}
 const activeTurns = new Map<string, Set<ImplementationTurn>>();
 
 export async function beginImplementationTurn(
@@ -139,14 +149,17 @@ export async function activeImplementationModels(
     : null;
 }
 
-export async function beginShipItRun(directory: string, prompt: string): Promise<void> {
+export async function beginShipItRun(
+  directory: string,
+  prompt: string,
+): Promise<ShipItIssue | null> {
   const firstLine = prompt.split('\n')[0].trim();
-  if (!/^\/ship-it(?:\s|$)/i.test(firstLine)) return;
+  if (!/^\/ship-it(?:\s|$)/i.test(firstLine)) return null;
   const issue =
     /^\/ship-it\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
       firstLine,
     )?.[1];
-  if (!issue) return;
+  if (!issue) return null;
   const canonical = async (reference: string): Promise<string> => {
     const number = Number(reference.match(/\d+$/)![0]);
     if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Choose an issue.');
@@ -163,6 +176,8 @@ export async function beginShipItRun(directory: string, prompt: string): Promise
   if (previous && previous !== identity)
     throw new Error(`This worktree tracks ${previous}. Start ${identity} in a new worktree.`);
   setSetting(runKey(directory), identity);
+  const [repository, number] = identity.split('#');
+  return { repository, number: Number(number) };
 }
 
 export function implementationModels(directory: string): string[] {

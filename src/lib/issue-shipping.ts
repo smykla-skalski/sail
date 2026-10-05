@@ -49,6 +49,63 @@ export interface ShipRun {
   umbrella?: { number: number; title: string; url: string };
 }
 
+export type DirectShipRunInput = {
+  id: string;
+  directory: string;
+  repository: string;
+  number: number;
+  provider: ShipRun['provider'];
+  threadId: string;
+  approvedAt: number;
+};
+
+export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): ShipRun[] {
+  if (
+    runs.some((run) =>
+      run.issues.some(
+        (issue) => issue.path === input.directory && issue.threadId === input.threadId,
+      ),
+    )
+  )
+    return runs;
+  return [
+    ...runs,
+    {
+      id: input.id,
+      source: `direct:${input.threadId}`,
+      repository: input.directory,
+      remote: input.repository,
+      provider: input.provider,
+      limit: 1,
+      approvedAt: input.approvedAt,
+      externalClosed: {},
+      issues: [
+        {
+          id: `${input.repository}#${input.number}`,
+          number: input.number,
+          url: `https://github.com/${input.repository}/issues/${input.number}`,
+          title: `Issue #${input.number}`,
+          dependsOn: [],
+          state: 'working',
+          branch: '',
+          path: input.directory,
+          receiptId: null,
+          threadId: input.threadId,
+          pullRequest: null,
+          workerSettled: false,
+          error: null,
+          stage: 'implementing',
+          events: [{ at: input.approvedAt, stage: 'implementing' }],
+        },
+      ],
+    },
+  ];
+}
+
+export function isDirectShipRun(run: ShipRun): boolean {
+  return run.source.startsWith('direct:');
+}
+
 export function shippingWorkerSettled(state: SpawnState): boolean {
   return ['completed', 'failed', 'interrupted'].includes(state);
 }

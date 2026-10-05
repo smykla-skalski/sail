@@ -27,6 +27,8 @@
     beginImplementationTurn,
     beginShipItRun,
     recordImplementationModel,
+    savedShipItIssue,
+    type ShipItIssue,
   } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import PromptPanel from './PromptPanel.svelte';
@@ -71,6 +73,7 @@
     onactivity,
     onstatus,
     onusage,
+    onshipit,
   }: {
     client: OpenCodeClient | null;
     directory: string;
@@ -91,6 +94,7 @@
     onactivity: (thread: AgentThread) => void;
     onstatus: (thread: AgentThread, status: ThreadStatus, notifyOnDone?: boolean) => void;
     onusage?: (sessionID: string, context: number | undefined) => void;
+    onshipit?: (issue: ShipItIssue, directory: string, threadId: string) => Promise<void>;
   } = $props();
 
   let session = $state<SessionInfo | null>(null);
@@ -107,6 +111,19 @@
   const failureRequests = new SvelteMap<string, string>();
   let skills = $state<SkillChoice[]>(bundledSkills);
   let skillSelected = $state(0);
+  const adoptedShipMessages = new Set<string>();
+  $effect(() => {
+    if (!onshipit || !activeID || !running) return;
+    const saved = savedShipItIssue(directory);
+    if (saved) void onshipit(saved, directory, `opencode:${activeID}`);
+    for (const message of messages) {
+      if (message.type !== 'user' || adoptedShipMessages.has(message.id)) continue;
+      adoptedShipMessages.add(message.id);
+      void beginShipItRun(directory, message.text)
+        .then((issue) => (issue ? onshipit(issue, directory, `opencode:${activeID}`) : undefined))
+        .catch(() => {});
+    }
+  });
   const skillMenuId = crypto.randomUUID();
   const skillMatches = $derived(matchingSkills(skills, draft));
   $effect(() => {
@@ -443,8 +460,9 @@
     const text = (externalText ?? draft).trim();
     const turnDirectory = directory;
     const current = generation;
+    let shipIssue: ShipItIssue | null;
     try {
-      await beginShipItRun(turnDirectory, text);
+      shipIssue = await beginShipItRun(turnDirectory, text);
     } catch (cause) {
       error = describe(cause);
       return;
@@ -496,6 +514,7 @@
         session = info;
         oncreated(summary(info));
       }
+      if (shipIssue && id) await onshipit?.(shipIssue, turnDirectory, `opencode:${id}`);
       running = true;
       if (session) onstatus(summary(session), 'working');
       const promptRequest = runSerialOpenCodeTurn(id, async () => {

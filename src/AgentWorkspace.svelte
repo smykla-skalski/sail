@@ -32,6 +32,8 @@
     beginImplementationTurn,
     beginShipItRun,
     recordImplementationModel,
+    savedShipItIssue,
+    type ShipItIssue,
   } from './lib/implementation-models';
   import {
     agentQueuePaused,
@@ -110,6 +112,7 @@
     spawnReceipts?: SpawnReceipt[];
     postTurnChecks?: PostTurnCheck[];
     onretrycheck?: (check: PostTurnCheck) => void;
+    onshipit?: (issue: ShipItIssue, directory: string, threadId: string) => Promise<void>;
   }
   let {
     agent,
@@ -139,6 +142,7 @@
     spawnReceipts = [],
     postTurnChecks = [],
     onretrycheck = () => {},
+    onshipit,
   }: Props = $props();
   let mounted = $state(false);
   let ready = $state(false);
@@ -163,6 +167,7 @@
       });
   });
   let queued = $state<QueuedAgentMessage[]>([]);
+  const adoptedShipMessages = new Set<string>();
   let queuePaused = $state(false);
   let steering = $state(false);
   function diagnostic(event: DiagnosticEvent, sessionId = activeSessionId, turnId = activeTurnId) {
@@ -180,6 +185,20 @@
     diagnostic('queue_dispatch_started');
     if (activeSessionId) saveQueuedAgentMessages(agent, directory, activeSessionId, queued);
     void send(next.text, next);
+  });
+  $effect(() => {
+    if (ephemeral || !activeSessionId || !onshipit || (!busy && !running)) return;
+    const saved = savedShipItIssue(directory);
+    if (saved) void onshipit(saved, directory, `acp:${agent}:${activeSessionId}`);
+    for (const entry of entries) {
+      if (entry.type !== 'user' || adoptedShipMessages.has(entry.id)) continue;
+      adoptedShipMessages.add(entry.id);
+      void beginShipItRun(directory, entry.text)
+        .then((issue) =>
+          issue ? onshipit(issue, directory, `acp:${agent}:${activeSessionId}`) : undefined,
+        )
+        .catch(() => {});
+    }
   });
 
   function updateSkills(value: unknown[]) {
@@ -833,8 +852,9 @@
     const text =
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
+    let shipIssue: ShipItIssue | null;
     try {
-      await beginShipItRun(directory, text);
+      shipIssue = await beginShipItRun(directory, text);
     } catch (cause) {
       error = describe(cause);
       return;
@@ -906,6 +926,8 @@
         onactivity({ ...activityThread, model: modelOption?.currentValue || activityThread.model });
       const id = activityThread?.sessionId ?? activeSessionId;
       deliverySessionId = id;
+      if (shipIssue && id && !ephemeral)
+        await onshipit?.(shipIssue, turnDirectory, `acp:${turnAgent}:${id}`);
       if (stopRequested) {
         notifyOnDone = false;
         if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');

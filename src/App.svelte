@@ -39,13 +39,16 @@
   } from './lib/ship-progress';
   import type { PublishedGraph } from './lib/issue-graph';
   import {
+    adoptDirectShipRun as createDirectShipRun,
     createShipRun,
+    isDirectShipRun,
     readyShipIssues,
     shippingWorkerSettled,
     shippingSetupAction,
     type ShipIssue,
     type ShipRun,
   } from './lib/issue-shipping';
+  import type { ShipItIssue } from './lib/implementation-models';
   import DiffPanel from './DiffPanel.svelte';
   import HistoryPanel from './HistoryPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
@@ -84,6 +87,7 @@
     implementationAttributionUncertain,
     implementationModels,
     recoverImplementationModels,
+    savedShipItIssue,
     settledImplementationAttribution,
     recordImplementationModel,
   } from './lib/implementation-models';
@@ -737,6 +741,7 @@
     if (!side.parentThreadId && thread) sideChat = { ...side, parentThreadId: thread.sessionId };
   });
   let messages = $state<SessionMessageInfo[]>([]);
+  const adoptedDirectMessages = new Set<string>();
   let olderMessageCursor = $state<string | null>(null);
   let loadingOlder = $state(false);
   let restoringTimelineSelection: number | null = null;
@@ -1146,6 +1151,22 @@
   let chatMessages = $derived(
     messages.filter((message) => message.type === 'user' || message.type === 'assistant'),
   );
+  $effect(() => {
+    if (!sessionID || !running) return;
+    const saved = savedShipItIssue(directory);
+    if (saved) void adoptDirectShipRun(saved, directory, `opencode:${sessionID}`);
+    for (const message of messages) {
+      if (message.type !== 'user') continue;
+      const key = `${sessionID}:${message.id}`;
+      if (adoptedDirectMessages.has(key)) continue;
+      adoptedDirectMessages.add(key);
+      void beginShipItRun(directory, message.text)
+        .then((issue) =>
+          issue ? adoptDirectShipRun(issue, directory, `opencode:${sessionID}`) : undefined,
+        )
+        .catch(() => {});
+    }
+  });
   const displayChatMessages = $derived(
     withSpawnResponses(
       chatMessages,
@@ -1869,6 +1890,36 @@
     void tickShippingRuns();
   }
 
+  async function adoptDirectShipRun(
+    issue: ShipItIssue,
+    path: string,
+    threadId: string,
+  ): Promise<void> {
+    const provider: ShipRun['provider'] = threadId.startsWith('opencode:')
+      ? 'opencode'
+      : threadId.startsWith('acp:claude:')
+        ? 'claude'
+        : 'codex';
+    const adopted = createDirectShipRun(shipRuns, {
+      id: crypto.randomUUID(),
+      directory: path,
+      repository: issue.repository,
+      number: issue.number,
+      provider,
+      threadId,
+      approvedAt: Date.now(),
+    });
+    if (adopted === shipRuns) return;
+    shipRuns = adopted;
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      shipRuns = shipRuns.filter((run) => run.id !== adopted.at(-1)!.id);
+      throw cause;
+    }
+    showShipRuns();
+  }
+
   async function launchShipIssue(run: ShipRun, issue: ShipIssue): Promise<void> {
     const receiptId = crypto.randomUUID();
     await updateShipIssue(run, issue, { state: 'starting', receiptId });
@@ -2005,6 +2056,7 @@
       }),
     );
     issue.gates = reconciledShipGates(issue, spawnReceipts);
+    if (isDirectShipRun(run)) return;
     try {
       const closed = await invoke<boolean>('shipping_dependency_closed', {
         repository: run.repository,
@@ -7851,8 +7903,9 @@
     const requestedAgent = selectedAgentID || undefined;
     const queueTurn = running;
     const sourceSkills = skills;
+    let shipIssue: ShipItIssue | null;
     try {
-      await beginShipItRun(path, text);
+      shipIssue = await beginShipItRun(path, text);
     } catch (cause) {
       error = describe(cause);
       return;
@@ -7897,6 +7950,7 @@
         });
         if (current === selection && path === directory) await refreshSessions();
       }
+      if (shipIssue && id) await adoptDirectShipRun(shipIssue, path, `opencode:${id}`);
       if (current === selection && path === directory) {
         running = true;
         activity = 'Thinking';
@@ -8609,6 +8663,7 @@
                 onstatus={updateAgentThreadStatus}
                 onreplaychange={setAgentReplay}
                 onterminal={(id) => void openAgentTerminal(id)}
+                onshipit={adoptDirectShipRun}
                 postTurnChecks={postTurnResults.filter(
                   (check) =>
                     acpThread &&
@@ -9040,6 +9095,7 @@
       onshipopen={openShipTarget}
       onshipsettings={openSettings}
       onship={(graph, provider, limit, source) => startShippingRun(graph, provider, limit, source)}
+      onshipit={adoptDirectShipRun}
       postTurnChecks={postTurnResults}
       onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
       {agentUsage}
