@@ -1865,6 +1865,8 @@
       return;
     }
     if (pr?.state === 'CLOSED') {
+      const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+      if (receipt && !receiptIsSettled(receipt.state)) await currentSpawnReceipt(receipt);
       await updateShipIssue(run, issue, {
         state: 'failed',
         error: 'Pull request closed without merging.',
@@ -1873,6 +1875,7 @@
     }
     const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
     if (issue.state === 'failed') {
+      if (receipt && !receiptIsSettled(receipt.state)) await currentSpawnReceipt(receipt);
       if (
         issue.error === 'Worker finished without a pull request. Inspect its thread.' &&
         receipt?.state === 'completed' &&
@@ -1934,7 +1937,12 @@
         .map((dependency) => refreshShippingDependency(run, dependency)),
     );
     await Promise.all(run.issues.map((issue) => refreshShippingIssue(run, issue)));
-    for (const issue of readyShipIssues(run)) scheduleShipLaunch(run, issue);
+    const unsettledReceiptIds = new Set(
+      spawnReceipts
+        .filter((receipt) => !receiptIsSettled(receipt.state))
+        .map((receipt) => receipt.receiptId),
+    );
+    for (const issue of readyShipIssues(run, unsettledReceiptIds)) scheduleShipLaunch(run, issue);
   }
 
   async function tickShippingRuns(): Promise<void> {

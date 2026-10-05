@@ -86,6 +86,17 @@ void test('failed dependency pauses only its dependent', () => {
   );
 });
 
+void test('failed issue keeps its slot while its worker is unsettled', () => {
+  const shipping = run(1);
+  shipping.issues[0].state = 'failed';
+  shipping.issues[0].receiptId = 'live-worker';
+  assert.deepEqual(readyShipIssues(shipping, new Set(['live-worker'])), []);
+  assert.deepEqual(
+    readyShipIssues(shipping, new Set()).map((issue) => issue.id),
+    ['second'],
+  );
+});
+
 void test('approved snapshot survives serialization and does not expand to new issues', () => {
   const shipping = run();
   graph.issues.push({ ...graph.issues[0], id: 'later', number: 14 });

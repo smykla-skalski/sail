@@ -82,7 +82,10 @@ export function createShipRun(
   };
 }
 
-export function readyShipIssues(run: ShipRun): ShipIssue[] {
+export function readyShipIssues(
+  run: ShipRun,
+  unsettledReceiptIds: ReadonlySet<string> = new Set(),
+): ShipIssue[] {
   const aliases = new Map<string, ShipIssue>();
   for (const issue of run.issues) {
     aliases.set(issue.id, issue);
@@ -92,6 +95,7 @@ export function readyShipIssues(run: ShipRun): ShipIssue[] {
   const active = run.issues.filter(
     (issue) =>
       ['starting', 'working'].includes(issue.state) ||
+      (issue.receiptId !== null && unsettledReceiptIds.has(issue.receiptId)) ||
       (issue.state === 'merged' &&
         issue.workerSettled !== true &&
         (!!issue.path || issue.workerSettled === false)),
