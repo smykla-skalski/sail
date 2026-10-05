@@ -83,7 +83,7 @@ describe('native Ship run history', () => {
           number: 42,
           url: 'https://github.com/fixture/repo/issues/42',
           title: 'Dependent fixture',
-          dependsOn: ['first'],
+          dependsOn: ['first', 'owner/repo#123'],
           state: 'pending',
           branch: 'second',
           path: null,
@@ -134,6 +134,14 @@ describe('native Ship run history', () => {
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('1 / 3 merged'));
     await expect($('.ship-panel')).toHaveText(expect.stringContaining('Umbrella #40'));
     await expect($('.ship-graph')).toHaveText(expect.stringContaining('Blocked'));
+    await expect(
+      $('.ship-graph a[href="https://github.com/owner/repo/issues/123"]'),
+    ).toBeDisplayed();
+    await $('.ship-node:nth-child(2) .ship-node-select').click();
+    await expect(
+      $('.ship-issue-detail a[href="https://github.com/owner/repo/issues/123"]'),
+    ).toBeDisplayed();
+    await $('.ship-node:first-child .ship-node-select').click();
     await expect($('.ship-issue-detail')).toHaveText(
       expect.stringContaining('model-implementation'),
     );

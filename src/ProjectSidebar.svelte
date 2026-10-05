@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { checkState } from './lib/pull-request-checks';
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import PathPicker from './PathPicker.svelte';
@@ -262,23 +263,6 @@
     return thread.agent === 'opencode'
       ? 'OpenCode'
       : (agents.find((agent) => agent.id === thread.agent)?.name ?? thread.agent);
-  }
-
-  function checkState(check: PullRequestCheck) {
-    if (
-      [
-        'FAILURE',
-        'ERROR',
-        'TIMED_OUT',
-        'CANCELLED',
-        'ACTION_REQUIRED',
-        'STALE',
-        'STARTUP_FAILURE',
-      ].includes(check.state)
-    )
-      return 'failing';
-    if (['SUCCESS', 'EXPECTED', 'NEUTRAL', 'SKIPPED'].includes(check.state)) return 'passing';
-    return 'pending';
   }
 
   function hasActionsLog(url: string) {

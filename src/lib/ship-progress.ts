@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import type { ShipIssue, ShipRun } from './issue-shipping';
 import type { SpawnReceipt, SpawnState } from './agent-results';
+import { shippingWorkerSettled } from './issue-shipping.ts';
+import { checkState } from './pull-request-checks.ts';
 
 export const gateNames = ['code-adversary', 'findings-adversary', 'test-adversary'] as const;
 export type GateName = (typeof gateNames)[number];
@@ -15,6 +17,12 @@ export const stages = [
 export const verdicts = ['CLEAN', 'NEEDS_FIXES', 'PASS', 'FAIL', 'BLOCKED'] as const;
 export type GateVerdict = (typeof verdicts)[number];
 export type ShipCheck = { name: string; state: string; url: string };
+export type ShippingPullRequest = {
+  url: string;
+  state: string;
+  mergedAt: string | null;
+  checks: ShipCheck[];
+};
 export type ShipEvent = { at: number; stage: string; reason?: string };
 export type GateMetadata = {
   gate: GateName;
@@ -99,6 +107,51 @@ export function dependencyIssue(run: ShipRun, reference: string): ShipIssue | un
   );
 }
 
+export function dependencyUrl(remote: string, reference: string): string | undefined {
+  const match = /^(?:([\w.-]+\/[\w.-]+)#|#)?([1-9]\d*)$/.exec(reference);
+  if (!match || !/^[\w.-]+\/[\w.-]+$/.test(match[1] ?? remote)) return undefined;
+  return `https://github.com/${match[1] ?? remote}/issues/${match[2]}`;
+}
+
+export function shipGatesSettled(issue: ShipIssue): boolean {
+  return (issue.gates ?? []).every((gate) => shippingWorkerSettled(gate.state));
+}
+
+export function refreshedPullRequest(
+  issue: ShipIssue,
+  pr: ShippingPullRequest | null,
+): Partial<ShipIssue> {
+  if (!pr)
+    return {
+      refreshError: issue.pullRequest ? 'Known pull request was not returned by GitHub.' : null,
+      refreshedAt: Date.now(),
+    };
+  return {
+    pullRequest: pr.url,
+    checks: pr.checks,
+    refreshError: null,
+    refreshedAt: Date.now(),
+    ...(pr.mergedAt ? { state: 'merged', error: null, blockedReason: null } : {}),
+  };
+}
+
+export async function settleShipRefresh(refreshes: Promise<void>[]): Promise<void> {
+  const results = await Promise.allSettled(refreshes);
+  const failure = results.find((result) => result.status === 'rejected');
+  if (failure) throw failure.reason;
+}
+
+export async function persistShipRefresh(
+  refreshes: Promise<void>[],
+  persist: () => Promise<void>,
+): Promise<void> {
+  try {
+    await settleShipRefresh(refreshes);
+  } finally {
+    await persist();
+  }
+}
+
 const closedBeforeLaunch = 'Issue closed before its worker launched.';
 
 export function refreshedIssueState(issue: ShipIssue, closed: boolean): Partial<ShipIssue> {
@@ -139,16 +192,8 @@ export function shipStatus(run: ShipRun, issue: ShipIssue): string {
 export function ciStatus(checks: ShipCheck[] | undefined): string {
   if (!checks) return 'Unknown';
   if (!checks.length) return 'No checks';
-  if (
-    checks.some((check) =>
-      ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STALE'].includes(
-        check.state,
-      ),
-    )
-  )
-    return 'Failed';
-  if (checks.some((check) => !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.state)))
-    return 'Pending';
+  if (checks.some((check) => checkState(check) === 'failing')) return 'Failed';
+  if (checks.some((check) => checkState(check) === 'pending')) return 'Pending';
   return 'Passed';
 }
 

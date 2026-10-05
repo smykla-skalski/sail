@@ -1,4 +1,28 @@
 import process from 'node:process';
+import { isAbsolute, join } from 'node:path';
+
+export function isolatedPaths(
+  state: string,
+  attach: boolean,
+  env: Record<string, string | undefined>,
+) {
+  return Object.fromEntries(
+    Object.entries({
+      SAIL_WORKTREE_ROOT: 'worktrees',
+      SAIL_E2E_CONFIG_DIR: 'config',
+      XDG_CONFIG_HOME: 'config',
+      XDG_DATA_HOME: 'data',
+      XDG_CACHE_HOME: 'cache',
+      XDG_STATE_HOME: 'state',
+    }).map(([name, directory]) => {
+      if (!attach) return [name, join(state, directory)];
+      const value = env[name];
+      if (!value || !isAbsolute(value))
+        throw new Error(`Attach mode requires an explicit private ${name}.`);
+      return [name, value];
+    }),
+  );
+}
 
 export function privatePort(value: string | undefined): number {
   if (!value || !/^\d+$/.test(value))

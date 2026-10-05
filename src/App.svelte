@@ -28,6 +28,11 @@
     loadShipRuns,
     parseShipReport,
     refreshedIssueState,
+    refreshedPullRequest,
+    shipGatesSettled,
+    persistShipRefresh,
+    settleShipRefresh,
+    type ShippingPullRequest,
     shipOwner,
     validateGateVerdict,
   } from './lib/ship-progress';
@@ -1727,6 +1732,7 @@
     run: ShipRun,
     issue: ShipIssue,
     changes: Partial<ShipIssue>,
+    durable = true,
   ): Promise<void> {
     const current = run.issues.find((item) => item.id === issue.id);
     if (!current) return;
@@ -1736,6 +1742,7 @@
     if (changes.state && changes.state !== current.state)
       changes.events = appendShipEvent(current.events, changes.state, changes.error ?? undefined);
     Object.assign(current, changes);
+    if (!durable) return;
     try {
       await saveShipRuns();
     } catch (cause) {
@@ -1868,32 +1875,13 @@
         repository: run.repository,
         reference: dependency,
       });
-      if (run.externalClosed[dependency] !== closed) {
-        const previous = run.externalClosed[dependency];
-        run.externalClosed[dependency] = closed;
-        try {
-          await saveShipRuns();
-        } catch (cause) {
-          run.externalClosed[dependency] = previous;
-          setSetting('sai-ship-runs', JSON.stringify(shipRuns));
-          throw cause;
-        }
-      }
+      run.externalClosed[dependency] = closed;
     } catch (cause) {
       error = describe(cause);
-      if (run.externalClosed[dependency]) {
-        run.externalClosed[dependency] = false;
-        await saveShipRuns().catch((failure) => (error = describe(failure)));
-      }
+      run.externalClosed[dependency] = false;
     }
   }
 
-  type ShippingPullRequest = {
-    url: string;
-    state: string;
-    mergedAt: string | null;
-    checks: import('./lib/ship-progress').ShipCheck[];
-  };
   const shippingPullRequests = new SvelteMap<string, ShippingPullRequest | null>();
 
   async function refreshShippingPullRequest(run: ShipRun, issue: ShipIssue): Promise<void> {
@@ -1902,16 +1890,10 @@
         repository: run.repository,
         branch: issue.branch,
       });
-      shippingPullRequests.set(`${run.id}:${issue.id}`, pr);
-      await updateShipIssue(run, issue, {
-        pullRequest: pr?.url ?? issue.pullRequest,
-        checks: pr?.checks,
-        refreshError: null,
-        refreshedAt: Date.now(),
-        ...(pr?.mergedAt ? { state: 'merged' as const, error: null, blockedReason: null } : {}),
-      });
+      if (pr) shippingPullRequests.set(`${run.id}:${issue.id}`, pr);
+      await updateShipIssue(run, issue, refreshedPullRequest(issue, pr), false);
     } catch (cause) {
-      await updateShipIssue(run, issue, { refreshError: describe(cause) });
+      await updateShipIssue(run, issue, { refreshError: describe(cause) }, false);
     }
   }
 
@@ -1920,6 +1902,7 @@
     issue: ShipIssue,
     refreshCompleted = false,
   ): Promise<void> {
+    const update = (changes: Partial<ShipIssue>) => updateShipIssue(run, issue, changes, false);
     if (
       !refreshCompleted &&
       issue.state === 'merged' &&
@@ -1938,7 +1921,7 @@
         JSON.stringify(models) !== JSON.stringify(issue.models) ||
         modelUncertain !== issue.modelUncertain
       )
-        await updateShipIssue(run, issue, { models, modelUncertain });
+        await update({ models, modelUncertain });
     }
     await Promise.all(
       (issue.gates ?? []).map(async (gate) => {
@@ -1951,13 +1934,13 @@
         repository: run.repository,
         reference: String(issue.number),
       });
-      await updateShipIssue(run, issue, {
+      await update({
         ...refreshedIssueState(issue, closed),
         refreshError: null,
         refreshedAt: Date.now(),
       });
     } catch (cause) {
-      await updateShipIssue(run, issue, { refreshError: describe(cause) });
+      await update({ refreshError: describe(cause) });
       return;
     }
     if (issue.state !== 'pending') await refreshShippingPullRequest(run, issue);
@@ -1967,17 +1950,18 @@
       if (!issue.workerSettled) {
         const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
         if (!receipt) {
-          await updateShipIssue(run, issue, {
+          await update({
             error: 'Worker receipt is missing. Inspect its thread before cleanup.',
           });
           return;
         }
         if (!shippingWorkerSettled((await currentSpawnReceipt(receipt)).state)) return;
-        await updateShipIssue(run, issue, { workerSettled: true });
+        await update({ workerSettled: true });
       }
-      if (issue.path) {
+      if (issue.path && shipGatesSettled(issue)) {
         try {
           await updateShipIssue(run, issue, await settledImplementationAttribution(issue.path));
+          if (!shipGatesSettled(issue)) return;
           const archivePath = await invoke<string | null>('delete_worktree', {
             repository: run.repository,
             worktree: issue.path,
@@ -1987,7 +1971,7 @@
           saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
           await updateShipIssue(run, issue, { path: null, archivePath, error: null });
         } catch (cause) {
-          await updateShipIssue(run, issue, { error: `Cleanup: ${describe(cause)}` });
+          await update({ error: `Cleanup: ${describe(cause)}` });
         }
       }
       return;
@@ -1997,16 +1981,15 @@
     if (run.provider === 'opencode' && !client && ['starting', 'working'].includes(issue.state))
       return;
     const pr = shippingPullRequests.get(`${run.id}:${issue.id}`);
-    if (pr?.url && pr.url !== issue.pullRequest)
-      await updateShipIssue(run, issue, { pullRequest: pr.url });
+    if (pr?.url && pr.url !== issue.pullRequest) await update({ pullRequest: pr.url });
     if (pr?.mergedAt) {
-      await updateShipIssue(run, issue, { state: 'merged', error: null });
+      await update({ state: 'merged', error: null });
       return;
     }
     if (pr?.state === 'CLOSED') {
       const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
       if (receipt && !shippingWorkerSettled(receipt.state)) await currentSpawnReceipt(receipt);
-      await updateShipIssue(run, issue, {
+      await update({
         state: 'failed',
         error: 'Pull request closed without merging.',
       });
@@ -2020,7 +2003,7 @@
         receipt?.state === 'completed' &&
         pr?.url
       )
-        await updateShipIssue(run, issue, { state: 'awaiting_merge', error: null });
+        await update({ state: 'awaiting_merge', error: null });
       return;
     }
     if (issue.state === 'starting') {
@@ -2029,31 +2012,30 @@
           repository: run.repository,
           name: issue.branch,
         });
-        if (existing && issue.path !== existing.path)
-          await updateShipIssue(run, issue, { path: existing.path });
+        if (existing && issue.path !== existing.path) await update({ path: existing.path });
         scheduleShipLaunch(run, issue);
       } else {
         if (receipt.provider === 'opencode') await recoverShippingOpenCodePrompt(receipt);
         else await recoverShippingAcpPrompt(receipt);
-        await updateShipIssue(run, issue, { state: 'working', threadId: receipt.targetId });
+        await update({ state: 'working', threadId: receipt.targetId });
       }
     } else if (issue.state === 'working') {
       if (!receipt)
-        await updateShipIssue(run, issue, {
+        await update({
           state: 'failed',
           error: 'Worker receipt is missing. Inspect its thread.',
         });
       else {
         const current = await currentSpawnReceipt(receipt);
         if (current.state === 'completed') {
-          if (pr?.url) await updateShipIssue(run, issue, { state: 'awaiting_merge', error: null });
+          if (pr?.url) await update({ state: 'awaiting_merge', error: null });
           else if (Date.now() - current.updated > 60_000)
-            await updateShipIssue(run, issue, {
+            await update({
               state: 'failed',
               error: 'Worker finished without a pull request. Inspect its thread.',
             });
         } else if (['failed', 'interrupted'].includes(current.state))
-          await updateShipIssue(run, issue, {
+          await update({
             state: 'failed',
             error: current.error ?? `Worker ${current.state}.`,
           });
@@ -2075,9 +2057,12 @@
         .filter((dependency) => !aliases.has(dependency))
         .map((dependency) => refreshShippingDependency(run, dependency)),
     );
-    await Promise.all(
+    await settleShipRefresh(
       run.issues.map((issue) => refreshShippingIssue(run, issue, refreshCompleted)),
     );
+  }
+
+  function launchReadyShipIssues(run: ShipRun): void {
     const unsettledReceiptIds = new Set(
       spawnReceipts
         .filter((receipt) => !shippingWorkerSettled(receipt.state))
@@ -2090,7 +2075,11 @@
     if (shippingBusy || disposed || !isTauri() || !acpRecoveryReady) return;
     shippingBusy = true;
     try {
-      await Promise.all(shipRuns.map((run) => refreshShippingRun(run, refreshCompleted)));
+      await persistShipRefresh(
+        shipRuns.map((run) => refreshShippingRun(run, refreshCompleted)),
+        saveShipRuns,
+      );
+      for (const run of shipRuns) launchReadyShipIssues(run);
     } catch (cause) {
       error = describe(cause);
     } finally {

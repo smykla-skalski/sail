@@ -1,7 +1,13 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import type { ShipRun } from './lib/issue-shipping';
-  import { ciStatus, dependencyIssue, gateNames, shipStatus } from './lib/ship-progress';
+  import type { ShipIssue, ShipRun } from './lib/issue-shipping';
+  import {
+    ciStatus,
+    dependencyIssue,
+    dependencyUrl,
+    gateNames,
+    shipStatus,
+  } from './lib/ship-progress';
 
   let {
     open,
@@ -54,6 +60,23 @@
     dialog.querySelector<HTMLElement>('.ship-issue-detail')?.focus();
   }
 </script>
+
+{#snippet dependencies(owner: ShipRun, item: ShipIssue)}
+  {#if item.dependsOn.length}<div class="ship-dependencies">
+      <span>Depends on →</span>
+      {#each item.dependsOn as ref (ref)}
+        {@const dependency = dependencyIssue(owner, ref)}
+        {@const url = dependencyUrl(owner.remote, ref)}
+        {#if dependency}<button onclick={() => selectIssue(dependency.id)}
+            >#{dependency.number} · {shipStatus(owner, dependency)}</button
+          >
+        {:else if url}<a href={url} target="_blank" rel="noreferrer"
+            >{ref} · {owner.externalClosed[ref] ? 'Closed' : 'Waiting'}</a
+          >
+        {:else}<span>{ref} · {owner.externalClosed[ref] ? 'Closed' : 'Waiting'}</span>{/if}
+      {/each}
+    </div>{:else}<small>Independent issue</small>{/if}
+{/snippet}
 
 <dialog class="ship-panel" bind:this={dialog} {onclose} aria-labelledby="ship-title">
   <header>
@@ -129,16 +152,7 @@
                 >{shipStatus(run, item)}</span
               ></button
             >
-            {#if item.dependsOn.length}<div class="ship-dependencies">
-                <span>Depends on →</span>
-                {#each item.dependsOn as ref (ref)}
-                  {@const dependency = dependencyIssue(run, ref)}
-                  {#if dependency}<button onclick={() => selectIssue(dependency.id)}
-                      >#{dependency.number} · {shipStatus(run, dependency)}</button
-                    >
-                  {:else}<span>{ref} · {run.externalClosed[ref] ? 'Closed' : 'Waiting'}</span>{/if}
-                {/each}
-              </div>{:else}<small>Independent issue</small>{/if}
+            {@render dependencies(run, item)}
           </div>
         {/each}
       </nav>
@@ -189,6 +203,7 @@
             {issue.branch}
           </p>
           {#if issue.archivePath}<p class="ship-path">Archived files: {issue.archivePath}</p>{/if}
+          {@render dependencies(run, issue)}
           <h4>Implementation</h4>
           <p>Worker: {run.provider} / {issue.workerModel ?? 'Unknown model'}</p>
           <p>

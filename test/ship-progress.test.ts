@@ -4,6 +4,10 @@ import { createShipRun, readyShipIssues } from '../src/lib/issue-shipping.ts';
 import {
   appendShipEvent,
   ciStatus,
+  dependencyUrl,
+  shipGatesSettled,
+  refreshedPullRequest,
+  persistShipRefresh,
   gateSnapshot,
   loadShipRuns,
   parseShipReport,
@@ -192,6 +196,8 @@ for (const [states, expected] of [
   [['FAILURE', 'PENDING'], 'Failed'],
   [['CANCELLED'], 'Failed'],
   [['TIMED_OUT'], 'Failed'],
+  [['STARTUP_FAILURE'], 'Failed'],
+  [['EXPECTED', 'NEUTRAL'], 'Passed'],
   [['NEW_STATE'], 'Pending'],
 ] as const) {
   void test(`CI ${states?.join(',') ?? 'unknown'} displays ${expected}`, () => {
@@ -203,4 +209,120 @@ void test('repeated updates preserve history without duplicate events', () => {
   const events = appendShipEvent([], 'ci', 'Waiting for checks');
   assert.equal(appendShipEvent(events, 'ci', 'Waiting for checks').length, 1);
   assert.equal(appendShipEvent(events, 'ci', 'Check failed').length, 2);
+});
+
+void test('external dependencies link only recognized issue references', () => {
+  for (const [reference, expected] of [
+    ['123', 'https://github.com/a/b/issues/123'],
+    ['#123', 'https://github.com/a/b/issues/123'],
+    ['owner/repo#123', 'https://github.com/owner/repo/issues/123'],
+    ['other.node/repo-name#456', 'https://github.com/other.node/repo-name/issues/456'],
+    ['unknown-node', undefined],
+    ['javascript:alert(1)', undefined],
+    ['../../evil#3', undefined],
+    ['owner/repo#0', undefined],
+  ])
+    assert.equal(dependencyUrl('a/b', reference!), expected);
+});
+
+void test('merged cleanup waits for every gate, including unavailable or receipt-pruned gates', () => {
+  const issue = fixture().issues[0];
+  issue.state = 'merged';
+  issue.workerSettled = true;
+  const gate = {
+    id: 'gate',
+    gate: 'test-adversary' as const,
+    provider: 'claude',
+    model: 'test',
+    requestedModel: 'test',
+    threadId: 'thread',
+    directory: '/worktree',
+    created: 1,
+    updated: 1,
+    error: null,
+    state: 'completed' as const,
+  };
+  for (const state of ['queued', 'starting', 'working', 'waiting', 'unavailable'] as const) {
+    issue.gates = [gate, { ...gate, id: 'active', state }];
+    assert.equal(shipGatesSettled(issue), false);
+  }
+  issue.gates = [gate, { ...gate, id: 'failed', state: 'failed' }];
+  assert.equal(shipGatesSettled(issue), true);
+});
+
+void test('null PR lookup keeps durable PR and CI across restart until a real record arrives', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, {
+    state: 'awaiting_merge',
+    pullRequest: 'https://github.com/a/b/pull/4',
+    checks: [{ name: 'build', state: 'FAILURE', url: 'https://github.com/a/b/actions/runs/1' }],
+  });
+  Object.assign(issue, refreshedPullRequest(issue, null));
+  const restored = loadShipRuns(JSON.stringify([run]))[0].issues[0];
+  assert.equal(restored.pullRequest, issue.pullRequest);
+  assert.deepEqual(restored.checks, issue.checks);
+  assert.equal(restored.state, 'awaiting_merge');
+  assert.match(restored.refreshError!, /not returned/);
+  Object.assign(
+    restored,
+    refreshedPullRequest(restored, {
+      url: issue.pullRequest!,
+      state: 'OPEN',
+      mergedAt: null,
+      checks: [{ name: 'build', state: 'SUCCESS', url: issue.checks![0].url }],
+    }),
+  );
+  assert.equal(ciStatus(restored.checks), 'Passed');
+  assert.equal(restored.refreshError, null);
+});
+
+void test('polling commits all parallel issue updates once, after slow refreshes settle', async () => {
+  const slow = Promise.withResolvers<void>();
+  const updates: string[] = [];
+  const snapshots: string[][] = [];
+  const tick = persistShipRefresh(
+    [
+      Promise.resolve().then(() => {
+        updates.push('fast');
+        return undefined;
+      }),
+      slow.promise.then(() => {
+        updates.push('slow');
+        return undefined;
+      }),
+    ],
+    async () => {
+      snapshots.push([...updates]);
+    },
+  );
+  await Promise.resolve();
+  assert.deepEqual(snapshots, []);
+  slow.resolve();
+  await tick;
+  assert.deepEqual(snapshots, [['fast', 'slow']]);
+});
+
+void test('a rejected refresh drains remaining updates and flushes before reporting failure', async () => {
+  const slow = Promise.withResolvers<void>();
+  const updates: string[] = [];
+  let writes = 0;
+  const tick = persistShipRefresh(
+    [
+      Promise.reject(new Error('refresh failed')),
+      slow.promise.then(() => {
+        updates.push('last');
+        return undefined;
+      }),
+    ],
+    async () => {
+      assert.deepEqual(updates, ['last']);
+      writes += 1;
+    },
+  );
+  const failure = assert.rejects(tick, /refresh failed/);
+  assert.equal(writes, 0);
+  slow.resolve();
+  await failure;
+  assert.equal(writes, 1);
 });

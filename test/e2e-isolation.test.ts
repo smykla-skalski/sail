@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import process from 'node:process';
 import test from 'node:test';
-import { privatePort, PrivateEndpointGuard } from './e2e-isolation.ts';
+import { isolatedPaths, privatePort, PrivateEndpointGuard } from './e2e-isolation.ts';
 
 await test('private desktop runner rejects fallback and malformed ports without connecting', () => {
   for (const value of [undefined, '', '4445', '0', '1023', '65536', '50000junk', '5e4', '-1'])
@@ -32,5 +32,26 @@ await test('runner fails before service initialization when either endpoint diff
   } finally {
     if (saved === undefined) delete process.env.TAURI_WEBDRIVER_PORT;
     else process.env.TAURI_WEBDRIVER_PORT = saved;
+  }
+});
+
+await test('regular runs discard caller state paths; attach requires explicit paths', () => {
+  const regular = isolatedPaths('/private/test', false, {
+    XDG_CONFIG_HOME: '/caller/config',
+    SAIL_WORKTREE_ROOT: '/caller/worktrees',
+  });
+  assert.equal(regular.XDG_CONFIG_HOME, '/private/test/config');
+  assert.equal(regular.SAIL_WORKTREE_ROOT, '/private/test/worktrees');
+  const attached = isolatedPaths('/unused', true, regular);
+  assert.deepEqual(attached, regular);
+  for (const name of Object.keys(regular)) {
+    assert.throws(
+      () => isolatedPaths('/unused', true, { ...regular, [name]: undefined }),
+      /requires an explicit private/,
+    );
+    assert.throws(
+      () => isolatedPaths('/unused', true, { ...regular, [name]: 'relative' }),
+      /requires an explicit private/,
+    );
   }
 });
