@@ -19,6 +19,15 @@ export const sailGateRules: Record<string, string> = {
   'adversarial-test': 'Sail gate rule: run the Test Adversary in a fresh subagent session.',
 };
 
+const defaultGateRules: Record<string, string> = {
+  'ship-it':
+    'Run the Code Adversary, Findings Adversary, and Test Adversary in this Ship It session with the implementation agent and model.',
+  'adversarial-review':
+    'Run the Code Adversary and Findings Adversary in this session with the implementation agent and model.',
+  'adversarial-test':
+    'Run the Test Adversary in this session with the implementation agent and model.',
+};
+
 const failedGateRule =
   'If a required fresh session cannot launch, pause and report the failed gate and reason in this thread. Never run a gate inline. This overrides any inline fallback in an installed skill.';
 
@@ -39,11 +48,19 @@ export function resolveSkillPrompt(
   const skill = promptSkill(skills, text);
   if (!skill) return text;
   const rule = sailGateRules[skill.name.toLowerCase()];
+  const settings =
+    typeof localStorage !== 'undefined'
+      ? parseValidationSettings(getSetting(validationSettingsKey))
+      : { choices: [], strictDifferentModel: false };
   const policy =
     rule && typeof localStorage !== 'undefined'
-      ? `\n\n${validationInstructions(parseValidationSettings(getSetting(validationSettingsKey)), currentModel)}`
+      ? `\n\n${validationInstructions(settings, currentModel)}`
       : '';
-  const gate = rule ? `\n\n${rule} ${failedGateRule}${policy}` : '';
+  const gate = rule
+    ? settings.choices.length || settings.strictDifferentModel
+      ? `\n\n${rule} ${failedGateRule}${policy}`
+      : `\n\nSail default gate rule: ${defaultGateRules[skill.name.toLowerCase()]} Do not call validation_gate or require agent coordination.${policy}`
+    : '';
   return skill.instructions
     ? `${text}${gate}\n\nFollow this bundled Sail skill:\n\n${skill.instructions}`
     : `${text}${gate}`;

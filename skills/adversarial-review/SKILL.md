@@ -14,9 +14,9 @@ metadata:
 
 ## Sail execution rule
 
-Apply the Sail cross-validation policy included with the prompt to both passes. In Sail, launch each fresh pass with `validation_gate`, passing its gate name, prompt, and every implementation model; wait for the first receipt before launching the second. The tool selects and verifies a configured agent/model pair, preferring a model different from every implementation model and honoring strict routing. Include the actual provider/model in each verdict. Pause with the reason when no eligible choice exists or the model cannot be verified.
+When the prompt enables Sail cross-validation, launch each fresh pass with `validation_gate`, passing its gate name, prompt, and every implementation model; wait for the first receipt before launching the second. The tool selects and verifies a configured agent/model pair, preferring a model different from every implementation model and honoring strict routing. Include the actual provider/model in each verdict. Pause with the reason when no eligible choice exists or the model cannot be verified.
 
-Use fresh subagent sessions for both passes, even when the first pass reports no findings. If either session cannot launch, stop and report `Review Verdict: BLOCKED` with the failed pass and reason. Never run a pass inline.
+Without Sail cross-validation, run both passes in the current session with the implementation agent and model. With Sail cross-validation enabled, use fresh subagent sessions for both passes, even when the first pass reports no findings. If either session cannot launch, stop and report `Review Verdict: BLOCKED` with the failed pass and reason.
 
 Find the bug, then try to prove the bug report wrong. It answers one question - **is this change correct?** - and answers it hard. It does not evaluate architecture, conventions, dead code, or taste; that is `/staff-code-review`.
 

@@ -12,11 +12,11 @@ metadata:
 
 # Adversarial Test
 
-Apply the Sail cross-validation policy included with the prompt. In Sail, launch the fresh Test Adversary session with `validation_gate`, passing its gate name, prompt, and every implementation model; wait for its receipt. The tool selects and verifies a configured agent/model pair, preferring a model different from every implementation model and honoring strict routing. Include the actual provider/model in the verdict. Pause with the reason when no eligible choice exists or the model cannot be verified.
+When the prompt enables Sail cross-validation, launch the fresh Test Adversary session with `validation_gate`, passing its gate name, prompt, and every implementation model; wait for its receipt. The tool selects and verifies a configured agent/model pair, preferring a model different from every implementation model and honoring strict routing. Include the actual provider/model in the verdict. Pause with the reason when no eligible choice exists or the model cannot be verified. Otherwise run the Test Adversary work in this session with the implementation agent and model.
 
 ## Sail execution rule
 
-Run the Test Adversary in a fresh subagent session. If it cannot launch, stop and report `Test Verdict: BLOCKED` with the reason. Never run the pass inline.
+With Sail cross-validation enabled, run the Test Adversary in a fresh subagent session. If it cannot launch, stop and report `Test Verdict: BLOCKED` with the reason. Otherwise run the pass in this session.
 
 Prove the change does **not** do what the task says - by running it. It answers one question - **does this change work for a user?** - and answers it with commands and output, not by reading code. Code correctness review is the `adversarial-review` skill.
 

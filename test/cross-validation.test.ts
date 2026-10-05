@@ -55,16 +55,22 @@ void test('provider prefix does not disguise the same implementation model', () 
   assert.equal(selectValidationChoice(pool, pool.choices, ['model-a']).choice, null);
 });
 
-void test('empty or corrupt settings pause instead of broadening the pool', () => {
+void test('empty or corrupt settings disable cross-validation', () => {
   assert.deepEqual(parseValidationSettings('{bad'), {
     choices: [],
     strictDifferentModel: false,
   });
   assert.match(
-    selectValidationChoice(parseValidationSettings(null), settings.choices, []).reason ?? '',
-    /Select/,
+    validationInstructions(parseValidationSettings(null), 'gpt-5.6-luna'),
+    /cross-validation is disabled[\s\S]*implementation agent and model[\s\S]*Do not call validation_gate/,
   );
   assert.match(validationInstructions(settings), /Report the actual provider and model/);
+});
+
+void test('an explicit strict policy still pauses without a selected model', () => {
+  const strict = { choices: [], strictDifferentModel: true };
+  assert.match(validationInstructions(strict), /Selected agent and model pool:\n\(empty\)/);
+  assert.match(selectValidationChoice(strict, [], []).reason ?? '', /Select/);
 });
 
 void test('strict routing pauses for unresolved implementation or selected aliases', () => {

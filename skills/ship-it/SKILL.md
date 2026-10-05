@@ -14,7 +14,7 @@ metadata:
 
 ## Sail execution rule
 
-For an issue opened in a Sail-managed worktree, use that worktree and branch. Skip branch creation and cleanup. Run the Code Adversary, Findings Adversary, and Test Adversary in three separate fresh subagent sessions, in order. If any session cannot launch, pause shipping and explain the failed gate in the current thread. Never run a gate inline.
+For an issue opened in a Sail-managed worktree, use that worktree and branch. Skip branch creation and cleanup. When the prompt enables Sail cross-validation with a selected model pool, run the Code Adversary, Findings Adversary, and Test Adversary in three separate fresh `validation_gate` sessions, in order. Otherwise run the gates in this Ship It session with the implementation agent and model; do not call `validation_gate` merely because no pool is configured.
 
 Take one change (task description, GitHub issue, or Jira ticket) to a merged PR, closing the GitHub issue if any.
 
@@ -46,7 +46,7 @@ Signed conventional commits, scope required, title ≤50 chars, no AI attributio
 
 ## Phase 5 — Adversarial review
 
-Before a gate starts, apply the Sail cross-validation policy included with the prompt. Record every model that implemented this issue. Use Sail's `validation_gate` tool for each pass, passing the complete model set; wait for its receipt before the next pass. The tool selects only a configured, available agent/model pair and verifies the actual model. Prefer a model outside the complete implementation set. Under strict different-model routing, pause if none qualifies. Report the actual provider and model for each pass. Never substitute outside the selected pool.
+When the prompt enables Sail cross-validation, record every model that implemented this issue and use Sail's `validation_gate` tool for each pass, passing the complete model set; wait for its receipt before the next pass. The tool selects only a configured, available agent/model pair and verifies the actual model. Prefer a model outside the complete implementation set. Under strict different-model routing, pause if none qualifies. Report the actual provider and model for each pass. Never substitute outside the selected pool. Without that policy, run the gates in this session with the implementation agent and model.
 
 Run `adversarial-review:adversarial-review` with `--base origin/<default> --context <task-context-file>`. Reply starts `Review Verdict: CLEAN` or `NEEDS_FIXES`. On NEEDS_FIXES fix every surviving `blocking:` and `issue:`, rerun gates and the review on the new tip. Unsettled `question:` findings go in the PR body. Phase 6 only after CLEAN.
 
