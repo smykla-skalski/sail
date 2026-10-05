@@ -19,6 +19,7 @@
   import {
     createShipRun,
     readyShipIssues,
+    shippingWorkerSettled,
     type ShipIssue,
     type ShipRun,
   } from './lib/issue-shipping';
@@ -1824,7 +1825,7 @@
           });
           return;
         }
-        if (!receiptIsSettled((await currentSpawnReceipt(receipt)).state)) return;
+        if (!shippingWorkerSettled((await currentSpawnReceipt(receipt)).state)) return;
         await updateShipIssue(run, issue, { workerSettled: true });
       }
       if (issue.path) {
@@ -1866,7 +1867,7 @@
     }
     if (pr?.state === 'CLOSED') {
       const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
-      if (receipt && !receiptIsSettled(receipt.state)) await currentSpawnReceipt(receipt);
+      if (receipt && !shippingWorkerSettled(receipt.state)) await currentSpawnReceipt(receipt);
       await updateShipIssue(run, issue, {
         state: 'failed',
         error: 'Pull request closed without merging.',
@@ -1875,7 +1876,7 @@
     }
     const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
     if (issue.state === 'failed') {
-      if (receipt && !receiptIsSettled(receipt.state)) await currentSpawnReceipt(receipt);
+      if (receipt && !shippingWorkerSettled(receipt.state)) await currentSpawnReceipt(receipt);
       if (
         issue.error === 'Worker finished without a pull request. Inspect its thread.' &&
         receipt?.state === 'completed' &&
@@ -1939,7 +1940,7 @@
     await Promise.all(run.issues.map((issue) => refreshShippingIssue(run, issue)));
     const unsettledReceiptIds = new Set(
       spawnReceipts
-        .filter((receipt) => !receiptIsSettled(receipt.state))
+        .filter((receipt) => !shippingWorkerSettled(receipt.state))
         .map((receipt) => receipt.receiptId),
     );
     for (const issue of readyShipIssues(run, unsettledReceiptIds)) scheduleShipLaunch(run, issue);
@@ -1976,6 +1977,7 @@
     if (!current) return;
     if (
       receiptIsSettled(current.state) &&
+      !(current.requestId.startsWith('ship:') && current.state === 'unavailable') &&
       changes.state &&
       ['working', 'waiting', 'unavailable'].includes(changes.state)
     )
@@ -2030,7 +2032,11 @@
   }
 
   async function currentSpawnReceipt(receipt: SpawnReceipt): Promise<SpawnReceipt> {
-    if (receiptIsSettled(receipt.state)) return receipt;
+    if (
+      receiptIsSettled(receipt.state) &&
+      !(receipt.requestId.startsWith('ship:') && receipt.state === 'unavailable')
+    )
+      return receipt;
     if (activeSpawnRequests.has(receipt.receiptId)) return receipt;
     if (
       !receipt.targetId ||

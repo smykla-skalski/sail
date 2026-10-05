@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createShipRun, readyShipIssues, shipIssueStatus } from '../src/lib/issue-shipping.ts';
+import {
+  createShipRun,
+  readyShipIssues,
+  shipIssueStatus,
+  shippingWorkerSettled,
+} from '../src/lib/issue-shipping.ts';
 import type { PublishedGraph } from '../src/lib/issue-graph.ts';
 
 const graph: PublishedGraph = {
@@ -95,6 +100,14 @@ void test('failed issue keeps its slot while its worker is unsettled', () => {
     readyShipIssues(shipping, new Set()).map((issue) => issue.id),
     ['second'],
   );
+});
+
+void test('unavailable worker does not prove its turn has stopped', () => {
+  assert.equal(shippingWorkerSettled('unavailable'), false);
+  assert.equal(shippingWorkerSettled('working'), false);
+  assert.equal(shippingWorkerSettled('completed'), true);
+  assert.equal(shippingWorkerSettled('failed'), true);
+  assert.equal(shippingWorkerSettled('interrupted'), true);
 });
 
 void test('approved snapshot survives serialization and does not expand to new issues', () => {

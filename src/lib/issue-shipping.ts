@@ -1,4 +1,5 @@
 import type { PublishedGraph } from './issue-graph';
+import type { SpawnState } from './agent-results';
 
 export type ShipIssueState =
   'pending' | 'starting' | 'working' | 'awaiting_merge' | 'failed' | 'merged';
@@ -30,6 +31,10 @@ export interface ShipRun {
   approvedAt: number;
   externalClosed: Record<string, boolean>;
   issues: ShipIssue[];
+}
+
+export function shippingWorkerSettled(state: SpawnState): boolean {
+  return ['completed', 'failed', 'interrupted'].includes(state);
 }
 
 export function createShipRun(
