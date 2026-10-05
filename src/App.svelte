@@ -448,12 +448,42 @@
   let openCodeUsage = $state<Record<string, number>>({});
   let nativeThreads = $state<AgentThread[]>(savedNativeThreads);
   let sidebarOpenCodeThreads = $state<AgentThread[]>(savedNativeThreads);
+  let hiddenSidebarThreadKeys = $state<string[]>(loadHiddenSidebarThreadKeys());
+  function loadHiddenSidebarThreadKeys(): string[] {
+    try {
+      const value: unknown = JSON.parse(getSetting('sai-hidden-sidebar-threads') ?? '[]');
+      return Array.isArray(value)
+        ? value.filter((key): key is string => typeof key === 'string')
+        : [];
+    } catch {
+      return [];
+    }
+  }
+  function removeSidebarThread(thread: AgentThread) {
+    const key = threadKey(thread);
+    if (!hiddenSidebarThreadKeys.includes(key)) {
+      hiddenSidebarThreadKeys = [...hiddenSidebarThreadKeys, key];
+      setSetting('sai-hidden-sidebar-threads', JSON.stringify(hiddenSidebarThreadKeys));
+    }
+  }
+  function showSidebarThread(thread: AgentThread) {
+    const key = threadKey(thread);
+    if (!hiddenSidebarThreadKeys.includes(key)) return;
+    hiddenSidebarThreadKeys = hiddenSidebarThreadKeys.filter((item) => item !== key);
+    setSetting('sai-hidden-sidebar-threads', JSON.stringify(hiddenSidebarThreadKeys));
+  }
   let sidebarOpenCodeOutcomes = $state<Record<string, ThreadStatus>>({});
   let threadAttention = $state<AttentionMap>(loadAttention(getSetting('sai-thread-attention')));
   let acpActivityReady = $state(false);
   let nativeActivityReady = $state(false);
   let nativeUnavailableDirectories = $state<string[]>([]);
-  let sidebarThreads = $derived(groupSidebarThreads([...agentThreads, ...sidebarOpenCodeThreads]));
+  let sidebarThreads = $derived(
+    groupSidebarThreads(
+      [...agentThreads, ...sidebarOpenCodeThreads].filter(
+        (thread) => !hiddenSidebarThreadKeys.includes(threadKey(thread)),
+      ),
+    ),
+  );
   let sidebarDirectoryKey = $derived(
     JSON.stringify([
       ...new Set([
@@ -3911,6 +3941,13 @@
           report.repository,
         );
         setSetting('sai-recent-agent-threads', JSON.stringify(recentThreadKeys));
+        hiddenSidebarThreadKeys = migrateRecentThreadKeys(
+          hiddenSidebarThreadKeys,
+          knownThreads,
+          path,
+          report.repository,
+        );
+        setSetting('sai-hidden-sidebar-threads', JSON.stringify(hiddenSidebarThreadKeys));
         const attentionKeys = new Map(
           knownThreads
             .filter((thread) => thread.directory === path)
@@ -4156,6 +4193,7 @@
       ++recentJumpGeneration;
     }
     if (thread) {
+      showSidebarThread(thread);
       rememberRecentThread(thread);
       markThreadRead(thread);
     }
@@ -4644,6 +4682,7 @@
         item.sessionId === thread.sessionId,
     );
     if (!selected) return;
+    showSidebarThread(selected);
     focusMainPane();
     if (selected.agent === 'opencode') await selectSession(selected.sessionId);
     else openAgent(selected.agent, selected, true);
@@ -6002,6 +6041,7 @@
       title: info.title ?? 'OpenCode thread',
       updated: info.time.updated,
     };
+    if (!automatic) showSidebarThread(nativeThread);
     rememberRecentThread(nativeThread);
     markThreadRead(nativeThread);
     if (targetPane) {
@@ -7470,6 +7510,7 @@
         }}
         onselectdefault={(path) => void selectDefaultWorktree(path)}
         onselectthread={(key) => void jumpToRecentThread(key)}
+        onremovethread={removeSidebarThread}
         onaddrepository={(groupID) => void chooseProject(groupID)}
         onaddgroup={addProjectGroup}
         onrenamegroup={renameProjectGroup}
