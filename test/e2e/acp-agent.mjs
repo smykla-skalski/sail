@@ -255,6 +255,10 @@ for await (const line of createInterface({ input: process.stdin })) {
     const { sessionId } = message.params;
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    if (text === 'Gate prompt model unavailable') {
+      send({ id: message.id, error: { code: -1, message: 'Model x is unavailable' } });
+      continue;
+    }
     if (text === 'Detached steer follow-up') {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;

@@ -1,7 +1,7 @@
 <script lang="ts">
   class ValidationCandidateUnavailable extends Error {
-    constructor(candidate: string, cause: unknown) {
-      super(`${candidate} is unavailable: ${describe(cause)}`, { cause });
+    constructor(message: string, cause?: unknown) {
+      super(cause === undefined ? message : `${message}: ${describe(cause)}`, { cause });
     }
   }
 
@@ -2465,7 +2465,7 @@
           ),
         );
         const active = await activeImplementationModels(request.directory, sourceId);
-        if (!active)
+        if (!active || implementationAttributionUncertain(request.directory))
           throw new Error(
             'Concurrent agent turns prevent reliable implementation model attribution.',
           );
@@ -2504,9 +2504,10 @@
           try {
             await acp.connect(choice.agent);
           } catch (cause) {
-            throw new Error(`Provider ${choice.agent} is unavailable: ${describe(cause)}`, {
+            throw new ValidationCandidateUnavailable(
+              `Provider ${choice.agent} is unavailable`,
               cause,
-            });
+            );
           }
         }
         await ensureSelected();
@@ -2531,13 +2532,7 @@
         };
       } catch (cause) {
         updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
-        if (
-          !(cause instanceof ValidationCandidateUnavailable) &&
-          !/^(Provider .+ is unavailable|Model .+ is unavailable|Cannot verify .+ selected model)/.test(
-            describe(cause),
-          )
-        )
-          throw cause;
+        if (!(cause instanceof ValidationCandidateUnavailable)) throw cause;
         return tryChoice(
           candidates.filter((item) => item !== choice),
           [...reasons, `${choice.agent} / ${choice.model}: ${describe(cause)}`],
@@ -2783,7 +2778,7 @@
     if (source.kind === 'acp') {
       const session = await acp.create(source.agent, created.path).catch((cause) => {
         if (!validation) throw cause;
-        throw new ValidationCandidateUnavailable(source.agent, cause);
+        throw new ValidationCandidateUnavailable(`${source.agent} is unavailable`, cause);
       });
       const reportedModel = session.configOptions?.find(
         (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
@@ -2792,17 +2787,24 @@
         const modelOption = session.configOptions?.find(
           (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
         );
-        if (!modelOption?.options.some((option) => option.value === source.model))
-          throw new Error(`Model ${source.model} is unavailable in ${source.agent}.`);
+        if (!modelOption?.options.some((option) => option.value === source.model)) {
+          const message = `Model ${source.model} is unavailable in ${source.agent}.`;
+          throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
+        }
         const changed = await acp
           .setConfig(source.agent, session.sessionId, modelOption.id, source.model)
           .catch((cause) => {
             if (!validation) throw cause;
-            throw new ValidationCandidateUnavailable(`${source.agent} / ${source.model}`, cause);
+            throw new ValidationCandidateUnavailable(
+              `${source.agent} / ${source.model} is unavailable`,
+              cause,
+            );
           });
         const actual = changed.configOptions?.find((option) => option.id === modelOption.id);
-        if (actual?.currentValue !== source.model)
-          throw new Error(`Cannot verify ${source.agent} selected model ${source.model}.`);
+        if (actual?.currentValue !== source.model) {
+          const message = `Cannot verify ${source.agent} selected model ${source.model}.`;
+          throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
+        }
       }
       const thread: AgentThread = {
         agent: source.agent,
@@ -2881,9 +2883,16 @@
         threadId: `acp:${source.agent}:${session.sessionId}`,
       };
     }
-    if (!client) throw new Error('OpenCode is unavailable for the new thread.');
-    await ensureOpenCodeBrowser(created.path);
-    const session = await client.session
+    if (!client) {
+      const message = 'OpenCode is unavailable for the new thread.';
+      throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
+    }
+    const promptClient = client;
+    await ensureOpenCodeBrowser(created.path).catch((cause) => {
+      if (!validation) throw cause;
+      throw new ValidationCandidateUnavailable('OpenCode is unavailable', cause);
+    });
+    const session = await promptClient.session
       .create({
         location: { directory: created.path },
         metadata: { saiHarness: true },
@@ -2894,7 +2903,7 @@
       .catch((cause) => {
         if (!validation) throw cause;
         throw new ValidationCandidateUnavailable(
-          `OpenCode / ${source.model?.providerID}:${source.model?.id}`,
+          `OpenCode / ${source.model?.providerID}:${source.model?.id} is unavailable`,
           cause,
         );
       });
@@ -2902,10 +2911,10 @@
       source.model &&
       (session.model?.providerID !== source.model.providerID ||
         session.model.id !== source.model.id)
-    )
-      throw new Error(
-        `Cannot verify OpenCode selected model ${source.model.providerID}:${source.model.id}.`,
-      );
+    ) {
+      const message = `Cannot verify OpenCode selected model ${source.model.providerID}:${source.model.id}.`;
+      throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
+    }
     if (receiptId)
       updateSpawnReceipt(receiptId, {
         targetId: `opencode:${session.id}`,
@@ -2930,7 +2939,6 @@
           session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
           `opencode:${session.id}`,
         );
-    const promptClient = client;
     await beforePrompt?.();
     const startingPrompt = promptClient.session.prompt({ sessionID: session.id, text: prompt });
     if (receiptId)
