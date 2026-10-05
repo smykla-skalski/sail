@@ -518,6 +518,7 @@ fn start_runtime(
 
     let mut command = Command::new(&binary);
     command.args(server_args());
+    command.env_remove("OPENCODE_CONFIG_DIR");
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command
