@@ -1751,6 +1751,7 @@ pub fn run() {
             github::open_issue,
             github::publish_issue_graph,
             github::load_issue_graph,
+            github::shipping_target_repository,
             github::shipping_pull_request,
             github::shipping_dependency_closed,
             github::pull_request_checks,

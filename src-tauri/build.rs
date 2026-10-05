@@ -35,6 +35,7 @@ fn main() {
             "open_issue",
             "publish_issue_graph",
             "load_issue_graph",
+            "shipping_target_repository",
             "shipping_pull_request",
             "shipping_dependency_closed",
             "pull_request_checks",

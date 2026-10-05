@@ -1725,6 +1725,9 @@
     const repository = coordinationProject(directory) ?? directory;
     const remote = graph.issues[0]?.repository ?? '';
     if (!repository || !remote) throw new Error('Select a published repository issue graph.');
+    const checkoutRemote = await invoke<string>('shipping_target_repository', { repository });
+    if (checkoutRemote.toLowerCase() !== remote.toLowerCase())
+      throw new Error(`Select a ${remote} checkout to ship this issue graph.`);
     if (shipRuns.some((run) => run.repository === repository && run.source === source))
       throw new Error('This plan already has a shipping run.');
     const run = createShipRun(
@@ -1810,6 +1813,11 @@
       );
       await updateShipIssue(run, issue, { state: 'working', threadId: started.threadId });
     } catch (cause) {
+      const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+      if (receipt && !receipt.turnId) {
+        updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      }
       await updateShipIssue(run, issue, { state: 'failed', error: describe(cause) });
     }
   }
@@ -1892,8 +1900,9 @@
       branch: issue.branch,
     }).catch((cause) => {
       error = describe(cause);
-      return null;
+      return undefined;
     });
+    if (pr === undefined) return;
     if (pr?.url && pr.url !== issue.pullRequest)
       await updateShipIssue(run, issue, { pullRequest: pr.url });
     if (pr?.mergedAt) {

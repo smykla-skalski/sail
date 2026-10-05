@@ -38,6 +38,7 @@
     "allow-publish-issue-graph",
     "allow-load-issue-graph",
     "allow-shipping-pull-request",
+    "allow-shipping-target-repository",
     "allow-shipping-dependency-closed",
     "allow-pull-request-checks",
     "allow-failed-check-log",

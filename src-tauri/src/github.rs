@@ -23,6 +23,16 @@ pub struct ShippingPullRequest {
 }
 
 #[tauri::command]
+pub async fn shipping_target_repository(repository: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = crate::validate_repository(repository)?;
+        target_repository(Path::new(&repository))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 pub async fn shipping_pull_request(
     repository: String,
     branch: String,
