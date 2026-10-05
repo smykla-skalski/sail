@@ -10,8 +10,6 @@
   } from './lib/ship-progress';
 
   let {
-    open,
-    repository,
     runs,
     busy,
     onclose,
@@ -19,8 +17,6 @@
     onopen,
     onsettings,
   }: {
-    open: boolean;
-    repository: string;
     runs: ShipRun[];
     busy: boolean;
     onclose: () => void;
@@ -28,22 +24,13 @@
     onopen: (path: string, threadId?: string | null) => Promise<void>;
     onsettings: () => Promise<void>;
   } = $props();
-  let dialog: HTMLDialogElement;
   let error = $state('');
   let selectedRun = $state('');
   let selectedIssue = $state('');
-  const visible = $derived(runs.filter((run) => !repository || run.repository === repository));
+  const visible = $derived(runs);
   const run = $derived(visible.find((item) => item.id === selectedRun) ?? visible.at(-1));
   const issue = $derived(run?.issues.find((item) => item.id === selectedIssue) ?? run?.issues[0]);
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
-
-  $effect(() => {
-    if (!dialog) return;
-    if (open && !dialog.open) {
-      error = '';
-      dialog.showModal();
-    } else if (!open && dialog.open) dialog.close();
-  });
 
   async function act(action: () => Promise<void>) {
     error = '';
@@ -57,7 +44,7 @@
   async function selectIssue(id: string) {
     selectedIssue = id;
     await tick();
-    dialog.querySelector<HTMLElement>('.ship-issue-detail')?.focus();
+    document.querySelector<HTMLElement>('.ship-panel .ship-issue-detail')?.focus();
   }
 </script>
 
@@ -78,11 +65,11 @@
     </div>{:else}<small>Independent issue</small>{/if}
 {/snippet}
 
-<dialog class="ship-panel" bind:this={dialog} {onclose} aria-labelledby="ship-title">
+<div class="ship-panel" aria-labelledby="ship-title">
   <header>
     <div>
       <h2 id="ship-title">Ship runs</h2>
-      <p>{repository || 'All repositories'}</p>
+      <p>All repositories</p>
     </div>
     <div class="ship-actions">
       <button onclick={() => act(onrefresh)} disabled={busy}
@@ -254,25 +241,21 @@
         </section>{/if}
     </div>
   {/if}
-</dialog>
+</div>
 
 <style>
   .ship-panel {
-    width: min(1120px, 94vw);
-    max-height: 90vh;
-    padding: 24px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 12px;
+    box-sizing: border-box;
+    height: 100%;
+    overflow: auto;
+    padding: 16px;
     background: var(--sui-surface);
     color: var(--sui-foreground);
-  }
-  .ship-panel::backdrop {
-    background: #0008;
   }
   header,
   .ship-summary {
     display: flex;
-    justify-content: space-between;
+    flex-direction: column;
     gap: 20px;
     align-items: start;
   }
@@ -310,6 +293,7 @@
   }
   .ship-run-select {
     display: flex;
+    flex-wrap: wrap;
     gap: 12px;
     margin: 20px 0;
     align-items: center;
@@ -329,7 +313,7 @@
   }
   .ship-content {
     display: grid;
-    grid-template-columns: minmax(240px, 1fr) minmax(0, 2fr);
+    grid-template-columns: minmax(0, 1fr);
     gap: 24px;
     margin-top: 20px;
   }
@@ -398,14 +382,5 @@
   }
   .ship-empty {
     padding: 40px 0;
-  }
-  @media (max-width: 750px) {
-    header,
-    .ship-summary {
-      flex-direction: column;
-    }
-    .ship-content {
-      grid-template-columns: 1fr;
-    }
   }
 </style>

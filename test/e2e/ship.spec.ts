@@ -22,7 +22,7 @@ describe('native Ship run history', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('shows dependencies, nested gates and CI after clearing browser storage', async () => {
+  it('shows persisted Ship runs in the Cmd+L details panel', async () => {
     const run: ShipRun = {
       id: 'ship-fixture',
       source: 'plan',
@@ -129,7 +129,15 @@ describe('native Ship run history', () => {
       sessionStorage.setItem('sail-e2e-settings', 'enabled');
     });
     await browser.refresh();
-    await $('.ship-launch').click();
+    await expect($('.ship-launch')).not.toExist();
+    await expect($('.project-ship')).not.toExist();
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
+      ),
+    );
+    await expect($('#session-details')).toBeDisplayed();
+    await expect($('.side-tabs')).toHaveText(expect.stringContaining('Ship runs (1)'));
     await expect($('.ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('1 / 3 merged'));
     await expect($('.ship-panel')).toHaveText(expect.stringContaining('Umbrella #40'));
@@ -156,7 +164,11 @@ describe('native Ship run history', () => {
     await $('.ship-node:first-child .ship-node-select').click();
     await $('.ship-issue-detail .ship-actions button').click();
     await expect($('.ship-panel')).not.toBeDisplayed();
-    await $('.ship-launch').click();
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
+      ),
+    );
     await $('.ship-panel header button').click();
     await expect($('.ship-issue-detail')).toHaveText(expect.stringContaining('Refresh failed:'));
     await expect($('.ship-gates')).toHaveText(
@@ -165,7 +177,11 @@ describe('native Ship run history', () => {
     await $('[aria-label="Close Ship runs"]').click();
     await browser.execute(() => localStorage.clear());
     await browser.refresh();
-    await $('.ship-launch').click();
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
+      ),
+    );
     await expect($('.ship-gates')).toHaveText(
       expect.stringContaining('Reproduced fixture failure'),
     );

@@ -29,7 +29,6 @@
   export type GitHubIssue = { number: number; title: string; body: string; url: string };
 
   type Props = {
-    onship: (repository: string) => void;
     catalog: ProjectCatalog;
     directory: string;
     disabled: boolean;
@@ -92,7 +91,6 @@
     | { kind: 'agent'; thread: AgentThread };
 
   let {
-    onship,
     catalog,
     directory,
     disabled,
@@ -882,7 +880,6 @@
                 id={repositoryWorktreesID(path)}
                 hidden={repositoryCollapsed(path)}
               >
-                <button class="project-ship" onclick={() => onship(path)}>Ship runs</button>
                 <div class:active={path === directory} class="project-worktree-row" role="group">
                   <button
                     class="project-worktree-select project-default-worktree-select"
@@ -1017,7 +1014,6 @@
               id={repositoryWorktreesID(path)}
               hidden={repositoryCollapsed(path)}
             >
-              <button class="project-ship" onclick={() => onship(path)}>Ship runs</button>
               <div class:active={path === directory} class="project-worktree-row" role="group">
                 <button
                   class="project-worktree-select project-default-worktree-select"
