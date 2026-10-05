@@ -12,6 +12,36 @@ import {
   settledImplementationAttribution,
 } from '../src/lib/implementation-models.ts';
 
+void test('archive waits for in-flight attribution even when the backend turn has finished', async () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  const revision = Promise.withResolvers<string>();
+  let recording = false;
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: { invoke: async () => (recording ? revision.promise : 'before') },
+    },
+  });
+  const directory = '/test/archive-active';
+  const turn = await beginImplementationTurn(directory, 'model-a', 'worker');
+  recording = true;
+  const completion = recordImplementationModel(directory, 'model-a', turn);
+  await assert.rejects(settledImplementationAttribution(directory), /still settling/);
+  revision.resolve('after');
+  await completion;
+  assert.deepEqual(await settledImplementationAttribution(directory), {
+    models: ['model-a'],
+    modelUncertain: false,
+  });
+});
+
 for (const model of ['provider:model-a', undefined]) {
   void test(`archive attribution recovers an interrupted ${model ?? 'unknown'} model`, async () => {
     const values = new Map<string, string>();
