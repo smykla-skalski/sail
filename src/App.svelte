@@ -873,6 +873,7 @@
   async function showMobileView(view: 'sessions' | 'chat' | 'details') {
     if (view === 'sessions') sidebarVisible = true;
     saveViewState();
+    if (view === 'details' && !sessionID && !acpAgent) showShipRuns();
     if (acpAgent) {
       agentChangesOpen = view === 'details';
       if (agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
@@ -897,6 +898,11 @@
 
   async function toggleChanges() {
     if (focusedPane !== 'main') {
+      const pane = leaves(paneLayout).find((item) => item.id === focusedPane);
+      if (!pane?.agent) {
+        showShipRuns();
+        return;
+      }
       changesPanes = changesPanes.includes(focusedPane)
         ? changesPanes.filter((id) => id !== focusedPane)
         : [...changesPanes, focusedPane];
@@ -1249,6 +1255,7 @@
   );
 
   function showShipRuns() {
+    focusMainPane();
     sideTab = 'ship';
     detailsOpen = true;
     if (acpAgent) agentChangesOpen = true;
@@ -1528,7 +1535,7 @@
     }, 30_000);
     diffPollTimer = setInterval(() => {
       const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
-      if (acpAgent && agentChangesOpen && visible && !diffLoading) {
+      if (acpAgent && agentChangesOpen && activeSideTab === 'changes' && visible && !diffLoading) {
         void refreshAgentDiff(true);
         return;
       }
@@ -8181,7 +8188,7 @@
 
   function focusWorkspace() {
     for (const pane of leaves(paneLayout)) if (pane.thread) markThreadRead(pane.thread);
-    if (acpAgent && agentChangesOpen) void refreshAgentDiff();
+    if (acpAgent && agentChangesOpen && activeSideTab === 'changes') void refreshAgentDiff();
     else if (!acpAgent && detailsOpen && activeSideTab === 'changes') void refreshDiff();
   }
 
@@ -8315,10 +8322,8 @@
         <button aria-pressed={mobileView === 'chat'} onclick={() => showMobileView('chat')}
           >Chat</button
         >
-        <button
-          aria-pressed={mobileView === 'details'}
-          disabled={!sessionID && !acpAgent}
-          onclick={() => showMobileView('details')}>Details</button
+        <button aria-pressed={mobileView === 'details'} onclick={() => showMobileView('details')}
+          >Details</button
         >
       </nav>
       <div class="breadcrumb">
@@ -8417,19 +8422,19 @@
             onclick={() => void openSnapshots()}>Restore</Button
           >{/if}
         <Button variant="ghost" size="sm" onclick={openCommandsDialog}>Commands</Button>
-        {#if sessionID || acpAgent || focusedPane !== 'main' || shipRuns.length}<Button
-            variant="ghost"
-            size="sm"
-            onclick={toggleChanges}
-            aria-controls="session-details"
-            aria-expanded={focusedPane !== 'main'
-              ? changesPanes.includes(focusedPane)
-              : acpAgent
-                ? agentChangesOpen
-                : detailsOpen &&
-                  (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship')}
-            title="Toggle Changes (⌘L)">{sessionID || acpAgent ? 'Changes' : 'Details'}</Button
-          >{/if}
+        <Button
+          variant="ghost"
+          size="sm"
+          onclick={toggleChanges}
+          aria-controls="session-details"
+          aria-expanded={focusedPane !== 'main'
+            ? changesPanes.includes(focusedPane)
+            : acpAgent
+              ? agentChangesOpen
+              : detailsOpen && (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship')}
+          title={sessionID || acpAgent ? 'Toggle Changes (⌘L)' : 'Toggle details (⌘L)'}
+          >{sessionID || acpAgent ? 'Changes' : 'Details'}</Button
+        >
       </div>
     </header>
     {#if $settingsError}<p class="notice error" role="alert">{$settingsError}</p>{/if}
@@ -8933,6 +8938,10 @@
       {coordinationMessages}
       {spawnReceipts}
       {shipRuns}
+      {shippingBusy}
+      onshiprefresh={() => tickShippingRuns(true)}
+      onshipopen={openShipTarget}
+      onshipsettings={openSettings}
       onship={(graph, provider, limit, source) => startShippingRun(graph, provider, limit, source)}
       postTurnChecks={postTurnResults}
       onretrycheck={(check) => void runOnePostTurnCheck(check, true)}

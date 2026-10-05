@@ -27,6 +27,7 @@
     onsettings: () => Promise<void>;
   } = $props();
   let error = $state('');
+  let panel: HTMLDivElement;
   let scope = $state<'current' | 'all'>('current');
   let selectedRun = $state('');
   let selectedIssue = $state('');
@@ -49,7 +50,7 @@
   async function selectIssue(id: string) {
     selectedIssue = id;
     await tick();
-    document.querySelector<HTMLElement>('.ship-panel .ship-issue-detail')?.focus();
+    panel.querySelector<HTMLElement>('.ship-issue-detail')?.focus();
   }
 </script>
 
@@ -70,10 +71,10 @@
     </div>{:else}<small>Independent issue</small>{/if}
 {/snippet}
 
-<div class="ship-panel" aria-labelledby="ship-title">
+<div class="ship-panel" bind:this={panel} aria-label="Ship runs">
   <header>
     <div>
-      <h2 id="ship-title">Ship runs</h2>
+      <h2>Ship runs</h2>
       <p>{scope === 'all' || !repository ? 'All repositories' : repository}</p>
     </div>
     <div class="ship-actions">

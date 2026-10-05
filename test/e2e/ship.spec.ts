@@ -203,5 +203,18 @@ describe('native Ship run history', () => {
       expect.stringContaining('Reproduced fixture failure'),
     );
     await $('[aria-label="Close Ship runs"]').click();
+
+    await browser.keys(['Meta', 'd']);
+    await expect($('.pane-split.row')).toBeDisplayed();
+    await $('[aria-label="Close main pane"]').click();
+    await expect($('[data-pane-id="main"]')).not.toExist();
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
+      ),
+    );
+    await expect($('.ship-panel')).toBeDisplayed();
+    await expect($('.ship-summary')).toHaveText(expect.stringContaining('Ship dashboard fixture'));
+    await $('[aria-label="Close Ship runs"]').click();
   });
 });
