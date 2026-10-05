@@ -98,6 +98,7 @@ await test('active subagent keeps a finished parent visibly working', () => {
       receipts,
     );
   assert.equal(status([receipt]), 'working');
+  assert.equal(status([{ ...receipt, state: 'waiting' }]), 'waiting');
   assert.equal(status([{ ...receipt, turnId: null }]), 'working');
   assert.equal(
     sidebarThreadStatus(

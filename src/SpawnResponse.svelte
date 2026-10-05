@@ -13,7 +13,7 @@
 </script>
 
 <article class="message assistant-message spawn-response" aria-label={`${name} subagent response`}>
-  <div class="avatar spawn-avatar">↳</div>
+  <div class="avatar agent-avatar spawn-avatar">↳</div>
   <div class="message-body">
     <div class="message-author">{name} <span>subagent · {receipt.state}</span></div>
     {#if receipt.result}<Markdown source={receipt.result} />{/if}

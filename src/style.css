@@ -282,6 +282,10 @@ button:disabled {
   border-left: 2px solid var(--sui-primary);
   background: color-mix(in srgb, var(--sui-primary) 5%, transparent);
 }
+.project-agent-row.subagent:hover,
+.project-agent-row.subagent.active {
+  background: var(--shell-selected);
+}
 .project-agent-provider,
 .project-agent-title {
   min-width: 0;

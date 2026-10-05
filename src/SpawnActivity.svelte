@@ -30,12 +30,14 @@
           <span class="spawn-state">{receipt.state}</span>
         </div>
         <p class="spawn-activity-line">
-          {receipt.activity ??
-            (receipt.result
-              ? 'Writing response…'
-              : receipt.state === 'queued' || receipt.state === 'starting'
-                ? 'Waiting to start…'
-                : 'Starting task…')}
+          {receipt.state === 'waiting'
+            ? 'Needs your input'
+            : (receipt.activity ??
+              (receipt.result
+                ? 'Writing response…'
+                : receipt.state === 'queued' || receipt.state === 'starting'
+                  ? 'Waiting to start…'
+                  : 'Starting task…'))}
         </p>
         {#if receipt.result}<div class="spawn-output">
             <Markdown source={receipt.result} />

@@ -99,7 +99,7 @@ export function sidebarThreadStatus(
       : !acpActivityReady)
   )
     status = null;
-  if (status !== 'working' && status !== 'waiting' && status !== 'failed') {
+  if (status !== 'failed') {
     const active = activeSubagentsForSource(
       spawnReceipts,
       receiptSourceId(thread.agent, thread.sessionId),
@@ -110,13 +110,15 @@ export function sidebarThreadStatus(
         spawnReceipts,
         receiptSourceId(thread.agent, thread.sessionId),
         thread.directory,
-      ).some((receipt) =>
+      ).filter((receipt) =>
         receipt.provider === 'opencode'
           ? nativeActivityReady &&
             !nativeUnavailableDirectories.includes(receipt.targetDirectory ?? '')
           : acpActivityReady,
       );
-      status = confirmed ? 'working' : null;
+      if (confirmed.some((receipt) => receipt.state === 'waiting')) status = 'waiting';
+      else if (status !== 'working' && status !== 'waiting')
+        status = confirmed.length ? 'working' : null;
     }
   }
   return status;

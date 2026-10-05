@@ -5446,9 +5446,11 @@
       body:
         status === 'waiting'
           ? 'Needs your input'
-          : children.length
-            ? 'Subagents are still active'
-            : 'Finished',
+          : children.some((child) => child.state === 'waiting')
+            ? 'Subagent needs your input'
+            : children.length
+              ? 'Subagents are still active'
+              : 'Finished',
       sound: notificationSound,
     }).catch(() => undefined);
   }
