@@ -29,6 +29,7 @@
           securityLevel: 'strict',
           theme: dark ? 'dark' : 'neutral',
         });
+        await mermaid.parse(source);
         const rendered = await mermaid.render(
           `sai-plan-${current}-${Math.random().toString(36).slice(2)}`,
           source,
