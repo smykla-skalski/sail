@@ -3318,9 +3318,13 @@
 
     if (Date.now() >= request.expiresAt)
       throw new Error('The agent spawn request expired before launch.');
+    // Return before the backend's five-minute coordination timeout.
+    const responseDeadline = request.expiresAt + 180_000;
     const previousSpawn = agentSpawnQueue;
     const launched = (async () => {
       await previousSpawn.catch(() => undefined);
+      if (Date.now() >= responseDeadline)
+        throw new Error('Agent spawn timed out while waiting to launch.');
       await coordinationSource(request);
       updateSpawnReceipt(receiptId, { state: 'starting' });
 
@@ -3355,7 +3359,7 @@
             const paneId = splitFocusedPane('row', 'terminal', created.setup);
             if (!paneId) throw new Error('Enlarge a pane before running worktree setup.');
             await new Promise<void>((resolve, reject) => {
-              const remaining = request.expiresAt + 90_000 - Date.now();
+              const remaining = Math.min(200_000, responseDeadline - Date.now());
               let expired = false;
               const timer = setTimeout(
                 () => {
@@ -3406,6 +3410,8 @@
         chosenProvider === 'opencode'
           ? { kind: 'opencode', agent: 'OpenCode', title: source.title }
           : { kind: 'acp', agent: chosenProvider, title: source.title };
+      if (Date.now() >= responseDeadline)
+        throw new Error('Agent spawn timed out before the agent could start.');
       const started = await startCoordinatedThread(
         destination,
         selectedSource,
