@@ -255,7 +255,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     const { sessionId } = message.params;
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
-    if (text === 'Gate prompt model unavailable') {
+    if (text.startsWith('Gate prompt model unavailable')) {
       send({ id: message.id, error: { code: -1, message: 'Model x is unavailable' } });
       continue;
     }
@@ -366,6 +366,10 @@ for await (const line of createInterface({ input: process.stdin })) {
         () => send({ id: message.id, error: { code: -1, message: 'Fixture prompt failed' } }),
         1500,
       );
+      continue;
+    }
+    if (text.startsWith('Ship gate fixture')) {
+      setTimeout(() => send({ id: message.id, result: { stopReason: 'end_turn' } }), 8000);
       continue;
     }
     if (text.startsWith('Clipboard fixture')) {

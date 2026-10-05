@@ -18,6 +18,12 @@ browser. Read the tool schemas before calling them.
 - Use `agent_spawn` to start Claude, Codex, or OpenCode without interactive
   approval. The default target is a new worktree; an existing target shares files.
   Use `worktree_create` when the user should choose a new worktree in Sail.
+- For an assigned Ship issue, use `ship_progress` to report `stage` (implementing,
+  reviewing, testing, pull_request, ci, merging) and `status` (running or blocked).
+  Include a concrete `reason` when blocked. Validation sessions use the same tool
+  to report their own `verdict`: CLEAN/NEEDS_FIXES/BLOCKED for reviews,
+  PASS/FAIL/BLOCKED for tests. Failing or blocked verdicts require a reason.
+  These reports persist in the native Ship view; chat text is not a status API.
 - Use `validation_gate` for each Ship It review or test pass. Pass the gate name,
   prompt, and every implementation model. It selects an allowed model and starts
   a fresh session in this worktree. Wait for its receipt before the next pass.

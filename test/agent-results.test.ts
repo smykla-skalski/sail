@@ -6,6 +6,7 @@ import {
   isSubagentThread,
   loadSpawnReceipts,
   receiptForSource,
+  receiptNeedsRefresh,
   receiptIsSettled,
   receiptSourceId,
   runningSubagentsForSource,
@@ -211,5 +212,34 @@ await test('ACP reconnect requires the same turn to prove state', () => {
       finished: { target: { turnId: 'turn-one', status: 'done', notify: true } },
     }),
     'completed',
+  );
+});
+
+for (const [state, refresh] of [
+  ['working', true],
+  ['waiting', true],
+  ['unavailable', true],
+  ['completed', false],
+  ['failed', false],
+  ['interrupted', false],
+] as const) {
+  void test(`validation receipt ${state} refreshes: ${refresh}`, () => {
+    const gate: SpawnReceipt = {
+      ...receipt,
+      state,
+      provider: 'opencode',
+      validation: { gate: 'code-adversary', requestedModel: 'concrete' },
+    };
+    const restored = loadSpawnReceipts(JSON.stringify([gate]));
+
+    assert.equal(receiptNeedsRefresh(restored[0]), refresh);
+  });
+}
+
+void test('unavailable ordinary receipts remain settled while Ship workers recover', () => {
+  assert.equal(receiptNeedsRefresh({ ...receipt, state: 'unavailable' }), false);
+  assert.equal(
+    receiptNeedsRefresh({ ...receipt, state: 'unavailable', requestId: 'ship:run:issue' }),
+    true,
   );
 });

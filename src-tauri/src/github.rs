@@ -20,6 +20,8 @@ pub struct ShippingPullRequest {
     url: String,
     state: String,
     merged_at: Option<String>,
+    #[serde(default)]
+    checks: Vec<PullRequestCheck>,
 }
 
 #[tauri::command]
@@ -56,13 +58,22 @@ pub async fn shipping_pull_request(
                 "--state",
                 "all",
                 "--json",
-                "number,url,state,mergedAt",
+                "number,url,state,mergedAt,statusCheckRollup",
                 "--limit",
                 "2",
             ],
         )?;
-        let mut prs: Vec<ShippingPullRequest> =
+        let values: Vec<serde_json::Value> =
             serde_json::from_str(&output).map_err(|error| error.to_string())?;
+        let mut prs = values
+            .iter()
+            .map(|value| {
+                let mut pr: ShippingPullRequest =
+                    serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+                pr.checks = parse_pull_request_checks(value)?.checks;
+                Ok(pr)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         if prs.len() > 1 {
             return Err("Multiple pull requests use this shipping branch.".to_string());
         }

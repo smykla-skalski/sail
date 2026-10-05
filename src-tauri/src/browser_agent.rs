@@ -467,8 +467,10 @@ impl BrowserManager {
     ) -> Result<Value, String> {
         let setting = match name {
             "worktree_create" | "worktree_list" | "worktree_info" | "agent_spawn"
-            | "validation_gate" | "agent_status" | "agent_wait" | "agent_result"
-            | "terminal_list" | "terminal_read" | "terminal_wait" => "sai-agent-worktrees-enabled",
+            | "validation_gate" | "ship_progress" | "agent_status" | "agent_wait"
+            | "agent_result" | "terminal_list" | "terminal_read" | "terminal_wait" => {
+                "sai-agent-worktrees-enabled"
+            }
             "terminal_create" | "terminal_write" | "terminal_stop" => "sai-agent-terminals-enabled",
             "worktree_status" => "sai-agent-status-enabled",
             "project_threads" => "sai-agent-thread-list-enabled",
@@ -553,6 +555,7 @@ impl BrowserManager {
                 | "worktree_info"
                 | "agent_spawn"
                 | "validation_gate"
+                | "ship_progress"
                 | "agent_status"
                 | "agent_wait"
                 | "agent_result"
@@ -1113,6 +1116,11 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "gate,prompt",
     ),
     (
+        "ship_progress",
+        "Report your assigned Ship issue stage, or your own validation verdict. Structured reports appear in the native Ship view. Blocked or failing reports require a reason.",
+        "",
+    ),
+    (
         "agent_status",
         "Inspect a launch receipt with its ID and access key. Only the launching thread can read it.",
         "receiptId,accessKey",
@@ -1240,6 +1248,16 @@ pub fn run_mcp_stdio() {
                             "implementingModels":{"type":"array","items":{"type":"string"}}
                         },
                         "required":["gate","prompt","implementingModels"]
+                    }});
+                }
+                if *name == "ship_progress" {
+                    return json!({"name":name,"description":description,"inputSchema":{
+                        "type":"object","properties":{
+                            "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging"]},
+                            "status":{"type":"string","enum":["running","blocked"]},
+                            "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","FAIL","BLOCKED"]},
+                            "reason":{"type":"string","maxLength":2000}
+                        },"oneOf":[{"required":["stage","status"]},{"required":["verdict"]}]
                     }});
                 }
                 if *name == "agent_wait" {
