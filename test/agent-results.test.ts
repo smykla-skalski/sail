@@ -3,11 +3,13 @@ import test from 'node:test';
 import {
   acpReceiptState,
   activeSubagentsForSource,
+  boundedSpawnOutput,
   isSubagentThread,
   loadSpawnReceipts,
   receiptForSource,
   receiptNeedsRefresh,
   receiptIsSettled,
+  receiptNeedsLiveActivity,
   receiptSourceId,
   runningSubagentsForSource,
   saveBoundedReceipt,
@@ -115,6 +117,22 @@ await test('receipts survive restart with bounded results and honest states', ()
   );
   assert.deepEqual(loadSpawnReceipts('{invalid'), []);
   assert.deepEqual(loadSpawnReceipts(JSON.stringify([{ ...receipt, targetId: 1 }])), []);
+});
+
+await test('live activity stays until a settled result is preserved', () => {
+  assert.equal(receiptNeedsLiveActivity({ ...receipt, state: 'working', result: null }), true);
+  assert.equal(receiptNeedsLiveActivity({ ...receipt, state: 'completed', result: null }), true);
+  assert.equal(receiptNeedsLiveActivity(receipt), false);
+  assert.equal(
+    receiptNeedsLiveActivity({ ...receipt, state: 'failed', result: null, error: 'failed' }),
+    false,
+  );
+});
+
+await test('expanded activity output keeps a bounded meaningful tail', () => {
+  assert.equal(boundedSpawnOutput(receipt), 'Done');
+  assert.equal(boundedSpawnOutput({ ...receipt, result: null, error: 'failed' }), 'failed');
+  assert.equal(boundedSpawnOutput({ ...receipt, result: 'abcdef' }, 4), '…cdef');
 });
 
 await test('shipping receipts survive unrelated spawn traffic', () => {
