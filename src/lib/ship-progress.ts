@@ -353,6 +353,7 @@ const shipIssueSchema = z.object({
   state: z.enum(['pending', 'starting', 'working', 'awaiting_merge', 'failed', 'merged']),
   branch: z.string(),
   path: nullableString,
+  worktreeUnavailable: z.boolean().optional(),
   receiptId: nullableString,
   threadId: nullableString,
   pullRequest: nullableString,

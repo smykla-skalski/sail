@@ -2136,6 +2136,10 @@
     }
   }
 
+  function missingRepositoryPath(cause: unknown): boolean {
+    return describe(cause) === 'Repository path does not exist. Choose an existing directory.';
+  }
+
   async function refreshShippingIssue(
     run: ShipRun,
     issue: ShipIssue,
@@ -2175,11 +2179,30 @@
     if (isDirectShipRun(run)) {
       const workerState = await directShipWorkerState(issue);
       if (workerState !== issue.workerState) await update({ workerState });
-      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
-        repository: run.repository,
-        paths: issue.path ? [issue.path] : [],
-      });
+      const project = issue.path ? worktreeAt(projectCatalog, issue.path)?.repository : undefined;
+      if (project && run.repository !== project) run.repository = project;
+      let registered: RegisteredWorktree[];
+      try {
+        registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+          repository: run.repository,
+          paths: issue.path ? [issue.path] : [],
+        });
+      } catch (cause) {
+        if (missingRepositoryPath(cause)) {
+          await update({
+            workerState: 'unavailable',
+            worktreeUnavailable: true,
+            refreshError: null,
+            refreshedAt: Date.now(),
+          });
+          return;
+        }
+        throw cause;
+      }
       const worktree = registered.find((item) => item.path === issue.path);
+      if (issue.path && !worktree && !issue.worktreeUnavailable)
+        await update({ worktreeUnavailable: true });
+      else if (worktree && issue.worktreeUnavailable) await update({ worktreeUnavailable: false });
       if (worktree?.branch && worktree.branch !== issue.branch)
         await update({ branch: worktree.branch });
       try {
@@ -5706,7 +5729,13 @@
   }
 
   async function openShipTarget(path: string, threadId?: string | null) {
-    await invoke('validate_repository', { path });
+    try {
+      await invoke('validate_repository', { path });
+    } catch (cause) {
+      if (missingRepositoryPath(cause))
+        throw new Error('This Ship worktree no longer exists on disk.', { cause });
+      throw cause;
+    }
     if (threadId) {
       const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
         (item) =>

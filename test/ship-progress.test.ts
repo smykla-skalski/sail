@@ -140,11 +140,13 @@ void test('restores umbrella, gate verdict and model after receipts are pruned',
 void test('loads legacy runs and discards malformed records without losing valid runs', () => {
   const run = fixture();
   delete run.umbrella;
+  run.issues[0].worktreeUnavailable = true;
   const restored = loadShipRuns(JSON.stringify([{ id: 'broken', issues: [null] }, run]));
 
   assert.equal(restored.length, 1);
   assert.equal(restored[0].id, 'run');
   assert.equal(restored[0].issues[0].gates, undefined);
+  assert.equal(restored[0].issues[0].worktreeUnavailable, true);
   assert.deepEqual(loadShipRuns('{'), []);
 });
 

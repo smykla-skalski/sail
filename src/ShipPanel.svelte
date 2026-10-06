@@ -202,11 +202,12 @@
           </p>
           <div class="ship-actions">
             <a href={issue.url} target="_blank" rel="noreferrer">Open GitHub issue</a>
-            <button disabled={!issue.path} onclick={() => act(() => onopen(issue!.path!))}
-              >Open worktree</button
+            <button
+              disabled={!issue.path || issue.worktreeUnavailable}
+              onclick={() => act(() => onopen(issue!.path!))}>Open worktree</button
             >
             <button
-              disabled={!issue.path || !issue.threadId}
+              disabled={!issue.path || !issue.threadId || issue.worktreeUnavailable}
               onclick={() => act(() => onopen(issue!.path!, issue!.threadId))}
               >Open worker session</button
             >
@@ -215,8 +216,12 @@
               >{/if}
           </div>
           <p class="ship-path">
-            {issue.path ??
-              (issue.state === 'merged' ? 'Worktree removed after merge' : 'Worktree not created')} ·
+            {issue.worktreeUnavailable
+              ? `Worktree unavailable: ${issue.path}`
+              : (issue.path ??
+                (issue.state === 'merged'
+                  ? 'Worktree removed after merge'
+                  : 'Worktree not created'))} ·
             {issue.branch}
           </p>
           {#if issue.archivePath}<p class="ship-path">Archived files: {issue.archivePath}</p>{/if}

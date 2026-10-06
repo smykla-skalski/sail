@@ -14,6 +14,7 @@ export interface ShipIssue {
   state: ShipIssueState;
   branch: string;
   path: string | null;
+  worktreeUnavailable?: boolean;
   receiptId: string | null;
   threadId: string | null;
   pullRequest: string | null;
