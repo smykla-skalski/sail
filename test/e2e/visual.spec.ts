@@ -1,6 +1,14 @@
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { returnToWorkspace, openSettings } from './settings-window';
@@ -53,8 +61,35 @@ async function layout() {
   });
 }
 
+async function expectLaunchActionsReachable(viewportHeight: number) {
+  const launchActions = await $$('.welcome-agents button');
+  expect(launchActions.length).toBeGreaterThan(1);
+  const actionBounds = await launchActions.reduce<
+    Promise<Array<{ label: string; top: number; bottom: number }>>
+  >(async (accumulated, action) => {
+    const bounds = await accumulated;
+    await browser.execute((element) => element.scrollIntoView({ block: 'center' }), action);
+    await action.waitForDisplayed();
+    expect(await action.isEnabled()).toBe(true);
+    return [
+      ...bounds,
+      await browser.execute((element) => {
+        const rect = element.getBoundingClientRect();
+        return { label: element.textContent ?? '', top: rect.top, bottom: rect.bottom };
+      }, action),
+    ];
+  }, Promise.resolve([]));
+  actionBounds.forEach((bounds) => {
+    expect(bounds.top).toBeGreaterThanOrEqual(0);
+    expect(bounds.bottom).toBeLessThanOrEqual(viewportHeight + 1);
+  });
+  return launchActions;
+}
+
 describe('visual layout audit', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-visual-repository-'));
+  const settingsFile = join(process.env.SAIL_E2E_CONFIG_DIR!, 'settings.json');
+  let settingsBackup: string | null | undefined;
 
   before(() => {
     execFileSync('git', ['init', '-q', repository]);
@@ -77,13 +112,26 @@ describe('visual layout audit', () => {
 
   after(() => rmSync(repository, { recursive: true, force: true }));
 
+  afterEach(async () => {
+    if (settingsBackup !== undefined) {
+      if (settingsBackup === null) rmSync(settingsFile, { force: true });
+      else writeFileSync(settingsFile, settingsBackup);
+      settingsBackup = undefined;
+    }
+    await browser.execute(() => sessionStorage.removeItem('sail-e2e-settings'));
+  });
+
   it('captures navigation, settings, worktree, and agent states at varied sizes', async function () {
     if (process.env.SAIL_FUZZ_SEED) this.skip();
     this.timeout(180_000);
     const path = realpathSync(repository);
     const longName = `A very long project group ${'navigation'.repeat(12)}`;
+    settingsBackup = existsSync(settingsFile) ? readFileSync(settingsFile, 'utf8') : null;
+    writeFileSync(settingsFile, '{');
+    await browser.setWindowSize(1280, 850);
     await browser.execute(
       (selected, groupName) => {
+        sessionStorage.setItem('sail-e2e-settings', 'enabled');
         localStorage.setItem('sai-directory', selected);
         localStorage.setItem('sai-theme', 'light');
         localStorage.setItem(
@@ -122,12 +170,67 @@ describe('visual layout audit', () => {
       if (typeof sendButtonBottom === 'number')
         expect(sendButtonBottom).toBeLessThanOrEqual(size.viewport.height + 1);
       if (width === 320) {
-        const agentActionBottom = await browser.execute(
-          () => document.querySelector('.welcome-agents button')?.getBoundingClientRect().bottom,
+        await expect($('.main-area > .notice.error')).toHaveText(
+          expect.stringContaining('settings'),
         );
-        expect(typeof agentActionBottom).toBe('number');
-        if (typeof agentActionBottom === 'number')
-          expect(agentActionBottom).toBeLessThanOrEqual(size.viewport.height + 1);
+        await expectLaunchActionsReachable(size.viewport.height);
+        const textScale = await browser.execute(() => {
+          const selectors = [
+            '.main-area > .notice.error',
+            '.welcome .eyebrow',
+            '.welcome h1',
+            '.welcome p:not(.eyebrow)',
+          ];
+          const styles = selectors.map((selector) => {
+            const element = document.querySelector<HTMLElement>(selector)!;
+            return {
+              selector,
+              inlineFontSize: element.style.fontSize,
+              fontSize: Number.parseFloat(getComputedStyle(element).fontSize),
+            };
+          });
+          const buttonFontSize = Number.parseFloat(
+            getComputedStyle(document.querySelector<HTMLElement>('.welcome-agents button')!)
+              .fontSize,
+          );
+          document.documentElement.style.fontSize = '200%';
+          styles.forEach(({ selector, fontSize }) => {
+            document.querySelector<HTMLElement>(selector)!.style.fontSize = `${fontSize * 2}px`;
+          });
+          return {
+            styles,
+            buttonFontSize,
+          };
+        });
+        const launchActions = await expectLaunchActionsReachable(size.viewport.height);
+        const scaledText = await browser.execute(
+          (styles, buttonFontSize, button) => {
+            return [
+              ...styles.map(({ selector, fontSize }) => ({
+                fontSize,
+                scaled: Number.parseFloat(
+                  getComputedStyle(document.querySelector<HTMLElement>(selector)!).fontSize,
+                ),
+              })),
+              {
+                fontSize: buttonFontSize,
+                scaled: Number.parseFloat(getComputedStyle(button).fontSize),
+              },
+            ];
+          },
+          textScale.styles,
+          textScale.buttonFontSize,
+          launchActions[0],
+        );
+        scaledText.forEach(({ fontSize, scaled }) => {
+          expect(scaled).toBeGreaterThanOrEqual(fontSize * 2);
+        });
+        await browser.execute((styles) => {
+          document.documentElement.style.removeProperty('font-size');
+          styles.forEach(({ selector, inlineFontSize }) => {
+            document.querySelector<HTMLElement>(selector)!.style.fontSize = inlineFontSize;
+          });
+        }, textScale.styles);
       }
       await capture(`${width}x${height}-chat`);
       if (width <= 850) await $('.mobile-switcher button:nth-child(1)').click();

@@ -191,14 +191,22 @@
     type InterruptedAgentTurn,
   } from './lib/acp';
   import {
+    compatibleOpenCodeVersion,
     connect,
+    OPENCODE_VERSION,
     type OpenCodeClient,
     type RuntimeInfo,
     type SessionInfo,
     type SessionMessageInfo,
   } from './lib/opencode';
-  import { getHistory, getPlan, type HistoryEntry, type PlanSnapshot } from './lib/plan';
+  import { recordDiagnostic } from './lib/diagnostics';
+  import { getPlan, type HistoryEntry, type PlanSnapshot } from './lib/plan';
   import { mergeMessages, nearBottom } from './lib/timeline';
+  import {
+    forgetOpenCodeTimeline,
+    recallOpenCodeTimeline,
+    rememberOpenCodeTimeline,
+  } from './lib/opencode-timeline-cache';
   import {
     clipboardFiles,
     fileUri,
@@ -851,7 +859,6 @@
   let diffRefresh = 0;
   let diffRevision = '';
   let diffRevisionPath = '';
-  let historyRefresh = 0;
   let draft = $state('');
   const failureRequests = new SvelteMap<string, string>();
   let mainPrompt = $state<HTMLTextAreaElement | undefined>();
@@ -1181,6 +1188,7 @@
     if (current !== selection || id !== sessionID) return;
     messages = mergeMessages(messages, page.data);
     olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
+    cacheCurrentTimeline();
     await restoreOlderMessages(source, id, current, count, anchorID);
   }
   let client = $state<OpenCodeClient | null>(null);
@@ -1758,8 +1766,10 @@
   async function activateRuntime(info: RuntimeInfo) {
     const nextClient = connect(info);
     const server = await nextClient.server.info({ signal: AbortSignal.timeout(5000) });
-    if (!server.version.startsWith('2.'))
-      throw new Error('OpenCode v2 is required. Choose a compatible binary in settings.');
+    if (!compatibleOpenCodeVersion(server.version))
+      throw new Error(
+        `OpenCode v${OPENCODE_VERSION} is required (found ${server.version}). Upgrade or choose a compatible binary in settings.`,
+      );
     if (disposed) return;
     clearTimeout(recoveryTimer);
     eventController?.abort();
@@ -1833,12 +1843,6 @@
 
   async function checkRuntime() {
     if (connecting || runtimeState !== 'connected' || !client) return;
-    try {
-      await client.server.info({ signal: AbortSignal.timeout(3000) });
-    } catch {
-      await recoverRuntime();
-      return;
-    }
     if (!directory || planReady || setupLoading) return;
     const now = Date.now();
     if (now - lastSetupProbe < (setupProbeCount < 12 ? 5000 : 30000)) return;
@@ -4928,6 +4932,7 @@
     }
     ++projectLoadGeneration;
     saveViewState();
+    cacheCurrentTimeline();
     error = '';
     const current = ++selection;
     directory = path;
@@ -4978,7 +4983,6 @@
     diffLoading = false;
     historyEvents = [];
     historyError = '';
-    ++historyRefresh;
     historyLoading = false;
     if (client) await ensureOpenCodeBrowser(path).catch((cause) => (error = describe(cause)));
     if (!client || !(await refreshSetup(path)) || current !== selection) return;
@@ -5302,6 +5306,7 @@
 
   function clearSelectedSession() {
     saveViewState();
+    cacheCurrentTimeline();
     sessionID = null;
     if (mobileView === 'details') mobileView = 'chat';
     selectedSession = null;
@@ -7315,16 +7320,19 @@
       (!targetPane ||
         (paneSelections.get(targetPane.id) === paneSelection &&
           leaves(paneLayout).some((pane) => pane.id === targetPane.id)));
-    let info: SessionInfo;
-    try {
-      info = await client.session.get({ sessionID: id });
-      if (!valid()) return false;
-      if (info.location.directory !== path || info.parentID)
-        throw new Error('This session does not belong to the selected repository.');
-    } catch (cause) {
-      if (valid()) error = describe(cause);
-      return false;
-    }
+    let info = sessions.find(
+      (session) => session.id === id && session.location.directory === path && !session.parentID,
+    );
+    if (!info)
+      try {
+        info = await client.session.get({ sessionID: id });
+        if (!valid()) return false;
+        if (info.location.directory !== path || info.parentID)
+          throw new Error('This session does not belong to the selected repository.');
+      } catch (cause) {
+        if (valid()) error = describe(cause);
+        return false;
+      }
     const nativeThread: AgentThread = {
       agent: 'opencode',
       sessionId: info.id,
@@ -7349,6 +7357,7 @@
       focusPaneForTyping(targetPane.id);
       return true;
     }
+    cacheCurrentTimeline();
     sessionID = id;
     clearMainPaneEmpty();
     detailsOpen = true;
@@ -7356,7 +7365,7 @@
     syncSessionChoice(info);
     newSessionMode = null;
     clearDraftAttachments();
-    resetTimeline();
+    restoreCachedTimeline(path, id);
     followChat = viewStates.get(viewKey())?.follow ?? true;
     running = activeSessionIDs.includes(id);
     activity = 'Thinking';
@@ -7364,17 +7373,18 @@
     pendingPermissions = [];
     pendingForms = [];
     snapshot = { plan: null, questions: null };
-    diffs = [];
-    selectedFilePath = null;
     diffError = '';
     ++diffRefresh;
     diffLoading = false;
     historyEvents = [];
     historyError = '';
-    ++historyRefresh;
     historyLoading = false;
     sideTab = viewStates.get(viewKey())?.sideTab ?? 'plan';
-    selectedFilePath = viewStates.get(viewKey())?.selectedFilePath ?? null;
+    selectedFilePath = selectedDiffFile(
+      diffs,
+      viewStates.get(viewKey())?.selectedFilePath ?? null,
+      path,
+    );
     if (!automatic) mobileView = 'chat';
     error = '';
     setSetting(`sai-session:${directory}`, id);
@@ -7413,6 +7423,7 @@
     savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null, kind: undefined }));
     clearMainPaneEmpty();
     saveViewState();
+    cacheCurrentTimeline();
     ++selection;
     sessionID = null;
     selectedSession = null;
@@ -7430,7 +7441,6 @@
     diffLoading = false;
     historyEvents = [];
     historyError = '';
-    ++historyRefresh;
     historyLoading = false;
     pendingPermissions = [];
     pendingForms = [];
@@ -7696,6 +7706,7 @@
           nextLayout = updatePane(nextLayout, pane.id, { thread: null });
       if (nextLayout !== paneLayout) savePaneLayout(nextLayout);
       if (session.id === sessionID) clearSelectedSession();
+      forgetOpenCodeTimeline(directory, session.id);
       await refreshSessions();
     } catch (cause) {
       error = describe(cause);
@@ -7739,6 +7750,23 @@
     messageGeneration.clear();
   }
 
+  function cacheCurrentTimeline() {
+    if (!directory || !sessionID || timelineSession !== sessionID) return;
+    rememberOpenCodeTimeline(directory, sessionID, {
+      messages,
+      cursor: olderMessageCursor,
+    });
+  }
+
+  function restoreCachedTimeline(path: string, id: string) {
+    resetTimeline();
+    const cached = recallOpenCodeTimeline(path, id);
+    if (!cached) return;
+    timelineSession = id;
+    messages = cached.messages;
+    olderMessageCursor = cached.cursor;
+  }
+
   function scrollToLatest() {
     if (!followChat) return;
     cancelAnimationFrame(followFrame);
@@ -7780,6 +7808,7 @@
       timelineSession = id;
       messages = acceptProjectedMessages(first.data, observed).toReversed();
       olderMessageCursor = first.cursor.next ?? null;
+      cacheCurrentTimeline();
       await tick();
       scrollToLatest();
       return;
@@ -7800,6 +7829,7 @@
     const incoming = await collectGap(first.cursor.next ?? null, [...first.data]);
     if (!valid()) return;
     messages = mergeMessages(messages, acceptProjectedMessages(incoming, observed));
+    cacheCurrentTimeline();
   }
 
   async function loadOlderMessages() {
@@ -7825,6 +7855,7 @@
       if (current !== selection || id !== sessionID) return;
       messages = mergeMessages(messages, acceptProjectedMessages(page.data, observed));
       olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
+      cacheCurrentTimeline();
       if (!underfilled) followChat = false;
       await tick();
       if (chatScroll)
@@ -7864,6 +7895,7 @@
       )
         return;
       messages = mergeMessages(messages, [message]);
+      cacheCurrentTimeline();
       if (settled) {
         const remaining = { ...liveText };
         delete remaining[messageID];
@@ -7919,35 +7951,15 @@
   }
 
   async function refreshHistory(id = sessionID, current = selection) {
-    if (!client || !id || !directory) return;
+    if (!client || !id || !directory || current !== selection) return;
     if (setup?.rpc.state !== 'ready') {
       historyEvents = [];
       historyError = 'Install the plan-review plugin to record plan history.';
       return;
     }
-    const source = client;
-    const path = directory;
-    const generation = ++historyRefresh;
-    historyLoading = true;
-    try {
-      const next = await getHistory(source, path, id);
-      if (
-        generation !== historyRefresh ||
-        current !== selection ||
-        id !== sessionID ||
-        path !== directory
-      )
-        return;
-      historyEvents = next;
-      historyError = '';
-    } catch (cause) {
-      if (generation === historyRefresh && current === selection && id === sessionID) {
-        historyError = describe(cause);
-        historyEvents = [];
-      }
-    } finally {
-      if (generation === historyRefresh) historyLoading = false;
-    }
+    historyLoading = false;
+    historyEvents = [];
+    historyError = 'Plan-review 0.2.0 does not expose history.';
   }
 
   function selectDiffPath(path: string) {
@@ -7972,13 +7984,13 @@
     if (!client || !id || !directory) return;
     const source = client;
     const path = directory;
+    void refreshDiff(id, current, true);
     const [history, plan] = await Promise.allSettled([
       refreshTimeline(id, current),
       setup?.rpc.state === 'ready'
         ? getPlan(source, path, id)
         : Promise.resolve({ plan: null, questions: null } as PlanSnapshot),
       refreshPrompts(id, current),
-      refreshDiff(id, current),
       refreshHistory(id, current),
     ]);
     if (current !== selection || id !== sessionID) return;
@@ -8056,6 +8068,7 @@
   }
 
   async function watchEvents(source: OpenCodeClient, signal: AbortSignal) {
+    let failed = false;
     try {
       for await (const event of source.event.subscribe({ signal })) {
         if (signal.aborted) return;
@@ -8289,10 +8302,17 @@
           void reconcileNativeActivity();
         }
       }
-    } catch {
+    } catch (cause) {
+      failed = true;
       // A new subscription reloads missed state after the live stream fails.
+      if (!signal.aborted)
+        recordDiagnostic('opencode_event_stream_failed', {
+          errorName: cause instanceof Error ? cause.name : typeof cause,
+          message: describe(cause).slice(0, 500),
+        });
     }
     if (!signal.aborted) {
+      if (!failed) recordDiagnostic('opencode_event_stream_ended');
       ++nativeActivityGeneration;
       nativeActivityReady = false;
       runtimeState = 'starting';

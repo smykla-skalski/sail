@@ -65,7 +65,7 @@ function stage(targetName) {
     target: targetName,
     sourceRevision: process.env.GITHUB_SHA ?? 'local',
     signing: process.env.SAIL_SIGNING_MODE ?? process.env.SAI_SIGNING_MODE ?? 'unsigned',
-    opencode: '2.0.19 (external prerequisite)',
+    opencode: '2.0.24 (external prerequisite)',
     files,
   };
   writeFileSync(join('release-output', 'metadata.json'), `${JSON.stringify(metadata, null, 2)}\n`);

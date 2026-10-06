@@ -4,12 +4,12 @@
 
 | Component          | Tested revision                                                      | Gate                                                   |
 | ------------------ | -------------------------------------------------------------------- | ------------------------------------------------------ |
-| OpenCode server    | `@opencode/cli@2.0.19`                                               | Live contract on Linux, macOS, Windows                 |
-| JavaScript client  | `@opencode/client@2.0.20`                                            | Frontend build and live contract                       |
-| Plan-review plugin | `fdc575ba5ffccc6420ad5b3b68372f99f70290f5` (package version `0.2.0`) | Live `get` and `history` RPC                           |
+| OpenCode server    | `@opencode/cli@2.0.24`                                               | Live contract on Linux, macOS, Windows                 |
+| JavaScript client  | `@opencode/client@2.0.24`                                            | Frontend build and live contract                       |
+| Plan-review plugin | `fdc575ba5ffccc6420ad5b3b68372f99f70290f5` (package version `0.2.0`) | Live `get` RPC                                         |
 | Tauri app          | This repository's current commit                                     | Rust CI on Linux, macOS, Windows; desktop WDIO locally |
 
-The plugin commit includes the history RPC. The published `0.2.0` package does not; its package version was not bumped after that change. Until a new package is published, configure the tested Git revision in `opencode.jsonc`:
+Configure the tested plugin revision in `opencode.jsonc`:
 
 ```json
 {
@@ -19,7 +19,7 @@ The plugin commit includes the history RPC. The published `0.2.0` package does n
 }
 ```
 
-The app accepts other OpenCode v2 revisions, but CI establishes compatibility only for the versions above. Update the CLI version, client version, plugin SHA, and this table together. The live contract fails when a method or response shape used by the app drifts.
+The app requires the exact OpenCode server revision above. Update the CLI version, client version, plugin SHA, and this table together. The live contract fails when a method or response shape used by the app drifts.
 
 ## Automated checks
 
@@ -50,4 +50,4 @@ Record failures with the exact versions, OS, step, visible error, and relevant O
 - [ ] Create `vX.Y.Z` only after the checks above. The tag workflow verifies version parity and source revision, attests the packages, and publishes a development prerelease with checksums and a manifest.
 - [ ] Verify downloaded package hashes and GitHub attestations from a separate clean machine; install and launch each package there before directing users to the release.
 
-Current platform limits: installers are macOS ARM64/x64, Linux x64, and Windows x64. Linux packages are built on Ubuntu 22.04 for older glibc compatibility; other distributions still require a compatible graphical stack. Windows NSIS may download WebView2 during installation. The app relies on a separately installed OpenCode v2.0.19 and does not self-update. The hosted package smoke checks do not exercise credentialed model execution, so the manual release smoke remains required.
+Current platform limits: installers are macOS ARM64/x64, Linux x64, and Windows x64. Linux packages are built on Ubuntu 22.04 for older glibc compatibility; other distributions still require a compatible graphical stack. Windows NSIS may download WebView2 during installation. The app relies on a separately installed OpenCode v2.0.24 and does not self-update. The hosted package smoke checks do not exercise credentialed model execution, so the manual release smoke remains required.

@@ -14,6 +14,7 @@ use tauri::Emitter;
 use tauri::{Manager, State};
 
 static SHIPPING_WORKTREE_LOCK: Mutex<()> = Mutex::new(());
+const OPENCODE_VERSION: &str = "2.0.24";
 
 fn existing_shipping_worktree(
     repository: &Path,
@@ -354,6 +355,10 @@ fn version_number(output: &str) -> Option<&str> {
     }
 }
 
+fn version_is_compatible(version: Option<&str>) -> bool {
+    version == Some(OPENCODE_VERSION)
+}
+
 fn compatible_version(binary: &Path) -> Result<(), String> {
     let mut command = Command::new(binary);
     command.arg("--version");
@@ -395,11 +400,11 @@ fn compatible_version(binary: &Path) -> Result<(), String> {
         .recv_timeout(Duration::from_secs(1))
         .unwrap_or_default();
     let version = version_number(&output);
-    if status.success() && version.is_some_and(|value| value.starts_with("2.")) {
+    if status.success() && version_is_compatible(version) {
         Ok(())
     } else {
         Err(format!(
-            "OpenCode v2 is required (found {}). Choose a compatible binary in settings.",
+            "OpenCode v{OPENCODE_VERSION} is required (found {}). Upgrade or choose a compatible binary in settings.",
             version.unwrap_or("an incompatible binary")
         ))
     }
@@ -431,14 +436,16 @@ fn resolve_binary(binary_path: Option<String>) -> Result<OsString, String> {
         }
     }
     Err(incompatible.unwrap_or_else(|| {
-        "OpenCode v2 was not found. Install it or choose an absolute binary path in settings."
-            .to_string()
+        format!(
+            "OpenCode v{OPENCODE_VERSION} was not found. Install it or choose an absolute binary path in settings."
+        )
     }))
 }
 
 fn probe_runtime(info: &RuntimeInfo) -> Result<(), String> {
-    let diagnostic =
-        "OpenCode did not respond with a compatible v2 API. Check its configuration and retry.";
+    let diagnostic = format!(
+        "OpenCode did not respond with the compatible v{OPENCODE_VERSION} API. Check its configuration and retry."
+    );
     let url = reqwest::Url::parse(&info.url).map_err(|_| diagnostic.to_string())?;
     if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") || url.port().is_none() {
         return Err(diagnostic.to_string());
@@ -457,11 +464,7 @@ fn probe_runtime(info: &RuntimeInfo) -> Result<(), String> {
         return Err(diagnostic.to_string());
     }
     let body: serde_json::Value = response.json().map_err(|_| diagnostic.to_string())?;
-    if body
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|version| version.starts_with("2."))
-    {
+    if version_is_compatible(body.get("version").and_then(serde_json::Value::as_str)) {
         Ok(())
     } else {
         Err(diagnostic.to_string())
@@ -1958,7 +1961,8 @@ mod tests {
         add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
         git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
         remove_worktree, repository_namespace, server_args, shipping_default_branch,
-        shipping_fetch_source, version_number, working_tree_diff, worktree_overviews,
+        shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
+        worktree_overviews,
     };
     use std::fs;
     #[cfg(unix)]
@@ -2743,8 +2747,11 @@ mod tests {
 
     #[test]
     fn accepts_real_opencode_version_output() {
-        assert_eq!(version_number("opencode v2.0.19\n"), Some("2.0.19"));
+        assert_eq!(version_number("opencode v2.0.24\n"), Some("2.0.24"));
         assert_eq!(version_number("2.1.0\n"), Some("2.1.0"));
+        assert!(version_is_compatible(Some("2.0.24")));
+        assert!(!version_is_compatible(Some("2.0.22")));
+        assert!(!version_is_compatible(Some("2.1.0")));
     }
 
     #[test]
