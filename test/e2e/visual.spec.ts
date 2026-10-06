@@ -1,6 +1,14 @@
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { returnToWorkspace, openSettings } from './settings-window';
@@ -53,8 +61,35 @@ async function layout() {
   });
 }
 
+async function expectLaunchActionsReachable(viewportHeight: number) {
+  const launchActions = await $$('.welcome-agents button');
+  expect(launchActions.length).toBeGreaterThan(1);
+  const actionBounds = await launchActions.reduce<
+    Promise<Array<{ label: string; top: number; bottom: number }>>
+  >(async (accumulated, action) => {
+    const bounds = await accumulated;
+    await browser.execute((element) => element.scrollIntoView({ block: 'center' }), action);
+    await action.waitForDisplayed();
+    expect(await action.isEnabled()).toBe(true);
+    return [
+      ...bounds,
+      await browser.execute((element) => {
+        const rect = element.getBoundingClientRect();
+        return { label: element.textContent ?? '', top: rect.top, bottom: rect.bottom };
+      }, action),
+    ];
+  }, Promise.resolve([]));
+  actionBounds.forEach((bounds) => {
+    expect(bounds.top).toBeGreaterThanOrEqual(0);
+    expect(bounds.bottom).toBeLessThanOrEqual(viewportHeight + 1);
+  });
+  return launchActions;
+}
+
 describe('visual layout audit', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-visual-repository-'));
+  const settingsFile = join(process.env.SAIL_E2E_CONFIG_DIR!, 'settings.json');
+  let settingsBackup: string | null | undefined;
 
   before(() => {
     execFileSync('git', ['init', '-q', repository]);
@@ -77,13 +112,26 @@ describe('visual layout audit', () => {
 
   after(() => rmSync(repository, { recursive: true, force: true }));
 
+  afterEach(async () => {
+    if (settingsBackup !== undefined) {
+      if (settingsBackup === null) rmSync(settingsFile, { force: true });
+      else writeFileSync(settingsFile, settingsBackup);
+      settingsBackup = undefined;
+    }
+    await browser.execute(() => sessionStorage.removeItem('sail-e2e-settings'));
+  });
+
   it('captures navigation, settings, worktree, and agent states at varied sizes', async function () {
     if (process.env.SAIL_FUZZ_SEED) this.skip();
     this.timeout(180_000);
     const path = realpathSync(repository);
     const longName = `A very long project group ${'navigation'.repeat(12)}`;
+    settingsBackup = existsSync(settingsFile) ? readFileSync(settingsFile, 'utf8') : null;
+    writeFileSync(settingsFile, '{');
+    await browser.setWindowSize(1280, 850);
     await browser.execute(
       (selected, groupName) => {
+        sessionStorage.setItem('sail-e2e-settings', 'enabled');
         localStorage.setItem('sai-directory', selected);
         localStorage.setItem('sai-theme', 'light');
         localStorage.setItem(
@@ -125,6 +173,7 @@ describe('visual layout audit', () => {
         await expect($('.main-area > .notice.error')).toHaveText(
           expect.stringContaining('settings'),
         );
+        await expectLaunchActionsReachable(size.viewport.height);
         const textScale = await browser.execute(() => {
           const selectors = [
             '.main-area > .notice.error',
@@ -153,8 +202,7 @@ describe('visual layout audit', () => {
             buttonFontSize,
           };
         });
-        const launchActions = await $$('.welcome-agents button');
-        expect(launchActions.length).toBeGreaterThan(1);
+        const launchActions = await expectLaunchActionsReachable(size.viewport.height);
         const scaledText = await browser.execute(
           (styles, buttonFontSize, button) => {
             return [
@@ -176,27 +224,6 @@ describe('visual layout audit', () => {
         );
         scaledText.forEach(({ fontSize, scaled }) => {
           expect(scaled).toBeGreaterThanOrEqual(fontSize * 2);
-        });
-        const actionBounds = await launchActions.reduce<
-          Promise<Array<{ top: number; bottom: number }>>
-        >(async (accumulated, action) => {
-          const bounds = await accumulated;
-          await browser.execute((element) => {
-            element.scrollIntoView({ block: 'center' });
-          }, action);
-          await action.waitForDisplayed();
-          expect(await action.isEnabled()).toBe(true);
-          return [
-            ...bounds,
-            await browser.execute((element) => {
-              const rect = element.getBoundingClientRect();
-              return { top: rect.top, bottom: rect.bottom };
-            }, action),
-          ];
-        }, Promise.resolve([]));
-        actionBounds.forEach((bounds) => {
-          expect(bounds.top).toBeGreaterThanOrEqual(0);
-          expect(bounds.bottom).toBeLessThanOrEqual(size.viewport.height + 1);
         });
         await browser.execute((styles) => {
           document.documentElement.style.removeProperty('font-size');

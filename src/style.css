@@ -2050,6 +2050,13 @@ button:disabled {
   }
 }
 @media (max-width: 520px) and (max-height: 600px) {
+  .main-area:has(.conversation > .welcome) {
+    overflow-y: auto;
+  }
+  .main-area:has(.conversation > .welcome) .workspace {
+    min-height: 280px;
+    flex: 0 0 280px;
+  }
   .topbar {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
