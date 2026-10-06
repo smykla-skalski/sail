@@ -86,6 +86,78 @@ async function expectLaunchActionsReachable(viewportHeight: number) {
   return launchActions;
 }
 
+async function navigationTargetAudit(compact: boolean) {
+  return browser.execute((isCompact) => {
+    const selectors = [
+      '[aria-label="Add project group"]',
+      '[aria-label="Add repository"]',
+      '.project-group-toggle',
+      '.project-repository-select',
+      ...(isCompact ? ['.mobile-switcher button', '.agent-menu-launch'] : ['.breadcrumb-project']),
+    ];
+    const elements = selectors
+      .flatMap((selector) => Array.from(document.querySelectorAll<HTMLElement>(selector)))
+      .filter(
+        (element) =>
+          getComputedStyle(element).display !== 'none' &&
+          !element.matches(':disabled') &&
+          element.getAttribute('aria-disabled') !== 'true',
+      );
+    const targets = [];
+    for (const element of elements) {
+      element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      element.focus();
+      const rect = element.getBoundingClientRect();
+      targets.push({
+        label: element.getAttribute('aria-label') ?? element.textContent?.trim() ?? '',
+        height: rect.height,
+        left: rect.left,
+        right: rect.right,
+      });
+    }
+    const overlaps = [
+      '.projects-heading',
+      '.project-group-heading',
+      '.project-repository-row',
+      '.mobile-switcher',
+      '.topbar-actions',
+    ].flatMap((selector) =>
+      [...document.querySelectorAll<HTMLElement>(selector)].flatMap((container) => {
+        const controls = [...container.querySelectorAll<HTMLElement>('button')].filter(
+          (element) => getComputedStyle(element).display !== 'none',
+        );
+        return controls.flatMap((control, index) => {
+          const rect = control.getBoundingClientRect();
+          return controls.slice(index + 1).flatMap((next) => {
+            const nextRect = next.getBoundingClientRect();
+            return rect.left < nextRect.right &&
+              rect.right > nextRect.left &&
+              rect.top < nextRect.bottom &&
+              rect.bottom > nextRect.top
+              ? [`${control.textContent?.trim()} / ${next.textContent?.trim()}`]
+              : [];
+          });
+        });
+      }),
+    );
+    const focusRule = Array.from(document.styleSheets)
+      .flatMap((sheet) => Array.from(sheet.cssRules))
+      .find(
+        (rule): rule is CSSStyleRule =>
+          rule instanceof CSSStyleRule &&
+          rule.selectorText.includes('.project-control') &&
+          rule.selectorText.endsWith(':focus-visible'),
+      );
+    return {
+      targets,
+      overlaps,
+      documentWidth: document.documentElement.scrollWidth,
+      focusOutline: focusRule?.style.outline,
+      focusShadow: focusRule?.style.boxShadow,
+    };
+  }, compact);
+}
+
 describe('visual layout audit', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-visual-repository-'));
   const settingsFile = join(process.env.SAIL_E2E_CONFIG_DIR!, 'settings.json');
@@ -349,6 +421,91 @@ describe('visual layout audit', () => {
     await capture('mobile-dark-details');
     await $('.mobile-switcher button:nth-child(2)').click();
     await capture('mobile-dark-agent-chat');
+  });
+
+  it('keeps navigation targets large, focused, and separate', async () => {
+    const selected = realpathSync(repository);
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({
+          repositories: [path],
+          groups: [{ id: 'targets', name: 'Targets', collapsed: false, repositories: [path] }],
+        }),
+      );
+    }, selected);
+    await browser.setWindowSize(1280, 850);
+    await browser.refresh();
+    await $('.project-group-toggle').waitForDisplayed();
+
+    const desktop = await navigationTargetAudit(false);
+    expect(desktop.targets.length).toBeGreaterThanOrEqual(5);
+    desktop.targets.forEach((target) => {
+      expect(target.height).toBeGreaterThanOrEqual(31.5);
+    });
+    expect(desktop.focusOutline).toContain('3px');
+    expect(desktop.focusShadow).toContain('3px');
+    expect(desktop.overlaps).toEqual([]);
+
+    await browser.setWindowSize(851, 650);
+    const desktopAgentsHeight = await browser.execute(
+      () => document.querySelector('.agent-menu-launch')!.getBoundingClientRect().height,
+    );
+    expect(desktopAgentsHeight).toBeGreaterThanOrEqual(31.5);
+
+    await browser.setWindowSize(850, 650);
+    const compactAgentsHeight = await browser.execute(
+      () => document.querySelector('.agent-menu-launch')!.getBoundingClientRect().height,
+    );
+    expect(compactAgentsHeight).toBeGreaterThanOrEqual(43.5);
+    const compactBreadcrumbHeight = await browser.execute(
+      () => document.querySelector('.breadcrumb-project')!.getBoundingClientRect().height,
+    );
+    expect(compactBreadcrumbHeight).toBeGreaterThanOrEqual(43.5);
+
+    await browser.setWindowSize(320, 500);
+    await $('.mobile-switcher button:nth-child(1)').click();
+    await expect($('.sidebar')).toBeDisplayed();
+    const textStyles = await browser.execute(() => {
+      const elements = [
+        ...document.querySelectorAll<HTMLElement>(
+          '.project-control, .project-group-toggle, .project-repository-select, .mobile-switcher button, .agent-menu-launch',
+        ),
+      ].filter((element) => getComputedStyle(element).display !== 'none');
+      const styles = elements.map((element) => ({
+        element,
+        inlineFontSize: element.style.fontSize,
+        fontSize: Number.parseFloat(getComputedStyle(element).fontSize),
+      }));
+      styles.forEach(({ element, fontSize }) => (element.style.fontSize = `${fontSize * 2}px`));
+      return styles.map(({ inlineFontSize, fontSize }) => ({ inlineFontSize, fontSize }));
+    });
+    const compact = await navigationTargetAudit(true);
+    expect(compact.targets.length).toBeGreaterThanOrEqual(8);
+    compact.targets.forEach((target) => {
+      expect(target.height).toBeGreaterThanOrEqual(43.5);
+      expect(target.left).toBeGreaterThanOrEqual(-1);
+      expect(target.right).toBeLessThanOrEqual(321);
+    });
+    expect(compact.focusOutline).toContain('3px');
+    expect(compact.focusShadow).toContain('3px');
+    expect(compact.overlaps).toEqual([]);
+    expect(compact.documentWidth).toBeLessThanOrEqual(321);
+    await browser.execute((styles) => {
+      const elements = [
+        ...document.querySelectorAll<HTMLElement>(
+          '.project-control, .project-group-toggle, .project-repository-select, .mobile-switcher button, .agent-menu-launch',
+        ),
+      ].filter((element) => getComputedStyle(element).display !== 'none');
+      elements.forEach((element, index) => (element.style.fontSize = styles[index].inlineFontSize));
+    }, textStyles);
+
+    await $('.mobile-switcher button:nth-child(2)').click();
+    await $('.agent-menu-launch').click();
+    await expect($('.command-palette')).toBeDisplayed();
+    await browser.keys(['Escape']);
+    await expect($('.command-palette')).not.toBeDisplayed();
   });
 
   const labels = [
