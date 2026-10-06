@@ -6,7 +6,7 @@
 | ------------------ | -------------------------------------------------------------------- | ------------------------------------------------------ |
 | OpenCode server    | `@opencode/cli@2.0.24`                                               | Live contract on Linux, macOS, Windows                 |
 | JavaScript client  | `@opencode/client@2.0.24`                                            | Frontend build and live contract                       |
-| Plan-review plugin | `2060ad90ec716468f9cf280a74126bffcb4e538d` (package version `0.2.0`) | Live `get` RPC                                         |
+| Plan-review plugin | `fdc575ba5ffccc6420ad5b3b68372f99f70290f5` (package version `0.2.0`) | Live `get` RPC                                         |
 | Tauri app          | This repository's current commit                                     | Rust CI on Linux, macOS, Windows; desktop WDIO locally |
 
 Configure the tested plugin revision in `opencode.jsonc`:
@@ -14,12 +14,12 @@ Configure the tested plugin revision in `opencode.jsonc`:
 ```json
 {
   "plugins": [
-    "github:smykla-skalski/opencode-plugin-plan-review#2060ad90ec716468f9cf280a74126bffcb4e538d"
+    "github:smykla-skalski/opencode-plugin-plan-review#fdc575ba5ffccc6420ad5b3b68372f99f70290f5"
   ]
 }
 ```
 
-The app accepts other OpenCode v2 revisions, but CI establishes compatibility only for the versions above. Update the CLI version, client version, plugin SHA, and this table together. The live contract fails when a method or response shape used by the app drifts.
+The app requires the exact OpenCode server revision above. Update the CLI version, client version, plugin SHA, and this table together. The live contract fails when a method or response shape used by the app drifts.
 
 ## Automated checks
 

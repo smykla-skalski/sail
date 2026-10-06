@@ -322,10 +322,38 @@
 
   async function refreshMessages(id: string, current = generation) {
     if (!client) return;
-    const page = await client.message.list({ sessionID: id, limit: 50, order: 'desc' });
+    const source = client;
+    const page = await source.message.list({ sessionID: id, limit: 50, order: 'desc' });
     if (current !== generation || id !== activeID) return;
     const first = !messages.length;
-    messages = first ? page.data.toReversed() : mergeMessages(messages, page.data);
+    let incoming = [...page.data];
+    if (!first) {
+      const known = new Set(messages.map((message) => message.id));
+      async function collectGap(
+        next: string | null,
+        accumulated: SessionMessageInfo[],
+      ): Promise<{ messages: SessionMessageInfo[]; exhausted: boolean }> {
+        if (!next || !accumulated.length)
+          return {
+            messages: accumulated,
+            exhausted: !accumulated.some((message) => known.has(message.id)),
+          };
+        if (accumulated.some((message) => known.has(message.id)))
+          return { messages: accumulated, exhausted: false };
+        const older = await source.message.list({ sessionID: id, limit: 50, cursor: next });
+        if (current !== generation || id !== activeID)
+          return { messages: accumulated, exhausted: false };
+        accumulated.push(...older.data);
+        if (older.cursor.next === next || !older.data.length)
+          return { messages: accumulated, exhausted: true };
+        return collectGap(older.cursor.next ?? null, accumulated);
+      }
+      const collected = await collectGap(page.cursor.next ?? null, incoming);
+      if (current !== generation || id !== activeID) return;
+      incoming = collected.messages;
+      if (collected.exhausted) cursor = null;
+    }
+    messages = first ? incoming.toReversed() : mergeMessages(messages, incoming);
     onusage?.(id, openCodeContextUsage(messages, setup?.models ?? []));
     if (first) cursor = page.cursor.next ?? null;
     rememberOpenCodeTimeline(directory, id, { messages, cursor });
@@ -416,11 +444,13 @@
     if (!client || !id) return;
     loading = true;
     try {
+      const auxiliary = Promise.allSettled([
+        refreshMessages(id, current),
+        refreshRequests(id, current),
+      ]);
       const [info, active] = await Promise.all([
         client.session.get({ sessionID: id }),
         client.session.active(),
-        refreshMessages(id, current),
-        refreshRequests(id, current),
       ]);
       if (current !== generation || disposed) return;
       session = info;
@@ -428,6 +458,10 @@
       selectedModel = info.model ? `${info.model.providerID}:${info.model.id}` : selectedModel;
       selectedVariant = info.model?.variant ?? '';
       running = active[id]?.type === 'running';
+      const failed = (await auxiliary).find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      if (failed && current === generation) error = describe(failed.reason);
     } catch (cause) {
       if (current === generation) error = describe(cause);
     } finally {
