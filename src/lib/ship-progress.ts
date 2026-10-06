@@ -397,6 +397,7 @@ const shipRunSchema = z.object({
   limit: z.number().int().min(1).max(8),
   approvedAt: z.number(),
   externalClosed: z.record(z.string(), z.boolean()).default({}),
+  dependencyErrors: z.record(z.string(), z.string()).default({}),
   issues: z.array(shipIssueSchema),
   umbrella: z.object({ number: z.number(), title: z.string(), url: z.string() }).optional(),
 });

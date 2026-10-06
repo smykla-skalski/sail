@@ -46,6 +46,7 @@ export interface ShipRun {
   limit: number;
   approvedAt: number;
   externalClosed: Record<string, boolean>;
+  dependencyErrors?: Record<string, string>;
   issues: ShipIssue[];
   umbrella?: { number: number; title: string; url: string };
 }
@@ -95,6 +96,7 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
       limit: 1,
       approvedAt: input.approvedAt,
       externalClosed: {},
+      dependencyErrors: {},
       issues: [
         {
           id: `${input.repository}#${input.number}`,
@@ -170,6 +172,7 @@ export function createShipRun(
     limit,
     approvedAt,
     externalClosed: {},
+    dependencyErrors: {},
     umbrella: graph.umbrella
       ? { number: graph.umbrella.number, title: graph.umbrella.title, url: graph.umbrella.url }
       : undefined,
