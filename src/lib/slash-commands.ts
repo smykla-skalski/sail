@@ -12,6 +12,12 @@ function closingTicks(text: string, start: number, length: number): number {
   return -1;
 }
 
+function escapedTick(text: string, index: number): boolean {
+  let slashes = 0;
+  for (let before = index - 1; before >= 0 && text[before] === '\\'; before--) slashes++;
+  return slashes % 2 === 1;
+}
+
 export function visibleCommandText(text: string): string {
   let fence: { marker: string; length: number } | null = null;
   const unfenced = text
@@ -34,7 +40,7 @@ export function visibleCommandText(text: string): string {
 
   let visible = '';
   for (let index = 0; index < unfenced.length;) {
-    if (unfenced[index] !== '`' || (index > 0 && unfenced[index - 1] === '\\')) {
+    if (unfenced[index] !== '`' || escapedTick(unfenced, index)) {
       visible += unfenced[index];
       index++;
       continue;
