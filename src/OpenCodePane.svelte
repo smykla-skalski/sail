@@ -171,6 +171,7 @@
   let files = $state<string[]>([]);
   let pendingPaste: Promise<void> = Promise.resolve();
   const clipboardPaths = new SvelteSet<string>();
+  const inFlightClipboard = new SvelteSet<string>();
   async function pasteFiles(event: ClipboardEvent) {
     const pasted = clipboardFiles(event);
     if (!pasted.length) return;
@@ -326,8 +327,11 @@
     const current = ++generation;
     clearTimeout(refreshTimer);
     refreshTimer = undefined;
-    for (const path of clipboardPaths) void removeClipboardFile(path);
-    clipboardPaths.clear();
+    for (const path of clipboardPaths)
+      if (!inFlightClipboard.has(path)) {
+        clipboardPaths.delete(path);
+        void removeClipboardFile(path);
+      }
     for (const path of pickedImages)
       if (!inFlightCaptures.has(path)) {
         pickedImages.delete(path);
@@ -478,6 +482,8 @@
       clearTimeout(refreshTimer);
       for (const path of pickedImages)
         if (!inFlightCaptures.has(path)) void invoke('browser_remove_capture', { path });
+      for (const path of clipboardPaths)
+        if (!inFlightClipboard.has(path)) void removeClipboardFile(path);
     };
   });
 
@@ -508,6 +514,7 @@
     const source = client;
     const paths = external ? [] : [...files];
     for (const path of paths) if (pickedImages.has(path)) inFlightCaptures.add(path);
+    for (const path of paths) if (clipboardPaths.has(path)) inFlightClipboard.add(path);
     let accepted = false;
     if (!external) {
       draft = '';
@@ -591,8 +598,10 @@
         if (clipboardPaths.delete(path))
           void source.session
             .wait({ sessionID: id })
+            .catch(() => undefined)
             .then(() => removeClipboardFile(path))
-            .catch(() => undefined);
+            .catch(() => undefined)
+            .finally(() => inFlightClipboard.delete(path));
       if (queued) {
         await refreshMessages(id, current);
         return;
@@ -623,6 +632,12 @@
       if (external) throw cause;
     } finally {
       for (const path of paths) inFlightCaptures.delete(path);
+      if (!accepted)
+        for (const path of paths)
+          if (inFlightClipboard.delete(path) && (disposed || current !== generation)) {
+            clipboardPaths.delete(path);
+            void removeClipboardFile(path);
+          }
       if (current === generation) sending = false;
       if (disposed || current !== generation)
         for (const path of paths)

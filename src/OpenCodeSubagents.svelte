@@ -30,7 +30,7 @@
         sessions.data.map(async (child) => {
           const messages = await client!.message.list({
             sessionID: child.id,
-            limit: expanded.includes(child.id) ? 25 : 1,
+            limit: expanded.includes(child.id) ? 25 : 5,
             order: 'desc',
           });
           return [child.id, messages.data.toReversed()] as const;
@@ -43,6 +43,7 @@
   }
 
   $effect(() => {
+    ++request;
     expanded = [];
     if (client && parentID) void refresh();
     else {
@@ -65,10 +66,9 @@
   }
 
   function activity(id: string): string {
-    const last = latest[id]?.at(-1);
-    if (!last || last.type !== 'assistant')
-      return active.includes(id) ? 'Thinking' : 'No activity yet';
-    const part = last.content.at(-1);
+    const last = latest[id]?.findLast((message) => message.type === 'assistant');
+    if (!last || last.type !== 'assistant') return active.includes(id) ? 'Thinking' : 'Finished';
+    const part = last.content.findLast((item) => item.type === 'tool' || item.type === 'text');
     if (part?.type === 'tool') return `${part.name} · ${part.state.status}`;
     if (part?.type === 'text') return part.text.slice(0, 160);
     return active.includes(id) ? 'Thinking' : 'Finished';
