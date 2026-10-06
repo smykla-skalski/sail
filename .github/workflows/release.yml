@@ -8,6 +8,7 @@ on:
       - scripts/package-release.mjs
       - src-tauri/Cargo.toml
       - src-tauri/Cargo.lock
+      - src-tauri/Entitlements.plist
       - src-tauri/tauri.conf.json
       - src-tauri/icons/**
   workflow_dispatch:
@@ -83,6 +84,7 @@ jobs:
           if [[ -z "$APPLE_CERTIFICATE" ]]; then
             echo 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
             echo 'SAIL_SIGNING_MODE=ad-hoc' >> "$GITHUB_ENV"
+            /usr/libexec/PlistBuddy -c 'Delete :com.apple.developer.web-browser.public-key-credential' src-tauri/Entitlements.plist
           else
             test -n "$APPLE_CERTIFICATE_PASSWORD"
             test -n "$APPLE_SIGNING_IDENTITY"
@@ -129,6 +131,11 @@ jobs:
           apps=("$mountpoint"/*.app)
           test -d "${apps[0]}"
           codesign --verify --deep --strict "${apps[0]}"
+          if [[ "$SAIL_SIGNING_MODE" == developer-id ]]; then
+            entitlements="$RUNNER_TEMP/sail-entitlements.plist"
+            codesign -d --entitlements - --xml "${apps[0]}" > "$entitlements"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.web-browser.public-key-credential' "$entitlements")" = true
+          fi
           app_copy="$RUNNER_TEMP/sai-smoke/$(basename "${apps[0]}")"
           mkdir -p "$(dirname "$app_copy")"
           ditto "${apps[0]}" "$app_copy"
