@@ -100,7 +100,9 @@ void test('a configured validation pool retains fresh session gates', () => {
   });
   try {
     const installed = [{ id: 'old', name: 'ship-it', description: 'Installed' }];
-    assert.match(resolveSkillPrompt(installed, '/ship-it #42'), /Never run a gate inline/);
+    const prompt = resolveSkillPrompt(installed, '/ship-it #42');
+    assert.match(prompt, /Never run a gate inline/);
+    assert.doesNotMatch(prompt, /After each completed Code Adversary/);
   } finally {
     Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: original });
   }

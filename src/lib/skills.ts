@@ -31,8 +31,11 @@ const defaultGateRules: Record<string, string> = {
 const failedGateRule =
   'If a required fresh session cannot launch, pause and report the failed gate and reason in this thread. Never run a gate inline. This overrides any inline fallback in an installed skill.';
 
-const shipProgressRule =
-  'Sail progress reporting: call ship_progress with { stage, status: "running" } before implementing, reviewing, testing, opening the pull request, waiting on CI, and merging. Use stages implementing, reviewing, testing, pull_request, ci, and merging respectively. After each completed Code Adversary, Findings Adversary, or Test Adversary pass, call ship_progress with { gate, verdict, reason? } using gates code-adversary, findings-adversary, or test-adversary and the actual verdict. When work cannot continue, call ship_progress with { stage, status: "blocked", reason } before explaining the blocker.';
+const shipProgressStageRule =
+  'Sail progress reporting: call ship_progress with { stage, status: "running" } before implementing, reviewing, testing, opening the pull request, waiting on CI, and merging. Use stages implementing, reviewing, testing, pull_request, ci, and merging respectively. When work cannot continue, call ship_progress with { stage, status: "blocked", reason } before explaining the blocker.';
+
+const shipProgressInlineVerdictRule =
+  'After each completed Code Adversary, Findings Adversary, or Test Adversary pass, call ship_progress with { gate, verdict, reason? } using gates code-adversary, findings-adversary, or test-adversary and the actual verdict.';
 
 export function mergeSkills(installed: SkillChoice[], bundled: SkillChoice[]): SkillChoice[] {
   const native = new Map(installed.map((skill) => [skill.name.toLowerCase(), skill]));
@@ -64,7 +67,14 @@ export function resolveSkillPrompt(
       ? `\n\n${rule} ${failedGateRule}${policy}`
       : `\n\nSail default gate rule: ${defaultGateRules[skill.name.toLowerCase()]} Do not call validation_gate or require agent coordination.${policy}`
     : '';
-  const reporting = skill.name.toLowerCase() === 'ship-it' ? `\n\n${shipProgressRule}` : '';
+  const reporting =
+    skill.name.toLowerCase() === 'ship-it'
+      ? `\n\n${shipProgressStageRule}${
+          settings.choices.length || settings.strictDifferentModel
+            ? ''
+            : ` ${shipProgressInlineVerdictRule}`
+        }`
+      : '';
   return skill.instructions
     ? `${text}${gate}${reporting}\n\nFollow this bundled Sail skill:\n\n${skill.instructions}`
     : `${text}${gate}${reporting}`;

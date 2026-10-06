@@ -26,6 +26,7 @@
     abandonImplementationTurn,
     beginImplementationTurn,
     beginShipItRun,
+    claimLegacyPendingImplementationTurn,
     hasPendingImplementationTurn,
     recordImplementationModel,
     savedShipItIssue,
@@ -125,20 +126,29 @@
     const sourceId = `opencode:${id}`;
     const callback = onshipit;
     const saved = savedShipItIssue(path);
-    if (saved && hasPendingImplementationTurn(path, sourceId))
+    const ownsPending = hasPendingImplementationTurn(path, sourceId);
+    const claimedLegacy =
+      !!saved &&
+      messages.some((message) => message.type === 'user' && isShipItPrompt(message.text)) &&
+      claimLegacyPendingImplementationTurn(path, sourceId);
+    if (saved && (ownsPending || claimedLegacy))
       void callback(
         saved,
         path,
         sourceId,
         session?.model ? `${session.model.providerID}:${session.model.id}` : undefined,
       );
-    if (!hasPendingImplementationTurn(path, sourceId)) return;
+    if (!ownsPending && !claimedLegacy) return;
     for (const message of messages) {
       if (message.type !== 'user' || adoptedShipMessages.has(message.id)) continue;
       adoptedShipMessages.add(message.id);
       void trackShipItMessage(message.text, path, sourceId, callback);
     }
   });
+
+  function isShipItPrompt(text: string): boolean {
+    return /^\s*\/ship-it(?:\s|$)/im.test(text);
+  }
 
   async function trackShipItMessage(
     text: string,

@@ -177,6 +177,14 @@ void test('fills in the recovered direct worker model without duplicating the ru
   });
   assert.equal(recovered.length, 1);
   assert.equal(recovered[0].issues[0].workerModel, 'gpt-5.6-luna');
+
+  const switched = adoptDirectShipRun(recovered, {
+    ...input,
+    id: 'third-run',
+    workerModel: 'provider:replacement-model',
+  });
+  assert.equal(switched.length, 1);
+  assert.equal(switched[0].issues[0].workerModel, 'provider:replacement-model');
 });
 
 void test('uses one recorded implementation model as the missing worker model', () => {

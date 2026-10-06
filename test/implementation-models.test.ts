@@ -5,6 +5,7 @@ import {
   abandonImplementationTurn,
   beginImplementationTurn,
   beginShipItRun,
+  claimLegacyPendingImplementationTurn,
   hasPendingImplementationTurn,
   implementationAttributionUncertain,
   implementationModels,
@@ -63,6 +64,34 @@ void test('pending implementation recovery stays with its owning session', async
   assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:session-a'), true);
   assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:session-b'), false);
   abandonImplementationTurn(directory, turn);
+});
+
+void test('a single legacy pending turn can be claimed by its Ship session', () => {
+  const values = new Map<string, string>();
+  const directory = '/test/legacy-pending-turn';
+  values.set(
+    `sai-implementation-pending:${directory}`,
+    JSON.stringify([{ id: 'turn', before: 'before', model: 'model-a' }]),
+  );
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  assert.equal(claimLegacyPendingImplementationTurn(directory, 'acp:codex:ship-session'), true);
+  assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:ship-session'), true);
+  assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:other-session'), false);
+
+  values.set(
+    `sai-implementation-pending:${directory}`,
+    JSON.stringify([
+      { id: 'legacy-a', before: 'before' },
+      { id: 'legacy-b', before: 'before' },
+    ]),
+  );
+  assert.equal(claimLegacyPendingImplementationTurn(directory, 'acp:codex:ship-session'), false);
 });
 
 for (const model of ['provider:model-a', undefined]) {

@@ -85,6 +85,7 @@
     activeImplementationModels,
     beginImplementationTurn,
     beginShipItRun,
+    claimLegacyPendingImplementationTurn,
     hasPendingImplementationTurn,
     implementationAttributionUncertain,
     implementationModels,
@@ -168,6 +169,7 @@
     forgetRecentTranscript,
     loadAgentThreads,
     loadInterruptedAgentTurns,
+    loadRecentTranscript,
     saveAgentThreads,
     updateEntriesInPlace,
     type AgentEntry,
@@ -216,6 +218,7 @@
     spawnReceiptsForSource,
     withSpawnResponses,
     type SpawnReceipt,
+    type SpawnState,
   } from './lib/agent-results';
   import {
     getSetting,
@@ -477,12 +480,24 @@
   let agentAvailability = $state<AgentAvailability[]>([]);
   let agentDetectionError = $state('');
   let agentThreads = $state<AgentThread[]>(savedAgentThreads);
+
+  function isShipItPrompt(text: string): boolean {
+    return /^\s*\/ship-it(?:\s|$)/im.test(text);
+  }
+
   $effect(() => {
     for (const thread of agentThreads) {
       const sourceId = `acp:${thread.agent}:${thread.sessionId}`;
-      if (!hasPendingImplementationTurn(thread.directory, sourceId)) continue;
       const { directory: path, model, agent, sessionId } = thread;
       const issue = savedShipItIssue(path);
+      const ownsPending = hasPendingImplementationTurn(path, sourceId);
+      const claimedLegacy =
+        !!issue &&
+        loadRecentTranscript(thread).some(
+          (entry) => entry.type === 'user' && isShipItPrompt(entry.text),
+        ) &&
+        claimLegacyPendingImplementationTurn(path, sourceId);
+      if (!ownsPending && !claimedLegacy) continue;
       if (issue) void adoptDirectShipRun(issue, path, `acp:${agent}:${sessionId}`, model);
     }
   });
@@ -1168,9 +1183,13 @@
     const id = sessionID;
     const sourceId = `opencode:${id}`;
     const saved = savedShipItIssue(path);
-    if (saved && hasPendingImplementationTurn(path, sourceId))
-      void adoptDirectShipRun(saved, path, sourceId);
-    if (!hasPendingImplementationTurn(path, sourceId)) return;
+    const ownsPending = hasPendingImplementationTurn(path, sourceId);
+    const claimedLegacy =
+      !!saved &&
+      messages.some((message) => message.type === 'user' && isShipItPrompt(message.text)) &&
+      claimLegacyPendingImplementationTurn(path, sourceId);
+    if (saved && (ownsPending || claimedLegacy)) void adoptDirectShipRun(saved, path, sourceId);
+    if (!ownsPending && !claimedLegacy) return;
     for (const message of messages) {
       if (message.type !== 'user') continue;
       const key = `${id}:${message.id}`;
@@ -1984,11 +2003,14 @@
           throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
         await acp.connect(run.provider);
       }
-      const gateReporting =
-        !crossValidation.choices.length && !crossValidation.strictDifferentModel
-          ? 'After every completed adversary pass, use ship_progress with its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.'
-          : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
-      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread. Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
+      const inlineGates = !crossValidation.choices.length && !crossValidation.strictDifferentModel;
+      const gateExecution = inlineGates
+        ? 'Run the Code Adversary, Findings Adversary, and Test Adversary in this Ship It session with the implementation agent and model. Do not call validation_gate or require agent coordination.'
+        : 'Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread.';
+      const gateReporting = inlineGates
+        ? 'After every completed adversary pass, use ship_progress with its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.'
+        : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -2065,6 +2087,55 @@
     }
   }
 
+  async function directShipWorkerState(issue: ShipIssue): Promise<SpawnState> {
+    if (!issue.threadId || !issue.path) return 'unavailable';
+    if (issue.threadId.startsWith('opencode:')) {
+      if (!client) return 'unavailable';
+      const sessionId = issue.threadId.slice('opencode:'.length);
+      try {
+        const [session, active, inbox, permissions, forms] = await Promise.all([
+          client.session.get({ sessionID: sessionId }),
+          client.session.active(),
+          client.session.inbox.list({ sessionID: sessionId }),
+          client.permission.request.list({ location: { directory: issue.path } }),
+          client.form.list({ location: { directory: issue.path } }),
+        ]);
+        if (session.location.directory !== issue.path) return 'unavailable';
+        if (
+          permissions.data.some((item) => item.sessionID === sessionId) ||
+          forms.data.some((item) => item.sessionID === sessionId)
+        )
+          return 'waiting';
+        if (active[sessionId]?.type === 'running') return 'working';
+        if (session.outcome === 'succeeded') return 'completed';
+        if (session.outcome === 'failed') return 'failed';
+        if (session.outcome) return 'interrupted';
+        return inbox.length ? 'queued' : 'completed';
+      } catch {
+        return 'unavailable';
+      }
+    }
+    const match = /^acp:([^:]+):(.+)$/.exec(issue.threadId);
+    if (!match) return 'unavailable';
+    const [, agent, sessionId] = match;
+    try {
+      const [agentActivity, interrupted] = await Promise.all([
+        acp.activity(),
+        acp.interruptedTurns(),
+      ]);
+      const state = agentActivity[agent];
+      if (state?.waiting.includes(sessionId)) return 'waiting';
+      if (state?.active.includes(sessionId)) return 'working';
+      if (interrupted.some((turn) => turn.agent === agent && turn.sessionId === sessionId))
+        return 'interrupted';
+      if (state?.finished[sessionId]?.status === 'failed') return 'failed';
+      if (state?.finished[sessionId] || state?.sessions.includes(sessionId)) return 'completed';
+      return 'unavailable';
+    } catch {
+      return 'unavailable';
+    }
+  }
+
   async function refreshShippingIssue(
     run: ShipRun,
     issue: ShipIssue,
@@ -2102,6 +2173,8 @@
     );
     issue.gates = reconciledShipGates(issue, spawnReceipts);
     if (isDirectShipRun(run)) {
+      const workerState = await directShipWorkerState(issue);
+      if (workerState !== issue.workerState) await update({ workerState });
       const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
         repository: run.repository,
         paths: issue.path ? [issue.path] : [],
@@ -2122,6 +2195,32 @@
         const branch = worktree?.branch ?? issue.branch;
         if (branch && issue.state !== 'pending')
           await refreshShippingPullRequest(run, { ...issue, branch });
+        const pr = shippingPullRequests.get(`${run.id}:${issue.id}`);
+        if (pr?.mergedAt) {
+          await update({ state: 'merged', workerSettled: true, error: null });
+        } else if (pr?.state === 'CLOSED') {
+          await update({
+            state: 'failed',
+            workerSettled: true,
+            error: 'Pull request closed without merging.',
+          });
+        } else if (workerState === 'completed') {
+          await update(
+            pr?.url
+              ? { state: 'awaiting_merge', workerSettled: true, error: null }
+              : {
+                  state: 'failed',
+                  workerSettled: true,
+                  error: 'Worker finished without a pull request. Inspect its thread.',
+                },
+          );
+        } else if (workerState === 'failed' || workerState === 'interrupted') {
+          await update({
+            state: 'failed',
+            workerSettled: true,
+            error: `Worker ${workerState}.`,
+          });
+        }
       } catch (cause) {
         await update({ refreshError: describe(cause) });
       }

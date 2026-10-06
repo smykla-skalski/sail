@@ -41,6 +41,15 @@ export function hasPendingImplementationTurn(directory: string, owner?: string):
   return pendingTurns(directory).some((turn) => owner === undefined || turn.owner === owner);
 }
 
+export function claimLegacyPendingImplementationTurn(directory: string, owner: string): boolean {
+  const turns = pendingTurns(directory);
+  const legacy = turns.filter((turn) => turn.owner === undefined);
+  if (legacy.length !== 1 || turns.some((turn) => turn.owner && turn.owner !== owner)) return false;
+  legacy[0].owner = owner;
+  savePendingTurns(directory, turns);
+  return true;
+}
+
 function savePendingTurns(directory: string, turns: PendingTurn[]): void {
   setSetting(pendingKey(directory), JSON.stringify(turns));
 }

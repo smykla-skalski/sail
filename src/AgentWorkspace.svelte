@@ -31,6 +31,7 @@
   import {
     beginImplementationTurn,
     beginShipItRun,
+    claimLegacyPendingImplementationTurn,
     hasPendingImplementationTurn,
     recordImplementationModel,
     savedShipItIssue,
@@ -200,15 +201,23 @@
     const callback = onshipit;
     const model = modelOption?.currentValue;
     const saved = savedShipItIssue(path);
-    if (saved && hasPendingImplementationTurn(path, sourceId))
-      void callback(saved, path, sourceId, model);
-    if (!hasPendingImplementationTurn(path, sourceId)) return;
+    const ownsPending = hasPendingImplementationTurn(path, sourceId);
+    const claimedLegacy =
+      !!saved &&
+      entries.some((entry) => entry.type === 'user' && isShipItPrompt(entry.text)) &&
+      claimLegacyPendingImplementationTurn(path, sourceId);
+    if (saved && (ownsPending || claimedLegacy)) void callback(saved, path, sourceId, model);
+    if (!ownsPending && !claimedLegacy) return;
     for (const entry of entries) {
       if (entry.type !== 'user' || adoptedShipMessages.has(entry.id)) continue;
       adoptedShipMessages.add(entry.id);
       void trackShipItMessage(entry.text, path, sourceId, model, callback);
     }
   });
+
+  function isShipItPrompt(text: string): boolean {
+    return /^\s*\/ship-it(?:\s|$)/im.test(text);
+  }
 
   async function trackShipItMessage(
     text: string,

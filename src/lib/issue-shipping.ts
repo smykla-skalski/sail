@@ -69,7 +69,7 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
     const existingIssue = existing.issues.find(
       (issue) => issue.path === input.directory && issue.threadId === input.threadId,
     );
-    if (!input.workerModel || existingIssue?.workerModel) return runs;
+    if (!input.workerModel || existingIssue?.workerModel === input.workerModel) return runs;
     return runs.map((run) =>
       run !== existing
         ? run
