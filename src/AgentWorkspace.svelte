@@ -5,6 +5,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { Button } from '@smykla-skalski/sui';
   import ActivityStatus from './ActivityStatus.svelte';
+  import TaskLocation from './TaskLocation.svelte';
   import Markdown from './Markdown.svelte';
   import ChatMessage from './ChatMessage.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
@@ -96,11 +97,16 @@
     recallComposerDraft,
     rememberComposerDraft,
   } from './lib/composer-drafts';
+  import {
+    composerTaskLocation,
+    type TaskLocation as TaskLocationValue,
+  } from './lib/task-location';
 
   interface Props {
     agent: AgentId;
     agentName: string;
     directory: string;
+    taskLocation: TaskLocationValue;
     thread: AgentThread | null;
     usage?: AgentUsage;
     running: boolean;
@@ -138,6 +144,7 @@
     agent,
     agentName,
     directory,
+    taskLocation,
     thread,
     usage,
     running,
@@ -167,6 +174,7 @@
     onshipit,
   }: Props = $props();
   let mounted = $state(false);
+  const promptLocation = $derived(composerTaskLocation(taskLocation, directory, thread?.directory));
   let ready = $state(false);
   let busy = $state(false);
   let connecting = $state(false);
@@ -1684,6 +1692,7 @@
   </div>
   <div class="agent-composer composer-wrap">
     <div class="composer">
+      <TaskLocation location={promptLocation} />
       {#if error}<p class="agent-error" role="alert">
           {error} <button onclick={() => void activate(activeSessionId)}>Retry</button>
         </p>{/if}

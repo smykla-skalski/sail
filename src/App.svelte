@@ -17,6 +17,7 @@
   import type { BrowserAttachment } from './lib/browser-pick';
   import { Button } from '@smykla-skalski/sui';
   import ActivityStatus from './ActivityStatus.svelte';
+  import TaskLocation from './TaskLocation.svelte';
   import Markdown from './Markdown.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import SpawnResponse from './SpawnResponse.svelte';
@@ -60,6 +61,11 @@
   import TaskOverview from './TaskOverview.svelte';
   import type { GitHubIssue, PullRequestCheck } from './ProjectSidebar.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
+  import {
+    composerTaskLocation,
+    resolveTaskLocation,
+    type TaskLocation as TaskLocationValue,
+  } from './lib/task-location';
   import PostTurnChecks from './PostTurnChecks.svelte';
   import {
     checkKey,
@@ -306,6 +312,33 @@
   let projectCatalog = $state<ProjectCatalog>(
     loadProjectCatalog(getSetting('sai-project-catalog'), savedDirectory),
   );
+  let taskLocation = $state<TaskLocationValue>(resolveTaskLocation(savedDirectory, '', null));
+  let taskLocationGeneration = 0;
+  $effect(() => {
+    const path = directory;
+    const repository = coordinationProject(path) ?? '';
+    const generation = ++taskLocationGeneration;
+    taskLocation = resolveTaskLocation(path, repository, null);
+    if (!path || !repository || !isTauri()) return;
+    void invoke<RegisteredWorktree[]>('registered_worktrees', {
+      repository,
+      paths: [path],
+    })
+      .then((registered) => {
+        if (generation !== taskLocationGeneration || path !== directory) return taskLocation;
+        taskLocation = resolveTaskLocation(
+          path,
+          repository,
+          registered.find((item) => item.path === path)?.branch,
+        );
+        return taskLocation;
+      })
+      .catch(() => {
+        if (generation === taskLocationGeneration && path === directory)
+          taskLocation = resolveTaskLocation(path, repository, null);
+        return taskLocation;
+      });
+  });
   let shipRuns = $state<ShipRun[]>(loadShipRuns(getSetting('sai-ship-runs')));
   let shippingBusy = $state(false);
   const activeShipLaunches = new SvelteSet<string>();
@@ -1220,6 +1253,9 @@
   let currentSession = $derived(
     sessions.find((session) => session.id === sessionID) ??
       (selectedSession?.id === sessionID ? selectedSession : undefined),
+  );
+  const mainPromptLocation = $derived(
+    composerTaskLocation(taskLocation, directory, currentSession?.location.directory),
   );
   let actionAgentThread = $derived(
     focusedPane === 'main'
@@ -9136,6 +9172,7 @@
                 agentName={agentAvailability.find((agent) => agent.id === acpAgent)?.name ??
                   acpAgent}
                 {directory}
+                {taskLocation}
                 thread={acpThread}
                 usage={acpThread
                   ? { ...agentUsage[threadKey(acpThread)], rates: agentRates[acpThread.agent] }
@@ -9384,6 +9421,7 @@
                   onchanged={() => refreshPrompts()}
                 />
                 <div class="composer">
+                  <TaskLocation location={mainPromptLocation} />
                   <textarea
                     role="combobox"
                     aria-autocomplete="list"
@@ -9620,6 +9658,7 @@
         focused={focusedPane}
         {directory}
         project={coordinationProject(directory) ?? directory}
+        {taskLocation}
         {dark}
         agents={paneAgents}
         {sideChat}

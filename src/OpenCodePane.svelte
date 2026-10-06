@@ -6,6 +6,7 @@
   import type { FormInfo, PermissionRequest } from '@opencode/client';
   import Markdown from './Markdown.svelte';
   import ActivityStatus from './ActivityStatus.svelte';
+  import TaskLocation from './TaskLocation.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
@@ -72,11 +73,16 @@
     recallComposerDraft,
     rememberComposerDraft,
   } from './lib/composer-drafts';
+  import {
+    composerTaskLocation,
+    type TaskLocation as TaskLocationValue,
+  } from './lib/task-location';
 
   let {
     client,
     runtimeState,
     directory,
+    taskLocation,
     thread,
     setup,
     coordinationMessages = [],
@@ -101,6 +107,7 @@
     client: OpenCodeClient | null;
     runtimeState: 'starting' | 'connected' | 'error';
     directory: string;
+    taskLocation: TaskLocationValue;
     thread: AgentThread | null;
     setup: SetupReport | null;
     coordinationMessages?: CoordinationMessage[];
@@ -129,6 +136,7 @@
   } = $props();
 
   let session = $state<SessionInfo | null>(null);
+  const promptLocation = $derived(composerTaskLocation(taskLocation, directory, thread?.directory));
   let messages = $state<SessionMessageInfo[]>([]);
   const displayMessages = $derived(
     withSpawnResponses(messages, spawnReceipts, (message) =>
@@ -1025,6 +1033,7 @@
   </div>
   <div class="agent-composer composer-wrap">
     <div class="composer">
+      <TaskLocation location={promptLocation} />
       {#if error}<p class="agent-error" role="alert">{error}</p>{/if}
       <PromptPanel
         {pendingPermissions}

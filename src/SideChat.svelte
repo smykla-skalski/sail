@@ -1,9 +1,14 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
+  import TaskLocation from './TaskLocation.svelte';
   import Markdown from './Markdown.svelte';
   import type { OpenCodeClient, SessionMessageInfo } from './lib/opencode';
   import type { AgentId } from './lib/acp';
+  import {
+    composerTaskLocation,
+    type TaskLocation as TaskLocationValue,
+  } from './lib/task-location';
   import {
     clipboardFiles,
     fileUri,
@@ -19,6 +24,7 @@
     source,
     client,
     directory,
+    taskLocation,
     focused,
     focusPrompt,
     onpromptfocused,
@@ -26,10 +32,12 @@
     source: Source;
     client: OpenCodeClient | null;
     directory: string;
+    taskLocation: TaskLocationValue;
     focused: boolean;
     focusPrompt: boolean;
     onpromptfocused: () => void;
   } = $props();
+  const promptLocation = $derived(composerTaskLocation(taskLocation, directory));
 
   let forkID = $state<string | null>(null);
   let loading = $state(false);
@@ -209,6 +217,7 @@
     agent={source.agent}
     agentName={source.agent}
     {directory}
+    {taskLocation}
     thread={null}
     running={false}
     {focused}
@@ -235,6 +244,7 @@
       {#if error}<p role="alert">{error}</p>{/if}
     </div>
     <div class="side-chat-composer">
+      <TaskLocation location={promptLocation} />
       {#if attachments.length}<div class="attachments">
           {#each attachments as attachment (attachment.path)}<span
               >{attachment.name}<button
@@ -295,7 +305,11 @@
   }
   .side-chat-composer {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.5rem;
+  }
+  .side-chat-composer :global(.task-location) {
+    flex: 1 0 100%;
   }
   textarea {
     flex: 1;
