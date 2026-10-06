@@ -41,6 +41,7 @@
   } from './lib/panes';
 
   type Props = {
+    active: boolean;
     pane: Pane;
     focused: string;
     directory: string;
@@ -125,6 +126,7 @@
   };
 
   let {
+    active,
     pane,
     focused,
     directory,
@@ -451,6 +453,7 @@
     bind:clientHeight={splitHeight}
   >
     <PaneTree
+      {active}
       {coordinationMessages}
       {spawnReceipts}
       {onopensubagent}
@@ -547,6 +550,7 @@
       onkeydown={resizeKey}
     ></div>
     <PaneTree
+      {active}
       {coordinationMessages}
       {spawnReceipts}
       {onopensubagent}
@@ -712,6 +716,7 @@
       {:else if pane.kind === 'browser'}
         {#key `${directory}:${pane.id}`}
           <BrowserPane
+            {active}
             {pane}
             {directory}
             onstate={(tabs, activeTab) => onbrowserstate(pane.id, tabs, activeTab)}

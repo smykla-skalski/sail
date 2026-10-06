@@ -16,6 +16,7 @@
   let {
     pane,
     directory,
+    active,
     onstate,
     onfocus,
     onshortcut,
@@ -23,6 +24,7 @@
   }: {
     pane: BrowserLeaf;
     directory: string;
+    active: boolean;
     onstate: (tabs: BrowserTab[], activeTab: string) => void;
     onfocus: () => void;
     onshortcut: (event: KeyboardEvent) => void;
@@ -49,6 +51,15 @@
 
   const current = $derived(pane.tabs.find((tab) => tab.id === pane.activeTab));
   const currentUrl = $derived(current?.history[current.index] ?? '');
+
+  $effect(() => {
+    if (!ready || !liveLabel) return;
+    void invoke('browser_visibility', {
+      label: liveLabel,
+      visible: active && !document.querySelector('dialog[open]'),
+    });
+    if (active) void tick().then(() => resize());
+  });
 
   function normalizeUrl(value: string): string {
     const input = value.trim();
@@ -258,7 +269,7 @@
       ready = true;
       await invoke('browser_visibility', {
         label,
-        visible: !document.querySelector('dialog[open]'),
+        visible: active && !document.querySelector('dialog[open]'),
       });
       await tick();
       await resize();
@@ -363,7 +374,7 @@
       if (!ready || !liveLabel) return;
       void invoke('browser_visibility', {
         label: liveLabel,
-        visible: !document.querySelector('dialog[open]'),
+        visible: active && !document.querySelector('dialog[open]'),
       });
     });
     overlayObserver.observe(document.body, {

@@ -951,6 +951,12 @@ button:disabled {
   flex-direction: column;
   min-width: 0;
 }
+.workspace-pane-host {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
 .ship-fallback {
   position: absolute;
   z-index: 2;
