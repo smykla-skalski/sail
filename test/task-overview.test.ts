@@ -309,6 +309,8 @@ void test('100 cards and 500 threads stay within the interaction budget', () => 
   const largeCatalog: ProjectCatalog = { repositories: [], groups: [], worktrees: {} };
   const largeThreads: Record<string, AgentThread[]> = {};
   const largeStatuses: Record<string, ThreadStatus | null> = {};
+  const largeChecks: PostTurnCheck[] = [];
+  const largeReceipts: SpawnReceipt[] = [];
   const paths: string[] = [];
   for (let repositoryIndex = 0; repositoryIndex < 10; repositoryIndex += 1) {
     const repository = `/scale/repo-${repositoryIndex}`;
@@ -326,6 +328,40 @@ void test('100 cards and 500 threads stay within the interaction budget', () => 
       largeStatuses[`["codex","${path}","${value.sessionId}"]`] = 'working';
       return value;
     });
+    for (let eventIndex = 0; eventIndex < 5; eventIndex += 1) {
+      largeChecks.push({
+        id: `check-${index}-${eventIndex}`,
+        updated: index * 100 + eventIndex,
+        directory: path,
+        thread: `thread-${index}`,
+        turn: `turn-${index}`,
+        source: 'repository',
+        command: `check ${eventIndex}`,
+        status: eventIndex === 4 ? 'failed' : 'passed',
+        output: '',
+        code: eventIndex === 4 ? 1 : 0,
+      });
+      largeReceipts.push({
+        receiptId: `receipt-${index}-${eventIndex}`,
+        accessKey: 'key',
+        requestId: `request-${index}-${eventIndex}`,
+        project: path,
+        sourceId: `source-${index}`,
+        sourceDirectory: path,
+        targetId: null,
+        turnId: null,
+        targetDirectory: path,
+        worktreeId: null,
+        provider: 'codex',
+        prompt: null,
+        state: eventIndex === 4 ? 'working' : 'completed',
+        created: index * 100 + eventIndex,
+        updated: index * 100 + eventIndex,
+        result: null,
+        error: null,
+        activity: `Event ${eventIndex}`,
+      });
+    }
   }
 
   const start = performance.now();
@@ -334,8 +370,8 @@ void test('100 cards and 500 threads stay within the interaction budget', () => 
     threads: largeThreads,
     statuses: largeStatuses,
     agentNames: { codex: 'Codex' },
-    checks: [],
-    receipts: [],
+    checks: largeChecks,
+    receipts: largeReceipts,
   });
   const searched = filterTaskOverviewCards(cards, 'Task 99');
   const sorted = sortTaskOverviewCards(cards, 'repository', []);
@@ -343,6 +379,8 @@ void test('100 cards and 500 threads stay within the interaction budget', () => 
 
   assert.equal(cards.length, 100);
   assert.equal(Object.values(largeThreads).flat().length, 500);
+  assert.equal(largeChecks.length, 500);
+  assert.equal(largeReceipts.length, 500);
   assert.equal(searched.length, 1);
   assert.equal(sorted[0].path, '/scale/repo-0');
   assert.ok(duration < 100, `overview interactions took ${duration.toFixed(1)}ms`);

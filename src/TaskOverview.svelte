@@ -41,6 +41,11 @@
     directory: string;
     onopen: (path: string, threadKey: string | null) => Promise<void>;
     onopencheck: (check: PostTurnCheck) => Promise<void>;
+    loadOverviews?: (paths: string[]) => Promise<WorktreeOverview[]>;
+    loadChecks?: (
+      repository: string,
+      worktrees: { path: string; branch: string }[],
+    ) => Promise<RepositoryChecks>;
   };
 
   let {
@@ -53,6 +58,9 @@
     directory,
     onopen,
     onopencheck,
+    loadOverviews = (paths) => invoke<WorktreeOverview[]>('worktree_overviews', { paths }),
+    loadChecks = (repository, worktrees) =>
+      invoke<RepositoryChecks>('pull_request_checks', { repository, worktrees }),
   }: Props = $props();
   const preferenceKey = 'sai-task-overview';
   const saved = loadTaskOverviewPreferences(getSetting(preferenceKey));
@@ -120,9 +128,7 @@
     const paths = baseCards.map((card) => card.path);
     loading = true;
     try {
-      const overviewResult = await invoke<WorktreeOverview[]>('worktree_overviews', {
-        paths,
-      }).catch(() => []);
+      const overviewResult = await loadOverviews(paths).catch(() => []);
       if (current !== generation) return;
       const overview = Object.fromEntries(overviewResult.map((entry) => [entry.path, entry]));
       metadata = overview;
@@ -146,7 +152,7 @@
       const checkResults = await Promise.allSettled(
         repositories.map(([repository, , worktrees]) =>
           worktrees.length
-            ? invoke<RepositoryChecks>('pull_request_checks', { repository, worktrees })
+            ? loadChecks(repository, worktrees)
             : Promise.resolve<RepositoryChecks>({ checks: {}, errors: {} }),
         ),
       );
@@ -196,6 +202,8 @@
   }
 
   function navigateCards(event: KeyboardEvent) {
+    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey)
+      return;
     if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key))
       return;
     const target = event.target as HTMLElement;

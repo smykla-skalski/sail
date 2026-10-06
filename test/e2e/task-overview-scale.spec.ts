@@ -1,6 +1,9 @@
 import { browser, expect } from '@wdio/globals';
 
-type ScaleWindow = Window & { sailTaskOverviewBurst?: () => void };
+type ScaleWindow = Window & {
+  sailTaskOverviewBurst?: () => void;
+  sailTaskOverviewReleaseRefresh?: () => void;
+};
 
 describe('task overview at scale', () => {
   it('keeps search, sorting, navigation, and activity batches responsive', async () => {
@@ -14,10 +17,37 @@ describe('task overview at scale', () => {
         () =>
           document.body.dataset.fixtureReload !== 'pending' &&
           document.querySelectorAll('.task-card').length === 100 &&
-          document.querySelector('.task-card-grid')?.getAttribute('aria-busy') === 'false',
+          document.querySelector('.task-card-grid')?.getAttribute('aria-busy') === 'true',
       ),
     );
     await expect($('[aria-label="Scale fixture state"]')).toHaveText('500 threads · 0 updates');
+
+    const loadingInteraction = await browser.executeAsync(
+      (done: (result: { duration: number; busy: string | null }) => void) => {
+        const input = document.querySelector<HTMLInputElement>('.task-overview-search input')!;
+        const start = performance.now();
+        input.value = 'Task 99';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        const check = () => {
+          if (document.querySelectorAll('.task-card').length === 1)
+            done({
+              duration: performance.now() - start,
+              busy: document.querySelector('.task-card-grid')?.getAttribute('aria-busy') ?? null,
+            });
+          else requestAnimationFrame(check);
+        };
+        requestAnimationFrame(check);
+      },
+    );
+    expect(loadingInteraction.duration).toBeLessThan(100);
+    expect(loadingInteraction.busy).toBe('true');
+    await expect($$('.task-card')).toBeElementsArrayOfSize(1);
+    await browser.execute(() => (window as ScaleWindow).sailTaskOverviewReleaseRefresh?.());
+    await browser.waitUntil(() =>
+      browser.execute(
+        () => document.querySelector('.task-card-grid')?.getAttribute('aria-busy') === 'false',
+      ),
+    );
 
     const searchMs = await browser.executeAsync((done: (duration: number) => void) => {
       const input = document.querySelector<HTMLInputElement>('.task-overview-search input')!;

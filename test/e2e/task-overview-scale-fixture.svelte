@@ -55,9 +55,17 @@
 
   let threads = $state(initialThreads);
   let burst = $state(0);
+  let releaseOverview: (() => void) | undefined;
+  const overviewPending = new Promise<[]>((resolve) => {
+    releaseOverview = () => resolve([]);
+  });
 
   onMount(() => {
-    const target = window as typeof window & { sailTaskOverviewBurst?: () => void };
+    const target = window as typeof window & {
+      sailTaskOverviewBurst?: () => void;
+      sailTaskOverviewReleaseRefresh?: () => void;
+    };
+    target.sailTaskOverviewReleaseRefresh = () => releaseOverview?.();
     target.sailTaskOverviewBurst = () => {
       for (let index = 0; index < 50; index += 1)
         queueMicrotask(() => {
@@ -76,7 +84,10 @@
           burst += 1;
         });
     };
-    return () => delete target.sailTaskOverviewBurst;
+    return () => {
+      delete target.sailTaskOverviewBurst;
+      delete target.sailTaskOverviewReleaseRefresh;
+    };
   });
 </script>
 
@@ -90,6 +101,7 @@
   directory=""
   onopen={async () => {}}
   onopencheck={async () => {}}
+  loadOverviews={() => overviewPending}
 />
 <output aria-label="Scale fixture state">{threadCount} threads · {burst} updates</output>
 
