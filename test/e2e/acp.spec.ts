@@ -125,6 +125,19 @@ describe('ACP agent threads', () => {
     await expect($('.workspace .side-area')).toHaveText(
       expect.stringContaining('agent-change.txt'),
     );
+    await expect($('.review-evidence')).toHaveText(expect.stringContaining('Review evidence'));
+    await expect($('.review-evidence')).toHaveText(
+      expect.stringContaining('Git working tree · current'),
+    );
+    await expect($('.review-evidence')).toHaveText(
+      expect.stringContaining('No checks recorded. Turn completion does not mean checks passed.'),
+    );
+    await $(
+      "//section[contains(@class,'review-evidence')]//button[.//span[contains(.,'agent-change.txt')]]",
+    ).click();
+    await expect($('.diff-files button.active')).toHaveText(
+      expect.stringContaining('agent-change.txt'),
+    );
     await $('.workspace .side-area button[aria-label="Close Changes"]').click();
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
     await $('.workspace .side-area .side-tabs button:nth-child(2)').click();

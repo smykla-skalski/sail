@@ -240,6 +240,12 @@
   } from './lib/saved-commands';
   import { annotateDiffs, repoPath, selectedDiffFile, type WorkingDiffInfo } from './lib/diff';
   import type { DiffComment } from './lib/diff-comments';
+  import {
+    browserReviewPreviews,
+    selectReviewPreview,
+    type ReviewCapture,
+    type ReviewPreview,
+  } from './lib/review-evidence';
   import { inspectRepository, type SetupReport } from './lib/onboarding';
   import {
     acpUsage,
@@ -697,6 +703,8 @@
   const clipboardAttachmentPaths = new SvelteSet<string>();
   const clipboardAttachmentNames = new SvelteMap<string, string>();
   let pickedAttachments = $state<Record<string, BrowserAttachment>>({});
+  let reviewCaptures = $state<(ReviewCapture & { directory: string })[]>([]);
+  let reviewEvidenceUpdated = $state(Date.now());
   let diffComments = $state<Record<string, DiffComment[]>>({});
   let pendingAgentBatches = $state<Record<string, { id: string; text: string }>>({});
   let issuePrefills = $state<Record<string, { id: string; text: string }>>({});
@@ -1032,6 +1040,7 @@
       diffRevisionPath = path;
       diffRevision = revision;
       diffs = next;
+      reviewEvidenceUpdated = Date.now();
       diffError = '';
       selectedFilePath = selectedDiffFile(next, selectedFilePath, path);
     } catch (cause) {
@@ -6166,6 +6175,25 @@
       })
       .toSorted((a, b) => a.distance - b.distance)[0];
     if (!next || !Number.isFinite(next.distance)) throw new Error('Agent pane is unavailable.');
+    if (attachment.previewUrl && attachment.url) {
+      const captureSource = URL.canParse(attachment.url)
+        ? new URL(attachment.url).hostname || attachment.url
+        : attachment.url;
+      reviewCaptures = [
+        ...reviewCaptures,
+        {
+          id: attachment.id,
+          paneId: next.id,
+          phase: 'before' as const,
+          source: captureSource,
+          url: attachment.url,
+          previewUrl: attachment.previewUrl,
+          created: attachment.created ?? Date.now(),
+          directory,
+        },
+      ].slice(-20);
+      reviewEvidenceUpdated = Date.now();
+    }
     if (next.id === 'main' && !acpAgent) {
       draft = [draft.trim(), attachment.text].filter(Boolean).join('\n\n');
       attachedFiles = [...attachedFiles, attachment.imagePath];
@@ -6212,6 +6240,58 @@
     pickedAttachments = Object.fromEntries(
       Object.entries(pickedAttachments).filter(([, attachment]) => attachment.id !== id),
     );
+  }
+
+  function setReviewCapturePhase(id: string, phase: ReviewCapture['phase']) {
+    reviewCaptures = reviewCaptures.map((capture) =>
+      capture.id === id ? { ...capture, phase } : capture,
+    );
+  }
+
+  function reviewPreviews(): ReviewPreview[] {
+    return browserReviewPreviews(paneLayout);
+  }
+
+  function reviewEvidence(paneId: string, thread: string | null) {
+    const captures = reviewCaptures.filter(
+      (capture) =>
+        capture.directory === directory && (paneId === 'main' || capture.paneId === paneId),
+    );
+    const checks = thread
+      ? postTurnResults.filter((check) => check.directory === directory && check.thread === thread)
+      : [];
+    return {
+      captures,
+      checks,
+      previews: reviewPreviews(),
+      filesUpdated: reviewEvidenceUpdated,
+      updated: Math.max(
+        reviewEvidenceUpdated,
+        ...captures.map((capture) => capture.created),
+        ...checks.map((check) => check.updated),
+      ),
+      oncheck: openReviewCheck,
+      onpreview: openReviewPreview,
+      oncapturephase: setReviewCapturePhase,
+    };
+  }
+
+  function openReviewPreview(preview: ReviewPreview) {
+    const next = selectReviewPreview(paneLayout, preview);
+    if (!next) {
+      error = 'Browser preview is no longer available.';
+      return;
+    }
+    savePaneLayout(next);
+    focusPane(preview.paneId);
+  }
+
+  async function openReviewCheck(check: PostTurnCheck) {
+    mobileView = 'chat';
+    await tick();
+    const item = document.querySelector<HTMLElement>(`[data-check-id="${CSS.escape(check.id)}"]`);
+    item?.scrollIntoView({ block: 'center' });
+    item?.focus();
   }
 
   function focusPane(id: string) {
@@ -9328,6 +9408,16 @@
                     oncomments={updateDiffComments}
                     oncommentssent={removeSentDiffComments}
                     onsendcomments={(scope, text) => sendDiffComments('main', scope, text)}
+                    evidence={reviewEvidence(
+                      'main',
+                      acpAgent
+                        ? acpThread
+                          ? `acp:${acpAgent}:${acpThread.sessionId}`
+                          : null
+                        : sessionID
+                          ? `opencode:${sessionID}`
+                          : null,
+                    )}
                   />
                 </div>{/if}
               {#if !acpAgent && sessionID}<div
@@ -9438,6 +9528,12 @@
       }}
       onterminalownerlost={(id) => savePaneLayout(updatePane(paneLayout, id, { owner: undefined }))}
       onagentterminal={(id) => void openAgentTerminal(id)}
+      reviewCaptures={reviewCaptures.filter((capture) => capture.directory === directory)}
+      reviewPreviews={reviewPreviews()}
+      {reviewEvidenceUpdated}
+      onreviewcheck={openReviewCheck}
+      onreviewpreview={openReviewPreview}
+      onreviewcapturephase={setReviewCapturePhase}
     />
     {#if mainShipFallback && detailsOpen && activeSideTab === 'ship' && (!mobileLayout || mobileView === 'details')}<section
         class="ship-fallback"

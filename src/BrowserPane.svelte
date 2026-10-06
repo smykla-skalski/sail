@@ -210,10 +210,18 @@
         canvas.width,
         canvas.height,
       );
-      const png = canvas.toDataURL('image/png').split(',')[1];
+      const previewUrl = canvas.toDataURL('image/png');
+      const png = previewUrl.split(',')[1];
       const imagePath = await invoke<string>('browser_save_capture', { png });
       try {
-        onpick({ id: crypto.randomUUID(), text: describePickedElement(element), imagePath });
+        onpick({
+          id: crypto.randomUUID(),
+          text: describePickedElement(element),
+          imagePath,
+          previewUrl,
+          url: element.url,
+          created: Date.now(),
+        });
       } catch (cause) {
         await invoke('browser_remove_capture', { path: imagePath });
         throw cause;
