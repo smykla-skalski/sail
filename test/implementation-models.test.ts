@@ -5,10 +5,15 @@ import {
   abandonImplementationTurn,
   beginImplementationTurn,
   beginShipItRun,
+  claimLegacyPendingImplementationTurn,
+  hasPendingImplementationTurn,
   implementationAttributionUncertain,
   implementationModels,
   recoverImplementationModels,
+  recordShipItOwner,
   recordImplementationModel,
+  savedShipItIssue,
+  savedShipItOwner,
   settledImplementationAttribution,
 } from '../src/lib/implementation-models.ts';
 
@@ -40,6 +45,70 @@ void test('archive waits for in-flight attribution even when the backend turn ha
     models: ['model-a'],
     modelUncertain: false,
   });
+});
+
+void test('pending implementation recovery stays with its owning session', async () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => 'before' } },
+  });
+  const directory = '/test/owned-pending-turn';
+  const turn = await beginImplementationTurn(directory, 'model-a', 'acp:codex:session-a');
+  assert.equal(hasPendingImplementationTurn(directory), true);
+  assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:session-a'), true);
+  assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:session-b'), false);
+  abandonImplementationTurn(directory, turn);
+});
+
+void test('a single legacy pending turn can be claimed by its Ship session', () => {
+  const values = new Map<string, string>();
+  const directory = '/test/legacy-pending-turn';
+  values.set(
+    `sai-implementation-pending:${directory}`,
+    JSON.stringify([{ id: 'turn', before: 'before', model: 'model-a' }]),
+  );
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  assert.equal(claimLegacyPendingImplementationTurn(directory, 'acp:codex:ship-session'), true);
+  assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:ship-session'), true);
+  assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:other-session'), false);
+
+  values.set(
+    `sai-implementation-pending:${directory}`,
+    JSON.stringify([
+      { id: 'legacy-a', before: 'before' },
+      { id: 'legacy-b', before: 'before' },
+    ]),
+  );
+  assert.equal(claimLegacyPendingImplementationTurn(directory, 'acp:codex:ship-session'), false);
+});
+
+void test('Ship It ownership is separate from an implementation turn owner', () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  const directory = '/test/ship-owner';
+  recordShipItOwner(directory, 'acp:codex:ship-session');
+  assert.equal(savedShipItOwner(directory), 'acp:codex:ship-session');
+  assert.notEqual(savedShipItOwner(directory), 'acp:codex:ordinary-session');
 });
 
 for (const model of ['provider:model-a', undefined]) {
@@ -84,7 +153,11 @@ void test('model history survives equivalent references and rejects a second iss
     value: { __TAURI_INTERNALS__: { invoke: async () => 'example/repo' } },
   });
   const directory = '/test/reused-worktree';
-  await beginShipItRun(directory, '/ship-it #1');
+  assert.deepEqual(await beginShipItRun(directory, '/ship-it #1'), {
+    repository: 'example/repo',
+    number: 1,
+  });
+  assert.deepEqual(savedShipItIssue(directory), { repository: 'example/repo', number: 1 });
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-a']));
   await beginShipItRun(directory, '/ship-it #1');
   assert.deepEqual(implementationModels(directory), ['model-a']);

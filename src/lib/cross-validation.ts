@@ -82,6 +82,15 @@ export function validationInstructions(
   settings: ValidationSettings,
   currentModel?: string,
 ): string {
+  if (!settings.choices.length && !settings.strictDifferentModel)
+    return [
+      'Sail cross-validation is disabled.',
+      currentModel ? `Current implementation model: ${currentModel}.` : '',
+      'Run every review and test gate in this Ship It session with the implementation agent and model.',
+      'Do not call validation_gate or pause because no validation pool is configured.',
+    ]
+      .filter(Boolean)
+      .join('\n');
   const pool = settings.choices.length
     ? settings.choices.map(({ agent, model }) => `- ${agent}: ${model}`).join('\n')
     : '(empty)';
@@ -90,7 +99,7 @@ export function validationInstructions(
     `Selected agent and model pool:\n${pool}`,
     `Strict different-model routing: ${settings.strictDifferentModel ? 'on' : 'off'}.`,
     currentModel ? `Current implementation model: ${currentModel}.` : '',
-    'Before each gate, collect every model that implemented the issue and check current availability of the selected pool. Choose a selected available model different from every implementation model when one exists. If strict routing is on and none exists, pause with the exact reason. An empty pool also pauses the gate.',
+    'Before each gate, collect every model that implemented the issue and check current availability of the selected pool. Choose a selected available model different from every implementation model when one exists. If strict routing is on and none exists, pause with the exact reason.',
     'In Sail, use the validation_gate tool for each pass in order, with gate, prompt, and the complete implementingModels list. Wait for its receipt before starting the next pass. The tool selects the configured provider/model and starts a fresh session. If the tool is unavailable or cannot verify its actual model, pause the gate. Never launch an unselected agent or model as a substitute. Report the actual provider and model returned for each pass.',
   ]
     .filter(Boolean)

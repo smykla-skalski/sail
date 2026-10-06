@@ -467,23 +467,30 @@ impl BrowserManager {
     ) -> Result<Value, String> {
         let setting = match name {
             "worktree_create" | "worktree_list" | "worktree_info" | "agent_spawn"
-            | "validation_gate" | "ship_progress" | "agent_status" | "agent_wait"
-            | "agent_result" | "terminal_list" | "terminal_read" | "terminal_wait" => {
-                "sai-agent-worktrees-enabled"
+            | "validation_gate" | "agent_status" | "agent_wait" | "agent_result"
+            | "terminal_list" | "terminal_read" | "terminal_wait" => {
+                Some("sai-agent-worktrees-enabled")
             }
-            "terminal_create" | "terminal_write" | "terminal_stop" => "sai-agent-terminals-enabled",
-            "worktree_status" => "sai-agent-status-enabled",
-            "project_threads" => "sai-agent-thread-list-enabled",
-            "thread_message" => "sai-agent-messages-enabled",
+            "terminal_create" | "terminal_write" | "terminal_stop" => {
+                Some("sai-agent-terminals-enabled")
+            }
+            "worktree_status" => Some("sai-agent-status-enabled"),
+            "project_threads" => Some("sai-agent-thread-list-enabled"),
+            "thread_message" => Some("sai-agent-messages-enabled"),
+            // Progress belongs to the owning Ship run and must remain available when
+            // cross-validation and other coordination actions are disabled.
+            "ship_progress" => None,
             _ => return Err("Unknown coordination action.".into()),
         };
         let settings = crate::settings::load_settings(app.clone())?;
-        let enabled = settings.get(setting).is_some_and(|value| value == "true");
-        if (setting == "sai-agent-terminals-enabled" && !enabled)
-            || (setting != "sai-agent-terminals-enabled"
-                && settings.get(setting).is_some_and(|value| value == "false"))
-        {
-            return Err("This agent coordination action is disabled in settings.".into());
+        if let Some(setting) = setting {
+            let enabled = settings.get(setting).is_some_and(|value| value == "true");
+            if (setting == "sai-agent-terminals-enabled" && !enabled)
+                || (setting != "sai-agent-terminals-enabled"
+                    && settings.get(setting).is_some_and(|value| value == "false"))
+            {
+                return Err("This agent coordination action is disabled in settings.".into());
+            }
         }
         let id = Uuid::new_v4().to_string();
         let (sender, receiver) = mpsc::channel();
@@ -1117,7 +1124,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "ship_progress",
-        "Report your assigned Ship issue stage, or your own validation verdict. Structured reports appear in the native Ship view. Blocked or failing reports require a reason.",
+        "Report your assigned Ship issue stage, an inline gate verdict, or your own validation verdict. Structured reports appear in the native Ship view. Blocked or failing reports require a reason.",
         "",
     ),
     (
@@ -1255,6 +1262,7 @@ pub fn run_mcp_stdio() {
                         "type":"object","properties":{
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging"]},
                             "status":{"type":"string","enum":["running","blocked"]},
+                            "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
                             "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","FAIL","BLOCKED"]},
                             "reason":{"type":"string","maxLength":2000}
                         },"oneOf":[{"required":["stage","status"]},{"required":["verdict"]}]

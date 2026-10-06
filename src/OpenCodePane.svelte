@@ -26,7 +26,13 @@
     abandonImplementationTurn,
     beginImplementationTurn,
     beginShipItRun,
+    claimLegacyPendingImplementationTurn,
+    hasPendingImplementationTurn,
     recordImplementationModel,
+    recordShipItOwner,
+    savedShipItIssue,
+    savedShipItOwner,
+    type ShipItIssue,
   } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
   import PromptPanel from './PromptPanel.svelte';
@@ -71,6 +77,7 @@
     onactivity,
     onstatus,
     onusage,
+    onshipit,
   }: {
     client: OpenCodeClient | null;
     directory: string;
@@ -91,6 +98,12 @@
     onactivity: (thread: AgentThread) => void;
     onstatus: (thread: AgentThread, status: ThreadStatus, notifyOnDone?: boolean) => void;
     onusage?: (sessionID: string, context: number | undefined) => void;
+    onshipit?: (
+      issue: ShipItIssue,
+      directory: string,
+      threadId: string,
+      workerModel?: string,
+    ) => Promise<void>;
   } = $props();
 
   let session = $state<SessionInfo | null>(null);
@@ -107,6 +120,35 @@
   const failureRequests = new SvelteMap<string, string>();
   let skills = $state<SkillChoice[]>(bundledSkills);
   let skillSelected = $state(0);
+  $effect(() => {
+    if (!onshipit || !activeID || !running) return;
+    const path = directory;
+    const id = activeID;
+    const sourceId = `opencode:${id}`;
+    const callback = onshipit;
+    const saved = savedShipItIssue(path);
+    const ownsPending = hasPendingImplementationTurn(path, sourceId);
+    const savedOwner = savedShipItOwner(path);
+    const claimedLegacy =
+      !savedOwner &&
+      !!saved &&
+      ownsPending &&
+      messages.some((message) => message.type === 'user' && isShipItPrompt(message.text)) &&
+      claimLegacyPendingImplementationTurn(path, sourceId);
+    if (claimedLegacy) recordShipItOwner(path, sourceId);
+    if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
+      void callback(
+        saved,
+        path,
+        sourceId,
+        session?.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+      );
+  });
+
+  function isShipItPrompt(text: string): boolean {
+    return /^\s*\/ship-it(?:\s|$)/im.test(text);
+  }
+
   const skillMenuId = crypto.randomUUID();
   const skillMatches = $derived(matchingSkills(skills, draft));
   $effect(() => {
@@ -443,8 +485,9 @@
     const text = (externalText ?? draft).trim();
     const turnDirectory = directory;
     const current = generation;
+    let shipIssue: ShipItIssue | null;
     try {
-      await beginShipItRun(turnDirectory, text);
+      shipIssue = await beginShipItRun(turnDirectory, text);
     } catch (cause) {
       error = describe(cause);
       return;
@@ -505,6 +548,10 @@
         const implementingModel = target.model
           ? `${target.model.providerID}:${target.model.id}`
           : undefined;
+        if (shipIssue) {
+          recordShipItOwner(turnDirectory, `opencode:${id}`);
+          await onshipit?.(shipIssue, turnDirectory, `opencode:${id}`, implementingModel);
+        }
         await invoke('record_turn_snapshot', { path: turnDirectory, thread: `opencode:${id}` });
         const tracking = await beginImplementationTurn(
           turnDirectory,

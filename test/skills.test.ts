@@ -7,6 +7,7 @@ import {
   resolveSkillPrompt,
   skillQuery,
 } from '../src/lib/skills.ts';
+import { validationSettingsKey } from '../src/lib/cross-validation.ts';
 
 const skills = [
   { id: 'one', name: 'ship-issue', description: 'Ship a GitHub issue' },
@@ -39,13 +40,20 @@ void test('bundled skills fill missing names without replacing installed skills'
   assert.equal(resolveSkillPrompt(merged, '/unknown'), '/unknown');
 });
 
-void test('an installed shipping skill still receives the fresh session gate', () => {
+void test('an installed shipping skill defaults gates to the implementation session', () => {
   const installed = [{ id: 'old', name: 'ship-it', description: 'Installed' }];
   const merged = mergeSkills(installed, [
     { name: 'ship-it', description: 'Bundled', instructions: 'Bundle content' },
   ]);
   assert.deepEqual(merged, installed);
-  assert.match(resolveSkillPrompt(merged, '/ship-it #42'), /Never run a gate inline/);
+  const prompt = resolveSkillPrompt(merged, '/ship-it #42');
+  assert.match(prompt, /Sail default gate rule/);
+  assert.match(prompt, /Do not call validation_gate/);
+  assert.match(prompt, /Sail progress reporting/);
+  assert.match(prompt, /stage, status: "running"/);
+  assert.match(prompt, /stages implementing, reviewing, testing, pull_request, ci, and merging/);
+  assert.match(prompt, /After each completed Code Adversary/);
+  assert.match(prompt, /gate, verdict, reason/);
 });
 
 void test('bundled choices stay visible with many installed skills and mixed case', () => {
@@ -71,8 +79,33 @@ void test('bundled choices stay visible with many installed skills and mixed cas
   );
   assert.equal(matchingSkills(merged, '/').length, 15);
   assert.equal(matchingSkills(merged, '/').at(-1)?.name, 'skill-11');
-  assert.match(resolveSkillPrompt(merged, '/Ship-It #42'), /Never run a gate inline/);
-  assert.match(resolveSkillPrompt(merged, '/SHIP-IT #42'), /Never run a gate inline/);
+  assert.match(resolveSkillPrompt(merged, '/Ship-It #42'), /Sail default gate rule/);
+  assert.match(resolveSkillPrompt(merged, '/SHIP-IT #42'), /Sail default gate rule/);
+});
+
+void test('a configured validation pool retains fresh session gates', () => {
+  const original = globalThis.localStorage;
+  const values = new Map([
+    [
+      validationSettingsKey,
+      JSON.stringify({
+        choices: [{ agent: 'codex', model: 'gpt-5.6-luna' }],
+        strictDifferentModel: false,
+      }),
+    ],
+  ]);
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: (key: string) => values.get(key) ?? null },
+  });
+  try {
+    const installed = [{ id: 'old', name: 'ship-it', description: 'Installed' }];
+    const prompt = resolveSkillPrompt(installed, '/ship-it #42');
+    assert.match(prompt, /Never run a gate inline/);
+    assert.doesNotMatch(prompt, /After each completed Code Adversary/);
+  } finally {
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: original });
+  }
 });
 
 void test('standalone gates require only their own fresh sessions', () => {

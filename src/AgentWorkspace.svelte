@@ -31,7 +31,13 @@
   import {
     beginImplementationTurn,
     beginShipItRun,
+    claimLegacyPendingImplementationTurn,
+    hasPendingImplementationTurn,
     recordImplementationModel,
+    recordShipItOwner,
+    savedShipItIssue,
+    savedShipItOwner,
+    type ShipItIssue,
   } from './lib/implementation-models';
   import {
     agentQueuePaused,
@@ -110,6 +116,12 @@
     spawnReceipts?: SpawnReceipt[];
     postTurnChecks?: PostTurnCheck[];
     onretrycheck?: (check: PostTurnCheck) => void;
+    onshipit?: (
+      issue: ShipItIssue,
+      directory: string,
+      threadId: string,
+      workerModel?: string,
+    ) => Promise<void>;
   }
   let {
     agent,
@@ -139,6 +151,7 @@
     spawnReceipts = [],
     postTurnChecks = [],
     onretrycheck = () => {},
+    onshipit,
   }: Props = $props();
   let mounted = $state(false);
   let ready = $state(false);
@@ -181,6 +194,30 @@
     if (activeSessionId) saveQueuedAgentMessages(agent, directory, activeSessionId, queued);
     void send(next.text, next);
   });
+  $effect(() => {
+    if (ephemeral || !activeSessionId || !onshipit || (!busy && !running)) return;
+    const path = directory;
+    const sessionId = activeSessionId;
+    const sourceId = `acp:${agent}:${sessionId}`;
+    const callback = onshipit;
+    const model = modelOption?.currentValue;
+    const saved = savedShipItIssue(path);
+    const ownsPending = hasPendingImplementationTurn(path, sourceId);
+    const savedOwner = savedShipItOwner(path);
+    const claimedLegacy =
+      !savedOwner &&
+      !!saved &&
+      ownsPending &&
+      entries.some((entry) => entry.type === 'user' && isShipItPrompt(entry.text)) &&
+      claimLegacyPendingImplementationTurn(path, sourceId);
+    if (claimedLegacy) recordShipItOwner(path, sourceId);
+    if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
+      void callback(saved, path, sourceId, model);
+  });
+
+  function isShipItPrompt(text: string): boolean {
+    return /^\s*\/ship-it(?:\s|$)/im.test(text);
+  }
 
   function updateSkills(value: unknown[]) {
     skills = mergeSkills(
@@ -833,8 +870,9 @@
     const text =
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
+    let shipIssue: ShipItIssue | null;
     try {
-      await beginShipItRun(directory, text);
+      shipIssue = await beginShipItRun(directory, text);
     } catch (cause) {
       error = describe(cause);
       return;
@@ -906,6 +944,15 @@
         onactivity({ ...activityThread, model: modelOption?.currentValue || activityThread.model });
       const id = activityThread?.sessionId ?? activeSessionId;
       deliverySessionId = id;
+      if (shipIssue && id && !ephemeral) {
+        recordShipItOwner(turnDirectory, `acp:${turnAgent}:${id}`);
+        await onshipit?.(
+          shipIssue,
+          turnDirectory,
+          `acp:${turnAgent}:${id}`,
+          modelOption?.currentValue,
+        );
+      }
       if (stopRequested) {
         notifyOnDone = false;
         if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');
