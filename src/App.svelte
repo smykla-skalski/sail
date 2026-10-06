@@ -185,12 +185,15 @@
     type InterruptedAgentTurn,
   } from './lib/acp';
   import {
+    compatibleOpenCodeVersion,
     connect,
+    OPENCODE_VERSION,
     type OpenCodeClient,
     type RuntimeInfo,
     type SessionInfo,
     type SessionMessageInfo,
   } from './lib/opencode';
+  import { recordDiagnostic } from './lib/diagnostics';
   import { getPlan, type HistoryEntry, type PlanSnapshot } from './lib/plan';
   import { mergeMessages, nearBottom } from './lib/timeline';
   import {
@@ -1713,8 +1716,10 @@
   async function activateRuntime(info: RuntimeInfo) {
     const nextClient = connect(info);
     const server = await nextClient.server.info({ signal: AbortSignal.timeout(5000) });
-    if (!server.version.startsWith('2.'))
-      throw new Error('OpenCode v2 is required. Choose a compatible binary in settings.');
+    if (!compatibleOpenCodeVersion(server.version))
+      throw new Error(
+        `OpenCode v${OPENCODE_VERSION} is required (found ${server.version}). Upgrade or choose a compatible binary in settings.`,
+      );
     if (disposed) return;
     clearTimeout(recoveryTimer);
     eventController?.abort();
@@ -7234,8 +7239,6 @@
     pendingPermissions = [];
     pendingForms = [];
     snapshot = { plan: null, questions: null };
-    diffs = [];
-    selectedFilePath = null;
     diffError = '';
     ++diffRefresh;
     diffLoading = false;
@@ -7243,7 +7246,11 @@
     historyError = '';
     historyLoading = false;
     sideTab = viewStates.get(viewKey())?.sideTab ?? 'plan';
-    selectedFilePath = viewStates.get(viewKey())?.selectedFilePath ?? null;
+    selectedFilePath = selectedDiffFile(
+      diffs,
+      viewStates.get(viewKey())?.selectedFilePath ?? null,
+      path,
+    );
     if (!automatic) mobileView = 'chat';
     error = '';
     setSetting(`sai-session:${directory}`, id);
@@ -7819,13 +7826,13 @@
     if (!client || !id || !directory) return;
     const source = client;
     const path = directory;
+    void refreshDiff(id, current, true);
     const [history, plan] = await Promise.allSettled([
       refreshTimeline(id, current),
       setup?.rpc.state === 'ready'
         ? getPlan(source, path, id)
         : Promise.resolve({ plan: null, questions: null } as PlanSnapshot),
       refreshPrompts(id, current),
-      refreshDiff(id, current),
       refreshHistory(id, current),
     ]);
     if (current !== selection || id !== sessionID) return;
@@ -8136,8 +8143,13 @@
           void reconcileNativeActivity();
         }
       }
-    } catch {
+    } catch (cause) {
       // A new subscription reloads missed state after the live stream fails.
+      if (!signal.aborted)
+        recordDiagnostic('opencode_event_stream_failed', {
+          errorName: cause instanceof Error ? cause.name : typeof cause,
+          message: describe(cause).slice(0, 500),
+        });
     }
     if (!signal.aborted) {
       ++nativeActivityGeneration;
