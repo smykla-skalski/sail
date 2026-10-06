@@ -4,6 +4,8 @@
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import Markdown from './Markdown.svelte';
   import ToolActivity from './ToolActivity.svelte';
+  import ActivityStatus from './ActivityStatus.svelte';
+  import { activityState } from './lib/activity-state';
   import { openCodeErrorDetails } from './lib/tool-failure';
   import { mergeMessages } from './lib/timeline';
   import { needsChildSummary } from './lib/opencode-subagent-summary';
@@ -200,13 +202,11 @@
     if (!last || last.type !== 'assistant')
       return active.includes(child.id)
         ? 'Thinking'
-        : child.outcome
-          ? 'Finished'
-          : 'Waiting to start';
+        : activityState(child.outcome ?? 'queued').label;
     const part = last.content.findLast((item) => item.type === 'tool' || item.type === 'text');
     if (part?.type === 'tool') return `${part.name} · ${part.state.status}`;
     if (part?.type === 'text') return part.text.slice(0, 160);
-    return active.includes(child.id) ? 'Thinking' : child.outcome ? 'Finished' : 'Waiting to start';
+    return active.includes(child.id) ? 'Thinking' : activityState(child.outcome ?? 'queued').label;
   }
 </script>
 
@@ -223,9 +223,10 @@
         >
           <span aria-hidden="true">{expanded.includes(child.id) ? '▾' : '▸'}</span>
           <strong>{child.title ?? child.agent ?? 'Subagent'}</strong>
-          <span class="subagent-state"
-            >{active.includes(child.id) ? 'Running' : (child.outcome ?? 'Pending')}</span
-          >
+          <ActivityStatus
+            status={active.includes(child.id) ? 'working' : (child.outcome ?? 'queued')}
+            compact
+          />
         </button>
         <p class="subagent-activity">{activity(child)}</p>
         {#if expanded.includes(child.id)}
@@ -317,7 +318,6 @@
     white-space: nowrap;
     font-size: 13px;
   }
-  .subagent-state,
   .subagent-activity {
     color: var(--text-muted, var(--sui-muted));
     font-size: 11px;

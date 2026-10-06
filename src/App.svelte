@@ -15,7 +15,8 @@
   import type { FormInfo, PermissionRequest } from '@opencode/client';
   import type { ModelRef } from '@opencode/client';
   import type { BrowserAttachment } from './lib/browser-pick';
-  import { Badge, Button } from '@smykla-skalski/sui';
+  import { Button } from '@smykla-skalski/sui';
+  import ActivityStatus from './ActivityStatus.svelte';
   import Markdown from './Markdown.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import SpawnResponse from './SpawnResponse.svelte';
@@ -6921,7 +6922,7 @@
             ? 'Subagent needs your input'
             : children.length
               ? 'Subagents are still active'
-              : 'Finished',
+              : 'Completed',
       sound: notificationSound,
     }).catch(() => undefined);
   }
@@ -8979,17 +8980,23 @@
                     (newSessionMode === 'work' ? 'New work' : 'New thread')}</span
                 >
               </div>
-              <Badge tone={running ? 'warning' : workReady ? 'success' : 'neutral'}
-                >{running
-                  ? 'Working'
-                  : workReady
-                    ? 'Ready'
-                    : setupLoading
-                      ? 'Connecting'
-                      : setup?.model.state === 'action'
-                        ? 'Model needed'
-                        : 'Offline'}</Badge
-              >
+              <ActivityStatus
+                status={runtimeState === 'starting'
+                  ? 'connecting'
+                  : runtimeState !== 'connected'
+                    ? 'offline'
+                    : pendingPermissions.length ||
+                        pendingForms.length ||
+                        setup?.model.state === 'action'
+                      ? 'waiting'
+                      : running
+                        ? 'working'
+                        : workReady
+                          ? 'ready'
+                          : setupLoading
+                            ? 'connecting'
+                            : 'offline'}
+              />
             </div>
             <div
               class="conversation"
@@ -9141,10 +9148,12 @@
                 )}
               />
               {#if running && runtimeState === 'connected'}<div class="chat-working">
-                  <span class="activity-spinner" aria-hidden="true"></span>
-                  <span class="working-label" role="status"
-                    >{currentSession?.agent ?? 'Agent'} · {activity}</span
-                  >
+                  <ActivityStatus
+                    status={pendingPermissions.length || pendingForms.length
+                      ? 'waiting'
+                      : 'working'}
+                  />
+                  <span class="working-label" role="status">{activity}</span>
                   <Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
                 </div>{/if}
             </div>
@@ -9373,6 +9382,7 @@
       {sideChat}
       {client}
       {setup}
+      {runtimeState}
       {coordinationMessages}
       {spawnReceipts}
       {shipRuns}

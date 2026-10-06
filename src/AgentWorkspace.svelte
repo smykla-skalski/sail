@@ -3,7 +3,8 @@
   import { SvelteMap } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { Badge, Button } from '@smykla-skalski/sui';
+  import { Button } from '@smykla-skalski/sui';
+  import ActivityStatus from './ActivityStatus.svelte';
   import Markdown from './Markdown.svelte';
   import ChatMessage from './ChatMessage.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
@@ -354,6 +355,17 @@
   const preparedFailures = new Map<string, string>();
   const name = $derived(agentName);
   const isBusy = $derived(busy || running || historyLoading);
+  const visibleStatus = $derived(
+    connecting
+      ? 'connecting'
+      : !ready
+        ? 'offline'
+        : permissions.length
+          ? 'waiting'
+          : isBusy
+            ? 'working'
+            : 'ready',
+  );
 
   $effect(() => {
     if (ready && !busy && !running && !historyLoaded && !historyAttempted) void loadHistory();
@@ -1424,9 +1436,7 @@
         />
       {/each}
     </div>
-    <Badge tone={isBusy ? 'warning' : ready ? 'success' : 'neutral'}
-      >{connecting ? 'Connecting' : isBusy ? 'Working' : ready ? 'Ready' : 'Offline'}</Badge
-    >
+    <ActivityStatus status={visibleStatus} />
   </div>
   <div
     class="agent-conversation conversation"
@@ -1501,10 +1511,14 @@
             <details class="agent-tool-group">
               <summary>
                 {entry.tools.length - 1} earlier {entry.tools.length === 2 ? 'action' : 'actions'}
-                {#if entry.tools.slice(0, -1).some(toolRunning)}<span>Running</span>{/if}
-                {#if entry.tools.slice(0, -1).some(toolFailed)}<span class="agent-tool-error"
-                    >Failed</span
-                  >{/if}
+                {#if entry.tools.slice(0, -1).some(toolRunning)}<ActivityStatus
+                    status="working"
+                    compact
+                  />{/if}
+                {#if entry.tools.slice(0, -1).some(toolFailed)}<ActivityStatus
+                    status="failed"
+                    compact
+                  />{/if}
               </summary>
               <div class="agent-tool-list">
                 {#each entry.tools.slice(0, -1) as tool (tool.id)}
@@ -1525,11 +1539,15 @@
             <summary>
               <span>{entry.tools.length} {entry.tools.length === 1 ? 'action' : 'actions'}</span>
               <span class="agent-tool-group-last">{entry.tools.at(-1)?.title}</span>
-              {#if entry.tools.at(-1)?.status !== 'completed' && !toolFailed(entry.tools.at(-1)!)}<span
-                  >{entry.tools.at(-1)?.status.replaceAll('_', ' ')}</span
-                >{/if}
-              {#if entry.tools.slice(0, -1).some(toolRunning)}<span>Running</span>{/if}
-              {#if entry.tools.some(toolFailed)}<span class="agent-tool-error">Failed</span>{/if}
+              {#if entry.tools.at(-1)?.status !== 'completed' && !toolFailed(entry.tools.at(-1)!)}<ActivityStatus
+                  status={entry.tools.at(-1)?.status}
+                  compact
+                />{/if}
+              {#if entry.tools.slice(0, -1).some(toolRunning)}<ActivityStatus
+                  status="working"
+                  compact
+                />{/if}
+              {#if entry.tools.some(toolFailed)}<ActivityStatus status="failed" compact />{/if}
             </summary>
             <div class="agent-tool-list">
               {#each entry.tools as tool (tool.id)}
@@ -1552,9 +1570,10 @@
               aria-label={`Subagent ${note.status}`}
               role="group"
             >
-              <span class="agent-tool-status" class:failed={isFailedStatus(note.status)}
-                >{note.status.replaceAll('_', ' ')}</span
-              >
+              <ActivityStatus
+                status={isFailedStatus(note.status) ? 'failed' : note.status}
+                compact
+              />
               <span class="agent-subagent-summary">{note.summary}</span>
               {#each notificationStats(note) as stat (stat)}<span class="agent-subagent-stat"
                   >{stat}</span
@@ -1622,7 +1641,11 @@
       </div>{/if}
     {#if isBusy}<ChatMessage kind="assistant" author={name}>
         <div class="agent-busy" role="status">
-          <span>Working…</span><Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
+          <ActivityStatus status={visibleStatus} /><Button
+            size="sm"
+            variant="secondary"
+            onclick={stop}>Stop</Button
+          >
         </div>
       </ChatMessage>{/if}
   </div>
@@ -1900,15 +1923,10 @@
   .agent-tool-list {
     padding: 0 12px 10px;
   }
-  .agent-tool-status,
   .agent-tool-current-label {
     color: var(--text-muted, #888);
     font-size: 0.75rem;
     white-space: nowrap;
-  }
-  .agent-tool-status.failed,
-  .agent-tool-error {
-    color: var(--danger, #d66);
   }
   .agent-subagent-card {
     display: flex;

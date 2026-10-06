@@ -5,7 +5,16 @@ describe('OpenCode failed tool card', () => {
     await browser.execute(() => history.replaceState(null, '', '?tool-failure-fixture'));
     await browser.refresh();
 
+    const initialStatus = $('.tool-activity .activity-status');
+    await expect(initialStatus).toHaveAttribute('data-state', 'working');
+    await expect(initialStatus).toHaveText(expect.stringContaining('Working'));
+    const workingColor = await initialStatus.getCSSProperty('color');
+
     await $('button[aria-label="Fail action"]').click();
+    const failedStatus = $('.tool-activity .activity-status');
+    await expect(failedStatus).toHaveAttribute('data-state', 'failed');
+    await expect(failedStatus).toHaveText(expect.stringContaining('Failed'));
+    expect((await failedStatus.getCSSProperty('color')).value).not.toBe(workingColor.value);
     await expect($('.tool-activity')).toHaveAttribute('open');
     await expect($('.tool-activity-error[role="alert"]')).toHaveText('Permission denied');
     await expect($('.tool-activity')).toHaveText(expect.stringContaining('blocked output'));

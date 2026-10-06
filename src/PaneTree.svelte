@@ -48,6 +48,7 @@
     agents: AgentAvailability[];
     sideChat: SideChatState | null;
     client: OpenCodeClient | null;
+    runtimeState: 'starting' | 'connected' | 'error';
     setup: SetupReport | null;
     coordinationMessages: CoordinationMessage[];
     spawnReceipts: SpawnReceipt[];
@@ -124,6 +125,7 @@
     agents,
     sideChat,
     client,
+    runtimeState,
     setup,
     coordinationMessages,
     spawnReceipts,
@@ -431,6 +433,7 @@
       {agents}
       {sideChat}
       {client}
+      {runtimeState}
       {setup}
       {onentries}
       {changesPanes}
@@ -519,6 +522,7 @@
       {agents}
       {sideChat}
       {client}
+      {runtimeState}
       {setup}
       {onentries}
       {changesPanes}
@@ -668,6 +672,7 @@
           <div class="pane-agent-content" class:changes-open={nativeDetailsVisible}>
             <OpenCodePane
               {client}
+              {runtimeState}
               {directory}
               thread={pane.thread}
               {setup}
