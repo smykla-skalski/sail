@@ -134,6 +134,7 @@ void test('approved snapshot survives serialization and does not expand to new i
 void test('adopts an already-running direct Ship It thread', () => {
   const adopted = adoptDirectShipRun([], {
     id: 'direct-run',
+    project: '/repo',
     directory: '/repo/worktrees/gateway-fix',
     repository: 'kumahq/kuma',
     number: 18976,
@@ -145,6 +146,7 @@ void test('adopts an already-running direct Ship It thread', () => {
 
   const issue = adopted[0].issues[0];
   assert.equal(adopted[0].remote, 'kumahq/kuma');
+  assert.equal(adopted[0].repository, '/repo');
   assert.equal(issue.url, 'https://github.com/kumahq/kuma/issues/18976');
   assert.equal(issue.state, 'working');
   assert.equal(issue.stage, 'implementing');
@@ -158,6 +160,7 @@ void test('adopts an already-running direct Ship It thread', () => {
 void test('fills in the recovered direct worker model without duplicating the run', () => {
   const input = {
     id: 'direct-run',
+    project: '/repo',
     directory: '/repo/worktrees/gateway-fix',
     repository: 'kumahq/kuma',
     number: 18976,

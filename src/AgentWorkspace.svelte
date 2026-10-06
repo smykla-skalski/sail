@@ -31,6 +31,7 @@
   import {
     beginImplementationTurn,
     beginShipItRun,
+    hasPendingImplementationTurn,
     recordImplementationModel,
     savedShipItIssue,
     type ShipItIssue,
@@ -112,7 +113,12 @@
     spawnReceipts?: SpawnReceipt[];
     postTurnChecks?: PostTurnCheck[];
     onretrycheck?: (check: PostTurnCheck) => void;
-    onshipit?: (issue: ShipItIssue, directory: string, threadId: string) => Promise<void>;
+    onshipit?: (
+      issue: ShipItIssue,
+      directory: string,
+      threadId: string,
+      workerModel?: string,
+    ) => Promise<void>;
   }
   let {
     agent,
@@ -188,18 +194,36 @@
   });
   $effect(() => {
     if (ephemeral || !activeSessionId || !onshipit || (!busy && !running)) return;
-    const saved = savedShipItIssue(directory);
-    if (saved) void onshipit(saved, directory, `acp:${agent}:${activeSessionId}`);
+    const path = directory;
+    const sessionId = activeSessionId;
+    const sourceId = `acp:${agent}:${sessionId}`;
+    const callback = onshipit;
+    const model = modelOption?.currentValue;
+    const saved = savedShipItIssue(path);
+    if (saved && hasPendingImplementationTurn(path, sourceId))
+      void callback(saved, path, sourceId, model);
+    if (!hasPendingImplementationTurn(path, sourceId)) return;
     for (const entry of entries) {
       if (entry.type !== 'user' || adoptedShipMessages.has(entry.id)) continue;
       adoptedShipMessages.add(entry.id);
-      void beginShipItRun(directory, entry.text)
-        .then((issue) =>
-          issue ? onshipit(issue, directory, `acp:${agent}:${activeSessionId}`) : undefined,
-        )
-        .catch(() => {});
+      void trackShipItMessage(entry.text, path, sourceId, model, callback);
     }
   });
+
+  async function trackShipItMessage(
+    text: string,
+    path: string,
+    sourceId: string,
+    model: string | undefined,
+    callback: NonNullable<Props['onshipit']>,
+  ): Promise<void> {
+    try {
+      const issue = await beginShipItRun(path, text);
+      if (issue) await callback(issue, path, sourceId, model);
+    } catch {
+      // A malformed historical message must not interrupt its active thread.
+    }
+  }
 
   function updateSkills(value: unknown[]) {
     skills = mergeSkills(
@@ -927,7 +951,12 @@
       const id = activityThread?.sessionId ?? activeSessionId;
       deliverySessionId = id;
       if (shipIssue && id && !ephemeral)
-        await onshipit?.(shipIssue, turnDirectory, `acp:${turnAgent}:${id}`);
+        await onshipit?.(
+          shipIssue,
+          turnDirectory,
+          `acp:${turnAgent}:${id}`,
+          modelOption?.currentValue,
+        );
       if (stopRequested) {
         notifyOnDone = false;
         if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');

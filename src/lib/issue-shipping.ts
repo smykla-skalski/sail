@@ -51,6 +51,7 @@ export interface ShipRun {
 
 export type DirectShipRunInput = {
   id: string;
+  project: string;
   directory: string;
   repository: string;
   number: number;
@@ -87,7 +88,7 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
     {
       id: input.id,
       source: `direct:${input.threadId}`,
-      repository: input.directory,
+      repository: input.project,
       remote: input.repository,
       provider: input.provider,
       limit: 1,

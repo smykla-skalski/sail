@@ -5,6 +5,7 @@ import {
   abandonImplementationTurn,
   beginImplementationTurn,
   beginShipItRun,
+  hasPendingImplementationTurn,
   implementationAttributionUncertain,
   implementationModels,
   recoverImplementationModels,
@@ -41,6 +42,27 @@ void test('archive waits for in-flight attribution even when the backend turn ha
     models: ['model-a'],
     modelUncertain: false,
   });
+});
+
+void test('pending implementation recovery stays with its owning session', async () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => 'before' } },
+  });
+  const directory = '/test/owned-pending-turn';
+  const turn = await beginImplementationTurn(directory, 'model-a', 'acp:codex:session-a');
+  assert.equal(hasPendingImplementationTurn(directory), true);
+  assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:session-a'), true);
+  assert.equal(hasPendingImplementationTurn(directory, 'acp:codex:session-b'), false);
+  abandonImplementationTurn(directory, turn);
 });
 
 for (const model of ['provider:model-a', undefined]) {

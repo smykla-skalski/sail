@@ -62,7 +62,12 @@
       limit: number,
       source: string,
     ) => Promise<void>;
-    onshipit: (issue: ShipItIssue, directory: string, threadId: string) => Promise<void>;
+    onshipit: (
+      issue: ShipItIssue,
+      directory: string,
+      threadId: string,
+      workerModel?: string,
+    ) => Promise<void>;
     postTurnChecks: PostTurnCheck[];
     onretrycheck: (check: PostTurnCheck) => void;
     agentUsage: Record<string, AgentUsage>;

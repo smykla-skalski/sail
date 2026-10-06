@@ -479,10 +479,11 @@
   let agentThreads = $state<AgentThread[]>(savedAgentThreads);
   $effect(() => {
     for (const thread of agentThreads) {
-      if (!hasPendingImplementationTurn(thread.directory)) continue;
-      const issue = savedShipItIssue(thread.directory);
-      if (issue)
-        void adoptDirectShipRun(issue, thread.directory, `acp:${thread.agent}:${thread.sessionId}`);
+      const sourceId = `acp:${thread.agent}:${thread.sessionId}`;
+      if (!hasPendingImplementationTurn(thread.directory, sourceId)) continue;
+      const { directory: path, model, agent, sessionId } = thread;
+      const issue = savedShipItIssue(path);
+      if (issue) void adoptDirectShipRun(issue, path, `acp:${agent}:${sessionId}`, model);
     }
   });
   let agentUsage = $state<Record<string, AgentUsage>>({});
@@ -1163,17 +1164,20 @@
   );
   $effect(() => {
     if (!sessionID || !running) return;
-    const saved = savedShipItIssue(directory);
-    if (saved) void adoptDirectShipRun(saved, directory, `opencode:${sessionID}`);
+    const path = directory;
+    const id = sessionID;
+    const sourceId = `opencode:${id}`;
+    const saved = savedShipItIssue(path);
+    if (saved && hasPendingImplementationTurn(path, sourceId))
+      void adoptDirectShipRun(saved, path, sourceId);
+    if (!hasPendingImplementationTurn(path, sourceId)) return;
     for (const message of messages) {
       if (message.type !== 'user') continue;
-      const key = `${sessionID}:${message.id}`;
+      const key = `${id}:${message.id}`;
       if (adoptedDirectMessages.has(key)) continue;
       adoptedDirectMessages.add(key);
-      void beginShipItRun(directory, message.text)
-        .then((issue) =>
-          issue ? adoptDirectShipRun(issue, directory, `opencode:${sessionID}`) : undefined,
-        )
+      void beginShipItRun(path, message.text)
+        .then((issue) => (issue ? adoptDirectShipRun(issue, path, sourceId) : undefined))
         .catch(() => {});
     }
   });
@@ -1904,6 +1908,7 @@
     issue: ShipItIssue,
     path: string,
     threadId: string,
+    knownWorkerModel?: string,
   ): Promise<void> {
     const provider: ShipRun['provider'] = threadId.startsWith('opencode:')
       ? 'opencode'
@@ -1911,12 +1916,21 @@
         ? 'claude'
         : 'codex';
     const [, agent, sessionId] = /^acp:([^:]+):(.+)$/.exec(threadId) ?? [];
-    const workerModel = agentThreads.find(
-      (thread) =>
-        thread.agent === agent && thread.sessionId === sessionId && thread.directory === path,
-    )?.model;
-    const adopted = createDirectShipRun(shipRuns, {
-      id: crypto.randomUUID(),
+    const workerModel =
+      knownWorkerModel ??
+      agentThreads.find(
+        (thread) =>
+          thread.agent === agent && thread.sessionId === sessionId && thread.directory === path,
+      )?.model;
+    const previous = shipRuns;
+    const previousIssue = previous
+      .flatMap((run) => run.issues)
+      .find((item) => item.path === path && item.threadId === threadId);
+    const project = worktreeAt(projectCatalog, path)?.repository ?? path;
+    const directRunId = crypto.randomUUID();
+    const adopted = createDirectShipRun(previous, {
+      id: directRunId,
+      project,
       directory: path,
       repository: issue.repository,
       number: issue.number,
@@ -1930,7 +1944,16 @@
     try {
       await saveShipRuns();
     } catch (cause) {
-      shipRuns = shipRuns.filter((run) => run.id !== adopted.at(-1)!.id);
+      shipRuns = previousIssue
+        ? shipRuns.map((run) => ({
+            ...run,
+            issues: run.issues.map((item) =>
+              item.path === path && item.threadId === threadId && item.workerModel === workerModel
+                ? { ...item, workerModel: previousIssue.workerModel }
+                : item,
+            ),
+          }))
+        : shipRuns.filter((run) => run.id !== directRunId);
       throw cause;
     }
     showShipRuns();
@@ -1961,7 +1984,11 @@
           throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
         await acp.connect(run.provider);
       }
-      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread. Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, merging), with status running or blocked and a reason when blocked. After every completed adversary pass, use ship_progress with its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.`;
+      const gateReporting =
+        !crossValidation.choices.length && !crossValidation.strictDifferentModel
+          ? 'After every completed adversary pass, use ship_progress with its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.'
+          : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread. Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -2074,7 +2101,32 @@
       }),
     );
     issue.gates = reconciledShipGates(issue, spawnReceipts);
-    if (isDirectShipRun(run)) return;
+    if (isDirectShipRun(run)) {
+      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+        repository: run.repository,
+        paths: issue.path ? [issue.path] : [],
+      });
+      const worktree = registered.find((item) => item.path === issue.path);
+      if (worktree?.branch && worktree.branch !== issue.branch)
+        await update({ branch: worktree.branch });
+      try {
+        const closed = await invoke<boolean>('shipping_dependency_closed', {
+          repository: run.repository,
+          reference: String(issue.number),
+        });
+        await update({
+          ...refreshedIssueState(issue, closed),
+          refreshError: null,
+          refreshedAt: Date.now(),
+        });
+        const branch = worktree?.branch ?? issue.branch;
+        if (branch && issue.state !== 'pending')
+          await refreshShippingPullRequest(run, { ...issue, branch });
+      } catch (cause) {
+        await update({ refreshError: describe(cause) });
+      }
+      return;
+    }
     try {
       const closed = await invoke<boolean>('shipping_dependency_closed', {
         repository: run.repository,
@@ -3154,6 +3206,10 @@
           item.targetDirectory === request.directory,
       );
       if (!receipt?.validation) {
+        if (crossValidation.choices.length || crossValidation.strictDifferentModel)
+          throw new Error(
+            'Inline gate verdicts are disabled while cross-validation is configured.',
+          );
         if (!('gate' in report))
           throw new Error('The implementation session must identify the completed inline gate.');
         const owner = shipOwner(shipRuns, request.directory, sourceId);
@@ -8006,7 +8062,6 @@
         });
         if (current === selection && path === directory) await refreshSessions();
       }
-      if (shipIssue && id) await adoptDirectShipRun(shipIssue, path, `opencode:${id}`);
       if (current === selection && path === directory) {
         running = true;
         activity = 'Thinking';
@@ -8020,6 +8075,8 @@
         const implementingModel = target.model
           ? `${target.model.providerID}:${target.model.id}`
           : undefined;
+        if (shipIssue)
+          await adoptDirectShipRun(shipIssue, path, `opencode:${targetId}`, implementingModel);
         await invoke('record_turn_snapshot', { path, thread: `opencode:${targetId}` });
         const tracking = await beginImplementationTurn(
           path,

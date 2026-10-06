@@ -17,7 +17,7 @@ function pendingKey(directory: string): string {
   return `sai-implementation-pending:${directory}`;
 }
 
-type PendingTurn = { id: string; before: string; model?: string };
+type PendingTurn = { id: string; before: string; model?: string; owner?: string };
 
 function pendingTurns(directory: string): PendingTurn[] {
   try {
@@ -28,7 +28,8 @@ function pendingTurns(directory: string): PendingTurn[] {
             !!turn &&
             typeof turn.id === 'string' &&
             typeof turn.before === 'string' &&
-            (turn.model === undefined || typeof turn.model === 'string'),
+            (turn.model === undefined || typeof turn.model === 'string') &&
+            (turn.owner === undefined || typeof turn.owner === 'string'),
         )
       : [];
   } catch {
@@ -36,8 +37,8 @@ function pendingTurns(directory: string): PendingTurn[] {
   }
 }
 
-export function hasPendingImplementationTurn(directory: string): boolean {
-  return pendingTurns(directory).length > 0;
+export function hasPendingImplementationTurn(directory: string, owner?: string): boolean {
+  return pendingTurns(directory).some((turn) => owner === undefined || turn.owner === owner);
 }
 
 function savePendingTurns(directory: string, turns: PendingTurn[]): void {
@@ -87,7 +88,7 @@ export async function beginImplementationTurn(
     turn.before = await invoke<string>('working_tree_revision', { path: directory });
     savePendingTurns(directory, [
       ...pendingTurns(directory),
-      { id: turn.id, before: turn.before, model },
+      { id: turn.id, before: turn.before, model, owner },
     ]);
     return turn;
   } catch (cause) {

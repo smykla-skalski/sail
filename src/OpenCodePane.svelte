@@ -26,6 +26,7 @@
     abandonImplementationTurn,
     beginImplementationTurn,
     beginShipItRun,
+    hasPendingImplementationTurn,
     recordImplementationModel,
     savedShipItIssue,
     type ShipItIssue,
@@ -94,7 +95,12 @@
     onactivity: (thread: AgentThread) => void;
     onstatus: (thread: AgentThread, status: ThreadStatus, notifyOnDone?: boolean) => void;
     onusage?: (sessionID: string, context: number | undefined) => void;
-    onshipit?: (issue: ShipItIssue, directory: string, threadId: string) => Promise<void>;
+    onshipit?: (
+      issue: ShipItIssue,
+      directory: string,
+      threadId: string,
+      workerModel?: string,
+    ) => Promise<void>;
   } = $props();
 
   let session = $state<SessionInfo | null>(null);
@@ -114,16 +120,44 @@
   const adoptedShipMessages = new SvelteSet<string>();
   $effect(() => {
     if (!onshipit || !activeID || !running) return;
-    const saved = savedShipItIssue(directory);
-    if (saved) void onshipit(saved, directory, `opencode:${activeID}`);
+    const path = directory;
+    const id = activeID;
+    const sourceId = `opencode:${id}`;
+    const callback = onshipit;
+    const saved = savedShipItIssue(path);
+    if (saved && hasPendingImplementationTurn(path, sourceId))
+      void callback(
+        saved,
+        path,
+        sourceId,
+        session?.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+      );
+    if (!hasPendingImplementationTurn(path, sourceId)) return;
     for (const message of messages) {
       if (message.type !== 'user' || adoptedShipMessages.has(message.id)) continue;
       adoptedShipMessages.add(message.id);
-      void beginShipItRun(directory, message.text)
-        .then((issue) => (issue ? onshipit(issue, directory, `opencode:${activeID}`) : undefined))
-        .catch(() => {});
+      void trackShipItMessage(message.text, path, sourceId, callback);
     }
   });
+
+  async function trackShipItMessage(
+    text: string,
+    path: string,
+    sourceId: string,
+    callback: (
+      issue: ShipItIssue,
+      directory: string,
+      threadId: string,
+      workerModel?: string,
+    ) => Promise<void>,
+  ): Promise<void> {
+    try {
+      const issue = await beginShipItRun(path, text);
+      if (issue) await callback(issue, path, sourceId);
+    } catch {
+      // A malformed historical message must not interrupt its active thread.
+    }
+  }
   const skillMenuId = crypto.randomUUID();
   const skillMatches = $derived(matchingSkills(skills, draft));
   $effect(() => {
@@ -514,7 +548,6 @@
         session = info;
         oncreated(summary(info));
       }
-      if (shipIssue && id) await onshipit?.(shipIssue, turnDirectory, `opencode:${id}`);
       running = true;
       if (session) onstatus(summary(session), 'working');
       const promptRequest = runSerialOpenCodeTurn(id, async () => {
@@ -524,6 +557,8 @@
         const implementingModel = target.model
           ? `${target.model.providerID}:${target.model.id}`
           : undefined;
+        if (shipIssue)
+          await onshipit?.(shipIssue, turnDirectory, `opencode:${id}`, implementingModel);
         await invoke('record_turn_snapshot', { path: turnDirectory, thread: `opencode:${id}` });
         const tracking = await beginImplementationTurn(
           turnDirectory,
