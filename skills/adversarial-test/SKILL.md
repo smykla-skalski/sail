@@ -18,6 +18,8 @@ When the prompt enables Sail cross-validation, launch the fresh Test Adversary s
 
 With Sail cross-validation enabled, run the Test Adversary in a fresh subagent session. If it cannot launch, stop and report `Test Verdict: BLOCKED` with the reason. Otherwise run the pass in this session.
 
+In same-session mode, derive the acceptance criteria, run the real product surface, attack its boundaries, and rerun every reproduction directly. The clean-context, spawning, and no-subagent `BLOCKED` rules below apply only with Sail cross-validation enabled.
+
 Prove the change does **not** do what the task says - by running it. It answers one question - **does this change work for a user?** - and answers it with commands and output, not by reading code. Code correctness review is the `adversarial-review` skill.
 
 One subagent with a clean context, then a check by you:
@@ -36,7 +38,7 @@ Paths in this file are relative to the skill directory (the one holding this SKI
 | Argument substitution                         | If the "Parse from" line under Arguments shows no value or an unreplaced placeholder, take the PR URL and flags from the user's request                                                                                                                                                    |
 | AskUserQuestion                               | Not used; the skill never stops for input                                                                                                                                                                                                                                                  |
 | Named agent `adversarial-test:test-adversary` | Claude Code and Copilot CLI register it from the plugin's `agents/` directory. Codex and opencode do not; there, or whenever the type is unknown, spawn a generic subagent with the full mandate from [references/test-adversary.md](references/test-adversary.md) prepended (see Phase 2) |
-| Subagent tool (Agent)                         | Codex: one `spawn_agent` call, waited on and closed before Phase 3. opencode: the `task` tool. No subagent tool or failed launches: report `Test Verdict: BLOCKED`.                                                                                                                        |
+| Subagent tool (Agent)                         | With Sail cross-validation: Codex: one `spawn_agent` call, waited on and closed before Phase 3. opencode: the `task` tool. No subagent tool or failed launches: report `Test Verdict: BLOCKED`. Without cross-validation, execute the test mandate directly.                               |
 | `context: fork`                               | Not used                                                                                                                                                                                                                                                                                   |
 
 The skill spawns at most one subagent at a time, so it runs sequentially on every agent.
@@ -54,7 +56,7 @@ Parse from `$ARGUMENTS`:
 
 ## Phase 1 - Build the test assignment
 
-Do not run or read the product yourself; the subagent does. Resolve only what it needs:
+With Sail cross-validation, do not run or read the product yourself; the subagent does. Without it, use the same assignment to test the product directly.
 
 - **Local (`--base` or none):** resolve the default branch with `git symbolic-ref --short refs/remotes/origin/HEAD` (fallback `origin/main`). `BASE=$(git merge-base <ref> HEAD)`. Run location: the repository root. Diff command: `git diff <BASE sha>`. Files: `git diff --name-only <BASE sha>` plus untracked files (`git ls-files --others --exclude-standard`).
 - **PR URL:** `gh pr view <url> --json number,headRefOid,baseRefName,title,body`. If local `HEAD` is `headRefOid` and the tree is clean, run from the repository root. Otherwise `git fetch origin pull/<number>/head` and `git worktree add --detach <tmpdir> <headRefOid>`; run from that worktree and remove it after Phase 3. Diff command: `gh pr diff <url>`. Use the PR title and body as context when `--context` is absent.
@@ -75,9 +77,9 @@ Task context:
 <context, or "none">
 ```
 
-## Phase 2 - Test Adversary (subagent)
+## Phase 2 - Test Adversary
 
-The instruction for the subagent is: _"Prove this change does not satisfy the task by running it. Do not edit tracked files."_ Pass the Test assignment and the instruction, nothing else - not your own reading of the code, not what you expect to work, not this conversation. When the mandate is not already the subagent's system prompt, prepend the full content of [references/test-adversary.md](references/test-adversary.md).
+With Sail cross-validation, the instruction for the subagent is: _"Prove this change does not satisfy the task by running it. Do not edit tracked files."_ Pass the Test assignment and the instruction, nothing else - not your own reading of the code, not what you expect to work, not this conversation. When the mandate is not already the subagent's system prompt, prepend the full content of [references/test-adversary.md](references/test-adversary.md). Without cross-validation, execute that mandate directly.
 
 **Claude Code and Copilot CLI.**
 

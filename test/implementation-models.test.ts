@@ -10,8 +10,10 @@ import {
   implementationAttributionUncertain,
   implementationModels,
   recoverImplementationModels,
+  recordShipItOwner,
   recordImplementationModel,
   savedShipItIssue,
+  savedShipItOwner,
   settledImplementationAttribution,
 } from '../src/lib/implementation-models.ts';
 
@@ -92,6 +94,21 @@ void test('a single legacy pending turn can be claimed by its Ship session', () 
     ]),
   );
   assert.equal(claimLegacyPendingImplementationTurn(directory, 'acp:codex:ship-session'), false);
+});
+
+void test('Ship It ownership is separate from an implementation turn owner', () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  const directory = '/test/ship-owner';
+  recordShipItOwner(directory, 'acp:codex:ship-session');
+  assert.equal(savedShipItOwner(directory), 'acp:codex:ship-session');
+  assert.notEqual(savedShipItOwner(directory), 'acp:codex:ordinary-session');
 });
 
 for (const model of ['provider:model-a', undefined]) {

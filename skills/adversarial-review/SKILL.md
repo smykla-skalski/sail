@@ -18,6 +18,8 @@ When the prompt enables Sail cross-validation, launch each fresh pass with `vali
 
 Without Sail cross-validation, run both passes in the current session with the implementation agent and model. With Sail cross-validation enabled, use fresh subagent sessions for both passes, even when the first pass reports no findings. If either session cannot launch, stop and report `Review Verdict: BLOCKED` with the failed pass and reason.
 
+In same-session mode, read the diff yourself, perform the Code Adversary mandate, then challenge every finding with the Findings Adversary mandate before producing the verdict. The clean-context, spawning, and no-subagent `BLOCKED` rules below apply only with Sail cross-validation enabled.
+
 Find the bug, then try to prove the bug report wrong. It answers one question - **is this change correct?** - and answers it hard. It does not evaluate architecture, conventions, dead code, or taste; that is `/staff-code-review`.
 
 Two subagents, opposed, each with a clean context:
@@ -31,12 +33,12 @@ The second pass exists because an unrefuted adversary nit-bombs. It sees only th
 
 Paths in this file are relative to the skill directory (the one holding this SKILL.md). The workflow is written for Claude Code; on other agents, or when a Claude feature is missing, use these fallbacks:
 
-| Claude Code feature                                                     | Fallback                                                                                                                                                           |
-| :---------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Argument substitution                                                   | If the "Parse from" line under Arguments shows no value or an unreplaced placeholder, take the PR URL, diff file, `--base` and `--context` from the user's request |
-| Named agents `adversarial-review:code-adversary` / `findings-adversary` | Spawn a generic subagent with the matching mandate file from `references/` prepended (see [Spawning a clean-context subagent](#spawning-a-clean-context-subagent)) |
-| Subagent tool (Agent)                                                   | Codex: `spawn_agent`; opencode: `task`; Copilot CLI: its task/subagent tool. With no subagent tool, report `Review Verdict: BLOCKED`.                              |
-| AskUserQuestion, `context: fork`                                        | Not used                                                                                                                                                           |
+| Claude Code feature                                                     | Fallback                                                                                                                                                                                                                    |
+| :---------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Argument substitution                                                   | If the "Parse from" line under Arguments shows no value or an unreplaced placeholder, take the PR URL, diff file, `--base` and `--context` from the user's request                                                          |
+| Named agents `adversarial-review:code-adversary` / `findings-adversary` | Spawn a generic subagent with the matching mandate file from `references/` prepended (see [Spawning a clean-context subagent](#spawning-a-clean-context-subagent))                                                          |
+| Subagent tool (Agent)                                                   | With Sail cross-validation: Codex: `spawn_agent`; opencode: `task`; Copilot CLI: its task/subagent tool. With no subagent tool, report `Review Verdict: BLOCKED`. Without cross-validation, execute both mandates directly. |
+| AskUserQuestion, `context: fork`                                        | Not used                                                                                                                                                                                                                    |
 
 The two passes always run sequentially, so the skill never needs more than one extra subagent at a time.
 
@@ -52,9 +54,9 @@ Parse from `$ARGUMENTS`:
 | (none)                   | Same as `--base origin/<default-branch>`                                                                      |
 | `--context <file\|text>` | Task context: issue body, acceptance criteria, PR description. A path is read; anything else is used verbatim |
 
-## Phase 1 - Build the review assignment
+## Phase 1 - Build the review assignment (cross-validation only)
 
-Do not read the full diff into your own context; the subagents fetch it themselves. Resolve only what they need:
+Do not read the full diff into your own context; the subagents fetch it themselves. In same-session mode, read the diff and use the relevant assignment details directly.
 
 - **Local (`--base` or none):** resolve the default branch with `git symbolic-ref --short refs/remotes/origin/HEAD` (fallback `origin/main`). `BASE=$(git merge-base <ref> HEAD)`. Diff command: `git diff <BASE sha>`. Files: `git diff --name-only <BASE sha>`. Untracked files (`git ls-files --others --exclude-standard`) are not in the diff; list them separately so the subagents read them whole.
 - **PR URL:** `gh pr view <url> --json number,headRefOid,baseRefName,title,body`. Diff command: `gh pr diff <url>`. If local `HEAD` is not `headRefOid`, run `git fetch origin pull/<number>/head` and tell the subagents to read changed files with `git show <headRefOid>:<path>` instead of the working tree. Use the PR title and body as context when `--context` is absent.
@@ -76,7 +78,7 @@ Task context:
 <context, or "none">
 ```
 
-## Spawning a clean-context subagent
+## Spawning a clean-context subagent (cross-validation only)
 
 Each pass is one fresh subagent whose prompt is the Review assignment plus the pass-specific payload. When the subagent is generic rather than a named adversary agent, prepend the full content of the pass's mandate file. Pass nothing else - not your own reading of the code, not hypotheses, not this conversation.
 
@@ -95,19 +97,19 @@ Each pass is one fresh subagent whose prompt is the Review assignment plus the p
 
 **Copilot CLI.** The plugin registers the same named agents (`adversarial-review:code-adversary`, `adversarial-review:findings-adversary`); use them through its subagent tool when offered, otherwise a fresh generic subagent with the mandate prepended.
 
-**Other agents** with a subagent tool: spawn a fresh generic subagent with the mandate prepended. Without a subagent tool, report `Review Verdict: BLOCKED`.
+**Other agents** with a subagent tool: spawn a fresh generic subagent with the mandate prepended. Without a subagent tool, report `Review Verdict: BLOCKED` only with Sail cross-validation; otherwise execute the mandate directly.
 
 **Validation and retry.** If a reply is empty or lacks its required final verdict line, spawn a fresh subagent once more. If that fails too, report `Review Verdict: BLOCKED` with the reason.
 
 ## Phase 2 - Code Adversary
 
-Spawn per [Spawning a clean-context subagent](#spawning-a-clean-context-subagent): named agent `adversarial-review:code-adversary`, mandate [references/code-adversary.md](references/code-adversary.md), payload _"Find the bug in this change and prove it. Read only; do not modify files."_
+With Sail cross-validation, spawn per [Spawning a clean-context subagent](#spawning-a-clean-context-subagent): named agent `adversarial-review:code-adversary`, mandate [references/code-adversary.md](references/code-adversary.md), payload _"Find the bug in this change and prove it. Read only; do not modify files."_ Without it, execute that mandate directly.
 
 The reply must end with a `CODE_ADVERSARY_VERDICT:` line. Continue to Phase 3 even when it reports `CLEAN` with no findings.
 
 ## Phase 3 - Findings Adversary
 
-Spawn a **new** subagent - never resume, message, or reuse the Code Adversary: named agent `adversarial-review:findings-adversary`, mandate [references/findings-adversary.md](references/findings-adversary.md), payload `Findings to refute:` followed by **only** the numbered `F<n>` finding blocks (label, message, location) copied from Phase 2. Use an empty findings list when Phase 2 is clean. Strip every other line of the Code Adversary's reply - the clean context is the point.
+With Sail cross-validation, spawn a **new** subagent - never resume, message, or reuse the Code Adversary: named agent `adversarial-review:findings-adversary`, mandate [references/findings-adversary.md](references/findings-adversary.md), payload `Findings to refute:` followed by **only** the numbered `F<n>` finding blocks (label, message, location) copied from Phase 2. Use an empty findings list when Phase 2 is clean. Without cross-validation, refute each finding directly before deciding the verdict.
 
 The reply must have one verdict line per input finding and end with a `FINDINGS_ADVERSARY_VERDICT:` line.
 

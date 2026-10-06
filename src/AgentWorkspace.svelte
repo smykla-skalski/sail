@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from 'svelte';
-  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+  import { SvelteMap } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { Badge, Button } from '@smykla-skalski/sui';
@@ -34,7 +34,9 @@
     claimLegacyPendingImplementationTurn,
     hasPendingImplementationTurn,
     recordImplementationModel,
+    recordShipItOwner,
     savedShipItIssue,
+    savedShipItOwner,
     type ShipItIssue,
   } from './lib/implementation-models';
   import {
@@ -174,7 +176,6 @@
       });
   });
   let queued = $state<QueuedAgentMessage[]>([]);
-  const adoptedShipMessages = new SvelteSet<string>();
   let queuePaused = $state(false);
   let steering = $state(false);
   function diagnostic(event: DiagnosticEvent, sessionId = activeSessionId, turnId = activeTurnId) {
@@ -202,36 +203,20 @@
     const model = modelOption?.currentValue;
     const saved = savedShipItIssue(path);
     const ownsPending = hasPendingImplementationTurn(path, sourceId);
+    const savedOwner = savedShipItOwner(path);
     const claimedLegacy =
+      !savedOwner &&
       !!saved &&
+      ownsPending &&
       entries.some((entry) => entry.type === 'user' && isShipItPrompt(entry.text)) &&
       claimLegacyPendingImplementationTurn(path, sourceId);
-    if (saved && (ownsPending || claimedLegacy)) void callback(saved, path, sourceId, model);
-    if (!ownsPending && !claimedLegacy) return;
-    for (const entry of entries) {
-      if (entry.type !== 'user' || adoptedShipMessages.has(entry.id)) continue;
-      adoptedShipMessages.add(entry.id);
-      void trackShipItMessage(entry.text, path, sourceId, model, callback);
-    }
+    if (claimedLegacy) recordShipItOwner(path, sourceId);
+    if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
+      void callback(saved, path, sourceId, model);
   });
 
   function isShipItPrompt(text: string): boolean {
     return /^\s*\/ship-it(?:\s|$)/im.test(text);
-  }
-
-  async function trackShipItMessage(
-    text: string,
-    path: string,
-    sourceId: string,
-    model: string | undefined,
-    callback: NonNullable<Props['onshipit']>,
-  ): Promise<void> {
-    try {
-      const issue = await beginShipItRun(path, text);
-      if (issue) await callback(issue, path, sourceId, model);
-    } catch {
-      // A malformed historical message must not interrupt its active thread.
-    }
   }
 
   function updateSkills(value: unknown[]) {
@@ -959,13 +944,15 @@
         onactivity({ ...activityThread, model: modelOption?.currentValue || activityThread.model });
       const id = activityThread?.sessionId ?? activeSessionId;
       deliverySessionId = id;
-      if (shipIssue && id && !ephemeral)
+      if (shipIssue && id && !ephemeral) {
+        recordShipItOwner(turnDirectory, `acp:${turnAgent}:${id}`);
         await onshipit?.(
           shipIssue,
           turnDirectory,
           `acp:${turnAgent}:${id}`,
           modelOption?.currentValue,
         );
+      }
       if (stopRequested) {
         notifyOnDone = false;
         if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');

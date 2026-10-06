@@ -89,8 +89,10 @@
     hasPendingImplementationTurn,
     implementationAttributionUncertain,
     implementationModels,
+    recordShipItOwner,
     recoverImplementationModels,
     savedShipItIssue,
+    savedShipItOwner,
     settledImplementationAttribution,
     recordImplementationModel,
   } from './lib/implementation-models';
@@ -491,13 +493,17 @@
       const { directory: path, model, agent, sessionId } = thread;
       const issue = savedShipItIssue(path);
       const ownsPending = hasPendingImplementationTurn(path, sourceId);
+      const savedOwner = savedShipItOwner(path);
       const claimedLegacy =
+        !savedOwner &&
         !!issue &&
+        ownsPending &&
         loadRecentTranscript(thread).some(
           (entry) => entry.type === 'user' && isShipItPrompt(entry.text),
         ) &&
         claimLegacyPendingImplementationTurn(path, sourceId);
-      if (!ownsPending && !claimedLegacy) continue;
+      if (claimedLegacy) recordShipItOwner(path, sourceId);
+      if (!ownsPending || (savedOwner !== sourceId && !claimedLegacy)) continue;
       if (issue) void adoptDirectShipRun(issue, path, `acp:${agent}:${sessionId}`, model);
     }
   });
@@ -767,7 +773,6 @@
     if (!side.parentThreadId && thread) sideChat = { ...side, parentThreadId: thread.sessionId };
   });
   let messages = $state<SessionMessageInfo[]>([]);
-  const adoptedDirectMessages = new SvelteSet<string>();
   let olderMessageCursor = $state<string | null>(null);
   let loadingOlder = $state(false);
   let restoringTimelineSelection: number | null = null;
@@ -1184,21 +1189,16 @@
     const sourceId = `opencode:${id}`;
     const saved = savedShipItIssue(path);
     const ownsPending = hasPendingImplementationTurn(path, sourceId);
+    const savedOwner = savedShipItOwner(path);
     const claimedLegacy =
+      !savedOwner &&
       !!saved &&
+      ownsPending &&
       messages.some((message) => message.type === 'user' && isShipItPrompt(message.text)) &&
       claimLegacyPendingImplementationTurn(path, sourceId);
-    if (saved && (ownsPending || claimedLegacy)) void adoptDirectShipRun(saved, path, sourceId);
-    if (!ownsPending && !claimedLegacy) return;
-    for (const message of messages) {
-      if (message.type !== 'user') continue;
-      const key = `${id}:${message.id}`;
-      if (adoptedDirectMessages.has(key)) continue;
-      adoptedDirectMessages.add(key);
-      void beginShipItRun(path, message.text)
-        .then((issue) => (issue ? adoptDirectShipRun(issue, path, sourceId) : undefined))
-        .catch(() => {});
-    }
+    if (claimedLegacy) recordShipItOwner(path, sourceId);
+    if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
+      void adoptDirectShipRun(saved, path, sourceId);
   });
   const displayChatMessages = $derived(
     withSpawnResponses(
@@ -2208,7 +2208,7 @@
       try {
         const closed = await invoke<boolean>('shipping_dependency_closed', {
           repository: run.repository,
-          reference: String(issue.number),
+          reference: issue.id,
         });
         await update({
           ...refreshedIssueState(issue, closed),
@@ -2218,6 +2218,7 @@
         const branch = worktree?.branch ?? issue.branch;
         if (branch && issue.state !== 'pending')
           await refreshShippingPullRequest(run, { ...issue, branch });
+        if (issue.refreshError) return;
         const pr = shippingPullRequests.get(`${run.id}:${issue.id}`);
         if (pr?.mergedAt) {
           await update({ state: 'merged', workerSettled: true, error: null });
@@ -2243,6 +2244,12 @@
             workerSettled: true,
             error: `Worker ${workerState}.`,
           });
+        } else if (
+          workerState === 'working' ||
+          workerState === 'waiting' ||
+          workerState === 'queued'
+        ) {
+          await update({ state: 'working', workerSettled: false, error: null });
         }
       } catch (cause) {
         await update({ refreshError: describe(cause) });
@@ -4568,6 +4575,31 @@
     }
   }
 
+  async function removeMissingWorktreeFromGui(repository: string, path: string): Promise<void> {
+    if (directory === path) await loadProject(repository);
+    saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
+    const removedThreads = agentThreads.filter((thread) => thread.directory === path);
+    const removedNative = sidebarOpenCodeThreads.filter((thread) => thread.directory === path);
+    agentThreads = agentThreads.filter((thread) => thread.directory !== path);
+    nativeThreads = nativeThreads.filter((thread) => thread.directory !== path);
+    sidebarOpenCodeThreads = sidebarOpenCodeThreads.filter((thread) => thread.directory !== path);
+    saveAgentThreads(agentThreads);
+    setSetting('sai-recent-native-threads', JSON.stringify(nativeThreads));
+    forgetMissingRecentThreads();
+    for (const thread of [...removedThreads, ...removedNative]) {
+      forgetThreadAttention(thread);
+      if (thread.agent !== 'opencode') forgetRecentTranscript(thread);
+    }
+    delete paneLayouts[path];
+    persistPaneLayouts();
+    removeSetting(`sai-session:${path}`);
+    pendingWorktreeStarts.delete(path);
+    runningWorktreeSetups.delete(path);
+    removeSetting(`sai-pending-worktree-start:${path}`);
+    removeSetting(`sai-main-pane-empty:${path}`);
+    error = '';
+  }
+
   async function deleteProjectWorktreeOnce(
     repository: string,
     path: string,
@@ -4578,6 +4610,10 @@
     try {
       config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
     } catch (cause) {
+      if (missingRepositoryPath(cause)) {
+        await removeMissingWorktreeFromGui(repository, path);
+        return;
+      }
       error = describe(cause);
       return;
     }
@@ -8203,8 +8239,10 @@
         const implementingModel = target.model
           ? `${target.model.providerID}:${target.model.id}`
           : undefined;
-        if (shipIssue)
+        if (shipIssue) {
+          recordShipItOwner(path, `opencode:${targetId}`);
           await adoptDirectShipRun(shipIssue, path, `opencode:${targetId}`, implementingModel);
+        }
         await invoke('record_turn_snapshot', { path, thread: `opencode:${targetId}` });
         const tracking = await beginImplementationTurn(
           path,

@@ -9,6 +9,10 @@ function runKey(directory: string): string {
   return `sai-implementation-run:${directory}`;
 }
 
+function shipOwnerKey(directory: string): string {
+  return `sai-ship-it-owner:${directory}`;
+}
+
 function uncertainKey(directory: string): string {
   return `sai-implementation-uncertain:${directory}`;
 }
@@ -66,6 +70,15 @@ export type ShipItIssue = {
   repository: string;
   number: number;
 };
+
+export function savedShipItOwner(directory: string): string | null {
+  const owner = getSetting(shipOwnerKey(directory));
+  return owner?.trim() || null;
+}
+
+export function recordShipItOwner(directory: string, owner: string): void {
+  setSetting(shipOwnerKey(directory), owner);
+}
 
 export function savedShipItIssue(directory: string): ShipItIssue | null {
   const match = /^([^#]+)#([1-9]\d*)$/.exec(getSetting(runKey(directory)) ?? '');
