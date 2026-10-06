@@ -83,6 +83,7 @@
     externalPrompt,
     onexternalresult,
     onpickedconsumed,
+    onattachmentsent,
     onpromptfocused,
     oncreated,
     onactivity,
@@ -105,6 +106,7 @@
     externalPrompt?: { id: string; text: string };
     onexternalresult?: (id: string, failure: string | null) => void;
     onpickedconsumed?: (id: string) => void;
+    onattachmentsent?: (ids: string[], thread: string, turn: string) => void;
     onpromptfocused?: () => void;
     oncreated: (thread: AgentThread) => void;
     onactivity: (thread: AgentThread) => void;
@@ -126,6 +128,7 @@
     ),
   );
   let cursor = $state<string | null>(null);
+  const pickedCaptureIds = new SvelteMap<string, string>();
   let pendingPermissions = $state<PermissionRequest[]>([]);
   let pendingForms = $state<FormInfo[]>([]);
   let draft = $state('');
@@ -401,6 +404,7 @@
     for (const path of pickedImages)
       if (!inFlightCaptures.has(path)) {
         pickedImages.delete(path);
+        pickedCaptureIds.delete(path);
         void invoke('browser_remove_capture', { path });
       }
     draft = '';
@@ -465,6 +469,7 @@
     if (!picked || picked.id === lastPicked) return;
     lastPicked = picked.id;
     pickedImages.add(picked.imagePath);
+    pickedCaptureIds.set(picked.imagePath, picked.id);
     files = [...files, picked.imagePath];
     draft = [draft.trim(), picked.text].filter(Boolean).join('\n\n');
     onpickedconsumed?.(picked.id);
@@ -547,7 +552,10 @@
       ++generation;
       clearTimeout(refreshTimer);
       for (const path of pickedImages)
-        if (!inFlightCaptures.has(path)) void invoke('browser_remove_capture', { path });
+        if (!inFlightCaptures.has(path)) {
+          pickedCaptureIds.delete(path);
+          void invoke('browser_remove_capture', { path });
+        }
       for (const path of clipboardPaths)
         if (!inFlightClipboard.has(path)) {
           clipboardNames.delete(path);
@@ -671,10 +679,18 @@
         return response;
       });
       sending = false;
-      await promptRequest;
+      const response = await promptRequest;
+      const captureIds = paths.flatMap((path) => {
+        const captureId = pickedCaptureIds.get(path);
+        return captureId ? [captureId] : [];
+      });
+      if (captureIds.length) onattachmentsent?.(captureIds, `opencode:${id}`, response.id);
       accepted = true;
       for (const path of paths)
-        if (pickedImages.delete(path)) void invoke('browser_remove_capture', { path });
+        if (pickedImages.delete(path)) {
+          pickedCaptureIds.delete(path);
+          void invoke('browser_remove_capture', { path });
+        }
       for (const path of paths)
         if (clipboardPaths.delete(path)) {
           clipboardNames.delete(path);
@@ -725,7 +741,10 @@
       if (current === generation) sending = false;
       if (disposed || current !== generation)
         for (const path of paths)
-          if (pickedImages.delete(path)) void invoke('browser_remove_capture', { path });
+          if (pickedImages.delete(path)) {
+            pickedCaptureIds.delete(path);
+            void invoke('browser_remove_capture', { path });
+          }
     }
   }
 
@@ -789,7 +808,10 @@
 
   function removeFile(path: string) {
     files = files.filter((item) => item !== path);
-    if (pickedImages.delete(path)) void invoke('browser_remove_capture', { path });
+    if (pickedImages.delete(path)) {
+      pickedCaptureIds.delete(path);
+      void invoke('browser_remove_capture', { path });
+    }
     if (clipboardPaths.delete(path)) void removeClipboardFile(path);
     clipboardNames.delete(path);
   }

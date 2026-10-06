@@ -103,6 +103,7 @@
     focusPrompt?: boolean;
     picked?: BrowserAttachment;
     onpickedconsumed?: (id: string) => void;
+    onattachmentsent?: (ids: string[], thread: string, turn: string) => void;
     prefill?: { id: string; text: string };
     onprefillconsumed?: (id: string) => void;
     externalPrompt?: { id: string; text: string };
@@ -138,6 +139,7 @@
     focusPrompt = false,
     picked,
     onpickedconsumed,
+    onattachmentsent,
     prefill,
     onprefillconsumed,
     externalPrompt,
@@ -999,6 +1001,12 @@
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
           : skillText;
       phase = 'prompt';
+      if (id && sentImages.length)
+        onattachmentsent?.(
+          sentImages.map((image) => image.id),
+          `acp:${turnAgent}:${id}`,
+          turnId,
+        );
       let result;
       try {
         result = await acp.prompt(

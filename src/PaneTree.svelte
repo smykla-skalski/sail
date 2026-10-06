@@ -24,6 +24,7 @@
   import { spawnReceiptsForSource, type SpawnReceipt } from './lib/agent-results';
   import type { ThreadStatus } from './lib/attention';
   import type { PostTurnCheck } from './lib/post-turn-checks';
+  import type { ReviewCapture, ReviewPreview } from './lib/review-evidence';
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import type { PublishedGraph } from './lib/issue-graph';
   import type { ShipRun } from './lib/issue-shipping';
@@ -94,6 +95,7 @@
     onbrowserpick: (id: string, attachment: BrowserAttachment) => void;
     pickedAttachments: Record<string, BrowserAttachment>;
     onpickedconsumed: (id: string) => void;
+    onattachmentsent: (ids: string[], thread: string, turn: string) => void;
     diffComments: Record<string, DiffComment[]>;
     ondiffcomments: (scope: string, comments: DiffComment[]) => void;
     ondiffcommentssent: (scope: string, ids: string[]) => void;
@@ -114,6 +116,11 @@
     onterminalexit: (id: string, code: number) => void;
     onterminalownerlost: (id: string) => void;
     onagentterminal: (id: string) => void;
+    reviewCaptures: ReviewCapture[];
+    reviewPreviews: ReviewPreview[];
+    onreviewcheck: (check: PostTurnCheck) => void;
+    onreviewpreview: (preview: ReviewPreview) => void;
+    onreviewcapturephase: (id: string, phase: ReviewCapture['phase']) => void;
   };
 
   let {
@@ -156,6 +163,7 @@
     onbrowserpick,
     pickedAttachments,
     onpickedconsumed,
+    onattachmentsent,
     diffComments,
     ondiffcomments,
     ondiffcommentssent,
@@ -176,6 +184,11 @@
     onterminalexit,
     onterminalownerlost,
     onagentterminal,
+    reviewCaptures,
+    reviewPreviews,
+    onreviewcheck,
+    onreviewpreview,
+    onreviewcapturephase,
   }: Props = $props();
   let container = $state<HTMLDivElement>();
   let splitWidth = $state(0);
@@ -196,6 +209,7 @@
   let diffGeneration = 0;
   let diffRevision = '';
   let diffRevisionPath = '';
+  let diffEvidenceUpdated = $state(Date.now());
   let nativeSnapshot = $state<PlanSnapshot>({ plan: null, questions: null });
   let nativeHistory = $state<HistoryEntry[]>([]);
   let nativeSession = $state<SessionInfo>();
@@ -207,6 +221,28 @@
   const nativeDetailsVisible = $derived(nativeDetailsOpen || changesPanes.includes(pane.id));
   let previousChangesOpen = false;
   let previousAcpOpen = false;
+
+  function reviewEvidence(thread: string | null) {
+    const checks = thread ? postTurnChecks.filter((check) => check.thread === thread) : [];
+    const captures = reviewCaptures.filter(
+      (capture) =>
+        capture.paneId === pane.id && (capture.thread === null || capture.thread === thread),
+    );
+    return {
+      checks,
+      captures,
+      previews: reviewPreviews,
+      filesUpdated: diffEvidenceUpdated,
+      updated: Math.max(
+        diffEvidenceUpdated,
+        ...checks.map((check) => check.updated),
+        ...captures.map((capture) => capture.created),
+      ),
+      oncheck: onreviewcheck,
+      onpreview: onreviewpreview,
+      oncapturephase: onreviewcapturephase,
+    };
+  }
 
   function closeNativeDetails() {
     nativeDetailsOpen = false;
@@ -343,6 +379,7 @@
       if (current !== diffGeneration || path !== directory) return;
       diffRevisionPath = path;
       diffRevision = revision;
+      diffEvidenceUpdated = Date.now();
       diffs = files;
       selectedFile =
         files.find((file) => file.file === selectedFile)?.file ?? files[0]?.file ?? null;
@@ -451,6 +488,7 @@
       {onbrowserpick}
       {pickedAttachments}
       {onpickedconsumed}
+      {onattachmentsent}
       {diffComments}
       {ondiffcomments}
       {ondiffcommentssent}
@@ -471,6 +509,11 @@
       {onterminalexit}
       {onterminalownerlost}
       {onagentterminal}
+      {reviewCaptures}
+      {reviewPreviews}
+      {onreviewcheck}
+      {onreviewpreview}
+      {onreviewcapturephase}
     />
     <div
       class="pane-divider"
@@ -540,6 +583,7 @@
       {onbrowserpick}
       {pickedAttachments}
       {onpickedconsumed}
+      {onattachmentsent}
       {diffComments}
       {ondiffcomments}
       {ondiffcommentssent}
@@ -560,6 +604,11 @@
       {onterminalexit}
       {onterminalownerlost}
       {onagentterminal}
+      {reviewCaptures}
+      {reviewPreviews}
+      {onreviewcheck}
+      {onreviewpreview}
+      {onreviewcapturephase}
     />
   </div>
 {:else}
@@ -700,6 +749,7 @@
               externalPrompt={pendingAgentBatches[pane.id]}
               onexternalresult={onbatchcomplete}
               {onpickedconsumed}
+              {onattachmentsent}
               {onpromptfocused}
               oncreated={(thread) => oncreated(pane.id, thread)}
               onactivity={(thread) => {
@@ -788,6 +838,9 @@
                     oncomments={ondiffcomments}
                     oncommentssent={ondiffcommentssent}
                     onsendcomments={(scope, text) => onsenddiffcomments(pane.id, scope, text)}
+                    evidence={reviewEvidence(
+                      pane.thread ? `opencode:${pane.thread.sessionId}` : null,
+                    )}
                   />
                 {/if}
               </section>
@@ -830,6 +883,7 @@
               externalPrompt={pendingAgentBatches[pane.id]}
               onexternalresult={onbatchcomplete}
               {onpickedconsumed}
+              {onattachmentsent}
               {onpromptfocused}
               onentrieschange={(entries, sessionId, ready) =>
                 onentries(pane.id, entries, sessionId, ready)}
@@ -882,6 +936,9 @@
                     oncomments={ondiffcomments}
                     oncommentssent={ondiffcommentssent}
                     onsendcomments={(scope, text) => onsenddiffcomments(pane.id, scope, text)}
+                    evidence={reviewEvidence(
+                      pane.thread ? `acp:${pane.agent}:${pane.thread.sessionId}` : null,
+                    )}
                   />
                 {/if}
               </section>

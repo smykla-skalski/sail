@@ -241,6 +241,13 @@
   } from './lib/saved-commands';
   import { annotateDiffs, repoPath, selectedDiffFile, type WorkingDiffInfo } from './lib/diff';
   import type { DiffComment } from './lib/diff-comments';
+  import {
+    browserReviewPreviews,
+    retainCaptureMetadata,
+    selectReviewPreview,
+    type ReviewCapture,
+    type ReviewPreview,
+  } from './lib/review-evidence';
   import { inspectRepository, type SetupReport } from './lib/onboarding';
   import {
     acpUsage,
@@ -698,6 +705,8 @@
   const clipboardAttachmentPaths = new SvelteSet<string>();
   const clipboardAttachmentNames = new SvelteMap<string, string>();
   let pickedAttachments = $state<Record<string, BrowserAttachment>>({});
+  let reviewCaptures = $state<(ReviewCapture & { directory: string })[]>([]);
+  let mainDiffEvidenceUpdated = $state(Date.now());
   let diffComments = $state<Record<string, DiffComment[]>>({});
   let pendingAgentBatches = $state<Record<string, { id: string; text: string }>>({});
   let issuePrefills = $state<Record<string, { id: string; text: string }>>({});
@@ -720,6 +729,7 @@
     { resolve: () => void; reject: (error: Error) => void }
   >();
   const pickedImageText = new SvelteMap<string, string>();
+  const pickedCaptureIds = new SvelteMap<string, string>();
   const inFlightCaptures = new SvelteSet<string>();
   let setup = $state<SetupReport | null>(null);
   let setupError = $state('');
@@ -1033,6 +1043,7 @@
       diffRevisionPath = path;
       diffRevision = revision;
       diffs = next;
+      mainDiffEvidenceUpdated = Date.now();
       diffError = '';
       selectedFilePath = selectedDiffFile(next, selectedFilePath, path);
     } catch (cause) {
@@ -6167,10 +6178,31 @@
       })
       .toSorted((a, b) => a.distance - b.distance)[0];
     if (!next || !Number.isFinite(next.distance)) throw new Error('Agent pane is unavailable.');
+    if (attachment.previewUrl && attachment.url) {
+      const captureSource = URL.canParse(attachment.url)
+        ? new URL(attachment.url).hostname || attachment.url
+        : attachment.url;
+      reviewCaptures = retainCaptureMetadata([
+        ...reviewCaptures,
+        {
+          id: attachment.id,
+          paneId: next.id,
+          phase: 'before' as const,
+          source: captureSource,
+          url: attachment.url,
+          previewUrl: attachment.previewUrl,
+          created: attachment.created ?? Date.now(),
+          thread: null,
+          turn: null,
+          directory,
+        },
+      ]);
+    }
     if (next.id === 'main' && !acpAgent) {
       draft = [draft.trim(), attachment.text].filter(Boolean).join('\n\n');
       attachedFiles = [...attachedFiles, attachment.imagePath];
       pickedImageText.set(attachment.imagePath, attachment.text);
+      pickedCaptureIds.set(attachment.imagePath, attachment.id);
     } else {
       pickedAttachments = { ...pickedAttachments, [next.id]: attachment };
     }
@@ -6185,6 +6217,7 @@
     if (pickedText) {
       draft = draft.replace(pickedText, '').trim();
       pickedImageText.delete(path);
+      pickedCaptureIds.delete(path);
       void invoke('browser_remove_capture', { path });
     }
   }
@@ -6196,6 +6229,7 @@
       clipboardAttachmentNames.delete(path);
       if (inFlightCaptures.has(path)) continue;
       if (!pickedImageText.delete(path)) continue;
+      pickedCaptureIds.delete(path);
       void invoke('browser_remove_capture', { path });
     }
     attachedFiles = [];
@@ -6213,6 +6247,67 @@
     pickedAttachments = Object.fromEntries(
       Object.entries(pickedAttachments).filter(([, attachment]) => attachment.id !== id),
     );
+  }
+
+  function setReviewCapturePhase(id: string, phase: ReviewCapture['phase']) {
+    reviewCaptures = reviewCaptures.map((capture) =>
+      capture.id === id ? { ...capture, phase } : capture,
+    );
+  }
+
+  function assignReviewCaptures(ids: string[], thread: string, turn: string) {
+    const captureIds = new Set(ids);
+    reviewCaptures = reviewCaptures.map((capture) =>
+      captureIds.has(capture.id) ? { ...capture, thread, turn } : capture,
+    );
+  }
+
+  function reviewPreviews(): ReviewPreview[] {
+    return browserReviewPreviews(paneLayout);
+  }
+
+  function reviewEvidence(paneId: string, thread: string | null) {
+    const captures = reviewCaptures.filter(
+      (capture) =>
+        capture.directory === directory &&
+        (capture.thread === null ? capture.paneId === paneId : capture.thread === thread) &&
+        (paneId === 'main' || capture.paneId === paneId),
+    );
+    const checks = thread
+      ? postTurnResults.filter((check) => check.directory === directory && check.thread === thread)
+      : [];
+    return {
+      captures,
+      checks,
+      previews: reviewPreviews(),
+      filesUpdated: mainDiffEvidenceUpdated,
+      updated: Math.max(
+        mainDiffEvidenceUpdated,
+        ...captures.map((capture) => capture.created),
+        ...checks.map((check) => check.updated),
+      ),
+      oncheck: openReviewCheck,
+      onpreview: openReviewPreview,
+      oncapturephase: setReviewCapturePhase,
+    };
+  }
+
+  function openReviewPreview(preview: ReviewPreview) {
+    const next = selectReviewPreview(paneLayout, preview);
+    if (!next) {
+      error = 'Browser preview is no longer available.';
+      return;
+    }
+    savePaneLayout(next);
+    focusPane(preview.paneId);
+  }
+
+  async function openReviewCheck(check: PostTurnCheck) {
+    mobileView = 'chat';
+    await tick();
+    const item = document.querySelector<HTMLElement>(`[data-check-id="${CSS.escape(check.id)}"]`);
+    item?.scrollIntoView({ block: 'center' });
+    item?.focus();
   }
 
   function focusPane(id: string) {
@@ -7780,6 +7875,7 @@
       diffRevisionPath = path;
       diffRevision = revision;
       diffs = next;
+      mainDiffEvidenceUpdated = Date.now();
       diffError = '';
       selectedFilePath = selectedDiffFile(next, selectedFilePath, path);
     } catch (cause) {
@@ -8311,7 +8407,12 @@
         return response;
       });
       sending = false;
-      await promptRequest;
+      const response = await promptRequest;
+      const captureIds = files.flatMap((file) => {
+        const captureId = pickedCaptureIds.get(file);
+        return captureId ? [captureId] : [];
+      });
+      if (captureIds.length) assignReviewCaptures(captureIds, `opencode:${targetId}`, response.id);
       accepted = true;
       const staged = files.filter((file) => clipboardAttachmentPaths.delete(file));
       staged.forEach((file) => clipboardAttachmentNames.delete(file));
@@ -8322,6 +8423,7 @@
           .finally(() => staged.forEach((file) => void removeClipboardFile(file)));
       for (const file of files) {
         if (!pickedImageText.delete(file)) continue;
+        pickedCaptureIds.delete(file);
         void invoke('browser_remove_capture', { path: file });
       }
       if (current === selection && path === directory) await refreshSession(id);
@@ -8338,6 +8440,7 @@
           if (clipboardAttachmentPaths.delete(file)) void removeClipboardFile(file);
           clipboardAttachmentNames.delete(file);
           if (!pickedImageText.delete(file)) continue;
+          pickedCaptureIds.delete(file);
           void invoke('browser_remove_capture', { path: file });
         }
       }
@@ -8949,6 +9052,7 @@
                 externalPrompt={pendingAgentBatches.main}
                 onexternalresult={completeAgentBatch}
                 onpickedconsumed={markPickConsumed}
+                onattachmentsent={assignReviewCaptures}
                 onpromptfocused={() => (promptFocusPane = null)}
                 onentrieschange={(entries, sessionId, ready) =>
                   (agentEntrySnapshots = {
@@ -9337,6 +9441,16 @@
                     oncomments={updateDiffComments}
                     oncommentssent={removeSentDiffComments}
                     onsendcomments={(scope, text) => sendDiffComments('main', scope, text)}
+                    evidence={reviewEvidence(
+                      'main',
+                      acpAgent
+                        ? acpThread
+                          ? `acp:${acpAgent}:${acpThread.sessionId}`
+                          : null
+                        : sessionID
+                          ? `opencode:${sessionID}`
+                          : null,
+                    )}
                   />
                 </div>{/if}
               {#if !acpAgent && sessionID}<div
@@ -9421,6 +9535,7 @@
       {pendingAgentBatches}
       onbatchcomplete={completeAgentBatch}
       onpickedconsumed={markPickConsumed}
+      onattachmentsent={assignReviewCaptures}
       onshortcut={keydownWorkspace}
       onactivity={recordPaneActivity}
       onusage={(id, context) => {
@@ -9448,6 +9563,11 @@
       }}
       onterminalownerlost={(id) => savePaneLayout(updatePane(paneLayout, id, { owner: undefined }))}
       onagentterminal={(id) => void openAgentTerminal(id)}
+      reviewCaptures={reviewCaptures.filter((capture) => capture.directory === directory)}
+      reviewPreviews={reviewPreviews()}
+      onreviewcheck={openReviewCheck}
+      onreviewpreview={openReviewPreview}
+      onreviewcapturephase={setReviewCapturePhase}
     />
     {#if mainShipFallback && detailsOpen && activeSideTab === 'ship' && (!mobileLayout || mobileView === 'details')}<section
         class="ship-fallback"
