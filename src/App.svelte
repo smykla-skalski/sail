@@ -1154,6 +1154,8 @@
   let diffPollTimer: ReturnType<typeof setInterval> | undefined;
   let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
   let healthTimer: ReturnType<typeof setInterval> | undefined;
+  let healthCheckInFlight = false;
+  let healthFailures = 0;
   let connecting = $state(false);
   let disposed = false;
   let hasConnected = false;
@@ -1730,6 +1732,7 @@
     clearTimeout(recoveryTimer);
     eventController?.abort();
     client = nextClient;
+    healthFailures = 0;
     nativeActivityReady = false;
     openCodeBrowserServers.clear();
     activeBinary = info.binaryPath;
@@ -1798,12 +1801,25 @@
   }
 
   async function checkRuntime() {
-    if (connecting || runtimeState !== 'connected' || !client) return;
+    if (connecting || healthCheckInFlight || runtimeState !== 'connected' || !client) return;
+    healthCheckInFlight = true;
     try {
       await client.server.info({ signal: AbortSignal.timeout(3000) });
-    } catch {
-      await recoverRuntime();
+      healthFailures = 0;
+    } catch (cause) {
+      healthFailures++;
+      recordDiagnostic('opencode_health_probe_failed', {
+        attempt: healthFailures,
+        errorName: cause instanceof Error ? cause.name : typeof cause,
+        message: describe(cause).slice(0, 500),
+      });
+      if (healthFailures >= 3) {
+        healthFailures = 0;
+        await recoverRuntime();
+      }
       return;
+    } finally {
+      healthCheckInFlight = false;
     }
     if (!directory || planReady || setupLoading) return;
     const now = Date.now();
@@ -7945,6 +7961,7 @@
   }
 
   async function watchEvents(source: OpenCodeClient, signal: AbortSignal) {
+    let failed = false;
     try {
       for await (const event of source.event.subscribe({ signal })) {
         if (signal.aborted) return;
@@ -8179,6 +8196,7 @@
         }
       }
     } catch (cause) {
+      failed = true;
       // A new subscription reloads missed state after the live stream fails.
       if (!signal.aborted)
         recordDiagnostic('opencode_event_stream_failed', {
@@ -8187,6 +8205,7 @@
         });
     }
     if (!signal.aborted) {
+      if (!failed) recordDiagnostic('opencode_event_stream_ended');
       ++nativeActivityGeneration;
       nativeActivityReady = false;
       runtimeState = 'starting';

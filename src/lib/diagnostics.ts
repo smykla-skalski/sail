@@ -10,7 +10,9 @@ export type DiagnosticEvent =
   | 'frontend_error'
   | 'frontend_unhandled_rejection'
   | 'frontend_start_failed'
-  | 'opencode_event_stream_failed';
+  | 'opencode_event_stream_failed'
+  | 'opencode_event_stream_ended'
+  | 'opencode_health_probe_failed';
 
 export function recordDiagnostic(
   event: DiagnosticEvent,
@@ -19,6 +21,7 @@ export function recordDiagnostic(
     sessionId?: string | null;
     turnId?: string | null;
     queueLength?: number;
+    attempt?: number;
     errorName?: string;
     message?: string;
     source?: string;
