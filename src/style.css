@@ -2050,20 +2050,57 @@ button:disabled {
   }
 }
 @media (max-width: 520px) and (max-height: 600px) {
-  .welcome {
+  .topbar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    align-content: start;
+    gap: 4px 8px;
+  }
+  .topbar-actions {
+    display: flex;
+    grid-row: 1;
+    grid-column: 2;
+    min-height: 0;
+    overflow-x: auto;
+    flex: initial;
+    flex-wrap: nowrap;
     justify-content: flex-start;
   }
+  .topbar-actions > * {
+    flex: 0 0 auto;
+  }
+  .mobile-switcher {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    order: initial;
+  }
+  .conversation:has(> .welcome) {
+    padding-block: 12px;
+  }
+  .welcome {
+    justify-content: flex-start;
+    min-height: 0;
+  }
   .welcome-mark {
-    font-size: 40px;
+    display: none;
   }
   .welcome .eyebrow {
-    margin: 8px 0 4px;
+    margin: 0 0 4px;
   }
   .welcome h1 {
     font-size: 24px;
   }
   .welcome p:not(.eyebrow) {
     margin-bottom: 12px;
+    line-height: 1.4;
+  }
+  .welcome-agents {
+    display: grid;
+    width: 100%;
+  }
+  .welcome-agents button {
+    width: 100%;
   }
 }
 .status-dot.connected {

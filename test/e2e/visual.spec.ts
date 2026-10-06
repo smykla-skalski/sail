@@ -122,12 +122,38 @@ describe('visual layout audit', () => {
       if (typeof sendButtonBottom === 'number')
         expect(sendButtonBottom).toBeLessThanOrEqual(size.viewport.height + 1);
       if (width === 320) {
-        const agentActionBottom = await browser.execute(
-          () => document.querySelector('.welcome-agents button')?.getBoundingClientRect().bottom,
+        await expect($('.main-area > .notice.error')).toHaveText(
+          expect.stringContaining('settings'),
         );
-        expect(typeof agentActionBottom).toBe('number');
-        if (typeof agentActionBottom === 'number')
-          expect(agentActionBottom).toBeLessThanOrEqual(size.viewport.height + 1);
+        await browser.execute(() => {
+          document.documentElement.style.fontSize = '200%';
+        });
+        const launchActions = await $$('.welcome-agents button');
+        expect(launchActions.length).toBeGreaterThan(1);
+        const actionBounds = await launchActions.reduce<
+          Promise<Array<{ top: number; bottom: number }>>
+        >(async (accumulated, action) => {
+          const bounds = await accumulated;
+          await browser.execute((element) => {
+            element.scrollIntoView({ block: 'center' });
+          }, action);
+          await action.waitForDisplayed();
+          expect(await action.isEnabled()).toBe(true);
+          return [
+            ...bounds,
+            await browser.execute((element) => {
+              const rect = element.getBoundingClientRect();
+              return { top: rect.top, bottom: rect.bottom };
+            }, action),
+          ];
+        }, Promise.resolve([]));
+        actionBounds.forEach((bounds) => {
+          expect(bounds.top).toBeGreaterThanOrEqual(0);
+          expect(bounds.bottom).toBeLessThanOrEqual(size.viewport.height + 1);
+        });
+        await browser.execute(() => {
+          document.documentElement.style.removeProperty('font-size');
+        });
       }
       await capture(`${width}x${height}-chat`);
       if (width <= 850) await $('.mobile-switcher button:nth-child(1)').click();
