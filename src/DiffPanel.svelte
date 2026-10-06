@@ -2,6 +2,9 @@
   import { onDestroy, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { Button } from '@smykla-skalski/sui';
+  import ReviewEvidencePanel from './ReviewEvidencePanel.svelte';
+  import type { PostTurnCheck } from './lib/post-turn-checks';
+  import type { ReviewCapture, ReviewPreview } from './lib/review-evidence';
   import {
     parsePatch,
     patchUnavailableReason,
@@ -31,6 +34,16 @@
     oncomments: (scope: string, comments: DiffComment[]) => void;
     oncommentssent: (scope: string, ids: string[]) => void;
     onsendcomments: (scope: string, text: string) => Promise<void>;
+    evidence?: {
+      checks: PostTurnCheck[];
+      captures: ReviewCapture[];
+      previews: ReviewPreview[];
+      updated: number;
+      filesUpdated: number;
+      oncheck: (check: PostTurnCheck) => void;
+      onpreview: (preview: ReviewPreview) => void;
+      oncapturephase: (id: string, phase: ReviewCapture['phase']) => void;
+    };
   }
 
   let {
@@ -48,6 +61,7 @@
     oncomments,
     oncommentssent,
     onsendcomments,
+    evidence,
   }: Props = $props();
   let current = $derived(files.find((file) => file.file === selected));
   let area = $state<'all' | 'staged' | 'unstaged'>('all');
@@ -320,6 +334,20 @@
     </div>
   </header>
   {#if error}<p class="diff-error" role="alert">{error}</p>{/if}
+  {#if evidence}
+    <ReviewEvidencePanel
+      {files}
+      checks={evidence.checks}
+      captures={evidence.captures}
+      previews={evidence.previews}
+      updated={evidence.updated}
+      filesUpdated={evidence.filesUpdated}
+      onfile={onselect}
+      oncheck={evidence.oncheck}
+      onpreview={evidence.onpreview}
+      oncapturephase={evidence.oncapturephase}
+    />
+  {/if}
   <div class="diff-files" aria-label="Changed files">
     {#each files as file (file.file)}
       <button class:active={file.file === selected} onclick={() => onselect(file.file)}>

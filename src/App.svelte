@@ -186,14 +186,22 @@
     type InterruptedAgentTurn,
   } from './lib/acp';
   import {
+    compatibleOpenCodeVersion,
     connect,
+    OPENCODE_VERSION,
     type OpenCodeClient,
     type RuntimeInfo,
     type SessionInfo,
     type SessionMessageInfo,
   } from './lib/opencode';
-  import { getHistory, getPlan, type HistoryEntry, type PlanSnapshot } from './lib/plan';
+  import { recordDiagnostic } from './lib/diagnostics';
+  import { getPlan, type HistoryEntry, type PlanSnapshot } from './lib/plan';
   import { mergeMessages, nearBottom } from './lib/timeline';
+  import {
+    forgetOpenCodeTimeline,
+    recallOpenCodeTimeline,
+    rememberOpenCodeTimeline,
+  } from './lib/opencode-timeline-cache';
   import {
     clipboardFiles,
     fileUri,
@@ -241,6 +249,13 @@
   } from './lib/saved-commands';
   import { annotateDiffs, repoPath, selectedDiffFile, type WorkingDiffInfo } from './lib/diff';
   import type { DiffComment } from './lib/diff-comments';
+  import {
+    browserReviewPreviews,
+    retainCaptureMetadata,
+    selectReviewPreview,
+    type ReviewCapture,
+    type ReviewPreview,
+  } from './lib/review-evidence';
   import { inspectRepository, type SetupReport } from './lib/onboarding';
   import {
     acpUsage,
@@ -698,6 +713,8 @@
   const clipboardAttachmentPaths = new SvelteSet<string>();
   const clipboardAttachmentNames = new SvelteMap<string, string>();
   let pickedAttachments = $state<Record<string, BrowserAttachment>>({});
+  let reviewCaptures = $state<(ReviewCapture & { directory: string })[]>([]);
+  let mainDiffEvidenceUpdated = $state(Date.now());
   let diffComments = $state<Record<string, DiffComment[]>>({});
   let pendingAgentBatches = $state<Record<string, { id: string; text: string }>>({});
   let issuePrefills = $state<Record<string, { id: string; text: string }>>({});
@@ -720,6 +737,7 @@
     { resolve: () => void; reject: (error: Error) => void }
   >();
   const pickedImageText = new SvelteMap<string, string>();
+  const pickedCaptureIds = new SvelteMap<string, string>();
   const inFlightCaptures = new SvelteSet<string>();
   let setup = $state<SetupReport | null>(null);
   let setupError = $state('');
@@ -812,7 +830,6 @@
   let diffRefresh = 0;
   let diffRevision = '';
   let diffRevisionPath = '';
-  let historyRefresh = 0;
   let draft = $state('');
   const failureRequests = new SvelteMap<string, string>();
   let mainPrompt = $state<HTMLTextAreaElement | undefined>();
@@ -1033,6 +1050,7 @@
       diffRevisionPath = path;
       diffRevision = revision;
       diffs = next;
+      mainDiffEvidenceUpdated = Date.now();
       diffError = '';
       selectedFilePath = selectedDiffFile(next, selectedFilePath, path);
     } catch (cause) {
@@ -1138,6 +1156,7 @@
     if (current !== selection || id !== sessionID) return;
     messages = mergeMessages(messages, page.data);
     olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
+    cacheCurrentTimeline();
     await restoreOlderMessages(source, id, current, count, anchorID);
   }
   let client = $state<OpenCodeClient | null>(null);
@@ -1715,8 +1734,10 @@
   async function activateRuntime(info: RuntimeInfo) {
     const nextClient = connect(info);
     const server = await nextClient.server.info({ signal: AbortSignal.timeout(5000) });
-    if (!server.version.startsWith('2.'))
-      throw new Error('OpenCode v2 is required. Choose a compatible binary in settings.');
+    if (!compatibleOpenCodeVersion(server.version))
+      throw new Error(
+        `OpenCode v${OPENCODE_VERSION} is required (found ${server.version}). Upgrade or choose a compatible binary in settings.`,
+      );
     if (disposed) return;
     clearTimeout(recoveryTimer);
     eventController?.abort();
@@ -1790,12 +1811,6 @@
 
   async function checkRuntime() {
     if (connecting || runtimeState !== 'connected' || !client) return;
-    try {
-      await client.server.info({ signal: AbortSignal.timeout(3000) });
-    } catch {
-      await recoverRuntime();
-      return;
-    }
     if (!directory || planReady || setupLoading) return;
     const now = Date.now();
     if (now - lastSetupProbe < (setupProbeCount < 12 ? 5000 : 30000)) return;
@@ -4885,6 +4900,7 @@
     }
     ++projectLoadGeneration;
     saveViewState();
+    cacheCurrentTimeline();
     error = '';
     const current = ++selection;
     directory = path;
@@ -4935,7 +4951,6 @@
     diffLoading = false;
     historyEvents = [];
     historyError = '';
-    ++historyRefresh;
     historyLoading = false;
     if (client) await ensureOpenCodeBrowser(path).catch((cause) => (error = describe(cause)));
     if (!client || !(await refreshSetup(path)) || current !== selection) return;
@@ -5259,6 +5274,7 @@
 
   function clearSelectedSession() {
     saveViewState();
+    cacheCurrentTimeline();
     sessionID = null;
     if (mobileView === 'details') mobileView = 'chat';
     selectedSession = null;
@@ -6174,10 +6190,31 @@
       })
       .toSorted((a, b) => a.distance - b.distance)[0];
     if (!next || !Number.isFinite(next.distance)) throw new Error('Agent pane is unavailable.');
+    if (attachment.previewUrl && attachment.url) {
+      const captureSource = URL.canParse(attachment.url)
+        ? new URL(attachment.url).hostname || attachment.url
+        : attachment.url;
+      reviewCaptures = retainCaptureMetadata([
+        ...reviewCaptures,
+        {
+          id: attachment.id,
+          paneId: next.id,
+          phase: 'before' as const,
+          source: captureSource,
+          url: attachment.url,
+          previewUrl: attachment.previewUrl,
+          created: attachment.created ?? Date.now(),
+          thread: null,
+          turn: null,
+          directory,
+        },
+      ]);
+    }
     if (next.id === 'main' && !acpAgent) {
       draft = [draft.trim(), attachment.text].filter(Boolean).join('\n\n');
       attachedFiles = [...attachedFiles, attachment.imagePath];
       pickedImageText.set(attachment.imagePath, attachment.text);
+      pickedCaptureIds.set(attachment.imagePath, attachment.id);
     } else {
       pickedAttachments = { ...pickedAttachments, [next.id]: attachment };
     }
@@ -6192,6 +6229,7 @@
     if (pickedText) {
       draft = draft.replace(pickedText, '').trim();
       pickedImageText.delete(path);
+      pickedCaptureIds.delete(path);
       void invoke('browser_remove_capture', { path });
     }
   }
@@ -6203,6 +6241,7 @@
       clipboardAttachmentNames.delete(path);
       if (inFlightCaptures.has(path)) continue;
       if (!pickedImageText.delete(path)) continue;
+      pickedCaptureIds.delete(path);
       void invoke('browser_remove_capture', { path });
     }
     attachedFiles = [];
@@ -6220,6 +6259,67 @@
     pickedAttachments = Object.fromEntries(
       Object.entries(pickedAttachments).filter(([, attachment]) => attachment.id !== id),
     );
+  }
+
+  function setReviewCapturePhase(id: string, phase: ReviewCapture['phase']) {
+    reviewCaptures = reviewCaptures.map((capture) =>
+      capture.id === id ? { ...capture, phase } : capture,
+    );
+  }
+
+  function assignReviewCaptures(ids: string[], thread: string, turn: string) {
+    const captureIds = new Set(ids);
+    reviewCaptures = reviewCaptures.map((capture) =>
+      captureIds.has(capture.id) ? { ...capture, thread, turn } : capture,
+    );
+  }
+
+  function reviewPreviews(): ReviewPreview[] {
+    return browserReviewPreviews(paneLayout);
+  }
+
+  function reviewEvidence(paneId: string, thread: string | null) {
+    const captures = reviewCaptures.filter(
+      (capture) =>
+        capture.directory === directory &&
+        (capture.thread === null ? capture.paneId === paneId : capture.thread === thread) &&
+        (paneId === 'main' || capture.paneId === paneId),
+    );
+    const checks = thread
+      ? postTurnResults.filter((check) => check.directory === directory && check.thread === thread)
+      : [];
+    return {
+      captures,
+      checks,
+      previews: reviewPreviews(),
+      filesUpdated: mainDiffEvidenceUpdated,
+      updated: Math.max(
+        mainDiffEvidenceUpdated,
+        ...captures.map((capture) => capture.created),
+        ...checks.map((check) => check.updated),
+      ),
+      oncheck: openReviewCheck,
+      onpreview: openReviewPreview,
+      oncapturephase: setReviewCapturePhase,
+    };
+  }
+
+  function openReviewPreview(preview: ReviewPreview) {
+    const next = selectReviewPreview(paneLayout, preview);
+    if (!next) {
+      error = 'Browser preview is no longer available.';
+      return;
+    }
+    savePaneLayout(next);
+    focusPane(preview.paneId);
+  }
+
+  async function openReviewCheck(check: PostTurnCheck) {
+    mobileView = 'chat';
+    await tick();
+    const item = document.querySelector<HTMLElement>(`[data-check-id="${CSS.escape(check.id)}"]`);
+    item?.scrollIntoView({ block: 'center' });
+    item?.focus();
   }
 
   function focusPane(id: string) {
@@ -7195,16 +7295,19 @@
       (!targetPane ||
         (paneSelections.get(targetPane.id) === paneSelection &&
           leaves(paneLayout).some((pane) => pane.id === targetPane.id)));
-    let info: SessionInfo;
-    try {
-      info = await client.session.get({ sessionID: id });
-      if (!valid()) return false;
-      if (info.location.directory !== path || info.parentID)
-        throw new Error('This session does not belong to the selected repository.');
-    } catch (cause) {
-      if (valid()) error = describe(cause);
-      return false;
-    }
+    let info = sessions.find(
+      (session) => session.id === id && session.location.directory === path && !session.parentID,
+    );
+    if (!info)
+      try {
+        info = await client.session.get({ sessionID: id });
+        if (!valid()) return false;
+        if (info.location.directory !== path || info.parentID)
+          throw new Error('This session does not belong to the selected repository.');
+      } catch (cause) {
+        if (valid()) error = describe(cause);
+        return false;
+      }
     const nativeThread: AgentThread = {
       agent: 'opencode',
       sessionId: info.id,
@@ -7229,6 +7332,7 @@
       focusPaneForTyping(targetPane.id);
       return true;
     }
+    cacheCurrentTimeline();
     sessionID = id;
     clearMainPaneEmpty();
     detailsOpen = true;
@@ -7236,7 +7340,7 @@
     syncSessionChoice(info);
     newSessionMode = null;
     clearDraftAttachments();
-    resetTimeline();
+    restoreCachedTimeline(path, id);
     followChat = viewStates.get(viewKey())?.follow ?? true;
     running = activeSessionIDs.includes(id);
     activity = 'Thinking';
@@ -7244,17 +7348,18 @@
     pendingPermissions = [];
     pendingForms = [];
     snapshot = { plan: null, questions: null };
-    diffs = [];
-    selectedFilePath = null;
     diffError = '';
     ++diffRefresh;
     diffLoading = false;
     historyEvents = [];
     historyError = '';
-    ++historyRefresh;
     historyLoading = false;
     sideTab = viewStates.get(viewKey())?.sideTab ?? 'plan';
-    selectedFilePath = viewStates.get(viewKey())?.selectedFilePath ?? null;
+    selectedFilePath = selectedDiffFile(
+      diffs,
+      viewStates.get(viewKey())?.selectedFilePath ?? null,
+      path,
+    );
     if (!automatic) mobileView = 'chat';
     error = '';
     setSetting(`sai-session:${directory}`, id);
@@ -7293,6 +7398,7 @@
     savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null, kind: undefined }));
     clearMainPaneEmpty();
     saveViewState();
+    cacheCurrentTimeline();
     ++selection;
     sessionID = null;
     selectedSession = null;
@@ -7310,7 +7416,6 @@
     diffLoading = false;
     historyEvents = [];
     historyError = '';
-    ++historyRefresh;
     historyLoading = false;
     pendingPermissions = [];
     pendingForms = [];
@@ -7576,6 +7681,7 @@
           nextLayout = updatePane(nextLayout, pane.id, { thread: null });
       if (nextLayout !== paneLayout) savePaneLayout(nextLayout);
       if (session.id === sessionID) clearSelectedSession();
+      forgetOpenCodeTimeline(directory, session.id);
       await refreshSessions();
     } catch (cause) {
       error = describe(cause);
@@ -7619,6 +7725,23 @@
     messageGeneration.clear();
   }
 
+  function cacheCurrentTimeline() {
+    if (!directory || !sessionID || timelineSession !== sessionID) return;
+    rememberOpenCodeTimeline(directory, sessionID, {
+      messages,
+      cursor: olderMessageCursor,
+    });
+  }
+
+  function restoreCachedTimeline(path: string, id: string) {
+    resetTimeline();
+    const cached = recallOpenCodeTimeline(path, id);
+    if (!cached) return;
+    timelineSession = id;
+    messages = cached.messages;
+    olderMessageCursor = cached.cursor;
+  }
+
   function scrollToLatest() {
     if (!followChat) return;
     cancelAnimationFrame(followFrame);
@@ -7660,6 +7783,7 @@
       timelineSession = id;
       messages = acceptProjectedMessages(first.data, observed).toReversed();
       olderMessageCursor = first.cursor.next ?? null;
+      cacheCurrentTimeline();
       await tick();
       scrollToLatest();
       return;
@@ -7680,6 +7804,7 @@
     const incoming = await collectGap(first.cursor.next ?? null, [...first.data]);
     if (!valid()) return;
     messages = mergeMessages(messages, acceptProjectedMessages(incoming, observed));
+    cacheCurrentTimeline();
   }
 
   async function loadOlderMessages() {
@@ -7705,6 +7830,7 @@
       if (current !== selection || id !== sessionID) return;
       messages = mergeMessages(messages, acceptProjectedMessages(page.data, observed));
       olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
+      cacheCurrentTimeline();
       if (!underfilled) followChat = false;
       await tick();
       if (chatScroll)
@@ -7744,6 +7870,7 @@
       )
         return;
       messages = mergeMessages(messages, [message]);
+      cacheCurrentTimeline();
       if (settled) {
         const remaining = { ...liveText };
         delete remaining[messageID];
@@ -7787,6 +7914,7 @@
       diffRevisionPath = path;
       diffRevision = revision;
       diffs = next;
+      mainDiffEvidenceUpdated = Date.now();
       diffError = '';
       selectedFilePath = selectedDiffFile(next, selectedFilePath, path);
     } catch (cause) {
@@ -7798,35 +7926,15 @@
   }
 
   async function refreshHistory(id = sessionID, current = selection) {
-    if (!client || !id || !directory) return;
+    if (!client || !id || !directory || current !== selection) return;
     if (setup?.rpc.state !== 'ready') {
       historyEvents = [];
       historyError = 'Install the plan-review plugin to record plan history.';
       return;
     }
-    const source = client;
-    const path = directory;
-    const generation = ++historyRefresh;
-    historyLoading = true;
-    try {
-      const next = await getHistory(source, path, id);
-      if (
-        generation !== historyRefresh ||
-        current !== selection ||
-        id !== sessionID ||
-        path !== directory
-      )
-        return;
-      historyEvents = next;
-      historyError = '';
-    } catch (cause) {
-      if (generation === historyRefresh && current === selection && id === sessionID) {
-        historyError = describe(cause);
-        historyEvents = [];
-      }
-    } finally {
-      if (generation === historyRefresh) historyLoading = false;
-    }
+    historyLoading = false;
+    historyEvents = [];
+    historyError = 'Plan-review 0.2.0 does not expose history.';
   }
 
   function selectDiffPath(path: string) {
@@ -7851,13 +7959,13 @@
     if (!client || !id || !directory) return;
     const source = client;
     const path = directory;
+    void refreshDiff(id, current, true);
     const [history, plan] = await Promise.allSettled([
       refreshTimeline(id, current),
       setup?.rpc.state === 'ready'
         ? getPlan(source, path, id)
         : Promise.resolve({ plan: null, questions: null } as PlanSnapshot),
       refreshPrompts(id, current),
-      refreshDiff(id, current),
       refreshHistory(id, current),
     ]);
     if (current !== selection || id !== sessionID) return;
@@ -7935,6 +8043,7 @@
   }
 
   async function watchEvents(source: OpenCodeClient, signal: AbortSignal) {
+    let failed = false;
     try {
       for await (const event of source.event.subscribe({ signal })) {
         if (signal.aborted) return;
@@ -8168,10 +8277,17 @@
           void reconcileNativeActivity();
         }
       }
-    } catch {
+    } catch (cause) {
+      failed = true;
       // A new subscription reloads missed state after the live stream fails.
+      if (!signal.aborted)
+        recordDiagnostic('opencode_event_stream_failed', {
+          errorName: cause instanceof Error ? cause.name : typeof cause,
+          message: describe(cause).slice(0, 500),
+        });
     }
     if (!signal.aborted) {
+      if (!failed) recordDiagnostic('opencode_event_stream_ended');
       ++nativeActivityGeneration;
       nativeActivityReady = false;
       runtimeState = 'starting';
@@ -8318,7 +8434,12 @@
         return response;
       });
       sending = false;
-      await promptRequest;
+      const response = await promptRequest;
+      const captureIds = files.flatMap((file) => {
+        const captureId = pickedCaptureIds.get(file);
+        return captureId ? [captureId] : [];
+      });
+      if (captureIds.length) assignReviewCaptures(captureIds, `opencode:${targetId}`, response.id);
       accepted = true;
       const staged = files.filter((file) => clipboardAttachmentPaths.delete(file));
       staged.forEach((file) => clipboardAttachmentNames.delete(file));
@@ -8329,6 +8450,7 @@
           .finally(() => staged.forEach((file) => void removeClipboardFile(file)));
       for (const file of files) {
         if (!pickedImageText.delete(file)) continue;
+        pickedCaptureIds.delete(file);
         void invoke('browser_remove_capture', { path: file });
       }
       if (current === selection && path === directory) await refreshSession(id);
@@ -8345,6 +8467,7 @@
           if (clipboardAttachmentPaths.delete(file)) void removeClipboardFile(file);
           clipboardAttachmentNames.delete(file);
           if (!pickedImageText.delete(file)) continue;
+          pickedCaptureIds.delete(file);
           void invoke('browser_remove_capture', { path: file });
         }
       }
@@ -8957,6 +9080,7 @@
                 externalPrompt={pendingAgentBatches.main}
                 onexternalresult={completeAgentBatch}
                 onpickedconsumed={markPickConsumed}
+                onattachmentsent={assignReviewCaptures}
                 onpromptfocused={() => (promptFocusPane = null)}
                 onentrieschange={(entries, sessionId, ready) =>
                   (agentEntrySnapshots = {
@@ -9346,6 +9470,16 @@
                     oncomments={updateDiffComments}
                     oncommentssent={removeSentDiffComments}
                     onsendcomments={(scope, text) => sendDiffComments('main', scope, text)}
+                    evidence={reviewEvidence(
+                      'main',
+                      acpAgent
+                        ? acpThread
+                          ? `acp:${acpAgent}:${acpThread.sessionId}`
+                          : null
+                        : sessionID
+                          ? `opencode:${sessionID}`
+                          : null,
+                    )}
                   />
                 </div>{/if}
               {#if !acpAgent && sessionID}<div
@@ -9431,6 +9565,7 @@
       {pendingAgentBatches}
       onbatchcomplete={completeAgentBatch}
       onpickedconsumed={markPickConsumed}
+      onattachmentsent={assignReviewCaptures}
       onshortcut={keydownWorkspace}
       onactivity={recordPaneActivity}
       onusage={(id, context) => {
@@ -9458,6 +9593,11 @@
       }}
       onterminalownerlost={(id) => savePaneLayout(updatePane(paneLayout, id, { owner: undefined }))}
       onagentterminal={(id) => void openAgentTerminal(id)}
+      reviewCaptures={reviewCaptures.filter((capture) => capture.directory === directory)}
+      reviewPreviews={reviewPreviews()}
+      onreviewcheck={openReviewCheck}
+      onreviewpreview={openReviewPreview}
+      onreviewcapturephase={setReviewCapturePhase}
     />
     {#if mainShipFallback && detailsOpen && activeSideTab === 'ship' && (!mobileLayout || mobileView === 'details')}<section
         class="ship-fallback"
