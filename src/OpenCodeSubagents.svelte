@@ -12,6 +12,7 @@
   let summaries = $state<Record<string, SessionMessageInfo>>({});
   let histories = $state<Record<string, SessionMessageInfo[]>>({});
   let historyCursors = $state<Record<string, string | null>>({});
+  let historyErrors = $state<Record<string, string>>({});
   let childCursor = $state<string | null>(null);
   let loadingOlderChildren = $state(false);
   let loadingOlderHistory = $state<string[]>([]);
@@ -55,9 +56,11 @@
       histories = { ...histories, [id]: mergeMessages(histories[id] ?? [], page.data) };
       if (cursor || !(id in historyCursors))
         historyCursors = { ...historyCursors, [id]: page.cursor.next ?? null };
-      loadError = '';
+      const nextErrors = { ...historyErrors };
+      delete nextErrors[id];
+      historyErrors = nextErrors;
     } catch (cause) {
-      if (current === generation) loadError = String(cause);
+      if (current === generation) historyErrors = { ...historyErrors, [id]: String(cause) };
     } finally {
       if (current === generation)
         loadingOlderHistory = loadingOlderHistory.filter((item) => item !== id);
@@ -120,6 +123,7 @@
     summaries = {};
     histories = {};
     historyCursors = {};
+    historyErrors = {};
     childCursor = null;
     loadingOlderChildren = false;
     loadingOlderHistory = [];
@@ -170,6 +174,10 @@
         <p class="subagent-activity">{activity(child.id)}</p>
         {#if expanded.includes(child.id)}
           <div class="subagent-history">
+            {#if historyErrors[child.id]}<p class="subagent-error" role="alert">
+                {historyErrors[child.id]}
+                <button onclick={() => void loadHistory(child.id)}>Retry</button>
+              </p>{/if}
             {#if historyCursors[child.id]}<button
                 class="load-older"
                 disabled={loadingOlderHistory.includes(child.id)}
