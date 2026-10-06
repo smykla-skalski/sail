@@ -61,18 +61,18 @@ function cardStatus(
   threads: AgentThread[],
   statuses: Record<string, ThreadStatus | null>,
 ): { thread: AgentThread; status: ThreadStatus } | null {
-  return (
-    threads
-      .flatMap((thread) => {
-        const status = statuses[threadKey(thread)];
-        return status ? [{ thread, status }] : [];
-      })
-      .toSorted(
-        (left, right) =>
-          statusPriority[left.status] - statusPriority[right.status] ||
-          right.thread.updated - left.thread.updated,
-      )[0] ?? null
-  );
+  let selected: { thread: AgentThread; status: ThreadStatus } | null = null;
+  for (const thread of threads) {
+    const status = statuses[threadKey(thread)];
+    if (!status) continue;
+    if (
+      !selected ||
+      statusPriority[status] < statusPriority[selected.status] ||
+      (status === selected.status && thread.updated > selected.thread.updated)
+    )
+      selected = { thread, status };
+  }
+  return selected;
 }
 
 function currentChecks(checks: PostTurnCheck[]): PostTurnCheck[] {
@@ -98,6 +98,22 @@ export function buildTaskOverviewCards(input: {
   checks: PostTurnCheck[];
   receipts: SpawnReceipt[];
 }): TaskOverviewCard[] {
+  const checksByDirectory = new Map<string, PostTurnCheck[]>();
+  for (const check of input.checks) {
+    const directoryChecks = checksByDirectory.get(check.directory);
+    if (directoryChecks) directoryChecks.push(check);
+    else checksByDirectory.set(check.directory, [check]);
+  }
+  const receiptsByDirectory = new Map<string, SpawnReceipt[]>();
+  for (const receipt of input.receipts) {
+    const directories = new Set([receipt.sourceDirectory, receipt.targetDirectory]);
+    for (const directory of directories) {
+      if (!directory) continue;
+      const directoryReceipts = receiptsByDirectory.get(directory);
+      if (directoryReceipts) directoryReceipts.push(receipt);
+      else receiptsByDirectory.set(directory, [receipt]);
+    }
+  }
   const locations = input.catalog.repositories.flatMap((repository) => [
     {
       path: repository,
@@ -121,19 +137,12 @@ export function buildTaskOverviewCards(input: {
     const threads = input.threads[location.path] ?? [];
     const recentThread = latest(threads);
     const active = cardStatus(threads, input.statuses);
-    const locationChecks = currentChecks(
-      input.checks.filter((check) => check.directory === location.path),
-    );
+    const locationChecks = currentChecks(checksByDirectory.get(location.path) ?? []);
     const recentCheck = latest(locationChecks);
     const failedCheck = locationChecks.find(
       (check) => check.status === 'failed' || check.status === 'timed_out',
     );
-    const recentReceipt = latest(
-      input.receipts.filter(
-        (receipt) =>
-          receipt.sourceDirectory === location.path || receipt.targetDirectory === location.path,
-      ),
-    );
+    const recentReceipt = latest(receiptsByDirectory.get(location.path) ?? []);
     const events = [
       ...(recentThread
         ? [{ updated: recentThread.updated, text: `Thread updated: ${recentThread.title}` }]

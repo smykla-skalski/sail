@@ -50,6 +50,13 @@ async function start() {
     const { default: WorkerDependencyFixture } =
       await import('../test/e2e/worker-dependency-fixture.svelte');
     mount(WorkerDependencyFixture, { target: document.getElementById('root')! });
+  } else if (
+    import.meta.env.MODE === 'e2e' &&
+    new URLSearchParams(location.search).has('task-overview-scale-fixture')
+  ) {
+    const { default: TaskOverviewScaleFixture } =
+      await import('../test/e2e/task-overview-scale-fixture.svelte');
+    mount(TaskOverviewScaleFixture, { target: document.getElementById('root')! });
   } else if (new URLSearchParams(location.search).get('window') === 'settings') {
     const { default: SettingsWindow } = await import('./SettingsWindow.svelte');
     mount(SettingsWindow, { target: document.getElementById('root')! });

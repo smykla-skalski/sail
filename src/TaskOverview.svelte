@@ -68,6 +68,9 @@
   let refreshing = false;
   let refreshQueued = false;
   let searchInput: HTMLInputElement;
+  let overviewRoot: HTMLElement;
+  let scrollRevision = 0;
+  let restoreGeneration = 0;
   let baseCards = $derived(
     buildTaskOverviewCards({ catalog, threads, statuses, agentNames, checks, receipts }),
   );
@@ -84,6 +87,7 @@
     sortTaskOverviewCards(filterTaskOverviewCards(sortableCards, query), sort, pinned),
   );
   let locationsKey = $derived(JSON.stringify(baseCards.map((card) => card.path)));
+  let viewportSources = $derived([baseCards, metadata, pullRequests, pullRequestErrors]);
 
   $effect(() => {
     setSetting(preferenceKey, JSON.stringify({ sort, pinned, selected }));
@@ -92,6 +96,11 @@
   $effect(() => {
     const key = locationsKey;
     untrack(() => void refresh(key));
+  });
+
+  $effect.pre(() => {
+    const sources = viewportSources;
+    untrack(() => preserveViewport(sources));
   });
 
   onMount(() => {
@@ -161,6 +170,59 @@
         void refresh();
       }
     }
+  }
+
+  function preserveViewport(sources: unknown[]) {
+    if (!sources.length || !overviewRoot) return;
+    const scrollTop = overviewRoot.scrollTop;
+    const revision = scrollRevision;
+    const active = document.activeElement as HTMLElement | null;
+    const focusedCard = active?.closest<HTMLElement>('[data-task-card-id]');
+    const focusedId = focusedCard?.dataset.taskCardId;
+    const focusedControl = active?.dataset.overviewControl;
+    const current = ++restoreGeneration;
+    void tick().then(() => {
+      if (current !== restoreGeneration || !overviewRoot) return undefined;
+      if (revision === scrollRevision) overviewRoot.scrollTop = scrollTop;
+      if (!focusedId || overviewRoot.contains(document.activeElement)) return undefined;
+      const card = [...overviewRoot.querySelectorAll<HTMLElement>('[data-task-card-id]')].find(
+        (item) => item.dataset.taskCardId === focusedId,
+      );
+      card
+        ?.querySelector<HTMLElement>(`[data-overview-control="${focusedControl ?? 'main'}"]`)
+        ?.focus({ preventScroll: true });
+      return undefined;
+    });
+  }
+
+  function navigateCards(event: KeyboardEvent) {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key))
+      return;
+    const target = event.target as HTMLElement;
+    const currentCard = target.closest<HTMLElement>('[data-task-card-id]');
+    if (!currentCard) return;
+    const buttons = [
+      ...overviewRoot.querySelectorAll<HTMLButtonElement>('[data-overview-control="main"]'),
+    ];
+    const index = buttons.findIndex(
+      (button) => button.closest('[data-task-card-id]') === currentCard,
+    );
+    if (index < 0) return;
+    const next =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? buttons.length - 1
+          : Math.max(
+              0,
+              Math.min(
+                buttons.length - 1,
+                index + (event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1),
+              ),
+            );
+    if (next === index) return;
+    event.preventDefault();
+    buttons[next]?.focus();
   }
 
   function togglePin(path: string) {
@@ -257,7 +319,14 @@
   }
 </script>
 
-<main class="task-overview" aria-label="Task overview">
+<svelte:window onkeydown={navigateCards} />
+
+<main
+  bind:this={overviewRoot}
+  class="task-overview"
+  aria-label="Task overview"
+  onscroll={() => (scrollRevision += 1)}
+>
   <header class="task-overview-header">
     <div>
       <p class="eyebrow">ALL WORKTREES</p>
@@ -291,18 +360,23 @@
     {#each cards as card (card.id)}
       {@const unavailable = availabilityMessage(card)}
       {@const repositoryUnavailable = repositoryError(card)}
-      <article class:selected={selected === card.id || directory === card.path} class="task-card">
+      <article
+        class:selected={selected === card.id || directory === card.path}
+        class="task-card"
+        data-task-card-id={card.id}
+      >
         <div class="task-card-topline">
           <span class="task-card-repository" title={card.repository}>{card.repositoryName}</span>
           <button
             class:active={pinned.includes(card.id)}
             class="task-card-pin"
+            data-overview-control="pin"
             aria-label={`${pinned.includes(card.id) ? 'Unpin' : 'Pin'} ${card.task}`}
             aria-pressed={pinned.includes(card.id)}
             onclick={() => togglePin(card.id)}>★</button
           >
         </div>
-        <button class="task-card-main" onclick={() => void open(card)}>
+        <button class="task-card-main" data-overview-control="main" onclick={() => void open(card)}>
           <strong>{card.task}</strong>
           <span class="task-card-branch" title={card.path}>⑂ {cardBranch(card)}</span>
           <span class="task-card-agent">
@@ -325,8 +399,10 @@
         {#if unavailable}<p class="task-card-unavailable" role="status">
             Unavailable · {unavailable}
           </p>{/if}
-        <button class="task-card-action" onclick={() => void openAction(card)}
-          >{actionLabel(card)}</button
+        <button
+          class="task-card-action"
+          data-overview-control="action"
+          onclick={() => void openAction(card)}>{actionLabel(card)}</button
         >
       </article>
     {:else}
@@ -420,6 +496,8 @@
     background: var(--surface-raised, var(--surface));
     box-shadow: 0 5px 18px color-mix(in srgb, var(--text) 6%, transparent);
     overflow: hidden;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 230px;
   }
   .task-card.selected {
     border-color: color-mix(in srgb, var(--primary) 60%, var(--border));

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { AgentThread } from '../src/lib/acp.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
+import type { ThreadStatus } from '../src/lib/attention.ts';
 import type { PostTurnCheck } from '../src/lib/post-turn-checks.ts';
 import type { ProjectCatalog } from '../src/lib/projects.ts';
 import {
@@ -302,6 +303,49 @@ void test('sorting supports attention, recent activity, repository, and pinned f
     ['Default branch', 'feat/urgent', 'fix/quiet'],
   );
   assert.equal(sortTaskOverviewCards(cards, 'pinned', ['/code/alpha'])[0].path, '/code/alpha');
+});
+
+void test('100 cards and 500 threads stay within the interaction budget', () => {
+  const largeCatalog: ProjectCatalog = { repositories: [], groups: [], worktrees: {} };
+  const largeThreads: Record<string, AgentThread[]> = {};
+  const largeStatuses: Record<string, ThreadStatus | null> = {};
+  const paths: string[] = [];
+  for (let repositoryIndex = 0; repositoryIndex < 10; repositoryIndex += 1) {
+    const repository = `/scale/repo-${repositoryIndex}`;
+    largeCatalog.repositories.push(repository);
+    paths.push(repository);
+    largeCatalog.worktrees[repository] = Array.from({ length: 9 }, (_, worktreeIndex) => {
+      const path = `${repository}/worktree-${worktreeIndex}`;
+      paths.push(path);
+      return { path, branch: `feature/${repositoryIndex}-${worktreeIndex}` };
+    });
+  }
+  for (const [index, path] of paths.entries()) {
+    largeThreads[path] = Array.from({ length: 5 }, (_, threadIndex) => {
+      const value = thread(path, `Task ${index}-${threadIndex}`, 'codex', index * 10 + threadIndex);
+      largeStatuses[`["codex","${path}","${value.sessionId}"]`] = 'working';
+      return value;
+    });
+  }
+
+  const start = performance.now();
+  const cards = buildTaskOverviewCards({
+    catalog: largeCatalog,
+    threads: largeThreads,
+    statuses: largeStatuses,
+    agentNames: { codex: 'Codex' },
+    checks: [],
+    receipts: [],
+  });
+  const searched = filterTaskOverviewCards(cards, 'Task 99');
+  const sorted = sortTaskOverviewCards(cards, 'repository', []);
+  const duration = performance.now() - start;
+
+  assert.equal(cards.length, 100);
+  assert.equal(Object.values(largeThreads).flat().length, 500);
+  assert.equal(searched.length, 1);
+  assert.equal(sorted[0].path, '/scale/repo-0');
+  assert.ok(duration < 100, `overview interactions took ${duration.toFixed(1)}ms`);
 });
 
 void test('preferences restore valid values and reject malformed state', () => {
