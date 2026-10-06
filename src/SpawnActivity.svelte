@@ -34,7 +34,8 @@
 
   function signalDate(receipt: SpawnReceipt): Date {
     const updated = Number.isFinite(receipt.updated) ? receipt.updated : 0;
-    return new Date(updated);
+    const date = new Date(updated);
+    return Number.isNaN(date.getTime()) ? new Date(0) : date;
   }
 
   function toggle(id: string) {
@@ -84,6 +85,7 @@
         <div class="spawn-heading">
           <button
             class="spawn-toggle"
+            aria-label={`${expanded.includes(receipt.receiptId) ? 'Collapse' : 'Expand'} ${label(receipt)} subagent task: ${receipt.prompt ?? 'Task details unavailable'}`}
             aria-expanded={expanded.includes(receipt.receiptId)}
             aria-controls={`spawn-details-${receipt.receiptId}`}
             onpointerdown={keepComposerSelection}
@@ -98,6 +100,7 @@
           <ActivityStatus status={receipt.state} compact />
           {#if receipt.targetId && receipt.targetDirectory && onopen}<button
               class="spawn-open"
+              aria-label={`Open ${label(receipt)} subagent thread for ${receipt.prompt ?? 'task details unavailable'}`}
               disabled={opening.includes(receipt.receiptId)}
               onpointerdown={keepComposerSelection}
               onclick={() => void open(receipt)}

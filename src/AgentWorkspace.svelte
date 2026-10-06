@@ -91,6 +91,11 @@
   import { splitKlaudiushMessage, type KlaudiushRule } from './lib/klaudiush';
   import { getSetting, removeSetting, setSetting } from './lib/settings';
   import { recordDiagnostic, type DiagnosticEvent } from './lib/diagnostics';
+  import {
+    composerDraftKey,
+    recallComposerDraft,
+    rememberComposerDraft,
+  } from './lib/composer-drafts';
 
   interface Props {
     agent: AgentId;
@@ -592,6 +597,9 @@
   async function activate(id: string | null) {
     rememberTranscript();
     const previousSessionId = activeSessionId;
+    rememberDraft(previousSessionId);
+    const savedDraft = recallComposerDraft(composerDraftKey(directory, agent, id));
+    draft = savedDraft?.text ?? '';
     if (id && id !== previousSessionId) recoveryEligible = false;
     const previousQueue = queued;
     const wasPaused = queuePaused;
@@ -693,10 +701,24 @@
       if (current === generation) connecting = false;
     }
     if (current === generation) {
+      await tick();
+      if (savedDraft && prompt)
+        prompt.setSelectionRange(savedDraft.selectionStart, savedDraft.selectionEnd);
       await follow();
       if (scroll.scrollHeight <= scroll.clientHeight && entries.length > visibleCount)
         void showEarlier();
     }
+  }
+
+  function rememberDraft(
+    sessionId = activeSessionId,
+    input: HTMLTextAreaElement | undefined = prompt,
+  ) {
+    rememberComposerDraft(composerDraftKey(directory, agent, sessionId), {
+      text: input?.value ?? draft,
+      selectionStart: input?.selectionStart ?? draft.length,
+      selectionEnd: input?.selectionEnd ?? draft.length,
+    });
   }
 
   $effect(() => {
@@ -861,6 +883,7 @@
         if (!disposed) error = `Could not subscribe to agent events: ${describe(cause)}`;
       });
     return () => {
+      rememberDraft();
       disposed = true;
       window.removeEventListener('sai-agent-failed-draft', restoreFailedDraft);
       if (recoveredDraft && !busy) {
@@ -1711,6 +1734,8 @@
           ? `${skillMenuId}-option-${Math.min(skillSelected, skillMatches.length - 1)}`
           : undefined}
         bind:value={draft}
+        oninput={(event) => rememberDraft(activeSessionId, event.currentTarget)}
+        onselect={(event) => rememberDraft(activeSessionId, event.currentTarget)}
         onpaste={(event) => {
           pendingPaste = Promise.all([pendingPaste, pasteFiles(event)]).then(() => {});
         }}

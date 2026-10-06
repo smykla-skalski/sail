@@ -890,6 +890,8 @@
       anchorOffset: number;
       sideTab: SideTab;
       selectedFilePath: string | null;
+      selectionStart: number;
+      selectionEnd: number;
       sideScroll: Partial<Record<SideTab, number[]>>;
     }
   >();
@@ -1100,6 +1102,8 @@
           : (previous?.anchorOffset ?? 0),
       sideTab,
       selectedFilePath,
+      selectionStart: mainPrompt?.selectionStart ?? draft.length,
+      selectionEnd: mainPrompt?.selectionEnd ?? draft.length,
       sideScroll: detailsVisible
         ? {
             ...previous?.sideScroll,
@@ -1119,6 +1123,7 @@
       if (current !== selection || id !== sessionID) return;
     }
     await tick();
+    if (saved && mainPrompt) mainPrompt.setSelectionRange(saved.selectionStart, saved.selectionEnd);
     if (saved && chatScroll) {
       cancelAnimationFrame(followFrame);
       followChat = saved.follow;

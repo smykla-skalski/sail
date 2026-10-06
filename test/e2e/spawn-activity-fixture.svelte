@@ -32,6 +32,7 @@
       provider: 'claude',
       prompt: 'Waiting for a thread',
       state: 'starting',
+      updated: 1e20,
       result: null,
       activity: undefined,
     },
