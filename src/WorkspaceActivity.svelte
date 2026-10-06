@@ -6,6 +6,7 @@
     type WorkspaceActivityItem,
     type WorkspaceActivitySection,
   } from './lib/workspace-activity';
+  import { getSetting, setSetting } from './lib/settings';
 
   let {
     items,
@@ -21,6 +22,7 @@
   let mounted = $state(false);
   let compact = $state(false);
   let trigger = $state<HTMLButtonElement>();
+  let selectionError = $state('');
   let loadedKey = '';
   const panelId = `workspace-activity-${crypto.randomUUID()}`;
   const sections: { id: WorkspaceActivitySection; label: string }[] = [
@@ -31,7 +33,10 @@
   const attentionCount = $derived(items.filter((item) => item.section === 'needs-input').length);
 
   function loadPreference() {
-    const saved = localStorage.getItem(storageKey);
+    selectionError = '';
+    const saved = storageKey.startsWith('sai-')
+      ? getSetting(storageKey)
+      : localStorage.getItem(storageKey);
     explicitPreference = saved === 'open' || saved === 'closed';
     open = saved === 'open' || (!explicitPreference && !compact && items.length > 0);
     loadedKey = storageKey;
@@ -55,15 +60,22 @@
   });
 
   function setOpen(next: boolean, restoreFocus = false) {
+    if (next) selectionError = '';
     open = next;
     explicitPreference = true;
-    localStorage.setItem(storageKey, next ? 'open' : 'closed');
+    if (storageKey.startsWith('sai-')) setSetting(storageKey, next ? 'open' : 'closed');
+    else localStorage.setItem(storageKey, next ? 'open' : 'closed');
     if (restoreFocus) void tick().then(() => trigger?.focus());
   }
 
   async function select(item: WorkspaceActivityItem) {
-    await onselect(item);
-    if (compact) setOpen(false, true);
+    selectionError = '';
+    try {
+      await onselect(item);
+      if (compact) setOpen(false, true);
+    } catch (cause) {
+      selectionError = `Could not open activity: ${cause instanceof Error ? cause.message : String(cause)}`;
+    }
   }
 </script>
 
@@ -107,6 +119,7 @@
           onclick={() => setOpen(false, true)}>×</button
         >
       </header>
+      {#if selectionError}<p class="activity-error" role="alert">{selectionError}</p>{/if}
       <div class="activity-sections">
         {#each sections as section (section.id)}
           {@const sectionItems = activitySectionItems(items, section.id)}
@@ -285,6 +298,10 @@
   }
   p {
     margin: 8px 4px;
+  }
+  .activity-error {
+    margin: 8px 12px 0;
+    color: var(--sui-destructive, #c33);
   }
   @media (max-width: 850px) {
     .workspace-activity {

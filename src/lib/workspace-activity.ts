@@ -54,7 +54,7 @@ export function workspaceActivityItems(input: {
   checks?: PostTurnCheck[];
   recentLimit?: number;
 }): WorkspaceActivityItem[] {
-  const tools = (input.tools ?? []).map((tool): WorkspaceActivityItem => {
+  const tools = (input.tools ?? []).map((tool, index): WorkspaceActivityItem => {
     const status = normalizedStatus(tool.status);
     return {
       id: `tool:${tool.id}`,
@@ -69,7 +69,7 @@ export function workspaceActivityItems(input: {
             ? 'Tool is queued'
             : `Tool ${status}`,
       status,
-      updated: Number.isFinite(tool.updated) ? (tool.updated ?? 0) : 0,
+      updated: Number.isFinite(tool.updated) ? (tool.updated ?? 0) : index + 1,
     };
   });
   const children = (input.children ?? []).map((receipt): WorkspaceActivityItem => {

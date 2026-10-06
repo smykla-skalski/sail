@@ -90,3 +90,19 @@ await test('workspace activity preserves an unavailable child as an explicit sou
   assert.equal(item.detail, 'Thread target not confirmed');
   assert.equal(item.updated, 1e20);
 });
+
+await test('workspace activity preserves input order when tool timestamps are absent', () => {
+  const items = workspaceActivityItems({
+    tools: Array.from({ length: 15 }, (_, index) => ({
+      id: `tool-${index}`,
+      title: `Tool ${index}`,
+      status: 'completed',
+    })),
+    recentLimit: 4,
+  });
+
+  assert.deepEqual(
+    items.map((item) => item.sourceId),
+    ['tool-14', 'tool-13', 'tool-12', 'tool-11'],
+  );
+});

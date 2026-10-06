@@ -9477,7 +9477,7 @@
               </div>
               <WorkspaceActivity
                 items={mainWorkspaceActivity}
-                storageKey={`workspace-activity:${directory}:opencode:${sessionID ?? 'new'}`}
+                storageKey={`sai-workspace-activity:${directory}:main`}
                 onselect={selectMainWorkspaceActivity}
               />
             </div>

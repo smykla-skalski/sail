@@ -414,6 +414,13 @@
         return;
       }
     }
+    if (item.kind === 'tool') {
+      const index = entries.findIndex(
+        (entry) => entry.type === 'tool' && entry.id === item.sourceId,
+      );
+      if (index >= 0 && index < entries.length - visibleCount)
+        visibleCount = entries.length - index;
+    }
     await tick();
     const attribute =
       item.kind === 'tool'
@@ -1744,7 +1751,7 @@
     </div>
     <WorkspaceActivity
       items={workspaceActivity}
-      storageKey={`workspace-activity:${directory}:${agent}:${thread?.sessionId ?? 'new'}`}
+      storageKey={`sai-workspace-activity:${directory}:${agent}`}
       onselect={selectWorkspaceActivity}
     />
   </div>

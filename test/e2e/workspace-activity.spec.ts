@@ -75,6 +75,23 @@ describe('workspace activity panel', () => {
     );
     await selectAndExpect('Open Needs input check 2: npm test', 'check:check');
 
+    await browser.execute(() => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Fail activity selection"]')!.click();
+      document
+        .querySelector<HTMLButtonElement>(
+          '#active-panel button[aria-label="Open Recent tool 1: Read configuration"]',
+        )!
+        .click();
+    });
+    await browser.waitUntil(async () =>
+      browser.execute(
+        () =>
+          document.querySelector('#active-panel [role="alert"]')?.textContent ===
+            'Could not open activity: Target unavailable' &&
+          !!document.querySelector('#active-panel aside'),
+      ),
+    );
+
     await browser.execute(() =>
       document.querySelector<HTMLButtonElement>('[aria-label="Clear activity"]')!.click(),
     );

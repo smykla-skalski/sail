@@ -46,6 +46,7 @@
   });
   let activeItems = $state(items);
   let opened = $state('');
+  let failSelection = $state(false);
 </script>
 
 <main>
@@ -58,6 +59,10 @@
         items={activeItems}
         storageKey="e2e-workspace-activity-active"
         onselect={(item) => {
+          if (failSelection) {
+            failSelection = false;
+            throw new Error('Target unavailable');
+          }
           opened = `${item.kind}:${item.sourceId}`;
         }}
       />
@@ -72,6 +77,11 @@
     class="fixture-control"
     aria-label="Restore activity"
     onclick={() => (activeItems = items)}>Restore</button
+  >
+  <button
+    class="fixture-control"
+    aria-label="Fail activity selection"
+    onclick={() => (failSelection = true)}>Fail selection</button
   >
   <div id="empty-panel">
     <WorkspaceActivity items={[]} storageKey="e2e-workspace-activity-empty" onselect={() => {}} />
