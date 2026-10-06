@@ -2401,9 +2401,12 @@
         reference: dependency,
       });
       run.externalClosed[dependency] = closed;
+      delete run.dependencyErrors?.[dependency];
     } catch (cause) {
       error = describe(cause);
       run.externalClosed[dependency] = false;
+      run.dependencyErrors ??= {};
+      run.dependencyErrors[dependency] = describe(cause);
     }
   }
 
@@ -2707,6 +2710,7 @@
 
   async function refreshShippingRun(run: ShipRun, refreshCompleted = false): Promise<void> {
     run.externalClosed ??= {};
+    run.dependencyErrors ??= {};
     const aliases = new Set(
       run.issues.flatMap((issue) => [
         issue.id,

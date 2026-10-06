@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import WorkerDependencyMap from './WorkerDependencyMap.svelte';
   import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './lib/issue-shipping';
   import {
     ciStatus,
@@ -176,6 +177,7 @@
         {:else}<p class="ship-muted">No shipping work is active.</p>{/each}
       </div>
     </section>
+    <WorkerDependencyMap {run} selected={issue?.id} onselect={selectIssue} {onopen} />
     <div class="ship-content">
       {#if issue}
         <section
