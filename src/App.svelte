@@ -70,6 +70,7 @@
   import TaskOverview from './TaskOverview.svelte';
   import type { GitHubIssue, PullRequestCheck } from './ProjectSidebar.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
+  import AgentStatusBar from './AgentStatusBar.svelte';
   import {
     composerTaskLocation,
     resolveTaskLocation,
@@ -284,6 +285,7 @@
     type AgentUsage,
     type RateWindow,
   } from './lib/agent-usage';
+  import { buildAgentStatusItems } from './lib/agent-status';
   import {
     settingsAction,
     settingsRequest,
@@ -655,6 +657,34 @@
       ['opencode', 'OpenCode'],
       ...agentAvailability.map((agent) => [agent.id, agent.name]),
     ]),
+  );
+  let agentStatusThreads = $derived([...agentThreads, ...sidebarOpenCodeThreads]);
+  let agentStatusStatuses = $derived(
+    Object.fromEntries(
+      agentStatusThreads.map((thread) => [
+        threadKey(thread),
+        sidebarThreadStatus(
+          thread,
+          threadAttention,
+          sidebarOpenCodeOutcomes,
+          acpActivityReady,
+          nativeActivityReady,
+          nativeUnavailableDirectories,
+          spawnReceipts,
+        ),
+      ]),
+    ),
+  );
+  let agentStatusItems = $derived(
+    buildAgentStatusItems({
+      threads: agentStatusThreads,
+      statuses: agentStatusStatuses,
+      attention: threadAttention,
+      agentNames: taskOverviewAgentNames,
+      usage: agentUsage,
+      openCodeUsage,
+      rates: agentRates,
+    }),
   );
   let sidebarDirectoryKey = $derived(
     JSON.stringify([
@@ -10068,6 +10098,7 @@
         </section>{/if}
     </div>
   </div>
+  <AgentStatusBar items={agentStatusItems} onopen={(key) => jumpToRecentThread(key)} />
 </div>
 <ConfirmDialog request={confirmation} onanswer={answerConfirmation} />
 <PathPicker
