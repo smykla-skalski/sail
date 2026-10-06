@@ -3,6 +3,7 @@
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import Markdown from './Markdown.svelte';
   import ToolActivity from './ToolActivity.svelte';
+  import { openCodeErrorDetails } from './lib/tool-failure';
 
   let { client, parentID }: { client: OpenCodeClient | null; parentID: string | null } = $props();
   let children = $state<SessionInfo[]>([]);
@@ -103,12 +104,15 @@
                       title={part.name}
                       status={part.state.status}
                       input={part.state.input}
-                      output={part.state.status === 'completed'
+                      output={part.state.status === 'completed' || part.state.status === 'error'
                         ? (part.state.content ?? [])
                             .map((item) =>
                               item.type === 'text' ? item.text : (item.name ?? item.uri),
                             )
                             .join('\n')
+                        : ''}
+                      error={part.state.status === 'error'
+                        ? openCodeErrorDetails(part.state.error)
                         : ''}
                     />
                   {/if}

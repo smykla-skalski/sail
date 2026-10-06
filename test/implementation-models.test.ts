@@ -85,6 +85,7 @@ void test('model history survives equivalent references and rejects a second iss
   });
   const directory = '/test/reused-worktree';
   await beginShipItRun(directory, '/ship-it #1');
+  await beginShipItRun(directory, 'Please /ship-it #1');
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-a']));
   await beginShipItRun(directory, '/ship-it #1');
   assert.deepEqual(implementationModels(directory), ['model-a']);
@@ -102,6 +103,10 @@ void test('model history survives equivalent references and rejects a second iss
   );
   await assert.rejects(
     () => beginShipItRun(directory, '/ship-it #2'),
+    /This worktree tracks example\/repo#1\. Start example\/repo#2 in a new worktree/,
+  );
+  await assert.rejects(
+    () => beginShipItRun(directory, 'Please /ship-it #2'),
     /This worktree tracks example\/repo#1\. Start example\/repo#2 in a new worktree/,
   );
   assert.deepEqual(implementationModels(directory), ['model-a']);

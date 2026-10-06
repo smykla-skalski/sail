@@ -67,8 +67,9 @@ export function matchingSkills(skills: SkillChoice[], draft: string): SkillChoic
 }
 
 export function promptSkill(skills: SkillChoice[], text: string): SkillChoice | undefined {
-  const names = new Set(
-    [...text.matchAll(/(?:^|\s)\/([^\s/]+)(?=\s|$)/g)].map((match) => match[1].toLowerCase()),
-  );
-  return skills.find((skill) => names.has(skill.name.toLowerCase()));
+  for (const match of text.matchAll(/(?:^|\s)\/([^\s/]+)(?=\s|$)/g)) {
+    const skill = skills.find((item) => item.name.toLowerCase() === match[1].toLowerCase());
+    if (skill) return skill;
+  }
+  return undefined;
 }
