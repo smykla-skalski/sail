@@ -9,6 +9,7 @@
   import Markdown from './Markdown.svelte';
   import ChatMessage from './ChatMessage.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
+  import WorkspaceActivity from './WorkspaceActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
@@ -101,6 +102,7 @@
     composerTaskLocation,
     type TaskLocation as TaskLocationValue,
   } from './lib/task-location';
+  import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
 
   interface Props {
     agent: AgentId;
@@ -383,6 +385,52 @@
             ? 'working'
             : 'ready',
   );
+  const workspaceActivity = $derived(
+    workspaceActivityItems({
+      tools: entries
+        .filter((entry): entry is AgentTool => entry.type === 'tool')
+        .map((tool) => ({
+          id: tool.id,
+          title: tool.title,
+          status: tool.status,
+          updated: tool.created,
+        })),
+      children: spawnReceipts,
+      decisions: permissions.map((permission) => ({
+        id: String(permission.id),
+        title: permission.title,
+        detail: 'Agent permission request',
+      })),
+      checks: postTurnChecks,
+    }),
+  );
+  let workspace: HTMLDivElement;
+
+  async function selectWorkspaceActivity(item: WorkspaceActivityItem) {
+    if (item.kind === 'child') {
+      const receipt = spawnReceipts.find((entry) => entry.receiptId === item.sourceId);
+      if (receipt?.targetId && receipt.targetDirectory && onopensubagent) {
+        await onopensubagent(receipt);
+        return;
+      }
+    }
+    await tick();
+    const attribute =
+      item.kind === 'tool'
+        ? 'data-tool-id'
+        : item.kind === 'child'
+          ? 'data-spawn-id'
+          : item.kind === 'decision'
+            ? 'data-request-id'
+            : 'data-check-id';
+    const target = workspace.querySelector<HTMLElement>(
+      `[${attribute}="${CSS.escape(item.sourceId)}"]`,
+    );
+    for (let parent = target?.parentElement; parent; parent = parent.parentElement)
+      if (parent instanceof HTMLDetailsElement) parent.open = true;
+    target?.scrollIntoView({ block: 'center' });
+    (target instanceof HTMLDetailsElement ? target.querySelector('summary') : target)?.focus();
+  }
 
   $effect(() => {
     if (ready && !busy && !running && !historyLoaded && !historyAttempted) void loadHistory();
@@ -1451,7 +1499,7 @@
 </script>
 
 <svelte:window onkeydown={keydownWorkspace} />
-<div class="agent-workspace">
+<div class="agent-workspace" bind:this={workspace}>
   <div class="agent-header">
     <div class="agent-heading">
       <HarnessIcon {agent} /><strong>{name}</strong><span>{thread?.title ?? 'New thread'}</span>
@@ -1479,216 +1527,226 @@
     </div>
     <ActivityStatus status={visibleStatus} />
   </div>
-  <div
-    class="agent-conversation conversation"
-    bind:this={scroll}
-    onscroll={() => {
-      autoFollow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80;
-      if (scroll.scrollTop <= 80 && !historyLoading) void showEarlier();
-    }}
-    aria-label={`${name} conversation`}
-  >
-    {#if entries.length === 0 && !connecting && !historyLoading}
-      <div class="agent-welcome">
-        <h1>Work with {name}</h1>
-        <p>Describe the work. Sail will show messages, tools, and approvals here.</p>
-      </div>
-    {/if}
-    {#if historyLoading}<div class="agent-history-status" role="status">Loading history…</div>{/if}
-    {#snippet hookNotice(rules: KlaudiushRule[])}
-      <div class="agent-hook-notice">
-        <strong>Action blocked by hook</strong>
-        <ul>
-          {#each rules as rule (rule.code)}
-            <li><code>{rule.code}</code> {rule.reason}</li>
-          {/each}
-        </ul>
-      </div>
-    {/snippet}
-    {#snippet toolRow(tool: AgentTool, revealed: boolean)}
-      <ToolActivity
-        title={tool.title}
-        status={tool.status}
-        input={tool.input}
-        output={tool.content || toolInput(tool.output)}
-        expanded={revealed}
-      >
-        {#each tool.terminalIds as terminalId (terminalId)}
-          <button onclick={() => onterminal(terminalId)}>Open terminal</button>
-        {/each}
-      </ToolActivity>
-    {/snippet}
-    {#snippet failureCard(tool: AgentTool)}
-      {@const failure = acpToolFailure(tool)}
-      {#if failure}
-        {@const label =
-          failure.kind === 'post-hook'
-            ? 'Post-action hook failed'
-            : failure.kind === 'hook'
-              ? 'Action blocked by hook'
-              : 'Tool failure'}
-        <div class="agent-tool-failure" role="group" aria-label={label}>
-          <strong>{label}</strong>
-          <div><span>Action:</span> <code>{failure.action}</code></div>
-          {#if failure.rule}<div><span>Rule or hook:</span> <code>{failure.rule}</code></div>{/if}
-          <div><span>Reason:</span> {failure.reason}</div>
-          {#if failure.output}<details>
-              <summary>Failure output</summary>
-              <pre>{failure.output}</pre>
-            </details>{/if}
-          <Button size="sm" variant="secondary" onclick={() => prepareFailure(tool, failure)}
-            >Fix with agent</Button
-          >
+  <div class="agent-body">
+    <div
+      class="agent-conversation conversation"
+      bind:this={scroll}
+      onscroll={() => {
+        autoFollow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80;
+        if (scroll.scrollTop <= 80 && !historyLoading) void showEarlier();
+      }}
+      aria-label={`${name} conversation`}
+    >
+      {#if entries.length === 0 && !connecting && !historyLoading}
+        <div class="agent-welcome">
+          <h1>Work with {name}</h1>
+          <p>Describe the work. Sail will show messages, tools, and approvals here.</p>
         </div>
       {/if}
-    {/snippet}
-    {#each displayEntries as entry (entry.id)}
-      {#if entry.type === 'spawn-response'}
-        <SpawnResponse receipt={entry.receipt} />
-      {:else if entry.type === 'tool-group'}
-        {#each entry.tools.filter(toolFailed) as tool (tool.id)}{@render failureCard(tool)}{/each}
-        {#if isBusy && (entry.id === displayEntries.at(-1)?.id || entry.tools.some(toolRunning))}
-          {#if entry.tools.length > 1}
+      {#if historyLoading}<div class="agent-history-status" role="status">
+          Loading history…
+        </div>{/if}
+      {#snippet hookNotice(rules: KlaudiushRule[])}
+        <div class="agent-hook-notice">
+          <strong>Action blocked by hook</strong>
+          <ul>
+            {#each rules as rule (rule.code)}
+              <li><code>{rule.code}</code> {rule.reason}</li>
+            {/each}
+          </ul>
+        </div>
+      {/snippet}
+      {#snippet toolRow(tool: AgentTool, revealed: boolean)}
+        <ToolActivity
+          title={tool.title}
+          status={tool.status}
+          activityId={tool.id}
+          input={tool.input}
+          output={tool.content || toolInput(tool.output)}
+          expanded={revealed}
+        >
+          {#each tool.terminalIds as terminalId (terminalId)}
+            <button onclick={() => onterminal(terminalId)}>Open terminal</button>
+          {/each}
+        </ToolActivity>
+      {/snippet}
+      {#snippet failureCard(tool: AgentTool)}
+        {@const failure = acpToolFailure(tool)}
+        {#if failure}
+          {@const label =
+            failure.kind === 'post-hook'
+              ? 'Post-action hook failed'
+              : failure.kind === 'hook'
+                ? 'Action blocked by hook'
+                : 'Tool failure'}
+          <div class="agent-tool-failure" role="group" aria-label={label}>
+            <strong>{label}</strong>
+            <div><span>Action:</span> <code>{failure.action}</code></div>
+            {#if failure.rule}<div><span>Rule or hook:</span> <code>{failure.rule}</code></div>{/if}
+            <div><span>Reason:</span> {failure.reason}</div>
+            {#if failure.output}<details>
+                <summary>Failure output</summary>
+                <pre>{failure.output}</pre>
+              </details>{/if}
+            <Button size="sm" variant="secondary" onclick={() => prepareFailure(tool, failure)}
+              >Fix with agent</Button
+            >
+          </div>
+        {/if}
+      {/snippet}
+      {#each displayEntries as entry (entry.id)}
+        {#if entry.type === 'spawn-response'}
+          <SpawnResponse receipt={entry.receipt} />
+        {:else if entry.type === 'tool-group'}
+          {#each entry.tools.filter(toolFailed) as tool (tool.id)}{@render failureCard(tool)}{/each}
+          {#if isBusy && (entry.id === displayEntries.at(-1)?.id || entry.tools.some(toolRunning))}
+            {#if entry.tools.length > 1}
+              <details class="agent-tool-group">
+                <summary>
+                  {entry.tools.length - 1} earlier {entry.tools.length === 2 ? 'action' : 'actions'}
+                  {#if entry.tools.slice(0, -1).some(toolRunning)}<ActivityStatus
+                      status="working"
+                      compact
+                    />{/if}
+                  {#if entry.tools.slice(0, -1).some(toolFailed)}<ActivityStatus
+                      status="failed"
+                      compact
+                    />{/if}
+                </summary>
+                <div class="agent-tool-list">
+                  {#each entry.tools.slice(0, -1) as tool (tool.id)}
+                    {@render toolRow(tool, true)}
+                  {/each}
+                </div>
+              </details>
+            {/if}
+            {@const latest = entry.tools.at(-1)}
+            {#if latest}
+              <div class="agent-tool-current" class:running={toolRunning(latest)}>
+                <span class="agent-tool-current-label">Latest action</span>
+                {@render toolRow(latest, false)}
+              </div>
+            {/if}
+          {:else}
             <details class="agent-tool-group">
               <summary>
-                {entry.tools.length - 1} earlier {entry.tools.length === 2 ? 'action' : 'actions'}
+                <span>{entry.tools.length} {entry.tools.length === 1 ? 'action' : 'actions'}</span>
+                <span class="agent-tool-group-last">{entry.tools.at(-1)?.title}</span>
+                {#if entry.tools.at(-1)?.status !== 'completed' && !toolFailed(entry.tools.at(-1)!)}<ActivityStatus
+                    status={entry.tools.at(-1)?.status}
+                    compact
+                  />{/if}
                 {#if entry.tools.slice(0, -1).some(toolRunning)}<ActivityStatus
                     status="working"
                     compact
                   />{/if}
-                {#if entry.tools.slice(0, -1).some(toolFailed)}<ActivityStatus
-                    status="failed"
-                    compact
-                  />{/if}
+                {#if entry.tools.some(toolFailed)}<ActivityStatus status="failed" compact />{/if}
               </summary>
               <div class="agent-tool-list">
-                {#each entry.tools.slice(0, -1) as tool (tool.id)}
+                {#each entry.tools as tool (tool.id)}
                   {@render toolRow(tool, true)}
                 {/each}
               </div>
             </details>
           {/if}
-          {@const latest = entry.tools.at(-1)}
-          {#if latest}
-            <div class="agent-tool-current" class:running={toolRunning(latest)}>
-              <span class="agent-tool-current-label">Latest action</span>
-              {@render toolRow(latest, false)}
-            </div>
-          {/if}
         {:else}
-          <details class="agent-tool-group">
-            <summary>
-              <span>{entry.tools.length} {entry.tools.length === 1 ? 'action' : 'actions'}</span>
-              <span class="agent-tool-group-last">{entry.tools.at(-1)?.title}</span>
-              {#if entry.tools.at(-1)?.status !== 'completed' && !toolFailed(entry.tools.at(-1)!)}<ActivityStatus
-                  status={entry.tools.at(-1)?.status}
+          {@const segments =
+            entry.type === 'user'
+              ? splitTaskNotifications(entry.text)
+              : [{ type: 'text' as const, text: entry.text }]}
+          {#each segments as segment, index (index)}
+            {#if segment.type === 'notification'}
+              {@const note = segment.notification}
+              <div
+                class="agent-subagent-card"
+                class:stopped={note.status !== 'completed'}
+                aria-label={`Subagent ${note.status}`}
+                role="group"
+              >
+                <ActivityStatus
+                  status={isFailedStatus(note.status) ? 'failed' : note.status}
                   compact
-                />{/if}
-              {#if entry.tools.slice(0, -1).some(toolRunning)}<ActivityStatus
-                  status="working"
-                  compact
-                />{/if}
-              {#if entry.tools.some(toolFailed)}<ActivityStatus status="failed" compact />{/if}
-            </summary>
-            <div class="agent-tool-list">
-              {#each entry.tools as tool (tool.id)}
-                {@render toolRow(tool, true)}
-              {/each}
-            </div>
-          </details>
-        {/if}
-      {:else}
-        {@const segments =
-          entry.type === 'user'
-            ? splitTaskNotifications(entry.text)
-            : [{ type: 'text' as const, text: entry.text }]}
-        {#each segments as segment, index (index)}
-          {#if segment.type === 'notification'}
-            {@const note = segment.notification}
-            <div
-              class="agent-subagent-card"
-              class:stopped={note.status !== 'completed'}
-              aria-label={`Subagent ${note.status}`}
-              role="group"
-            >
-              <ActivityStatus
-                status={isFailedStatus(note.status) ? 'failed' : note.status}
-                compact
-              />
-              <span class="agent-subagent-summary">{note.summary}</span>
-              {#each notificationStats(note) as stat (stat)}<span class="agent-subagent-stat"
-                  >{stat}</span
-                >{/each}
-            </div>
-          {:else}
-            {@const text = segment.text}
-            {@const hookMessage = entry.type === 'assistant' ? splitKlaudiushMessage(text) : null}
-            {@const attribution =
-              entry.type === 'user'
-                ? coordinationMessageForText(text, coordinationMessages)
-                : undefined}
-            <ChatMessage
-              kind={entry.type}
-              created={entry.created}
-              author={entry.type === 'user'
-                ? attribution
-                  ? `From ${attribution.sender}`
-                  : 'You'
-                : entry.type === 'thought'
-                  ? `${name} · thinking`
-                  : name}
-            >
-              {#if hookMessage}
-                {@render hookNotice(hookMessage.rules)}
-                <details class="agent-hook-details">
-                  <summary>Full hook notice</summary>
-                  <Markdown source={hookMessage.notice} />
-                </details>
-                {#if hookMessage.remainder}<Markdown source={hookMessage.remainder} />{/if}
-              {:else}
-                <Markdown
-                  source={attribution
-                    ? text.replace(coordinationPrompt(attribution), attribution.text)
-                    : text}
                 />
-              {/if}
+                <span class="agent-subagent-summary">{note.summary}</span>
+                {#each notificationStats(note) as stat (stat)}<span class="agent-subagent-stat"
+                    >{stat}</span
+                  >{/each}
+              </div>
+            {:else}
+              {@const text = segment.text}
+              {@const hookMessage = entry.type === 'assistant' ? splitKlaudiushMessage(text) : null}
+              {@const attribution =
+                entry.type === 'user'
+                  ? coordinationMessageForText(text, coordinationMessages)
+                  : undefined}
+              <ChatMessage
+                kind={entry.type}
+                created={entry.created}
+                author={entry.type === 'user'
+                  ? attribution
+                    ? `From ${attribution.sender}`
+                    : 'You'
+                  : entry.type === 'thought'
+                    ? `${name} · thinking`
+                    : name}
+              >
+                {#if hookMessage}
+                  {@render hookNotice(hookMessage.rules)}
+                  <details class="agent-hook-details">
+                    <summary>Full hook notice</summary>
+                    <Markdown source={hookMessage.notice} />
+                  </details>
+                  {#if hookMessage.remainder}<Markdown source={hookMessage.remainder} />{/if}
+                {:else}
+                  <Markdown
+                    source={attribution
+                      ? text.replace(coordinationPrompt(attribution), attribution.text)
+                      : text}
+                  />
+                {/if}
+              </ChatMessage>
+            {/if}
+          {/each}
+        {/if}
+      {/each}
+      {#each coordinationMessages.filter((message) => !entries.some((entry) => entry.type === 'user' && entry.text.includes(coordinationPrompt(message)))) as message (message.id)}
+        <ChatMessage
+          kind="user"
+          author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
+        >
+          <Markdown source={message.text} />
+        </ChatMessage>
+      {/each}
+      <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
+      <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
+      {#if queued.length}<div class="queued-messages" role="status" aria-label="Queued messages">
+          {#each queued as message, index (index)}
+            <ChatMessage
+              kind="user"
+              author={`You · queued${message.attachments.length || message.images.length ? ` · ${message.attachments.length + message.images.length} attachments` : ''}`}
+            >
+              <Markdown source={message.text || 'Attachments'} />
             </ChatMessage>
-          {/if}
-        {/each}
-      {/if}
-    {/each}
-    {#each coordinationMessages.filter((message) => !entries.some((entry) => entry.type === 'user' && entry.text.includes(coordinationPrompt(message)))) as message (message.id)}
-      <ChatMessage
-        kind="user"
-        author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
-      >
-        <Markdown source={message.text} />
-      </ChatMessage>
-    {/each}
-    <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
-    <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
-    {#if queued.length}<div class="queued-messages" role="status" aria-label="Queued messages">
-        {#each queued as message, index (index)}
-          <ChatMessage
-            kind="user"
-            author={`You · queued${message.attachments.length || message.images.length ? ` · ${message.attachments.length + message.images.length} attachments` : ''}`}
-          >
-            <Markdown source={message.text || 'Attachments'} />
-          </ChatMessage>
-        {/each}
-        {#if queuePaused}<Button size="sm" variant="secondary" onclick={retryQueue}
-            >Retry queue</Button
-          >{/if}
-      </div>{/if}
-    {#if isBusy}<ChatMessage kind="assistant" author={name}>
-        <div class="agent-busy" role="status">
-          <ActivityStatus status={visibleStatus} /><Button
-            size="sm"
-            variant="secondary"
-            onclick={stop}>Stop</Button
-          >
-        </div>
-      </ChatMessage>{/if}
+          {/each}
+          {#if queuePaused}<Button size="sm" variant="secondary" onclick={retryQueue}
+              >Retry queue</Button
+            >{/if}
+        </div>{/if}
+      {#if isBusy}<ChatMessage kind="assistant" author={name}>
+          <div class="agent-busy" role="status">
+            <ActivityStatus status={visibleStatus} /><Button
+              size="sm"
+              variant="secondary"
+              onclick={stop}>Stop</Button
+            >
+          </div>
+        </ChatMessage>{/if}
+    </div>
+    <WorkspaceActivity
+      items={workspaceActivity}
+      storageKey={`workspace-activity:${directory}:${agent}:${thread?.sessionId ?? 'new'}`}
+      onselect={selectWorkspaceActivity}
+    />
   </div>
   <div class="agent-composer composer-wrap">
     <div class="composer">
@@ -1819,10 +1877,18 @@
 
 <style>
   .agent-workspace {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-height: 0;
     flex: 1;
+  }
+  .agent-body {
+    position: relative;
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
   }
   .agent-header {
     display: flex;
