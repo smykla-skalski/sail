@@ -29,6 +29,7 @@
   import type { PublishedGraph } from './lib/issue-graph';
   import type { ShipRun } from './lib/issue-shipping';
   import type { ShipItIssue } from './lib/implementation-models';
+  import type { TaskLocation } from './lib/task-location';
   import { threadKey } from './lib/recent-threads';
   import { getPlan, getHistory, type PlanSnapshot, type HistoryEntry } from './lib/plan';
   import { annotateDiffs } from './lib/diff';
@@ -46,6 +47,7 @@
     focused: string;
     directory: string;
     project: string;
+    taskLocation: TaskLocation;
     dark: boolean;
     agents: AgentAvailability[];
     sideChat: SideChatState | null;
@@ -131,6 +133,7 @@
     focused,
     directory,
     project,
+    taskLocation,
     dark,
     agents,
     sideChat,
@@ -472,6 +475,7 @@
       {focused}
       {directory}
       {project}
+      {taskLocation}
       {dark}
       {agents}
       {sideChat}
@@ -569,6 +573,7 @@
       {focused}
       {directory}
       {project}
+      {taskLocation}
       {dark}
       {agents}
       {sideChat}
@@ -732,6 +737,7 @@
               {client}
               {runtimeState}
               {directory}
+              {taskLocation}
               thread={pane.thread}
               {setup}
               coordinationMessages={coordinationMessages.filter(
@@ -864,6 +870,7 @@
               agent={pane.agent}
               agentName={agents.find((agent) => agent.id === pane.agent)?.name ?? pane.agent}
               {directory}
+              {taskLocation}
               thread={pane.thread}
               usage={pane.thread
                 ? { ...agentUsage[threadKey(pane.thread)], rates: agentRates[pane.thread.agent] }
@@ -986,6 +993,7 @@
             source={sideChat.source}
             {client}
             {directory}
+            {taskLocation}
             focused={focused === sideChat.id}
             focusPrompt={focusPromptPane === sideChat.id}
             {onpromptfocused}
