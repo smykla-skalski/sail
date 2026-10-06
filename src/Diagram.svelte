@@ -29,6 +29,7 @@
           startOnLoad: false,
           securityLevel: 'strict',
           theme: dark ? 'dark' : 'neutral',
+          htmlLabels: false,
         });
         try {
           await mermaid.parse(source);
