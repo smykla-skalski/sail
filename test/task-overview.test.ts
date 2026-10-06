@@ -211,6 +211,16 @@ void test('checks aggregate the newest turn without stale failures', () => {
     receipts: [],
   });
   assert.equal(passingCards.find((item) => item.path === '/work/urgent')?.checkState, 'passed');
+
+  const canceledCards = buildTaskOverviewCards({
+    catalog,
+    threads: {},
+    statuses: {},
+    agentNames: {},
+    checks: [{ ...checks[1], id: 'new-canceled', status: 'canceled' }],
+    receipts: [],
+  });
+  assert.equal(canceledCards.find((item) => item.path === '/work/urgent')?.checkState, 'other');
 });
 
 void test('search matches task, repository, branch, and agent fields', () => {

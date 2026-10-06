@@ -173,10 +173,13 @@
     return state ? `Checks ${state}` : 'Checks not run';
   }
 
-  function visibleCheckState(card: TaskOverviewCard): 'passing' | 'failing' | 'pending' | null {
+  function visibleCheckState(
+    card: TaskOverviewCard,
+  ): 'passing' | 'failing' | 'pending' | 'canceled' | null {
     const pullRequest = pullRequestState(card);
     if (pullRequest === 'failing' || card.checkState === 'failed') return 'failing';
     if (pullRequest === 'pending' || card.checkState === 'running') return 'pending';
+    if (card.checkState === 'other') return 'canceled';
     if (pullRequest === 'passing' || card.checkState === 'passed') return 'passing';
     return null;
   }
