@@ -121,10 +121,13 @@ describe('styled app dialogs', () => {
     );
     await $('.path-picker-dialog[open] .path-picker-actions .confirmation-primary').click();
     await expect($('.worktree-destination span')).toHaveText(realpathSync(fixture));
-    await $('[aria-label^="Agent for new worktree:"]').click();
-    await expect($('.option-menu')).toBeDisplayed();
-    await browser.keys('Escape');
-    await expect($('.option-menu')).not.toExist();
+    await browser.execute(() =>
+      document
+        .querySelector<HTMLInputElement>('.worktree-agent-option input:not(:disabled)')
+        ?.focus(),
+    );
+    await browser.keys('ArrowRight');
+    await expect($('.worktree-agent-option input:focus')).toExist();
     await expect($('.worktree-dialog')).toBeDisplayed();
   });
 });

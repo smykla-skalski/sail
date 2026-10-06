@@ -271,8 +271,13 @@ describe('repository setup', () => {
     const name = path.split('/').at(-1);
     await $(`[aria-label="Create worktree for ${name}"]`).click();
     await $(`[aria-label="Worktree name for ${name}"]`).setValue('agent-launch');
-    await $('[aria-label^="Agent for new worktree:"]').click();
-    await $('.option-menu [role="option"]:nth-child(3)').click();
+    await browser.execute(() =>
+      document
+        .querySelector<HTMLInputElement>('.worktree-agent-option input[value="claude"]')
+        ?.focus(),
+    );
+    await browser.keys('Space');
+    await expect($('.worktree-agent-option input[value="claude"]')).toBeSelected();
     await $('.worktree-form button[type="submit"]').click();
     await expect($('.worktree-dialog')).not.toBeDisplayed();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
@@ -283,7 +288,7 @@ describe('repository setup', () => {
       'page',
     );
     await $(`[aria-label="Create worktree for ${name}"]`).click();
-    await expect($('[aria-label^="Agent for new worktree:"]')).toHaveText('Claude');
+    await expect($('.worktree-agent-option input[value="claude"]')).toBeSelected();
     await $('.worktree-dialog .worktree-cancel').click();
   });
 

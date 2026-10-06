@@ -175,15 +175,14 @@ describe('command palette project flow', () => {
     await $('[data-kind="new-worktree"]').click();
     await expect($('.worktree-dialog[open]')).toBeDisplayed();
     await capture('palette-create-worktree');
-    await expect($('[aria-label^="Agent for new worktree:"]')).toBeDisplayed();
+    await expect($('.worktree-agent-picker')).toBeDisplayed();
     await $('.worktree-cancel').click();
     await expect($('.command-palette[open]')).toBeDisplayed();
     await expect($('[data-kind="new-worktree"]')).toBeDisplayed();
     await $('[data-kind="new-worktree"]').click();
     await expect($('.worktree-dialog[open]')).toBeDisplayed();
     await $('[aria-label^="Worktree name for"]').setValue('palette-created');
-    await $('[aria-label^="Agent for new worktree:"]').click();
-    await $('.option-menu [role="option"]:nth-child(3)').click();
+    await $('.worktree-agent-option:has(input[value="claude"])').click();
     await $('.worktree-create').click();
     await expect($('.worktree-dialog[open]')).not.toExist();
     await expect($('.command-palette[open]')).not.toExist();
@@ -263,7 +262,7 @@ describe('command palette project flow', () => {
     await expect($('.worktree-dialog')).toHaveText(
       expect.stringContaining(realpathSync(repository).split(/[\\/]/).at(-1)!),
     );
-    await expect($('[aria-label^="Agent for new worktree:"]')).toBeDisplayed();
+    await expect($('.worktree-agent-picker')).toBeDisplayed();
     await $('.worktree-cancel').click();
     await expect($('.worktree-dialog[open]')).not.toExist();
     await expect($('.command-palette[open]')).not.toExist();

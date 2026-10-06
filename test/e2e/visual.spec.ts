@@ -206,8 +206,7 @@ describe('visual layout audit', () => {
     await returnToWorkspace();
     await $(`[aria-label="Create worktree for ${path.split('/').at(-1)}"]`).click();
     await $(`[aria-label="Worktree name for ${path.split('/').at(-1)}"]`).setValue('visual-audit');
-    await $('[aria-label^="Agent for new worktree:"]').click();
-    await $('.option-menu [role="option"]:nth-child(3)').click();
+    await $('.worktree-agent-option:has(input[value="claude"])').click();
     await $('.worktree-form button[type="submit"]').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     const worktree = await browser.execute(() => localStorage.getItem('sai-directory'));
