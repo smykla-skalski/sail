@@ -2149,6 +2149,11 @@ button:disabled {
   font-size: inherit;
   white-space: nowrap;
 }
+@media (max-width: 850px) {
+  .breadcrumb-project {
+    min-height: 44px;
+  }
+}
 .breadcrumb-project:hover {
   color: var(--sui-primary);
 }

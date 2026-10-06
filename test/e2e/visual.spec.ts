@@ -459,6 +459,10 @@ describe('visual layout audit', () => {
       () => document.querySelector('.agent-menu-launch')!.getBoundingClientRect().height,
     );
     expect(compactAgentsHeight).toBeGreaterThanOrEqual(43.5);
+    const compactBreadcrumbHeight = await browser.execute(
+      () => document.querySelector('.breadcrumb-project')!.getBoundingClientRect().height,
+    );
+    expect(compactBreadcrumbHeight).toBeGreaterThanOrEqual(43.5);
 
     await browser.setWindowSize(320, 500);
     await $('.mobile-switcher button:nth-child(1)').click();
