@@ -1,6 +1,6 @@
 function closingTicks(text: string, start: number, length: number): number {
   for (let index = start; index < text.length;) {
-    if (text[index] !== '`' || (index > 0 && text[index - 1] === '\\')) {
+    if (text[index] !== '`') {
       index++;
       continue;
     }

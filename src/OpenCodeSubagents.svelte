@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import { SvelteSet } from 'svelte/reactivity';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import Markdown from './Markdown.svelte';
   import ToolActivity from './ToolActivity.svelte';
   import { openCodeErrorDetails } from './lib/tool-failure';
   import { mergeMessages } from './lib/timeline';
+  import { needsChildSummary } from './lib/opencode-subagent-summary';
 
   let { client, parentID }: { client: OpenCodeClient | null; parentID: string | null } = $props();
   let children = $state<SessionInfo[]>([]);
@@ -21,6 +22,7 @@
   let expanded = $state<string[]>([]);
   let generation = 0;
   let refreshing = false;
+  const summaryUpdates = new SvelteMap<string, number>();
 
   async function collectThroughOverlap<T extends { id: string }>(
     readPage: (cursor?: string) => Promise<{ data: T[]; cursor: { next?: string | null } }>,
@@ -48,22 +50,26 @@
   }
 
   async function loadSummaries(source: OpenCodeClient, sessions: SessionInfo[], current: number) {
+    const stale = sessions.filter((child) => needsChildSummary(child, active, summaryUpdates));
+    if (!stale.length) return;
     const snapshots = await Promise.all(
-      sessions.map(async (child) => {
+      stale.map(async (child) => {
         const response = await source.message.list({
           sessionID: child.id,
           limit: 1,
           order: 'desc',
           type: 'assistant',
         });
-        return [child.id, response.data[0]] as const;
+        return [child.id, child.time.updated, response.data[0]] as const;
       }),
     );
     if (current !== generation) return;
-    summaries = {
-      ...summaries,
-      ...Object.fromEntries(snapshots.filter((entry) => entry[1])),
-    };
+    const next = { ...summaries };
+    for (const [id, updated, message] of snapshots) {
+      summaryUpdates.set(id, updated);
+      if (message) next[id] = message;
+    }
+    summaries = next;
   }
 
   async function loadHistory(id: string, cursor?: string) {
@@ -164,6 +170,8 @@
     expanded = [];
     children = [];
     summaries = {};
+    summaryUpdates.clear();
+    active = [];
     histories = {};
     historyCursors = {};
     historyErrors = {};

@@ -213,6 +213,7 @@
   let files = $state<string[]>([]);
   let pendingPaste: Promise<void> = Promise.resolve();
   const clipboardPaths = new SvelteSet<string>();
+  const clipboardNames = new SvelteMap<string, string>();
   const inFlightClipboard = new SvelteSet<string>();
   async function pasteFiles(event: ClipboardEvent) {
     const pasted = clipboardFiles(event);
@@ -229,19 +230,23 @@
     const staged = await Promise.all(
       pasted.map(async (file) => {
         try {
-          return await stageClipboardFile(file);
+          return { file, path: await stageClipboardFile(file) };
         } catch (cause) {
           error = `Could not paste ${file.name}: ${describe(cause)}`;
           return null;
         }
       }),
     );
-    const paths = staged.filter((path): path is string => !!path);
+    const paths = staged.flatMap((item) => (item ? [item.path] : []));
     if (current !== generation) {
       paths.forEach((path) => void removeClipboardFile(path));
       return;
     }
-    paths.forEach((path) => clipboardPaths.add(path));
+    for (const item of staged) {
+      if (!item) continue;
+      clipboardPaths.add(item.path);
+      clipboardNames.set(item.path, item.file.name || 'clipboard-image.png');
+    }
     files = [...files, ...paths];
   }
   let error = $state('');
@@ -372,6 +377,7 @@
     for (const path of clipboardPaths)
       if (!inFlightClipboard.has(path)) {
         clipboardPaths.delete(path);
+        clipboardNames.delete(path);
         void removeClipboardFile(path);
       }
     for (const path of pickedImages)
@@ -525,7 +531,10 @@
       for (const path of pickedImages)
         if (!inFlightCaptures.has(path)) void invoke('browser_remove_capture', { path });
       for (const path of clipboardPaths)
-        if (!inFlightClipboard.has(path)) void removeClipboardFile(path);
+        if (!inFlightClipboard.has(path)) {
+          clipboardNames.delete(path);
+          void removeClipboardFile(path);
+        }
     };
   });
 
@@ -622,7 +631,10 @@
               ? [{ id: promptSkill(skills, text)!.id! }]
               : undefined,
             delivery: queued ? 'steer' : undefined,
-            files: paths.map((path) => ({ uri: fileUri(path), name: path.split(/[\\/]/).at(-1) })),
+            files: paths.map((path) => ({
+              uri: fileUri(path),
+              name: clipboardNames.get(path) ?? path.split(/[\\/]/).at(-1),
+            })),
           });
         } catch (cause) {
           await recordImplementationModel(turnDirectory, implementingModel, tracking);
@@ -646,13 +658,15 @@
       for (const path of paths)
         if (pickedImages.delete(path)) void invoke('browser_remove_capture', { path });
       for (const path of paths)
-        if (clipboardPaths.delete(path))
+        if (clipboardPaths.delete(path)) {
+          clipboardNames.delete(path);
           void source.session
             .wait({ sessionID: id })
             .catch(() => undefined)
             .then(() => removeClipboardFile(path))
             .catch(() => undefined)
             .finally(() => inFlightClipboard.delete(path));
+        }
       if (queued) {
         await refreshMessages(id, current);
         return;
@@ -687,6 +701,7 @@
         for (const path of paths)
           if (inFlightClipboard.delete(path) && (disposed || current !== generation)) {
             clipboardPaths.delete(path);
+            clipboardNames.delete(path);
             void removeClipboardFile(path);
           }
       if (current === generation) sending = false;
@@ -758,6 +773,7 @@
     files = files.filter((item) => item !== path);
     if (pickedImages.delete(path)) void invoke('browser_remove_capture', { path });
     if (clipboardPaths.delete(path)) void removeClipboardFile(path);
+    clipboardNames.delete(path);
   }
 
   function keydown(event: KeyboardEvent) {
@@ -939,8 +955,8 @@
       />
       {#if files.length}<div class="attachments">
           {#each files as file (file)}<span
-              >{file.split(/[\\/]/).at(-1)}<button
-                aria-label={`Remove ${file.split(/[\\/]/).at(-1)}`}
+              >{clipboardNames.get(file) ?? file.split(/[\\/]/).at(-1)}<button
+                aria-label={`Remove ${clipboardNames.get(file) ?? file.split(/[\\/]/).at(-1)}`}
                 onclick={() => removeFile(file)}>×</button
               ></span
             >{/each}
