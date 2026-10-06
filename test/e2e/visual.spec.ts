@@ -125,11 +125,58 @@ describe('visual layout audit', () => {
         await expect($('.main-area > .notice.error')).toHaveText(
           expect.stringContaining('settings'),
         );
-        await browser.execute(() => {
+        const textScale = await browser.execute(() => {
+          const selectors = [
+            '.main-area > .notice.error',
+            '.welcome .eyebrow',
+            '.welcome h1',
+            '.welcome p:not(.eyebrow)',
+          ];
+          const styles = selectors.map((selector) => {
+            const element = document.querySelector<HTMLElement>(selector)!;
+            return {
+              selector,
+              inlineFontSize: element.style.fontSize,
+              fontSize: Number.parseFloat(getComputedStyle(element).fontSize),
+            };
+          });
+          const buttonFontSize = Number.parseFloat(
+            getComputedStyle(document.querySelector<HTMLElement>('.welcome-agents button')!)
+              .fontSize,
+          );
           document.documentElement.style.fontSize = '200%';
+          styles.forEach(({ selector, fontSize }) => {
+            document.querySelector<HTMLElement>(selector)!.style.fontSize = `${fontSize * 2}px`;
+          });
+          return {
+            styles,
+            buttonFontSize,
+          };
         });
         const launchActions = await $$('.welcome-agents button');
         expect(launchActions.length).toBeGreaterThan(1);
+        const scaledText = await browser.execute(
+          (styles, buttonFontSize, button) => {
+            return [
+              ...styles.map(({ selector, fontSize }) => ({
+                fontSize,
+                scaled: Number.parseFloat(
+                  getComputedStyle(document.querySelector<HTMLElement>(selector)!).fontSize,
+                ),
+              })),
+              {
+                fontSize: buttonFontSize,
+                scaled: Number.parseFloat(getComputedStyle(button).fontSize),
+              },
+            ];
+          },
+          textScale.styles,
+          textScale.buttonFontSize,
+          launchActions[0],
+        );
+        scaledText.forEach(({ fontSize, scaled }) => {
+          expect(scaled).toBeGreaterThanOrEqual(fontSize * 2);
+        });
         const actionBounds = await launchActions.reduce<
           Promise<Array<{ top: number; bottom: number }>>
         >(async (accumulated, action) => {
@@ -151,9 +198,12 @@ describe('visual layout audit', () => {
           expect(bounds.top).toBeGreaterThanOrEqual(0);
           expect(bounds.bottom).toBeLessThanOrEqual(size.viewport.height + 1);
         });
-        await browser.execute(() => {
+        await browser.execute((styles) => {
           document.documentElement.style.removeProperty('font-size');
-        });
+          styles.forEach(({ selector, inlineFontSize }) => {
+            document.querySelector<HTMLElement>(selector)!.style.fontSize = inlineFontSize;
+          });
+        }, textScale.styles);
       }
       await capture(`${width}x${height}-chat`);
       if (width <= 850) await $('.mobile-switcher button:nth-child(1)').click();
