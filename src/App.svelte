@@ -8981,17 +8981,21 @@
                 >
               </div>
               <ActivityStatus
-                status={pendingPermissions.length ||
-                pendingForms.length ||
-                setup?.model.state === 'action'
-                  ? 'waiting'
-                  : running
-                    ? 'working'
-                    : workReady
-                      ? 'ready'
-                      : setupLoading
-                        ? 'connecting'
-                        : 'offline'}
+                status={runtimeState === 'starting'
+                  ? 'connecting'
+                  : runtimeState !== 'connected'
+                    ? 'offline'
+                    : pendingPermissions.length ||
+                        pendingForms.length ||
+                        setup?.model.state === 'action'
+                      ? 'waiting'
+                      : running
+                        ? 'working'
+                        : workReady
+                          ? 'ready'
+                          : setupLoading
+                            ? 'connecting'
+                            : 'offline'}
               />
             </div>
             <div
@@ -9378,6 +9382,7 @@
       {sideChat}
       {client}
       {setup}
+      {runtimeState}
       {coordinationMessages}
       {spawnReceipts}
       {shipRuns}

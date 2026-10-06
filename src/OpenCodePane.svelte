@@ -69,6 +69,7 @@
 
   let {
     client,
+    runtimeState,
     directory,
     thread,
     setup,
@@ -90,6 +91,7 @@
     onshipit,
   }: {
     client: OpenCodeClient | null;
+    runtimeState: 'starting' | 'connected' | 'error';
     directory: string;
     thread: AgentThread | null;
     setup: SetupReport | null;
@@ -285,15 +287,19 @@
     !!setup?.workReady || (session?.agent === 'architect' && !!setup?.planReady),
   );
   const visibleStatus = $derived(
-    pendingPermissions.length || pendingForms.length
-      ? 'waiting'
-      : loading
-        ? 'connecting'
-        : busy
-          ? 'working'
-          : inputReady
-            ? 'ready'
-            : 'offline',
+    runtimeState === 'starting'
+      ? 'connecting'
+      : runtimeState !== 'connected'
+        ? 'offline'
+        : pendingPermissions.length || pendingForms.length
+          ? 'waiting'
+          : loading
+            ? 'connecting'
+            : busy
+              ? 'working'
+              : inputReady
+                ? 'ready'
+                : 'offline',
   );
   const contextUsage = $derived(openCodeContextUsage(messages, setup?.models ?? []));
   const chosenModel = $derived(

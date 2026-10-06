@@ -356,15 +356,15 @@
   const name = $derived(agentName);
   const isBusy = $derived(busy || running || historyLoading);
   const visibleStatus = $derived(
-    permissions.length
-      ? 'waiting'
-      : connecting
-        ? 'connecting'
-        : isBusy
-          ? 'working'
-          : ready
-            ? 'ready'
-            : 'offline',
+    connecting
+      ? 'connecting'
+      : !ready
+        ? 'offline'
+        : permissions.length
+          ? 'waiting'
+          : isBusy
+            ? 'working'
+            : 'ready',
   );
 
   $effect(() => {

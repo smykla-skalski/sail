@@ -20,11 +20,7 @@
   <section class="spawn-activity" aria-label="Subagent activity">
     <h2>Subagents ({active.length})</h2>
     {#each active as receipt (receipt.receiptId)}
-      <article
-        class="spawn-active state-{receipt.state}"
-        role="status"
-        aria-label={`${label(receipt)} subagent ${receipt.state}`}
-      >
+      <article class="spawn-active state-{receipt.state}" role="status">
         <div class="spawn-heading">
           <span class="spawn-avatar" aria-hidden="true">↳</span>
           <strong>{label(receipt)} <span class="spawn-kind">subagent</span></strong>
