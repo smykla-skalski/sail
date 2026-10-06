@@ -191,7 +191,7 @@
     type SessionInfo,
     type SessionMessageInfo,
   } from './lib/opencode';
-  import { getHistory, getPlan, type HistoryEntry, type PlanSnapshot } from './lib/plan';
+  import { getPlan, type HistoryEntry, type PlanSnapshot } from './lib/plan';
   import { mergeMessages, nearBottom } from './lib/timeline';
   import {
     clipboardFiles,
@@ -811,7 +811,6 @@
   let diffRefresh = 0;
   let diffRevision = '';
   let diffRevisionPath = '';
-  let historyRefresh = 0;
   let draft = $state('');
   const failureRequests = new SvelteMap<string, string>();
   let mainPrompt = $state<HTMLTextAreaElement | undefined>();
@@ -4934,7 +4933,6 @@
     diffLoading = false;
     historyEvents = [];
     historyError = '';
-    ++historyRefresh;
     historyLoading = false;
     if (client) await ensureOpenCodeBrowser(path).catch((cause) => (error = describe(cause)));
     if (!client || !(await refreshSetup(path)) || current !== selection) return;
@@ -7243,7 +7241,6 @@
     diffLoading = false;
     historyEvents = [];
     historyError = '';
-    ++historyRefresh;
     historyLoading = false;
     sideTab = viewStates.get(viewKey())?.sideTab ?? 'plan';
     selectedFilePath = viewStates.get(viewKey())?.selectedFilePath ?? null;
@@ -7302,7 +7299,6 @@
     diffLoading = false;
     historyEvents = [];
     historyError = '';
-    ++historyRefresh;
     historyLoading = false;
     pendingPermissions = [];
     pendingForms = [];
@@ -7790,35 +7786,15 @@
   }
 
   async function refreshHistory(id = sessionID, current = selection) {
-    if (!client || !id || !directory) return;
+    if (!client || !id || !directory || current !== selection) return;
     if (setup?.rpc.state !== 'ready') {
       historyEvents = [];
       historyError = 'Install the plan-review plugin to record plan history.';
       return;
     }
-    const source = client;
-    const path = directory;
-    const generation = ++historyRefresh;
-    historyLoading = true;
-    try {
-      const next = await getHistory(source, path, id);
-      if (
-        generation !== historyRefresh ||
-        current !== selection ||
-        id !== sessionID ||
-        path !== directory
-      )
-        return;
-      historyEvents = next;
-      historyError = '';
-    } catch (cause) {
-      if (generation === historyRefresh && current === selection && id === sessionID) {
-        historyError = describe(cause);
-        historyEvents = [];
-      }
-    } finally {
-      if (generation === historyRefresh) historyLoading = false;
-    }
+    historyLoading = false;
+    historyEvents = [];
+    historyError = 'Plan-review 0.2.0 does not expose history.';
   }
 
   function selectDiffPath(path: string) {

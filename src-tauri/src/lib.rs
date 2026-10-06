@@ -2638,7 +2638,7 @@ mod tests {
 
     #[test]
     fn accepts_real_opencode_version_output() {
-        assert_eq!(version_number("opencode v2.0.19\n"), Some("2.0.19"));
+        assert_eq!(version_number("opencode v2.0.24\n"), Some("2.0.24"));
         assert_eq!(version_number("2.1.0\n"), Some("2.1.0"));
     }
 

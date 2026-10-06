@@ -26,6 +26,7 @@ const env = {
   XDG_STATE_HOME: join(root, 'state'),
 };
 let server;
+let eventController;
 
 async function freePort() {
   const listener = createServer();
@@ -66,6 +67,19 @@ async function untilPlugin(client, location, attempt = 0) {
   return untilPlugin(client, location, attempt + 1);
 }
 
+async function untilEvent(events, predicate, deadline = Date.now() + 5_000) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error('OpenCode event stream did not deliver the expected event');
+  const event = await Promise.race([
+    events.next(),
+    delay(remaining).then(() => {
+      throw new Error('OpenCode event stream did not deliver the expected event');
+    }),
+  ]);
+  if (event.done) throw new Error('OpenCode event stream ended unexpectedly');
+  return predicate(event.value) ? event.value : untilEvent(events, predicate, deadline);
+}
+
 try {
   mkdirSync(repository);
   mkdirSync(config);
@@ -89,7 +103,7 @@ try {
     'baseline',
   ]);
   const version = execFileSync(cli, ['--version'], { env, encoding: 'utf8' }).trim();
-  assert.match(version, /^opencode v2\.0\.19$/);
+  assert.match(version, /^opencode v2\.0\.24$/);
   const port = await freePort();
   const password = 'sai-contract-test';
   const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`;
@@ -103,6 +117,8 @@ try {
   server.stderr.on('data', (data) => process.stderr.write(data));
   await ready(url, authorization);
   const client = OpenCode.make({ baseUrl: url, headers: { authorization } });
+  eventController = new AbortController();
+  const events = client.event.subscribe({ signal: eventController.signal })[Symbol.asyncIterator]();
   const location = { directory: repository };
   const canonical = (await client.location.get({ location })).project.canonical;
   assert.equal(readFileSync(join(canonical, '.sai-contract-marker'), 'utf8'), marker);
@@ -112,8 +128,10 @@ try {
   assert(Array.isArray((await client.provider.list({ location })).data));
   assert(Array.isArray((await client.integration.list({ location })).data));
 
+  const createdEvent = untilEvent(events, (event) => event.type === 'session.created');
   const created = await client.session.create({ location });
   assert.match(created.id, /^ses_/);
+  assert.equal((await createdEvent).data.sessionID, created.id);
   assert.equal((await client.session.get({ sessionID: created.id, location })).id, created.id);
   assert(Array.isArray((await client.session.list({ location })).data));
   assert(Array.isArray((await client.message.list({ sessionID: created.id, location })).data));
@@ -137,18 +155,10 @@ try {
   ).output;
   assert(snapshot && typeof snapshot === 'object');
   assert('plan' in snapshot && 'questions' in snapshot);
-  const history = (
-    await client.rpc.call({
-      rpcID: 'planreview',
-      method: 'history',
-      location,
-      input: { sessionID: created.id },
-    })
-  ).output;
-  assert(history && typeof history === 'object' && Array.isArray(history.events));
   await client.session.remove({ sessionID: created.id, location });
-  console.log(`Live contract passed: ${version}, @opencode/client 2.0.20, ${plugin}`);
+  console.log(`Live contract passed: ${version}, @opencode/client 2.0.24, ${plugin}`);
 } finally {
+  eventController?.abort();
   if (server && server.exitCode === null) {
     server.kill();
     await Promise.race([new Promise((resolve) => server.once('exit', resolve)), delay(5_000)]);
