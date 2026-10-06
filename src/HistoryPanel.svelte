@@ -21,7 +21,7 @@
   let selectionError = $state('');
 
   function name(path: string): string {
-    return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+    return path.split(/[\\/]/).findLast((part) => part.length > 0) ?? path;
   }
 
   async function select(event: ActivityHistoryEvent) {

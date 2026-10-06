@@ -1380,12 +1380,12 @@
         }
       }
     }
-    for (const [paneId, snapshot] of Object.entries(agentEntrySnapshots)) {
+    for (const [paneId, entrySnapshot] of Object.entries(agentEntrySnapshots)) {
       const pane = paneId === 'main' ? null : leaves(paneLayout).find((leaf) => leaf.id === paneId);
       const agent = paneId === 'main' ? acpAgent : pane?.agent;
       const thread = paneId === 'main' ? acpThread : pane?.thread;
       if (!agent || !thread) continue;
-      for (const entry of snapshot.entries.slice(-50)) {
+      for (const entry of entrySnapshot.entries.slice(-50)) {
         if (entry.type !== 'tool' || !Number.isFinite(entry.created)) continue;
         input.push({
           workspace: thread.directory,
