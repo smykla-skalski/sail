@@ -18,7 +18,12 @@ export function visibleCommandText(text: string): string {
     .split('\n')
     .map((line) => {
       const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
-      if (marker && (!fence || (marker[0] === fence.marker && marker.length >= fence.length))) {
+      const closesFence =
+        fence &&
+        marker?.[0] === fence.marker &&
+        marker.length >= fence.length &&
+        line.slice(line.indexOf(marker) + marker.length).trim() === '';
+      if (marker && (!fence || closesFence)) {
         fence = fence ? null : { marker: marker[0], length: marker.length };
         return ' '.repeat(line.length);
       }

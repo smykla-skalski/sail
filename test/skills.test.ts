@@ -37,6 +37,7 @@ void test('a selected skill resolves from a prompt with arguments', () => {
   );
   assert.equal(promptSkill(skills, 'A stray ` mark\nPlease /review')?.id, 'two');
   assert.equal(promptSkill(skills, 'Example:\n    /review'), undefined);
+  assert.equal(promptSkill(skills, 'Example:\n```\n/review\n```js\n/review\n```'), undefined);
 });
 
 void test('bundled skills fill missing names without replacing installed skills', () => {
