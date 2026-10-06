@@ -67,6 +67,11 @@
     reportedHookIdentity,
     toolFailurePrompt,
   } from './lib/tool-failure';
+  import {
+    composerDraftKey,
+    recallComposerDraft,
+    rememberComposerDraft,
+  } from './lib/composer-drafts';
 
   let {
     client,
@@ -76,6 +81,7 @@
     setup,
     coordinationMessages = [],
     spawnReceipts = [],
+    onopensubagent,
     postTurnChecks = [],
     onretrycheck,
     focused,
@@ -99,6 +105,7 @@
     setup: SetupReport | null;
     coordinationMessages?: CoordinationMessage[];
     spawnReceipts?: SpawnReceipt[];
+    onopensubagent?: (receipt: SpawnReceipt) => Promise<void>;
     postTurnChecks?: PostTurnCheck[];
     onretrycheck: (check: PostTurnCheck) => void;
     focused: boolean;
@@ -424,6 +431,8 @@
 
   async function activate(id: string | null) {
     const current = ++generation;
+    rememberDraft(activeID);
+    const savedDraft = recallComposerDraft(composerDraftKey(directory, 'opencode', id));
     if (activeID)
       rememberOpenCodeTimeline(directory, activeID, {
         messages,
@@ -443,7 +452,7 @@
         pickedCaptureIds.delete(path);
         void invoke('browser_remove_capture', { path });
       }
-    draft = '';
+    draft = savedDraft?.text ?? '';
     files = [];
     selectedThreadId = id;
     activeID = id;
@@ -489,6 +498,18 @@
     } finally {
       if (current === generation) loading = false;
     }
+    if (current === generation && savedDraft) {
+      await tick();
+      prompt?.setSelectionRange(savedDraft.selectionStart, savedDraft.selectionEnd);
+    }
+  }
+
+  function rememberDraft(sessionId = activeID, input: HTMLTextAreaElement | undefined = prompt) {
+    rememberComposerDraft(composerDraftKey(directory, 'opencode', sessionId), {
+      text: input?.value ?? draft,
+      selectionStart: input?.selectionStart ?? draft.length,
+      selectionEnd: input?.selectionEnd ?? draft.length,
+    });
   }
 
   $effect(() => {
@@ -591,6 +612,7 @@
     disposed = false;
     mounted = true;
     return () => {
+      rememberDraft();
       if (activeID) rememberOpenCodeTimeline(directory, activeID, { messages, cursor });
       disposed = true;
       mounted = false;
@@ -992,7 +1014,7 @@
       </ChatMessage>
     {/each}
     <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
-    <SpawnActivity receipts={spawnReceipts} />
+    <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
     {#if running}<div class="agent-busy" role="status">
         <ActivityStatus status={visibleStatus} /><Button
           size="sm"
@@ -1026,6 +1048,8 @@
         data-pane-prompt
         aria-label="Message OpenCode"
         bind:value={draft}
+        oninput={(event) => rememberDraft(activeID, event.currentTarget)}
+        onselect={(event) => rememberDraft(activeID, event.currentTarget)}
         onpaste={(event) => {
           pendingPaste = Promise.all([pendingPaste, pasteFiles(event)]).then(() => {});
         }}

@@ -31,6 +31,25 @@
 }
 * {
   box-sizing: border-box;
+  scrollbar-color: transparent transparent;
+  scrollbar-width: thin;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: transparent;
+}
+*.sail-scrollbar-active {
+  scrollbar-color: color-mix(in srgb, var(--sui-muted) 55%, transparent) transparent;
+}
+*.sail-scrollbar-active::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--sui-muted) 55%, transparent);
 }
 body {
   margin: 0;
@@ -49,6 +68,22 @@ button:disabled {
 :where(button, input, textarea, select, summary, a):focus-visible {
   outline: 3px solid var(--sui-primary);
   outline-offset: 2px;
+}
+:where(
+  .project-control,
+  .project-group-toggle,
+  .project-icon-button,
+  .project-repository-select,
+  .project-worktree-select,
+  .project-agent-row,
+  .breadcrumb-project,
+  .agent-menu-launch,
+  .mobile-switcher button,
+  .side-tabs button
+):focus-visible {
+  outline: 3px solid var(--sui-primary);
+  outline-offset: -3px;
+  box-shadow: inset 0 0 0 3px var(--sui-primary);
 }
 .app-shell {
   display: flex;
@@ -70,8 +105,8 @@ button:disabled {
 }
 .sidebar-toggle {
   flex: 0 0 auto;
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
   border: 0;
   border-radius: 7px;
   color: var(--sui-muted);
@@ -171,6 +206,7 @@ button:disabled {
   cursor: pointer;
 }
 .project-control {
+  min-height: 32px;
   padding: 4px 2px;
   font-size: 10px;
 }
@@ -205,9 +241,12 @@ button:disabled {
   width: 16px;
   color: var(--shell-muted);
 }
+.project-group-toggle {
+  min-height: 32px;
+}
 .project-icon-button {
-  flex: 0 0 24px;
-  min-height: 24px;
+  flex: 0 0 32px;
+  min-height: 32px;
   border-radius: 5px;
   font-size: 15px;
 }
@@ -225,6 +264,7 @@ button:disabled {
   align-items: center;
   gap: 7px;
   min-width: 0;
+  min-height: 32px;
   padding: 6px 4px 6px 17px;
   text-align: left;
   font-size: 12px;
@@ -243,6 +283,7 @@ button:disabled {
   align-items: center;
   gap: 7px;
   min-width: 0;
+  min-height: 32px;
   padding: 5px 4px 5px 32px;
   border: 0;
   color: var(--sui-muted);
@@ -270,6 +311,7 @@ button:disabled {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   width: 100%;
+  min-height: 32px;
   gap: 1px 5px;
   padding: 4px 5px;
   border: 0;
@@ -1501,6 +1543,7 @@ button:disabled {
   background: var(--sui-surface);
 }
 .side-tabs button {
+  min-height: 32px;
   padding: 8px 12px;
   border: 0;
   border-radius: 6px;
@@ -1900,7 +1943,10 @@ button:disabled {
   }
   .agent-menu-launch {
     display: inline-block;
+    min-height: 32px;
+    padding: 4px 8px;
     border: 0;
+    border-radius: 6px;
     color: var(--sui-muted);
     background: transparent;
     font: inherit;
@@ -1956,13 +2002,31 @@ button:disabled {
   }
   .mobile-switcher button {
     flex: 1;
-    padding: 3px 6px;
+    min-height: 44px;
+    padding: 8px 6px;
     border: 0;
     border-radius: 6px;
     color: var(--sui-muted);
     background: transparent;
     font: inherit;
     font-size: 12px;
+  }
+  .sidebar-toggle,
+  .project-control,
+  .project-group-toggle,
+  .project-icon-button,
+  .project-repository-select,
+  .project-worktree-select,
+  .project-agent-row,
+  .agent-menu-launch,
+  .side-tabs button {
+    min-height: 44px;
+  }
+  .sidebar-toggle {
+    width: 44px;
+  }
+  .project-icon-button {
+    flex-basis: 44px;
   }
   .mobile-switcher button[aria-pressed='true'] {
     color: var(--shell-selected-ink);
@@ -2047,7 +2111,7 @@ button:disabled {
     grid-template-columns: auto minmax(0, 1fr);
     grid-template-rows: auto auto;
     align-content: start;
-    gap: 4px 8px;
+    gap: 2px 8px;
   }
   .topbar-actions {
     display: flex;
@@ -2102,12 +2166,18 @@ button:disabled {
   align-items: center;
 }
 .breadcrumb-project {
-  padding: 0;
+  min-height: 32px;
+  padding: 4px 6px;
   border: 0;
   color: var(--sui-muted);
   background: transparent;
   font-size: inherit;
   white-space: nowrap;
+}
+@media (max-width: 850px) {
+  .breadcrumb-project {
+    min-height: 44px;
+  }
 }
 .breadcrumb-project:hover {
   color: var(--sui-primary);

@@ -922,6 +922,8 @@
       anchorOffset: number;
       sideTab: SideTab;
       selectedFilePath: string | null;
+      selectionStart: number;
+      selectionEnd: number;
       sideScroll: Partial<Record<SideTab, number[]>>;
     }
   >();
@@ -1132,6 +1134,8 @@
           : (previous?.anchorOffset ?? 0),
       sideTab,
       selectedFilePath,
+      selectionStart: mainPrompt?.selectionStart ?? draft.length,
+      selectionEnd: mainPrompt?.selectionEnd ?? draft.length,
       sideScroll: detailsVisible
         ? {
             ...previous?.sideScroll,
@@ -1151,6 +1155,7 @@
       if (current !== selection || id !== sessionID) return;
     }
     await tick();
+    if (saved && mainPrompt) mainPrompt.setSelectionRange(saved.selectionStart, saved.selectionEnd);
     if (saved && chatScroll) {
       cancelAnimationFrame(followFrame);
       followChat = saved.follow;
@@ -5869,9 +5874,16 @@
           : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available)
       )
         throw new Error('This session’s agent is unavailable.');
-      await jumpToRecentThread(threadKey(thread));
+      if (!(await jumpToRecentThread(threadKey(thread))))
+        throw new Error('Session history is unavailable. Open the worktree to inspect it.');
     } else await loadProject(path);
     closeShipRuns();
+  }
+
+  async function openSpawnTarget(receipt: SpawnReceipt) {
+    if (!receipt.targetId || !receipt.targetDirectory)
+      throw new Error('The child has not confirmed a target thread.');
+    await openShipTarget(receipt.targetDirectory, receipt.targetId);
   }
 
   function openInbox() {
@@ -9139,6 +9151,7 @@
                   acpThread ? `acp:${acpAgent}:${acpThread.sessionId}` : null,
                   directory,
                 )}
+                onopensubagent={openSpawnTarget}
                 focusPrompt={promptFocusPane === 'main'}
                 picked={pickedAttachments.main}
                 prefill={issuePrefills[directory]}
@@ -9350,6 +9363,7 @@
                   sessionID ? `opencode:${sessionID}` : null,
                   directory,
                 )}
+                onopen={openSpawnTarget}
               />
               {#if running && runtimeState === 'connected'}<div class="chat-working">
                   <ActivityStatus
@@ -9614,6 +9628,7 @@
         {runtimeState}
         {coordinationMessages}
         {spawnReceipts}
+        onopensubagent={openSpawnTarget}
         {shipRuns}
         {shippingBusy}
         onshiprefresh={() => tickShippingRuns(true)}
