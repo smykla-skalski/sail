@@ -38,7 +38,7 @@ describe('composer task location', () => {
   it('keeps real per-worktree context beside active and restored prompts', async () => {
     const repositoryPath = realpathSync(repository);
     const worktreePath = realpathSync(worktree);
-    const repositoryName = repositoryPath.split('/').at(-1)!;
+    const repositoryName = repositoryPath.split(/[\\/]/).at(-1)!;
     await browser.execute(
       (path, child, childBranch) => {
         localStorage.setItem('sai-directory', path);

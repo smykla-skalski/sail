@@ -18,7 +18,7 @@
   );
 </script>
 
-<div class="task-location" aria-label={accessibleLabel} title={fullLabel}>
+<div class="task-location" role="note" aria-label={accessibleLabel} title={fullLabel}>
   <span class="task-location-marker" aria-hidden="true">⌖</span>
   {#if location.repository}<span class="task-location-repository" dir="auto"
       >{location.repository}</span
