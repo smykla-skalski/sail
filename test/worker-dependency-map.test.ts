@@ -77,3 +77,20 @@ await test('dependency map keeps cycles and missing or unavailable targets visib
   assert.equal(graph.nodes.find((node) => node.label === 'other/repo#9')?.depth, 0);
   assert.equal(graph.nodes.find((node) => node.id === 'owner/repo#3')?.depth, 1);
 });
+
+await test('dependency map preserves draft ID case and normalizes only repository references', () => {
+  const upper = { ...issue(1), id: 'A' };
+  const lower = { ...issue(2), id: 'a' };
+  const dependent = { ...issue(3, ['A', 'Owner/Repo#2', '99']), id: 'dependent' };
+  const graph = buildWorkerDependencyMap(run([upper, lower, dependent]));
+
+  assert.deepEqual(
+    graph.edges.map(({ from, to }) => [from, to]),
+    [
+      ['A', 'dependent'],
+      ['a', 'dependent'],
+      ['external:99', 'dependent'],
+    ],
+  );
+  assert.equal(graph.nodes.find((node) => node.id === 'external:99')?.owner, 'owner/repo');
+});

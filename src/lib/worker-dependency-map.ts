@@ -26,15 +26,25 @@ export type WorkerDependencyMap = {
 function localAliases(run: ShipRun): Map<string, ShipIssue> {
   const aliases = new Map<string, ShipIssue>();
   for (const issue of run.issues) {
-    aliases.set(issue.id.toLowerCase(), issue);
+    aliases.set(issue.id, issue);
     aliases.set(String(issue.number), issue);
-    aliases.set(`${run.remote.toLowerCase()}#${issue.number}`, issue);
   }
   return aliases;
 }
 
+function localReference(reference: string, remote: string): string {
+  const match = /^([^/#]+\/[^/#]+)#([1-9]\d*)$/.exec(reference);
+  return match && match[1].toLowerCase() === remote.toLowerCase() ? match[2] : reference;
+}
+
 function externalId(reference: string): string {
-  return `external:${reference.toLowerCase()}`;
+  const match = /^([^/#]+\/[^/#]+)#([1-9]\d*)$/.exec(reference);
+  return `external:${match ? `${match[1].toLowerCase()}#${match[2]}` : reference}`;
+}
+
+function dependencyOwner(reference: string, remote: string): string {
+  const match = /^([^/#]+\/[^/#]+)#[1-9]\d*$/.exec(reference);
+  return match?.[1] ?? remote;
 }
 
 export function hasWorkerDependencies(run: ShipRun): boolean {
@@ -53,7 +63,7 @@ export function buildWorkerDependencyMap(run: ShipRun): WorkerDependencyMap {
 
   for (const issue of run.issues) {
     for (const reference of issue.dependsOn) {
-      const target = aliases.get(reference.toLowerCase());
+      const target = aliases.get(localReference(reference, run.remote));
       if (target) {
         dependencies.get(issue.id)!.push(target);
         edges.push({ from: target.id, to: issue.id, error: false });
@@ -70,7 +80,7 @@ export function buildWorkerDependencyMap(run: ShipRun): WorkerDependencyMap {
           id,
           kind: missing ? 'missing' : 'external',
           label: reference,
-          owner: url ? reference.split('#')[0] || run.remote : 'Unknown repository',
+          owner: url ? dependencyOwner(reference, run.remote) : 'Unknown repository',
           state: problem ? 'Unavailable' : run.externalClosed[reference] ? 'Closed' : 'Waiting',
           blockingReason: problem,
           checkState: 'Unavailable',
