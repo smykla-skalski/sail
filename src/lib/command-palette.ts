@@ -192,7 +192,8 @@ export function searchCommandPalette({
       return rank(
         [...repositories, ...worktrees, ...sessionEntries, ...commandEntries],
         query,
-        (entry) => `${entry.label} ${entry.detail} ${entry.command?.command ?? ''}`,
+        (entry) =>
+          `${entry.label} ${entry.detail} ${entry.directory ?? ''} ${entry.command?.command ?? ''}`,
         (entry) =>
           entry.thread && running.has(threadKey(entry.thread))
             ? 2

@@ -5492,11 +5492,13 @@
     if (step.kind === 'projects' && entry.kind === 'thread' && entry.thread) {
       paletteBusy = true;
       paletteError = '';
+      const workspaceError = error;
       try {
         if (!(await jumpToRecentThread(threadKey(entry.thread))))
           throw new Error('This session is no longer available.');
         closeCommandPalette(false);
       } catch (cause) {
+        error = workspaceError;
         paletteError = describe(cause);
       } finally {
         paletteBusy = false;

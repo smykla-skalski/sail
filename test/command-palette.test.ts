@@ -74,10 +74,15 @@ void test('project search keeps duplicate names distinct and shows group context
 void test('root search finds agent work by title, provider, and worktree context', () => {
   const titleMatch = search({ kind: 'projects' }, 'older');
   const providerAndBranchMatch = search({ kind: 'projects' }, 'claude feature');
+  const pathMatch = search({ kind: 'projects' }, '/work/alpha-feature');
 
   assert.equal(titleMatch[0]?.thread?.sessionId, 'old');
   assert.deepEqual(
     providerAndBranchMatch.map((entry) => entry.thread?.sessionId),
+    ['old', 'new'],
+  );
+  assert.deepEqual(
+    pathMatch.filter((entry) => entry.kind === 'thread').map((entry) => entry.thread?.sessionId),
     ['old', 'new'],
   );
 });
