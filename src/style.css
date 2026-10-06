@@ -1574,12 +1574,21 @@ button:disabled {
   min-width: 0;
   min-height: 0;
 }
+.chat-body {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
 .conversation {
   flex: 1;
   overflow: auto;
   padding: 28px max(28px, calc((100% - 740px) / 2));
 }
-.chat-area > .conversation {
+.chat-area > .conversation,
+.chat-area > .chat-body > .conversation {
+  min-width: 0;
   padding-inline: 20px;
 }
 .chat-area > .agent-header {

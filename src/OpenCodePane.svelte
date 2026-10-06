@@ -8,6 +8,7 @@
   import ActivityStatus from './ActivityStatus.svelte';
   import TaskLocation from './TaskLocation.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
+  import WorkspaceActivity from './WorkspaceActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
@@ -77,6 +78,7 @@
     composerTaskLocation,
     type TaskLocation as TaskLocationValue,
   } from './lib/task-location';
+  import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
 
   let {
     client,
@@ -320,6 +322,67 @@
                 ? 'ready'
                 : 'offline',
   );
+  const workspaceActivity = $derived(
+    workspaceActivityItems({
+      tools: messages.flatMap((message) =>
+        message.type === 'assistant'
+          ? message.content.flatMap((part) =>
+              part.type === 'tool'
+                ? [
+                    {
+                      id: `${message.id}:${part.id}`,
+                      title: part.name,
+                      status: part.state.status,
+                      updated: message.time.created,
+                    },
+                  ]
+                : [],
+            )
+          : [],
+      ),
+      children: spawnReceipts,
+      decisions: [
+        ...pendingPermissions.map((request) => ({
+          id: request.id,
+          title: `Allow ${request.action}?`,
+          detail: 'Agent permission request',
+        })),
+        ...pendingForms.map((form) => ({
+          id: form.id,
+          title: form.title,
+          detail: 'Agent form request',
+        })),
+      ],
+      checks: postTurnChecks,
+    }),
+  );
+  let workspace: HTMLDivElement;
+
+  async function selectWorkspaceActivity(item: WorkspaceActivityItem) {
+    if (item.kind === 'child') {
+      const receipt = spawnReceipts.find((entry) => entry.receiptId === item.sourceId);
+      if (receipt?.targetId && receipt.targetDirectory && onopensubagent) {
+        await onopensubagent(receipt);
+        return;
+      }
+    }
+    await tick();
+    const attribute =
+      item.kind === 'tool'
+        ? 'data-tool-id'
+        : item.kind === 'child'
+          ? 'data-spawn-id'
+          : item.kind === 'decision'
+            ? 'data-request-id'
+            : 'data-check-id';
+    const target = workspace.querySelector<HTMLElement>(
+      `[${attribute}="${CSS.escape(item.sourceId)}"]`,
+    );
+    for (let parent = target?.parentElement; parent; parent = parent.parentElement)
+      if (parent instanceof HTMLDetailsElement) parent.open = true;
+    target?.scrollIntoView({ block: 'center' });
+    (target instanceof HTMLDetailsElement ? target.querySelector('summary') : target)?.focus();
+  }
   const contextUsage = $derived(openCodeContextUsage(messages, setup?.models ?? []));
   const chosenModel = $derived(
     setup?.models.find((model) => `${model.providerID}:${model.id}` === selectedModel),
@@ -923,7 +986,7 @@
   }
 </script>
 
-<div class="agent-workspace opencode-pane">
+<div class="agent-workspace opencode-pane" bind:this={workspace}>
   <div class="agent-header">
     <div class="agent-heading">
       <HarnessIcon agent="opencode" /><strong>OpenCode</strong><span
@@ -933,103 +996,111 @@
     {#if contextUsage !== undefined}<span class="agent-usage">Context {contextUsage}%</span>{/if}
     <ActivityStatus status={visibleStatus} />
   </div>
-  <div
-    class="agent-conversation conversation"
-    bind:this={scroll}
-    aria-label="OpenCode conversation"
-    onscroll={() => {
-      following = nearBottom(scroll);
-      if (scroll.scrollTop <= 80) void loadOlder();
-    }}
-  >
-    {#if !messages.length && !loading}<div class="agent-welcome">
-        <h1>Work with OpenCode</h1>
-        <p>Describe the work. Sail will show messages, tools, and approvals here.</p>
-      </div>{/if}
-    {#each displayMessages as message (message.id)}
-      {#if message.type === 'spawn-response'}
-        <SpawnResponse receipt={message.receipt} />
-      {:else if message.type === 'user'}
-        {@const attribution = coordinationMessageForText(message.text, coordinationMessages)}
-        <ChatMessage kind="user" author={attribution ? `From ${attribution.sender}` : 'You'}>
-          <Markdown
-            source={attribution
-              ? message.text.replace(coordinationPrompt(attribution), attribution.text)
-              : message.text}
-          />
-          {#if message.files?.length}<div class="message-files">
-              {#each message.files as file, index (index)}<span
-                  >{file.name ??
-                    (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
-                >{/each}
-            </div>{/if}
-        </ChatMessage>
-      {:else if message.type === 'assistant'}
-        {@const text = message.content
-          .filter((part) => part.type === 'text')
-          .map((part) => part.text)
-          .join('\n')}
-        <ChatMessage kind="assistant" author={message.agent}>
-          {#if text}<Markdown source={text} />{/if}
-          {#each message.content as part, ordinal (ordinal)}
-            {#if part.type === 'tool'}
-              {@const reason =
-                part.state.status === 'error' ? openCodeErrorDetails(part.state.error) : ''}
-              {@const output =
-                part.state.status === 'completed' || part.state.status === 'error'
-                  ? (part.state.content ?? [])
-                      .map((item) => (item.type === 'text' ? item.text : (item.name ?? item.uri)))
-                      .join('\n')
-                  : ''}
-              <ToolActivity
-                title={part.name}
-                status={part.state.status}
-                input={part.state.input}
-                {output}
-                error={reason}
-                source={part.state.status === 'error'
-                  ? (reportedHookIdentity(part.state.metadata) ?? '')
-                  : ''}
-                onfix={part.state.status === 'error'
-                  ? () =>
-                      fixToolFailure(
-                        `${message.id}:${part.id}`,
-                        part.name,
-                        part.state.input,
-                        reason,
-                        output,
-                      )
-                  : undefined}
-              />
-            {/if}
-          {/each}
-          {#if message.retry}<p class="retry-state" role="status">
-              Retry {message.retry.attempt}: {message.retry.error.message}
-            </p>{/if}
-          {#if message.error}<p class="message-error" role="alert">
-              {message.error.message}
-            </p>{/if}
-        </ChatMessage>
-      {/if}
-    {/each}
-    <OpenCodeSubagents {client} parentID={activeID} />
-    {#each coordinationMessages.filter((message) => !messages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
-      <ChatMessage
-        kind="user"
-        author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
-      >
-        <Markdown source={message.text} />
-      </ChatMessage>
-    {/each}
-    <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
-    <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
-    {#if running}<div class="agent-busy" role="status">
-        <ActivityStatus status={visibleStatus} /><Button
-          size="sm"
-          variant="secondary"
-          onclick={stop}>Stop</Button
+  <div class="agent-body">
+    <div
+      class="agent-conversation conversation"
+      bind:this={scroll}
+      aria-label="OpenCode conversation"
+      onscroll={() => {
+        following = nearBottom(scroll);
+        if (scroll.scrollTop <= 80) void loadOlder();
+      }}
+    >
+      {#if !messages.length && !loading}<div class="agent-welcome">
+          <h1>Work with OpenCode</h1>
+          <p>Describe the work. Sail will show messages, tools, and approvals here.</p>
+        </div>{/if}
+      {#each displayMessages as message (message.id)}
+        {#if message.type === 'spawn-response'}
+          <SpawnResponse receipt={message.receipt} />
+        {:else if message.type === 'user'}
+          {@const attribution = coordinationMessageForText(message.text, coordinationMessages)}
+          <ChatMessage kind="user" author={attribution ? `From ${attribution.sender}` : 'You'}>
+            <Markdown
+              source={attribution
+                ? message.text.replace(coordinationPrompt(attribution), attribution.text)
+                : message.text}
+            />
+            {#if message.files?.length}<div class="message-files">
+                {#each message.files as file, index (index)}<span
+                    >{file.name ??
+                      (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
+                  >{/each}
+              </div>{/if}
+          </ChatMessage>
+        {:else if message.type === 'assistant'}
+          {@const text = message.content
+            .filter((part) => part.type === 'text')
+            .map((part) => part.text)
+            .join('\n')}
+          <ChatMessage kind="assistant" author={message.agent}>
+            {#if text}<Markdown source={text} />{/if}
+            {#each message.content as part, ordinal (ordinal)}
+              {#if part.type === 'tool'}
+                {@const reason =
+                  part.state.status === 'error' ? openCodeErrorDetails(part.state.error) : ''}
+                {@const output =
+                  part.state.status === 'completed' || part.state.status === 'error'
+                    ? (part.state.content ?? [])
+                        .map((item) => (item.type === 'text' ? item.text : (item.name ?? item.uri)))
+                        .join('\n')
+                    : ''}
+                <ToolActivity
+                  title={part.name}
+                  status={part.state.status}
+                  activityId={`${message.id}:${part.id}`}
+                  input={part.state.input}
+                  {output}
+                  error={reason}
+                  source={part.state.status === 'error'
+                    ? (reportedHookIdentity(part.state.metadata) ?? '')
+                    : ''}
+                  onfix={part.state.status === 'error'
+                    ? () =>
+                        fixToolFailure(
+                          `${message.id}:${part.id}`,
+                          part.name,
+                          part.state.input,
+                          reason,
+                          output,
+                        )
+                    : undefined}
+                />
+              {/if}
+            {/each}
+            {#if message.retry}<p class="retry-state" role="status">
+                Retry {message.retry.attempt}: {message.retry.error.message}
+              </p>{/if}
+            {#if message.error}<p class="message-error" role="alert">
+                {message.error.message}
+              </p>{/if}
+          </ChatMessage>
+        {/if}
+      {/each}
+      <OpenCodeSubagents {client} parentID={activeID} />
+      {#each coordinationMessages.filter((message) => !messages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
+        <ChatMessage
+          kind="user"
+          author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
         >
-      </div>{/if}
+          <Markdown source={message.text} />
+        </ChatMessage>
+      {/each}
+      <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
+      <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
+      {#if running}<div class="agent-busy" role="status">
+          <ActivityStatus status={visibleStatus} /><Button
+            size="sm"
+            variant="secondary"
+            onclick={stop}>Stop</Button
+          >
+        </div>{/if}
+    </div>
+    <WorkspaceActivity
+      items={workspaceActivity}
+      storageKey={`sai-workspace-activity:${directory}:opencode`}
+      onselect={selectWorkspaceActivity}
+    />
   </div>
   <div class="agent-composer composer-wrap">
     <div class="composer">
@@ -1142,9 +1213,17 @@
 
 <style>
   .opencode-pane {
+    position: relative;
     display: flex;
     flex: 1;
     flex-direction: column;
+    min-height: 0;
+  }
+  .opencode-pane .agent-body {
+    position: relative;
+    display: flex;
+    flex: 1;
+    min-width: 0;
     min-height: 0;
   }
   .opencode-pane .agent-header {

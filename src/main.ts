@@ -29,6 +29,13 @@ async function start() {
     const { default: SpawnActivityFixture } =
       await import('../test/e2e/spawn-activity-fixture.svelte');
     mount(SpawnActivityFixture, { target: document.getElementById('root')! });
+  } else if (
+    import.meta.env.MODE === 'e2e' &&
+    new URLSearchParams(location.search).has('workspace-activity-fixture')
+  ) {
+    const { default: WorkspaceActivityFixture } =
+      await import('../test/e2e/workspace-activity-fixture.svelte');
+    mount(WorkspaceActivityFixture, { target: document.getElementById('root')! });
   } else if (new URLSearchParams(location.search).get('window') === 'settings') {
     const { default: SettingsWindow } = await import('./SettingsWindow.svelte');
     mount(SettingsWindow, { target: document.getElementById('root')! });

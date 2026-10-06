@@ -10,6 +10,7 @@
     error = '',
     source = '',
     expanded = false,
+    activityId,
     onfix,
     children,
   }: {
@@ -20,6 +21,7 @@
     error?: string;
     source?: string;
     expanded?: boolean;
+    activityId?: string;
     onfix?: () => void;
     children?: import('svelte').Snippet;
   } = $props();
@@ -32,7 +34,7 @@
   const formattedInput = $derived(toolInput(input));
 </script>
 
-<details class="tool-activity" bind:open>
+<details class="tool-activity" data-tool-id={activityId} bind:open>
   <summary>
     <span class="tool-activity-name">{title}</span>
     <ActivityStatus {status} compact />

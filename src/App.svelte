@@ -18,6 +18,8 @@
   import { Button } from '@smykla-skalski/sui';
   import ActivityStatus from './ActivityStatus.svelte';
   import TaskLocation from './TaskLocation.svelte';
+  import WorkspaceActivity from './WorkspaceActivity.svelte';
+  import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
   import Markdown from './Markdown.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import SpawnResponse from './SpawnResponse.svelte';
@@ -1283,6 +1285,48 @@
   );
   let chatMessages = $derived(
     messages.filter((message) => message.type === 'user' || message.type === 'assistant'),
+  );
+  const mainSpawnActivity = $derived(
+    spawnReceiptsForSource(spawnReceipts, sessionID ? `opencode:${sessionID}` : null, directory),
+  );
+  const mainPostTurnChecks = $derived(
+    postTurnResults.filter(
+      (check) => check.directory === directory && check.thread === `opencode:${sessionID}`,
+    ),
+  );
+  const mainWorkspaceActivity = $derived(
+    workspaceActivityItems({
+      tools: chatMessages.flatMap((message) =>
+        message.type === 'assistant'
+          ? message.content.flatMap((part) =>
+              part.type === 'tool'
+                ? [
+                    {
+                      id: `${message.id}:${part.id}`,
+                      title: part.name,
+                      status: part.state.status,
+                      updated: message.time.created,
+                    },
+                  ]
+                : [],
+            )
+          : [],
+      ),
+      children: mainSpawnActivity,
+      decisions: [
+        ...pendingPermissions.map((request) => ({
+          id: request.id,
+          title: `Allow ${request.action}?`,
+          detail: 'Agent permission request',
+        })),
+        ...pendingForms.map((form) => ({
+          id: form.id,
+          title: form.title,
+          detail: 'Agent form request',
+        })),
+      ],
+      checks: mainPostTurnChecks,
+    }),
   );
   $effect(() => {
     if (!sessionID || !running) return;
@@ -6410,6 +6454,32 @@
     item?.focus();
   }
 
+  async function selectMainWorkspaceActivity(item: WorkspaceActivityItem) {
+    if (item.kind === 'child') {
+      const receipt = mainSpawnActivity.find((entry) => entry.receiptId === item.sourceId);
+      if (receipt?.targetId && receipt.targetDirectory) {
+        await openSpawnTarget(receipt);
+        return;
+      }
+    }
+    await tick();
+    const attribute =
+      item.kind === 'tool'
+        ? 'data-tool-id'
+        : item.kind === 'child'
+          ? 'data-spawn-id'
+          : item.kind === 'decision'
+            ? 'data-request-id'
+            : 'data-check-id';
+    const target = chatArea?.querySelector<HTMLElement>(
+      `[${attribute}="${CSS.escape(item.sourceId)}"]`,
+    );
+    for (let parent = target; parent; parent = parent.parentElement)
+      if (parent instanceof HTMLDetailsElement) parent.open = true;
+    target?.scrollIntoView({ block: 'center' });
+    (target instanceof HTMLDetailsElement ? target.querySelector('summary') : target)?.focus();
+  }
+
   function focusPane(id: string) {
     if (focusedPane === id) return;
     ++recentJumpGeneration;
@@ -9252,165 +9322,164 @@
                             : 'offline'}
               />
             </div>
-            <div
-              class="conversation"
-              bind:this={chatScroll}
-              onscroll={() => {
-                followChat = chatScroll ? nearBottom(chatScroll) : true;
-                if (chatScroll && chatScroll.scrollTop <= 80) void loadOlderMessages();
-              }}
-            >
-              {#if !sessionID && messages.length === 0}<div class="welcome">
-                  <div class="welcome-mark">◇</div>
-                  <p class="eyebrow">{planReady ? 'PLAN WITH ARCHITECT' : 'START WORK'}</p>
-                  <h1>What are we working on?</h1>
-                  <p>
-                    {planReady
-                      ? 'Choose an agent and model, then describe the work. Use New plan for Architect-first planning.'
-                      : workReady
-                        ? 'Choose an OpenCode agent and describe the work.'
-                        : agentAvailability.some((agent) => agent.available)
-                          ? 'Choose an available agent to start in this repository.'
-                          : 'Connect a model in OpenCode settings to start.'}
-                  </p>
-                  {#if !directory}<Button
-                      onclick={() => chooseProject()}
-                      disabled={runtimeState !== 'connected'}>Select repository</Button
-                    >{/if}
-                  {#if directory && !workReady}<div class="welcome-agents">
-                      {#each agentAvailability.filter((agent) => agent.available) as agent (agent.id)}<Button
-                          variant="secondary"
-                          onclick={() => openAgent(agent.id)}
-                          >Start with <HarnessIcon agent={agent.id} /> {agent.name}</Button
-                        >{/each}
-                    </div>{/if}
-                </div>{/if}
-              {#each displayChatMessages as message (message.id)}
-                {#if message.type === 'spawn-response'}
-                  <SpawnResponse receipt={message.receipt} />
-                {:else if message.type === 'user'}
-                  {@const attribution = coordinationMessageForText(
-                    message.text,
-                    coordinationMessages.filter(
-                      (item) => item.target === coordinationKey(directory, `opencode:${sessionID}`),
-                    ),
-                  )}
-                  <ChatMessage
-                    kind="user"
-                    author={attribution ? `From ${attribution.sender}` : 'You'}
-                    messageId={message.id}
-                    created={message.time.created}
-                  >
-                    <Markdown
-                      source={attribution
-                        ? message.text.replace(coordinationPrompt(attribution), attribution.text)
-                        : message.text}
-                    />
-                    {#if message.files?.length}<div class="message-files">
-                        {#each message.files as file, fileIndex (fileIndex)}<span
-                            >{file.name ??
-                              (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
+            <div class="chat-body">
+              <div
+                class="conversation"
+                bind:this={chatScroll}
+                onscroll={() => {
+                  followChat = chatScroll ? nearBottom(chatScroll) : true;
+                  if (chatScroll && chatScroll.scrollTop <= 80) void loadOlderMessages();
+                }}
+              >
+                {#if !sessionID && messages.length === 0}<div class="welcome">
+                    <div class="welcome-mark">◇</div>
+                    <p class="eyebrow">{planReady ? 'PLAN WITH ARCHITECT' : 'START WORK'}</p>
+                    <h1>What are we working on?</h1>
+                    <p>
+                      {planReady
+                        ? 'Choose an agent and model, then describe the work. Use New plan for Architect-first planning.'
+                        : workReady
+                          ? 'Choose an OpenCode agent and describe the work.'
+                          : agentAvailability.some((agent) => agent.available)
+                            ? 'Choose an available agent to start in this repository.'
+                            : 'Connect a model in OpenCode settings to start.'}
+                    </p>
+                    {#if !directory}<Button
+                        onclick={() => chooseProject()}
+                        disabled={runtimeState !== 'connected'}>Select repository</Button
+                      >{/if}
+                    {#if directory && !workReady}<div class="welcome-agents">
+                        {#each agentAvailability.filter((agent) => agent.available) as agent (agent.id)}<Button
+                            variant="secondary"
+                            onclick={() => openAgent(agent.id)}
+                            >Start with <HarnessIcon agent={agent.id} /> {agent.name}</Button
                           >{/each}
                       </div>{/if}
-                  </ChatMessage>
-                {:else if message.type === 'assistant'}<ChatMessage
-                    kind="assistant"
-                    author={message.agent}
-                    messageId={message.id}
-                    created={message.time.created}
+                  </div>{/if}
+                {#each displayChatMessages as message (message.id)}
+                  {#if message.type === 'spawn-response'}
+                    <SpawnResponse receipt={message.receipt} />
+                  {:else if message.type === 'user'}
+                    {@const attribution = coordinationMessageForText(
+                      message.text,
+                      coordinationMessages.filter(
+                        (item) =>
+                          item.target === coordinationKey(directory, `opencode:${sessionID}`),
+                      ),
+                    )}
+                    <ChatMessage
+                      kind="user"
+                      author={attribution ? `From ${attribution.sender}` : 'You'}
+                      messageId={message.id}
+                      created={message.time.created}
+                    >
+                      <Markdown
+                        source={attribution
+                          ? message.text.replace(coordinationPrompt(attribution), attribution.text)
+                          : message.text}
+                      />
+                      {#if message.files?.length}<div class="message-files">
+                          {#each message.files as file, fileIndex (fileIndex)}<span
+                              >{file.name ??
+                                (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
+                            >{/each}
+                        </div>{/if}
+                    </ChatMessage>
+                  {:else if message.type === 'assistant'}<ChatMessage
+                      kind="assistant"
+                      author={message.agent}
+                      messageId={message.id}
+                      created={message.time.created}
+                    >
+                      {#if assistantText(message)}<Markdown source={assistantText(message)} />{/if}
+                      {#each message.content as part, ordinal (ordinal)}
+                        {#if part.type === 'tool'}
+                          {@const reason =
+                            part.state.status === 'error'
+                              ? openCodeErrorDetails(part.state.error)
+                              : ''}
+                          {@const output =
+                            part.state.status === 'completed' || part.state.status === 'error'
+                              ? (part.state.content ?? [])
+                                  .map((item) =>
+                                    item.type === 'text' ? item.text : (item.name ?? item.uri),
+                                  )
+                                  .join('\n')
+                              : ''}
+                          <ToolActivity
+                            activityId={`${message.id}:${part.id}`}
+                            title={part.name}
+                            status={part.state.status}
+                            input={part.state.input}
+                            {output}
+                            error={reason}
+                            source={part.state.status === 'error'
+                              ? (reportedHookIdentity(part.state.metadata) ?? '')
+                              : ''}
+                            onfix={part.state.status === 'error'
+                              ? () =>
+                                  fixOpenCodeToolFailure(
+                                    `${message.id}:${part.id}`,
+                                    part.name,
+                                    part.state.input,
+                                    reason,
+                                    output,
+                                  )
+                              : undefined}
+                          />
+                        {/if}
+                      {/each}
+                      {#if message.retry}<p class="retry-state" role="status">
+                          Retry {message.retry.attempt}: {message.retry.error.message}
+                        </p>{/if}
+                      {#if message.error}<p class="message-error" role="alert">
+                          {message.error.message}
+                        </p>{/if}
+                    </ChatMessage>{/if}
+                {/each}
+                <OpenCodeSubagents {client} parentID={sessionID} />
+                {#each coordinationMessages.filter((message) => sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`) && !chatMessages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
+                  <ChatMessage
+                    kind="user"
+                    author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
                   >
-                    {#if assistantText(message)}<Markdown source={assistantText(message)} />{/if}
-                    {#each message.content as part, ordinal (ordinal)}
-                      {#if part.type === 'tool'}
-                        {@const reason =
-                          part.state.status === 'error'
-                            ? openCodeErrorDetails(part.state.error)
-                            : ''}
-                        {@const output =
-                          part.state.status === 'completed' || part.state.status === 'error'
-                            ? (part.state.content ?? [])
-                                .map((item) =>
-                                  item.type === 'text' ? item.text : (item.name ?? item.uri),
-                                )
-                                .join('\n')
-                            : ''}
-                        <ToolActivity
-                          title={part.name}
-                          status={part.state.status}
-                          input={part.state.input}
-                          {output}
-                          error={reason}
-                          source={part.state.status === 'error'
-                            ? (reportedHookIdentity(part.state.metadata) ?? '')
-                            : ''}
-                          onfix={part.state.status === 'error'
-                            ? () =>
-                                fixOpenCodeToolFailure(
-                                  `${message.id}:${part.id}`,
-                                  part.name,
-                                  part.state.input,
-                                  reason,
-                                  output,
-                                )
-                            : undefined}
-                        />
-                      {/if}
-                    {/each}
-                    {#if message.retry}<p class="retry-state" role="status">
-                        Retry {message.retry.attempt}: {message.retry.error.message}
-                      </p>{/if}
-                    {#if message.error}<p class="message-error" role="alert">
-                        {message.error.message}
-                      </p>{/if}
-                  </ChatMessage>{/if}
-              {/each}
-              <OpenCodeSubagents {client} parentID={sessionID} />
-              {#each coordinationMessages.filter((message) => sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`) && !chatMessages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
-                <ChatMessage
-                  kind="user"
-                  author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
-                >
-                  <Markdown source={message.text} />
-                </ChatMessage>
-              {/each}
-              {#each liveOnly as [id, parts] (id)}
-                <ChatMessage
-                  kind="assistant"
-                  author={`${currentSession?.agent ?? 'Agent'} · streaming`}
-                  messageId={id}
-                >
-                  <Markdown
-                    source={Object.entries(parts)
-                      .toSorted(([a], [b]) => Number(a) - Number(b))
-                      .map(([, value]) => value)
-                      .join('\n')}
-                  />
-                </ChatMessage>
-              {/each}
-              <PostTurnChecks
-                checks={postTurnResults.filter(
-                  (check) =>
-                    check.directory === directory && check.thread === `opencode:${sessionID}`,
-                )}
-                onretry={(check) => void runOnePostTurnCheck(check, true)}
+                    <Markdown source={message.text} />
+                  </ChatMessage>
+                {/each}
+                {#each liveOnly as [id, parts] (id)}
+                  <ChatMessage
+                    kind="assistant"
+                    author={`${currentSession?.agent ?? 'Agent'} · streaming`}
+                    messageId={id}
+                  >
+                    <Markdown
+                      source={Object.entries(parts)
+                        .toSorted(([a], [b]) => Number(a) - Number(b))
+                        .map(([, value]) => value)
+                        .join('\n')}
+                    />
+                  </ChatMessage>
+                {/each}
+                <PostTurnChecks
+                  checks={mainPostTurnChecks}
+                  onretry={(check) => void runOnePostTurnCheck(check, true)}
+                />
+                <SpawnActivity receipts={mainSpawnActivity} onopen={openSpawnTarget} />
+                {#if running && runtimeState === 'connected'}<div class="chat-working">
+                    <ActivityStatus
+                      status={pendingPermissions.length || pendingForms.length
+                        ? 'waiting'
+                        : 'working'}
+                    />
+                    <span class="working-label" role="status">{activity}</span>
+                    <Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
+                  </div>{/if}
+              </div>
+              <WorkspaceActivity
+                items={mainWorkspaceActivity}
+                storageKey={`sai-workspace-activity:${directory}:main`}
+                onselect={selectMainWorkspaceActivity}
               />
-              <SpawnActivity
-                receipts={spawnReceiptsForSource(
-                  spawnReceipts,
-                  sessionID ? `opencode:${sessionID}` : null,
-                  directory,
-                )}
-                onopen={openSpawnTarget}
-              />
-              {#if running && runtimeState === 'connected'}<div class="chat-working">
-                  <ActivityStatus
-                    status={pendingPermissions.length || pendingForms.length
-                      ? 'waiting'
-                      : 'working'}
-                  />
-                  <span class="working-label" role="status">{activity}</span>
-                  <Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
-                </div>{/if}
             </div>
             {#if workReady || sessionID}<div class="composer-wrap">
                 <PromptPanel

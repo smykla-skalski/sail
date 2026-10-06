@@ -79,6 +79,8 @@
     {#each active as receipt (receipt.receiptId)}
       <article
         class="spawn-active state-{receipt.state}"
+        data-spawn-id={receipt.receiptId}
+        tabindex="-1"
         role="group"
         aria-label={`${label(receipt)} subagent`}
       >

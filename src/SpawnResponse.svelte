@@ -15,6 +15,8 @@
 
 <article
   class="message assistant-message spawn-response state-{receipt.state}"
+  data-spawn-id={receipt.receiptId}
+  tabindex="-1"
   aria-label={`${name} subagent response`}
 >
   <div class="avatar agent-avatar spawn-avatar">↳</div>
