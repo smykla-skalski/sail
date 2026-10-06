@@ -10,6 +10,12 @@ async function start() {
   if (import.meta.env.MODE === 'e2e') await import('@wdio/tauri-plugin');
   if (
     import.meta.env.MODE === 'e2e' &&
+    new URLSearchParams(location.search).has('diagram-fixture')
+  ) {
+    const { default: DiagramFixture } = await import('../test/e2e/diagram-fixture.svelte');
+    mount(DiagramFixture, { target: document.getElementById('root')! });
+  } else if (
+    import.meta.env.MODE === 'e2e' &&
     new URLSearchParams(location.search).has('tool-failure-fixture')
   ) {
     const { default: ToolFailureFixture } = await import('../test/e2e/tool-failure-fixture.svelte');
