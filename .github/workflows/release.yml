@@ -8,6 +8,7 @@ on:
       - scripts/package-release.mjs
       - src-tauri/Cargo.toml
       - src-tauri/Cargo.lock
+      - src-tauri/Entitlements.plist
       - src-tauri/tauri.conf.json
       - src-tauri/icons/**
   workflow_dispatch:
@@ -130,8 +131,8 @@ jobs:
           test -d "${apps[0]}"
           codesign --verify --deep --strict "${apps[0]}"
           entitlements="$RUNNER_TEMP/sail-entitlements.plist"
-          codesign -d --entitlements :- "${apps[0]}" > "$entitlements"
-          test "$(plutil -extract com.apple.developer.web-browser.public-key-credential raw -o - "$entitlements")" = true
+          codesign -d --entitlements - --xml "${apps[0]}" > "$entitlements"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.web-browser.public-key-credential' "$entitlements")" = true
           app_copy="$RUNNER_TEMP/sai-smoke/$(basename "${apps[0]}")"
           mkdir -p "$(dirname "$app_copy")"
           ditto "${apps[0]}" "$app_copy"
