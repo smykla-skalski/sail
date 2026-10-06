@@ -24,6 +24,7 @@
     matchingSkills,
     insertSkill,
     mergeSkills,
+    promptSkill,
     resolveSkillPrompt,
     skillQuery,
     type SkillChoice,
@@ -836,7 +837,7 @@
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
     try {
-      await beginShipItRun(directory, text);
+      await beginShipItRun(directory, text, promptSkill(skills, text)?.name ?? null);
     } catch (cause) {
       error = describe(cause);
       return;

@@ -494,7 +494,7 @@
     const turnDirectory = directory;
     const current = generation;
     try {
-      await beginShipItRun(turnDirectory, text);
+      await beginShipItRun(turnDirectory, text, promptSkill(skills, text)?.name ?? null);
     } catch (cause) {
       error = describe(cause);
       return;

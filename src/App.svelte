@@ -3543,7 +3543,8 @@
           'Cannot verify the actual validation model behind an alias. Select a concrete model ID.',
         );
     }
-    if (!validation) await beginShipItRun(created.path, prompt);
+    if (!validation)
+      await beginShipItRun(created.path, prompt, promptSkill(skills, prompt)?.name ?? null);
     if (source.kind === 'acp') {
       const session = await acp.create(source.agent, created.path).catch((cause) => {
         if (!validation) throw cause;
@@ -7855,7 +7856,7 @@
     const queueTurn = running;
     const sourceSkills = skills;
     try {
-      await beginShipItRun(path, text);
+      await beginShipItRun(path, text, promptSkill(sourceSkills, text)?.name ?? null);
     } catch (cause) {
       error = describe(cause);
       return;

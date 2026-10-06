@@ -140,7 +140,12 @@ export async function activeImplementationModels(
     : null;
 }
 
-export async function beginShipItRun(directory: string, prompt: string): Promise<void> {
+export async function beginShipItRun(
+  directory: string,
+  prompt: string,
+  selectedSkill?: string | null,
+): Promise<void> {
+  if (selectedSkill !== undefined && selectedSkill?.toLowerCase() !== 'ship-it') return;
   const command = slashCommands(prompt).find((item) => item.name.toLowerCase() === 'ship-it');
   if (!command) return;
   const issue =
