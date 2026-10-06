@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { SvelteSet } from 'svelte/reactivity';
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import Markdown from './Markdown.svelte';
@@ -171,7 +171,7 @@
     loadingOlderChildren = false;
     loadingOlderHistory = [];
     loadError = '';
-    if (client && parentID) void refresh();
+    if (client && parentID) untrack(() => void refresh());
   });
 
   onMount(() => {
