@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getSetting, setSetting } from './settings.ts';
+import { slashCommands } from './slash-commands.ts';
 
 function key(directory: string): string {
   return `sai-implementation-models:${directory}`;
@@ -140,10 +141,11 @@ export async function activeImplementationModels(
 }
 
 export async function beginShipItRun(directory: string, prompt: string): Promise<void> {
-  if (!/(?:^|\s)\/ship-it(?:\s|$)/i.test(prompt)) return;
+  const command = slashCommands(prompt).find((item) => item.name.toLowerCase() === 'ship-it');
+  if (!command) return;
   const issue =
-    /(?:^|\s)\/ship-it\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
-      prompt,
+    /^\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
+      prompt.slice(command.end),
     )?.[1];
   if (!issue) return;
   const canonical = async (reference: string): Promise<string> => {

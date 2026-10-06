@@ -87,6 +87,7 @@ void test('model history survives equivalent references and rejects a second iss
   await beginShipItRun(directory, '/ship-it #1');
   await beginShipItRun(directory, 'Please /ship-it #1');
   await beginShipItRun(directory, 'What does `/ship-it #2` do?');
+  await beginShipItRun(directory, 'Explain this:\n```\n/ship-it #2\n```');
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-a']));
   await beginShipItRun(directory, '/ship-it #1');
   assert.deepEqual(implementationModels(directory), ['model-a']);

@@ -5,6 +5,7 @@ export interface SkillChoice {
   instructions?: string;
 }
 import { getSetting } from './settings.ts';
+import { slashCommands, visibleCommandText } from './slash-commands.ts';
 import {
   parseValidationSettings,
   validationInstructions,
@@ -50,7 +51,7 @@ export function resolveSkillPrompt(
 }
 
 export function skillQuery(draft: string): string | null {
-  const match = /(?:^|\s)\/([^\s/]*)$/.exec(draft);
+  const match = /(?:^|\s)\/([^\s/]*)$/.exec(visibleCommandText(draft));
   return match?.[1].toLowerCase() ?? null;
 }
 
@@ -67,8 +68,8 @@ export function matchingSkills(skills: SkillChoice[], draft: string): SkillChoic
 }
 
 export function promptSkill(skills: SkillChoice[], text: string): SkillChoice | undefined {
-  for (const match of text.matchAll(/(?:^|\s)\/([^\s/]+)(?=\s|$)/g)) {
-    const skill = skills.find((item) => item.name.toLowerCase() === match[1].toLowerCase());
+  for (const command of slashCommands(text)) {
+    const skill = skills.find((item) => item.name.toLowerCase() === command.name.toLowerCase());
     if (skill) return skill;
   }
   return undefined;
