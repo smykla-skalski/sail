@@ -29,6 +29,7 @@ void test('a selected skill resolves from a prompt with arguments', () => {
   assert.equal(promptSkill(skills, '/ship-issues'), undefined);
   assert.equal(promptSkill(skills, 'Please /review this')?.id, 'two');
   assert.equal(promptSkill(skills, '/review then /ship-issue')?.id, 'two');
+  assert.equal(promptSkill(skills, 'What does `/review` do?'), undefined);
 });
 
 void test('bundled skills fill missing names without replacing installed skills', () => {

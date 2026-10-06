@@ -187,13 +187,18 @@
     if (expanded.includes(id)) void loadHistory(id);
   }
 
-  function activity(id: string): string {
-    const last = summaries[id];
-    if (!last || last.type !== 'assistant') return active.includes(id) ? 'Thinking' : 'Finished';
+  function activity(child: SessionInfo): string {
+    const last = summaries[child.id];
+    if (!last || last.type !== 'assistant')
+      return active.includes(child.id)
+        ? 'Thinking'
+        : child.outcome
+          ? 'Finished'
+          : 'Waiting to start';
     const part = last.content.findLast((item) => item.type === 'tool' || item.type === 'text');
     if (part?.type === 'tool') return `${part.name} · ${part.state.status}`;
     if (part?.type === 'text') return part.text.slice(0, 160);
-    return active.includes(id) ? 'Thinking' : 'Finished';
+    return active.includes(child.id) ? 'Thinking' : child.outcome ? 'Finished' : 'Waiting to start';
   }
 </script>
 
@@ -211,10 +216,10 @@
           <span aria-hidden="true">{expanded.includes(child.id) ? '▾' : '▸'}</span>
           <strong>{child.title ?? child.agent ?? 'Subagent'}</strong>
           <span class="subagent-state"
-            >{active.includes(child.id) ? 'Running' : (child.outcome ?? 'Finished')}</span
+            >{active.includes(child.id) ? 'Running' : (child.outcome ?? 'Pending')}</span
           >
         </button>
-        <p class="subagent-activity">{activity(child.id)}</p>
+        <p class="subagent-activity">{activity(child)}</p>
         {#if expanded.includes(child.id)}
           <div class="subagent-history">
             {#if historyErrors[child.id]}<p class="subagent-error" role="alert">
