@@ -4563,11 +4563,6 @@
     focusPaneForTyping('main');
   });
 
-  let forceDeleteWorktree = $state<{
-    repository: string;
-    path: string;
-    branch: string;
-  } | null>(null);
   const deletingWorktreeRequests = new SvelteSet<string>();
 
   async function deleteProjectWorktree(
@@ -4616,6 +4611,7 @@
     branch: string,
     force: boolean,
   ) {
+    let retryForce = false;
     let config: WorktreeConfig | null;
     try {
       config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
@@ -4673,7 +4669,6 @@
           .filter((pane) => pane.kind === 'terminal')
           .map((pane) => invoke('terminal_close', { id: terminalRuntimeId(path, pane.id) })),
       );
-      forceDeleteWorktree = null;
       worktreeDeletions = { ...worktreeDeletions, [path]: 'Deleting files' };
       await invoke('delete_worktree', { repository, worktree: path, force: force || !!config });
       saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
@@ -4699,15 +4694,20 @@
       error = '';
     } catch (cause) {
       if (wasSelected && directory === repository) await loadProject(path);
-      error = describe(cause);
-      if (!force && error === 'Worktree has ignored files. Move or remove them before deleting.') {
-        forceDeleteWorktree = { repository, path, branch };
-      }
+      const deletionError = describe(cause);
+      if (
+        !force &&
+        deletionError === 'Worktree has ignored files. Move or remove them before deleting.'
+      ) {
+        error = '';
+        retryForce = true;
+      } else error = deletionError;
     } finally {
       const remaining = { ...worktreeDeletions };
       delete remaining[path];
       worktreeDeletions = remaining;
     }
+    if (retryForce) await deleteProjectWorktreeOnce(repository, path, branch, true);
   }
 
   let closingWorktree: string | null = null;
@@ -8896,18 +8896,7 @@
     </header>
     {#if $settingsError}<p class="notice error" role="alert">{$settingsError}</p>{/if}
     {#if setupError}<p class="notice error" role="alert">{setupError}</p>{/if}
-    {#if error}<div class="notice error" role="alert">
-        {error}
-        {#if forceDeleteWorktree && error === 'Worktree has ignored files. Move or remove them before deleting.'}<Button
-            variant="ghost"
-            size="sm"
-            onclick={() => {
-              const target = forceDeleteWorktree;
-              if (target)
-                void deleteProjectWorktree(target.repository, target.path, target.branch, true);
-            }}>Force delete</Button
-          >{/if}
-      </div>{/if}
+    {#if error}<div class="notice error" role="alert">{error}</div>{/if}
     {#snippet mainPaneContent()}
       <div
         class:single={acpAgent

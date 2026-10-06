@@ -242,21 +242,21 @@ describe('repository setup', () => {
     await row.click({ button: 'right' });
     await browser.execute(() => sessionStorage.setItem('sai-e2e-delete-worktree', 'Yes'));
     await $(deleteMenuItem).click();
-    await expect($('.app-shell [role="alert"]')).toHaveText(
-      expect.stringContaining('Worktree has ignored files'),
-    );
-    expect(existsSync(ignored)).toBe(true);
-    await expect(row).toHaveAttribute('aria-current', 'page');
-
-    await $('.app-shell [role="alert"] button').click();
     await expect($('.confirmation-dialog')).toHaveText(
       expect.stringContaining('permanently removes uncommitted and ignored files'),
     );
+    await expect($('.app-shell > .notice.error')).not.toExist();
+    expect(existsSync(ignored)).toBe(true);
+    await expect(row).toHaveAttribute('aria-current', 'page');
+
     await $('.confirmation-dialog button:first-child').click();
     expect(existsSync(ignored)).toBe(true);
     await expect(row).toBeDisplayed();
 
-    await $('.app-shell [role="alert"] button').click();
+    await row.click({ button: 'right' });
+    await browser.execute(() => sessionStorage.setItem('sai-e2e-delete-worktree', 'Yes'));
+    await $(deleteMenuItem).click();
+    await expect($('.confirmation-dialog')).toBeDisplayed();
     await $('.confirmation-dialog .confirmation-primary').click();
     await expect(row).not.toExist();
     expect(existsSync(worktree)).toBe(false);
