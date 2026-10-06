@@ -129,6 +129,9 @@ jobs:
           apps=("$mountpoint"/*.app)
           test -d "${apps[0]}"
           codesign --verify --deep --strict "${apps[0]}"
+          entitlements="$RUNNER_TEMP/sail-entitlements.plist"
+          codesign -d --entitlements :- "${apps[0]}" > "$entitlements"
+          test "$(plutil -extract com.apple.developer.web-browser.public-key-credential raw -o - "$entitlements")" = true
           app_copy="$RUNNER_TEMP/sai-smoke/$(basename "${apps[0]}")"
           mkdir -p "$(dirname "$app_copy")"
           ditto "${apps[0]}" "$app_copy"

@@ -46,7 +46,7 @@ Record failures with the exact versions, OS, step, visible error, and relevant O
 - [ ] Run the full CI and live OpenCode contract checks on Ubuntu, macOS, and Windows.
 - [ ] Run the Desktop packages workflow on the release commit; inspect four fresh-runner smoke tests, five packages, per-target hashes, and signing modes.
 - [ ] Run the credentialed release smoke above on clean macOS ARM and Intel, Linux x64, and Windows x64 machines. Record the OS version, result, and any platform gaps.
-- [ ] Configure Apple Developer ID signing and notarization secrets before claiming a trusted macOS build. Otherwise keep the ad-hoc development label. Configure Windows signing before claiming a trusted Windows build.
+- [ ] Configure Apple Developer ID signing, notarization secrets, and Apple's managed browser public-key credential entitlement before claiming a trusted macOS build. Otherwise keep the ad-hoc development label. Configure Windows signing before claiming a trusted Windows build.
 - [ ] Create `vX.Y.Z` only after the checks above. The tag workflow verifies version parity and source revision, attests the packages, and publishes a development prerelease with checksums and a manifest.
 - [ ] Verify downloaded package hashes and GitHub attestations from a separate clean machine; install and launch each package there before directing users to the release.
 
