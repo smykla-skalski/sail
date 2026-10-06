@@ -1,0 +1,66 @@
+export type ActivityHistoryKind = 'parent' | 'subagent' | 'tool' | 'decision' | 'check';
+
+export type ActivityHistoryEvent = {
+  id: string;
+  workspace: string;
+  kind: ActivityHistoryKind;
+  source: string;
+  sourceId: string;
+  title: string;
+  outcome: string;
+  at: number;
+  agent?: string;
+  sessionId?: string;
+};
+
+export type ActivityHistoryInput = Omit<ActivityHistoryEvent, 'id'> & { id?: string };
+
+function eventKey(event: ActivityHistoryInput): string {
+  return (
+    event.id ??
+    JSON.stringify([
+      event.workspace,
+      event.kind,
+      event.agent ?? '',
+      event.sessionId ?? '',
+      event.sourceId,
+    ])
+  );
+}
+
+function bounded(value: string, limit: number): string {
+  return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+}
+
+export function recentActivityEvents(
+  input: ActivityHistoryInput[],
+  limit = 100,
+): ActivityHistoryEvent[] {
+  const events = new Map<string, ActivityHistoryEvent>();
+  for (const candidate of input) {
+    if (
+      !candidate.workspace ||
+      !Number.isFinite(candidate.at) ||
+      candidate.at <= 0 ||
+      Number.isNaN(new Date(candidate.at).getTime())
+    )
+      continue;
+    const id = eventKey(candidate);
+    const event = {
+      ...candidate,
+      id,
+      source: bounded(candidate.source, 80),
+      title: bounded(candidate.title, 240),
+      outcome: bounded(candidate.outcome, 80),
+    };
+    const previous = events.get(id);
+    if (!previous || previous.at <= event.at) events.set(id, event);
+  }
+  return [...events.values()]
+    .toSorted((left, right) => right.at - left.at || left.id.localeCompare(right.id))
+    .slice(0, Math.max(0, limit));
+}
+
+export function activityWorkspaces(events: ActivityHistoryEvent[]): string[] {
+  return [...new Set(events.map((event) => event.workspace))];
+}

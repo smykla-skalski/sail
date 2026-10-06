@@ -7,7 +7,7 @@
   import OpenCodePane from './OpenCodePane.svelte';
   import DiffPanel from './DiffPanel.svelte';
   import PlanPanel from './PlanPanel.svelte';
-  import HistoryPanel from './HistoryPanel.svelte';
+  import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import ShipPanel from './ShipPanel.svelte';
   import EmptyPanePicker from './EmptyPanePicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
@@ -829,7 +829,7 @@
                     onsettings={onshipsettings}
                   />
                 {:else if nativeTab === 'history'}
-                  <HistoryPanel
+                  <PlanHistoryPanel
                     events={nativeHistory}
                     session={nativeSession}
                     loading={false}

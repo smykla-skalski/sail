@@ -1,63 +1,89 @@
 <script lang="ts">
   import { Button } from '@smykla-skalski/sui';
-  import type { SessionInfo } from './lib/opencode';
-  import { historyRows } from './lib/history';
-  import type { HistoryEntry } from './lib/plan';
+  import ActivityStatus from './ActivityStatus.svelte';
+  import { activityWorkspaces, type ActivityHistoryEvent } from './lib/activity-history';
 
-  interface Props {
-    events: HistoryEntry[];
-    session: SessionInfo | undefined;
+  let {
+    events,
+    loading,
+    error,
+    onrefresh,
+    onselect,
+  }: {
+    events: ActivityHistoryEvent[];
     loading: boolean;
     error: string;
     onrefresh: () => void;
+    onselect: (event: ActivityHistoryEvent) => void | Promise<void>;
+  } = $props();
+  const workspaces = $derived(activityWorkspaces(events));
+  let opening = $state('');
+  let selectionError = $state('');
+
+  function name(path: string): string {
+    return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
   }
 
-  let { events, session, loading, error, onrefresh }: Props = $props();
-  let rows = $derived(historyRows(events));
-  const number = new Intl.NumberFormat();
+  async function select(event: ActivityHistoryEvent) {
+    if (opening) return;
+    opening = event.id;
+    selectionError = '';
+    try {
+      await onselect(event);
+    } catch (cause) {
+      selectionError = cause instanceof Error ? cause.message : String(cause);
+    } finally {
+      opening = '';
+    }
+  }
 </script>
 
-<aside class="history-panel" aria-label="Session history">
+<aside class="history-panel" aria-label="Workspace activity history">
   <header class="history-heading">
     <div>
-      <p class="eyebrow">SESSION HISTORY</p>
+      <p class="eyebrow">WORKSPACE HISTORY</p>
       <h2>Activity</h2>
     </div>
     <Button size="sm" variant="ghost" onclick={onrefresh} disabled={loading}
       >{loading ? 'Refreshing…' : 'Refresh'}</Button
     >
   </header>
-  {#if session && typeof session.cost === 'number' && session.tokens}<div
-      class="usage"
-      aria-label="Session usage"
-    >
-      <strong>Session usage</strong>
-      <span
-        >${session.cost.toFixed(4)} · {number.format(session.tokens.input)} input · {number.format(
-          session.tokens.output,
-        )} output · {number.format(session.tokens.reasoning)} reasoning tokens</span
-      >
-      <small
-        >Cache: {number.format(session.tokens.cache?.read ?? 0)} read · {number.format(
-          session.tokens.cache?.write ?? 0,
-        )} write</small
-      >
-    </div>{/if}
+  <p class="history-summary">Durable threads, tools, decisions, children, and checks.</p>
   {#if error}<p class="history-error" role="status">History unavailable: {error}</p>{/if}
-  <ol class="history-list">
-    {#each rows as row (row.id)}<li>
-        <div class="history-meta">
-          <time datetime={new Date(row.at).toISOString()}>{new Date(row.at).toLocaleString()}</time
-          ><span>v{row.version}</span>
-        </div>
-        <strong>{row.title}</strong>
-        {#if row.details.length}<ul>
-            {#each row.details as detail, index (index)}<li>{detail}</li>{/each}
-          </ul>{/if}
-      </li>{:else}<li class="history-empty">
-        {loading ? 'Loading history…' : 'No recorded plan history for this session.'}
-      </li>{/each}
-  </ol>
+  {#if selectionError}<p class="history-error" role="alert">{selectionError}</p>{/if}
+  <div class="history-list">
+    {#each workspaces as workspace (workspace)}
+      <section aria-label={`${name(workspace)} activity`}>
+        <h3><span>{name(workspace)}</span><small>{workspace}</small></h3>
+        <ol>
+          {#each events.filter((event) => event.workspace === workspace) as event (event.id)}
+            <li>
+              <button
+                aria-label={`Open ${event.kind} activity: ${event.title}`}
+                data-activity-id={event.id}
+                disabled={!!opening}
+                onclick={() => void select(event)}
+              >
+                <ActivityStatus status={event.outcome} compact />
+                <span class="event-copy">
+                  <strong>{event.title}</strong>
+                  <small>{event.source} · {event.kind} · {event.outcome.replaceAll('_', ' ')}</small
+                  >
+                </span>
+                <time datetime={new Date(event.at).toISOString()}
+                  >{new Date(event.at).toLocaleString()}</time
+                >
+              </button>
+            </li>
+          {/each}
+        </ol>
+      </section>
+    {:else}
+      <p class="history-empty">
+        {loading ? 'Loading activity…' : 'No durable workspace activity recorded yet.'}
+      </p>
+    {/each}
+  </div>
 </aside>
 
 <style>
@@ -87,55 +113,81 @@
     margin: 0;
     font-size: 18px;
   }
-  .usage {
-    display: grid;
-    gap: 4px;
-    padding: 12px 20px;
-    border-bottom: 1px solid var(--shell-divider);
-    font-size: 12px;
-  }
-  .usage span,
-  .usage small {
-    color: var(--sui-muted);
-  }
-  .history-error {
-    margin: 12px 20px;
+  .history-summary,
+  .history-error,
+  .history-empty {
+    margin: 12px 20px 0;
     color: var(--sui-muted);
     font-size: 12px;
     line-height: 1.5;
+  }
+  .history-error[role='alert'] {
+    color: var(--sui-destructive, #c33);
   }
   .history-list {
     flex: 1;
+    min-height: 0;
     overflow: auto;
-    margin: 0;
-    padding: 10px 20px 20px 36px;
+    padding: 12px 16px 20px;
   }
-  .history-list > li {
-    padding: 12px 0;
-    border-bottom: 1px solid var(--shell-divider);
+  section + section {
+    margin-top: 18px;
+  }
+  h3 {
+    display: grid;
+    gap: 2px;
+    margin: 0 4px 7px;
     font-size: 12px;
-    line-height: 1.5;
   }
-  .history-meta {
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
+  h3 small {
+    overflow: hidden;
+    color: var(--sui-muted);
+    font-weight: 400;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  ol {
+    display: grid;
+    gap: 6px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  li button {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 5px 8px;
+    width: 100%;
+    min-height: 52px;
+    padding: 9px;
+    border: 1px solid var(--shell-divider);
+    border-radius: 8px;
+    color: inherit;
+    background: color-mix(in srgb, var(--sui-surface) 94%, var(--sui-primary));
+    text-align: left;
+    cursor: pointer;
+  }
+  li button:hover,
+  li button:focus-visible {
+    border-color: var(--sui-primary);
+  }
+  .event-copy {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+  }
+  .event-copy strong,
+  .event-copy small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .event-copy small,
+  time {
     color: var(--sui-muted);
     font-size: 11px;
   }
-  .history-list strong {
-    display: block;
-    margin-top: 5px;
-    font-size: 13px;
-  }
-  .history-list ul {
-    margin: 6px 0 0;
-    padding-left: 17px;
-    color: var(--sui-muted);
-    overflow-wrap: anywhere;
-  }
-  .history-list .history-empty {
-    list-style: none;
-    color: var(--sui-muted);
+  time {
+    grid-column: 2;
   }
 </style>

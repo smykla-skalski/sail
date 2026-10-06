@@ -1,0 +1,99 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { activityWorkspaces, recentActivityEvents } from '../src/lib/activity-history.ts';
+
+await test('activity history deduplicates provider updates with latest scoped outcome', () => {
+  const events = recentActivityEvents([
+    {
+      workspace: '/repo/a',
+      kind: 'tool',
+      source: 'Codex',
+      sourceId: 'tool-1',
+      title: 'Run tests',
+      outcome: 'working',
+      at: 10,
+      agent: 'codex',
+      sessionId: 'session-1',
+    },
+    {
+      workspace: '/repo/a',
+      kind: 'tool',
+      source: 'Codex',
+      sourceId: 'tool-1',
+      title: 'Run tests',
+      outcome: 'completed',
+      at: 20,
+      agent: 'codex',
+      sessionId: 'session-1',
+    },
+  ]);
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].outcome, 'completed');
+  assert.equal(events[0].at, 20);
+});
+
+await test('activity history excludes events without an authoritative timestamp', () => {
+  const events = recentActivityEvents([
+    {
+      workspace: '/repo/a',
+      kind: 'decision',
+      source: 'OpenCode',
+      sourceId: 'permission',
+      title: 'Allow command?',
+      outcome: 'waiting',
+      at: Number.NaN,
+    },
+    {
+      workspace: '/repo/b',
+      kind: 'check',
+      source: 'repository',
+      sourceId: 'check',
+      title: 'npm test',
+      outcome: 'passed',
+      at: 30,
+    },
+  ]);
+
+  assert.deepEqual(
+    events.map((event) => event.sourceId),
+    ['check'],
+  );
+  assert.deepEqual(activityWorkspaces(events), ['/repo/b']);
+});
+
+await test('activity history stays bounded in reverse chronological order', () => {
+  const events = recentActivityEvents(
+    Array.from({ length: 150 }, (_, index) => ({
+      workspace: '/repo/a',
+      kind: 'parent' as const,
+      source: 'OpenCode',
+      sourceId: `session-${index}`,
+      title: `Session ${index}`,
+      outcome: 'done',
+      at: index + 1,
+    })),
+  );
+
+  assert.equal(events.length, 100);
+  assert.equal(events[0].sourceId, 'session-149');
+  assert.equal(events.at(-1)?.sourceId, 'session-50');
+});
+
+await test('activity history bounds display text without storing output', () => {
+  const [event] = recentActivityEvents([
+    {
+      workspace: '/repo/a',
+      kind: 'decision',
+      source: 'OpenCode',
+      sourceId: 'question',
+      title: 'x'.repeat(2_000),
+      outcome: 'waiting',
+      at: Date.now(),
+    },
+  ]);
+
+  assert.equal(event.title.length, 240);
+  assert.equal(event.title.endsWith('…'), true);
+  assert.equal('output' in event, false);
+});
