@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { SvelteSet } from 'svelte/reactivity';
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import Markdown from './Markdown.svelte';
   import ToolActivity from './ToolActivity.svelte';
@@ -20,6 +21,31 @@
   let expanded = $state<string[]>([]);
   let generation = 0;
   let refreshing = false;
+
+  async function collectThroughOverlap<T extends { id: string }>(
+    readPage: (cursor?: string) => Promise<{ data: T[]; cursor: { next?: string | null } }>,
+    known: Set<string>,
+    cursor?: string,
+    singlePage = false,
+    received: T[] = [],
+    seen?: Set<string>,
+  ): Promise<{ data: T[]; next: string | null }> {
+    const page = await readPage(cursor);
+    const data = [...received, ...page.data];
+    const next = page.cursor.next ?? null;
+    const visited = seen ?? new SvelteSet<string>();
+    if (
+      singlePage ||
+      !known.size ||
+      !page.data.length ||
+      page.data.some((item) => known.has(item.id)) ||
+      !next ||
+      visited.has(next)
+    )
+      return { data, next };
+    visited.add(next);
+    return collectThroughOverlap(readPage, known, next, false, data, visited);
+  }
 
   async function loadSummaries(source: OpenCodeClient, sessions: SessionInfo[], current: number) {
     const snapshots = await Promise.all(
@@ -46,16 +72,23 @@
     const current = generation;
     loadingOlderHistory = [...loadingOlderHistory, id];
     try {
-      const page = await source.message.list({
-        sessionID: id,
-        limit: 25,
-        order: 'desc',
-        ...(cursor ? { cursor } : {}),
-      });
+      const known = new Set((histories[id] ?? []).map((message) => message.id));
+      const page = await collectThroughOverlap(
+        (next) =>
+          source.message.list({
+            sessionID: id,
+            limit: 25,
+            order: 'desc',
+            ...(next ? { cursor: next } : {}),
+          }),
+        known,
+        cursor,
+        !!cursor,
+      );
       if (current !== generation) return;
       histories = { ...histories, [id]: mergeMessages(histories[id] ?? [], page.data) };
-      if (cursor || !(id in historyCursors))
-        historyCursors = { ...historyCursors, [id]: page.cursor.next ?? null };
+      if (cursor || !known.size || !(id in historyCursors))
+        historyCursors = { ...historyCursors, [id]: page.next };
       const nextErrors = { ...historyErrors };
       delete nextErrors[id];
       historyErrors = nextErrors;
@@ -94,14 +127,24 @@
     const current = generation;
     refreshing = true;
     try {
+      const known = new Set(children.map((child) => child.id));
       const [sessions, running] = await Promise.all([
-        source.session.list({ parentID, limit: 50, order: 'desc' }),
+        collectThroughOverlap(
+          (cursor) =>
+            source.session.list({
+              parentID,
+              limit: 50,
+              order: 'desc',
+              ...(cursor ? { cursor } : {}),
+            }),
+          known,
+        ),
         source.session.active(),
       ]);
       if (current !== generation) return;
-      const firstPage = new Set(sessions.data.map((child) => child.id));
-      children = [...sessions.data, ...children.filter((child) => !firstPage.has(child.id))];
-      if (children.length === sessions.data.length) childCursor = sessions.cursor.next ?? null;
+      const fresh = new Set(sessions.data.map((child) => child.id));
+      children = [...sessions.data, ...children.filter((child) => !fresh.has(child.id))];
+      if (!known.size) childCursor = sessions.next;
       active = Object.keys(running);
       await Promise.all([
         loadSummaries(source, sessions.data, current),
