@@ -5818,9 +5818,16 @@
           : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available)
       )
         throw new Error('This session’s agent is unavailable.');
-      await jumpToRecentThread(threadKey(thread));
+      if (!(await jumpToRecentThread(threadKey(thread))))
+        throw new Error('Session history is unavailable. Open the worktree to inspect it.');
     } else await loadProject(path);
     closeShipRuns();
+  }
+
+  async function openSpawnTarget(receipt: SpawnReceipt) {
+    if (!receipt.targetId || !receipt.targetDirectory)
+      throw new Error('The child has not confirmed a target thread.');
+    await openShipTarget(receipt.targetDirectory, receipt.targetId);
   }
 
   function openInbox() {
@@ -8936,6 +8943,7 @@
                   acpThread ? `acp:${acpAgent}:${acpThread.sessionId}` : null,
                   directory,
                 )}
+                onopensubagent={openSpawnTarget}
                 focusPrompt={promptFocusPane === 'main'}
                 picked={pickedAttachments.main}
                 prefill={issuePrefills[directory]}
@@ -9146,6 +9154,7 @@
                   sessionID ? `opencode:${sessionID}` : null,
                   directory,
                 )}
+                onopen={openSpawnTarget}
               />
               {#if running && runtimeState === 'connected'}<div class="chat-working">
                   <ActivityStatus
@@ -9385,6 +9394,7 @@
       {runtimeState}
       {coordinationMessages}
       {spawnReceipts}
+      onopensubagent={openSpawnTarget}
       {shipRuns}
       {shippingBusy}
       onshiprefresh={() => tickShippingRuns(true)}

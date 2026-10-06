@@ -75,6 +75,7 @@
     setup,
     coordinationMessages = [],
     spawnReceipts = [],
+    onopensubagent,
     postTurnChecks = [],
     onretrycheck,
     focused,
@@ -97,6 +98,7 @@
     setup: SetupReport | null;
     coordinationMessages?: CoordinationMessage[];
     spawnReceipts?: SpawnReceipt[];
+    onopensubagent?: (receipt: SpawnReceipt) => Promise<void>;
     postTurnChecks?: PostTurnCheck[];
     onretrycheck: (check: PostTurnCheck) => void;
     focused: boolean;
@@ -925,7 +927,7 @@
       </ChatMessage>
     {/each}
     <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
-    <SpawnActivity receipts={spawnReceipts} />
+    <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
     {#if running}<div class="agent-busy" role="status">
         <ActivityStatus status={visibleStatus} /><Button
           size="sm"

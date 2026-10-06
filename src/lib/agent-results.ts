@@ -122,6 +122,16 @@ export function receiptIsSettled(state: SpawnState): boolean {
   return ['completed', 'failed', 'interrupted', 'unavailable'].includes(state);
 }
 
+export function receiptNeedsLiveActivity(receipt: SpawnReceipt): boolean {
+  return !receiptIsSettled(receipt.state) || (!receipt.result && !receipt.error);
+}
+
+export function boundedSpawnOutput(receipt: SpawnReceipt, limit = 4_000): string {
+  const output = receipt.result ?? receipt.error ?? '';
+  if (output.length <= limit) return output;
+  return `…${output.slice(-limit)}`;
+}
+
 export function receiptNeedsRefresh(receipt: SpawnReceipt): boolean {
   return (
     !receiptIsSettled(receipt.state) ||

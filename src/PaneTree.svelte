@@ -52,6 +52,7 @@
     setup: SetupReport | null;
     coordinationMessages: CoordinationMessage[];
     spawnReceipts: SpawnReceipt[];
+    onopensubagent: (receipt: SpawnReceipt) => Promise<void>;
     shipRuns: ShipRun[];
     shippingBusy: boolean;
     onshiprefresh: () => Promise<void>;
@@ -129,6 +130,7 @@
     setup,
     coordinationMessages,
     spawnReceipts,
+    onopensubagent,
     shipRuns,
     shippingBusy,
     onshiprefresh,
@@ -414,6 +416,7 @@
     <PaneTree
       {coordinationMessages}
       {spawnReceipts}
+      {onopensubagent}
       {shipRuns}
       {shippingBusy}
       {onshiprefresh}
@@ -503,6 +506,7 @@
     <PaneTree
       {coordinationMessages}
       {spawnReceipts}
+      {onopensubagent}
       {shipRuns}
       {shippingBusy}
       {onshiprefresh}
@@ -694,6 +698,7 @@
                 pane.thread ? `opencode:${pane.thread.sessionId}` : null,
                 directory,
               )}
+              {onopensubagent}
               focused={focused === pane.id}
               focusPrompt={focusPromptPane === pane.id}
               picked={pickedAttachments[pane.id]}
@@ -816,6 +821,7 @@
                 pane.thread ? `acp:${pane.agent}:${pane.thread.sessionId}` : null,
                 directory,
               )}
+              {onopensubagent}
               postTurnChecks={postTurnChecks.filter(
                 (check) =>
                   pane.thread &&

@@ -20,6 +20,13 @@ async function start() {
   ) {
     const { default: ToolFailureFixture } = await import('../test/e2e/tool-failure-fixture.svelte');
     mount(ToolFailureFixture, { target: document.getElementById('root')! });
+  } else if (
+    import.meta.env.MODE === 'e2e' &&
+    new URLSearchParams(location.search).has('spawn-activity-fixture')
+  ) {
+    const { default: SpawnActivityFixture } =
+      await import('../test/e2e/spawn-activity-fixture.svelte');
+    mount(SpawnActivityFixture, { target: document.getElementById('root')! });
   } else if (new URLSearchParams(location.search).get('window') === 'settings') {
     const { default: SettingsWindow } = await import('./SettingsWindow.svelte');
     mount(SettingsWindow, { target: document.getElementById('root')! });

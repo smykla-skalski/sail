@@ -118,6 +118,7 @@
     seedContext?: string;
     coordinationMessages?: CoordinationMessage[];
     spawnReceipts?: SpawnReceipt[];
+    onopensubagent?: (receipt: SpawnReceipt) => Promise<void>;
     postTurnChecks?: PostTurnCheck[];
     onretrycheck?: (check: PostTurnCheck) => void;
     onshipit?: (
@@ -153,6 +154,7 @@
     seedContext = '',
     coordinationMessages = [],
     spawnReceipts = [],
+    onopensubagent,
     postTurnChecks = [],
     onretrycheck = () => {},
     onshipit,
@@ -1625,7 +1627,7 @@
       </ChatMessage>
     {/each}
     <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
-    <SpawnActivity receipts={spawnReceipts} />
+    <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
     {#if queued.length}<div class="queued-messages" role="status" aria-label="Queued messages">
         {#each queued as message, index (index)}
           <ChatMessage
