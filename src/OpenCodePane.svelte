@@ -2,9 +2,10 @@
   import { onMount, tick } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
-  import { Badge, Button } from '@smykla-skalski/sui';
+  import { Button } from '@smykla-skalski/sui';
   import type { FormInfo, PermissionRequest } from '@opencode/client';
   import Markdown from './Markdown.svelte';
+  import ActivityStatus from './ActivityStatus.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
@@ -280,10 +281,21 @@
   });
   let stopRequested = false;
   const busy = $derived(sending || running || configuring);
-  const contextUsage = $derived(openCodeContextUsage(messages, setup?.models ?? []));
   const inputReady = $derived(
     !!setup?.workReady || (session?.agent === 'architect' && !!setup?.planReady),
   );
+  const visibleStatus = $derived(
+    pendingPermissions.length || pendingForms.length
+      ? 'waiting'
+      : loading
+        ? 'connecting'
+        : busy
+          ? 'working'
+          : inputReady
+            ? 'ready'
+            : 'offline',
+  );
+  const contextUsage = $derived(openCodeContextUsage(messages, setup?.models ?? []));
   const chosenModel = $derived(
     setup?.models.find((model) => `${model.providerID}:${model.id}` === selectedModel),
   );
@@ -816,9 +828,7 @@
       >
     </div>
     {#if contextUsage !== undefined}<span class="agent-usage">Context {contextUsage}%</span>{/if}
-    <Badge tone={busy ? 'warning' : inputReady ? 'success' : 'neutral'}
-      >{loading ? 'Connecting' : busy ? 'Working' : inputReady ? 'Ready' : 'Offline'}</Badge
-    >
+    <ActivityStatus status={visibleStatus} />
   </div>
   <div
     class="agent-conversation conversation"
@@ -911,7 +921,11 @@
     <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
     <SpawnActivity receipts={spawnReceipts} />
     {#if running}<div class="agent-busy" role="status">
-        OpenCode is working… <Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
+        <ActivityStatus status={visibleStatus} /><Button
+          size="sm"
+          variant="secondary"
+          onclick={stop}>Stop</Button
+        >
       </div>{/if}
   </div>
   <div class="agent-composer composer-wrap">

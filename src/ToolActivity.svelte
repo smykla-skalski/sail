@@ -1,5 +1,6 @@
 <script lang="ts">
   import { toolCommand, toolInput } from './lib/tool-display';
+  import ActivityStatus from './ActivityStatus.svelte';
 
   let {
     title,
@@ -34,9 +35,7 @@
 <details class="tool-activity" bind:open>
   <summary>
     <span class="tool-activity-name">{title}</span>
-    <span class="tool-activity-status" class:failed={status === 'failed' || status === 'error'}
-      >{status.replaceAll('_', ' ')}</span
-    >
+    <ActivityStatus {status} compact />
     {#if error}<span class="tool-activity-summary-error">{error}</span>{/if}
     {#if command}<code class="tool-activity-command">{command}</code>{/if}
   </summary>
@@ -81,11 +80,6 @@
   .tool-activity-name {
     font-weight: 600;
   }
-  .tool-activity-status {
-    color: var(--text-muted, var(--sui-muted));
-    font-size: 11px;
-  }
-  .tool-activity-status.failed,
   .tool-activity-error {
     color: var(--danger, #d66);
   }

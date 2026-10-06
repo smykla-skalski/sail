@@ -4,8 +4,10 @@
   import { invoke } from '@tauri-apps/api/core';
   import PathPicker from './PathPicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
+  import ActivityStatus from './ActivityStatus.svelte';
   import type { AgentAvailability, AgentThread } from './lib/acp';
   import type { AttentionMap, ThreadStatus } from './lib/attention';
+  import { activityState } from './lib/activity-state';
   import { threadKey } from './lib/recent-threads';
   import { sidebarThreadStatus } from './lib/sidebar-agents';
   import {
@@ -264,11 +266,7 @@
   }
 
   function statusLabel(status: ThreadStatus | null): string {
-    if (status === 'working') return 'Working';
-    if (status === 'waiting') return 'Needs input';
-    if (status === 'done') return 'Finished';
-    if (status === 'failed') return 'Failed';
-    return 'Unknown';
+    return activityState(status).label;
   }
 
   function providerName(thread: AgentThread): string {
@@ -758,13 +756,13 @@
               >{/if}</span
           >
           <span class="project-agent-title">{thread.title}</span>
-          <span class={`project-agent-status ${status ?? 'unknown'}`}
-            >{activeChildren && status === 'working'
-              ? 'Subagents working'
-              : activeChildren && status === 'failed'
-                ? 'Failed · subagents working'
-                : statusLabel(status)}</span
-          >
+          <ActivityStatus
+            {status}
+            label={activeChildren
+              ? `${statusLabel(status)} · ${activeChildren} subagent${activeChildren === 1 ? '' : 's'}`
+              : statusLabel(status)}
+            compact
+          />
         </button>
       {/each}
     </div>
