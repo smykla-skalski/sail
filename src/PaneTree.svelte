@@ -94,6 +94,7 @@
     onbrowserpick: (id: string, attachment: BrowserAttachment) => void;
     pickedAttachments: Record<string, BrowserAttachment>;
     onpickedconsumed: (id: string) => void;
+    onattachmentsent: (ids: string[], thread: string, turn: string) => void;
     diffComments: Record<string, DiffComment[]>;
     ondiffcomments: (scope: string, comments: DiffComment[]) => void;
     ondiffcommentssent: (scope: string, ids: string[]) => void;
@@ -116,7 +117,6 @@
     onagentterminal: (id: string) => void;
     reviewCaptures: ReviewCapture[];
     reviewPreviews: ReviewPreview[];
-    reviewEvidenceUpdated: number;
     onreviewcheck: (check: PostTurnCheck) => void;
     onreviewpreview: (preview: ReviewPreview) => void;
     onreviewcapturephase: (id: string, phase: ReviewCapture['phase']) => void;
@@ -161,6 +161,7 @@
     onbrowserpick,
     pickedAttachments,
     onpickedconsumed,
+    onattachmentsent,
     diffComments,
     ondiffcomments,
     ondiffcommentssent,
@@ -183,7 +184,6 @@
     onagentterminal,
     reviewCaptures,
     reviewPreviews,
-    reviewEvidenceUpdated,
     onreviewcheck,
     onreviewpreview,
     onreviewcapturephase,
@@ -222,14 +222,16 @@
 
   function reviewEvidence(thread: string | null) {
     const checks = thread ? postTurnChecks.filter((check) => check.thread === thread) : [];
-    const captures = reviewCaptures.filter((capture) => capture.paneId === pane.id);
+    const captures = reviewCaptures.filter(
+      (capture) =>
+        capture.paneId === pane.id && (capture.thread === null || capture.thread === thread),
+    );
     return {
       checks,
       captures,
       previews: reviewPreviews,
       filesUpdated: diffEvidenceUpdated,
       updated: Math.max(
-        reviewEvidenceUpdated,
         diffEvidenceUpdated,
         ...checks.map((check) => check.updated),
         ...captures.map((capture) => capture.created),
@@ -483,6 +485,7 @@
       {onbrowserpick}
       {pickedAttachments}
       {onpickedconsumed}
+      {onattachmentsent}
       {diffComments}
       {ondiffcomments}
       {ondiffcommentssent}
@@ -505,7 +508,6 @@
       {onagentterminal}
       {reviewCaptures}
       {reviewPreviews}
-      {reviewEvidenceUpdated}
       {onreviewcheck}
       {onreviewpreview}
       {onreviewcapturephase}
@@ -577,6 +579,7 @@
       {onbrowserpick}
       {pickedAttachments}
       {onpickedconsumed}
+      {onattachmentsent}
       {diffComments}
       {ondiffcomments}
       {ondiffcommentssent}
@@ -599,7 +602,6 @@
       {onagentterminal}
       {reviewCaptures}
       {reviewPreviews}
-      {reviewEvidenceUpdated}
       {onreviewcheck}
       {onreviewpreview}
       {onreviewcapturephase}
@@ -742,6 +744,7 @@
               externalPrompt={pendingAgentBatches[pane.id]}
               onexternalresult={onbatchcomplete}
               {onpickedconsumed}
+              {onattachmentsent}
               {onpromptfocused}
               oncreated={(thread) => oncreated(pane.id, thread)}
               onactivity={(thread) => {
@@ -875,6 +878,7 @@
               externalPrompt={pendingAgentBatches[pane.id]}
               onexternalresult={onbatchcomplete}
               {onpickedconsumed}
+              {onattachmentsent}
               {onpromptfocused}
               onentrieschange={(entries, sessionId, ready) =>
                 onentries(pane.id, entries, sessionId, ready)}

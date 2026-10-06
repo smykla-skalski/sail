@@ -4,6 +4,7 @@
   import type { WorkingDiffInfo } from './lib/diff';
   import {
     evidenceFreshness,
+    groupReviewCaptures,
     groupReviewChecks,
     reviewFiles,
     type ReviewCapture,
@@ -35,6 +36,7 @@
   } = $props();
 
   const evidenceFiles = $derived(reviewFiles(files));
+  const captureGroups = $derived(groupReviewCaptures(captures));
   const checkGroups = $derived(groupReviewChecks(checks));
   let now = $state(Date.now());
   const freshness = $derived(evidenceFreshness(updated, now));
@@ -60,41 +62,56 @@
   <details open>
     <summary>Captures ({captures.length})</summary>
     {#if captures.length}
-      <div class="capture-grid">
-        {#each captures as capture (capture.id)}
-          <figure>
-            <button
-              class="capture-preview"
-              aria-label={`Open ${capture.phase} capture`}
-              onclick={() => {
-                selectedCapture = capture;
-                captureDialog.showModal();
-              }}
-            >
-              <img
-                src={capture.previewUrl}
-                alt={`${capture.phase} capture from ${capture.source}`}
-              />
-            </button>
-            <figcaption>
-              <select
-                aria-label={`Capture phase for ${capture.source}`}
-                value={capture.phase}
-                onchange={(event) =>
-                  oncapturephase(
-                    capture.id,
-                    (event.currentTarget as HTMLSelectElement).value as ReviewCapture['phase'],
-                  )}
-              >
-                <option value="before">Before</option>
-                <option value="after">After</option>
-              </select>
-              <span class="source" title={capture.url}>{capture.source}</span>
-              <small>{time(capture.created)} · {evidenceFreshness(capture.created, now)}</small>
-            </figcaption>
-          </figure>
-        {/each}
-      </div>
+      {#each captureGroups as group (group.turn ?? 'draft')}
+        <section
+          class="turn-group"
+          aria-label={group.turn ? `Turn ${group.turn} captures` : 'Draft captures'}
+        >
+          <div class="turn-heading">
+            <strong>{group.turn ? `Turn ${group.turn.slice(0, 8)}` : 'Draft'}</strong>
+            <small>{time(group.updated)} · {evidenceFreshness(group.updated, now)}</small>
+          </div>
+          <div class="capture-grid">
+            {#each group.captures as capture (capture.id)}
+              <figure>
+                {#if capture.previewUrl}
+                  <button
+                    class="capture-preview"
+                    aria-label={`Open ${capture.phase} capture`}
+                    onclick={() => {
+                      selectedCapture = capture;
+                      captureDialog.showModal();
+                    }}
+                  >
+                    <img
+                      src={capture.previewUrl}
+                      alt={`${capture.phase} capture from ${capture.source}`}
+                    />
+                  </button>
+                {:else}
+                  <div class="capture-preview unavailable-preview">Preview unavailable</div>
+                {/if}
+                <figcaption>
+                  <select
+                    aria-label={`Capture phase for ${capture.source}`}
+                    value={capture.phase}
+                    onchange={(event) =>
+                      oncapturephase(
+                        capture.id,
+                        (event.currentTarget as HTMLSelectElement).value as ReviewCapture['phase'],
+                      )}
+                  >
+                    <option value="before">Before</option>
+                    <option value="after">After</option>
+                  </select>
+                  <span class="source" title={capture.url}>{capture.source}</span>
+                  <small>{time(capture.created)} · {evidenceFreshness(capture.created, now)}</small>
+                </figcaption>
+              </figure>
+            {/each}
+          </div>
+        </section>
+      {/each}
     {:else}
       <p class="empty">
         No browser captures recorded. Pick an element in a browser pane to add one.
@@ -180,7 +197,7 @@
 </section>
 
 <dialog bind:this={captureDialog} aria-label="Browser capture">
-  {#if selectedCapture}
+  {#if selectedCapture?.previewUrl}
     <header>
       <strong>{selectedCapture.phase} capture</strong>
       <button onclick={() => captureDialog.close()} aria-label="Close capture">×</button>
@@ -294,6 +311,12 @@
     grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
     gap: 8px;
     margin-top: 8px;
+  }
+  .unavailable-preview {
+    display: grid;
+    place-items: center;
+    color: var(--shell-muted, #607069);
+    font-size: 0.75rem;
   }
   figure {
     min-width: 0;

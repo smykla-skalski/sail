@@ -6,10 +6,26 @@ import { leaves, type Pane } from '../src/lib/panes.ts';
 import {
   browserReviewPreviews,
   evidenceFreshness,
+  groupReviewCaptures,
   groupReviewChecks,
+  retainCaptureMetadata,
   reviewFiles,
   selectReviewPreview,
 } from '../src/lib/review-evidence.ts';
+
+function capture(id: string, turn: string | null, created: number) {
+  return {
+    id,
+    paneId: 'main',
+    phase: 'before' as const,
+    source: 'example.com',
+    url: 'https://example.com',
+    previewUrl: `data:image/png;base64,${id}`,
+    created,
+    thread: turn ? 'acp:codex:session' : null,
+    turn,
+  };
+}
 
 function diffFile(file: string, patch: string, additions = 1, deletions = 0): WorkingDiffInfo {
   return {
@@ -72,6 +88,32 @@ await test('review checks stay grouped by turn and newest turn appears first', (
   assert.deepEqual(
     groups[0].checks.map(({ command }) => command),
     ['npm run check', 'npm run lint'],
+  );
+});
+
+await test('capture metadata survives preview eviction', () => {
+  const captures = Array.from({ length: 21 }, (_, index) =>
+    capture(`capture-${index}`, 'turn', index),
+  );
+  const retained = retainCaptureMetadata(captures);
+  assert.equal(retained.length, 21);
+  assert.equal(retained[0].previewUrl, null);
+  assert.equal(retained[1].previewUrl, 'data:image/png;base64,capture-1');
+});
+
+await test('captures stay grouped by originating turn', () => {
+  const groups = groupReviewCaptures([
+    capture('old', 'turn-old', 100),
+    capture('draft', null, 300),
+    capture('new', 'turn-new', 200),
+  ]);
+  assert.deepEqual(
+    groups.map(({ turn, updated }) => ({ turn, updated })),
+    [
+      { turn: null, updated: 300 },
+      { turn: 'turn-new', updated: 200 },
+      { turn: 'turn-old', updated: 100 },
+    ],
   );
 });
 

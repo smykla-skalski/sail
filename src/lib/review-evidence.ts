@@ -8,8 +8,16 @@ export type ReviewCapture = {
   phase: 'before' | 'after';
   source: string;
   url: string;
-  previewUrl: string;
+  previewUrl: string | null;
   created: number;
+  thread: string | null;
+  turn: string | null;
+};
+
+export type ReviewCaptureGroup = {
+  turn: string | null;
+  updated: number;
+  captures: ReviewCapture[];
 };
 
 export type ReviewPreview = {
@@ -61,6 +69,37 @@ export function groupReviewChecks(checks: PostTurnCheck[]): ReviewCheckGroup[] {
       checks: items.toSorted((left, right) => left.command.localeCompare(right.command)),
     }))
     .toSorted((left, right) => right.updated - left.updated || left.turn.localeCompare(right.turn));
+}
+
+export function retainCaptureMetadata<T extends ReviewCapture>(
+  captures: T[],
+  previewLimit = 20,
+): T[] {
+  const retained = [...captures];
+  let remaining = previewLimit;
+  for (let index = retained.length - 1; index >= 0; index -= 1) {
+    const capture = retained[index];
+    if (!capture.previewUrl) continue;
+    if (remaining > 0) {
+      remaining -= 1;
+      continue;
+    }
+    retained[index] = Object.assign({}, capture, { previewUrl: null });
+  }
+  return retained;
+}
+
+export function groupReviewCaptures(captures: ReviewCapture[]): ReviewCaptureGroup[] {
+  const groups = new Map<string | null, ReviewCapture[]>();
+  for (const capture of captures)
+    groups.set(capture.turn, [...(groups.get(capture.turn) ?? []), capture]);
+  return [...groups.entries()]
+    .map(([turn, items]) => ({
+      turn,
+      updated: Math.max(...items.map((item) => item.created)),
+      captures: items.toSorted((left, right) => left.created - right.created),
+    }))
+    .toSorted((left, right) => right.updated - left.updated);
 }
 
 export function evidenceFreshness(updated: number, now = Date.now()): 'current' | 'stale' {
