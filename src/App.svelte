@@ -1154,8 +1154,6 @@
   let diffPollTimer: ReturnType<typeof setInterval> | undefined;
   let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
   let healthTimer: ReturnType<typeof setInterval> | undefined;
-  let healthCheckInFlight = false;
-  let healthFailures = 0;
   let connecting = $state(false);
   let disposed = false;
   let hasConnected = false;
@@ -1732,7 +1730,6 @@
     clearTimeout(recoveryTimer);
     eventController?.abort();
     client = nextClient;
-    healthFailures = 0;
     nativeActivityReady = false;
     openCodeBrowserServers.clear();
     activeBinary = info.binaryPath;
@@ -1801,26 +1798,7 @@
   }
 
   async function checkRuntime() {
-    if (connecting || healthCheckInFlight || runtimeState !== 'connected' || !client) return;
-    healthCheckInFlight = true;
-    try {
-      await client.server.info({ signal: AbortSignal.timeout(3000) });
-      healthFailures = 0;
-    } catch (cause) {
-      healthFailures++;
-      recordDiagnostic('opencode_health_probe_failed', {
-        attempt: healthFailures,
-        errorName: cause instanceof Error ? cause.name : typeof cause,
-        message: describe(cause).slice(0, 500),
-      });
-      if (healthFailures >= 3) {
-        healthFailures = 0;
-        await recoverRuntime();
-      }
-      return;
-    } finally {
-      healthCheckInFlight = false;
-    }
+    if (connecting || runtimeState !== 'connected' || !client) return;
     if (!directory || planReady || setupLoading) return;
     const now = Date.now();
     if (now - lastSetupProbe < (setupProbeCount < 12 ? 5000 : 30000)) return;

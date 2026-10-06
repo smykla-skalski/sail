@@ -127,7 +127,6 @@ pub struct UiDiagnostic {
     session_id: Option<String>,
     turn_id: Option<String>,
     queue_length: Option<usize>,
-    attempt: Option<usize>,
     error_name: Option<String>,
     message: Option<String>,
     source: Option<String>,
@@ -151,7 +150,6 @@ pub fn diagnostic_event(details: UiDiagnostic) {
             | "frontend_start_failed"
             | "opencode_event_stream_failed"
             | "opencode_event_stream_ended"
-            | "opencode_health_probe_failed"
     ) || details
         .agent
         .as_deref()
@@ -166,7 +164,6 @@ pub fn diagnostic_event(details: UiDiagnostic) {
             "sessionId":details.session_id,
             "turnId":details.turn_id,
             "queueLength":details.queue_length,
-            "attempt":details.attempt,
             "errorName":details.error_name.as_deref().map(|name| name.chars().take(80).collect::<String>()),
             "message":details.message.as_deref().map(|message| message.chars().take(500).collect::<String>()),
             "source":details.source.as_deref().map(|source| source.chars().take(160).collect::<String>()),
