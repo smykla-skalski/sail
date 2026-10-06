@@ -15,6 +15,16 @@ export type ActivityHistoryEvent = {
 
 export type ActivityHistoryInput = Omit<ActivityHistoryEvent, 'id'> & { id?: string };
 
+function isActivityKind(value: unknown): value is ActivityHistoryKind {
+  return (
+    value === 'parent' ||
+    value === 'subagent' ||
+    value === 'tool' ||
+    value === 'decision' ||
+    value === 'check'
+  );
+}
+
 function eventKey(event: ActivityHistoryInput): string {
   return (
     event.id ??
@@ -63,4 +73,34 @@ export function recentActivityEvents(
 
 export function activityWorkspaces(events: ActivityHistoryEvent[]): string[] {
   return [...new Set(events.map((event) => event.workspace))];
+}
+
+export function loadActivityHistory(raw: string | null): ActivityHistoryEvent[] {
+  try {
+    const value: unknown = JSON.parse(raw ?? '[]');
+    if (!Array.isArray(value)) return [];
+    return recentActivityEvents(
+      value.filter(
+        (event): event is ActivityHistoryEvent =>
+          !!event &&
+          typeof event === 'object' &&
+          typeof event.id === 'string' &&
+          typeof event.workspace === 'string' &&
+          isActivityKind(event.kind) &&
+          typeof event.source === 'string' &&
+          typeof event.sourceId === 'string' &&
+          typeof event.title === 'string' &&
+          typeof event.outcome === 'string' &&
+          typeof event.at === 'number' &&
+          (event.agent === undefined || typeof event.agent === 'string') &&
+          (event.sessionId === undefined || typeof event.sessionId === 'string'),
+      ),
+    );
+  } catch {
+    return [];
+  }
+}
+
+export function saveActivityHistory(events: ActivityHistoryEvent[]): string {
+  return JSON.stringify(recentActivityEvents(events));
 }

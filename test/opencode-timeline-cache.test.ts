@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { SessionMessageInfo } from '@opencode/client';
 import {
+  cachedOpenCodeTimelines,
   clearOpenCodeTimelineCache,
   recallOpenCodeTimeline,
   rememberOpenCodeTimeline,
@@ -38,4 +39,21 @@ await test('bounds cached conversations and retains recently recalled sessions',
 
   assert.equal(recallOpenCodeTimeline('/repo', 'session-1'), null);
   assert.equal(recallOpenCodeTimeline('/repo', 'session-0')?.messages[0]?.id, '0');
+});
+
+await test('lists cached conversations with source identity for activity history', () => {
+  clearOpenCodeTimelineCache();
+  rememberOpenCodeTimeline('/repo/a', 'session-a', {
+    messages: [message('one')],
+    cursor: 'older',
+  });
+
+  assert.deepEqual(cachedOpenCodeTimelines(), [
+    {
+      directory: '/repo/a',
+      sessionID: 'session-a',
+      messages: [message('one')],
+      cursor: 'older',
+    },
+  ]);
 });

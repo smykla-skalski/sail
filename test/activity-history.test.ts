@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { activityWorkspaces, recentActivityEvents } from '../src/lib/activity-history.ts';
+import {
+  activityWorkspaces,
+  loadActivityHistory,
+  recentActivityEvents,
+  saveActivityHistory,
+} from '../src/lib/activity-history.ts';
 
 await test('activity history deduplicates provider updates with latest scoped outcome', () => {
   const events = recentActivityEvents([
@@ -96,4 +101,27 @@ await test('activity history bounds display text without storing output', () => 
   assert.equal(event.title.length, 240);
   assert.equal(event.title.endsWith('…'), true);
   assert.equal('output' in event, false);
+});
+
+await test('activity history reloads only valid bounded durable events', () => {
+  const stored = saveActivityHistory(
+    Array.from({ length: 110 }, (_, index) => ({
+      id: `event-${index}`,
+      workspace: '/repo/a',
+      kind: 'decision' as const,
+      source: 'Codex',
+      sourceId: `decision-${index}`,
+      title: `Decision ${index}`,
+      outcome: 'completed',
+      at: index + 1,
+      agent: 'codex',
+      sessionId: 'session-1',
+    })),
+  );
+
+  const restored = loadActivityHistory(stored);
+  assert.equal(restored.length, 100);
+  assert.equal(restored[0].id, 'event-109');
+  assert.deepEqual(loadActivityHistory('{"kind":"tool"}'), []);
+  assert.deepEqual(loadActivityHistory('[{"kind":"invented"}]'), []);
 });

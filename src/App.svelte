@@ -21,7 +21,9 @@
   import WorkspaceActivity from './WorkspaceActivity.svelte';
   import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
   import {
+    loadActivityHistory,
     recentActivityEvents,
+    saveActivityHistory,
     type ActivityHistoryEvent,
     type ActivityHistoryInput,
   } from './lib/activity-history';
@@ -216,6 +218,7 @@
   import { getPlan, type PlanSnapshot } from './lib/plan';
   import { mergeMessages, nearBottom } from './lib/timeline';
   import {
+    cachedOpenCodeTimelines,
     forgetOpenCodeTimeline,
     recallOpenCodeTimeline,
     rememberOpenCodeTimeline,
@@ -674,6 +677,10 @@
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
   let inboxItems = $state<InboxItem[]>([]);
   let inboxOutcomes = $state<InboxOutcome[]>(loadInboxOutcomes(getSetting('sai-inbox-outcomes')));
+  let durableActivityHistory = $state<ActivityHistoryEvent[]>(
+    loadActivityHistory(getSetting('sai-activity-history')),
+  );
+  let openCodeTimelineRevision = $state(0);
   let inboxLoading = $state(false);
   let inboxError = $state('');
   let inboxDialog: HTMLDialogElement;
@@ -1331,7 +1338,8 @@
     }),
   );
   const activityHistory = $derived.by(() => {
-    const input: ActivityHistoryInput[] = [];
+    const openCodeTimelines = openCodeTimelineRevision >= 0 ? cachedOpenCodeTimelines() : [];
+    const input: ActivityHistoryInput[] = [...durableActivityHistory];
     for (const thread of [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads]) {
       input.push({
         workspace: thread.directory,
@@ -1342,7 +1350,7 @@
         outcome:
           threadAttention[threadKey(thread)]?.status ??
           sidebarOpenCodeOutcomes[threadKey(thread)] ??
-          'completed',
+          'unknown',
         at: thread.updated,
         agent: thread.agent,
         sessionId: thread.sessionId,
@@ -1378,6 +1386,46 @@
             sessionId: sessionID,
           });
         }
+      }
+    }
+    for (const timeline of openCodeTimelines) {
+      for (const message of timeline.messages) {
+        if (message.type !== 'assistant') continue;
+        for (const part of message.content) {
+          if (part.type !== 'tool') continue;
+          input.push({
+            workspace: timeline.directory,
+            kind: 'tool',
+            source: message.agent,
+            sourceId: `${message.id}:${part.id}`,
+            title: part.name,
+            outcome: part.state.status,
+            at: message.time.created,
+            agent: 'opencode',
+            sessionId: timeline.sessionID,
+          });
+        }
+      }
+    }
+    const cachedThreads = new Map(
+      [...agentThreads, ...nativeThreads]
+        .filter((thread) => thread.agent !== 'opencode')
+        .map((thread) => [threadKey(thread), thread]),
+    );
+    for (const thread of cachedThreads.values()) {
+      for (const entry of loadRecentTranscript(thread)) {
+        if (entry.type !== 'tool' || !Number.isFinite(entry.created)) continue;
+        input.push({
+          workspace: thread.directory,
+          kind: 'tool',
+          source: thread.agent,
+          sourceId: entry.id,
+          title: entry.title,
+          outcome: entry.status,
+          at: entry.created!,
+          agent: thread.agent,
+          sessionId: thread.sessionId,
+        });
       }
     }
     for (const [paneId, entrySnapshot] of Object.entries(agentEntrySnapshots)) {
@@ -1436,6 +1484,12 @@
       });
     }
     return recentActivityEvents(input);
+  });
+  $effect(() => {
+    const saved = saveActivityHistory(activityHistory);
+    if (saved === saveActivityHistory(durableActivityHistory)) return;
+    durableActivityHistory = activityHistory;
+    setSetting('sai-activity-history', saved);
   });
   $effect(() => {
     if (!sessionID || !running) return;
@@ -6214,6 +6268,18 @@
         if (!isPermissionNotFoundError(cause)) throw cause;
       }
     }
+    recordDecisionActivity(
+      {
+        agent: item.agentId ?? 'opencode',
+        directory: item.directory,
+        sessionId: item.sessionId,
+        title: item.text,
+        updated: item.receivedAt,
+      },
+      String(item.requestId ?? item.key),
+      item.text,
+      optionId === null || optionId === 'reject' ? 'rejected' : 'completed',
+    );
     await refreshInbox();
     if (item.kind === 'acp-permission') void restoreAgentActivity();
     if (item.kind === 'opencode-permission' && item.sessionId === sessionID) void refreshPrompts();
@@ -6562,8 +6628,8 @@
 
   async function focusActivitySource(attribute: string, id: string, attempts = 30): Promise<void> {
     await tick();
-    const target = [...document.querySelectorAll<HTMLElement>(`[${attribute}]`)].find(
-      (element) => element.getAttribute(attribute) === id && element.getClientRects().length,
+    const target = [...chatArea.querySelectorAll<HTMLElement>(`[${attribute}]`)].find(
+      (element) => element.getAttribute(attribute) === id,
     );
     if (target) {
       for (let parent: HTMLElement | null = target; parent; parent = parent.parentElement)
@@ -6598,9 +6664,10 @@
           candidate.sessionId === event.sessionId &&
           String(candidate.requestId ?? candidate.key) === event.sourceId,
       );
-      if (!item) throw new Error('The recorded decision is no longer available.');
-      await openInboxItem(item);
-      return;
+      if (item) {
+        await openInboxItem(item);
+        return;
+      }
     }
     const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
       (item) =>
@@ -6612,6 +6679,29 @@
       throw new Error('The recorded thread is no longer available.');
     mobileView = 'chat';
     if (event.kind === 'tool') await focusActivitySource('data-tool-id', event.sourceId);
+  }
+
+  function recordDecisionActivity(
+    thread: AgentThread,
+    sourceId: string,
+    title: string,
+    outcome: string,
+  ) {
+    durableActivityHistory = recentActivityEvents([
+      ...durableActivityHistory,
+      {
+        workspace: thread.directory,
+        kind: 'decision',
+        source: thread.agent,
+        sourceId,
+        title,
+        outcome,
+        at: Date.now(),
+        agent: thread.agent,
+        sessionId: thread.sessionId,
+      },
+    ]);
+    setSetting('sai-activity-history', saveActivityHistory(durableActivityHistory));
   }
 
   async function selectMainWorkspaceActivity(item: WorkspaceActivityItem) {
@@ -8044,6 +8134,7 @@
       messages,
       cursor: olderMessageCursor,
     });
+    openCodeTimelineRevision++;
   }
 
   function restoreCachedTimeline(path: string, id: string) {
@@ -9419,6 +9510,13 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
+                ondecision={(thread, permission, optionId) =>
+                  recordDecisionActivity(
+                    thread,
+                    String(permission.id),
+                    permission.title,
+                    optionId === 'reject' ? 'rejected' : 'completed',
+                  )}
                 running={!!(acpThread && runningAgentThreads[agentThreadKey(acpThread)])}
                 focused={focusedPane === 'main'}
                 oncreated={createAgentThread}
@@ -9917,6 +10015,8 @@
         onattachmentsent={assignReviewCaptures}
         onshortcut={keydownWorkspace}
         onactivity={recordPaneActivity}
+        onhistorychange={() => openCodeTimelineRevision++}
+        ondecision={recordDecisionActivity}
         onusage={(id, context) => {
           if (context !== undefined && openCodeUsage[`${directory}:${id}`] !== context)
             openCodeUsage = { ...openCodeUsage, [`${directory}:${id}`]: context };

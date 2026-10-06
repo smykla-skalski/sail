@@ -8,6 +8,11 @@ export interface CachedOpenCodeTimeline {
 const timelines = new Map<string, CachedOpenCodeTimeline>();
 const limit = 8;
 
+export interface OpenCodeTimelineSnapshot extends CachedOpenCodeTimeline {
+  directory: string;
+  sessionID: string;
+}
+
 function key(directory: string, sessionID: string): string {
   return `${directory}\0${sessionID}`;
 }
@@ -41,4 +46,11 @@ export function forgetOpenCodeTimeline(directory: string, sessionID: string): vo
 
 export function clearOpenCodeTimelineCache(): void {
   timelines.clear();
+}
+
+export function cachedOpenCodeTimelines(): OpenCodeTimelineSnapshot[] {
+  return [...timelines.entries()].map(([id, timeline]) => {
+    const [directory, sessionID] = id.split('\0');
+    return { directory, sessionID, messages: [...timeline.messages], cursor: timeline.cursor };
+  });
 }
