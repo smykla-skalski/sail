@@ -4852,6 +4852,7 @@
   }
 
   async function selectProject(path: string, groupID: string | null) {
+    showWorkspace();
     try {
       path = await invoke<string>('validate_repository', { path });
       if (
@@ -5008,6 +5009,7 @@
   }
 
   async function selectDefaultWorktree(path: string) {
+    showWorkspace();
     if (path !== directory) await loadProject(path);
     if (path !== directory) return;
     const panes = leaves(paneLayout);
@@ -5812,6 +5814,7 @@
         : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available))
     )
       return false;
+    showWorkspace();
     const jump = ++recentJumpGeneration;
     let expectedProjectLoad = projectLoadGeneration;
     const target = await invoke<string>('validate_repository', { path: thread.directory }).catch(
@@ -6340,6 +6343,18 @@
   }
 
   async function openReviewCheck(check: PostTurnCheck) {
+    showWorkspace();
+    const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
+      (item) =>
+        item.directory === check.directory &&
+        (item.agent === 'opencode'
+          ? `opencode:${item.sessionId}`
+          : `acp:${item.agent}:${item.sessionId}`) === check.thread,
+    );
+    if (!thread || !(await jumpToRecentThread(threadKey(thread)))) {
+      error = 'The session for this check is unavailable.';
+      return;
+    }
     mobileView = 'chat';
     await tick();
     const item = document.querySelector<HTMLElement>(`[data-check-id="${CSS.escape(check.id)}"]`);
@@ -7296,6 +7311,7 @@
 
   async function selectSession(id: string, automatic = false): Promise<boolean> {
     if (!client || !directory) return false;
+    if (!automatic) showWorkspace();
     const targetPane =
       !automatic && focusedPane !== 'main'
         ? leaves(paneLayout).find((pane) => pane.id === focusedPane)
@@ -8893,6 +8909,7 @@
         onworktreecancelled={(repository) =>
           reopenCommandPalette({ kind: 'worktrees', repository })}
         onselect={(path) => {
+          showWorkspace();
           if (path !== directory) void loadProject(path);
         }}
         onselectdefault={(path) => void selectDefaultWorktree(path)}
@@ -9581,7 +9598,10 @@
         onopen={openTaskOverviewTarget}
         onopencheck={openTaskOverviewCheck}
       />
-    {:else}<PaneTree
+    {/if}
+    <div class="workspace-pane-host" hidden={workspaceView === 'overview'}>
+      <PaneTree
+        active={workspaceView === 'workspace'}
         pane={paneLayout}
         focused={focusedPane}
         {directory}
@@ -9682,7 +9702,8 @@
               await openSettings();
             }}
           />
-        </section>{/if}{/if}
+        </section>{/if}
+    </div>
   </div>
 </div>
 <ConfirmDialog request={confirmation} onanswer={answerConfirmation} />

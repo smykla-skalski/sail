@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import ActivityStatus from './ActivityStatus.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
@@ -65,6 +65,8 @@
   let pullRequestErrors = $state<Record<string, string>>({});
   let loading = $state(true);
   let generation = 0;
+  let refreshing = false;
+  let refreshQueued = false;
   let searchInput: HTMLInputElement;
   let baseCards = $derived(
     buildTaskOverviewCards({ catalog, threads, statuses, agentNames, checks, receipts }),
@@ -75,8 +77,11 @@
       branch: metadata[card.path]?.branch ?? card.branch,
     })),
   );
+  let sortableCards = $derived(
+    searchableCards.map((card) => Object.assign({}, card, { checkState: sortCheckState(card) })),
+  );
   let cards = $derived(
-    sortTaskOverviewCards(filterTaskOverviewCards(searchableCards, query), sort, pinned),
+    sortTaskOverviewCards(filterTaskOverviewCards(sortableCards, query), sort, pinned),
   );
   let locationsKey = $derived(JSON.stringify(baseCards.map((card) => card.path)));
 
@@ -85,7 +90,8 @@
   });
 
   $effect(() => {
-    void refresh(locationsKey);
+    const key = locationsKey;
+    untrack(() => void refresh(key));
   });
 
   onMount(() => {
@@ -96,38 +102,65 @@
 
   async function refresh(_locationsKey = locationsKey) {
     if (_locationsKey !== locationsKey) return;
+    if (refreshing) {
+      refreshQueued = true;
+      return;
+    }
+    refreshing = true;
     const current = ++generation;
     const paths = baseCards.map((card) => card.path);
     loading = true;
-    const repositories = Object.entries(catalog.worktrees).filter(
-      ([, worktrees]) => worktrees.length,
-    );
-    const [overviewResult, checkResults] = await Promise.all([
-      invoke<WorktreeOverview[]>('worktree_overviews', { paths }).catch(() => []),
-      Promise.allSettled(
-        repositories.map(([repository, worktrees]) =>
-          invoke<RepositoryChecks>('pull_request_checks', {
-            repository,
-            worktrees: worktrees.map(({ path, branch }) => ({ path, branch })),
-          }),
+    try {
+      const overviewResult = await invoke<WorktreeOverview[]>('worktree_overviews', {
+        paths,
+      }).catch(() => []);
+      if (current !== generation) return;
+      const overview = Object.fromEntries(overviewResult.map((entry) => [entry.path, entry]));
+      metadata = overview;
+      const repositories = catalog.repositories.map((repository) => {
+        const locations = [
+          { path: repository, branch: overview[repository]?.branch },
+          ...(catalog.worktrees[repository] ?? []).map(({ path }) => ({
+            path,
+            branch: overview[path]?.branch,
+          })),
+        ];
+        const available = locations.flatMap(({ path, branch }) =>
+          branch && branch !== 'Detached HEAD' ? [{ path, branch }] : [],
+        );
+        return [repository, locations, available] as const;
+      });
+      const nextErrors: Record<string, string> = {};
+      for (const [, locations] of repositories)
+        for (const { path, branch } of locations)
+          if (branch === 'Detached HEAD') nextErrors[path] = 'Checks unavailable on detached HEAD.';
+      const checkResults = await Promise.allSettled(
+        repositories.map(([repository, , worktrees]) =>
+          worktrees.length
+            ? invoke<RepositoryChecks>('pull_request_checks', { repository, worktrees })
+            : Promise.resolve<RepositoryChecks>({ checks: {}, errors: {} }),
         ),
-      ),
-    ]);
-    if (current !== generation) return;
-    metadata = Object.fromEntries(overviewResult.map((entry) => [entry.path, entry]));
-    const nextChecks: Record<string, PullRequestChecks | null> = {};
-    const nextErrors: Record<string, string> = {};
-    checkResults.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        Object.assign(nextChecks, result.value.checks);
-        Object.assign(nextErrors, result.value.errors);
-      } else {
-        for (const worktree of repositories[index][1]) nextErrors[worktree.path] = 'Unavailable';
+      );
+      if (current !== generation) return;
+      const nextChecks: Record<string, PullRequestChecks | null> = {};
+      checkResults.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          Object.assign(nextChecks, result.value.checks);
+          Object.assign(nextErrors, result.value.errors);
+        } else {
+          for (const { path } of repositories[index][1]) nextErrors[path] = 'Checks unavailable.';
+        }
+      });
+      pullRequests = nextChecks;
+      pullRequestErrors = nextErrors;
+    } finally {
+      loading = false;
+      refreshing = false;
+      if (refreshQueued) {
+        refreshQueued = false;
+        void refresh();
       }
-    });
-    pullRequests = nextChecks;
-    pullRequestErrors = nextErrors;
-    loading = false;
+    }
   }
 
   function togglePin(path: string) {
@@ -148,12 +181,15 @@
     return metadata[card.path]?.branch ?? card.branch;
   }
 
-  function repositoryState(card: TaskOverviewCard): string | null {
+  function repositoryError(card: TaskOverviewCard): string | null {
     return (
       metadata[card.path]?.error ??
-      pullRequestErrors[card.path] ??
       (!loading && !(card.path in metadata) ? 'Repository status unavailable' : null)
     );
+  }
+
+  function availabilityMessage(card: TaskOverviewCard): string | null {
+    return repositoryError(card) ?? pullRequestErrors[card.path] ?? null;
   }
 
   function pullRequestState(card: TaskOverviewCard): 'passing' | 'failing' | 'pending' | null {
@@ -175,13 +211,22 @@
 
   function visibleCheckState(
     card: TaskOverviewCard,
-  ): 'passing' | 'failing' | 'pending' | 'canceled' | null {
+  ): 'passing' | 'failing' | 'pending' | 'canceled' | 'unavailable' | null {
+    if (repositoryError(card) || pullRequestErrors[card.path]) return 'unavailable';
     const pullRequest = pullRequestState(card);
     if (pullRequest === 'failing' || card.checkState === 'failed') return 'failing';
     if (pullRequest === 'pending' || card.checkState === 'running') return 'pending';
     if (card.checkState === 'other') return 'canceled';
     if (pullRequest === 'passing' || card.checkState === 'passed') return 'passing';
     return null;
+  }
+
+  function sortCheckState(card: TaskOverviewCard): TaskOverviewCard['checkState'] {
+    const state = visibleCheckState(card);
+    if (state === 'failing') return 'failed';
+    if (state === 'pending') return 'running';
+    if (state === 'passing') return 'passed';
+    return state ? 'other' : 'none';
   }
 
   function actionLabel(card: TaskOverviewCard): string {
@@ -244,7 +289,8 @@
   </div>
   <section class="task-card-grid" aria-label="Worktree tasks" aria-busy={loading}>
     {#each cards as card (card.id)}
-      {@const unavailable = repositoryState(card)}
+      {@const unavailable = availabilityMessage(card)}
+      {@const repositoryUnavailable = repositoryError(card)}
       <article class:selected={selected === card.id || directory === card.path} class="task-card">
         <div class="task-card-topline">
           <span class="task-card-repository" title={card.repository}>{card.repositoryName}</span>
@@ -262,7 +308,7 @@
           <span class="task-card-agent">
             {#if card.agent}<HarnessIcon agent={card.agent} size={14} />{/if}
             {card.agentName}
-            <ActivityStatus status={unavailable ? 'offline' : card.status} compact />
+            <ActivityStatus status={repositoryUnavailable ? 'offline' : card.status} compact />
           </span>
           <span class="task-card-event">{card.latestEvent}</span>
         </button>

@@ -26,6 +26,7 @@ export type TaskOverviewCard = {
   checkState: TaskOverviewCheckState;
   check: PostTurnCheck | null;
   setupFailed: boolean;
+  setupPending: boolean;
 };
 
 export type TaskOverviewPreferences = {
@@ -103,6 +104,7 @@ export function buildTaskOverviewCards(input: {
       repository,
       branch: 'Default branch',
       setupFailed: false,
+      setupPending: false,
       statusComment: undefined as string | undefined,
     },
     ...(input.catalog.worktrees[repository] ?? []).map((worktree) => ({
@@ -110,6 +112,7 @@ export function buildTaskOverviewCards(input: {
       repository,
       branch: worktree.branch,
       setupFailed: worktree.setupStatus === 'failed',
+      setupPending: worktree.setupStatus === 'pending',
       statusComment: worktree.statusComment,
     })),
   ]);
@@ -159,6 +162,7 @@ export function buildTaskOverviewCards(input: {
     const currentCheckState = combinedCheckState(locationChecks);
     let nextAction = 'Start an agent';
     if (location.setupFailed) nextAction = 'Repair worktree setup';
+    else if (location.setupPending) nextAction = 'Worktree setup in progress';
     else if (status === 'waiting')
       nextAction = `Respond to ${input.agentNames[agent ?? ''] ?? agent}`;
     else if (currentCheckState === 'failed') nextAction = 'Review failed check';
@@ -183,6 +187,7 @@ export function buildTaskOverviewCards(input: {
       checkState: currentCheckState,
       check: failedCheck ?? recentCheck ?? null,
       setupFailed: location.setupFailed,
+      setupPending: location.setupPending,
     };
   });
 }
@@ -207,7 +212,7 @@ export function sortTaskOverviewCards(
 ): TaskOverviewCard[] {
   const pins = new Set(pinned);
   const attention = (card: TaskOverviewCard) => {
-    if (card.setupFailed || card.status === 'waiting') return 0;
+    if (card.setupFailed || card.setupPending || card.status === 'waiting') return 0;
     if (card.checkState === 'failed' || card.status === 'failed') return 1;
     if (card.status === 'working' || card.checkState === 'running') return 2;
     if (!card.status) return 3;

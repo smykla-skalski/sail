@@ -51,7 +51,7 @@ describe('cross-worktree task overview', () => {
               [repo]: [
                 {
                   path: checkout,
-                  branch: 'feat/overview',
+                  branch: 'stale/catalog-branch',
                   statusComment: 'Build the cross-worktree overview',
                   setupStatus: 'ready',
                 },
@@ -68,6 +68,7 @@ describe('cross-worktree task overview', () => {
 
     await $('button=Overview').click();
     await expect($('main[aria-label="Task overview"]')).toBeDisplayed();
+    await expect($('.workspace-pane-host')).toHaveAttribute('hidden');
     await expect($$('.task-card')).toBeElementsArrayOfSize(2);
     const featureCard = $('.task-card*=Build the cross-worktree overview');
     await expect(featureCard).toHaveText(expect.stringContaining('feat/overview'));
@@ -125,6 +126,7 @@ describe('cross-worktree task overview', () => {
 
     await $('.task-card-main').click();
     await expect($('main[aria-label="Task overview"]')).not.toExist();
+    await expect($('.workspace-pane-host')).not.toHaveAttribute('hidden');
     await expect($('.breadcrumb-project')).toHaveText(expect.stringContaining('worktree'));
     const selected = await browser.execute(() => {
       const saved: unknown = JSON.parse(localStorage.getItem('sai-task-overview') ?? '{}');

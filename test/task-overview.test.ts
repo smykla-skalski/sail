@@ -101,6 +101,7 @@ void test('cards expose the most urgent agent and latest meaningful event', () =
       checkState: 'failed',
       check: checks[0],
       setupFailed: false,
+      setupPending: false,
     },
   );
 });
@@ -147,6 +148,26 @@ void test('empty and failed worktrees never imply successful activity', () => {
       },
     ],
   );
+});
+
+void test('pending worktree setup cannot offer an agent start', () => {
+  const pendingCatalog: ProjectCatalog = {
+    ...catalog,
+    worktrees: {
+      '/code/alpha': [{ path: '/work/pending', branch: 'feat/pending', setupStatus: 'pending' }],
+    },
+  };
+  const cards = buildTaskOverviewCards({
+    catalog: pendingCatalog,
+    threads: {},
+    statuses: {},
+    agentNames: {},
+    checks: [],
+    receipts: [],
+  });
+
+  assert.equal(cards[1].setupPending, true);
+  assert.equal(cards[1].nextAction, 'Worktree setup in progress');
 });
 
 void test('checks aggregate the newest turn without stale failures', () => {

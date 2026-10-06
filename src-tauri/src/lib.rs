@@ -964,7 +964,8 @@ fn inspect_worktree(path: String) -> WorktreeOverview {
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|branch| !branch.is_empty());
+        .filter(|branch| !branch.is_empty())
+        .or_else(|| Some("Detached HEAD".into()));
     let changes = Command::new("git")
         .args([
             "-C",
@@ -2382,6 +2383,17 @@ mod tests {
         assert!(result[1].branch.is_none());
         assert!(result[1].changed_files.is_none());
         assert!(result[1].error.is_some());
+
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        git(path, &["add", "changed.txt"]);
+        git(
+            path,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        git(path, &["checkout", "--detach", "-q"]);
+        let detached = tauri::async_runtime::block_on(worktree_overviews(vec![path.into()]));
+        assert_eq!(detached[0].branch.as_deref(), Some("Detached HEAD"));
         fs::remove_dir_all(root).unwrap();
     }
 

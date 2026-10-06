@@ -1389,22 +1389,28 @@ pub async fn open_issue(repository: String, number: u64) -> Result<GitHubIssue, 
     .map_err(|error| error.to_string())?
 }
 
-fn checked_worktree(repository: String, worktree: String, branch: &str) -> Result<PathBuf, String> {
+fn checked_worktree(
+    repository: String,
+    worktree: String,
+    branch: &str,
+    allow_repository: bool,
+) -> Result<PathBuf, String> {
     let repository = PathBuf::from(crate::validate_repository(repository)?);
     let worktree = Path::new(&worktree)
         .canonicalize()
         .map_err(|_| "Worktree folder no longer exists.".to_string())?;
     let listed = crate::git_reference(&repository, &["worktree", "list", "--porcelain"])
         .ok_or("Cannot inspect repository worktrees.")?;
-    if worktree == repository
-        || !listed
-            .lines()
-            .filter_map(|line| line.strip_prefix("worktree "))
-            .any(|path| {
-                Path::new(path)
-                    .canonicalize()
-                    .is_ok_and(|registered| registered == worktree)
-            })
+    if (!allow_repository && worktree == repository)
+        || (worktree != repository
+            && !listed
+                .lines()
+                .filter_map(|line| line.strip_prefix("worktree "))
+                .any(|path| {
+                    Path::new(path)
+                        .canonicalize()
+                        .is_ok_and(|registered| registered == worktree)
+                }))
     {
         return Err("This folder is not a worktree of the selected repository.".to_string());
     }
@@ -1448,7 +1454,7 @@ pub async fn pull_request_checks(
         for entry in worktrees {
             let result = (|| {
                 let worktree =
-                    checked_worktree(repository.clone(), entry.path.clone(), &entry.branch)?;
+                    checked_worktree(repository.clone(), entry.path.clone(), &entry.branch, true)?;
                 let remote = branch_remote(&worktree, &entry.branch)?;
                 let source = source_repository(&worktree, &remote)?;
                 let owner = source.split('/').next().unwrap_or_default();
@@ -1538,7 +1544,7 @@ pub async fn failed_check_log(
     url: String,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let worktree = checked_worktree(repository, worktree, &branch)?;
+        let worktree = checked_worktree(repository, worktree, &branch, false)?;
         let parsed = tauri::Url::parse(&url).map_err(|_| "Invalid check link.")?;
         let parts = parsed
             .path_segments()
@@ -1597,7 +1603,7 @@ pub async fn create_pull_request(
     draft: bool,
 ) -> Result<PullRequest, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let worktree = checked_worktree(repository, worktree, &branch)?;
+        let worktree = checked_worktree(repository, worktree, &branch, false)?;
         let base = base.trim();
         let title = title.trim();
         if base.is_empty() || base.starts_with('-') || title.is_empty() {
@@ -1744,8 +1750,26 @@ fn open_url(url: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        marked_issue, marker, validate_external_url, validate_graph, IssueDraft, IssueGraphDraft,
+        checked_worktree, marked_issue, marker, validate_external_url, validate_graph, IssueDraft,
+        IssueGraphDraft,
     };
+    use std::{fs, process::Command};
+
+    #[test]
+    fn check_probe_accepts_repository_root_only_when_requested() {
+        let root = std::env::temp_dir().join(format!("sail-root-check-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let status = Command::new("git")
+            .args(["-C", root.to_str().unwrap(), "init", "-q", "-b", "main"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let path = root.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        assert!(checked_worktree(path.clone(), path.clone(), "main", true).is_ok());
+        assert!(checked_worktree(path.clone(), path, "main", false).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn markers_recover_only_the_matching_issue() {
