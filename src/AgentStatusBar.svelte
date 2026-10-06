@@ -8,6 +8,7 @@
   let expanded = $state(false);
   let now = $state(Date.now());
   let root: HTMLElement;
+  let summary: HTMLButtonElement;
   const counts = $derived(agentStatusCounts(items));
 
   function dismiss(event: MouseEvent) {
@@ -16,9 +17,11 @@
 
   onMount(() => {
     document.addEventListener('click', dismiss);
+    window.addEventListener('keydown', keydown, true);
     const clock = setInterval(() => (now = Date.now()), 60_000);
     return () => {
       document.removeEventListener('click', dismiss);
+      window.removeEventListener('keydown', keydown, true);
       clearInterval(clock);
     };
   });
@@ -26,14 +29,16 @@
   function keydown(event: KeyboardEvent) {
     if (event.key === 'Escape' && expanded) {
       event.preventDefault();
+      event.stopImmediatePropagation();
       expanded = false;
+      queueMicrotask(() => summary.focus());
     }
   }
 </script>
 
-<svelte:window onkeydown={keydown} />
 <footer class="agent-status-bar" bind:this={root}>
   <button
+    bind:this={summary}
     class="agent-status-summary"
     aria-expanded={expanded}
     aria-controls="agent-status-details"

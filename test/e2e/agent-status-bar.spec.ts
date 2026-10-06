@@ -57,6 +57,7 @@ describe('agent status bar', () => {
 
     await browser.keys('Escape');
     await expect(details).not.toExist();
+    await expect($('.agent-status-summary')).toBeFocused();
     await $('.agent-status-summary').click();
     await $('.topbar').click();
     await expect(details).not.toExist();
