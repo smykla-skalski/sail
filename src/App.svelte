@@ -197,6 +197,11 @@
   import { getPlan, type HistoryEntry, type PlanSnapshot } from './lib/plan';
   import { mergeMessages, nearBottom } from './lib/timeline';
   import {
+    forgetOpenCodeTimeline,
+    recallOpenCodeTimeline,
+    rememberOpenCodeTimeline,
+  } from './lib/opencode-timeline-cache';
+  import {
     clipboardFiles,
     fileUri,
     insertClipboardText,
@@ -1139,6 +1144,7 @@
     if (current !== selection || id !== sessionID) return;
     messages = mergeMessages(messages, page.data);
     olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
+    cacheCurrentTimeline();
     await restoreOlderMessages(source, id, current, count, anchorID);
   }
   let client = $state<OpenCodeClient | null>(null);
@@ -4888,6 +4894,7 @@
     }
     ++projectLoadGeneration;
     saveViewState();
+    cacheCurrentTimeline();
     error = '';
     const current = ++selection;
     directory = path;
@@ -5261,6 +5268,7 @@
 
   function clearSelectedSession() {
     saveViewState();
+    cacheCurrentTimeline();
     sessionID = null;
     if (mobileView === 'details') mobileView = 'chat';
     selectedSession = null;
@@ -7190,16 +7198,19 @@
       (!targetPane ||
         (paneSelections.get(targetPane.id) === paneSelection &&
           leaves(paneLayout).some((pane) => pane.id === targetPane.id)));
-    let info: SessionInfo;
-    try {
-      info = await client.session.get({ sessionID: id });
-      if (!valid()) return false;
-      if (info.location.directory !== path || info.parentID)
-        throw new Error('This session does not belong to the selected repository.');
-    } catch (cause) {
-      if (valid()) error = describe(cause);
-      return false;
-    }
+    let info = sessions.find(
+      (session) => session.id === id && session.location.directory === path && !session.parentID,
+    );
+    if (!info)
+      try {
+        info = await client.session.get({ sessionID: id });
+        if (!valid()) return false;
+        if (info.location.directory !== path || info.parentID)
+          throw new Error('This session does not belong to the selected repository.');
+      } catch (cause) {
+        if (valid()) error = describe(cause);
+        return false;
+      }
     const nativeThread: AgentThread = {
       agent: 'opencode',
       sessionId: info.id,
@@ -7224,6 +7235,7 @@
       focusPaneForTyping(targetPane.id);
       return true;
     }
+    cacheCurrentTimeline();
     sessionID = id;
     clearMainPaneEmpty();
     detailsOpen = true;
@@ -7231,7 +7243,7 @@
     syncSessionChoice(info);
     newSessionMode = null;
     clearDraftAttachments();
-    resetTimeline();
+    restoreCachedTimeline(path, id);
     followChat = viewStates.get(viewKey())?.follow ?? true;
     running = activeSessionIDs.includes(id);
     activity = 'Thinking';
@@ -7289,6 +7301,7 @@
     savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null, kind: undefined }));
     clearMainPaneEmpty();
     saveViewState();
+    cacheCurrentTimeline();
     ++selection;
     sessionID = null;
     selectedSession = null;
@@ -7571,6 +7584,7 @@
           nextLayout = updatePane(nextLayout, pane.id, { thread: null });
       if (nextLayout !== paneLayout) savePaneLayout(nextLayout);
       if (session.id === sessionID) clearSelectedSession();
+      forgetOpenCodeTimeline(directory, session.id);
       await refreshSessions();
     } catch (cause) {
       error = describe(cause);
@@ -7614,6 +7628,23 @@
     messageGeneration.clear();
   }
 
+  function cacheCurrentTimeline() {
+    if (!directory || !sessionID || timelineSession !== sessionID) return;
+    rememberOpenCodeTimeline(directory, sessionID, {
+      messages,
+      cursor: olderMessageCursor,
+    });
+  }
+
+  function restoreCachedTimeline(path: string, id: string) {
+    resetTimeline();
+    const cached = recallOpenCodeTimeline(path, id);
+    if (!cached) return;
+    timelineSession = id;
+    messages = cached.messages;
+    olderMessageCursor = cached.cursor;
+  }
+
   function scrollToLatest() {
     if (!followChat) return;
     cancelAnimationFrame(followFrame);
@@ -7655,6 +7686,7 @@
       timelineSession = id;
       messages = acceptProjectedMessages(first.data, observed).toReversed();
       olderMessageCursor = first.cursor.next ?? null;
+      cacheCurrentTimeline();
       await tick();
       scrollToLatest();
       return;
@@ -7675,6 +7707,7 @@
     const incoming = await collectGap(first.cursor.next ?? null, [...first.data]);
     if (!valid()) return;
     messages = mergeMessages(messages, acceptProjectedMessages(incoming, observed));
+    cacheCurrentTimeline();
   }
 
   async function loadOlderMessages() {
@@ -7700,6 +7733,7 @@
       if (current !== selection || id !== sessionID) return;
       messages = mergeMessages(messages, acceptProjectedMessages(page.data, observed));
       olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
+      cacheCurrentTimeline();
       if (!underfilled) followChat = false;
       await tick();
       if (chatScroll)
@@ -7739,6 +7773,7 @@
       )
         return;
       messages = mergeMessages(messages, [message]);
+      cacheCurrentTimeline();
       if (settled) {
         const remaining = { ...liveText };
         delete remaining[messageID];

@@ -59,6 +59,7 @@
   import type { SetupReport } from './lib/onboarding';
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import { mergeMessages, nearBottom } from './lib/timeline';
+  import { recallOpenCodeTimeline, rememberOpenCodeTimeline } from './lib/opencode-timeline-cache';
   import {
     prepareToolFailureDraft,
     openCodeErrorDetails,
@@ -327,6 +328,7 @@
     messages = first ? page.data.toReversed() : mergeMessages(messages, page.data);
     onusage?.(id, openCodeContextUsage(messages, setup?.models ?? []));
     if (first) cursor = page.cursor.next ?? null;
+    rememberOpenCodeTimeline(directory, id, { messages, cursor });
     await follow();
     if (scroll?.scrollHeight <= scroll?.clientHeight && cursor) void loadOlder();
   }
@@ -346,6 +348,7 @@
       if (current !== generation || id !== activeID) return;
       messages = mergeMessages(messages, page.data);
       cursor = page.cursor.next === next ? null : (page.cursor.next ?? null);
+      rememberOpenCodeTimeline(directory, id, { messages, cursor });
       if (!underfilled) following = false;
       await tick();
       scroll.scrollTop =
@@ -372,6 +375,11 @@
 
   async function activate(id: string | null) {
     const current = ++generation;
+    if (activeID)
+      rememberOpenCodeTimeline(directory, activeID, {
+        messages,
+        cursor,
+      });
     clearTimeout(refreshTimer);
     refreshTimer = undefined;
     for (const path of clipboardPaths)
@@ -390,8 +398,9 @@
     selectedThreadId = id;
     activeID = id;
     session = null;
-    messages = [];
-    cursor = null;
+    const cached = id ? recallOpenCodeTimeline(directory, id) : null;
+    messages = cached?.messages ?? [];
+    cursor = cached?.cursor ?? null;
     pendingPermissions = [];
     pendingForms = [];
     error = '';
@@ -410,6 +419,8 @@
       const [info, active] = await Promise.all([
         client.session.get({ sessionID: id }),
         client.session.active(),
+        refreshMessages(id, current),
+        refreshRequests(id, current),
       ]);
       if (current !== generation || disposed) return;
       session = info;
@@ -417,7 +428,6 @@
       selectedModel = info.model ? `${info.model.providerID}:${info.model.id}` : selectedModel;
       selectedVariant = info.model?.variant ?? '';
       running = active[id]?.type === 'running';
-      await Promise.all([refreshMessages(id, current), refreshRequests(id, current)]);
     } catch (cause) {
       if (current === generation) error = describe(cause);
     } finally {
@@ -524,6 +534,7 @@
     disposed = false;
     mounted = true;
     return () => {
+      if (activeID) rememberOpenCodeTimeline(directory, activeID, { messages, cursor });
       disposed = true;
       mounted = false;
       ++generation;
