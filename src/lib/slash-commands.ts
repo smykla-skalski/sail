@@ -20,6 +20,7 @@ function escapedTick(text: string, index: number): boolean {
 
 export function visibleCommandText(text: string): string {
   let fence: { marker: string; length: number } | null = null;
+  let quote = false;
   const unfenced = text
     .split('\n')
     .map((line) => {
@@ -29,11 +30,18 @@ export function visibleCommandText(text: string): string {
         marker?.[0] === fence.marker &&
         marker.length >= fence.length &&
         line.slice(line.indexOf(marker) + marker.length).trim() === '';
-      if (marker && (!fence || closesFence)) {
-        fence = fence ? null : { marker: marker[0], length: marker.length };
+      if (fence) {
+        if (closesFence) fence = null;
         return ' '.repeat(line.length);
       }
-      if (fence || /^(?: {4}|\t)/.test(line)) return ' '.repeat(line.length);
+      if (!line.trim()) quote = false;
+      if (/^ {0,3}>/.test(line)) quote = true;
+      if (quote) return ' '.repeat(line.length);
+      if (marker) {
+        fence = { marker: marker[0], length: marker.length };
+        return ' '.repeat(line.length);
+      }
+      if (/^(?: {4}|\t)/.test(line)) return ' '.repeat(line.length);
       return line;
     })
     .join('\n');
