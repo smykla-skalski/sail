@@ -1,11 +1,12 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import type { ShipIssue, ShipRun } from './lib/issue-shipping';
+  import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './lib/issue-shipping';
   import {
     ciStatus,
     dependencyIssue,
     dependencyUrl,
     gateNames,
+    shipActivity,
     shipStatus,
   } from './lib/ship-progress';
 
@@ -40,6 +41,13 @@
   const run = $derived(visible.find((item) => item.id === selectedRun) ?? visible.at(-1));
   const issue = $derived(run?.issues.find((item) => item.id === selectedIssue) ?? run?.issues[0]);
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
+  const issues = $derived(run?.issues ?? []);
+
+  function issueLabel(item: ShipIssue): string {
+    return item.title === `Issue #${item.number}`
+      ? `#${item.number}`
+      : `#${item.number} ${item.title}`;
+  }
 
   $effect(() => {
     if (active && !wasActive) error = '';
@@ -144,38 +152,38 @@
         </p>
       </div>
     </section>
-    <div class="ship-content">
-      <nav class="ship-graph" aria-label="Issue dependency graph">
-        {#each run.issues as item (item.id)}
-          <div
-            class="ship-node"
-            class:selected={item.id === issue?.id}
-            data-state={shipStatus(run, item)}
+    <section class="ship-now" aria-label="Current shipping activity">
+      <div>
+        <h3>Happening now</h3>
+        <p>Latest worker, gate, blocker, and merge state for every issue.</p>
+      </div>
+      <div class="ship-now-list">
+        {#each issues as item (item.id)}
+          {@const activity = shipActivity(run, item)}
+          <button
+            class="ship-now-item"
+            data-state={activity.state}
+            aria-pressed={item.id === issue?.id}
+            onclick={() => selectIssue(item.id)}
           >
-            <button
-              class="ship-node-select"
-              aria-pressed={item.id === issue?.id}
-              onclick={() => selectIssue(item.id)}
-              ><strong>#{item.number} {item.title}</strong><span class="ship-status"
-                >{shipStatus(run, item)}</span
-              ></button
-            >
-            {@render dependencies(run, item)}
-          </div>
-        {/each}
-      </nav>
-      {#if issue}<section
+            <strong>{issueLabel(item)}</strong>
+            <span>{activity.title}</span>
+            <small>{activity.detail}</small>
+            {#if activity.at}<time datetime={new Date(activity.at).toISOString()}
+                >Last signal {new Date(activity.at).toLocaleTimeString()}</time
+              >{/if}
+          </button>
+        {:else}<p class="ship-muted">No shipping work is active.</p>{/each}
+      </div>
+    </section>
+    <div class="ship-content">
+      {#if issue}
+        <section
           class="ship-issue-detail"
           tabindex="-1"
           aria-label={`Issue ${issue.number} details`}
         >
-          <h3>
-            <a href={issue.url} target="_blank" rel="noreferrer">#{issue.number} {issue.title}</a>
-          </h3>
-          <p>
-            <strong>{shipStatus(run, issue)}</strong> · Stage: {issue.stage?.replaceAll('_', ' ') ??
-              issue.state.replaceAll('_', ' ')} · GitHub issue: {issue.issueState ?? 'Unknown'}
-          </p>
+          <h3>Issue details</h3>
           {#if issue.blockedReason || issue.error}<p class="ship-error" role="status">
               {issue.blockedReason || issue.error}
             </p>{/if}
@@ -193,11 +201,13 @@
               : 'Not refreshed yet'}
           </p>
           <div class="ship-actions">
-            <button disabled={!issue.path} onclick={() => act(() => onopen(issue!.path!))}
-              >Open worktree</button
+            <a href={issue.url} target="_blank" rel="noreferrer">Open GitHub issue</a>
+            <button
+              disabled={!issue.path || issue.worktreeUnavailable}
+              onclick={() => act(() => onopen(issue!.path!))}>Open worktree</button
             >
             <button
-              disabled={!issue.path || !issue.threadId}
+              disabled={!issue.path || !issue.threadId || issue.worktreeUnavailable}
               onclick={() => act(() => onopen(issue!.path!, issue!.threadId))}
               >Open worker session</button
             >
@@ -206,17 +216,25 @@
               >{/if}
           </div>
           <p class="ship-path">
-            {issue.path ??
-              (issue.state === 'merged' ? 'Worktree removed after merge' : 'Worktree not created')} ·
+            {issue.worktreeUnavailable
+              ? `Worktree unavailable: ${issue.path}`
+              : (issue.path ??
+                (issue.state === 'merged'
+                  ? 'Worktree removed after merge'
+                  : 'Worktree not created'))} ·
             {issue.branch}
           </p>
           {#if issue.archivePath}<p class="ship-path">Archived files: {issue.archivePath}</p>{/if}
           {@render dependencies(run, issue)}
           <h4>Implementation</h4>
-          <p>Worker: {run.provider} / {issue.workerModel ?? 'Unknown model'}</p>
+          <p>Worker: {run.provider} / {resolvedWorkerModel(issue) ?? 'Unknown model'}</p>
           <p>
             Models that changed files: {issue.models?.join(', ') ||
-              'Not recorded'}{issue.modelUncertain ? ' · Attribution uncertain' : ''}
+              (resolvedWorkerModel(issue)
+                ? `Awaiting file-change attribution from ${resolvedWorkerModel(issue)}`
+                : 'Awaiting worker model attribution')}{issue.modelUncertain
+              ? ' · Attribution uncertain'
+              : ''}
           </p>
           <h4>Validation gates</h4>
           <ol class="ship-gates">
@@ -285,6 +303,36 @@
     gap: 20px;
     align-items: start;
   }
+  .ship-now {
+    display: grid;
+    gap: 12px;
+    margin-top: 20px;
+  }
+  .ship-now h3,
+  .ship-now p {
+    margin: 0;
+  }
+  .ship-now-list {
+    display: grid;
+    gap: 8px;
+  }
+  .ship-now-item {
+    display: grid;
+    gap: 4px;
+    padding: 12px;
+    text-align: left;
+    border-left: 3px solid var(--sui-primary);
+  }
+  .ship-now-item[data-state='blocked'] {
+    border-left-color: var(--sui-danger);
+  }
+  .ship-now-item[data-state='waiting'] {
+    border-left-color: var(--sui-warning, var(--sui-primary));
+  }
+  .ship-now-item time {
+    opacity: 0.7;
+    font-size: 12px;
+  }
   h2,
   h3 {
     margin: 0 0 8px;
@@ -352,26 +400,6 @@
     grid-template-columns: minmax(0, 1fr);
     gap: 24px;
     margin-top: 20px;
-  }
-  .ship-node {
-    padding: 12px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-    margin-bottom: 12px;
-  }
-  .ship-node.selected {
-    border-color: var(--sui-primary);
-  }
-  .ship-node-select {
-    display: grid;
-    gap: 8px;
-    width: 100%;
-    text-align: left;
-    border: 0;
-    padding: 0 0 8px;
-  }
-  .ship-status {
-    font-size: 12px;
   }
   .ship-dependencies {
     display: grid;

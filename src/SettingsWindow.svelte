@@ -334,7 +334,9 @@
               >{:else}<span> — agent available; model verified at gate</span>{/if}
             <Button size="sm" onclick={() => removeValidationChoice(choice)}>Remove</Button>
           </p>
-        {:else}<p role="status">No cross-validation models selected. Gates will pause.</p>{/each}
+        {:else}<p role="status">
+            No cross-validation models selected. Gates use the implementation agent and model.
+          </p>{/each}
         <label for="validation-agent">Agent</label>
         <select id="validation-agent" bind:value={validationAgent}>
           <option value="">Select an agent</option>

@@ -14,6 +14,7 @@ export interface ShipIssue {
   state: ShipIssueState;
   branch: string;
   path: string | null;
+  worktreeUnavailable?: boolean;
   receiptId: string | null;
   threadId: string | null;
   pullRequest: string | null;
@@ -47,6 +48,84 @@ export interface ShipRun {
   externalClosed: Record<string, boolean>;
   issues: ShipIssue[];
   umbrella?: { number: number; title: string; url: string };
+}
+
+export type DirectShipRunInput = {
+  id: string;
+  project: string;
+  directory: string;
+  repository: string;
+  number: number;
+  provider: ShipRun['provider'];
+  threadId: string;
+  workerModel?: string;
+  approvedAt: number;
+};
+
+export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): ShipRun[] {
+  const existing = runs.find((run) =>
+    run.issues.some((issue) => issue.path === input.directory && issue.threadId === input.threadId),
+  );
+  if (existing) {
+    const existingIssue = existing.issues.find(
+      (issue) => issue.path === input.directory && issue.threadId === input.threadId,
+    );
+    if (!input.workerModel || existingIssue?.workerModel === input.workerModel) return runs;
+    return runs.map((run) =>
+      run !== existing
+        ? run
+        : {
+            ...run,
+            issues: run.issues.map((issue) =>
+              issue.path === input.directory && issue.threadId === input.threadId
+                ? { ...issue, workerModel: input.workerModel }
+                : issue,
+            ),
+          },
+    );
+  }
+  return [
+    ...runs,
+    {
+      id: input.id,
+      source: `direct:${input.threadId}`,
+      repository: input.project,
+      remote: input.repository,
+      provider: input.provider,
+      limit: 1,
+      approvedAt: input.approvedAt,
+      externalClosed: {},
+      issues: [
+        {
+          id: `${input.repository}#${input.number}`,
+          number: input.number,
+          url: `https://github.com/${input.repository}/issues/${input.number}`,
+          title: `Issue #${input.number}`,
+          dependsOn: [],
+          state: 'working',
+          branch: '',
+          path: input.directory,
+          receiptId: null,
+          threadId: input.threadId,
+          pullRequest: null,
+          workerSettled: false,
+          workerModel: input.workerModel,
+          error: null,
+          stage: 'implementing',
+          events: [{ at: input.approvedAt, stage: 'implementing' }],
+        },
+      ],
+    },
+  ];
+}
+
+export function isDirectShipRun(run: ShipRun): boolean {
+  return run.source.startsWith('direct:');
+}
+
+export function resolvedWorkerModel(issue: ShipIssue): string | undefined {
+  if (issue.workerModel) return issue.workerModel;
+  return issue.models?.length === 1 ? issue.models[0] : undefined;
 }
 
 export function shippingWorkerSettled(state: SpawnState): boolean {

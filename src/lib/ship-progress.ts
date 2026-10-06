@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ShipIssue, ShipRun } from './issue-shipping';
+import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './issue-shipping.ts';
 import type { SpawnReceipt, SpawnState } from './agent-results';
 import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
@@ -24,6 +24,12 @@ export type ShippingPullRequest = {
   checks: ShipCheck[];
 };
 export type ShipEvent = { at: number; stage: string; reason?: string };
+export type ShipActivity = {
+  state: 'active' | 'blocked' | 'waiting' | 'complete';
+  title: string;
+  detail: string;
+  at?: number;
+};
 export type GateMetadata = {
   gate: GateName;
   requestedModel: string;
@@ -54,6 +60,13 @@ const reportSchema = z.union([
     .object({
       stage: z.enum(stages),
       status: z.enum(['running', 'blocked']),
+      reason: z.string().max(2000).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      gate: z.enum(gateNames),
+      verdict: z.enum(verdicts),
       reason: z.string().max(2000).optional(),
     })
     .strict(),
@@ -203,6 +216,95 @@ export function shipStatus(run: ShipRun, issue: ShipIssue): string {
   return issue.state === 'starting' ? 'Starting' : 'Running';
 }
 
+function titleCase(value: string): string {
+  return value
+    .replaceAll('_', ' ')
+    .replaceAll('-', ' ')
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function workerDetail(issue: ShipIssue): string {
+  const model = resolvedWorkerModel(issue);
+  const worker = model ? ` · ${model}` : '';
+  if (issue.workerState === 'waiting') return `Worker needs input${worker}`;
+  if (issue.workerState === 'unavailable') return `Reconnecting worker${worker}`;
+  return `Worker running${worker}`;
+}
+
+export function shipActivity(run: ShipRun, issue: ShipIssue): ShipActivity {
+  const latestEvent = issue.events?.at(-1);
+  const activeGate = (issue.gates ?? [])
+    .filter((gate) => !shippingWorkerSettled(gate.state))
+    .toSorted((left, right) => right.updated - left.updated)[0];
+  if (issue.blockedReason)
+    return {
+      state: 'blocked',
+      title: `Blocked during ${titleCase(issue.stage ?? 'shipping')}`,
+      detail: issue.blockedReason,
+      at: latestEvent?.at,
+    };
+  if (issue.state === 'failed')
+    return {
+      state: 'blocked',
+      title: 'Shipping failed',
+      detail: issue.error ?? 'Inspect the worker session for the failure.',
+      at: latestEvent?.at,
+    };
+  if (issue.state === 'merged')
+    return {
+      state: 'complete',
+      title: 'Merged',
+      detail: 'Shipping complete.',
+      at: latestEvent?.at,
+    };
+  if (activeGate)
+    return {
+      state: activeGate.state === 'waiting' ? 'waiting' : 'active',
+      title: `${titleCase(activeGate.gate)} — ${titleCase(activeGate.state)}`,
+      detail: `Validation gate · ${activeGate.provider} / ${activeGate.model ?? activeGate.requestedModel}`,
+      at: activeGate.updated,
+    };
+  if (issue.state === 'awaiting_merge')
+    return {
+      state: 'waiting',
+      title: 'Awaiting merge',
+      detail: `Pull request open · CI ${ciStatus(issue.checks)}`,
+      at: latestEvent?.at,
+    };
+  if (issue.state === 'starting')
+    return {
+      state: 'active',
+      title: 'Preparing worktree',
+      detail: 'Creating the worktree and starting the implementation worker.',
+      at: latestEvent?.at,
+    };
+  if (issue.state === 'working')
+    return {
+      state: issue.workerState === 'waiting' ? 'waiting' : 'active',
+      title: titleCase(issue.stage ?? 'implementing'),
+      detail: workerDetail(issue),
+      at: latestEvent?.at,
+    };
+  const status = shipStatus(run, issue);
+  if (status === 'Blocked')
+    return {
+      state: 'blocked',
+      title: 'Blocked by dependency',
+      detail: 'A required issue must recover or merge before shipping can continue.',
+    };
+  if (status === 'Waiting')
+    return {
+      state: 'waiting',
+      title: 'Waiting for dependencies',
+      detail: 'This issue starts when every dependency is merged.',
+    };
+  return {
+    state: 'waiting',
+    title: 'Queued',
+    detail: 'Ready to start when a worker is available.',
+  };
+}
+
 export function ciStatus(checks: ShipCheck[] | undefined): string {
   if (!checks) return 'Unknown';
   if (!checks.length) return 'No checks';
@@ -251,6 +353,7 @@ const shipIssueSchema = z.object({
   state: z.enum(['pending', 'starting', 'working', 'awaiting_merge', 'failed', 'merged']),
   branch: z.string(),
   path: nullableString,
+  worktreeUnavailable: z.boolean().optional(),
   receiptId: nullableString,
   threadId: nullableString,
   pullRequest: nullableString,

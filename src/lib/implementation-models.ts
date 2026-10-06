@@ -10,6 +10,10 @@ function runKey(directory: string): string {
   return `sai-implementation-run:${directory}`;
 }
 
+function shipOwnerKey(directory: string): string {
+  return `sai-ship-it-owner:${directory}`;
+}
+
 function uncertainKey(directory: string): string {
   return `sai-implementation-uncertain:${directory}`;
 }
@@ -18,7 +22,7 @@ function pendingKey(directory: string): string {
   return `sai-implementation-pending:${directory}`;
 }
 
-type PendingTurn = { id: string; before: string; model?: string };
+type PendingTurn = { id: string; before: string; model?: string; owner?: string };
 
 function pendingTurns(directory: string): PendingTurn[] {
   try {
@@ -29,12 +33,26 @@ function pendingTurns(directory: string): PendingTurn[] {
             !!turn &&
             typeof turn.id === 'string' &&
             typeof turn.before === 'string' &&
-            (turn.model === undefined || typeof turn.model === 'string'),
+            (turn.model === undefined || typeof turn.model === 'string') &&
+            (turn.owner === undefined || typeof turn.owner === 'string'),
         )
       : [];
   } catch {
     return [];
   }
+}
+
+export function hasPendingImplementationTurn(directory: string, owner?: string): boolean {
+  return pendingTurns(directory).some((turn) => owner === undefined || turn.owner === owner);
+}
+
+export function claimLegacyPendingImplementationTurn(directory: string, owner: string): boolean {
+  const turns = pendingTurns(directory);
+  const legacy = turns.filter((turn) => turn.owner === undefined);
+  if (legacy.length !== 1 || turns.some((turn) => turn.owner && turn.owner !== owner)) return false;
+  legacy[0].owner = owner;
+  savePendingTurns(directory, turns);
+  return true;
 }
 
 function savePendingTurns(directory: string, turns: PendingTurn[]): void {
@@ -48,6 +66,25 @@ export type ImplementationTurn = {
   owner: string | undefined;
   peers: Set<ImplementationTurn>;
 };
+
+export type ShipItIssue = {
+  repository: string;
+  number: number;
+};
+
+export function savedShipItOwner(directory: string): string | null {
+  const owner = getSetting(shipOwnerKey(directory));
+  return owner?.trim() || null;
+}
+
+export function recordShipItOwner(directory: string, owner: string): void {
+  setSetting(shipOwnerKey(directory), owner);
+}
+
+export function savedShipItIssue(directory: string): ShipItIssue | null {
+  const match = /^([^#]+)#([1-9]\d*)$/.exec(getSetting(runKey(directory)) ?? '');
+  return match ? { repository: match[1], number: Number(match[2]) } : null;
+}
 const activeTurns = new Map<string, Set<ImplementationTurn>>();
 
 export async function beginImplementationTurn(
@@ -74,7 +111,7 @@ export async function beginImplementationTurn(
     turn.before = await invoke<string>('working_tree_revision', { path: directory });
     savePendingTurns(directory, [
       ...pendingTurns(directory),
-      { id: turn.id, before: turn.before, model },
+      { id: turn.id, before: turn.before, model, owner },
     ]);
     return turn;
   } catch (cause) {
@@ -144,15 +181,15 @@ export async function beginShipItRun(
   directory: string,
   prompt: string,
   selectedSkill?: string | null,
-): Promise<void> {
-  if (selectedSkill !== undefined && selectedSkill?.toLowerCase() !== 'ship-it') return;
+): Promise<ShipItIssue | null> {
+  if (selectedSkill !== undefined && selectedSkill?.toLowerCase() !== 'ship-it') return null;
   const command = slashCommands(prompt).find((item) => item.name.toLowerCase() === 'ship-it');
-  if (!command) return;
+  if (!command) return null;
   const issue =
     /^\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
       prompt.slice(command.end),
     )?.[1];
-  if (!issue) return;
+  if (!issue) return null;
   const canonical = async (reference: string): Promise<string> => {
     const number = Number(reference.match(/\d+$/)![0]);
     if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Choose an issue.');
@@ -169,6 +206,8 @@ export async function beginShipItRun(
   if (previous && previous !== identity)
     throw new Error(`This worktree tracks ${previous}. Start ${identity} in a new worktree.`);
   setSetting(runKey(directory), identity);
+  const [repository, number] = identity.split('#');
+  return { repository, number: Number(number) };
 }
 
 export function implementationModels(directory: string): string[] {

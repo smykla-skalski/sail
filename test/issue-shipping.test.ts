@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  adoptDirectShipRun,
   createShipRun,
   readyShipIssues,
+  resolvedWorkerModel,
   shipIssueStatus,
   shippingWorkerSettled,
   shippingSetupAction,
 } from '../src/lib/issue-shipping.ts';
+import { shipOwner } from '../src/lib/ship-progress.ts';
 import type { PublishedGraph } from '../src/lib/issue-graph.ts';
 
 const graph: PublishedGraph = {
@@ -126,6 +129,76 @@ void test('approved snapshot survives serialization and does not expand to new i
   assert.equal(JSON.parse(JSON.stringify(shipping)).issues.length, 3);
   graph.issues.pop();
   assert.equal(shipping.issues[0].branch, 'ship-issue-11-run-id-1');
+});
+
+void test('adopts an already-running direct Ship It thread', () => {
+  const adopted = adoptDirectShipRun([], {
+    id: 'direct-run',
+    project: '/repo',
+    directory: '/repo/worktrees/gateway-fix',
+    repository: 'kumahq/kuma',
+    number: 18976,
+    provider: 'codex',
+    threadId: 'acp:codex:running-thread',
+    workerModel: 'gpt-5.6-luna',
+    approvedAt: 100,
+  });
+
+  const issue = adopted[0].issues[0];
+  assert.equal(adopted[0].remote, 'kumahq/kuma');
+  assert.equal(adopted[0].repository, '/repo');
+  assert.equal(issue.url, 'https://github.com/kumahq/kuma/issues/18976');
+  assert.equal(issue.state, 'working');
+  assert.equal(issue.stage, 'implementing');
+  assert.equal(issue.workerModel, 'gpt-5.6-luna');
+  assert.equal(
+    shipOwner(adopted, '/repo/worktrees/gateway-fix', 'acp:codex:running-thread')?.issue,
+    issue,
+  );
+});
+
+void test('fills in the recovered direct worker model without duplicating the run', () => {
+  const input = {
+    id: 'direct-run',
+    project: '/repo',
+    directory: '/repo/worktrees/gateway-fix',
+    repository: 'kumahq/kuma',
+    number: 18976,
+    provider: 'codex' as const,
+    threadId: 'acp:codex:running-thread',
+    approvedAt: 100,
+  };
+  const adopted = adoptDirectShipRun([], input);
+
+  const recovered = adoptDirectShipRun(adopted, {
+    ...input,
+    id: 'second-run',
+    workerModel: 'gpt-5.6-luna',
+  });
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].issues[0].workerModel, 'gpt-5.6-luna');
+
+  const switched = adoptDirectShipRun(recovered, {
+    ...input,
+    id: 'third-run',
+    workerModel: 'provider:replacement-model',
+  });
+  assert.equal(switched.length, 1);
+  assert.equal(switched[0].issues[0].workerModel, 'provider:replacement-model');
+});
+
+void test('uses one recorded implementation model as the missing worker model', () => {
+  const issue = run().issues[0];
+  issue.models = ['kong-ai-gateway:zai-org/GLM-5.3'];
+
+  assert.equal(resolvedWorkerModel(issue), 'kong-ai-gateway:zai-org/GLM-5.3');
+});
+
+void test('does not guess a worker model when multiple models changed files', () => {
+  const issue = run().issues[0];
+  issue.models = ['model-a', 'model-b'];
+
+  assert.equal(resolvedWorkerModel(issue), undefined);
 });
 
 void test('external blocker waits until GitHub reports it closed', () => {

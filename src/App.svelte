@@ -41,13 +41,17 @@
   } from './lib/ship-progress';
   import type { PublishedGraph } from './lib/issue-graph';
   import {
+    adoptDirectShipRun as createDirectShipRun,
     createShipRun,
+    isDirectShipRun,
     readyShipIssues,
+    resolvedWorkerModel,
     shippingWorkerSettled,
     shippingSetupAction,
     type ShipIssue,
     type ShipRun,
   } from './lib/issue-shipping';
+  import type { ShipItIssue } from './lib/implementation-models';
   import DiffPanel from './DiffPanel.svelte';
   import HistoryPanel from './HistoryPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
@@ -84,9 +88,14 @@
     activeImplementationModels,
     beginImplementationTurn,
     beginShipItRun,
+    claimLegacyPendingImplementationTurn,
+    hasPendingImplementationTurn,
     implementationAttributionUncertain,
     implementationModels,
+    recordShipItOwner,
     recoverImplementationModels,
+    savedShipItIssue,
+    savedShipItOwner,
     settledImplementationAttribution,
     recordImplementationModel,
   } from './lib/implementation-models';
@@ -165,6 +174,7 @@
     forgetRecentTranscript,
     loadAgentThreads,
     loadInterruptedAgentTurns,
+    loadRecentTranscript,
     saveAgentThreads,
     updateEntriesInPlace,
     type AgentEntry,
@@ -213,6 +223,7 @@
     spawnReceiptsForSource,
     withSpawnResponses,
     type SpawnReceipt,
+    type SpawnState,
   } from './lib/agent-results';
   import {
     getSetting,
@@ -474,6 +485,31 @@
   let agentAvailability = $state<AgentAvailability[]>([]);
   let agentDetectionError = $state('');
   let agentThreads = $state<AgentThread[]>(savedAgentThreads);
+
+  function isShipItPrompt(text: string): boolean {
+    return /^\s*\/ship-it(?:\s|$)/im.test(text);
+  }
+
+  $effect(() => {
+    for (const thread of agentThreads) {
+      const sourceId = `acp:${thread.agent}:${thread.sessionId}`;
+      const { directory: path, model, agent, sessionId } = thread;
+      const issue = savedShipItIssue(path);
+      const ownsPending = hasPendingImplementationTurn(path, sourceId);
+      const savedOwner = savedShipItOwner(path);
+      const claimedLegacy =
+        !savedOwner &&
+        !!issue &&
+        ownsPending &&
+        loadRecentTranscript(thread).some(
+          (entry) => entry.type === 'user' && isShipItPrompt(entry.text),
+        ) &&
+        claimLegacyPendingImplementationTurn(path, sourceId);
+      if (claimedLegacy) recordShipItOwner(path, sourceId);
+      if (!ownsPending || (savedOwner !== sourceId && !claimedLegacy)) continue;
+      if (issue) void adoptDirectShipRun(issue, path, `acp:${agent}:${sessionId}`, model);
+    }
+  });
   let agentUsage = $state<Record<string, AgentUsage>>({});
   let agentRates = $state<Record<string, RateWindow[]>>({});
   let replayingAgentSessions = $state<Record<string, number>>({});
@@ -1149,6 +1185,24 @@
   let chatMessages = $derived(
     messages.filter((message) => message.type === 'user' || message.type === 'assistant'),
   );
+  $effect(() => {
+    if (!sessionID || !running) return;
+    const path = directory;
+    const id = sessionID;
+    const sourceId = `opencode:${id}`;
+    const saved = savedShipItIssue(path);
+    const ownsPending = hasPendingImplementationTurn(path, sourceId);
+    const savedOwner = savedShipItOwner(path);
+    const claimedLegacy =
+      !savedOwner &&
+      !!saved &&
+      ownsPending &&
+      messages.some((message) => message.type === 'user' && isShipItPrompt(message.text)) &&
+      claimLegacyPendingImplementationTurn(path, sourceId);
+    if (claimedLegacy) recordShipItOwner(path, sourceId);
+    if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
+      void adoptDirectShipRun(saved, path, sourceId);
+  });
   const displayChatMessages = $derived(
     withSpawnResponses(
       chatMessages,
@@ -1872,6 +1926,61 @@
     void tickShippingRuns();
   }
 
+  async function adoptDirectShipRun(
+    issue: ShipItIssue,
+    path: string,
+    threadId: string,
+    knownWorkerModel?: string,
+  ): Promise<void> {
+    const provider: ShipRun['provider'] = threadId.startsWith('opencode:')
+      ? 'opencode'
+      : threadId.startsWith('acp:claude:')
+        ? 'claude'
+        : 'codex';
+    const [, agent, sessionId] = /^acp:([^:]+):(.+)$/.exec(threadId) ?? [];
+    const workerModel =
+      knownWorkerModel ??
+      agentThreads.find(
+        (thread) =>
+          thread.agent === agent && thread.sessionId === sessionId && thread.directory === path,
+      )?.model;
+    const previous = shipRuns;
+    const previousIssue = previous
+      .flatMap((run) => run.issues)
+      .find((item) => item.path === path && item.threadId === threadId);
+    const project = worktreeAt(projectCatalog, path)?.repository ?? path;
+    const directRunId = crypto.randomUUID();
+    const adopted = createDirectShipRun(previous, {
+      id: directRunId,
+      project,
+      directory: path,
+      repository: issue.repository,
+      number: issue.number,
+      provider,
+      threadId,
+      workerModel,
+      approvedAt: Date.now(),
+    });
+    if (adopted === shipRuns) return;
+    shipRuns = adopted;
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      shipRuns = previousIssue
+        ? shipRuns.map((run) => ({
+            ...run,
+            issues: run.issues.map((item) =>
+              item.path === path && item.threadId === threadId && item.workerModel === workerModel
+                ? { ...item, workerModel: previousIssue.workerModel }
+                : item,
+            ),
+          }))
+        : shipRuns.filter((run) => run.id !== directRunId);
+      throw cause;
+    }
+    showShipRuns();
+  }
+
   async function launchShipIssue(run: ShipRun, issue: ShipIssue): Promise<void> {
     const receiptId = crypto.randomUUID();
     await updateShipIssue(run, issue, { state: 'starting', receiptId });
@@ -1897,7 +2006,14 @@
           throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
         await acp.connect(run.provider);
       }
-      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread. Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, merging), with status running or blocked and a reason when blocked.`;
+      const inlineGates = !crossValidation.choices.length && !crossValidation.strictDifferentModel;
+      const gateExecution = inlineGates
+        ? 'Run the Code Adversary, Findings Adversary, and Test Adversary in this Ship It session with the implementation agent and model. Do not call validation_gate or require agent coordination.'
+        : 'Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread.';
+      const gateReporting = inlineGates
+        ? 'After every completed adversary pass, use ship_progress with its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.'
+        : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -1974,6 +2090,59 @@
     }
   }
 
+  async function directShipWorkerState(issue: ShipIssue): Promise<SpawnState> {
+    if (!issue.threadId || !issue.path) return 'unavailable';
+    if (issue.threadId.startsWith('opencode:')) {
+      if (!client) return 'unavailable';
+      const sessionId = issue.threadId.slice('opencode:'.length);
+      try {
+        const [session, active, inbox, permissions, forms] = await Promise.all([
+          client.session.get({ sessionID: sessionId }),
+          client.session.active(),
+          client.session.inbox.list({ sessionID: sessionId }),
+          client.permission.request.list({ location: { directory: issue.path } }),
+          client.form.list({ location: { directory: issue.path } }),
+        ]);
+        if (session.location.directory !== issue.path) return 'unavailable';
+        if (
+          permissions.data.some((item) => item.sessionID === sessionId) ||
+          forms.data.some((item) => item.sessionID === sessionId)
+        )
+          return 'waiting';
+        if (active[sessionId]?.type === 'running') return 'working';
+        if (session.outcome === 'succeeded') return 'completed';
+        if (session.outcome === 'failed') return 'failed';
+        if (session.outcome) return 'interrupted';
+        return inbox.length ? 'queued' : 'completed';
+      } catch {
+        return 'unavailable';
+      }
+    }
+    const match = /^acp:([^:]+):(.+)$/.exec(issue.threadId);
+    if (!match) return 'unavailable';
+    const [, agent, sessionId] = match;
+    try {
+      const [agentActivity, interrupted] = await Promise.all([
+        acp.activity(),
+        acp.interruptedTurns(),
+      ]);
+      const state = agentActivity[agent];
+      if (state?.waiting.includes(sessionId)) return 'waiting';
+      if (state?.active.includes(sessionId)) return 'working';
+      if (interrupted.some((turn) => turn.agent === agent && turn.sessionId === sessionId))
+        return 'interrupted';
+      if (state?.finished[sessionId]?.status === 'failed') return 'failed';
+      if (state?.finished[sessionId] || state?.sessions.includes(sessionId)) return 'completed';
+      return 'unavailable';
+    } catch {
+      return 'unavailable';
+    }
+  }
+
+  function missingRepositoryPath(cause: unknown): boolean {
+    return describe(cause) === 'Repository path does not exist. Choose an existing directory.';
+  }
+
   async function refreshShippingIssue(
     run: ShipRun,
     issue: ShipIssue,
@@ -1994,11 +2163,13 @@
     if (path) {
       const models = implementationModels(path);
       const modelUncertain = implementationAttributionUncertain(path);
+      const workerModel = resolvedWorkerModel({ ...issue, models });
       if (
         JSON.stringify(models) !== JSON.stringify(issue.models) ||
-        modelUncertain !== issue.modelUncertain
+        modelUncertain !== issue.modelUncertain ||
+        workerModel !== issue.workerModel
       )
-        await update({ models, modelUncertain });
+        await update({ models, modelUncertain, workerModel });
     }
     issue.gates = reconciledShipGates(issue, spawnReceipts);
     await Promise.all(
@@ -2008,6 +2179,86 @@
       }),
     );
     issue.gates = reconciledShipGates(issue, spawnReceipts);
+    if (isDirectShipRun(run)) {
+      const workerState = await directShipWorkerState(issue);
+      if (workerState !== issue.workerState) await update({ workerState });
+      const project = issue.path ? worktreeAt(projectCatalog, issue.path)?.repository : undefined;
+      if (project && run.repository !== project) run.repository = project;
+      let registered: RegisteredWorktree[];
+      try {
+        registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+          repository: run.repository,
+          paths: issue.path ? [issue.path] : [],
+        });
+      } catch (cause) {
+        if (missingRepositoryPath(cause)) {
+          await update({
+            workerState: 'unavailable',
+            worktreeUnavailable: true,
+            refreshError: null,
+            refreshedAt: Date.now(),
+          });
+          return;
+        }
+        throw cause;
+      }
+      const worktree = registered.find((item) => item.path === issue.path);
+      if (issue.path && !worktree && !issue.worktreeUnavailable)
+        await update({ worktreeUnavailable: true });
+      else if (worktree && issue.worktreeUnavailable) await update({ worktreeUnavailable: false });
+      if (worktree?.branch && worktree.branch !== issue.branch)
+        await update({ branch: worktree.branch });
+      try {
+        const closed = await invoke<boolean>('shipping_dependency_closed', {
+          repository: run.repository,
+          reference: issue.id,
+        });
+        await update({
+          ...refreshedIssueState(issue, closed),
+          refreshError: null,
+          refreshedAt: Date.now(),
+        });
+        const branch = worktree?.branch ?? issue.branch;
+        if (branch && issue.state !== 'pending')
+          await refreshShippingPullRequest(run, { ...issue, branch });
+        if (issue.refreshError) return;
+        const pr = shippingPullRequests.get(`${run.id}:${issue.id}`);
+        if (pr?.mergedAt) {
+          await update({ state: 'merged', workerSettled: true, error: null });
+        } else if (pr?.state === 'CLOSED') {
+          await update({
+            state: 'failed',
+            workerSettled: true,
+            error: 'Pull request closed without merging.',
+          });
+        } else if (workerState === 'completed') {
+          await update(
+            pr?.url
+              ? { state: 'awaiting_merge', workerSettled: true, error: null }
+              : {
+                  state: 'failed',
+                  workerSettled: true,
+                  error: 'Worker finished without a pull request. Inspect its thread.',
+                },
+          );
+        } else if (workerState === 'failed' || workerState === 'interrupted') {
+          await update({
+            state: 'failed',
+            workerSettled: true,
+            error: `Worker ${workerState}.`,
+          });
+        } else if (
+          workerState === 'working' ||
+          workerState === 'waiting' ||
+          workerState === 'queued'
+        ) {
+          await update({ state: 'working', workerSettled: false, error: null });
+        }
+      } catch (cause) {
+        await update({ refreshError: describe(cause) });
+      }
+      return;
+    }
     try {
       const closed = await invoke<boolean>('shipping_dependency_closed', {
         repository: run.repository,
@@ -3086,8 +3337,50 @@
           item.targetId === sourceId &&
           item.targetDirectory === request.directory,
       );
-      if (!receipt?.validation)
-        throw new Error('Only a validation session can report its own verdict.');
+      if (!receipt?.validation) {
+        if (crossValidation.choices.length || crossValidation.strictDifferentModel)
+          throw new Error(
+            'Inline gate verdicts are disabled while cross-validation is configured.',
+          );
+        if (!('gate' in report))
+          throw new Error('The implementation session must identify the completed inline gate.');
+        const owner = shipOwner(shipRuns, request.directory, sourceId);
+        if (!owner)
+          throw new Error('Only the assigned Ship worker can report inline gate verdicts.');
+        validateGateVerdict(report.gate, report.verdict);
+        const now = Date.now();
+        const model = resolvedWorkerModel(owner.issue) ?? null;
+        await updateShipIssue(owner.run, owner.issue, {
+          stage: report.gate === 'test-adversary' ? 'testing' : 'reviewing',
+          blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
+            ? report.reason
+            : null,
+          gates: [
+            ...(owner.issue.gates ?? []),
+            {
+              id: `inline:${sourceId}:${report.gate}:${crypto.randomUUID()}`,
+              gate: report.gate,
+              requestedModel: model ?? 'implementation session',
+              provider: owner.run.provider,
+              model,
+              threadId: sourceId,
+              directory: request.directory,
+              state: 'completed',
+              created: now,
+              updated: now,
+              error: null,
+              verdict: report.verdict,
+              reason: report.reason,
+            },
+          ],
+          events: appendShipEvent(
+            owner.issue.events,
+            `${report.gate}: ${report.verdict}`,
+            report.reason,
+          ),
+        });
+        return { status: 'recorded' };
+      }
       if (shippingWorkerSettled(receipt.state))
         throw new Error('This validation attempt has already finished.');
       validateGateVerdict(receipt.validation.gate, report.verdict);
@@ -4286,6 +4579,31 @@
     }
   }
 
+  async function removeMissingWorktreeFromGui(repository: string, path: string): Promise<void> {
+    if (directory === path) await loadProject(repository);
+    saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
+    const removedThreads = agentThreads.filter((thread) => thread.directory === path);
+    const removedNative = sidebarOpenCodeThreads.filter((thread) => thread.directory === path);
+    agentThreads = agentThreads.filter((thread) => thread.directory !== path);
+    nativeThreads = nativeThreads.filter((thread) => thread.directory !== path);
+    sidebarOpenCodeThreads = sidebarOpenCodeThreads.filter((thread) => thread.directory !== path);
+    saveAgentThreads(agentThreads);
+    setSetting('sai-recent-native-threads', JSON.stringify(nativeThreads));
+    forgetMissingRecentThreads();
+    for (const thread of [...removedThreads, ...removedNative]) {
+      forgetThreadAttention(thread);
+      if (thread.agent !== 'opencode') forgetRecentTranscript(thread);
+    }
+    delete paneLayouts[path];
+    persistPaneLayouts();
+    removeSetting(`sai-session:${path}`);
+    pendingWorktreeStarts.delete(path);
+    runningWorktreeSetups.delete(path);
+    removeSetting(`sai-pending-worktree-start:${path}`);
+    removeSetting(`sai-main-pane-empty:${path}`);
+    error = '';
+  }
+
   async function deleteProjectWorktreeOnce(
     repository: string,
     path: string,
@@ -4296,6 +4614,10 @@
     try {
       config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
     } catch (cause) {
+      if (missingRepositoryPath(cause)) {
+        await removeMissingWorktreeFromGui(repository, path);
+        return;
+      }
       error = describe(cause);
       return;
     }
@@ -5447,7 +5769,13 @@
   }
 
   async function openShipTarget(path: string, threadId?: string | null) {
-    await invoke('validate_repository', { path });
+    try {
+      await invoke('validate_repository', { path });
+    } catch (cause) {
+      if (missingRepositoryPath(cause))
+        throw new Error('This Ship worktree no longer exists on disk.', { cause });
+      throw cause;
+    }
     if (threadId) {
       const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
         (item) =>
@@ -7855,8 +8183,9 @@
     const requestedAgent = selectedAgentID || undefined;
     const queueTurn = running;
     const sourceSkills = skills;
+    let shipIssue: ShipItIssue | null;
     try {
-      await beginShipItRun(path, text, promptSkill(sourceSkills, text)?.name ?? null);
+      shipIssue = await beginShipItRun(path, text, promptSkill(sourceSkills, text)?.name ?? null);
     } catch (cause) {
       error = describe(cause);
       return;
@@ -7914,6 +8243,10 @@
         const implementingModel = target.model
           ? `${target.model.providerID}:${target.model.id}`
           : undefined;
+        if (shipIssue) {
+          recordShipItOwner(path, `opencode:${targetId}`);
+          await adoptDirectShipRun(shipIssue, path, `opencode:${targetId}`, implementingModel);
+        }
         await invoke('record_turn_snapshot', { path, thread: `opencode:${targetId}` });
         const tracking = await beginImplementationTurn(
           path,
@@ -8613,6 +8946,7 @@
                 onstatus={updateAgentThreadStatus}
                 onreplaychange={setAgentReplay}
                 onterminal={(id) => void openAgentTerminal(id)}
+                onshipit={adoptDirectShipRun}
                 postTurnChecks={postTurnResults.filter(
                   (check) =>
                     acpThread &&
@@ -9032,6 +9366,7 @@
       onshipopen={openShipTarget}
       onshipsettings={openSettings}
       onship={(graph, provider, limit, source) => startShippingRun(graph, provider, limit, source)}
+      onshipit={adoptDirectShipRun}
       postTurnChecks={postTurnResults}
       onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
       {agentUsage}

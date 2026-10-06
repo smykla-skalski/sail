@@ -167,27 +167,26 @@ describe('native Ship run history', () => {
     await expect($('.ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('1 / 3 merged'));
     await expect($('.ship-panel')).toHaveText(expect.stringContaining('Umbrella #40'));
-    await expect($('.ship-graph')).toHaveText(expect.stringContaining('Blocked'));
-    await expect(
-      $('.ship-graph a[href="https://github.com/owner/repo/issues/123"]'),
-    ).toBeDisplayed();
-    await $('.ship-node:nth-child(2) .ship-node-select').click();
+    await expect($('.ship-now')).toHaveText(expect.stringContaining('Happening now'));
+    await expect($('.ship-now')).toHaveText(expect.stringContaining('Shipping failed'));
+    await expect($('.ship-now')).toHaveText(expect.stringContaining('Blocked by dependency'));
+    await $('.ship-now-item:nth-child(2)').click();
     await expect(
       $('.ship-issue-detail a[href="https://github.com/owner/repo/issues/123"]'),
     ).toBeDisplayed();
-    await $('.ship-node:first-child .ship-node-select').click();
+    await $('.ship-now-item:nth-child(1)').click();
     await expect($('.ship-issue-detail')).toHaveText(
       expect.stringContaining('model-implementation'),
     );
     await expect($('.ship-gates')).toHaveText(expect.stringContaining('codex / model-test'));
     await expect($('.ship-gates')).toHaveText(expect.stringContaining('FAIL'));
     await expect($('.ship-checks summary')).toHaveText('CI: Failed');
-    await $('.ship-node:nth-child(3) .ship-node-select').click();
+    await $('.ship-now-item:nth-child(3)').click();
     await expect($('.ship-issue-detail')).toHaveText(
       expect.stringContaining('Worktree removed after merge'),
     );
     await expect($('.ship-issue-detail button')).toBeDisabled();
-    await $('.ship-node:first-child .ship-node-select').click();
+    await $('.ship-now-item:nth-child(1)').click();
     await $('.ship-issue-detail .ship-actions button').click();
     await expect($('.ship-panel')).not.toBeDisplayed();
     await browser.execute(() =>
@@ -200,7 +199,7 @@ describe('native Ship run history', () => {
     await expect($('.ship-gates')).toHaveText(
       expect.stringContaining('Reproduced fixture failure'),
     );
-    await $('.ship-node:nth-child(2) .ship-node-select').click();
+    await $('.ship-now-item:nth-child(2)').click();
     await $('.ship-issue-detail .ship-actions button').click();
     await expect($('.ship-panel > .ship-error[role="alert"]')).toExist();
     await $('[aria-label="Close Ship runs"]').click();
