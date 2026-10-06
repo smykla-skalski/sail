@@ -128,6 +128,15 @@ describe('command palette project flow', () => {
     await expect($('.agent-launches button')).toBeDisplayed();
 
     await openPalette();
+    await searchAndEnter('Newest thread');
+    await expect($('.command-palette[open]')).not.toExist();
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(() => localStorage.getItem('sai-directory'))) === worktreePath,
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Newest thread'));
+
+    await openPalette();
     await capture('palette-projects');
     await searchAndEnter(repoPath.split('/').at(-1)!);
     await expect($('.palette-path')).toHaveText(
@@ -155,6 +164,7 @@ describe('command palette project flow', () => {
     await openPalette();
     await searchAndEnter(repoPath.split('/').at(-1)!);
     await searchAndEnter('palette-feature');
+    await expect($('.command-palette[open]')).not.toExist();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Newest thread'));
 
     await openPalette();

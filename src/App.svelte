@@ -655,10 +655,16 @@
       catalog: projectCatalog,
       currentDirectory: directory,
       agents: agentAvailability,
-      threads: agentThreads,
+      threads: [...agentThreads, ...sidebarOpenCodeThreads],
       openCodeAvailable: runtimeState === 'connected',
       openCodeSessions: paletteOpenCodeSessions,
       commands: savedCommands,
+      runningThreadKeys: [
+        ...Object.keys(runningAgentThreads),
+        ...sidebarOpenCodeThreads
+          .filter((thread) => activeSessionIDs.includes(thread.sessionId))
+          .map(threadKey),
+      ],
     }),
   );
   let runtimeError = $state('');
@@ -5482,16 +5488,32 @@
 
   async function choosePaletteEntry(entry: PaletteEntry | null) {
     if (!entry || entry.disabled || paletteBusy) return;
+    const step = paletteStep;
     if (entry.kind === 'command' && entry.command) {
       runSavedCommand(entry.command);
       return;
     }
-    const step = paletteStep;
+    if (step.kind === 'projects' && entry.kind === 'thread' && entry.thread) {
+      paletteBusy = true;
+      paletteError = '';
+      const workspaceError = error;
+      try {
+        if (!(await jumpToRecentThread(threadKey(entry.thread))))
+          throw new Error('This session is no longer available.');
+        closeCommandPalette(false);
+      } catch (cause) {
+        error = workspaceError;
+        paletteError = describe(cause);
+      } finally {
+        paletteBusy = false;
+      }
+      return;
+    }
     if (step.kind === 'projects' && entry.kind === 'project' && entry.directory) {
       setPaletteStep({ kind: 'worktrees', repository: entry.directory });
       return;
     }
-    if (step.kind === 'worktrees' && entry.kind === 'worktree' && entry.directory) {
+    if (entry.kind === 'worktree' && entry.directory) {
       paletteBusy = true;
       paletteError = '';
       try {
@@ -5730,7 +5752,7 @@
     return thread ? threadKey(thread) : null;
   }
 
-  async function jumpToRecentThread(key: string) {
+  async function jumpToRecentThread(key: string): Promise<boolean> {
     const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
       (item) => threadKey(item) === key,
     );
@@ -5740,32 +5762,35 @@
         ? runtimeState !== 'connected'
         : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available))
     )
-      return;
+      return false;
     const jump = ++recentJumpGeneration;
     let expectedProjectLoad = projectLoadGeneration;
     const target = await invoke<string>('validate_repository', { path: thread.directory }).catch(
       () => null,
     );
     if (!target || jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
-      return;
+      return false;
     if (thread.directory !== directory || target !== directory) {
       const pending = loadProject(thread.directory, false);
       expectedProjectLoad = projectLoadGeneration;
       await pending;
     }
-    if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration) return;
+    if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
+      return false;
     const selected = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
       (item) =>
         item.directory === directory &&
         item.agent === thread.agent &&
         item.sessionId === thread.sessionId,
     );
-    if (!selected) return;
+    if (!selected) return false;
     showSidebarThread(selected);
     focusMainPane();
-    if (selected.agent === 'opencode') await selectSession(selected.sessionId);
-    else openAgent(selected.agent, selected, true);
+    if (selected.agent === 'opencode') {
+      if (!(await selectSession(selected.sessionId))) return false;
+    } else openAgent(selected.agent, selected, true);
     focusPaneForTyping('main');
+    return true;
   }
 
   async function openShipTarget(path: string, threadId?: string | null) {
@@ -7136,8 +7161,8 @@
     paneSelections.set(id, (paneSelections.get(id) ?? 0) + 1);
   }
 
-  async function selectSession(id: string, automatic = false) {
-    if (!client || !directory) return;
+  async function selectSession(id: string, automatic = false): Promise<boolean> {
+    if (!client || !directory) return false;
     const targetPane =
       !automatic && focusedPane !== 'main'
         ? leaves(paneLayout).find((pane) => pane.id === focusedPane)
@@ -7165,12 +7190,12 @@
     let info: SessionInfo;
     try {
       info = await client.session.get({ sessionID: id });
-      if (!valid()) return;
+      if (!valid()) return false;
       if (info.location.directory !== path || info.parentID)
         throw new Error('This session does not belong to the selected repository.');
     } catch (cause) {
       if (valid()) error = describe(cause);
-      return;
+      return false;
     }
     const nativeThread: AgentThread = {
       agent: 'opencode',
@@ -7194,7 +7219,7 @@
         }),
       );
       focusPaneForTyping(targetPane.id);
-      return;
+      return true;
     }
     sessionID = id;
     clearMainPaneEmpty();
@@ -7237,6 +7262,7 @@
     }
     if (current === selection && chatScroll && chatScroll.scrollHeight <= chatScroll.clientHeight)
       void loadOlderMessages();
+    return true;
   }
 
   function syncSessionChoice(session: SessionInfo) {

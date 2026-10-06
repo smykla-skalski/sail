@@ -1,5 +1,6 @@
 import type { AgentAvailability, AgentId, AgentThread } from './acp';
 import type { ProjectCatalog } from './projects';
+import { threadKey } from './recent-threads.ts';
 import { commandsForDirectory, type SavedCommand } from './saved-commands.ts';
 
 export type PaletteStep =
@@ -47,6 +48,7 @@ export type PaletteSearch = {
   openCodeAvailable: boolean;
   openCodeSessions: PaletteOpenCodeSession[];
   commands: SavedCommand[];
+  runningThreadKeys: string[];
 };
 
 export function locationName(path: string): string {
@@ -84,15 +86,27 @@ function rank(
   entries: PaletteEntry[],
   query: string,
   searchText = (entry: PaletteEntry) => `${entry.label} ${entry.detail}`,
+  priority: (entry: PaletteEntry) => number = () => 0,
 ): PaletteEntry[] {
   return entries
     .flatMap((entry) => {
       const matchScore = score(searchText(entry), query);
       return matchScore === null ? [] : [{ entry, matchScore }];
     })
-    .toSorted((a, b) => a.matchScore - b.matchScore)
+    .toSorted((a, b) => priority(b.entry) - priority(a.entry) || a.matchScore - b.matchScore)
     .slice(0, 50)
     .map(({ entry }) => entry);
+}
+
+function directoryContext(catalog: ProjectCatalog, directory: string) {
+  for (const repository of catalog.repositories) {
+    if (repository === directory)
+      return { repository, project: locationName(repository), location: 'Main checkout' };
+    const worktree = (catalog.worktrees[repository] ?? []).find((item) => item.path === directory);
+    if (worktree)
+      return { repository, project: locationName(repository), location: worktree.branch };
+  }
+  return null;
 }
 
 export function searchCommandPalette({
@@ -105,6 +119,7 @@ export function searchCommandPalette({
   openCodeAvailable,
   openCodeSessions,
   commands,
+  runningThreadKeys,
 }: PaletteSearch): PaletteEntry[] {
   if (step.kind === 'projects') {
     const repositories: PaletteEntry[] = catalog.repositories.map((repository) => {
@@ -120,17 +135,73 @@ export function searchCommandPalette({
     const projects = rank(repositories, query).toSorted(
       (a, b) => Number(b.directory === currentDirectory) - Number(a.directory === currentDirectory),
     );
+    const commandEntries: PaletteEntry[] = commandsForDirectory(
+      commands,
+      catalog,
+      currentDirectory,
+    ).map((command) => ({
+      id: `command:${command.id}`,
+      kind: 'command',
+      label: command.name,
+      detail: command.project ? 'Project command' : 'Global command',
+      command,
+    }));
     const saved = rank(
-      commandsForDirectory(commands, catalog, currentDirectory).map((command) => ({
-        id: `command:${command.id}`,
-        kind: 'command',
-        label: command.name,
-        detail: command.project ? 'Project command' : 'Global command',
-        command,
-      })),
+      commandEntries,
       query,
       (entry) => `${entry.label} ${entry.detail} ${entry.command?.command ?? ''}`,
     );
+    if (query.trim()) {
+      const worktrees: PaletteEntry[] = catalog.repositories.flatMap((repository) =>
+        (catalog.worktrees[repository] ?? []).map((worktree) => ({
+          id: `worktree:${worktree.path}`,
+          kind: 'worktree' as const,
+          label: worktree.branch,
+          detail: `${locationName(repository)} · ${worktree.path}`,
+          directory: worktree.path,
+        })),
+      );
+      const running = new Set(runningThreadKeys);
+      const uniqueThreads = new Map(threads.map((thread) => [threadKey(thread), thread]));
+      const sessionEntries: PaletteEntry[] = [...uniqueThreads.entries()].flatMap(
+        ([key, thread]) => {
+          const context = directoryContext(catalog, thread.directory);
+          if (!context) return [];
+          const agentName =
+            thread.agent === 'opencode'
+              ? 'OpenCode'
+              : (agents.find((agent) => agent.id === thread.agent)?.name ?? thread.agent);
+          const available =
+            thread.agent === 'opencode'
+              ? openCodeAvailable
+              : !!agents.find((agent) => agent.id === thread.agent)?.available;
+          return [
+            {
+              id: `global-thread:${key}`,
+              kind: 'thread' as const,
+              label: thread.title,
+              detail: `${agentName} · ${context.project} / ${context.location}${running.has(key) ? ' · Running' : ''}`,
+              directory: thread.directory,
+              agent: thread.agent,
+              thread,
+              disabled: !available,
+            },
+          ];
+        },
+      );
+      return rank(
+        [...repositories, ...worktrees, ...sessionEntries, ...commandEntries],
+        query,
+        (entry) =>
+          `${entry.label} ${entry.detail} ${entry.directory ?? ''} ${entry.command?.command ?? ''}`,
+        (entry) =>
+          entry.thread && running.has(threadKey(entry.thread))
+            ? 2
+            : entry.kind === 'command'
+              ? 1
+              : 0,
+      );
+    }
     const projectSlots = 50 - Math.min(saved.length, 10);
     return [...projects.slice(0, projectSlots), ...saved.slice(0, 50 - projectSlots)];
   }

@@ -48,6 +48,7 @@ function search(step: PaletteStep, query = '', options: Partial<PaletteSearch> =
     openCodeAvailable: true,
     openCodeSessions: [],
     commands: [],
+    runningThreadKeys: [],
     ...options,
   });
 }
@@ -63,11 +64,48 @@ function session(
 void test('project search keeps duplicate names distinct and shows group context', () => {
   const matches = search({ kind: 'projects' }, 'alpha');
   assert.deepEqual(
-    matches.map((entry) => entry.directory),
+    matches.filter((entry) => entry.kind === 'project').map((entry) => entry.directory),
     ['/work/alpha', '/other/alpha'],
   );
   assert.match(matches[0].detail, /Team project/);
-  assert.deepEqual(search({ kind: 'projects' }, 'feature'), []);
+  assert.equal(search({ kind: 'projects' }, 'feature')[0]?.directory, '/work/alpha-feature');
+});
+
+void test('root search finds agent work by title, provider, and worktree context', () => {
+  const titleMatch = search({ kind: 'projects' }, 'older');
+  const providerAndBranchMatch = search({ kind: 'projects' }, 'claude feature');
+  const pathMatch = search({ kind: 'projects' }, '/work/alpha-feature');
+
+  assert.equal(titleMatch[0]?.thread?.sessionId, 'old');
+  assert.deepEqual(
+    providerAndBranchMatch.map((entry) => entry.thread?.sessionId),
+    ['old', 'new'],
+  );
+  assert.deepEqual(
+    pathMatch.filter((entry) => entry.kind === 'thread').map((entry) => entry.thread?.sessionId),
+    ['old', 'new'],
+  );
+});
+
+void test('root search puts running agent work first', () => {
+  const matches = search({ kind: 'projects' }, 'claude feature', {
+    runningThreadKeys: [JSON.stringify(['claude', '/work/alpha-feature', 'old'])],
+  });
+
+  assert.equal(matches[0]?.thread?.sessionId, 'old');
+  assert.match(matches[0]?.detail ?? '', /Running/);
+});
+
+void test('root search deduplicates known agent work', () => {
+  const duplicate = threads[0];
+  const matches = search({ kind: 'projects' }, 'older', {
+    threads: [duplicate, duplicate],
+  });
+
+  assert.deepEqual(
+    matches.map((entry) => entry.thread?.sessionId),
+    ['old'],
+  );
 });
 
 void test('worktree step offers main checkout, matching branches, and creation', () => {
