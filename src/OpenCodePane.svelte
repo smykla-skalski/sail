@@ -102,6 +102,7 @@
     onpromptfocused,
     oncreated,
     onactivity,
+    onhistorychange = () => {},
     onstatus,
     onusage,
     onshipit,
@@ -127,6 +128,7 @@
     onpromptfocused?: () => void;
     oncreated: (thread: AgentThread) => void;
     onactivity: (thread: AgentThread) => void;
+    onhistorychange?: () => void;
     onstatus: (thread: AgentThread, status: ThreadStatus, notifyOnDone?: boolean) => void;
     onusage?: (sessionID: string, context: number | undefined) => void;
     onshipit?: (
@@ -456,6 +458,7 @@
     onusage?.(id, openCodeContextUsage(messages, setup?.models ?? []));
     if (first) cursor = page.cursor.next ?? null;
     rememberOpenCodeTimeline(directory, id, { messages, cursor });
+    onhistorychange();
     await follow();
     if (scroll?.scrollHeight <= scroll?.clientHeight && cursor) void loadOlder();
   }
@@ -476,6 +479,7 @@
       messages = mergeMessages(messages, page.data);
       cursor = page.cursor.next === next ? null : (page.cursor.next ?? null);
       rememberOpenCodeTimeline(directory, id, { messages, cursor });
+      onhistorychange();
       if (!underfilled) following = false;
       await tick();
       scroll.scrollTop =
@@ -509,6 +513,7 @@
         messages,
         cursor,
       });
+    onhistorychange();
     clearTimeout(refreshTimer);
     refreshTimer = undefined;
     for (const path of clipboardPaths)
@@ -684,7 +689,10 @@
     mounted = true;
     return () => {
       rememberDraft();
-      if (activeID) rememberOpenCodeTimeline(directory, activeID, { messages, cursor });
+      if (activeID) {
+        rememberOpenCodeTimeline(directory, activeID, { messages, cursor });
+        onhistorychange();
+      }
       disposed = true;
       mounted = false;
       ++generation;

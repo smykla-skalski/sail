@@ -128,6 +128,7 @@
     onreplaychange?: (agent: AgentId, sessionId: string | null, replaying: boolean) => void;
     onterminal: (id: string) => void;
     onentrieschange?: (entries: AgentEntry[], sessionId: string | null, ready: boolean) => void;
+    ondecision?: (thread: AgentThread, permission: AgentPermission, optionId: string) => void;
     ephemeral?: boolean;
     seedContext?: string;
     coordinationMessages?: CoordinationMessage[];
@@ -166,6 +167,7 @@
     onreplaychange,
     onterminal,
     onentrieschange,
+    ondecision,
     ephemeral = false,
     seedContext = '',
     coordinationMessages = [],
@@ -733,7 +735,7 @@
           ? await acp.resume(agent, directory, id)
           : await acp.load(agent, directory, id);
         if (current === generation && !canResume) {
-          entries = replayEntries;
+          entries = restoreEntryTimes(replayEntries, entries);
           setReplaying(false);
           replayEntries = [];
           historyLoaded = true;
@@ -1382,6 +1384,7 @@
     try {
       await acp.permission(agent, permission.id, optionId);
       permissions = permissions.filter((item) => item.id !== permission.id);
+      if (thread) ondecision?.(thread, permission, optionId);
     } catch (cause) {
       error = describe(cause);
       if (thread && lastRequest) {

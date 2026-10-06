@@ -7,7 +7,7 @@
   import OpenCodePane from './OpenCodePane.svelte';
   import DiffPanel from './DiffPanel.svelte';
   import PlanPanel from './PlanPanel.svelte';
-  import HistoryPanel from './HistoryPanel.svelte';
+  import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import ShipPanel from './ShipPanel.svelte';
   import EmptyPanePicker from './EmptyPanePicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
@@ -108,6 +108,8 @@
     onbatchcomplete: (id: string, failure: string | null) => void;
     onshortcut: (event: KeyboardEvent) => void;
     onactivity: (thread: AgentThread) => void;
+    onhistorychange: () => void;
+    ondecision: (thread: AgentThread, id: string, title: string, outcome: string) => void;
     onusage: (sessionID: string, context: number | undefined) => void;
     focusPromptPane: string | null;
     onpromptfocused: () => void;
@@ -179,6 +181,8 @@
     onbatchcomplete,
     onshortcut,
     onactivity,
+    onhistorychange,
+    ondecision,
     onusage,
     focusPromptPane,
     onpromptfocused,
@@ -507,6 +511,8 @@
       {onbatchcomplete}
       {onshortcut}
       {onactivity}
+      {onhistorychange}
+      {ondecision}
       {onusage}
       {focusPromptPane}
       {onpromptfocused}
@@ -605,6 +611,8 @@
       {onbatchcomplete}
       {onshortcut}
       {onactivity}
+      {onhistorychange}
+      {ondecision}
       {onusage}
       {focusPromptPane}
       {onpromptfocused}
@@ -772,6 +780,7 @@
                 onactivity(thread);
                 void refreshNativeDetails();
               }}
+              {onhistorychange}
               {onusage}
               {onstatus}
               {onshipit}
@@ -829,7 +838,7 @@
                     onsettings={onshipsettings}
                   />
                 {:else if nativeTab === 'history'}
-                  <HistoryPanel
+                  <PlanHistoryPanel
                     events={nativeHistory}
                     session={nativeSession}
                     loading={false}
@@ -907,6 +916,8 @@
                 onentries(pane.id, entries, sessionId, ready)}
               oncreated={(thread) => oncreated(pane.id, thread)}
               {onactivity}
+              ondecision={(thread, permission, optionId) =>
+                ondecision(thread, String(permission.id), permission.title, optionId)}
               {onstatus}
               {onreplaychange}
               onterminal={onagentterminal}

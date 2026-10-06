@@ -20,6 +20,13 @@
   import TaskLocation from './TaskLocation.svelte';
   import WorkspaceActivity from './WorkspaceActivity.svelte';
   import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
+  import {
+    loadActivityHistory,
+    recentActivityEvents,
+    saveActivityHistory,
+    type ActivityHistoryEvent,
+    type ActivityHistoryInput,
+  } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import SpawnResponse from './SpawnResponse.svelte';
@@ -209,9 +216,10 @@
     type SessionMessageInfo,
   } from './lib/opencode';
   import { recordDiagnostic } from './lib/diagnostics';
-  import { getPlan, type HistoryEntry, type PlanSnapshot } from './lib/plan';
+  import { getPlan, type PlanSnapshot } from './lib/plan';
   import { mergeMessages, nearBottom } from './lib/timeline';
   import {
+    cachedOpenCodeTimelines,
     forgetOpenCodeTimeline,
     recallOpenCodeTimeline,
     rememberOpenCodeTimeline,
@@ -699,6 +707,10 @@
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
   let inboxItems = $state<InboxItem[]>([]);
   let inboxOutcomes = $state<InboxOutcome[]>(loadInboxOutcomes(getSetting('sai-inbox-outcomes')));
+  let durableActivityHistory = $state<ActivityHistoryEvent[]>(
+    loadActivityHistory(getSetting('sai-activity-history')),
+  );
+  let openCodeTimelineRevision = $state(0);
   let inboxLoading = $state(false);
   let inboxError = $state('');
   let inboxDialog: HTMLDialogElement;
@@ -914,9 +926,6 @@
   let diffs = $state<WorkingDiffInfo[]>([]);
   let diffLoading = $state(false);
   let diffError = $state('');
-  let historyEvents = $state<HistoryEntry[]>([]);
-  let historyLoading = $state(false);
-  let historyError = $state('');
   let selectedFilePath = $state<string | null>(null);
   type SideTab = 'plan' | 'changes' | 'history' | 'ship';
   let sideTab = $state<SideTab>('plan');
@@ -1358,6 +1367,160 @@
       checks: mainPostTurnChecks,
     }),
   );
+  const activityHistory = $derived.by(() => {
+    const openCodeTimelines = openCodeTimelineRevision >= 0 ? cachedOpenCodeTimelines() : [];
+    const input: ActivityHistoryInput[] = [...durableActivityHistory];
+    for (const thread of [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads]) {
+      input.push({
+        workspace: thread.directory,
+        kind: 'parent',
+        source: thread.agent,
+        sourceId: thread.sessionId,
+        title: thread.title,
+        outcome:
+          threadAttention[threadKey(thread)]?.status ??
+          sidebarOpenCodeOutcomes[threadKey(thread)] ??
+          'unknown',
+        at: thread.updated,
+        agent: thread.agent,
+        sessionId: thread.sessionId,
+      });
+    }
+    for (const receipt of spawnReceipts) {
+      input.push({
+        workspace: receipt.sourceDirectory,
+        kind: 'subagent',
+        source: receipt.provider,
+        sourceId: receipt.receiptId,
+        title: receipt.prompt ?? `${receipt.provider} subagent`,
+        outcome: receipt.state,
+        at: receipt.updated,
+        agent: receipt.provider,
+        sessionId: receipt.targetId ?? undefined,
+      });
+    }
+    if (sessionID) {
+      for (const message of chatMessages) {
+        if (message.type !== 'assistant') continue;
+        for (const part of message.content) {
+          if (part.type !== 'tool') continue;
+          input.push({
+            workspace: directory,
+            kind: 'tool',
+            source: message.agent,
+            sourceId: `${message.id}:${part.id}`,
+            title: part.name,
+            outcome: part.state.status,
+            at: message.time.created,
+            agent: 'opencode',
+            sessionId: sessionID,
+          });
+        }
+      }
+    }
+    for (const timeline of openCodeTimelines) {
+      for (const message of timeline.messages) {
+        if (message.type !== 'assistant') continue;
+        for (const part of message.content) {
+          if (part.type !== 'tool') continue;
+          input.push({
+            workspace: timeline.directory,
+            kind: 'tool',
+            source: message.agent,
+            sourceId: `${message.id}:${part.id}`,
+            title: part.name,
+            outcome: part.state.status,
+            at: message.time.created,
+            agent: 'opencode',
+            sessionId: timeline.sessionID,
+          });
+        }
+      }
+    }
+    const cachedThreads = new Map(
+      [...agentThreads, ...nativeThreads]
+        .filter((thread) => thread.agent !== 'opencode')
+        .map((thread) => [threadKey(thread), thread]),
+    );
+    for (const thread of cachedThreads.values()) {
+      for (const entry of loadRecentTranscript(thread)) {
+        if (entry.type !== 'tool' || !Number.isFinite(entry.created)) continue;
+        input.push({
+          workspace: thread.directory,
+          kind: 'tool',
+          source: thread.agent,
+          sourceId: entry.id,
+          title: entry.title,
+          outcome: entry.status,
+          at: entry.created!,
+          agent: thread.agent,
+          sessionId: thread.sessionId,
+        });
+      }
+    }
+    for (const [paneId, entrySnapshot] of Object.entries(agentEntrySnapshots)) {
+      const pane = paneId === 'main' ? null : leaves(paneLayout).find((leaf) => leaf.id === paneId);
+      const agent = paneId === 'main' ? acpAgent : pane?.agent;
+      const thread = paneId === 'main' ? acpThread : pane?.thread;
+      if (!agent || !thread) continue;
+      for (const entry of entrySnapshot.entries.slice(-50)) {
+        if (entry.type !== 'tool' || !Number.isFinite(entry.created)) continue;
+        input.push({
+          workspace: thread.directory,
+          kind: 'tool',
+          source: agent,
+          sourceId: entry.id,
+          title: entry.title,
+          outcome: entry.status,
+          at: entry.created!,
+          agent,
+          sessionId: thread.sessionId,
+        });
+      }
+    }
+    for (const item of inboxItems) {
+      if (isInboxOutcome(item)) continue;
+      input.push({
+        workspace: item.directory,
+        kind: 'decision',
+        source: item.agent,
+        sourceId: String(item.requestId ?? item.key),
+        title: item.text,
+        outcome: 'waiting',
+        at: item.receivedAt,
+        agent: item.agentId ?? (item.kind === 'opencode-permission' ? 'opencode' : undefined),
+        sessionId: item.sessionId,
+      });
+    }
+    for (const check of postTurnResults) {
+      const [provider, agent, session] = check.thread.split(':');
+      input.push({
+        workspace: check.directory,
+        kind: 'check',
+        source: check.source,
+        sourceId: check.id,
+        title: check.command,
+        outcome:
+          check.status === 'running'
+            ? 'working'
+            : check.status === 'passed'
+              ? 'completed'
+              : check.status === 'canceled'
+                ? 'interrupted'
+                : 'failed',
+        at: check.updated,
+        agent: provider === 'opencode' ? 'opencode' : agent,
+        sessionId: provider === 'opencode' ? agent : session,
+      });
+    }
+    return recentActivityEvents(input);
+  });
+  $effect(() => {
+    const saved = saveActivityHistory(activityHistory);
+    if (saved === saveActivityHistory(durableActivityHistory)) return;
+    durableActivityHistory = activityHistory;
+    setSetting('sai-activity-history', saved);
+  });
   $effect(() => {
     if (!sessionID || !running) return;
     const path = directory;
@@ -1500,7 +1663,7 @@
   let activeSideTab = $derived(
     sideTab === 'ship'
       ? 'ship'
-      : acpAgent
+      : acpAgent && sideTab !== 'history'
         ? 'changes'
         : showPlanPanel && sideTab === 'plan'
           ? 'plan'
@@ -5097,9 +5260,6 @@
     diffError = '';
     ++diffRefresh;
     diffLoading = false;
-    historyEvents = [];
-    historyError = '';
-    historyLoading = false;
     if (client) await ensureOpenCodeBrowser(path).catch((cause) => (error = describe(cause)));
     if (!client || !(await refreshSetup(path)) || current !== selection) return;
     draft = viewStates.get(viewKey())?.draft ?? '';
@@ -6138,6 +6298,18 @@
         if (!isPermissionNotFoundError(cause)) throw cause;
       }
     }
+    recordDecisionActivity(
+      {
+        agent: item.agentId ?? 'opencode',
+        directory: item.directory,
+        sessionId: item.sessionId,
+        title: item.text,
+        updated: item.receivedAt,
+      },
+      String(item.requestId ?? item.key),
+      item.text,
+      optionId === null || optionId === 'reject' ? 'rejected' : 'completed',
+    );
     await refreshInbox();
     if (item.kind === 'acp-permission') void restoreAgentActivity();
     if (item.kind === 'opencode-permission' && item.sessionId === sessionID) void refreshPrompts();
@@ -6482,6 +6654,84 @@
     const item = document.querySelector<HTMLElement>(`[data-check-id="${CSS.escape(check.id)}"]`);
     item?.scrollIntoView({ block: 'center' });
     item?.focus();
+  }
+
+  async function focusActivitySource(attribute: string, id: string, attempts = 30): Promise<void> {
+    await tick();
+    const target = [...chatArea.querySelectorAll<HTMLElement>(`[${attribute}]`)].find(
+      (element) => element.getAttribute(attribute) === id,
+    );
+    if (target) {
+      for (let parent: HTMLElement | null = target; parent; parent = parent.parentElement)
+        if (parent instanceof HTMLDetailsElement) parent.open = true;
+      target.scrollIntoView({ block: 'center' });
+      (target instanceof HTMLDetailsElement ? target.querySelector('summary') : target)?.focus();
+      return;
+    }
+    if (attempts === 0) throw new Error('The recorded activity source is no longer available.');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return focusActivitySource(attribute, id, attempts - 1);
+  }
+
+  async function selectActivityHistory(event: ActivityHistoryEvent) {
+    if (event.kind === 'subagent') {
+      const receipt = spawnReceipts.find((item) => item.receiptId === event.sourceId);
+      if (!receipt) throw new Error('The recorded child is no longer available.');
+      await openSpawnTarget(receipt);
+      return;
+    }
+    if (event.kind === 'check') {
+      const check = postTurnResults.find((item) => item.id === event.sourceId);
+      if (!check) throw new Error('The recorded check is no longer available.');
+      await openReviewCheck(check);
+      return;
+    }
+    if (event.kind === 'decision') {
+      const item = inboxItems.find(
+        (candidate) =>
+          !isInboxOutcome(candidate) &&
+          candidate.directory === event.workspace &&
+          candidate.sessionId === event.sessionId &&
+          String(candidate.requestId ?? candidate.key) === event.sourceId,
+      );
+      if (item) {
+        await openInboxItem(item);
+        return;
+      }
+    }
+    const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
+      (item) =>
+        item.directory === event.workspace &&
+        item.agent === event.agent &&
+        item.sessionId === event.sessionId,
+    );
+    if (!thread || !(await jumpToRecentThread(threadKey(thread))))
+      throw new Error('The recorded thread is no longer available.');
+    mobileView = 'chat';
+    if (event.kind === 'tool') await focusActivitySource('data-tool-id', event.sourceId);
+  }
+
+  function recordDecisionActivity(
+    thread: AgentThread,
+    sourceId: string,
+    title: string,
+    outcome: string,
+  ) {
+    durableActivityHistory = recentActivityEvents([
+      ...durableActivityHistory,
+      {
+        workspace: thread.directory,
+        kind: 'decision',
+        source: thread.agent,
+        sourceId,
+        title,
+        outcome,
+        at: Date.now(),
+        agent: thread.agent,
+        sessionId: thread.sessionId,
+      },
+    ]);
+    setSetting('sai-activity-history', saveActivityHistory(durableActivityHistory));
   }
 
   async function selectMainWorkspaceActivity(item: WorkspaceActivityItem) {
@@ -7540,9 +7790,6 @@
     diffError = '';
     ++diffRefresh;
     diffLoading = false;
-    historyEvents = [];
-    historyError = '';
-    historyLoading = false;
     sideTab = viewStates.get(viewKey())?.sideTab ?? 'plan';
     selectedFilePath = selectedDiffFile(
       diffs,
@@ -7603,9 +7850,6 @@
     sideTab = 'changes';
     ++diffRefresh;
     diffLoading = false;
-    historyEvents = [];
-    historyError = '';
-    historyLoading = false;
     pendingPermissions = [];
     pendingForms = [];
     clearDraftAttachments();
@@ -7920,6 +8164,7 @@
       messages,
       cursor: olderMessageCursor,
     });
+    openCodeTimelineRevision++;
   }
 
   function restoreCachedTimeline(path: string, id: string) {
@@ -8114,18 +8359,6 @@
     }
   }
 
-  async function refreshHistory(id = sessionID, current = selection) {
-    if (!client || !id || !directory || current !== selection) return;
-    if (setup?.rpc.state !== 'ready') {
-      historyEvents = [];
-      historyError = 'Install the plan-review plugin to record plan history.';
-      return;
-    }
-    historyLoading = false;
-    historyEvents = [];
-    historyError = 'Plan-review 0.2.0 does not expose history.';
-  }
-
   function selectDiffPath(path: string) {
     saveViewState();
     detailsOpen = true;
@@ -8155,7 +8388,6 @@
         ? getPlan(source, path, id)
         : Promise.resolve({ plan: null, questions: null } as PlanSnapshot),
       refreshPrompts(id, current),
-      refreshHistory(id, current),
     ]);
     if (current !== selection || id !== sessionID) return;
     if (history.status === 'rejected') error = describe(history.reason);
@@ -8175,7 +8407,6 @@
         : Promise.resolve({ plan: null, questions: null } as PlanSnapshot),
       refreshPrompts(id, current),
       refreshDiff(id, current),
-      refreshHistory(id, current),
     ]);
     if (current !== selection || id !== sessionID) return;
     if (plan.status === 'fulfilled') snapshot = plan.value;
@@ -9309,6 +9540,13 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
+                ondecision={(thread, permission, optionId) =>
+                  recordDecisionActivity(
+                    thread,
+                    String(permission.id),
+                    permission.title,
+                    optionId === 'reject' ? 'rejected' : 'completed',
+                  )}
                 running={!!(acpThread && runningAgentThreads[agentThreadKey(acpThread)])}
                 focused={focusedPane === 'main'}
                 oncreated={createAgentThread}
@@ -9641,10 +9879,10 @@
                   class:active={activeSideTab === 'changes'}
                   aria-current={activeSideTab === 'changes' ? 'page' : undefined}
                   onclick={toggleChanges}>Changes ({diffs.length})</button
-                >{/if}{#if !acpAgent && sessionID}<button
+                >{/if}{#if sessionID || acpAgent}<button
                   class:active={activeSideTab === 'history'}
                   aria-current={activeSideTab === 'history' ? 'page' : undefined}
-                  onclick={() => switchSideTab('history')}>History</button
+                  onclick={() => switchSideTab('history')}>Activity</button
                 >{/if}<button
                 class:active={activeSideTab === 'ship'}
                 aria-current={activeSideTab === 'ship' ? 'page' : undefined}
@@ -9704,16 +9942,16 @@
                     )}
                   />
                 </div>{/if}
-              {#if !acpAgent && sessionID}<div
+              {#if sessionID || acpAgent}<div
                   class:inactive={activeSideTab !== 'history'}
                   class="side-view"
                 >
                   <HistoryPanel
-                    events={historyEvents}
-                    session={currentSession}
-                    loading={historyLoading}
-                    error={historyError}
-                    onrefresh={() => refreshHistory()}
+                    events={activityHistory}
+                    loading={inboxLoading}
+                    error={inboxError}
+                    onrefresh={() => void refreshInbox()}
+                    onselect={selectActivityHistory}
                   />
                 </div>{/if}
               <div class:inactive={activeSideTab !== 'ship'} class="side-view">
@@ -9807,6 +10045,8 @@
         onattachmentsent={assignReviewCaptures}
         onshortcut={keydownWorkspace}
         onactivity={recordPaneActivity}
+        onhistorychange={() => openCodeTimelineRevision++}
+        ondecision={recordDecisionActivity}
         onusage={(id, context) => {
           if (context !== undefined && openCodeUsage[`${directory}:${id}`] !== context)
             openCodeUsage = { ...openCodeUsage, [`${directory}:${id}`]: context };
