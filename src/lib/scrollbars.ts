@@ -1,13 +1,31 @@
 const activeClass = 'sail-scrollbar-active';
-const idleDelay = 700;
+export const scrollbarIdleDelay = 700;
 
-export function installScrollbarVisibility(root: Document = document) {
-  const idleTimers = new Map<Element, ReturnType<typeof setTimeout>>();
+type ScrollbarElement = EventTarget & {
+  classList: Pick<DOMTokenList, 'add' | 'remove'>;
+};
+
+export type ScrollbarRoot = EventTarget & {
+  readonly scrollingElement: ScrollbarElement | null;
+  addEventListener(type: 'scroll', listener: EventListener, capture: true): void;
+  removeEventListener(type: 'scroll', listener: EventListener, capture: true): void;
+};
+
+function isScrollbarElement(target: EventTarget | null): target is ScrollbarElement {
+  return target !== null && 'classList' in target;
+}
+
+export function installScrollbarVisibility(
+  root: ScrollbarRoot = document,
+  idleDelay = scrollbarIdleDelay,
+) {
+  const idleTimers = new Map<ScrollbarElement, ReturnType<typeof setTimeout>>();
 
   const onScroll = (event: Event) => {
-    if (!(event.target instanceof Element)) return;
+    const target = event.target === root ? root.scrollingElement : event.target;
+    if (!isScrollbarElement(target)) return;
 
-    const element = event.target;
+    const element = target;
     const previous = idleTimers.get(element);
     if (previous) clearTimeout(previous);
 
