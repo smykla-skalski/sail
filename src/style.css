@@ -86,7 +86,9 @@ button:disabled {
   box-shadow: inset 0 0 0 3px var(--sui-primary);
 }
 .app-shell {
-  display: flex;
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
   height: 100vh;
   min-height: 0;
   overflow: hidden;
@@ -100,8 +102,15 @@ button:disabled {
   background: var(--shell-sidebar);
   border-right: 1px solid var(--shell-divider);
 }
+.main-area {
+  grid-column: 2;
+  grid-row: 1;
+}
 .app-shell[data-sidebar-visible='false'] .sidebar {
   display: none;
+}
+.app-shell[data-sidebar-visible='false'] {
+  grid-template-columns: 0 minmax(0, 1fr);
 }
 .sidebar-toggle {
   flex: 0 0 auto;
@@ -1964,23 +1973,34 @@ button:disabled {
     width: 195px;
     flex-basis: 195px;
   }
+  .app-shell {
+    grid-template-columns: 195px minmax(0, 1fr);
+  }
+  .app-shell[data-sidebar-visible='false'] {
+    grid-template-columns: 0 minmax(0, 1fr);
+  }
   .workspace {
     grid-template-columns: minmax(300px, 1fr) 8px minmax(320px, var(--details-width));
   }
 }
 @media (max-width: 850px) {
   .app-shell {
-    display: block;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
     position: relative;
   }
+  .app-shell[data-sidebar-visible='false'] {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .main-area {
+    grid-column: 1;
     height: 100%;
   }
   .sidebar {
     display: none;
     position: absolute;
     top: var(--topbar-height, 80px);
-    bottom: 0;
+    bottom: 32px;
     z-index: 2;
     width: 100%;
     padding: 18px 12px;
