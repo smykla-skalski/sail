@@ -121,10 +121,15 @@ describe('styled app dialogs', () => {
     );
     await $('.path-picker-dialog[open] .path-picker-actions .confirmation-primary').click();
     await expect($('.worktree-destination span')).toHaveText(realpathSync(fixture));
-    await $('[aria-label^="Agent for new worktree:"]').click();
-    await expect($('.option-menu')).toBeDisplayed();
-    await browser.keys('Escape');
-    await expect($('.option-menu')).not.toExist();
+    await browser.execute(() =>
+      document
+        .querySelector<HTMLInputElement>('.worktree-agent-option input:not(:disabled)')
+        ?.focus(),
+    );
+    await browser.keys('ArrowRight');
+    const focusedAgent = $('.worktree-agent-option input:focus');
+    await expect(focusedAgent).toBeSelected();
+    expect(await focusedAgent.getValue()).not.toBe('');
     await expect($('.worktree-dialog')).toBeDisplayed();
   });
 });

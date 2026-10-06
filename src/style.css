@@ -534,7 +534,7 @@ button:disabled {
   font-size: 11px;
 }
 .worktree-dialog {
-  width: min(440px, calc(100vw - 32px));
+  width: min(520px, calc(100vw - 32px));
   max-height: calc(100vh - 32px);
   overflow-x: hidden;
   overflow-y: auto;
@@ -550,7 +550,7 @@ button:disabled {
 }
 .worktree-form {
   display: grid;
-  gap: 18px;
+  gap: 16px;
   margin: 0;
 }
 .worktree-dialog-heading,
@@ -612,23 +612,6 @@ button:disabled {
   min-height: 110px;
   resize: vertical;
 }
-.worktree-issue-results {
-  display: grid;
-  max-height: 160px;
-  overflow-y: auto;
-  border: 1px solid var(--shell-divider);
-  border-radius: 7px;
-}
-.worktree-issue-results button {
-  padding: 7px 10px;
-  color: var(--sui-foreground);
-  text-align: left;
-  font-size: 12px;
-}
-.worktree-issue-results button:hover,
-.worktree-issue-results button.selected {
-  background: var(--shell-selected);
-}
 .worktree-issue-note {
   margin: 0;
   color: var(--sui-muted);
@@ -637,6 +620,78 @@ button:disabled {
 .worktree-issue-note button {
   margin-left: 6px;
   color: var(--sui-primary);
+}
+.worktree-agent-picker {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.worktree-agent-picker legend {
+  margin-bottom: 7px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.worktree-agent-picker > p {
+  margin: 7px 0 0;
+  color: var(--sui-muted);
+  font-size: 11px;
+}
+.worktree-agent-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 7px;
+}
+.worktree-form .worktree-agent-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid var(--shell-divider);
+  border-radius: 7px;
+  background: var(--sui-canvas);
+  font-size: 12px;
+  cursor: pointer;
+}
+.worktree-agent-option > span:last-child {
+  display: grid;
+  min-width: 0;
+}
+.worktree-agent-option strong {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.worktree-agent-option small {
+  overflow: hidden;
+  color: var(--sui-muted);
+  font-size: 10px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.worktree-agent-option:has(input:checked) {
+  border-color: var(--sui-primary);
+  background: var(--shell-selected);
+  box-shadow: 0 0 0 1px var(--sui-primary);
+}
+.worktree-agent-option:has(input:focus-visible) {
+  outline: 2px solid var(--sui-primary);
+  outline-offset: 2px;
+}
+.worktree-agent-option:has(input:disabled) {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.worktree-form .worktree-agent-option input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
 }
 .worktree-form .pull-request-draft {
   display: flex;

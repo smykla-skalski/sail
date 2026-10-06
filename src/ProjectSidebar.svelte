@@ -3,7 +3,6 @@
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import PathPicker from './PathPicker.svelte';
-  import OptionPicker from './OptionPicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
   import type { AgentAvailability, AgentThread } from './lib/acp';
   import type { AttentionMap, ThreadStatus } from './lib/attention';
@@ -18,7 +17,7 @@
   import type { ProjectCatalog, ProjectWorktree, WorktreeCreation } from './lib/projects';
   import { ungroupedRepositories } from './lib/projects';
   import { getSetting, setSetting } from './lib/settings';
-  import { issueBranch, worktreeBranchName } from './lib/github-issues';
+  import { issueBranch, parseGitHubIssueLink, worktreeBranchName } from './lib/github-issues';
 
   export type PullRequestCheck = { name: string; state: string; url: string };
   type PullRequestChecks = { number: number; url: string; checks: PullRequestCheck[] };
@@ -150,15 +149,30 @@
   let worktreeBase = $state('');
   let worktreeAgent = $state('');
   let worktreeAgentTouched = $state(false);
-  let agentPickerOpen = $state(false);
+  let worktreeAgentOptions = $derived([
+    { value: '', name: 'Later', detail: 'Choose after creation', icon: '', available: true },
+    {
+      value: 'opencode',
+      name: 'OpenCode',
+      detail: openCodeAvailable ? 'Ready' : 'Unavailable',
+      icon: 'opencode',
+      available: openCodeAvailable,
+    },
+    ...agents.map((agent) => ({
+      value: agent.id,
+      name: agent.name,
+      detail: agent.available ? 'Ready' : (agent.reason ?? 'Unavailable'),
+      icon: agent.id,
+      available: agent.available,
+    })),
+  ]);
   let worktreeError = $state('');
-  let issueQuery = $state('');
-  let issueResults = $state<GitHubIssue[]>([]);
+  let issueURL = $state('');
   let issueError = $state('');
   let issueLoading = $state(false);
   let selectedIssue = $state<GitHubIssue | null>(null);
-  let issueSearchTimer: ReturnType<typeof setTimeout> | undefined;
-  let issueSearchGeneration = 0;
+  let issueLookupTimer: ReturnType<typeof setTimeout> | undefined;
+  let issueLookupGeneration = 0;
   let creatingPullRequestFor = $state<{ repository: string; worktree: ProjectWorktree } | null>(
     null,
   );
@@ -450,38 +464,61 @@
         : '';
     worktreeError = '';
     selectedIssue = null;
-    issueQuery = '';
-    issueResults = [];
+    issueURL = '';
     issueError = '';
     closeMenu();
     await tick();
     worktreeDialog.showModal();
     worktreeNameInput?.focus();
-    if (!fromPalette) void loadIssues(path);
   }
 
-  async function loadIssues(repository: string) {
-    const generation = ++issueSearchGeneration;
+  async function loadIssue(repository: string, showInvalid = false) {
+    clearTimeout(issueLookupTimer);
+    const link = parseGitHubIssueLink(issueURL);
+    if (!link) {
+      selectedIssue = null;
+      issueLoading = false;
+      issueError = issueURL.trim() && showInvalid ? 'Paste a full GitHub issue link.' : '';
+      return;
+    }
+    const generation = ++issueLookupGeneration;
     issueLoading = true;
     issueError = '';
     try {
-      const issues = await invoke<GitHubIssue[]>('list_open_issues', {
+      const issue = await invoke<GitHubIssue>('open_issue', {
         repository,
-        query: issueQuery,
+        number: link.number,
       });
-      if (generation === issueSearchGeneration && creatingWorktreeFor === repository)
-        issueResults = issues;
+      if (generation !== issueLookupGeneration || creatingWorktreeFor !== repository) return;
+      const resolved = parseGitHubIssueLink(issue.url);
+      if (
+        !resolved ||
+        resolved.owner.toLowerCase() !== link.owner.toLowerCase() ||
+        resolved.repository.toLowerCase() !== link.repository.toLowerCase()
+      ) {
+        selectedIssue = null;
+        issueError = 'Issue link must belong to this repository.';
+        return;
+      }
+      chooseIssue(issue);
     } catch (cause) {
-      if (generation === issueSearchGeneration && creatingWorktreeFor === repository)
+      if (generation === issueLookupGeneration && creatingWorktreeFor === repository) {
+        selectedIssue = null;
         issueError = cause instanceof Error ? cause.message : String(cause);
+      }
     } finally {
-      if (generation === issueSearchGeneration) issueLoading = false;
+      if (generation === issueLookupGeneration) issueLoading = false;
     }
   }
 
-  function searchIssues(repository: string) {
-    clearTimeout(issueSearchTimer);
-    issueSearchTimer = setTimeout(() => void loadIssues(repository), 300);
+  function queueIssueLookup(repository: string) {
+    clearTimeout(issueLookupTimer);
+    ++issueLookupGeneration;
+    selectedIssue = null;
+    issueLoading = false;
+    issueError = '';
+    if (!issueURL.trim()) return;
+    issueLookupTimer = setTimeout(() => void loadIssue(repository), 300);
   }
 
   function chooseIssue(issue: GitHubIssue) {
@@ -490,7 +527,6 @@
     if (!worktreeAgentTouched)
       worktreeAgent =
         agents.find((agent) => agent.available)?.id ?? (openCodeAvailable ? 'opencode' : '');
-    void tick().then(() => worktreeNameInput?.focus());
   }
 
   function chooseWorktreeDestination() {
@@ -508,6 +544,10 @@
       )
     ) {
       worktreeError = 'This worktree already has a pending entry. Retry or dismiss it first.';
+      return;
+    }
+    if (issueURL.trim() && !selectedIssue) {
+      worktreeError = 'Enter a valid open issue link or clear the field.';
       return;
     }
     if ((selectedIssue || worktreeFromPalette) && !worktreeAgent) {
@@ -530,8 +570,8 @@
   }
 
   function closeWorktreeDialog() {
-    clearTimeout(issueSearchTimer);
-    ++issueSearchGeneration;
+    clearTimeout(issueLookupTimer);
+    ++issueLookupGeneration;
     worktreeDialog.close();
   }
 
@@ -1225,8 +1265,8 @@
     const returnToPalette = worktreeFromPalette && !worktreeCreated;
     creatingWorktreeFor = null;
     worktreeFromPalette = false;
-    clearTimeout(issueSearchTimer);
-    ++issueSearchGeneration;
+    clearTimeout(issueLookupTimer);
+    ++issueLookupGeneration;
     if (returnToPalette && repository)
       void tick().then(() => {
         onworktreecancelled(repository);
@@ -1254,47 +1294,32 @@
         >
       </div>
       {#if !worktreeFromPalette}<label
-          >Open GitHub issue <span>(optional)</span>
+          >GitHub issue link <span>(optional)</span>
           <input
-            aria-label="Search open GitHub issues"
-            placeholder="Search by title or number"
-            bind:value={issueQuery}
-            oninput={() => searchIssues(creatingWorktreeFor!)}
+            type="url"
+            aria-label="GitHub issue link"
+            placeholder="https://github.com/owner/repo/issues/123"
+            bind:value={issueURL}
+            oninput={() => queueIssueLookup(creatingWorktreeFor!)}
+            onblur={() => void loadIssue(creatingWorktreeFor!, true)}
             onkeydown={(event) => {
               if (event.key === 'Enter') {
                 event.preventDefault();
-                clearTimeout(issueSearchTimer);
-                void loadIssues(creatingWorktreeFor!);
+                clearTimeout(issueLookupTimer);
+                void loadIssue(creatingWorktreeFor!, true);
               }
             }}
           />
         </label>{/if}
       {#if issueLoading && !worktreeFromPalette}<p class="worktree-issue-note" role="status">
-          Searching issues…
+          Checking issue…
         </p>{/if}
       {#if issueError && !worktreeFromPalette}<p class="worktree-error" role="status">
           {issueError}
         </p>{/if}
-      {#if !worktreeFromPalette && !issueLoading && !issueError && !issueResults.length}<p
-          class="worktree-issue-note"
-          role="status"
-        >
-          No open issues found.
-        </p>{/if}
-      {#if !worktreeFromPalette && !issueError && !issueLoading && issueResults.length}<div
-          class="worktree-issue-results"
-          aria-label="Open GitHub issues"
-        >
-          {#each issueResults as issue (issue.number)}<button
-              type="button"
-              class:selected={selectedIssue?.number === issue.number}
-              aria-pressed={selectedIssue?.number === issue.number}
-              onclick={() => chooseIssue(issue)}>#{issue.number} {issue.title}</button
-            >{/each}
-        </div>{/if}
       {#if !worktreeFromPalette && selectedIssue}<p class="worktree-issue-note">
-          Selected #{selectedIssue.number}: {selectedIssue.title}
-          <button type="button" onclick={() => (selectedIssue = null)}>Clear</button>
+          ✓ #{selectedIssue.number}
+          {selectedIssue.title}
         </p>{/if}
       <label
         >Worktree or branch name
@@ -1316,30 +1341,24 @@
           bind:value={worktreeBase}
         />
       </label>
-      <label
-        >Start with agent
-        <OptionPicker
-          label="Agent for new worktree"
-          value={worktreeAgent}
-          options={[
-            { value: '', name: 'Choose after creation' },
-            { value: 'opencode', name: 'OpenCode', icon: 'opencode', disabled: !openCodeAvailable },
-            ...agents.map((agent) => ({
-              value: agent.id,
-              name: agent.name,
-              icon: agent.id,
-              disabled: !agent.available,
-            })),
-          ]}
-          open={agentPickerOpen}
-          onopen={() => (agentPickerOpen = true)}
-          onclose={() => (agentPickerOpen = false)}
-          onchoose={(value) => {
-            worktreeAgent = value;
-            worktreeAgentTouched = true;
-          }}
-        />
-      </label>
+      <fieldset class="worktree-agent-picker">
+        <legend>Start with agent</legend>
+        <div class="worktree-agent-options">
+          {#each worktreeAgentOptions as agent (agent.value)}<label class="worktree-agent-option">
+              <input
+                type="radio"
+                name="worktree-agent"
+                value={agent.value}
+                bind:group={worktreeAgent}
+                disabled={!agent.available}
+                onclick={() => (worktreeAgentTouched = true)}
+              />
+              {#if agent.icon}<HarnessIcon agent={agent.icon} size={18} />{/if}
+              <span><strong>{agent.name}</strong><small>{agent.detail}</small></span>
+            </label>{/each}
+        </div>
+        <p>Use Tab to enter, then arrow keys to choose.</p>
+      </fieldset>
       {#if (selectedIssue || worktreeFromPalette) && !worktreeAgent}<p
           class="worktree-issue-note"
           role="status"
@@ -1361,6 +1380,7 @@
           type="submit"
           class="worktree-create"
           disabled={!worktreeName.trim() ||
+            (!!issueURL.trim() && (!selectedIssue || issueLoading)) ||
             ((!!selectedIssue || worktreeFromPalette) && !worktreeAgent)}>Create worktree</button
         >
       </div>

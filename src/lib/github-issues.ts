@@ -32,3 +32,16 @@ export function issueBranch(issue: { number: number; title: string }): string {
   const slug = branchSlug(issue.title, available);
   return slug && available > 0 ? `${prefix}-${slug}` : prefix;
 }
+
+export type GitHubIssueLink = { owner: string; repository: string; number: number };
+
+export function parseGitHubIssueLink(value: string): GitHubIssueLink | null {
+  const match = value
+    .trim()
+    .match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)\/?(?:[?#].*)?$/i);
+  if (!match) return null;
+  const number = Number(match[3]);
+  return Number.isSafeInteger(number) && number > 0
+    ? { owner: match[1], repository: match[2], number }
+    : null;
+}
