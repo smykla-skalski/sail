@@ -12,6 +12,7 @@ fn main() {
             "list_picker_directory",
             "working_tree_diff",
             "working_tree_revision",
+            "worktree_overviews",
             "record_turn_snapshot",
             "list_turn_snapshots",
             "restore_turn_snapshot",

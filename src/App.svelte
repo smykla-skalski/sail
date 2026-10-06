@@ -57,6 +57,7 @@
   import HistoryPanel from './HistoryPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
+  import TaskOverview from './TaskOverview.svelte';
   import type { GitHubIssue, PullRequestCheck } from './ProjectSidebar.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
@@ -144,7 +145,11 @@
     threadKey,
     touchRecentThread,
   } from './lib/recent-threads';
-  import { groupSidebarThreads, listSidebarOpenCodeThreads } from './lib/sidebar-agents';
+  import {
+    groupSidebarThreads,
+    listSidebarOpenCodeThreads,
+    sidebarThreadStatus,
+  } from './lib/sidebar-agents';
   import {
     loadAttention,
     markAttentionRead,
@@ -576,6 +581,30 @@
       ),
     ),
   );
+  let taskOverviewStatuses = $derived(
+    Object.fromEntries(
+      Object.values(sidebarThreads)
+        .flat()
+        .map((thread) => [
+          threadKey(thread),
+          sidebarThreadStatus(
+            thread,
+            threadAttention,
+            sidebarOpenCodeOutcomes,
+            acpActivityReady,
+            nativeActivityReady,
+            nativeUnavailableDirectories,
+            spawnReceipts,
+          ),
+        ]),
+    ),
+  );
+  let taskOverviewAgentNames = $derived(
+    Object.fromEntries([
+      ['opencode', 'OpenCode'],
+      ...agentAvailability.map((agent) => [agent.id, agent.name]),
+    ]),
+  );
   let sidebarDirectoryKey = $derived(
     JSON.stringify([
       ...new Set([
@@ -870,6 +899,9 @@
     );
   }
   let mobileView = $state<'sessions' | 'chat' | 'details'>('chat');
+  let workspaceView = $state<'workspace' | 'overview'>(
+    getSetting('sai-workspace-view') === 'overview' ? 'overview' : 'workspace',
+  );
   let sidebarVisible = $state(true);
   let mobileLayout = $state(window.matchMedia('(max-width: 850px)').matches);
   const viewStates = new SvelteMap<
@@ -8741,6 +8773,29 @@
       void tick().then(() => sidebarToggleElement.focus());
   }
 
+  function showTaskOverview() {
+    workspaceView = 'overview';
+    mobileView = 'chat';
+    setSetting('sai-workspace-view', workspaceView);
+  }
+
+  function showWorkspace() {
+    workspaceView = 'workspace';
+    setSetting('sai-workspace-view', workspaceView);
+  }
+
+  async function openTaskOverviewTarget(path: string, key: string | null) {
+    showWorkspace();
+    if (key && (await jumpToRecentThread(key))) return;
+    if (path !== directory) await loadProject(path);
+    focusPaneForTyping('main');
+  }
+
+  async function openTaskOverviewCheck(check: PostTurnCheck) {
+    showWorkspace();
+    await openReviewCheck(check);
+  }
+
   function keyupWorkspace(event: KeyboardEvent) {
     if (event.key === 'Control') recentCycleKeys = null;
   }
@@ -8886,15 +8941,23 @@
         >
       </nav>
       <div class="breadcrumb">
-        <button
-          class="breadcrumb-project"
-          onclick={() => chooseProject()}
-          disabled={runtimeState !== 'connected' &&
-            !agentAvailability.some((agent) => agent.available)}
-          >{directory ? directory.split('/').filter(Boolean).at(-1) : 'Workspace'} ⌄</button
-        ><span class="slash">/</span><strong>{focusedConversationTitle}</strong>
+        {#if workspaceView === 'overview'}<strong>All worktrees</strong><span class="slash">/</span
+          ><strong>Task overview</strong>{:else}<button
+            class="breadcrumb-project"
+            onclick={() => chooseProject()}
+            disabled={runtimeState !== 'connected' &&
+              !agentAvailability.some((agent) => agent.available)}
+            >{directory ? directory.split('/').filter(Boolean).at(-1) : 'Workspace'} ⌄</button
+          ><span class="slash">/</span><strong>{focusedConversationTitle}</strong>{/if}
       </div>
       <div class="topbar-actions">
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-pressed={workspaceView === 'overview'}
+          onclick={() => (workspaceView === 'overview' ? showWorkspace() : showTaskOverview())}
+          >{workspaceView === 'overview' ? 'Workspace' : 'Overview'}</Button
+        >
         <Button variant="ghost" size="sm" aria-label="Pending requests" onclick={openInbox}
           >Inbox ({inboxItems.filter((item) => !isInboxOutcome(item) || !item.read).length})</Button
         >
@@ -9486,106 +9549,120 @@
           </section>{/if}
       </div>
     {/snippet}
-    <PaneTree
-      pane={paneLayout}
-      focused={focusedPane}
-      {directory}
-      project={coordinationProject(directory) ?? directory}
-      {dark}
-      agents={paneAgents}
-      {sideChat}
-      {client}
-      {setup}
-      {runtimeState}
-      {coordinationMessages}
-      {spawnReceipts}
-      {shipRuns}
-      {shippingBusy}
-      onshiprefresh={() => tickShippingRuns(true)}
-      onshipopen={openShipTarget}
-      onshipsettings={openSettings}
-      onship={(graph, provider, limit, source) => startShippingRun(graph, provider, limit, source)}
-      onshipit={adoptDirectShipRun}
-      postTurnChecks={postTurnResults}
-      onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
-      {agentUsage}
-      {agentRates}
-      onentries={(id, entries, sessionId, ready) =>
-        (agentEntrySnapshots = { ...agentEntrySnapshots, [id]: { entries, sessionId, ready } })}
-      {changesPanes}
-      main={mainPaneContent}
-      mainPicker={showMainPicker}
-      canClose={leaves(paneLayout).length > 1 ||
-        !!sideChat ||
-        leaves(paneLayout).some((pane) => pane.id === 'main' && !!pane.kind)}
-      onfocus={focusPane}
-      onclose={closeFocusedPane}
-      onratio={updatePaneRatio}
-      oncreated={createPaneThread}
-      onchooseagent={choosePaneAgent}
-      onchooseterminal={choosePaneTerminal}
-      onchoosebrowser={choosePaneBrowser}
-      onbrowserstate={updatePaneBrowser}
-      onbrowserpick={attachPickedElement}
-      {pickedAttachments}
-      {diffComments}
-      ondiffcomments={updateDiffComments}
-      ondiffcommentssent={removeSentDiffComments}
-      onsenddiffcomments={sendDiffComments}
-      {pendingAgentBatches}
-      onbatchcomplete={completeAgentBatch}
-      onpickedconsumed={markPickConsumed}
-      onattachmentsent={assignReviewCaptures}
-      onshortcut={keydownWorkspace}
-      onactivity={recordPaneActivity}
-      onusage={(id, context) => {
-        if (context !== undefined && openCodeUsage[`${directory}:${id}`] !== context)
-          openCodeUsage = { ...openCodeUsage, [`${directory}:${id}`]: context };
-      }}
-      focusPromptPane={promptFocusPane}
-      onpromptfocused={() => (promptFocusPane = null)}
-      running={(thread) => !!(thread && runningAgentThreads[agentThreadKey(thread)])}
-      onstatus={updateAgentThreadStatus}
-      onreplaychange={setAgentReplay}
-      onchanges={(id) => {
-        changesPanes = changesPanes.filter((item) => item !== id);
-      }}
-      {pendingCommands}
-      oncommandstarted={(id) => {
-        const next = { ...pendingCommands };
-        delete next[id];
-        pendingCommands = next;
-      }}
-      onterminalexit={(id, code) => {
-        terminalExitWaiters.get(id)?.(code);
-        terminalExitWaiters.delete(id);
-        finishCoordinationSetup(id, code);
-      }}
-      onterminalownerlost={(id) => savePaneLayout(updatePane(paneLayout, id, { owner: undefined }))}
-      onagentterminal={(id) => void openAgentTerminal(id)}
-      reviewCaptures={reviewCaptures.filter((capture) => capture.directory === directory)}
-      reviewPreviews={reviewPreviews()}
-      onreviewcheck={openReviewCheck}
-      onreviewpreview={openReviewPreview}
-      onreviewcapturephase={setReviewCapturePhase}
-    />
-    {#if mainShipFallback && detailsOpen && activeSideTab === 'ship' && (!mobileLayout || mobileView === 'details')}<section
-        class="ship-fallback"
-        aria-label="Ship run details"
-      >
-        <ShipPanel
-          repository={coordinationProject(directory) ?? directory}
-          runs={shipRuns}
-          busy={shippingBusy}
-          onclose={closeShipRuns}
-          onrefresh={() => tickShippingRuns(true)}
-          onopen={openShipTarget}
-          onsettings={async () => {
-            closeShipRuns();
-            await openSettings();
-          }}
-        />
-      </section>{/if}
+    {#if workspaceView === 'overview'}
+      <TaskOverview
+        catalog={projectCatalog}
+        threads={sidebarThreads}
+        statuses={taskOverviewStatuses}
+        agentNames={taskOverviewAgentNames}
+        checks={postTurnResults}
+        receipts={spawnReceipts}
+        {directory}
+        onopen={openTaskOverviewTarget}
+        onopencheck={openTaskOverviewCheck}
+      />
+    {:else}<PaneTree
+        pane={paneLayout}
+        focused={focusedPane}
+        {directory}
+        project={coordinationProject(directory) ?? directory}
+        {dark}
+        agents={paneAgents}
+        {sideChat}
+        {client}
+        {setup}
+        {runtimeState}
+        {coordinationMessages}
+        {spawnReceipts}
+        {shipRuns}
+        {shippingBusy}
+        onshiprefresh={() => tickShippingRuns(true)}
+        onshipopen={openShipTarget}
+        onshipsettings={openSettings}
+        onship={(graph, provider, limit, source) =>
+          startShippingRun(graph, provider, limit, source)}
+        onshipit={adoptDirectShipRun}
+        postTurnChecks={postTurnResults}
+        onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+        {agentUsage}
+        {agentRates}
+        onentries={(id, entries, sessionId, ready) =>
+          (agentEntrySnapshots = { ...agentEntrySnapshots, [id]: { entries, sessionId, ready } })}
+        {changesPanes}
+        main={mainPaneContent}
+        mainPicker={showMainPicker}
+        canClose={leaves(paneLayout).length > 1 ||
+          !!sideChat ||
+          leaves(paneLayout).some((pane) => pane.id === 'main' && !!pane.kind)}
+        onfocus={focusPane}
+        onclose={closeFocusedPane}
+        onratio={updatePaneRatio}
+        oncreated={createPaneThread}
+        onchooseagent={choosePaneAgent}
+        onchooseterminal={choosePaneTerminal}
+        onchoosebrowser={choosePaneBrowser}
+        onbrowserstate={updatePaneBrowser}
+        onbrowserpick={attachPickedElement}
+        {pickedAttachments}
+        {diffComments}
+        ondiffcomments={updateDiffComments}
+        ondiffcommentssent={removeSentDiffComments}
+        onsenddiffcomments={sendDiffComments}
+        {pendingAgentBatches}
+        onbatchcomplete={completeAgentBatch}
+        onpickedconsumed={markPickConsumed}
+        onattachmentsent={assignReviewCaptures}
+        onshortcut={keydownWorkspace}
+        onactivity={recordPaneActivity}
+        onusage={(id, context) => {
+          if (context !== undefined && openCodeUsage[`${directory}:${id}`] !== context)
+            openCodeUsage = { ...openCodeUsage, [`${directory}:${id}`]: context };
+        }}
+        focusPromptPane={promptFocusPane}
+        onpromptfocused={() => (promptFocusPane = null)}
+        running={(thread) => !!(thread && runningAgentThreads[agentThreadKey(thread)])}
+        onstatus={updateAgentThreadStatus}
+        onreplaychange={setAgentReplay}
+        onchanges={(id) => {
+          changesPanes = changesPanes.filter((item) => item !== id);
+        }}
+        {pendingCommands}
+        oncommandstarted={(id) => {
+          const next = { ...pendingCommands };
+          delete next[id];
+          pendingCommands = next;
+        }}
+        onterminalexit={(id, code) => {
+          terminalExitWaiters.get(id)?.(code);
+          terminalExitWaiters.delete(id);
+          finishCoordinationSetup(id, code);
+        }}
+        onterminalownerlost={(id) =>
+          savePaneLayout(updatePane(paneLayout, id, { owner: undefined }))}
+        onagentterminal={(id) => void openAgentTerminal(id)}
+        reviewCaptures={reviewCaptures.filter((capture) => capture.directory === directory)}
+        reviewPreviews={reviewPreviews()}
+        onreviewcheck={openReviewCheck}
+        onreviewpreview={openReviewPreview}
+        onreviewcapturephase={setReviewCapturePhase}
+      />
+      {#if mainShipFallback && detailsOpen && activeSideTab === 'ship' && (!mobileLayout || mobileView === 'details')}<section
+          class="ship-fallback"
+          aria-label="Ship run details"
+        >
+          <ShipPanel
+            repository={coordinationProject(directory) ?? directory}
+            runs={shipRuns}
+            busy={shippingBusy}
+            onclose={closeShipRuns}
+            onrefresh={() => tickShippingRuns(true)}
+            onopen={openShipTarget}
+            onsettings={async () => {
+              closeShipRuns();
+              await openSettings();
+            }}
+          />
+        </section>{/if}{/if}
   </div>
 </div>
 <ConfirmDialog request={confirmation} onanswer={answerConfirmation} />

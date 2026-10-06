@@ -934,6 +934,82 @@ async fn working_tree_revision(path: String) -> Result<String, String> {
     .map_err(|error| error.to_string())?
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeOverview {
+    path: String,
+    branch: Option<String>,
+    changed_files: Option<usize>,
+    error: Option<String>,
+}
+
+fn inspect_worktree(path: String) -> WorktreeOverview {
+    let root = match validate_repository(path.clone()) {
+        Ok(root) => root,
+        Err(error) => {
+            return WorktreeOverview {
+                path,
+                branch: None,
+                changed_files: None,
+                error: Some(error),
+            };
+        }
+    };
+    let branch = Command::new("git")
+        .args(["-C", &root, "symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|branch| !branch.is_empty());
+    let changes = Command::new("git")
+        .args([
+            "-C",
+            &root,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+        ])
+        .output();
+    match changes {
+        Ok(output) if output.status.success() => WorktreeOverview {
+            path,
+            branch,
+            changed_files: Some(
+                output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|record| record.len() >= 4)
+                    .count(),
+            ),
+            error: None,
+        },
+        _ => WorktreeOverview {
+            path,
+            branch,
+            changed_files: None,
+            error: Some("Could not read working tree status.".into()),
+        },
+    }
+}
+
+#[tauri::command]
+async fn worktree_overviews(paths: Vec<String>) -> Vec<WorktreeOverview> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut unique = Vec::new();
+        for path in paths.into_iter().take(500) {
+            if !unique.contains(&path) {
+                unique.push(path);
+            }
+        }
+        unique.into_iter().map(inspect_worktree).collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 fn git_directory_revision(root: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
@@ -1752,6 +1828,7 @@ pub fn run() {
             list_picker_directory,
             working_tree_diff,
             working_tree_revision,
+            worktree_overviews,
             worktree_snapshots::record_turn_snapshot,
             worktree_snapshots::list_turn_snapshots,
             worktree_snapshots::restore_turn_snapshot,
@@ -1881,7 +1958,7 @@ mod tests {
         add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
         git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
         remove_worktree, repository_namespace, server_args, shipping_default_branch,
-        shipping_fetch_source, version_number, working_tree_diff,
+        shipping_fetch_source, version_number, working_tree_diff, worktree_overviews,
     };
     use std::fs;
     #[cfg(unix)]
@@ -2273,6 +2350,34 @@ mod tests {
         let after =
             tauri::async_runtime::block_on(working_tree_revision(parent_path.into())).unwrap();
         assert_ne!(before, after);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overview_reports_branch_changes_and_missing_repositories() {
+        let root =
+            std::env::temp_dir().join(format!("sail-overview-test-{}", uuid::Uuid::new_v4()));
+        let repository = root.join("repository");
+        let missing = root.join("missing");
+        fs::create_dir_all(&repository).unwrap();
+        let repository = repository.canonicalize().unwrap();
+        let path = repository.to_str().unwrap();
+        git(path, &["init", "-q", "-b", "overview-test"]);
+        fs::write(repository.join("changed.txt"), "change\n").unwrap();
+
+        let result = tauri::async_runtime::block_on(worktree_overviews(vec![
+            path.into(),
+            path.into(),
+            missing.to_string_lossy().into_owned(),
+        ]));
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].branch.as_deref(), Some("overview-test"));
+        assert_eq!(result[0].changed_files, Some(1));
+        assert!(result[0].error.is_none());
+        assert!(result[1].branch.is_none());
+        assert!(result[1].changed_files.is_none());
+        assert!(result[1].error.is_some());
         fs::remove_dir_all(root).unwrap();
     }
 

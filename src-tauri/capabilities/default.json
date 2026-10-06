@@ -15,6 +15,7 @@
     "allow-list-picker-directory",
     "allow-working-tree-diff",
     "allow-working-tree-revision",
+    "allow-worktree-overviews",
     "allow-record-turn-snapshot",
     "allow-list-turn-snapshots",
     "allow-restore-turn-snapshot",
