@@ -1351,7 +1351,7 @@
                 value={agent.value}
                 bind:group={worktreeAgent}
                 disabled={!agent.available}
-                onchange={() => (worktreeAgentTouched = true)}
+                onclick={() => (worktreeAgentTouched = true)}
               />
               {#if agent.icon}<HarnessIcon agent={agent.icon} size={18} />{/if}
               <span><strong>{agent.name}</strong><small>{agent.detail}</small></span>

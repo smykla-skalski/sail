@@ -127,7 +127,9 @@ describe('styled app dialogs', () => {
         ?.focus(),
     );
     await browser.keys('ArrowRight');
-    await expect($('.worktree-agent-option input:focus')).toExist();
+    const focusedAgent = $('.worktree-agent-option input:focus');
+    await expect(focusedAgent).toBeSelected();
+    expect(await focusedAgent.getValue()).not.toBe('');
     await expect($('.worktree-dialog')).toBeDisplayed();
   });
 });
