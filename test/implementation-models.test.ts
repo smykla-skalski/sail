@@ -158,6 +158,15 @@ void test('model history survives equivalent references and rejects a second iss
     number: 1,
   });
   assert.deepEqual(savedShipItIssue(directory), { repository: 'example/repo', number: 1 });
+  assert.deepEqual(await beginShipItRun(directory, 'Please /ship-it #1'), {
+    repository: 'example/repo',
+    number: 1,
+  });
+  assert.equal(await beginShipItRun(directory, 'What does `/ship-it #2` do?'), null);
+  assert.equal(await beginShipItRun(directory, 'Explain this:\n```\n/ship-it #2\n```'), null);
+  assert.equal(await beginShipItRun(directory, '/review /ship-it #2', 'review'), null);
+  assert.equal(await beginShipItRun(directory, 'Example:\n    /ship-it #2'), null);
+  assert.equal(await beginShipItRun(directory, 'Example:\n> /ship-it #2'), null);
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-a']));
   await beginShipItRun(directory, '/ship-it #1');
   assert.deepEqual(implementationModels(directory), ['model-a']);
@@ -175,6 +184,14 @@ void test('model history survives equivalent references and rejects a second iss
   );
   await assert.rejects(
     () => beginShipItRun(directory, '/ship-it #2'),
+    /This worktree tracks example\/repo#1\. Start example\/repo#2 in a new worktree/,
+  );
+  await assert.rejects(
+    () => beginShipItRun(directory, 'Please /ship-it #2'),
+    /This worktree tracks example\/repo#1\. Start example\/repo#2 in a new worktree/,
+  );
+  await assert.rejects(
+    () => beginShipItRun(directory, 'Please help\n/ship-it #2'),
     /This worktree tracks example\/repo#1\. Start example\/repo#2 in a new worktree/,
   );
   assert.deepEqual(implementationModels(directory), ['model-a']);

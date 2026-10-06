@@ -5,6 +5,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { Badge, Button } from '@smykla-skalski/sui';
   import Markdown from './Markdown.svelte';
+  import ChatMessage from './ChatMessage.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
@@ -21,7 +22,9 @@
   import SkillMenu from './SkillMenu.svelte';
   import {
     matchingSkills,
+    insertSkill,
     mergeSkills,
+    promptSkill,
     resolveSkillPrompt,
     skillQuery,
     type SkillChoice,
@@ -240,7 +243,7 @@
   }
 
   function chooseSkill(skill: SkillChoice) {
-    draft = `/${skill.name} `;
+    draft = insertSkill(draft, skill);
     skillSelected = 0;
     void tick().then(() => prompt.focus());
   }
@@ -872,7 +875,7 @@
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
     let shipIssue: ShipItIssue | null;
     try {
-      shipIssue = await beginShipItRun(directory, text);
+      shipIssue = await beginShipItRun(directory, text, promptSkill(skills, text)?.name ?? null);
     } catch (cause) {
       error = describe(cause);
       return;
@@ -1564,91 +1567,64 @@
               entry.type === 'user'
                 ? coordinationMessageForText(text, coordinationMessages)
                 : undefined}
-            <article
-              class:user-message={entry.type === 'user'}
-              class:assistant-message={entry.type !== 'user'}
-              class:thought={entry.type === 'thought'}
-              class="agent-message message"
-              data-created={entry.created}
-              tabindex="-1"
+            <ChatMessage
+              kind={entry.type}
+              created={entry.created}
+              author={entry.type === 'user'
+                ? attribution
+                  ? `From ${attribution.sender}`
+                  : 'You'
+                : entry.type === 'thought'
+                  ? `${name} · thinking`
+                  : name}
             >
-              <div
-                class:agent-avatar={entry.type !== 'user'}
-                class:user-avatar={entry.type === 'user'}
-                class="avatar"
-              >
-                {attribution ? '↗' : entry.type === 'user' ? 'You' : 'S.'}
-              </div>
-              <div class="message-body">
-                <div class="message-author">
-                  {entry.type === 'user'
-                    ? attribution
-                      ? `From ${attribution.sender}`
-                      : 'You'
-                    : entry.type === 'thought'
-                      ? `${name} · thinking`
-                      : name}
-                </div>
-                {#if hookMessage}
-                  {@render hookNotice(hookMessage.rules)}
-                  <details class="agent-hook-details">
-                    <summary>Full hook notice</summary>
-                    <Markdown source={hookMessage.notice} />
-                  </details>
-                  {#if hookMessage.remainder}<Markdown source={hookMessage.remainder} />{/if}
-                {:else}
-                  <Markdown
-                    source={attribution
-                      ? text.replace(coordinationPrompt(attribution), attribution.text)
-                      : text}
-                  />
-                {/if}
-              </div>
-            </article>
+              {#if hookMessage}
+                {@render hookNotice(hookMessage.rules)}
+                <details class="agent-hook-details">
+                  <summary>Full hook notice</summary>
+                  <Markdown source={hookMessage.notice} />
+                </details>
+                {#if hookMessage.remainder}<Markdown source={hookMessage.remainder} />{/if}
+              {:else}
+                <Markdown
+                  source={attribution
+                    ? text.replace(coordinationPrompt(attribution), attribution.text)
+                    : text}
+                />
+              {/if}
+            </ChatMessage>
           {/if}
         {/each}
       {/if}
     {/each}
     {#each coordinationMessages.filter((message) => !entries.some((entry) => entry.type === 'user' && entry.text.includes(coordinationPrompt(message)))) as message (message.id)}
-      <article class="agent-message message user-message">
-        <div class="avatar user-avatar">↗</div>
-        <div class="message-body">
-          <div class="message-author">
-            From {message.sender}{message.delivered ? '' : ' · queued'}
-          </div>
-          <Markdown source={message.text} />
-        </div>
-      </article>
+      <ChatMessage
+        kind="user"
+        author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
+      >
+        <Markdown source={message.text} />
+      </ChatMessage>
     {/each}
     <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
     <SpawnActivity receipts={spawnReceipts} />
     {#if queued.length}<div class="queued-messages" role="status" aria-label="Queued messages">
         {#each queued as message, index (index)}
-          <article class="agent-message message user-message queued-message">
-            <div class="avatar user-avatar">You</div>
-            <div class="message-body">
-              <div class="message-author">
-                You · queued{message.attachments.length || message.images.length
-                  ? ` · ${message.attachments.length + message.images.length} attachments`
-                  : ''}
-              </div>
-              <Markdown source={message.text || 'Attachments'} />
-            </div>
-          </article>
+          <ChatMessage
+            kind="user"
+            author={`You · queued${message.attachments.length || message.images.length ? ` · ${message.attachments.length + message.images.length} attachments` : ''}`}
+          >
+            <Markdown source={message.text || 'Attachments'} />
+          </ChatMessage>
         {/each}
         {#if queuePaused}<Button size="sm" variant="secondary" onclick={retryQueue}
             >Retry queue</Button
           >{/if}
       </div>{/if}
-    {#if isBusy}<article class="agent-message message assistant-message agent-working-message">
-        <div class="avatar agent-avatar">S.</div>
-        <div class="message-body">
-          <div class="message-author">{name}</div>
-          <div class="agent-busy" role="status">
-            <span>Working…</span><Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
-          </div>
+    {#if isBusy}<ChatMessage kind="assistant" author={name}>
+        <div class="agent-busy" role="status">
+          <span>Working…</span><Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
         </div>
-      </article>{/if}
+      </ChatMessage>{/if}
   </div>
   <div class="agent-composer composer-wrap">
     <div class="composer">
@@ -1848,12 +1824,6 @@
     margin: 15vh auto;
     text-align: center;
   }
-  .agent-message {
-    width: 100%;
-  }
-  .agent-message.thought {
-    opacity: 0.65;
-  }
   .agent-tool-group,
   .agent-tool-current {
     margin: 0 0 8px 42px;
@@ -1888,7 +1858,7 @@
     overflow: auto;
     white-space: pre-wrap;
   }
-  .message-body .agent-hook-notice {
+  .agent-hook-notice {
     margin-left: 0;
   }
   .agent-hook-notice strong {
@@ -1973,7 +1943,7 @@
     display: block;
     margin-bottom: 2px;
   }
-  .queued-message {
+  .queued-messages :global(.agent-message) {
     opacity: 0.6;
   }
   .agent-busy {

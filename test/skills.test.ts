@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   matchingSkills,
+  insertSkill,
   mergeSkills,
   promptSkill,
   resolveSkillPrompt,
@@ -18,7 +19,8 @@ void test('slash matches names and closes after arguments begin', () => {
   assert.equal(skillQuery('/'), '');
   assert.deepEqual(matchingSkills(skills, '/SHIP'), [skills[0]]);
   assert.deepEqual(matchingSkills(skills, '/ship-issue '), []);
-  assert.deepEqual(matchingSkills(skills, 'Please /ship'), []);
+  assert.deepEqual(matchingSkills(skills, 'Please /ship'), [skills[0]]);
+  assert.equal(insertSkill('Please /ship', skills[0]), 'Please /ship-issue ');
 });
 
 void test('a selected skill resolves from a prompt with arguments', () => {
@@ -26,6 +28,23 @@ void test('a selected skill resolves from a prompt with arguments', () => {
   assert.equal(promptSkill(skills, '/ship-issue')?.id, 'one');
   assert.equal(promptSkill(skills, '/SHIP-ISSUE #42')?.id, 'one');
   assert.equal(promptSkill(skills, '/ship-issues'), undefined);
+  assert.equal(promptSkill(skills, 'Please /review this')?.id, 'two');
+  assert.equal(promptSkill(skills, '/review then /ship-issue')?.id, 'two');
+  assert.equal(promptSkill(skills, 'What does `/review` do?'), undefined);
+  assert.equal(promptSkill(skills, 'What does `/review\\` do?'), undefined);
+  assert.equal(promptSkill(skills, '\\\\` /review `'), undefined);
+  assert.equal(promptSkill(skills, '\\` /review')?.id, 'two');
+  assert.equal(promptSkill(skills, 'Explain this:\n```\n/review\n```'), undefined);
+  assert.equal(
+    promptSkill(skills, 'Explain this:\n```\n/review\n```\nThen /ship-issue')?.id,
+    'one',
+  );
+  assert.equal(promptSkill(skills, 'A stray ` mark\nPlease /review')?.id, 'two');
+  assert.equal(promptSkill(skills, 'Example:\n    /review'), undefined);
+  assert.equal(promptSkill(skills, 'Example:\n```\n/review\n```js\n/review\n```'), undefined);
+  assert.equal(promptSkill(skills, 'Example:\n> /review'), undefined);
+  assert.equal(promptSkill(skills, '> Example\n/review'), undefined);
+  assert.equal(promptSkill(skills, '> Example\n\n/review')?.id, 'two');
 });
 
 void test('bundled skills fill missing names without replacing installed skills', () => {
