@@ -31,6 +31,25 @@
 }
 * {
   box-sizing: border-box;
+  scrollbar-color: transparent transparent;
+  scrollbar-width: thin;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: transparent;
+}
+*.sail-scrollbar-active {
+  scrollbar-color: color-mix(in srgb, var(--sui-muted) 55%, transparent) transparent;
+}
+*.sail-scrollbar-active::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--sui-muted) 55%, transparent);
 }
 body {
   margin: 0;
