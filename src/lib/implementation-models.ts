@@ -140,11 +140,10 @@ export async function activeImplementationModels(
 }
 
 export async function beginShipItRun(directory: string, prompt: string): Promise<void> {
-  const firstLine = prompt.split('\n')[0].trim();
-  if (!/(?:^|\s)\/ship-it(?:\s|$)/i.test(firstLine)) return;
+  if (!/(?:^|\s)\/ship-it(?:\s|$)/i.test(prompt)) return;
   const issue =
     /(?:^|\s)\/ship-it\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
-      firstLine,
+      prompt,
     )?.[1];
   if (!issue) return;
   const canonical = async (reference: string): Promise<string> => {

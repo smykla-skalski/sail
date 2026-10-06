@@ -109,6 +109,10 @@ void test('model history survives equivalent references and rejects a second iss
     () => beginShipItRun(directory, 'Please /ship-it #2'),
     /This worktree tracks example\/repo#1\. Start example\/repo#2 in a new worktree/,
   );
+  await assert.rejects(
+    () => beginShipItRun(directory, 'Please help\n/ship-it #2'),
+    /This worktree tracks example\/repo#1\. Start example\/repo#2 in a new worktree/,
+  );
   assert.deepEqual(implementationModels(directory), ['model-a']);
   values.set(`sai-implementation-models:${directory}`, JSON.stringify(['model-b']));
   await beginShipItRun(directory, '/ship-it');
