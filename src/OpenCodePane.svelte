@@ -10,12 +10,15 @@
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
+  import ChatMessage from './ChatMessage.svelte';
+  import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import PathPicker from './PathPicker.svelte';
   import SkillMenu from './SkillMenu.svelte';
   import {
     matchingSkills,
+    insertSkill,
     mergeSkills,
     promptSkill,
     resolveSkillPrompt,
@@ -40,7 +43,13 @@
   } from './lib/coordination';
   import type { ThreadStatus } from './lib/attention';
   import { openCodeContextUsage } from './lib/agent-usage';
-  import { fileUri } from './lib/attachments';
+  import {
+    clipboardFiles,
+    fileUri,
+    insertClipboardText,
+    removeClipboardFile,
+    stageClipboardFile,
+  } from './lib/attachments';
   import type { SetupReport } from './lib/onboarding';
   import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
   import { mergeMessages, nearBottom } from './lib/timeline';
@@ -142,7 +151,7 @@
   });
 
   function chooseSkill(skill: SkillChoice) {
-    draft = `/${skill.name} `;
+    draft = insertSkill(draft, skill);
     skillSelected = 0;
     void tick().then(() => prompt.focus());
   }
@@ -160,6 +169,38 @@
     void tick().then(() => prompt.focus());
   }
   let files = $state<string[]>([]);
+  let pendingPaste: Promise<void> = Promise.resolve();
+  const clipboardPaths = new SvelteSet<string>();
+  async function pasteFiles(event: ClipboardEvent) {
+    const pasted = clipboardFiles(event);
+    if (!pasted.length) return;
+    event.preventDefault();
+    const pastedText = event.clipboardData?.getData('text/plain') ?? '';
+    if (pastedText && event.target instanceof HTMLTextAreaElement) {
+      const input = event.target;
+      const caret = input.selectionStart + pastedText.length;
+      draft = insertClipboardText(draft, pastedText, input.selectionStart, input.selectionEnd);
+      void tick().then(() => input.setSelectionRange(caret, caret));
+    }
+    const current = generation;
+    const staged = await Promise.all(
+      pasted.map(async (file) => {
+        try {
+          return await stageClipboardFile(file);
+        } catch (cause) {
+          error = `Could not paste ${file.name}: ${describe(cause)}`;
+          return null;
+        }
+      }),
+    );
+    const paths = staged.filter((path): path is string => !!path);
+    if (current !== generation) {
+      paths.forEach((path) => void removeClipboardFile(path));
+      return;
+    }
+    paths.forEach((path) => clipboardPaths.add(path));
+    files = [...files, ...paths];
+  }
   let error = $state('');
   let loading = $state(false);
   let loadingOlder = $state(false);
@@ -285,6 +326,8 @@
     const current = ++generation;
     clearTimeout(refreshTimer);
     refreshTimer = undefined;
+    for (const path of clipboardPaths) void removeClipboardFile(path);
+    clipboardPaths.clear();
     for (const path of pickedImages)
       if (!inFlightCaptures.has(path)) {
         pickedImages.delete(path);
@@ -439,6 +482,7 @@
   });
 
   async function send(externalText?: string) {
+    await pendingPaste;
     const external = externalText !== undefined;
     const text = (externalText ?? draft).trim();
     const turnDirectory = directory;
@@ -543,6 +587,12 @@
       accepted = true;
       for (const path of paths)
         if (pickedImages.delete(path)) void invoke('browser_remove_capture', { path });
+      for (const path of paths)
+        if (clipboardPaths.delete(path))
+          void source.session
+            .wait({ sessionID: id })
+            .then(() => removeClipboardFile(path))
+            .catch(() => undefined);
       if (queued) {
         await refreshMessages(id, current);
         return;
@@ -641,6 +691,7 @@
   function removeFile(path: string) {
     files = files.filter((item) => item !== path);
     if (pickedImages.delete(path)) void invoke('browser_remove_capture', { path });
+    if (clipboardPaths.delete(path)) void removeClipboardFile(path);
   }
 
   function keydown(event: KeyboardEvent) {
@@ -705,85 +756,75 @@
         <SpawnResponse receipt={message.receipt} />
       {:else if message.type === 'user'}
         {@const attribution = coordinationMessageForText(message.text, coordinationMessages)}
-        <article class="agent-message message user-message">
-          <div class="avatar user-avatar">{attribution ? '↗' : 'You'}</div>
-          <div class="message-body">
-            <div class="message-author">{attribution ? `From ${attribution.sender}` : 'You'}</div>
-            <Markdown
-              source={attribution
-                ? message.text.replace(coordinationPrompt(attribution), attribution.text)
-                : message.text}
-            />
-            {#if message.files?.length}<div class="message-files">
-                {#each message.files as file, index (index)}<span
-                    >{file.name ??
-                      (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
-                  >{/each}
-              </div>{/if}
-          </div>
-        </article>
+        <ChatMessage kind="user" author={attribution ? `From ${attribution.sender}` : 'You'}>
+          <Markdown
+            source={attribution
+              ? message.text.replace(coordinationPrompt(attribution), attribution.text)
+              : message.text}
+          />
+          {#if message.files?.length}<div class="message-files">
+              {#each message.files as file, index (index)}<span
+                  >{file.name ??
+                    (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
+                >{/each}
+            </div>{/if}
+        </ChatMessage>
       {:else if message.type === 'assistant'}
         {@const text = message.content
           .filter((part) => part.type === 'text')
           .map((part) => part.text)
           .join('\n')}
-        <article class="agent-message message assistant-message">
-          <div class="avatar agent-avatar">S.</div>
-          <div class="message-body">
-            <div class="message-author">{message.agent}</div>
-            {#if text}<Markdown source={text} />{/if}
-            {#each message.content as part, ordinal (ordinal)}
-              {#if part.type === 'tool'}
-                {@const reason =
-                  part.state.status === 'error' ? openCodeErrorDetails(part.state.error) : ''}
-                {@const output =
-                  part.state.status === 'completed' || part.state.status === 'error'
-                    ? (part.state.content ?? [])
-                        .map((item) => (item.type === 'text' ? item.text : (item.name ?? item.uri)))
-                        .join('\n')
-                    : ''}
-                <ToolActivity
-                  title={part.name}
-                  status={part.state.status}
-                  input={part.state.input}
-                  {output}
-                  error={reason}
-                  source={part.state.status === 'error'
-                    ? (reportedHookIdentity(part.state.metadata) ?? '')
-                    : ''}
-                  onfix={part.state.status === 'error'
-                    ? () =>
-                        fixToolFailure(
-                          `${message.id}:${part.id}`,
-                          part.name,
-                          part.state.input,
-                          reason,
-                          output,
-                        )
-                    : undefined}
-                />
-              {/if}
-            {/each}
-            {#if message.retry}<p class="retry-state" role="status">
-                Retry {message.retry.attempt}: {message.retry.error.message}
-              </p>{/if}
-            {#if message.error}<p class="message-error" role="alert">
-                {message.error.message}
-              </p>{/if}
-          </div>
-        </article>
+        <ChatMessage kind="assistant" author={message.agent}>
+          {#if text}<Markdown source={text} />{/if}
+          {#each message.content as part, ordinal (ordinal)}
+            {#if part.type === 'tool'}
+              {@const reason =
+                part.state.status === 'error' ? openCodeErrorDetails(part.state.error) : ''}
+              {@const output =
+                part.state.status === 'completed' || part.state.status === 'error'
+                  ? (part.state.content ?? [])
+                      .map((item) => (item.type === 'text' ? item.text : (item.name ?? item.uri)))
+                      .join('\n')
+                  : ''}
+              <ToolActivity
+                title={part.name}
+                status={part.state.status}
+                input={part.state.input}
+                {output}
+                error={reason}
+                source={part.state.status === 'error'
+                  ? (reportedHookIdentity(part.state.metadata) ?? '')
+                  : ''}
+                onfix={part.state.status === 'error'
+                  ? () =>
+                      fixToolFailure(
+                        `${message.id}:${part.id}`,
+                        part.name,
+                        part.state.input,
+                        reason,
+                        output,
+                      )
+                  : undefined}
+              />
+            {/if}
+          {/each}
+          {#if message.retry}<p class="retry-state" role="status">
+              Retry {message.retry.attempt}: {message.retry.error.message}
+            </p>{/if}
+          {#if message.error}<p class="message-error" role="alert">
+              {message.error.message}
+            </p>{/if}
+        </ChatMessage>
       {/if}
     {/each}
+    <OpenCodeSubagents {client} parentID={activeID} />
     {#each coordinationMessages.filter((message) => !messages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
-      <article class="agent-message message user-message">
-        <div class="avatar user-avatar">↗</div>
-        <div class="message-body">
-          <div class="message-author">
-            From {message.sender}{message.delivered ? '' : ' · queued'}
-          </div>
-          <Markdown source={message.text} />
-        </div>
-      </article>
+      <ChatMessage
+        kind="user"
+        author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
+      >
+        <Markdown source={message.text} />
+      </ChatMessage>
     {/each}
     <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
     <SpawnActivity receipts={spawnReceipts} />
@@ -816,6 +857,9 @@
         data-pane-prompt
         aria-label="Message OpenCode"
         bind:value={draft}
+        onpaste={(event) => {
+          pendingPaste = Promise.all([pendingPaste, pasteFiles(event)]).then(() => {});
+        }}
         onkeydown={keydown}
         rows="3"
         wrap="soft"
@@ -931,9 +975,6 @@
     flex: 1;
     min-height: 0;
     padding-inline: 20px;
-  }
-  .opencode-pane .agent-message {
-    width: 100%;
   }
   .opencode-pane .agent-busy {
     display: flex;

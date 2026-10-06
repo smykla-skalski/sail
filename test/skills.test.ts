@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   matchingSkills,
+  insertSkill,
   mergeSkills,
   promptSkill,
   resolveSkillPrompt,
@@ -17,7 +18,8 @@ void test('slash matches names and closes after arguments begin', () => {
   assert.equal(skillQuery('/'), '');
   assert.deepEqual(matchingSkills(skills, '/SHIP'), [skills[0]]);
   assert.deepEqual(matchingSkills(skills, '/ship-issue '), []);
-  assert.deepEqual(matchingSkills(skills, 'Please /ship'), []);
+  assert.deepEqual(matchingSkills(skills, 'Please /ship'), [skills[0]]);
+  assert.equal(insertSkill('Please /ship', skills[0]), 'Please /ship-issue ');
 });
 
 void test('a selected skill resolves from a prompt with arguments', () => {
@@ -25,6 +27,7 @@ void test('a selected skill resolves from a prompt with arguments', () => {
   assert.equal(promptSkill(skills, '/ship-issue')?.id, 'one');
   assert.equal(promptSkill(skills, '/SHIP-ISSUE #42')?.id, 'one');
   assert.equal(promptSkill(skills, '/ship-issues'), undefined);
+  assert.equal(promptSkill(skills, 'Please /review this')?.id, 'two');
 });
 
 void test('bundled skills fill missing names without replacing installed skills', () => {

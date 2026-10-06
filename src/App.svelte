@@ -20,6 +20,8 @@
   import SpawnActivity from './SpawnActivity.svelte';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
+  import ChatMessage from './ChatMessage.svelte';
+  import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import PlanPanel from './PlanPanel.svelte';
   import ShipPanel from './ShipPanel.svelte';
   import {
@@ -64,6 +66,7 @@
   import SkillMenu from './SkillMenu.svelte';
   import {
     matchingSkills,
+    insertSkill,
     mergeSkills,
     promptSkill,
     resolveSkillPrompt,
@@ -807,7 +810,7 @@
   });
 
   function chooseSkill(skill: SkillChoice) {
-    draft = `/${skill.name} `;
+    draft = insertSkill(draft, skill);
     skillSelected = 0;
     void tick().then(() =>
       document.querySelector<HTMLTextAreaElement>('.chat-area .composer textarea')?.focus(),
@@ -8681,109 +8684,97 @@
                       (item) => item.target === coordinationKey(directory, `opencode:${sessionID}`),
                     ),
                   )}
-                  <article
-                    class="message user-message"
-                    data-message-id={message.id}
-                    data-created={message.time.created}
-                    tabindex="-1"
+                  <ChatMessage
+                    kind="user"
+                    author={attribution ? `From ${attribution.sender}` : 'You'}
+                    messageId={message.id}
+                    created={message.time.created}
                   >
-                    <div class="avatar user-avatar">{attribution ? '↗' : 'You'}</div>
-                    <div class="message-body">
-                      <div class="message-author">
-                        {attribution ? `From ${attribution.sender}` : 'You'}
-                      </div>
-                      <Markdown
-                        source={attribution
-                          ? message.text.replace(coordinationPrompt(attribution), attribution.text)
-                          : message.text}
-                      />
-                      {#if message.files?.length}<div class="message-files">
-                          {#each message.files as file, fileIndex (fileIndex)}<span
-                              >{file.name ??
-                                (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
-                            >{/each}
-                        </div>{/if}
-                    </div>
-                  </article>
-                {:else if message.type === 'assistant'}<article
-                    class="message assistant-message"
-                    data-message-id={message.id}
-                    data-created={message.time.created}
-                    tabindex="-1"
+                    <Markdown
+                      source={attribution
+                        ? message.text.replace(coordinationPrompt(attribution), attribution.text)
+                        : message.text}
+                    />
+                    {#if message.files?.length}<div class="message-files">
+                        {#each message.files as file, fileIndex (fileIndex)}<span
+                            >{file.name ??
+                              (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
+                          >{/each}
+                      </div>{/if}
+                  </ChatMessage>
+                {:else if message.type === 'assistant'}<ChatMessage
+                    kind="assistant"
+                    author={message.agent}
+                    messageId={message.id}
+                    created={message.time.created}
                   >
-                    <div class="avatar agent-avatar">S.</div>
-                    <div class="message-body">
-                      <div class="message-author">{message.agent}</div>
-                      {#if assistantText(message)}<Markdown source={assistantText(message)} />{/if}
-                      {#each message.content as part, ordinal (ordinal)}
-                        {#if part.type === 'tool'}
-                          {@const reason =
-                            part.state.status === 'error'
-                              ? openCodeErrorDetails(part.state.error)
-                              : ''}
-                          {@const output =
-                            part.state.status === 'completed' || part.state.status === 'error'
-                              ? (part.state.content ?? [])
-                                  .map((item) =>
-                                    item.type === 'text' ? item.text : (item.name ?? item.uri),
-                                  )
-                                  .join('\n')
-                              : ''}
-                          <ToolActivity
-                            title={part.name}
-                            status={part.state.status}
-                            input={part.state.input}
-                            {output}
-                            error={reason}
-                            source={part.state.status === 'error'
-                              ? (reportedHookIdentity(part.state.metadata) ?? '')
-                              : ''}
-                            onfix={part.state.status === 'error'
-                              ? () =>
-                                  fixOpenCodeToolFailure(
-                                    `${message.id}:${part.id}`,
-                                    part.name,
-                                    part.state.input,
-                                    reason,
-                                    output,
-                                  )
-                              : undefined}
-                          />
-                        {/if}
-                      {/each}
-                      {#if message.retry}<p class="retry-state" role="status">
-                          Retry {message.retry.attempt}: {message.retry.error.message}
-                        </p>{/if}
-                      {#if message.error}<p class="message-error" role="alert">
-                          {message.error.message}
-                        </p>{/if}
-                    </div>
-                  </article>{/if}
+                    {#if assistantText(message)}<Markdown source={assistantText(message)} />{/if}
+                    {#each message.content as part, ordinal (ordinal)}
+                      {#if part.type === 'tool'}
+                        {@const reason =
+                          part.state.status === 'error'
+                            ? openCodeErrorDetails(part.state.error)
+                            : ''}
+                        {@const output =
+                          part.state.status === 'completed' || part.state.status === 'error'
+                            ? (part.state.content ?? [])
+                                .map((item) =>
+                                  item.type === 'text' ? item.text : (item.name ?? item.uri),
+                                )
+                                .join('\n')
+                            : ''}
+                        <ToolActivity
+                          title={part.name}
+                          status={part.state.status}
+                          input={part.state.input}
+                          {output}
+                          error={reason}
+                          source={part.state.status === 'error'
+                            ? (reportedHookIdentity(part.state.metadata) ?? '')
+                            : ''}
+                          onfix={part.state.status === 'error'
+                            ? () =>
+                                fixOpenCodeToolFailure(
+                                  `${message.id}:${part.id}`,
+                                  part.name,
+                                  part.state.input,
+                                  reason,
+                                  output,
+                                )
+                            : undefined}
+                        />
+                      {/if}
+                    {/each}
+                    {#if message.retry}<p class="retry-state" role="status">
+                        Retry {message.retry.attempt}: {message.retry.error.message}
+                      </p>{/if}
+                    {#if message.error}<p class="message-error" role="alert">
+                        {message.error.message}
+                      </p>{/if}
+                  </ChatMessage>{/if}
               {/each}
+              <OpenCodeSubagents {client} parentID={sessionID} />
               {#each coordinationMessages.filter((message) => sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`) && !chatMessages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
-                <article class="message user-message">
-                  <div class="avatar user-avatar">↗</div>
-                  <div class="message-body">
-                    <div class="message-author">
-                      From {message.sender}{message.delivered ? '' : ' · queued'}
-                    </div>
-                    <Markdown source={message.text} />
-                  </div>
-                </article>
+                <ChatMessage
+                  kind="user"
+                  author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
+                >
+                  <Markdown source={message.text} />
+                </ChatMessage>
               {/each}
               {#each liveOnly as [id, parts] (id)}
-                <article class="message assistant-message" data-message-id={id}>
-                  <div class="avatar agent-avatar">S.</div>
-                  <div class="message-body">
-                    <div class="message-author">{currentSession?.agent ?? 'Agent'} · streaming</div>
-                    <Markdown
-                      source={Object.entries(parts)
-                        .toSorted(([a], [b]) => Number(a) - Number(b))
-                        .map(([, value]) => value)
-                        .join('\n')}
-                    />
-                  </div>
-                </article>
+                <ChatMessage
+                  kind="assistant"
+                  author={`${currentSession?.agent ?? 'Agent'} · streaming`}
+                  messageId={id}
+                >
+                  <Markdown
+                    source={Object.entries(parts)
+                      .toSorted(([a], [b]) => Number(a) - Number(b))
+                      .map(([, value]) => value)
+                      .join('\n')}
+                  />
+                </ChatMessage>
               {/each}
               <PostTurnChecks
                 checks={postTurnResults.filter(
@@ -8816,14 +8807,6 @@
                   onchanged={() => refreshPrompts()}
                 />
                 <div class="composer">
-                  {#if attachedFiles.length}<div class="attachments">
-                      {#each attachedFiles as path (path)}<span
-                          >{clipboardAttachmentNames.get(path) ?? path.split(/[\\/]/).at(-1)}<button
-                            aria-label={`Remove ${clipboardAttachmentNames.get(path) ?? path.split(/[\\/]/).at(-1)}`}
-                            onclick={() => removeAttachedFile(path)}>×</button
-                          ></span
-                        >{/each}
-                    </div>{/if}
                   <textarea
                     role="combobox"
                     aria-autocomplete="list"
@@ -8847,6 +8830,14 @@
                       ? 'Describe the work or ask a question…'
                       : 'OpenCode needs a connected model…'}
                     disabled={!inputReady || sending}></textarea>
+                  {#if attachedFiles.length}<div class="attachments">
+                      {#each attachedFiles as path (path)}<span
+                          >{clipboardAttachmentNames.get(path) ?? path.split(/[\\/]/).at(-1)}<button
+                            aria-label={`Remove ${clipboardAttachmentNames.get(path) ?? path.split(/[\\/]/).at(-1)}`}
+                            onclick={() => removeAttachedFile(path)}>×</button
+                          ></span
+                        >{/each}
+                    </div>{/if}
                   <SkillMenu
                     id={skillMenuId}
                     skills={skillMatches}
