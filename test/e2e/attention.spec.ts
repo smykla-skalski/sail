@@ -233,6 +233,20 @@ describe('agent thread attention', () => {
     );
 
     await waitForComposer();
+    await $('.agent-composer textarea').setValue('Native interrupted subagent');
+    await $('.agent-actions button').click();
+    await $('.agent-launches button').click();
+    const nativeChildren = $('button[aria-label*="for Native interrupted subagent"]');
+    await expect(nativeChildren).toHaveText(expect.stringContaining('1 historical'));
+    await nativeChildren.click();
+    const nativeInterrupted = $('.project-agent-row[aria-label*="Inspect interrupted delegation"]');
+    await expect(nativeInterrupted.$('.activity-status')).toHaveAttribute(
+      'data-state',
+      'interrupted',
+    );
+    await expect(nativeInterrupted).toHaveText(expect.stringContaining('Interrupted'));
+
+    await waitForComposer();
     await $('.agent-composer textarea').setValue('Crash on cancel');
     await $('.agent-actions button').click();
     await expect($('.agent-permission')).toBeDisplayed();

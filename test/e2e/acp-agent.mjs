@@ -518,6 +518,31 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
+    if (text === 'Native interrupted subagent') {
+      const child = `${sessionId}:interrupted-child`;
+      const remember = (target, value) => {
+        sessions.get(sessionId).history.push({ sessionId: target, update: value });
+        update(target, value);
+      };
+      remember(sessionId, {
+        sessionUpdate: 'subagent_spawned',
+        subagentSessionId: child,
+        name: 'worker',
+        task: 'Inspect interrupted delegation',
+        capabilities: {},
+      });
+      remember(child, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Step interrupted' },
+      });
+      remember(sessionId, {
+        sessionUpdate: 'subagent_state_update',
+        subagentSessionId: child,
+        state: 'completed',
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Post-hook failure demo') {
       update(sessionId, {
         sessionUpdate: 'tool_call',

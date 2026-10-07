@@ -222,29 +222,38 @@ function spawnState(outcome: NativeSubagentOutcome): SpawnState {
   return outcome === 'unknown' ? 'unavailable' : outcome;
 }
 
+function reportsInterruption(transcript: AgentEntry[]): boolean {
+  const last = transcript.at(-1);
+  return last?.type === 'assistant' && last.text.trim().toLowerCase() === 'step interrupted';
+}
+
 export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt[] {
-  return Object.values(store).map((child) => ({
-    receiptId: `native:${child.agent}:${child.sessionId}`,
-    accessKey: '',
-    requestId: `native:${child.sessionId}`,
-    project: child.directory,
-    sourceId: `acp:${child.agent}:${child.parentSessionId}`,
-    sourceDirectory: child.directory,
-    targetId: `acp:${child.agent}:${child.sessionId}`,
-    turnId: null,
-    targetDirectory: child.directory,
-    worktreeId: null,
-    provider: child.agent === 'claude' ? 'claude' : 'codex',
-    prompt: child.task,
-    state: spawnState(child.outcome),
-    created: child.created,
-    updated: child.updated,
-    result: ['completed', 'failed', 'interrupted', 'unknown'].includes(child.outcome)
-      ? child.activity
-      : null,
-    error: child.error ?? null,
-    activity: child.activity,
-  }));
+  return Object.values(store).map((child) => {
+    const interrupted = child.outcome === 'completed' && reportsInterruption(child.transcript);
+    const activity = interrupted ? 'Interrupted' : child.activity;
+    return {
+      receiptId: `native:${child.agent}:${child.sessionId}`,
+      accessKey: '',
+      requestId: `native:${child.sessionId}`,
+      project: child.directory,
+      sourceId: `acp:${child.agent}:${child.parentSessionId}`,
+      sourceDirectory: child.directory,
+      targetId: `acp:${child.agent}:${child.sessionId}`,
+      turnId: null,
+      targetDirectory: child.directory,
+      worktreeId: null,
+      provider: child.agent === 'claude' ? 'claude' : 'codex',
+      prompt: child.task,
+      state: interrupted ? 'interrupted' : spawnState(child.outcome),
+      created: child.created,
+      updated: child.updated,
+      result: ['completed', 'failed', 'interrupted', 'unknown'].includes(child.outcome)
+        ? activity
+        : null,
+      error: child.error ?? null,
+      activity,
+    };
+  });
 }
 
 export function nativeSubagentThreads(store: NativeSubagentStore): AgentThread[] {
