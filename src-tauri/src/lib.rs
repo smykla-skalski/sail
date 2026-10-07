@@ -1805,6 +1805,7 @@ fn local_plugin_version(path: String) -> Option<String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|_app| {
             if let Err(error) = diagnostics::init(_app.handle()) {
                 eprintln!("Sail diagnostics unavailable: {error}");

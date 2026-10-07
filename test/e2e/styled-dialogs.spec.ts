@@ -35,59 +35,28 @@ describe('styled app dialogs', () => {
 
   after(() => rmSync(fixture, { recursive: true, force: true }));
 
-  it('chooses folders and confirms destructive actions inside Sail', async () => {
+  it('chooses worktree folders and confirms destructive actions inside Sail', async () => {
     const root = realpathSync(first);
     const another = realpathSync(second);
     const linked = realpathSync(worktree);
     await browser.execute(
-      (repository, linkedPath) => {
+      (repository, secondRepository, linkedPath) => {
         sessionStorage.removeItem('sai-e2e-delete-worktree');
         localStorage.setItem('sai-directory', repository);
         localStorage.setItem(
           'sai-project-catalog',
           JSON.stringify({
-            repositories: [repository],
+            repositories: [repository, secondRepository],
             groups: [],
             worktrees: { [repository]: [{ path: linkedPath, branch: 'linked' }] },
           }),
         );
       },
       root,
+      another,
       linked,
     );
     await browser.refresh();
-    await $('[aria-label="Add repository"]').click();
-    try {
-      await expect($('.path-picker-dialog[open]')).toBeDisplayed();
-    } catch (cause) {
-      console.error(
-        'Picker diagnostic',
-        await browser.execute(() => ({
-          dialogs: [...document.querySelectorAll<HTMLDialogElement>('.path-picker-dialog')].map(
-            (item) => ({ open: item.open, title: item.querySelector('h2')?.textContent }),
-          ),
-          active: document.activeElement?.outerHTML,
-          errors: [...document.querySelectorAll('[role="alert"]')].map((item) => item.textContent),
-        })),
-      );
-      throw cause;
-    }
-    await $('.path-picker-dialog[open] [aria-label="Folder path"]').setValue(another);
-    await $('.path-picker-dialog[open] button[type="submit"]').click();
-    await expect($('.path-picker-dialog[open] .path-picker-actions span')).toHaveText(another);
-    await $('.path-picker-dialog[open] [aria-label="Folder path"]').setValue(
-      join(fixture, 'missing'),
-    );
-    await $('.path-picker-dialog[open] button[type="submit"]').click();
-    await expect($('.path-picker-dialog[open] [role="alert"]')).toBeDisplayed();
-    await expect(
-      $('.path-picker-dialog[open] .path-picker-actions .confirmation-primary'),
-    ).toBeDisabled();
-    await $('.path-picker-dialog[open] [aria-label="Folder path"]').setValue(another);
-    await $('.path-picker-dialog[open] button[type="submit"]').click();
-    await expect($('.path-picker-dialog[open] [role="alert"]')).not.toExist();
-    await $('.path-picker-dialog[open] .path-picker-actions .confirmation-primary').click();
-    await expect($('.path-picker-dialog[open]')).not.toExist();
     await expect($(`.project-default-worktree-select[title="${another}"]`)).toBeDisplayed();
 
     await $(`.project-worktree-select[title="${linked}"]`).click({ button: 'right' });

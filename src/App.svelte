@@ -11,6 +11,7 @@
   import { emitTo, listen } from '@tauri-apps/api/event';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import { isPermissionNotFoundError, isSessionNotFoundError } from '@opencode/client';
   import type { FormInfo, PermissionRequest } from '@opencode/client';
   import type { ModelRef } from '@opencode/client';
@@ -533,17 +534,12 @@
   let confirmation = $state<Confirmation | null>(null);
   let confirmationResolver: ((confirmed: boolean) => void) | null = null;
   let confirmationQueue = Promise.resolve();
-  let pathPicker = $state<
-    | { kind: 'project'; groupID: string | null; initialPath?: string }
-    | {
-        kind: 'attachments';
-        initialPath?: string;
-        selection: number;
-        sessionID: string | null;
-        directory: string;
-      }
-    | null
-  >(null);
+  let pathPicker = $state<{
+    initialPath?: string;
+    selection: number;
+    sessionID: string | null;
+    directory: string;
+  } | null>(null);
 
   function confirmInApp(title: string, message: string, confirmLabel: string): Promise<boolean> {
     const pending = confirmationQueue.then(
@@ -5252,12 +5248,18 @@
     throw new Error('Open an agent thread in this worktree before sending check logs.');
   }
 
-  function chooseProject(groupID: string | null = null) {
-    pathPicker = {
-      kind: 'project',
-      groupID,
-      initialPath: directory || undefined,
-    };
+  async function chooseProject(groupID: string | null = null) {
+    try {
+      const path = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: directory || undefined,
+        title: 'Choose a repository',
+      });
+      if (path) await selectProject(path, groupID);
+    } catch (cause) {
+      error = describe(cause);
+    }
   }
 
   async function selectProject(path: string, groupID: string | null) {
@@ -8175,7 +8177,6 @@
       return;
     }
     pathPicker = {
-      kind: 'attachments',
       selection: current,
       sessionID: originalSessionID,
       directory: path,
@@ -8187,10 +8188,6 @@
     const request = pathPicker;
     pathPicker = null;
     if (!request || !paths.length) return;
-    if (request.kind === 'project') {
-      await selectProject(paths[0], request.groupID);
-      return;
-    }
     if (
       request.selection !== selection ||
       request.sessionID !== sessionID ||
@@ -10305,8 +10302,8 @@
 <ConfirmDialog request={confirmation} onanswer={answerConfirmation} />
 <PathPicker
   open={pathPicker !== null}
-  title={pathPicker?.kind === 'attachments' ? 'Attach files' : 'Choose a repository'}
-  mode={pathPicker?.kind === 'attachments' ? 'files' : 'directory'}
+  title="Attach files"
+  mode="files"
   initialPath={pathPicker?.initialPath}
   onselect={(paths) => void selectPickerPaths(paths)}
   oncancel={() => (pathPicker = null)}
