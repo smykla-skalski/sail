@@ -50,6 +50,14 @@ function state(value: unknown): NativeSubagentOutcome {
 export const nativeTranscriptLimit = 500;
 export const nativeMessageLimit = 40_000;
 
+/** The newest text that fits the message limit after an ellipsis, never starting inside a
+ * surrogate pair. */
+function messageTail(text: string): string {
+  const start = text.length + 1 - nativeMessageLimit;
+  const code = text.charCodeAt(start);
+  return `…${text.slice(code >= 0xdc00 && code <= 0xdfff ? start + 1 : start)}`;
+}
+
 /** Keeps a live child's transcript bounded after an update changed it: the spawn prompt plus the
  * newest entries. Streaming chunks only ever grow the last entry, so only that one needs
  * trimming. */
@@ -57,7 +65,7 @@ export function boundNativeTranscript(entries: AgentEntry[]): AgentEntry[] {
   const last = entries.at(-1);
   const trimmed =
     last && last.type !== 'tool' && last.text.length > nativeMessageLimit
-      ? [...entries.slice(0, -1), { ...last, text: `…${last.text.slice(1 - nativeMessageLimit)}` }]
+      ? [...entries.slice(0, -1), { ...last, text: messageTail(last.text) }]
       : entries;
   if (trimmed.length <= nativeTranscriptLimit) return trimmed;
   const prompt = trimmed[0]?.id.endsWith(':prompt') ? [trimmed[0]] : [];

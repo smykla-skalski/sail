@@ -116,6 +116,35 @@ await test('a long-running child keeps its prompt and the newest bounded transcr
   assert.equal(nativeSubagentCounts(store, 'codex', 'parent').active, 1);
 });
 
+await test('a capped message never starts inside a surrogate pair', () => {
+  for (const text of ['😀'.repeat(30_000), `${'😀'.repeat(30_000)}!`]) {
+    let store = updateNativeSubagents(
+      {},
+      event('parent', {
+        sessionUpdate: 'subagent_spawned',
+        subagentSessionId: 'child',
+        name: 'worker',
+        task: 'Task',
+        capabilities: {},
+      }),
+      '/repo',
+      1,
+    );
+    store = updateNativeSubagents(
+      store,
+      event('child', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } }),
+      '/repo',
+      2,
+    );
+    const last = store['codex:child'].transcript.at(-1);
+    assert.ok(last?.type === 'assistant');
+    assert.ok(last.text.isWellFormed());
+    assert.ok(last.text.length <= nativeMessageLimit);
+    assert.ok(last.text.length >= nativeMessageLimit - 1);
+    assert.ok(text.endsWith(last.text.slice(1)));
+  }
+});
+
 await test('an update that changes nothing leaves a long spawn prompt whole', () => {
   const prompt = 'P'.repeat(nativeMessageLimit + 10_000);
   let store = updateNativeSubagents(
