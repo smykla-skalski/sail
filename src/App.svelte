@@ -86,6 +86,7 @@
   import {
     evidenceReadiness,
     mergeEvidenceManifests,
+    nextTaskEvidenceSequence,
     requireEvidenceBaseRevision,
     requireEvidenceRevision,
     recordTaskEvidence,
@@ -2534,6 +2535,7 @@
     issue: ShipIssue,
     revision?: string,
     worktreePath?: string | null,
+    baseRevision?: string,
   ): Promise<void> {
     const refreshKey = `${run.id}:${issue.id}`;
     const isLatestRefresh = beginLatestRefresh(shippingPullRequestGenerations, refreshKey);
@@ -2567,6 +2569,7 @@
           refreshedRevision,
           checkpoint.acceptanceCriteria,
           Date.now(),
+          baseRevision,
         );
       if (
         pr &&
@@ -2597,6 +2600,7 @@
               outputReference: check.url || pr.url,
               criteria: [],
             },
+            baseRevision,
           );
       }
       await updateShipIssue(
@@ -2714,6 +2718,7 @@
     const worker = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
     const path = issue.path ?? worker?.targetDirectory;
     let currentRevision: string | undefined;
+    let currentBaseRevision: string | undefined;
     if (path) {
       const shippingTarget = await shippingTargetFor(run, issue, path);
       const models = implementationModels(path);
@@ -2725,11 +2730,12 @@
         workerModel !== issue.workerModel
       )
         await update({ models, modelUncertain, workerModel });
-      const [revision, currentBaseRevision] = await Promise.all([
+      const [revision, baseRevision] = await Promise.all([
         invoke<string>('working_tree_revision', { path }),
         invoke<string>('shipping_base_revision', { path, baseRef: shippingTarget.baseRef }),
       ]);
       currentRevision = revision;
+      currentBaseRevision = baseRevision;
       await markValidationRevisionDrift(path, currentRevision);
       if (
         issue.validationPolicy &&
@@ -2750,6 +2756,7 @@
           currentRevision,
           issue.checkpoint.acceptanceCriteria,
           Date.now(),
+          currentBaseRevision,
         );
         if (
           issue.evidenceRevision !== currentRevision ||
@@ -2813,7 +2820,13 @@
         });
         const branch = worktree?.branch ?? issue.branch;
         if (branch && issue.state !== 'pending')
-          await refreshShippingPullRequest(run, { ...issue, branch }, currentRevision, path);
+          await refreshShippingPullRequest(
+            run,
+            { ...issue, branch },
+            currentRevision,
+            path,
+            currentBaseRevision,
+          );
         if (issue.refreshError) return;
         const pr = shippingPullRequests.get(`${run.id}:${issue.id}`);
         if (pr?.mergedAt) {
@@ -2867,7 +2880,7 @@
       return;
     }
     if (issue.state !== 'pending')
-      await refreshShippingPullRequest(run, issue, currentRevision, path);
+      await refreshShippingPullRequest(run, issue, currentRevision, path, currentBaseRevision);
     if (issue.refreshError) return;
     if (issue.state === 'merged') {
       if (issue.workerSettled && !issue.path) return;
@@ -3908,9 +3921,14 @@
       const owner = shipCheckpointOwner(shipRuns, request.directory, sourceId);
       if (!owner?.issue.checkpoint)
         throw new Error('This thread cannot record evidence for a Ship task.');
-      const currentRevision = await invoke<string>('working_tree_revision', {
-        path: request.directory,
-      });
+      const shippingTarget = await shippingTargetFor(owner.run, owner.issue, request.directory);
+      const [currentRevision, baseRevision] = await Promise.all([
+        invoke<string>('working_tree_revision', { path: request.directory }),
+        invoke<string>('shipping_base_revision', {
+          path: request.directory,
+          baseRef: shippingTarget.baseRef,
+        }),
+      ]);
       await markValidationRevisionDrift(request.directory, currentRevision);
       requireEvidenceRevision(request.arguments.expectedRevision, currentRevision);
       if (owner.issue.checkpoint.revision !== currentRevision)
@@ -3936,6 +3954,7 @@
         currentRevision,
         owner.issue.checkpoint.acceptanceCriteria,
         evidence,
+        baseRevision,
       );
       await updateShipIssue(owner.run, owner.issue, {
         evidenceRevision: currentRevision,
@@ -3949,6 +3968,7 @@
           currentRevision,
           owner.issue.checkpoint.requiredGates,
           owner.issue.checkpoint.acceptanceCriteria,
+          baseRevision,
         ),
       };
     }
@@ -3962,9 +3982,14 @@
           { id: owner.issue.id, url: owner.issue.url, title: owner.issue.title },
           owner.run.approvedAt,
         );
-      const currentRevision = await invoke<string>('working_tree_revision', {
-        path: request.directory,
-      });
+      const shippingTarget = await shippingTargetFor(owner.run, owner.issue, request.directory);
+      const [currentRevision, baseRevision] = await Promise.all([
+        invoke<string>('working_tree_revision', { path: request.directory }),
+        invoke<string>('shipping_base_revision', {
+          path: request.directory,
+          baseRef: shippingTarget.baseRef,
+        }),
+      ]);
       await markValidationRevisionDrift(request.directory, currentRevision);
       if (request.name === 'task_checkpoint_update') {
         const patch = request.arguments.checkpoint;
@@ -3990,6 +4015,7 @@
         currentRevision,
         saved.acceptanceCriteria,
         Date.now(),
+        baseRevision,
       );
       if (
         owner.issue.evidenceRevision !== currentRevision ||
@@ -4014,6 +4040,7 @@
             currentRevision,
             saved.requiredGates,
             saved.acceptanceCriteria,
+            baseRevision,
           ),
         },
       };
@@ -4073,6 +4100,7 @@
         revision,
         checkpoint.acceptanceCriteria,
         Date.now(),
+        baseRevision,
       );
       await updateShipIssue(owner.run, owner.issue, {
         validationPolicyRequired: true,
@@ -4200,36 +4228,42 @@
     outputReference: string | undefined,
     fallbackReference: string,
     expectedRevision: unknown,
+    baseRevision: string,
     evidenceIdentity?: { id: string; timestamp: number; sequence?: number },
-  ): Promise<Pick<ShipIssue, 'evidenceRevision' | 'evidenceManifests'>> {
+  ): Promise<
+    Pick<ShipIssue, 'evidenceRevision' | 'evidenceManifests'> & { evidenceSequence: number }
+  > {
     if (!owner.issue.path || !owner.issue.checkpoint)
       throw new Error('Gate evidence needs a canonical task checkpoint and worktree.');
     const revision = await invoke<string>('working_tree_revision', { path: owner.issue.path });
     requireEvidenceRevision(expectedRevision, revision);
     if (owner.issue.checkpoint.revision !== revision)
       throw new Error('Bind the task checkpoint to the current revision before reporting a gate.');
+    const evidenceId = evidenceIdentity?.id ?? crypto.randomUUID();
+    const evidenceSequence =
+      evidenceIdentity?.sequence ?? nextTaskEvidenceSequence(owner.issue.evidenceManifests ?? []);
     const evidenceManifests = recordTaskEvidence(
       owner.issue.evidenceManifests ?? [],
       revision,
       owner.issue.checkpoint.acceptanceCriteria,
       {
-        id: evidenceIdentity?.id ?? crypto.randomUUID(),
+        id: evidenceId,
         kind: 'gate',
         name: gate,
         provider,
         model,
         result: ['CLEAN', 'PASS'].includes(verdict) ? 'passed' : 'failed',
         timestamp: evidenceIdentity?.timestamp ?? Date.now(),
-        ...(evidenceIdentity?.sequence === undefined
-          ? {}
-          : { sequence: evidenceIdentity.sequence + 1 }),
+        sequence: evidenceSequence,
         outputReference: outputReference ?? fallbackReference,
         criteria: criteria ?? [],
       },
+      baseRevision,
     );
     return {
       evidenceRevision: revision,
       evidenceManifests,
+      evidenceSequence,
     };
   }
 
@@ -4312,7 +4346,12 @@
               report.outputReference,
               `thread:${sourceId}`,
               report.revision,
-              { id: `gate:${gateId}`, timestamp: now, sequence },
+              baseRevision,
+              {
+                id: `gate:${gateId}`,
+                timestamp: now,
+                sequence: nextTaskEvidenceSequence(owner.issue.evidenceManifests ?? [], sequence),
+              },
             );
             requireEvidenceBaseRevision(
               evidenceChanges.evidenceRevision!,
@@ -4320,9 +4359,18 @@
             );
             return evidenceChanges;
           },
-          commit: async (evidenceChanges) =>
-            updateShipIssue(owner.run, owner.issue, {
-              ...evidenceChanges,
+          commit: async (evidenceChanges) => {
+            const previous = structuredClone({
+              evidenceRevision: owner.issue.evidenceRevision,
+              evidenceManifests: owner.issue.evidenceManifests,
+              stage: owner.issue.stage,
+              blockedReason: owner.issue.blockedReason,
+              gates: owner.issue.gates,
+              events: owner.issue.events,
+            });
+            const { evidenceSequence, ...issueEvidenceChanges } = evidenceChanges;
+            await updateShipIssue(owner.run, owner.issue, {
+              ...issueEvidenceChanges,
               stage: report.gate === 'test-adversary' ? 'testing' : 'reviewing',
               blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
                 ? report.reason
@@ -4345,6 +4393,7 @@
                     revision,
                     mutationGeneration: policy?.mutationGeneration,
                     baseRevision,
+                    evidenceSequence,
                   },
                   now,
                 ),
@@ -4354,7 +4403,12 @@
                 `${report.gate}: ${report.verdict}`,
                 report.reason,
               ),
-            }),
+            });
+            return async () => {
+              Object.assign(owner.issue, previous);
+              await saveShipRuns();
+            };
+          },
         });
         return { status: 'recorded' };
       }
@@ -4413,18 +4467,29 @@
                 report.outputReference,
                 `thread:${receipt.targetId ?? receipt.receiptId}`,
                 validation.revision,
+                validation.baseRevision!,
                 {
                   id: `gate:${receipt.receiptId}`,
                   timestamp: evidenceTimestamp,
-                  sequence: validation.sequence,
+                  sequence: validation.evidenceSequence,
                 },
               )
-            : {};
-          if (owner)
+            : null;
+          if (owner && evidenceChanges)
             requireEvidenceBaseRevision(validation.revision!, owner.issue.evidenceRevision);
           return evidenceChanges;
         },
         commit: async (evidenceChanges) => {
+          const previousReceipt = structuredClone(receipt);
+          const previousIssue = owner
+            ? structuredClone({
+                evidenceRevision: owner.issue.evidenceRevision,
+                evidenceManifests: owner.issue.evidenceManifests,
+                blockedReason: owner.issue.blockedReason,
+                events: owner.issue.events,
+              })
+            : null;
+          const evidenceSequence = evidenceChanges?.evidenceSequence;
           updateSpawnReceipt(receipt.receiptId, {
             validation: {
               ...validation,
@@ -4433,12 +4498,17 @@
               evidenceCriteria,
               evidenceOutputReference,
               evidenceTimestamp,
+              evidenceSequence,
             },
           });
           await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
-          if (owner) {
+          if (owner && evidenceChanges) {
+            const issueEvidenceChanges = {
+              evidenceRevision: evidenceChanges.evidenceRevision,
+              evidenceManifests: evidenceChanges.evidenceManifests,
+            };
             await updateShipIssue(owner.run, owner.issue, {
-              ...evidenceChanges,
+              ...issueEvidenceChanges,
               blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
                 ? report.reason
                 : null,
@@ -4449,6 +4519,14 @@
               ),
             });
           }
+          return async () => {
+            saveSpawnReceipt(previousReceipt);
+            await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+            if (owner && previousIssue) {
+              Object.assign(owner.issue, previousIssue);
+              await saveShipRuns();
+            }
+          };
         },
       });
     } else {
@@ -4548,6 +4626,10 @@
         }),
       ];
       const sequence = nextGateSequence(priorGates);
+      const evidenceSequence = nextTaskEvidenceSequence(
+        gateOwner?.issue.evidenceManifests ?? [],
+        sequence,
+      );
       const shippingTarget = gateOwner
         ? await shippingTargetFor(gateOwner.run, gateOwner.issue, request.directory)
         : undefined;
@@ -4590,6 +4672,7 @@
           gate: gate as import('./lib/ship-progress').GateName,
           requestedModel: choice.model,
           sequence,
+          evidenceSequence,
         },
         state: 'starting',
         created: Date.now(),
@@ -4626,6 +4709,7 @@
             gate: gate as import('./lib/ship-progress').GateName,
             requestedModel: choice.model,
             sequence,
+            evidenceSequence,
             revision,
             mutationGeneration,
             baseRevision,

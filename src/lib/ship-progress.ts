@@ -59,6 +59,7 @@ export type GateMetadata = {
   evidenceCriteria?: string[];
   evidenceOutputReference?: string;
   evidenceTimestamp?: number;
+  evidenceSequence?: number;
 };
 
 export function nextGateSequence(gates: Pick<ShipGate, 'sequence'>[]): number {
@@ -126,6 +127,7 @@ export const gateMetadataSchema = z.object({
   evidenceCriteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
   evidenceOutputReference: z.string().min(1).max(2000).optional(),
   evidenceTimestamp: z.number().int().nonnegative().optional(),
+  evidenceSequence: z.number().int().positive().optional(),
 });
 
 const reportSchema = z.union([
@@ -200,7 +202,7 @@ export async function commitRevisionBoundValidation<T>({
   readMutationGeneration: () => Promise<string>;
   readBaseRevision?: () => Promise<string>;
   prepare: () => Promise<T>;
-  commit: (prepared: T) => Promise<void>;
+  commit: (prepared: T) => Promise<(() => Promise<void>) | void>;
 }): Promise<void> {
   if (!expectedRevision)
     throw new Error('Validation needs the revision captured before execution.');
@@ -218,7 +220,13 @@ export async function commitRevisionBoundValidation<T>({
   await verifyBoundary();
   const prepared = await prepare();
   await verifyBoundary();
-  await commit(prepared);
+  const rollback = await commit(prepared);
+  try {
+    await verifyBoundary();
+  } catch (cause) {
+    await rollback?.();
+    throw cause;
+  }
 }
 
 export function gateSnapshot(receipt: SpawnReceipt): ShipGate | null {
@@ -326,6 +334,7 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     issue.evidenceRevision,
     issue.checkpoint.requiredGates,
     issue.checkpoint.acceptanceCriteria,
+    issue.validationPolicy?.baseRevision,
   );
   if (
     issue.validationPolicyRequired !== false &&
@@ -352,7 +361,10 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     };
   if (!issue.pullRequest || !issue.checks?.length || !issue.evidenceRevision) return readiness;
   const manifest = (issue.evidenceManifests ?? []).find(
-    (candidate) => candidate.revision === issue.evidenceRevision && !candidate.stale,
+    (candidate) =>
+      candidate.revision === issue.evidenceRevision &&
+      candidate.baseRevision === (issue.validationPolicy?.baseRevision ?? null) &&
+      !candidate.stale,
   );
   const latestCommands = new Map<string, TaskEvidence>();
   for (const entry of manifest?.evidence ?? [])
@@ -377,44 +389,61 @@ export function recoverValidationEvidence(
   const checkpoint = issue.checkpoint;
   if (!checkpoint?.revision) return null;
   const revision = checkpoint.revision;
+  const baseRevision = issue.validationPolicy?.baseRevision;
   let manifests = issue.evidenceManifests ?? [];
-  let recovered = false;
   const gates = (issue.gates ?? []).toSorted(
     (left, right) =>
       (left.sequence ?? Number.MAX_SAFE_INTEGER) - (right.sequence ?? Number.MAX_SAFE_INTEGER) ||
       left.created - right.created ||
       left.id.localeCompare(right.id),
   );
-  for (const gate of gates) {
-    if (
-      gate.revision !== revision ||
-      !gate.verdict ||
-      gate.evidenceTimestamp === undefined ||
-      !gate.evidenceOutputReference
-    )
-      continue;
+  const recoverable = gates.filter(
+    (gate) =>
+      gate.revision === revision &&
+      gate.baseRevision === baseRevision &&
+      gate.verdict &&
+      gate.evidenceTimestamp !== undefined &&
+      gate.evidenceOutputReference,
+  );
+  const evidenceIds = new Set(recoverable.map((gate) => `gate:${gate.id}`));
+  const missing = recoverable.some((gate) =>
+    manifests.every((manifest) =>
+      manifest.evidence.every((entry) => entry.id !== `gate:${gate.id}`),
+    ),
+  );
+  if (!missing && issue.evidenceRevision === revision) return null;
+  if (missing)
+    manifests = manifests.map((manifest) => ({
+      ...manifest,
+      evidence: manifest.evidence.filter((entry) => !evidenceIds.has(entry.id)),
+    }));
+  for (const gate of recoverable) {
     const evidenceId = `gate:${gate.id}`;
-    if (manifests.some((manifest) => manifest.evidence.some((entry) => entry.id === evidenceId)))
-      continue;
     const criteria = (gate.evidenceCriteria ?? []).filter((criterion) =>
       checkpoint.acceptanceCriteria.includes(criterion),
     );
-    const next = recordTaskEvidence(manifests, revision, checkpoint.acceptanceCriteria, {
-      id: evidenceId,
-      kind: 'gate',
-      name: gate.gate,
-      provider: gate.provider,
-      model: gate.model,
-      result: ['CLEAN', 'PASS'].includes(gate.verdict) ? 'passed' : 'failed',
-      timestamp: gate.evidenceTimestamp,
-      outputReference: gate.evidenceOutputReference,
-      criteria,
-      ...(gate.sequence === undefined ? {} : { sequence: gate.sequence + 1 }),
-    });
-    if (JSON.stringify(next) !== JSON.stringify(manifests)) recovered = true;
+    const next = recordTaskEvidence(
+      manifests,
+      revision,
+      checkpoint.acceptanceCriteria,
+      {
+        id: evidenceId,
+        kind: 'gate',
+        name: gate.gate,
+        provider: gate.provider,
+        model: gate.model,
+        result: ['CLEAN', 'PASS'].includes(gate.verdict!) ? 'passed' : 'failed',
+        timestamp: gate.evidenceTimestamp!,
+        outputReference: gate.evidenceOutputReference!,
+        criteria,
+        ...(!missing && gate.evidenceSequence !== undefined
+          ? { sequence: gate.evidenceSequence }
+          : {}),
+      },
+      baseRevision,
+    );
     manifests = next;
   }
-  if (!recovered && issue.evidenceRevision === revision) return null;
   return { evidenceRevision: revision, evidenceManifests: manifests };
 }
 

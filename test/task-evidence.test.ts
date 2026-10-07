@@ -4,6 +4,7 @@ import {
   evidenceReadiness,
   evidenceManifestsSchema,
   mergeEvidenceManifests,
+  nextTaskEvidenceSequence,
   requireEvidenceBaseRevision,
   requireEvidenceRevision,
   recordTaskEvidence,
@@ -39,6 +40,40 @@ void test('creates one current manifest and invalidates earlier revisions', () =
   assert.equal(second[1].revision, 'revision-two');
   assert.equal(second[1].stale, false);
   assert.deepEqual(second[1].evidence, []);
+});
+
+void test('a base move stales every kind of evidence without changing the worktree revision', () => {
+  let manifests = recordTaskEvidence(
+    [],
+    'revision',
+    criteria,
+    evidence({ id: 'command', kind: 'command', name: 'npm test', criteria }),
+    'base-one',
+  );
+  manifests = syncEvidenceManifest(manifests, 'revision', criteria, 30, 'base-two');
+  manifests = recordTaskEvidence(
+    manifests,
+    'revision',
+    criteria,
+    evidence({ id: 'new-gate', criteria: [] }),
+    'base-two',
+  );
+
+  assert.equal(manifests.find((manifest) => manifest.baseRevision === 'base-one')?.stale, true);
+  assert.deepEqual(
+    evidenceReadiness(manifests, 'revision', ['code-adversary'], criteria, 'base-two'),
+    {
+      ready: false,
+      stale: false,
+      missingGates: [],
+      failedGates: [],
+      pendingGates: [],
+      failedCommands: [],
+      pendingCommands: [],
+      unverifiedCriteria: criteria,
+      reason: '2 acceptance criteria remain unverified.',
+    },
+  );
 });
 
 void test('blocks readiness for stale, missing, failed, and unverified evidence', () => {
@@ -175,6 +210,57 @@ void test('rejects unknown criteria and bounds manifests and entries', () => {
   assert.equal(manifests.at(-1)?.evidence.length, 100);
 });
 
+void test('the evidence bound retains each latest gate above a full command history', () => {
+  let manifests: EvidenceManifest[] = [];
+  for (let index = 1; index <= 100; index += 1)
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision',
+      criteria,
+      evidence({
+        id: `command-${index}`,
+        kind: 'command',
+        name: `command-${index}`,
+        timestamp: index,
+        criteria: [],
+      }),
+    );
+  const gateNames = ['code-adversary', 'findings-adversary', 'test-adversary'];
+  const gateSequences = gateNames.map((_, index) => nextTaskEvidenceSequence(manifests, index));
+  for (const [index, name] of gateNames.entries())
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision',
+      criteria,
+      evidence({
+        id: `gate-${index}`,
+        name,
+        timestamp: 200 + index,
+        sequence: gateSequences[index],
+        criteria,
+      }),
+    );
+
+  const gateEvidence = manifests[0].evidence.filter((entry) => entry.kind === 'gate');
+  assert.deepEqual(
+    gateEvidence.map((entry) => [entry.name, entry.sequence]),
+    [
+      ['code-adversary', 101],
+      ['findings-adversary', 102],
+      ['test-adversary', 103],
+    ],
+  );
+  assert.equal(
+    evidenceReadiness(
+      manifests,
+      'revision',
+      ['code-adversary', 'findings-adversary', 'test-adversary'],
+      criteria,
+    ).ready,
+    true,
+  );
+});
+
 void test('normalizes duplicate persisted revisions to the newest manifest', () => {
   const first = recordTaskEvidence([], 'revision', criteria, evidence())[0];
   const newest = {
@@ -205,6 +291,7 @@ void test('latest evidence uses timestamps instead of persisted array order', ()
   const older = evidence({ id: 'older', result: 'failed', timestamp: 20, criteria: [] });
   const manifest: EvidenceManifest = {
     revision: 'revision',
+    baseRevision: null,
     acceptanceCriteria: criteria,
     evidence: [newest, older],
     stale: false,
