@@ -8,6 +8,7 @@
   import DiffPanel from './DiffPanel.svelte';
   import PlanPanel from './PlanPanel.svelte';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
+  import WorkspaceActivity from './WorkspaceActivity.svelte';
   import ShipPanel from './ShipPanel.svelte';
   import EmptyPanePicker from './EmptyPanePicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
@@ -28,6 +29,8 @@
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import type { PublishedGraph } from './lib/issue-graph';
   import type { ShipRun } from './lib/issue-shipping';
+  import type { ActivityHistoryEvent } from './lib/activity-history';
+  import type { WorkspaceActivityItem } from './lib/workspace-activity';
   import type { ShipItIssue } from './lib/implementation-models';
   import type { TaskLocation } from './lib/task-location';
   import { threadKey } from './lib/recent-threads';
@@ -109,6 +112,12 @@
     onshortcut: (event: KeyboardEvent) => void;
     onactivity: (thread: AgentThread) => void;
     onhistorychange: () => void;
+    activityEvents: ActivityHistoryEvent[];
+    activityLoading: boolean;
+    activityError: string;
+    onactivityrefresh: () => void;
+    onactivityselect: (event: ActivityHistoryEvent) => void | Promise<void>;
+    onactivityopen: () => void;
     ondecision: (thread: AgentThread, id: string, title: string, outcome: string) => void;
     onusage: (sessionID: string, context: number | undefined) => void;
     focusPromptPane: string | null;
@@ -182,6 +191,12 @@
     onshortcut,
     onactivity,
     onhistorychange,
+    activityEvents,
+    activityLoading,
+    activityError,
+    onactivityrefresh,
+    onactivityselect,
+    onactivityopen,
     ondecision,
     onusage,
     focusPromptPane,
@@ -226,12 +241,76 @@
   let nativeSession = $state<SessionInfo>();
   let nativeHistoryError = $state('');
   let nativeDetailsOpen = $state(false);
-  let nativeTab = $state<'plan' | 'changes' | 'history' | 'ship'>('changes');
-  let acpTab = $state<'changes' | 'ship'>('changes');
+  let nativeTab = $state<'plan' | 'changes' | 'history' | 'activity' | 'ship'>('changes');
+  let acpTab = $state<'changes' | 'activity' | 'ship'>('changes');
+  let paneActivityItems = $state<WorkspaceActivityItem[]>([]);
+  let selectPaneActivity = $state<(item: WorkspaceActivityItem) => Promise<void>>(async () => {
+    throw new Error('The activity source is unavailable.');
+  });
   let nativeDetailsGeneration = 0;
   const nativeDetailsVisible = $derived(nativeDetailsOpen || changesPanes.includes(pane.id));
   let previousChangesOpen = false;
   let previousAcpOpen = false;
+
+  function updatePaneActivity(
+    items: WorkspaceActivityItem[],
+    onselect: (item: WorkspaceActivityItem) => Promise<void>,
+  ) {
+    paneActivityItems = items;
+    selectPaneActivity = onselect;
+  }
+
+  async function selectPaneActivitySource(item: WorkspaceActivityItem) {
+    await selectPaneActivity(item);
+    onactivityopen();
+  }
+
+  function paneOwnsActivity(event: ActivityHistoryEvent): boolean {
+    return (
+      !('direction' in pane) &&
+      !!pane.agent &&
+      !!pane.thread &&
+      event.workspace === directory &&
+      event.agent === pane.agent &&
+      event.sessionId === pane.thread.sessionId
+    );
+  }
+
+  function paneOwnsChild(event: ActivityHistoryEvent): boolean {
+    if ('direction' in pane || !pane.agent || !pane.thread || event.kind !== 'subagent')
+      return false;
+    const source =
+      pane.agent === 'opencode'
+        ? `opencode:${pane.thread.sessionId}`
+        : `acp:${pane.agent}:${pane.thread.sessionId}`;
+    return spawnReceiptsForSource(spawnReceipts, source, directory).some(
+      (receipt) => receipt.receiptId === event.sourceId,
+    );
+  }
+
+  async function selectPaneActivityHistory(event: ActivityHistoryEvent) {
+    if (event.kind === 'parent' && paneOwnsActivity(event)) {
+      onfocus(pane.id);
+      onactivityopen();
+      return;
+    }
+    const kind = event.kind === 'subagent' ? 'child' : event.kind;
+    if (kind !== 'parent' && (paneOwnsActivity(event) || paneOwnsChild(event))) {
+      await selectPaneActivity({
+        id: event.id,
+        sourceId: event.sourceId,
+        kind,
+        section: 'recent',
+        title: event.title,
+        detail: event.source,
+        status: event.outcome,
+        updated: event.at,
+      });
+      onactivityopen();
+      return;
+    }
+    await onactivityselect(event);
+  }
 
   function reviewEvidence(thread: string | null) {
     const checks = thread ? postTurnChecks.filter((check) => check.thread === thread) : [];
@@ -512,6 +591,12 @@
       {onshortcut}
       {onactivity}
       {onhistorychange}
+      {activityEvents}
+      {activityLoading}
+      {activityError}
+      {onactivityrefresh}
+      {onactivityselect}
+      {onactivityopen}
       {ondecision}
       {onusage}
       {focusPromptPane}
@@ -612,6 +697,12 @@
       {onshortcut}
       {onactivity}
       {onhistorychange}
+      {activityEvents}
+      {activityLoading}
+      {activityError}
+      {onactivityrefresh}
+      {onactivityselect}
+      {onactivityopen}
       {ondecision}
       {onusage}
       {focusPromptPane}
@@ -781,6 +872,7 @@
                 void refreshNativeDetails();
               }}
               {onhistorychange}
+              onworkspaceactivity={updatePaneActivity}
               {onusage}
               {onstatus}
               {onshipit}
@@ -796,7 +888,10 @@
                     onclick={() => (nativeTab = 'changes')}>Changes ({diffs.length})</button
                   ><button
                     class:active={nativeTab === 'history'}
-                    onclick={() => (nativeTab = 'history')}>History</button
+                    onclick={() => (nativeTab = 'history')}>Plan history</button
+                  ><button
+                    class:active={nativeTab === 'activity'}
+                    onclick={() => (nativeTab = 'activity')}>Activity</button
                   ><button
                     data-detail-tab="ship"
                     class:active={nativeTab === 'ship'}
@@ -844,6 +939,18 @@
                     loading={false}
                     error={nativeHistoryError}
                     onrefresh={refreshNativeDetails}
+                  />
+                {:else if nativeTab === 'activity'}
+                  <WorkspaceActivity
+                    items={paneActivityItems}
+                    events={activityEvents}
+                    agent="opencode"
+                    sessionId={pane.thread?.sessionId}
+                    loading={activityLoading}
+                    error={activityError}
+                    onrefresh={onactivityrefresh}
+                    onselect={selectPaneActivitySource}
+                    onselecthistory={selectPaneActivityHistory}
                   />
                 {:else}
                   <DiffPanel
@@ -914,6 +1021,7 @@
               {onpromptfocused}
               onentrieschange={(entries, sessionId, ready) =>
                 onentries(pane.id, entries, sessionId, ready)}
+              onworkspaceactivity={updatePaneActivity}
               oncreated={(thread) => oncreated(pane.id, thread)}
               {onactivity}
               ondecision={(thread, permission, optionId) =>
@@ -928,6 +1036,9 @@
                 <nav class="side-tabs" aria-label="Agent detail tabs">
                   <button class:active={acpTab === 'changes'} onclick={() => (acpTab = 'changes')}
                     >Changes ({diffs.length})</button
+                  ><button
+                    class:active={acpTab === 'activity'}
+                    onclick={() => (acpTab = 'activity')}>Activity</button
                   ><button
                     data-detail-tab="ship"
                     class:active={acpTab === 'ship'}
@@ -946,6 +1057,18 @@
                       closeAcpDetails();
                     }}
                     onsettings={onshipsettings}
+                  />
+                {:else if acpTab === 'activity'}
+                  <WorkspaceActivity
+                    items={paneActivityItems}
+                    events={activityEvents}
+                    agent={pane.agent}
+                    sessionId={pane.thread?.sessionId}
+                    loading={activityLoading}
+                    error={activityError}
+                    onrefresh={onactivityrefresh}
+                    onselect={selectPaneActivitySource}
+                    onselecthistory={selectPaneActivityHistory}
                   />
                 {:else}
                   <DiffPanel

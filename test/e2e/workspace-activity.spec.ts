@@ -23,50 +23,56 @@ async function selectAndExpect(label: string, expected: string) {
 }
 
 describe('workspace activity panel', () => {
-  it('keeps real activity readable and navigable across desktop and compact layouts', async () => {
-    await browser.execute(() => {
-      localStorage.removeItem('e2e-workspace-activity-active');
-      localStorage.removeItem('e2e-workspace-activity-empty');
-      history.replaceState(null, '', '?workspace-activity-fixture');
-    });
+  it('fills Cmd-L details and combines live and durable activity without duplicates', async () => {
+    await browser.execute(() => history.replaceState(null, '', '?workspace-activity-fixture'));
     await browser.setWindowSize(1200, 700);
     await browser.refresh();
     await browser.waitUntil(
       async () =>
         (await browser.execute(
           () => document.querySelectorAll('#active-panel aside li').length,
-        )) === 13,
-      { timeout: 15_000, timeoutMsg: 'activity panel did not render all real-state items' },
+        )) === 14,
+      { timeout: 15_000, timeoutMsg: 'activity panel did not render combined activity' },
     );
 
     const desktop = await browser.execute(() => {
       const panel = document.querySelector<HTMLElement>('#active-panel aside')!;
-      const scroll = panel.querySelector<HTMLElement>('.activity-sections')!;
+      const bounds = panel.getBoundingClientRect();
+      const body = document.querySelector<HTMLElement>('.fixture-body')!.getBoundingClientRect();
+      const status = document
+        .querySelector<HTMLElement>('[aria-label="Fixture agent status"]')!
+        .getBoundingClientRect();
       const sections = [...panel.querySelectorAll('section')].map((section) => ({
-        label: section.querySelector('h2')?.textContent?.replace(/\s+/g, ' ').trim(),
+        label: section.querySelector('h3')?.textContent?.replace(/\s+/g, ' ').trim(),
         items: section.querySelectorAll('li').length,
       }));
-      const composer = document.querySelector<HTMLElement>('[aria-label="Fixture composer"]')!;
       return {
         sections,
-        scrollable: scroll.scrollHeight > scroll.clientHeight,
-        composerVisible: composer.getBoundingClientRect().bottom <= innerHeight,
-        emptyOpen: !!document.querySelector('#empty-panel aside'),
-        emptyExpanded: document
-          .querySelector('#empty-panel .activity-toggle')
-          ?.getAttribute('aria-expanded'),
+        top: bounds.top,
+        bodyTop: body.top,
+        bottom: bounds.bottom,
+        statusTop: status.top,
+        scrollable:
+          panel.querySelector<HTMLElement>('.activity-sections')!.scrollHeight >
+          panel.querySelector<HTMLElement>('.activity-sections')!.clientHeight,
+        duplicateChildren: panel.querySelectorAll(
+          '[data-workspace-activity-id="child:child-9"], [data-activity-id="duplicate-child"]',
+        ).length,
+        detachedToggle: !!document.querySelector('.activity-toggle, .activity-backdrop'),
       };
     });
     expect(desktop.sections).toEqual([
       { label: 'Now10', items: 10 },
       { label: 'Needs input2', items: 2 },
       { label: 'Recent1', items: 1 },
+      { label: 'Earlier1', items: 1 },
     ]);
+    expect(desktop.top).toBe(desktop.bodyTop);
+    expect(desktop.bottom).toBe(desktop.statusTop);
     expect(desktop.scrollable).toBe(true);
-    expect(desktop.composerVisible).toBe(true);
-    expect(desktop.emptyOpen).toBe(false);
-    expect(desktop.emptyExpanded).toBe('false');
-    await capture('workspace-activity-desktop');
+    expect(desktop.duplicateChildren).toBe(1);
+    expect(desktop.detachedToggle).toBe(false);
+    await capture('workspace-activity-details-desktop');
 
     await selectAndExpect('Open Recent tool 1: Read configuration', 'tool:read');
     await selectAndExpect(
@@ -74,6 +80,7 @@ describe('workspace activity panel', () => {
       'decision:permission',
     );
     await selectAndExpect('Open Needs input check 2: npm test', 'check:check');
+    await selectAndExpect('Open parent activity: Earlier parent task', 'parent:parent');
 
     await browser.execute(() => {
       document.querySelector<HTMLButtonElement>('[aria-label="Fail activity selection"]')!.click();
@@ -87,8 +94,7 @@ describe('workspace activity panel', () => {
       browser.execute(
         () =>
           document.querySelector('#active-panel [role="alert"]')?.textContent ===
-            'Could not open activity: Target unavailable' &&
-          !!document.querySelector('#active-panel aside'),
+          'Target unavailable',
       ),
     );
 
@@ -96,79 +102,41 @@ describe('workspace activity panel', () => {
       document.querySelector<HTMLButtonElement>('[aria-label="Clear activity"]')!.click(),
     );
     await browser.waitUntil(async () =>
-      browser.execute(() => !document.querySelector('#active-panel aside')),
+      browser.execute(
+        () =>
+          !!document.querySelector('#active-panel aside') &&
+          document.querySelectorAll('#active-panel [data-workspace-activity-id]').length === 0 &&
+          document.querySelectorAll('#active-panel [data-activity-id]').length === 2,
+      ),
     );
     await browser.execute(() =>
       document.querySelector<HTMLButtonElement>('[aria-label="Restore activity"]')!.click(),
     );
-    await browser.waitUntil(async () =>
-      browser.execute(() => !!document.querySelector('#active-panel aside')),
-    );
-
-    await browser.execute(() =>
-      document.querySelector<HTMLButtonElement>('#active-panel .activity-close')!.click(),
-    );
-    await browser.waitUntil(async () =>
-      browser.execute(
-        () =>
-          !document.querySelector('#active-panel aside') &&
-          document.activeElement === document.querySelector('#active-panel .activity-toggle'),
-      ),
-    );
 
     await browser.setWindowSize(320, 500);
-    await browser.execute(() => localStorage.removeItem('e2e-workspace-activity-active'));
-    await browser.refresh();
-    await browser.waitUntil(async () =>
-      browser.execute(
-        () =>
-          !document.querySelector('#active-panel aside') &&
-          document
-            .querySelector('#active-panel .activity-toggle')
-            ?.getAttribute('aria-expanded') === 'false',
-      ),
-    );
-    await browser.execute(() =>
-      document.querySelector<HTMLButtonElement>('#active-panel .activity-toggle')!.click(),
-    );
-    await browser.waitUntil(async () =>
-      browser.execute(() => !!document.querySelector('#active-panel aside')),
-    );
     const compact = await browser.execute(() => {
-      const sheet = document
+      const panel = document
         .querySelector<HTMLElement>('#active-panel aside')!
         .getBoundingClientRect();
       const body = document.querySelector<HTMLElement>('.fixture-body')!.getBoundingClientRect();
-      const composer = document.querySelector<HTMLElement>('[aria-label="Fixture composer"]')!;
+      const status = document
+        .querySelector<HTMLElement>('[aria-label="Fixture agent status"]')!
+        .getBoundingClientRect();
       return {
-        left: sheet.left,
-        right: sheet.right,
-        bottom: sheet.bottom,
+        left: panel.left,
+        right: panel.right,
+        bottom: panel.bottom,
         bodyBottom: body.bottom,
-        composerVisible: composer.getBoundingClientRect().bottom <= innerHeight,
+        statusTop: status.top,
       };
     });
     expect(compact.left).toBe(0);
     expect(compact.right).toBe(320);
     expect(compact.bottom).toBe(compact.bodyBottom);
-    expect(compact.composerVisible).toBe(true);
-    await capture('workspace-activity-compact');
+    expect(compact.bottom).toBe(compact.statusTop);
+    await capture('workspace-activity-details-compact');
 
-    await browser.execute(() =>
-      document
-        .querySelector<HTMLButtonElement>(
-          '#active-panel button[aria-label="Open Now child 1: Child task 9"]',
-        )!
-        .click(),
-    );
-    await browser.waitUntil(async () =>
-      browser.execute(
-        () =>
-          document.querySelector<HTMLOutputElement>('[aria-label="Opened activity"]')!.value ===
-            'child:child-9' &&
-          !document.querySelector('#active-panel aside') &&
-          document.activeElement === document.querySelector('#active-panel .activity-toggle'),
-      ),
-    );
+    await selectAndExpect('Open Now child 1: Child task 9', 'child:child-9');
+    await expect($('#active-panel aside')).toBeDisplayed();
   });
 });

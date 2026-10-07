@@ -9,7 +9,6 @@
   import Markdown from './Markdown.svelte';
   import ChatMessage from './ChatMessage.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
-  import WorkspaceActivity from './WorkspaceActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
@@ -136,6 +135,10 @@
     onopensubagent?: (receipt: SpawnReceipt) => Promise<void>;
     postTurnChecks?: PostTurnCheck[];
     onretrycheck?: (check: PostTurnCheck) => void;
+    onworkspaceactivity?: (
+      items: WorkspaceActivityItem[],
+      onselect: (item: WorkspaceActivityItem) => Promise<void>,
+    ) => void;
     onshipit?: (
       issue: ShipItIssue,
       directory: string,
@@ -175,6 +178,7 @@
     onopensubagent,
     postTurnChecks = [],
     onretrycheck = () => {},
+    onworkspaceactivity,
     onshipit,
   }: Props = $props();
   let mounted = $state(false);
@@ -435,11 +439,17 @@
     const target = workspace.querySelector<HTMLElement>(
       `[${attribute}="${CSS.escape(item.sourceId)}"]`,
     );
+    if (!target) throw new Error('The activity source is unavailable.');
     for (let parent = target?.parentElement; parent; parent = parent.parentElement)
       if (parent instanceof HTMLDetailsElement) parent.open = true;
     target?.scrollIntoView({ block: 'center' });
     (target instanceof HTMLDetailsElement ? target.querySelector('summary') : target)?.focus();
   }
+
+  $effect(() => {
+    const items = workspaceActivity;
+    untrack(() => onworkspaceactivity?.(items, selectWorkspaceActivity));
+  });
 
   $effect(() => {
     if (ready && !busy && !running && !historyLoaded && !historyAttempted) void loadHistory();
@@ -1752,11 +1762,6 @@
           </div>
         </ChatMessage>{/if}
     </div>
-    <WorkspaceActivity
-      items={workspaceActivity}
-      storageKey={`sai-workspace-activity:${directory}:${agent}`}
-      onselect={selectWorkspaceActivity}
-    />
   </div>
   <div class="agent-composer composer-wrap">
     <div class="composer">

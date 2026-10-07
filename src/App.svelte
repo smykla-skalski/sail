@@ -64,7 +64,6 @@
   } from './lib/issue-shipping';
   import type { ShipItIssue } from './lib/implementation-models';
   import DiffPanel from './DiffPanel.svelte';
-  import HistoryPanel from './HistoryPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
   import TaskOverview from './TaskOverview.svelte';
@@ -1125,8 +1124,7 @@
       return;
     }
     const narrow = window.matchMedia('(max-width: 850px)').matches;
-    const visible =
-      detailsOpen && activeSideTab === 'changes' && (!narrow || mobileView === 'details');
+    const visible = detailsOpen && (!narrow || mobileView === 'details');
     saveViewState();
     if (visible) {
       detailsOpen = false;
@@ -1367,6 +1365,12 @@
       checks: mainPostTurnChecks,
     }),
   );
+  let mainAgentWorkspaceActivity = $state<WorkspaceActivityItem[]>([]);
+  let selectMainAgentWorkspaceActivity = $state<(item: WorkspaceActivityItem) => Promise<void>>(
+    async () => {
+      throw new Error('The activity source is unavailable.');
+    },
+  );
   const activityHistory = $derived.by(() => {
     const openCodeTimelines = openCodeTimelineRevision >= 0 ? cachedOpenCodeTimelines() : [];
     const input: ActivityHistoryInput[] = [...durableActivityHistory];
@@ -1515,6 +1519,9 @@
     }
     return recentActivityEvents(input);
   });
+  const currentActivityHistory = $derived(
+    activityHistory.filter((event) => event.workspace === directory),
+  );
   $effect(() => {
     const saved = saveActivityHistory(activityHistory);
     if (saved === saveActivityHistory(durableActivityHistory)) return;
@@ -6764,6 +6771,23 @@
     (target instanceof HTMLDetailsElement ? target.querySelector('summary') : target)?.focus();
   }
 
+  function updateMainAgentWorkspaceActivity(
+    items: WorkspaceActivityItem[],
+    onselect: (item: WorkspaceActivityItem) => Promise<void>,
+  ) {
+    mainAgentWorkspaceActivity = items;
+    selectMainAgentWorkspaceActivity = onselect;
+  }
+
+  async function selectMainActivity(item: WorkspaceActivityItem) {
+    await (acpAgent ? selectMainAgentWorkspaceActivity(item) : selectMainWorkspaceActivity(item));
+    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'chat';
+  }
+
+  function showActivitySource() {
+    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'chat';
+  }
+
   function focusPane(id: string) {
     if (focusedPane === id) return;
     ++recentJumpGeneration;
@@ -9544,6 +9568,7 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
+                onworkspaceactivity={updateMainAgentWorkspaceActivity}
                 ondecision={(thread, permission, optionId) =>
                   recordDecisionActivity(
                     thread,
@@ -9747,11 +9772,6 @@
                     <Button size="sm" variant="secondary" onclick={stop}>Stop</Button>
                   </div>{/if}
               </div>
-              <WorkspaceActivity
-                items={mainWorkspaceActivity}
-                storageKey={`sai-workspace-activity:${directory}:main`}
-                onselect={selectMainWorkspaceActivity}
-              />
             </div>
             {#if workReady || sessionID}<div class="composer-wrap">
                 <PromptPanel
@@ -9950,12 +9970,16 @@
                   class:inactive={activeSideTab !== 'history'}
                   class="side-view"
                 >
-                  <HistoryPanel
-                    events={activityHistory}
+                  <WorkspaceActivity
+                    items={acpAgent ? mainAgentWorkspaceActivity : mainWorkspaceActivity}
+                    events={currentActivityHistory}
+                    agent={acpAgent ?? 'opencode'}
+                    sessionId={acpAgent ? acpThread?.sessionId : (sessionID ?? undefined)}
                     loading={inboxLoading}
                     error={inboxError}
                     onrefresh={() => void refreshInbox()}
-                    onselect={selectActivityHistory}
+                    onselect={selectMainActivity}
+                    onselecthistory={selectActivityHistory}
                   />
                 </div>{/if}
               <div class:inactive={activeSideTab !== 'ship'} class="side-view">
@@ -10050,6 +10074,12 @@
         onshortcut={keydownWorkspace}
         onactivity={recordPaneActivity}
         onhistorychange={() => openCodeTimelineRevision++}
+        activityEvents={currentActivityHistory}
+        activityLoading={inboxLoading}
+        activityError={inboxError}
+        onactivityrefresh={() => void refreshInbox()}
+        onactivityselect={selectActivityHistory}
+        onactivityopen={showActivitySource}
         ondecision={recordDecisionActivity}
         onusage={(id, context) => {
           if (context !== undefined && openCodeUsage[`${directory}:${id}`] !== context)

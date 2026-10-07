@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { workspaceActivityItems } from '../src/lib/workspace-activity.ts';
+import {
+  activityHistoryWithoutLiveItems,
+  workspaceActivityItems,
+} from '../src/lib/workspace-activity.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 
 function child(index: number, state: SpawnReceipt['state'] = 'working'): SpawnReceipt {
@@ -104,5 +107,63 @@ await test('workspace activity preserves input order when tool timestamps are ab
   assert.deepEqual(
     items.map((item) => item.sourceId),
     ['tool-14', 'tool-13', 'tool-12', 'tool-11'],
+  );
+});
+
+await test('durable history excludes sources already shown as live activity', () => {
+  const items = workspaceActivityItems({
+    children: [child(1)],
+    tools: [{ id: 'tool', title: 'Read file', status: 'completed', updated: 2 }],
+  });
+  const events = [
+    {
+      id: 'child-history',
+      workspace: '/repo',
+      kind: 'subagent' as const,
+      source: 'codex',
+      sourceId: 'child-1',
+      title: 'Child task 1',
+      outcome: 'working',
+      at: 2,
+    },
+    {
+      id: 'tool-history',
+      workspace: '/repo',
+      kind: 'tool' as const,
+      source: 'codex',
+      sourceId: 'tool',
+      title: 'Read file',
+      outcome: 'completed',
+      at: 2,
+      agent: 'codex',
+      sessionId: 'session-1',
+    },
+    {
+      id: 'other-tool-history',
+      workspace: '/repo',
+      kind: 'tool' as const,
+      source: 'codex',
+      sourceId: 'tool',
+      title: 'Read file in another session',
+      outcome: 'completed',
+      at: 2,
+      agent: 'codex',
+      sessionId: 'session-2',
+    },
+    {
+      id: 'parent-history',
+      workspace: '/repo',
+      kind: 'parent' as const,
+      source: 'codex',
+      sourceId: 'parent',
+      title: 'Parent task',
+      outcome: 'completed',
+      at: 1,
+    },
+  ];
+
+  assert.deepEqual(
+    activityHistoryWithoutLiveItems(items, events, 'codex', 'session-1').map((event) => event.id),
+    ['other-tool-history', 'parent-history'],
   );
 });

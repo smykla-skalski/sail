@@ -2,6 +2,7 @@
   import WorkspaceActivity from '../../src/WorkspaceActivity.svelte';
   import { workspaceActivityItems } from '../../src/lib/workspace-activity';
   import type { SpawnReceipt } from '../../src/lib/agent-results';
+  import type { ActivityHistoryEvent } from '../../src/lib/activity-history';
 
   const children: SpawnReceipt[] = Array.from({ length: 10 }, (_, index) => ({
     receiptId: `child-${index}`,
@@ -45,6 +46,28 @@
     ],
   });
   let activeItems = $state(items);
+  const events: ActivityHistoryEvent[] = [
+    {
+      id: 'duplicate-child',
+      workspace: '/repo',
+      kind: 'subagent',
+      source: 'codex',
+      sourceId: 'child-9',
+      title: 'Child task 9',
+      outcome: 'working',
+      at: 20,
+    },
+    {
+      id: 'earlier-parent',
+      workspace: '/repo',
+      kind: 'parent',
+      source: 'opencode',
+      sourceId: 'parent',
+      title: 'Earlier parent task',
+      outcome: 'completed',
+      at: 1,
+    },
+  ];
   let opened = $state('');
   let failSelection = $state(false);
 </script>
@@ -57,7 +80,9 @@
     <div id="active-panel">
       <WorkspaceActivity
         items={activeItems}
-        storageKey="e2e-workspace-activity-active"
+        {events}
+        agent="opencode"
+        sessionId="parent"
         onselect={(item) => {
           if (failSelection) {
             failSelection = false;
@@ -65,10 +90,13 @@
           }
           opened = `${item.kind}:${item.sourceId}`;
         }}
+        onselecthistory={(event) => {
+          opened = `${event.kind}:${event.sourceId}`;
+        }}
       />
     </div>
   </div>
-  <div class="composer" aria-label="Fixture composer">Composer remains visible</div>
+  <div class="agent-status-bar" aria-label="Fixture agent status">Agents</div>
   <output aria-label="Opened activity">{opened}</output>
   <button class="fixture-control" aria-label="Clear activity" onclick={() => (activeItems = [])}
     >Clear</button
@@ -83,9 +111,6 @@
     aria-label="Fail activity selection"
     onclick={() => (failSelection = true)}>Fail selection</button
   >
-  <div id="empty-panel">
-    <WorkspaceActivity items={[]} storageKey="e2e-workspace-activity-empty" onselect={() => {}} />
-  </div>
 </main>
 
 <style>
@@ -114,11 +139,13 @@
     padding: 24px;
   }
   #active-panel {
-    display: contents;
+    width: min(420px, 50%);
+    min-width: 0;
+    border-left: 1px solid var(--sui-border);
   }
-  .composer {
-    flex: 0 0 90px;
-    padding: 16px;
+  .agent-status-bar {
+    flex: 0 0 31px;
+    padding: 7px 12px;
     border-top: 1px solid var(--sui-border);
   }
   output {
@@ -133,9 +160,13 @@
     overflow: hidden;
     opacity: 0;
   }
-  #empty-panel {
-    position: absolute;
-    top: 8px;
-    left: 8px;
+  @media (max-width: 850px) {
+    .conversation {
+      display: none;
+    }
+    #active-panel {
+      width: 100%;
+      border-left: 0;
+    }
   }
 </style>

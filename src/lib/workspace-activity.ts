@@ -1,4 +1,5 @@
 import type { SpawnReceipt } from './agent-results.ts';
+import type { ActivityHistoryEvent } from './activity-history.ts';
 import { activityState } from './activity-state.ts';
 import type { PostTurnCheck } from './post-turn-checks.ts';
 
@@ -128,4 +129,27 @@ export function activitySectionItems(
   selected: WorkspaceActivitySection,
 ): WorkspaceActivityItem[] {
   return items.filter((item) => item.section === selected);
+}
+
+export function activityHistoryWithoutLiveItems(
+  items: WorkspaceActivityItem[],
+  events: ActivityHistoryEvent[],
+  agent?: string,
+  sessionId?: string,
+): ActivityHistoryEvent[] {
+  const visible = new Set(
+    items.map((item) =>
+      item.kind === 'child'
+        ? `subagent:${item.sourceId}`
+        : `${item.kind}:${agent ?? ''}:${sessionId ?? ''}:${item.sourceId}`,
+    ),
+  );
+  return events.filter(
+    (event) =>
+      !visible.has(
+        event.kind === 'subagent'
+          ? `subagent:${event.sourceId}`
+          : `${event.kind}:${event.agent ?? ''}:${event.sessionId ?? ''}:${event.sourceId}`,
+      ),
+  );
 }
