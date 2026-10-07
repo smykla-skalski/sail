@@ -23,7 +23,9 @@ browser. Read the tool schemas before calling them.
 ## Worktrees and agents
 
 - Before resuming a Ship task, call `task_checkpoint_read` and inspect its
-  reconciliation result. Stop on a revision or delivery-state mismatch.
+  reconciliation result. Stop on a revision or delivery-state mismatch, unless
+  the user merged the pull request after you reported `awaiting_merge`; then
+  continue with completion.
 - Call `task_checkpoint_update` after every phase, blocker, revision,
   required-gate, unresolved-question, or next-action change. Keep one concrete
   next action; never infer success from the phase alone. Pass the sequence and

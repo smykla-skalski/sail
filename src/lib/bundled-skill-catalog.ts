@@ -46,10 +46,18 @@ const descriptions: Record<BundledSkillName, string> = {
   'adversarial-test': 'Manually test a change in a fresh session',
 };
 
-export function bundledSkillChoices(cores: Record<BundledSkillName, string>): SkillChoice[] {
-  return bundledSkillNames.map((name) => ({
-    name,
-    description: descriptions[name],
-    instructions: progressiveSkillInstructions(name, cores[name], bundledSkillReferences[name]),
-  }));
+export function bundledSkillCorePath(name: BundledSkillName): string {
+  return `../../skills/${name}/SKILL.md`;
+}
+
+export function bundledSkillChoices(cores: Partial<Record<string, string>>): SkillChoice[] {
+  return bundledSkillNames.map((name) => {
+    const core = cores[bundledSkillCorePath(name)];
+    if (core === undefined) throw new Error(`The bundled ${name} skill core is missing.`);
+    return {
+      name,
+      description: descriptions[name],
+      instructions: progressiveSkillInstructions(name, core, bundledSkillReferences[name]),
+    };
+  });
 }

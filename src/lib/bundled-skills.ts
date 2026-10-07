@@ -1,10 +1,12 @@
 import { bundledSkillChoices } from './bundled-skill-catalog';
-import shipIt from '../../skills/ship-it/SKILL.md?raw';
-import review from '../../skills/adversarial-review/SKILL.md?raw';
-import manualTest from '../../skills/adversarial-test/SKILL.md?raw';
 
-export const bundledSkills = bundledSkillChoices({
-  'ship-it': shipIt,
-  'adversarial-review': review,
-  'adversarial-test': manualTest,
-});
+export const bundledSkills = bundledSkillChoices(
+  import.meta.glob<string>(
+    [
+      '../../skills/ship-it/SKILL.md',
+      '../../skills/adversarial-review/SKILL.md',
+      '../../skills/adversarial-test/SKILL.md',
+    ],
+    { query: '?raw', import: 'default', eager: true },
+  ),
+);
