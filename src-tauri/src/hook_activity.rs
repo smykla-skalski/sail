@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_EVENT_BYTES: u64 = 64 * 1024;
@@ -77,24 +77,6 @@ fn connection_root() -> PathBuf {
     std::env::temp_dir().join("sail-hook-bridges")
 }
 
-fn connection_paths() -> Vec<PathBuf> {
-    if let Some(path) = connection_override() {
-        return vec![path];
-    }
-    let Ok(entries) = fs::read_dir(connection_root()) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .take(32)
-        .collect()
-}
-
 fn read_connection(path: &Path) -> Option<(u16, String)> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -153,6 +135,13 @@ fn integration_command(executable: &Path) -> String {
     )
 }
 
+fn integration_executable() -> PathBuf {
+    std::env::var_os("APPIMAGE")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("Sail")))
+}
+
 fn is_sail_handler(value: &Value) -> bool {
     value
         .get("command")
@@ -181,6 +170,49 @@ fn has_integration(value: &Value) -> bool {
         .filter_map(|group| group.get("hooks").and_then(Value::as_array))
         .flatten()
         .any(is_sail_handler)
+}
+
+fn installed_commands(value: &Value) -> Vec<String> {
+    let mut commands: Vec<String> = value
+        .get("hooks")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|hooks| hooks.values())
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|handler| is_sail_handler(handler))
+        .filter_map(|handler| handler.get("command").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+fn integration_complete(value: &Value, expected: &str) -> bool {
+    let Some(hooks) = value.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    let event_handlers = |event: &str| {
+        hooks
+            .get(event)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+            .flatten()
+            .filter(|handler| handler.get("command").and_then(Value::as_str) == Some(expected))
+            .count()
+    };
+    EVENTS.iter().all(|event| event_handlers(event) == 1)
+        && hooks
+            .keys()
+            .map(|event| event_handlers(event))
+            .sum::<usize>()
+            == EVENTS.len()
+        && installed_commands(value) == [expected.to_string()]
 }
 
 fn remove_handlers(value: &mut Value) {
@@ -261,20 +293,22 @@ fn bridge_state(manager: &HookActivityManager) -> (bool, Option<String>) {
 
 fn preview(root: &Path, manager: &HookActivityManager) -> HookIntegrationPreview {
     let file = integration_path(root);
-    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("Sail"));
+    let expected = integration_command(&integration_executable());
     match validate_integration_path(root).and_then(|path| read_config(&path)) {
         Ok(value) => {
             let enabled = has_integration(&value);
+            let commands = installed_commands(&value);
+            let complete = integration_complete(&value, &expected);
             let (active, delivery_error) = bridge_state(manager);
             HookIntegrationPreview {
                 provider: "Claude",
                 scope: "This worktree",
                 file: file.display().to_string(),
-                commands: vec![integration_command(&executable)],
+                commands: if commands.is_empty() { vec![expected] } else { commands },
                 events: EVENTS.to_vec(),
                 trust_impact: "Claude will run the Sail executable for these project hook events. Review and trust the project in Claude before use.",
-                state: if delivery_error.is_some() { "failing" } else if enabled && active { "enabled" } else if enabled { "disconnected" } else { "trust-required" },
-                detail: if let Some(error) = delivery_error { format!("Last delivery failed: {error}") } else if enabled && active { "Connected to this Sail process.".into() } else if enabled { "Configured, but no Sail hook receiver is available.".into() } else { "Not enabled. Claude will request project trust before running project hooks.".into() },
+                state: if (enabled && !complete) || delivery_error.is_some() { "failing" } else if enabled && active { "enabled" } else if enabled { "disconnected" } else { "trust-required" },
+                detail: if enabled && !complete { "Installed handlers are stale, partial, or inconsistent. Remove them before enabling again.".into() } else if let Some(error) = delivery_error { format!("Last delivery failed: {error}") } else if enabled && active { "Connected to this Sail process.".into() } else if enabled { "Configured, but no Sail hook receiver is available.".into() } else { "Not enabled. Claude will request project trust before running project hooks.".into() },
                 enabled,
             }
         }
@@ -282,7 +316,7 @@ fn preview(root: &Path, manager: &HookActivityManager) -> HookIntegrationPreview
             provider: "Claude",
             scope: "This worktree",
             file: file.display().to_string(),
-            commands: vec![integration_command(&executable)],
+            commands: vec![expected],
             events: EVENTS.to_vec(),
             trust_impact: "Configuration must be repaired before Sail can safely edit it.",
             state: "failing",
@@ -319,8 +353,7 @@ pub fn enable_hook_integration(
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or("The hooks setting must be an object.")?;
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let command = integration_command(&executable);
+    let command = integration_command(&integration_executable());
     for event in EVENTS {
         let groups = hooks
             .entry((*event).to_string())
@@ -385,13 +418,9 @@ fn activity(event: Value) -> Result<HookActivity, String> {
     if !EVENTS.contains(&name.as_str()) {
         return Err("Unsupported hook event.".into());
     }
-    let decision = string(&event, &["permission_decision", "decision"], 40);
-    let outcome = match (name.as_str(), decision.as_deref()) {
-        ("PostToolUseFailure", _) => "failed",
-        (_, Some("deny" | "block" | "blocked")) => "blocked",
-        ("Stop" | "SubagentStop", _) => "completed",
-        (_, Some("allow" | "approve")) => "allowed",
-        _ => "ran",
+    let outcome = match name.as_str() {
+        "Stop" | "SubagentStop" => "completed",
+        _ => "observed",
     };
     Ok(HookActivity {
         id: uuid::Uuid::new_v4().to_string(),
@@ -401,11 +430,7 @@ fn activity(event: Value) -> Result<HookActivity, String> {
         source: "Sail-managed project hook",
         outcome,
         action: string(&event, &["tool_name", "toolName"], 120),
-        reason: string(
-            &event,
-            &["permission_decision_reason", "decision_reason", "reason"],
-            1000,
-        ),
+        reason: None,
         actor: string(
             &event,
             &["agent_id", "agentId", "agent_type", "agentType"],
@@ -437,13 +462,27 @@ fn handle_stream(
     token: &str,
     mut stream: TcpStream,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
     let mut bytes = Vec::new();
-    let result = std::io::Read::by_ref(&mut stream)
-        .take(MAX_EVENT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())
-        .and_then(|_| parse_delivery(token, &bytes));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        if Instant::now() >= deadline {
+            break Err("Hook delivery timed out.".into());
+        }
+        let mut chunk = [0_u8; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => break parse_delivery(token, &bytes),
+            Ok(count) => {
+                bytes.extend_from_slice(&chunk[..count]);
+                if bytes.len() > MAX_EVENT_BYTES as usize {
+                    break Err("Hook event is too large.".into());
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => break Err(error.to_string()),
+        }
+    };
     if let Ok(mut state) = manager.0.lock() {
         if let Some(bridge) = state.bridge.as_mut() {
             bridge.last_error = result.as_ref().err().cloned();
@@ -519,10 +558,7 @@ pub fn start_bridge(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let app = app.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let app = app.clone();
-            let manager = manager.clone();
-            let token = token.clone();
-            std::thread::spawn(move || handle_stream(&app, &manager, &token, stream));
+            handle_stream(&app, &manager, &token, stream);
         }
     });
     Ok(())
@@ -541,19 +577,29 @@ pub fn deliver_from_stdin() {
     let Ok(event): Result<Value, _> = serde_json::from_slice(&input) else {
         return;
     };
-    for path in connection_paths() {
-        let Some((port, token)) = read_connection(&path) else {
-            continue;
-        };
-        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-        let Ok(mut stream) =
-            TcpStream::connect_timeout(&address.into(), Duration::from_millis(300))
-        else {
-            continue;
-        };
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
-        let _ = serde_json::to_writer(&mut stream, &json!({"token":token,"event":event}));
-    }
+    let Some(path) = connection_override() else {
+        return;
+    };
+    let Some((port, token)) = read_connection(&path) else {
+        return;
+    };
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    let Ok(mut stream) = TcpStream::connect_timeout(&address.into(), Duration::from_millis(300))
+    else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+    let _ = serde_json::to_writer(&mut stream, &json!({"token":token,"event":event}));
+}
+
+pub fn connection_file(manager: &HookActivityManager) -> Option<PathBuf> {
+    manager
+        .0
+        .lock()
+        .ok()?
+        .bridge
+        .as_ref()
+        .map(|bridge| bridge.connection_file.clone())
 }
 
 pub fn cleanup(manager: &HookActivityManager) {
@@ -600,6 +646,18 @@ mod tests {
     }
 
     #[test]
+    fn integration_requires_one_current_handler_per_event() {
+        let command = integration_command(Path::new("/Applications/Sail"));
+        let mut value = json!({"hooks":{}});
+        for event in EVENTS {
+            value["hooks"][event] = json!([{"hooks":[{"type":"command","command":command}]}]);
+        }
+        assert!(integration_complete(&value, &command));
+        value["hooks"]["Stop"] = json!([]);
+        assert!(!integration_complete(&value, &command));
+    }
+
+    #[test]
     fn public_activity_omits_sensitive_fields() {
         let item = activity(json!({
             "session_id":"parent",
@@ -613,8 +671,9 @@ mod tests {
         .unwrap();
         let public = serde_json::to_value(&item).unwrap();
         assert_eq!(public["sessionId"], "parent");
-        assert_eq!(public["outcome"], "blocked");
+        assert_eq!(public["outcome"], "observed");
         assert_eq!(public["action"], "Bash");
+        assert!(public["reason"].is_null());
         assert!(public.get("toolInput").is_none());
         assert_eq!(public["diagnostics"]["tool_input"]["command"], "secret");
     }

@@ -1,4 +1,4 @@
-export type HookOutcome = 'ran' | 'allowed' | 'blocked' | 'failed' | 'completed';
+export type HookOutcome = 'observed' | 'blocked' | 'failed' | 'completed';
 
 export type HookActivity = {
   id: string;
@@ -15,13 +15,7 @@ export type HookActivity = {
 };
 
 function hookOutcome(value: unknown): value is HookOutcome {
-  return (
-    value === 'ran' ||
-    value === 'allowed' ||
-    value === 'blocked' ||
-    value === 'failed' ||
-    value === 'completed'
-  );
+  return value === 'observed' || value === 'blocked' || value === 'failed' || value === 'completed';
 }
 
 export function parseHookActivity(value: unknown): HookActivity | null {

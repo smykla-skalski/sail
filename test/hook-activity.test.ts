@@ -8,7 +8,7 @@ const event = (sessionId: string) => ({
   sessionId,
   event: 'PreToolUse',
   source: 'Sail-managed project hook',
-  outcome: 'blocked',
+  outcome: 'observed',
   action: 'Bash',
   reason: 'Policy denied it',
   created: Date.now(),

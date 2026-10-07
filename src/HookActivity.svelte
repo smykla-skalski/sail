@@ -4,11 +4,7 @@
 
   let { activity }: { activity: HookActivity } = $props();
   const status = $derived(
-    activity.outcome === 'blocked' || activity.outcome === 'failed'
-      ? 'failed'
-      : activity.outcome === 'ran'
-        ? 'working'
-        : 'completed',
+    activity.outcome === 'blocked' || activity.outcome === 'failed' ? 'failed' : 'completed',
   );
 </script>
 

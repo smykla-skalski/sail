@@ -374,7 +374,7 @@
   let authMethods = $state<AgentAuthMethod[]>([]);
   let authNeeded = $state(false);
   let authenticating = $state(false);
-  let activeSessionId: string | null = null;
+  let activeSessionId = $state<string | null>(null);
   const visibleHookActivities = $derived(activityForSession(hookActivities, activeSessionId));
   $effect(() => {
     const sessionId = activeSessionId;

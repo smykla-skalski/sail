@@ -51,38 +51,55 @@
   let hookLoading = $state(false);
   let hookDirectory = '';
   let hookIntegration = $state<HookIntegration | null>(null);
+  let integrationDirectory = '';
+  let integrationRequest = 0;
   let integrationLoading = $state(false);
   let integrationError = $state('');
 
   async function inspectIntegration(directory: string) {
+    const request = ++integrationRequest;
+    integrationDirectory = directory;
     hookIntegration = null;
     integrationError = '';
-    if (!directory) return;
+    if (!directory) {
+      integrationLoading = false;
+      return;
+    }
     integrationLoading = true;
     try {
-      hookIntegration = await invoke<HookIntegration>('inspect_hook_integration', {
+      const result = await invoke<HookIntegration>('inspect_hook_integration', {
         worktree: directory,
       });
+      if (request === integrationRequest && integrationDirectory === directory)
+        hookIntegration = result;
     } catch (cause) {
-      integrationError = String(cause);
+      if (request === integrationRequest && integrationDirectory === directory)
+        integrationError = String(cause);
     } finally {
-      integrationLoading = false;
+      if (request === integrationRequest && integrationDirectory === directory)
+        integrationLoading = false;
     }
   }
 
   async function changeIntegration(command: 'enable_hook_integration' | 'remove_hook_integration') {
-    if (!snapshot?.directory) return;
+    const directory = snapshot?.directory;
+    if (!directory || integrationDirectory !== directory) return;
+    const request = ++integrationRequest;
     integrationLoading = true;
     integrationError = '';
     try {
-      hookIntegration = await invoke<HookIntegration>(command, {
-        worktree: snapshot.directory,
+      const result = await invoke<HookIntegration>(command, {
+        worktree: directory,
       });
-      await inspectHooks(snapshot.directory);
+      if (request !== integrationRequest || snapshot?.directory !== directory) return;
+      hookIntegration = result;
+      await inspectHooks(directory);
     } catch (cause) {
-      integrationError = String(cause);
+      if (request === integrationRequest && snapshot?.directory === directory)
+        integrationError = String(cause);
     } finally {
-      integrationLoading = false;
+      if (request === integrationRequest && snapshot?.directory === directory)
+        integrationLoading = false;
     }
   }
 
@@ -198,11 +215,11 @@
       try {
         const stop = await listen<SettingsSnapshot>(settingsState, (event) => {
           snapshot = event.payload;
-          if (selectedSection === 'agents' && snapshot.directory !== hookDirectory)
-            void Promise.all([
-              inspectHooks(snapshot.directory),
-              inspectIntegration(snapshot.directory),
-            ]);
+          if (selectedSection === 'agents') {
+            if (snapshot.directory !== hookDirectory) void inspectHooks(snapshot.directory);
+            if (snapshot.directory !== integrationDirectory)
+              void inspectIntegration(snapshot.directory);
+          }
           document.documentElement.dataset.suiTheme = snapshot.theme;
           if (!binaryDirty) binaryPath = snapshot.binaryPath;
           if (!personalChecksDirty) personalChecks = snapshot.personalPostTurnChecks.join('\n');
@@ -246,11 +263,11 @@
         aria-current={selectedSection === 'agents' ? 'page' : undefined}
         onclick={() => {
           selectedSection = 'agents';
-          if (snapshot?.directory && snapshot.directory !== hookDirectory)
-            void Promise.all([
-              inspectHooks(snapshot.directory),
-              inspectIntegration(snapshot.directory),
-            ]);
+          if (snapshot?.directory) {
+            if (snapshot.directory !== hookDirectory) void inspectHooks(snapshot.directory);
+            if (snapshot.directory !== integrationDirectory)
+              void inspectIntegration(snapshot.directory);
+          }
         }}>Agents</button
       >
     </nav>
@@ -457,6 +474,13 @@
               >Enable reviewed integration</Button
             >
           {/if}
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={integrationLoading}
+            onclick={() => snapshot?.directory && void inspectIntegration(snapshot.directory)}
+            >Refresh integration health</Button
+          >
         {:else}
           <Button
             size="sm"
