@@ -268,6 +268,26 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'cancelled' } });
       continue;
     }
+    if (text === 'Agent text interrupted') {
+      update(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Step inter' },
+      });
+      update(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'rupted' },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Discuss interruption') {
+      update(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'The previous step was interrupted, then recovered.' },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text.startsWith('Gate prompt model unavailable')) {
       send({ id: message.id, error: { code: -1, message: 'Model x is unavailable' } });
       continue;

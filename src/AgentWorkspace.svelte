@@ -55,6 +55,7 @@
   } from './lib/agent-queue';
   import {
     acp,
+    acpPromptInterrupted,
     groupAgentEntries,
     loadRecentTranscript,
     restoreEntryTimes,
@@ -1169,14 +1170,13 @@
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
         throw cause;
       }
-      if (recoveredDraft && result.stopReason !== 'cancelled' && !stopRequested)
-        recoveredDraft = false;
-      if (result.stopReason === 'cancelled') finalStatus = 'interrupted';
-      if (result.stopReason === 'cancelled' || stopRequested) notifyOnDone = false;
+      if (recoveredDraft && !acpPromptInterrupted(result) && !stopRequested) recoveredDraft = false;
+      if (acpPromptInterrupted(result)) finalStatus = 'interrupted';
+      if (acpPromptInterrupted(result) || stopRequested) notifyOnDone = false;
       if (external && !queuedMessage && finalStatus === 'interrupted')
         throw new Error('Agent turn was cancelled.');
       if (current === generation && stopRequested)
-        markTools(result.stopReason === 'cancelled' ? 'cancelled' : 'status unconfirmed', [
+        markTools(acpPromptInterrupted(result) ? 'cancelled' : 'status unconfirmed', [
           'pending',
           'in_progress',
           'stopping',

@@ -155,6 +155,25 @@ describe('agent thread attention', () => {
       'interrupted',
     );
 
+    await waitForComposer();
+    await $('.agent-composer textarea').setValue('Agent text interrupted');
+    await $('.agent-actions button').click();
+    await $('.agent-launches button').click();
+    const textInterrupted = $('.project-agent-row[aria-label*="Agent text interrupted"]');
+    await expect(textInterrupted.$('.activity-status')).toHaveAttribute(
+      'data-state',
+      'interrupted',
+    );
+    await expect(textInterrupted).toHaveText(expect.stringContaining('Interrupted'));
+
+    await waitForComposer();
+    await $('.agent-composer textarea').setValue('Discuss interruption');
+    await $('.agent-actions button').click();
+    await $('.agent-launches button').click();
+    const discussed = $('.project-agent-row[aria-label*="Discuss interruption"]');
+    await expect(discussed.$('.activity-status')).toHaveAttribute('data-state', 'done');
+    await expect(discussed).toHaveText(expect.stringContaining('Completed'));
+
     await openSettings();
     await $('.settings-navigation button:nth-of-type(3)').click();
     const options = await $$('.attention-setting input');

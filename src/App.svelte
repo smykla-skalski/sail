@@ -193,6 +193,7 @@
   } from './lib/panes';
   import {
     acp,
+    acpPromptInterrupted,
     forgetRecentTranscript,
     loadAgentThreads,
     loadInterruptedAgentTurns,
@@ -2999,7 +3000,7 @@
         (outcome) => {
           const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
           updateSpawnReceipt(receipt.receiptId, {
-            state: outcome.stopReason === 'cancelled' ? 'interrupted' : 'completed',
+            state: acpPromptInterrupted(outcome) ? 'interrupted' : 'completed',
             result: spawnOutput.get(receipt.receiptId) ?? current?.result ?? null,
           });
           spawnOutput.delete(receipt.receiptId);
@@ -3226,7 +3227,7 @@
                 await recordImplementationModel(thread.directory, thread.model, tracking);
                 updateAgentThreadStatus(
                   thread,
-                  outcome.stopReason === 'cancelled' ? 'interrupted' : 'done',
+                  acpPromptInterrupted(outcome) ? 'interrupted' : 'done',
                 );
                 return undefined;
               },
@@ -4270,14 +4271,11 @@
         async (outcome) => {
           if (tracking)
             await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
-          updateAgentThreadStatus(
-            thread,
-            outcome.stopReason === 'cancelled' ? 'interrupted' : 'done',
-          );
+          updateAgentThreadStatus(thread, acpPromptInterrupted(outcome) ? 'interrupted' : 'done');
           if (receiptId) {
             const current = spawnReceipts.find((item) => item.receiptId === receiptId);
             updateSpawnReceipt(receiptId, {
-              state: outcome.stopReason === 'cancelled' ? 'interrupted' : 'completed',
+              state: acpPromptInterrupted(outcome) ? 'interrupted' : 'completed',
               result: spawnOutput.get(receiptId) ?? current?.result ?? null,
             });
             spawnOutput.delete(receiptId);
@@ -7411,8 +7409,8 @@
               if (!disposed)
                 updateAgentThreadStatus(
                   recoveredThread,
-                  outcome.stopReason === 'cancelled' ? 'interrupted' : 'done',
-                  outcome.stopReason !== 'cancelled',
+                  acpPromptInterrupted(outcome) ? 'interrupted' : 'done',
+                  !acpPromptInterrupted(outcome),
                 );
             } catch (cause) {
               if (!disposed) {

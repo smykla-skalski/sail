@@ -29,6 +29,15 @@ export interface InterruptedAgentTurn {
   text: string;
 }
 
+export interface AcpPromptOutcome {
+  stopReason: string;
+  sailInterrupted?: boolean;
+}
+
+export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
+  return outcome.stopReason === 'cancelled' || outcome.sailInterrupted === true;
+}
+
 export function loadInterruptedAgentTurns(raw: string | null): InterruptedAgentTurn[] {
   try {
     const value: unknown = JSON.parse(raw ?? '[]');
@@ -466,7 +475,7 @@ export const acp = {
     turnId: string,
     imagePaths: string[] = [],
   ) =>
-    invoke<{ stopReason: string }>('acp_prompt', {
+    invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, sessionId, text, turnId, imagePaths },
     }),
   steer: (agent: AgentId, sessionId: string, text: string, imagePaths: string[] = []) =>

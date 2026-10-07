@@ -314,6 +314,17 @@ struct PromptState {
 struct ActivePrompt {
     turn_id: String,
     text: String,
+    last_agent_message: String,
+    agent_message_open: bool,
+    agent_message_overflow: bool,
+}
+
+fn reports_interruption(prompt: &ActivePrompt) -> bool {
+    !prompt.agent_message_overflow
+        && prompt
+            .last_agent_message
+            .trim()
+            .eq_ignore_ascii_case("Step interrupted")
 }
 
 #[derive(Clone, Serialize)]
@@ -687,6 +698,44 @@ fn connect_blocking(
                 continue;
             };
             if let Some(update) = message.pointer("/params/update") {
+                if let Some(session_id) =
+                    message.pointer("/params/sessionId").and_then(Value::as_str)
+                {
+                    if let Ok(mut prompts) = reader.prompt_state.lock() {
+                        if let Some(prompt) = prompts.active.get_mut(session_id) {
+                            match update.get("sessionUpdate").and_then(Value::as_str) {
+                                Some("agent_message_chunk") => {
+                                    if let Some(text) =
+                                        update.pointer("/content/text").and_then(Value::as_str)
+                                    {
+                                        if !prompt.agent_message_open {
+                                            prompt.last_agent_message.clear();
+                                            prompt.agent_message_overflow = false;
+                                        }
+                                        prompt.agent_message_open = true;
+                                        if !prompt.agent_message_overflow {
+                                            if prompt.last_agent_message.len() + text.len() <= 256 {
+                                                prompt.last_agent_message.push_str(text);
+                                            } else {
+                                                prompt.last_agent_message.clear();
+                                                prompt.agent_message_overflow = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(
+                                    "user_message_chunk"
+                                    | "agent_thought_chunk"
+                                    | "tool_call"
+                                    | "tool_call_update",
+                                ) => {
+                                    prompt.agent_message_open = false;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 if update.get("sessionUpdate").and_then(Value::as_str) == Some("subagent_spawned") {
                     let parent_id = message.pointer("/params/sessionId").and_then(Value::as_str);
                     let child_id = update.get("subagentSessionId").and_then(Value::as_str);
@@ -1067,6 +1116,9 @@ pub async fn acp_prompt(
             ActivePrompt {
                 turn_id: turn_id.clone(),
                 text: text.clone(),
+                last_agent_message: String::new(),
+                agent_message_open: false,
+                agent_message_overflow: false,
             },
         );
     }
@@ -1077,7 +1129,7 @@ pub async fn acp_prompt(
         }),
     );
     tauri::async_runtime::spawn_blocking(move || {
-        let result = runtime.request(
+        let mut result = runtime.request(
             "session/prompt",
             json!({
                 "sessionId":session_id,"prompt":content
@@ -1095,7 +1147,19 @@ pub async fn acp_prompt(
             .and_then(|value| value.get("stopReason"))
             .and_then(Value::as_str)
             == Some("cancelled");
-        let interrupted = cancelled_result || (explicitly_cancelled && result.is_err());
+        let reported_interruption = runtime
+            .prompt_state
+            .lock()
+            .ok()
+            .and_then(|prompts| prompts.active.get(&session_id).map(reports_interruption))
+            .unwrap_or(false);
+        let interrupted =
+            cancelled_result || reported_interruption || (explicitly_cancelled && result.is_err());
+        if interrupted {
+            if let Ok(Value::Object(payload)) = &mut result {
+                payload.insert("sailInterrupted".into(), Value::Bool(true));
+            }
+        }
         let status = if interrupted {
             "interrupted"
         } else if result.is_err() {
@@ -1106,9 +1170,10 @@ pub async fn acp_prompt(
         crate::diagnostics::record("prompt_finished", json!({
             "agent":agent,"sessionId":session_id,"turnId":turn_id,
             "status":status,"explicitlyCancelled":explicitly_cancelled,
+            "reportedInterruption":reported_interruption,
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
-        let notify = !explicitly_cancelled && !cancelled_result;
+        let notify = !explicitly_cancelled && !interrupted;
         let latest = if let Ok(mut prompts) = runtime.prompt_state.lock() {
             if prompts
                 .active
