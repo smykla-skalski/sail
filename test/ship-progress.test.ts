@@ -5,6 +5,7 @@ import {
   appendShipEvent,
   beginLatestRefresh,
   ciStatus,
+  completedInlineShipGate,
   dependencyUrl,
   shipGatesSettled,
   shipEvidenceReadiness,
@@ -138,7 +139,36 @@ function withMergeEvidence(issue: ReturnType<typeof fixture>['issues'][number]) 
       criteria: [],
     },
   );
-  return { ...issue, evidenceRevision: revision, evidenceManifests };
+  const requiredGates = issue.checkpoint!.requiredGates;
+  return {
+    ...issue,
+    evidenceRevision: revision,
+    evidenceManifests,
+    validationPolicy: {
+      risk: 'high' as const,
+      requiredGates,
+      sources: ['test fixture'],
+      revision,
+      changedPaths: [],
+      selectedAt: 1,
+      history: [],
+    },
+    gates: requiredGates.map((gate, index) => ({
+      id: `gate-${gate}`,
+      gate,
+      requestedModel: 'test',
+      provider: 'codex',
+      model: 'test',
+      threadId: `thread-${gate}`,
+      directory: '/repo',
+      state: 'completed' as const,
+      created: 10 + index,
+      updated: 10 + index,
+      error: null,
+      verdict: gate === 'test-adversary' ? ('PASS' as const) : ('CLEAN' as const),
+      revision,
+    })),
+  };
 }
 
 void test('restores umbrella, gate verdict and model after receipts are pruned', () => {
@@ -396,6 +426,71 @@ void test('merge readiness rejects missing, failed, and stale revision evidence'
   issue.evidenceRevision = 'revision-two';
   assert.equal(shipEvidenceReadiness(issue).stale, true);
   assert.match(shipIssuePresentation(run, issue).nextAction, /missing or stale/);
+  assert.equal(shipMergeClaim(issue), 'PR open');
+});
+
+void test('inline validation gates retain their current worktree revision', () => {
+  const gate = completedInlineShipGate(
+    {
+      id: 'inline-gate',
+      gate: 'test-adversary',
+      requestedModel: 'implementation session',
+      provider: 'codex',
+      model: 'test',
+      threadId: 'worker',
+      directory: '/repo',
+      error: null,
+      verdict: 'PASS',
+      revision: 'revision-current',
+    },
+    42,
+  );
+
+  assert.equal(gate.revision, 'revision-current');
+  assert.equal(gate.state, 'completed');
+});
+
+void test('passing evidence cannot authorize merge after its validator fails', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, {
+    ...withMergeEvidence(issue),
+    state: 'awaiting_merge',
+    pullRequest: 'https://example.test/pull/2',
+    pullRequestHead: 'commit-one',
+    evidenceCommit: 'commit-one',
+    checks: [{ name: 'build', state: 'SUCCESS', url: 'https://example.test/build' }],
+    validationPolicyRequired: true,
+    validationPolicy: {
+      risk: 'low',
+      requiredGates: ['test-adversary'],
+      sources: ['test'],
+      revision: 'revision-one',
+      changedPaths: [],
+      selectedAt: 1,
+      history: [],
+    },
+    gates: [
+      {
+        id: 'failed-validator',
+        gate: 'test-adversary',
+        requestedModel: 'test',
+        provider: 'codex',
+        model: 'test',
+        threadId: 'validator',
+        directory: '/repo',
+        state: 'failed',
+        created: 1,
+        updated: 2,
+        error: 'validator failed after reporting',
+        verdict: 'PASS',
+        revision: 'revision-one',
+      },
+    ],
+  });
+
+  assert.equal(shipEvidenceReadiness(issue).ready, false);
+  assert.match(shipEvidenceReadiness(issue).reason!, /not completed/);
   assert.equal(shipMergeClaim(issue), 'PR open');
 });
 

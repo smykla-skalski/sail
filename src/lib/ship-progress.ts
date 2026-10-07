@@ -66,6 +66,28 @@ export type ShipGate = GateMetadata & {
   error: string | null;
 };
 
+export function completedInlineShipGate(
+  gate: Omit<ShipGate, 'state' | 'created' | 'updated' | 'revision'> & { revision: string },
+  now: number,
+): ShipGate {
+  return { ...gate, revision: gate.revision, state: 'completed', created: now, updated: now };
+}
+
+export function requiredValidationGatesSatisfied(
+  policy:
+    Pick<NonNullable<ShipIssue['validationPolicy']>, 'requiredGates' | 'revision'> | undefined,
+  gates: ShipGate[],
+): boolean {
+  if (!policy) return false;
+  return policy.requiredGates.every((name) => {
+    const gate = gates
+      .filter((item) => item.gate === name && item.revision === policy.revision)
+      .toSorted((left, right) => right.updated - left.updated)[0];
+    if (!gate || gate.state !== 'completed') return false;
+    return name === 'test-adversary' ? gate.verdict === 'PASS' : gate.verdict === 'CLEAN';
+  });
+}
+
 export const gateMetadataSchema = z.object({
   gate: z.enum(gateNames),
   requestedModel: z.string(),
@@ -216,6 +238,17 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     issue.checkpoint.requiredGates,
     issue.checkpoint.acceptanceCriteria,
   );
+  if (
+    issue.validationPolicyRequired &&
+    !requiredValidationGatesSatisfied(issue.validationPolicy, issue.gates ?? [])
+  )
+    return {
+      ...readiness,
+      ready: false,
+      reason:
+        readiness.reason ??
+        'Required validation gates are not completed for the selected revision.',
+    };
   if (issue.refreshError)
     return {
       ...readiness,

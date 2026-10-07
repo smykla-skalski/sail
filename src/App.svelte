@@ -39,6 +39,7 @@
   import {
     appendShipEvent,
     beginLatestRefresh,
+    completedInlineShipGate,
     gateSnapshot,
     loadShipRuns,
     parseShipReport,
@@ -88,6 +89,7 @@
   } from './lib/task-evidence.ts';
   import {
     selectShipValidationPolicy,
+    readStableShipValidationInputs,
     assertShipGateAllowed,
     requiredShipGatesSatisfied,
     shipRiskLevels,
@@ -3953,11 +3955,11 @@
       const explicitRisk = request.arguments.risk;
       if (!shipRiskLevels.includes(explicitRisk as ShipRisk))
         throw new Error('Choose validation risk low, medium, or high.');
-      const [revision, changedPaths, config] = await Promise.all([
-        invoke<string>('working_tree_revision', { path: request.directory }),
-        invoke<string[]>('shipping_changed_paths', { path: request.directory }),
-        invoke<WorktreeConfig | null>('worktree_config', { worktree: request.directory }),
-      ]);
+      const { revision, changedPaths, config } = await readStableShipValidationInputs(
+        () => invoke<string>('working_tree_revision', { path: request.directory }),
+        () => invoke<string[]>('shipping_changed_paths', { path: request.directory }),
+        () => invoke<WorktreeConfig | null>('worktree_config', { worktree: request.directory }),
+      );
       const policy = selectShipValidationPolicy(
         config?.validation,
         changedPaths,
@@ -4204,21 +4206,22 @@
             : null,
           gates: [
             ...(owner.issue.gates ?? []),
-            {
-              id: `inline:${sourceId}:${report.gate}:${crypto.randomUUID()}`,
-              gate: report.gate,
-              requestedModel: model ?? 'implementation session',
-              provider: owner.run.provider,
-              model,
-              threadId: sourceId,
-              directory: request.directory,
-              state: 'completed',
-              created: now,
-              updated: now,
-              error: null,
-              verdict: report.verdict,
-              reason: report.reason,
-            },
+            completedInlineShipGate(
+              {
+                id: `inline:${sourceId}:${report.gate}:${crypto.randomUUID()}`,
+                gate: report.gate,
+                requestedModel: model ?? 'implementation session',
+                provider: owner.run.provider,
+                model,
+                threadId: sourceId,
+                directory: request.directory,
+                error: null,
+                verdict: report.verdict,
+                reason: report.reason,
+                revision,
+              },
+              now,
+            ),
           ],
           events: appendShipEvent(
             owner.issue.events,

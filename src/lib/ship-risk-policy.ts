@@ -1,6 +1,10 @@
 import { z } from 'zod';
-import { gateNames, type GateName, type ShipGate } from './ship-progress.ts';
-import { shippingWorkerSettled } from './issue-shipping.ts';
+import {
+  gateNames,
+  requiredValidationGatesSatisfied,
+  type GateName,
+  type ShipGate,
+} from './ship-progress.ts';
 
 export const shipRiskLevels = ['low', 'medium', 'high'] as const;
 export type ShipRisk = (typeof shipRiskLevels)[number];
@@ -172,14 +176,27 @@ export function requiredShipGatesSatisfied(
   policy: ShipValidationPolicy | undefined,
   gates: ShipGate[],
 ): boolean {
-  if (!policy) return false;
-  return policy.requiredGates.every((name) => {
-    const gate = gates
-      .filter((item) => item.gate === name)
-      .toSorted((left, right) => right.updated - left.updated)[0];
-    if (!gate || !shippingWorkerSettled(gate.state)) return false;
-    return name === 'test-adversary' ? gate.verdict === 'PASS' : gate.verdict === 'CLEAN';
-  });
+  return requiredValidationGatesSatisfied(policy, gates);
+}
+
+export async function readStableShipValidationInputs<T>(
+  readRevision: () => Promise<string>,
+  readChangedPaths: () => Promise<string[]>,
+  readConfig: () => Promise<T>,
+  maxAttempts = 3,
+): Promise<{ revision: string; changedPaths: string[]; config: T }> {
+  async function readAttempt(
+    attemptsRemaining: number,
+  ): Promise<{ revision: string; changedPaths: string[]; config: T }> {
+    const revision = await readRevision();
+    const [changedPaths, config] = await Promise.all([readChangedPaths(), readConfig()]);
+    if ((await readRevision()) === revision) return { revision, changedPaths, config };
+    if (attemptsRemaining > 1) return readAttempt(attemptsRemaining - 1);
+    throw new Error(
+      'The worktree kept changing while selecting validation risk. Retry when stable.',
+    );
+  }
+  return readAttempt(Math.max(1, maxAttempts));
 }
 
 export function assertShipGateAllowed(

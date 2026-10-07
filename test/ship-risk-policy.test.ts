@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   assertShipGateAllowed,
   pathMatchesRiskPattern,
+  readStableShipValidationInputs,
   requiredShipGatesSatisfied,
   selectShipValidationPolicy,
   shipValidationConfigSchema,
@@ -34,6 +35,7 @@ function gate(name: ShipGate['gate'], verdict: ShipGate['verdict'], updated = 1)
     updated,
     error: null,
     verdict,
+    revision: 'revision-a',
   };
 }
 
@@ -129,6 +131,51 @@ void test('all required gates need a latest successful terminal verdict', () => 
     false,
   );
   assert.equal(requiredShipGatesSatisfied(undefined, [clean, findings, pass]), false);
+});
+
+void test('required gates reject stale revisions and non-completed passing verdicts', () => {
+  const policy = selectShipValidationPolicy(config, [], 'low', 'revision-a', undefined, 10);
+  const pass = gate('test-adversary', 'PASS');
+
+  assert.equal(requiredShipGatesSatisfied(policy, [{ ...pass, revision: 'revision-old' }]), false);
+  assert.equal(requiredShipGatesSatisfied(policy, [{ ...pass, state: 'failed' }]), false);
+  assert.equal(requiredShipGatesSatisfied(policy, [{ ...pass, state: 'interrupted' }]), false);
+  assert.equal(
+    requiredShipGatesSatisfied(policy, [pass, { ...pass, updated: 2, state: 'failed' }]),
+    false,
+  );
+});
+
+void test('validation inputs retry until paths and config share one stable revision', async () => {
+  const revisions = ['revision-a', 'revision-b', 'revision-b', 'revision-b'];
+  const paths = [['stale.ts'], ['current.ts']];
+  const configs = [{ source: 'stale' }, { source: 'current' }];
+
+  const result = await readStableShipValidationInputs(
+    async () => revisions.shift()!,
+    async () => paths.shift()!,
+    async () => configs.shift()!,
+  );
+
+  assert.deepEqual(result, {
+    revision: 'revision-b',
+    changedPaths: ['current.ts'],
+    config: { source: 'current' },
+  });
+});
+
+void test('validation selection fails when the worktree never stabilizes', async () => {
+  let revision = 0;
+
+  await assert.rejects(
+    readStableShipValidationInputs(
+      async () => `revision-${revision++}`,
+      async () => ['current.ts'],
+      async () => ({ source: 'repository' }),
+      2,
+    ),
+    /kept changing/,
+  );
 });
 
 void test('gate enforcement rejects missing, stale, and non-required policy', () => {
