@@ -214,7 +214,7 @@
   .agent-status-row {
     display: grid;
     width: 100%;
-    grid-template-columns: 92px minmax(0, 1fr) auto 10px;
+    grid-template-columns: 92px minmax(0, 1fr) max-content 10px;
     align-items: center;
     gap: 12px;
     padding: 11px 16px;
@@ -240,6 +240,12 @@
   .agent-status-agent {
     align-items: center;
     gap: 7px;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .agent-status-agent strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .agent-status-task {
     flex-direction: column;
@@ -247,6 +253,7 @@
   }
   .agent-status-task strong,
   .agent-status-task small {
+    display: block;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
