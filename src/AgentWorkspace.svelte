@@ -1171,11 +1171,10 @@
       }
       if (recoveredDraft && result.stopReason !== 'cancelled' && !stopRequested)
         recoveredDraft = false;
-      if (result.stopReason === 'cancelled' || stopRequested) {
-        finalStatus = 'interrupted';
-        notifyOnDone = false;
-      }
-      if (external && !queuedMessage && !notifyOnDone) throw new Error('Agent turn was cancelled.');
+      if (result.stopReason === 'cancelled') finalStatus = 'interrupted';
+      if (result.stopReason === 'cancelled' || stopRequested) notifyOnDone = false;
+      if (external && !queuedMessage && finalStatus === 'interrupted')
+        throw new Error('Agent turn was cancelled.');
       if (current === generation && stopRequested)
         markTools(result.stopReason === 'cancelled' ? 'cancelled' : 'status unconfirmed', [
           'pending',

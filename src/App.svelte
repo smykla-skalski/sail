@@ -2999,10 +2999,7 @@
         (outcome) => {
           const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
           updateSpawnReceipt(receipt.receiptId, {
-            state:
-              outcome.stopReason === 'cancelled' || current?.state === 'interrupted'
-                ? 'interrupted'
-                : 'completed',
+            state: outcome.stopReason === 'cancelled' ? 'interrupted' : 'completed',
             result: spawnOutput.get(receipt.receiptId) ?? current?.result ?? null,
           });
           spawnOutput.delete(receipt.receiptId);
@@ -4280,10 +4277,7 @@
           if (receiptId) {
             const current = spawnReceipts.find((item) => item.receiptId === receiptId);
             updateSpawnReceipt(receiptId, {
-              state:
-                outcome.stopReason === 'cancelled' || current?.state === 'interrupted'
-                  ? 'interrupted'
-                  : 'completed',
+              state: outcome.stopReason === 'cancelled' ? 'interrupted' : 'completed',
               result: spawnOutput.get(receiptId) ?? current?.result ?? null,
             });
             spawnOutput.delete(receiptId);
@@ -7753,13 +7747,7 @@
       ))
         updateSpawnReceipt(receipt.receiptId, {
           state:
-            status === 'failed'
-              ? 'failed'
-              : status === 'interrupted'
-                ? 'interrupted'
-                : event.message.params?.notify === false
-                  ? 'interrupted'
-                  : 'completed',
+            status === 'failed' ? 'failed' : status === 'interrupted' ? 'interrupted' : 'completed',
           result: spawnOutput.get(receipt.receiptId) ?? receipt.result,
           error:
             typeof event.message.params?.error === 'string'

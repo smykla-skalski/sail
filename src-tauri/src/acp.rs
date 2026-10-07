@@ -1089,13 +1089,13 @@ pub async fn acp_prompt(
             .lock()
             .map(|mut cancelled| cancelled.remove(&turn_id))
             .unwrap_or(false);
-        let interrupted = explicitly_cancelled
-            || result
-                .as_ref()
-                .ok()
-                .and_then(|value| value.get("stopReason"))
-                .and_then(Value::as_str)
-                == Some("cancelled");
+        let cancelled_result = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("stopReason"))
+            .and_then(Value::as_str)
+            == Some("cancelled");
+        let interrupted = cancelled_result || (explicitly_cancelled && result.is_err());
         let status = if interrupted {
             "interrupted"
         } else if result.is_err() {
@@ -1108,7 +1108,7 @@ pub async fn acp_prompt(
             "status":status,"explicitlyCancelled":explicitly_cancelled,
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
-        let notify = !interrupted;
+        let notify = !explicitly_cancelled && !cancelled_result;
         let latest = if let Ok(mut prompts) = runtime.prompt_state.lock() {
             if prompts
                 .active

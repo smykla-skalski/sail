@@ -119,6 +119,16 @@ describe('agent thread attention', () => {
     );
 
     await waitForComposer();
+    await $('.agent-composer textarea').setValue('Cancel ignored');
+    await $('.agent-actions button').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    await $('.agent-busy button').click();
+    await $('.agent-launches button').click();
+    const completedAfterCancel = $('.project-agent-row[aria-label*="Cancel ignored"]');
+    await expect(completedAfterCancel.$('.activity-status')).toHaveAttribute('data-state', 'done');
+    await expect(completedAfterCancel).toHaveText(expect.stringContaining('Completed'));
+
+    await waitForComposer();
     await $('.agent-composer textarea').setValue('Agent interrupted');
     await $('.agent-actions button').click();
     const agentInterrupted = $('.project-agent-row[aria-label*="Agent interrupted"]');
