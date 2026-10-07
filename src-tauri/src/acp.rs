@@ -317,14 +317,103 @@ struct ActivePrompt {
     last_agent_message: String,
     agent_message_open: bool,
     agent_message_overflow: bool,
+    known_tool_calls: HashSet<String>,
 }
 
-fn reports_interruption(prompt: &ActivePrompt) -> bool {
-    !prompt.agent_message_overflow
-        && prompt
-            .last_agent_message
-            .trim()
-            .eq_ignore_ascii_case("Step interrupted")
+impl ActivePrompt {
+    fn observe_update(&mut self, update: &Value) {
+        match update.get("sessionUpdate").and_then(Value::as_str) {
+            Some("agent_message_chunk") => {
+                if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
+                    if !self.agent_message_open {
+                        self.last_agent_message.clear();
+                        self.agent_message_overflow = false;
+                    }
+                    self.agent_message_open = true;
+                    if !self.agent_message_overflow {
+                        if self.last_agent_message.len() + text.len() <= 256 {
+                            self.last_agent_message.push_str(text);
+                        } else {
+                            self.last_agent_message.clear();
+                            self.agent_message_overflow = true;
+                        }
+                    }
+                }
+            }
+            Some("user_message_chunk" | "agent_thought_chunk") => {
+                if update
+                    .pointer("/content/text")
+                    .and_then(Value::as_str)
+                    .is_some()
+                {
+                    self.agent_message_open = false;
+                }
+            }
+            Some("tool_call" | "tool_call_update") => {
+                if let Some(id) = update.get("toolCallId").and_then(Value::as_str) {
+                    if self.known_tool_calls.insert(id.to_string()) {
+                        self.agent_message_open = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn reports_interruption(&self) -> bool {
+        !self.agent_message_overflow
+            && self
+                .last_agent_message
+                .trim()
+                .eq_ignore_ascii_case("Step interrupted")
+    }
+}
+
+#[cfg(test)]
+mod interruption_report_tests {
+    use super::*;
+
+    fn prompt() -> ActivePrompt {
+        ActivePrompt {
+            turn_id: "turn".into(),
+            text: "task".into(),
+            last_agent_message: String::new(),
+            agent_message_open: false,
+            agent_message_overflow: false,
+            known_tool_calls: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn existing_tool_update_keeps_split_interruption_message_together() {
+        let mut active = prompt();
+        for update in [
+            json!({"sessionUpdate":"tool_call","toolCallId":"read"}),
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"Step "}}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"read"}),
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"interrupted"}}),
+        ] {
+            active.observe_update(&update);
+        }
+        assert!(active.reports_interruption());
+    }
+
+    #[test]
+    fn new_tool_or_longer_answer_does_not_report_interruption() {
+        let mut active = prompt();
+        for update in [
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"Step "}}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"new"}),
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"interrupted"}}),
+        ] {
+            active.observe_update(&update);
+        }
+        assert!(!active.reports_interruption());
+        active.observe_update(
+            &json!({"sessionUpdate":"agent_message_chunk","content":{"text":" but recovered"}}),
+        );
+        assert!(!active.reports_interruption());
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -703,36 +792,7 @@ fn connect_blocking(
                 {
                     if let Ok(mut prompts) = reader.prompt_state.lock() {
                         if let Some(prompt) = prompts.active.get_mut(session_id) {
-                            match update.get("sessionUpdate").and_then(Value::as_str) {
-                                Some("agent_message_chunk") => {
-                                    if let Some(text) =
-                                        update.pointer("/content/text").and_then(Value::as_str)
-                                    {
-                                        if !prompt.agent_message_open {
-                                            prompt.last_agent_message.clear();
-                                            prompt.agent_message_overflow = false;
-                                        }
-                                        prompt.agent_message_open = true;
-                                        if !prompt.agent_message_overflow {
-                                            if prompt.last_agent_message.len() + text.len() <= 256 {
-                                                prompt.last_agent_message.push_str(text);
-                                            } else {
-                                                prompt.last_agent_message.clear();
-                                                prompt.agent_message_overflow = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                Some(
-                                    "user_message_chunk"
-                                    | "agent_thought_chunk"
-                                    | "tool_call"
-                                    | "tool_call_update",
-                                ) => {
-                                    prompt.agent_message_open = false;
-                                }
-                                _ => {}
-                            }
+                            prompt.observe_update(update);
                         }
                     }
                 }
@@ -1119,6 +1179,7 @@ pub async fn acp_prompt(
                 last_agent_message: String::new(),
                 agent_message_open: false,
                 agent_message_overflow: false,
+                known_tool_calls: HashSet::new(),
             },
         );
     }
@@ -1151,7 +1212,12 @@ pub async fn acp_prompt(
             .prompt_state
             .lock()
             .ok()
-            .and_then(|prompts| prompts.active.get(&session_id).map(reports_interruption))
+            .and_then(|prompts| {
+                prompts
+                    .active
+                    .get(&session_id)
+                    .map(ActivePrompt::reports_interruption)
+            })
             .unwrap_or(false);
         let interrupted =
             cancelled_result || reported_interruption || (explicitly_cancelled && result.is_err());

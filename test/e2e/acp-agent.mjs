@@ -270,8 +270,19 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     if (text === 'Agent text interrupted') {
       update(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'interrupted-step-tool',
+        title: 'Read task',
+        status: 'in_progress',
+      });
+      update(sessionId, {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Step inter' },
+      });
+      update(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'interrupted-step-tool',
+        status: 'completed',
       });
       update(sessionId, {
         sessionUpdate: 'agent_message_chunk',
