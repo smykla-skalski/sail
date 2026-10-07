@@ -4,8 +4,10 @@ import type { AgentEvent } from '../src/lib/acp.ts';
 import {
   disconnectNativeSubagents,
   finalizeNativeSubagentRestore,
+  nativeMessageLimit,
   nativeSubagentCounts,
   nativeSubagentReceipts,
+  nativeTranscriptLimit,
   setNativeSubagentWaiting,
   updateNativeSubagents,
 } from '../src/lib/native-subagents.ts';
@@ -60,6 +62,58 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
   assert.equal(store['codex:grandchild'].transcript.length, 0);
   assert.equal(nativeSubagentReceipts(store)[0].result, null);
   assert.deepEqual(nativeSubagentCounts(store, 'codex', 'parent'), { active: 1, waiting: 0 });
+});
+
+await test('a long-running child keeps its prompt and the newest bounded transcript', () => {
+  let store = updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'worker',
+      task: 'Task',
+      prompt: 'Start here',
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+  );
+  const steps = nativeTranscriptLimit + 20;
+  for (let index = 0; index < steps; index++)
+    store = updateNativeSubagents(
+      store,
+      event('child', {
+        sessionUpdate: 'tool_call',
+        toolCallId: `tool-${index}`,
+        title: `Step ${index}`,
+        status: 'completed',
+      }),
+      '/repo',
+      index + 2,
+    );
+  for (const text of ['x'.repeat(nativeMessageLimit), 'y'.repeat(10), 'END'])
+    store = updateNativeSubagents(
+      store,
+      event('child', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } }),
+      '/repo',
+      steps + 2,
+    );
+
+  const transcript = store['codex:child'].transcript;
+  assert.equal(transcript.length, nativeTranscriptLimit);
+  assert.deepEqual(transcript[0], {
+    id: 'codex:child:prompt',
+    type: 'user',
+    text: 'Start here',
+    created: 1,
+  });
+  assert.equal(transcript[1].id, `tool-${steps - nativeTranscriptLimit + 2}`);
+  const last = transcript.at(-1);
+  assert.ok(last?.type === 'assistant');
+  assert.equal(last.text.length, nativeMessageLimit);
+  assert.ok(last.text.startsWith('…x'));
+  assert.ok(last.text.endsWith(`${'y'.repeat(10)}END`));
+  assert.equal(nativeSubagentCounts(store, 'codex', 'parent').active, 1);
 });
 
 await test('replayed lifecycle deduplicates and unfinished history disconnects', () => {

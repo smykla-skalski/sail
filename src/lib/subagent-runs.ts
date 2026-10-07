@@ -1,0 +1,312 @@
+import type { AgentEntry, AgentMessage } from './acp';
+import { receiptSourceId, type SpawnReceipt, type SpawnState } from './agent-results.ts';
+import { nativeSubagentStatus, type NativeSubagentStore } from './native-subagents.ts';
+import type { SessionInfo } from './opencode';
+import {
+  isFailedStatus,
+  splitTaskNotifications,
+  type TaskNotification,
+} from './task-notification.ts';
+
+export type SubagentSource = 'native' | 'opencode' | 'mcp' | 'task-notification';
+
+/** Live sources first: native ACP children, then OpenCode children, MCP spawn receipts and the
+ * task notifications a parent transcript carries. */
+export const subagentSourcePrecedence: readonly SubagentSource[] = [
+  'native',
+  'opencode',
+  'mcp',
+  'task-notification',
+];
+
+export type SubagentControls = {
+  /** The agent accepts a follow-up prompt for this child. */
+  prompt: boolean;
+  /** The agent can stop this child without stopping its parent. */
+  cancel: boolean;
+};
+
+export type SubagentUsage = { tokens?: number; toolUses?: number; durationMs?: number };
+
+/** One child agent, whichever sources reported it. `SpawnReceipt` stays the stored record. */
+export type SubagentRun = {
+  /** Thread id of the child session (`acp:<agent>:<session>` or `opencode:<session>`). An MCP
+   * child that has no session yet uses `receipt:<receiptId>`. */
+  id: string;
+  source: SubagentSource;
+  sources: SubagentSource[];
+  agent: string;
+  sessionId: string | null;
+  directory: string | null;
+  parentId: string | null;
+  parentDirectory: string | null;
+  name: string | null;
+  task: string | null;
+  model: string | null;
+  state: SpawnState;
+  activity: string | null;
+  result: string | null;
+  error: string | null;
+  created: number | null;
+  updated: number;
+  receiptId: string | null;
+  usage: SubagentUsage | null;
+  controls: SubagentControls;
+};
+
+export type OpenCodeChildSessions = {
+  parentSessionId: string;
+  directory: string;
+  children: readonly SessionInfo[];
+  active: readonly string[];
+};
+
+export type ParentTranscript = {
+  agent: string;
+  sessionId: string;
+  directory: string;
+  entries: readonly AgentEntry[];
+};
+
+export type SubagentRunSources = {
+  native?: NativeSubagentStore;
+  receipts?: readonly SpawnReceipt[];
+  openCode?: readonly OpenCodeChildSessions[];
+  transcripts?: readonly ParentTranscript[];
+};
+
+/** claude-agent-acp 0.84.0 advertises no child capabilities: a child prompt fails with "Session
+ * not found" and a child cancel is ignored, so only the parent turn can stop its children. */
+const nativeControls: SubagentControls = { prompt: false, cancel: false };
+
+function nativeRuns(store: NativeSubagentStore): SubagentRun[] {
+  return Object.values(store).map((child) => {
+    const { state, activity } = nativeSubagentStatus(child);
+    const settled = state !== 'working' && state !== 'waiting';
+    const output = settled
+      ? child.transcript
+          .findLast((entry): entry is AgentMessage => entry.type === 'assistant')
+          ?.text.trim()
+      : undefined;
+    return {
+      id: receiptSourceId(child.agent, child.sessionId),
+      source: 'native',
+      sources: ['native'],
+      agent: child.agent,
+      sessionId: child.sessionId,
+      directory: child.directory,
+      parentId: receiptSourceId(child.agent, child.parentSessionId),
+      parentDirectory: child.directory,
+      name: child.name,
+      task: child.task,
+      model: null,
+      state,
+      activity,
+      result: output || null,
+      error: child.error ?? null,
+      created: child.created,
+      updated: child.updated,
+      receiptId: `native:${child.agent}:${child.sessionId}`,
+      usage: null,
+      controls: nativeControls,
+    };
+  });
+}
+
+function threadSession(threadId: string, provider: string): string | null {
+  const prefix = provider === 'opencode' ? 'opencode:' : `acp:${provider}:`;
+  return threadId.startsWith(prefix) && threadId.length > prefix.length
+    ? threadId.slice(prefix.length)
+    : null;
+}
+
+function receiptRuns(receipts: readonly SpawnReceipt[]): SubagentRun[] {
+  return receipts
+    .filter((receipt) => !receipt.receiptId.startsWith('native:'))
+    .map((receipt) => {
+      const sessionId = receipt.targetId ? threadSession(receipt.targetId, receipt.provider) : null;
+      return {
+        id: sessionId
+          ? receiptSourceId(receipt.provider, sessionId)
+          : `receipt:${receipt.receiptId}`,
+        source: 'mcp',
+        sources: ['mcp'],
+        agent: receipt.provider,
+        sessionId,
+        directory: receipt.targetDirectory,
+        parentId: receipt.sourceId,
+        parentDirectory: receipt.sourceDirectory,
+        name: null,
+        task: receipt.prompt,
+        model: receipt.model ?? null,
+        state: receipt.state,
+        activity: receipt.activity ?? null,
+        result: receipt.result,
+        error: receipt.error,
+        created: receipt.created,
+        updated: receipt.updated,
+        receiptId: receipt.receiptId,
+        usage: null,
+        controls: { prompt: !!sessionId, cancel: !!sessionId },
+      };
+    });
+}
+
+function openCodeState(child: SessionInfo, active: readonly string[]): SpawnState {
+  if (active.includes(child.id)) return 'working';
+  if (child.outcome === 'succeeded') return 'completed';
+  return child.outcome ?? 'unavailable';
+}
+
+function openCodeRuns(groups: readonly OpenCodeChildSessions[]): SubagentRun[] {
+  return groups.flatMap(({ parentSessionId, directory, children, active }) =>
+    children.map((child) => ({
+      id: receiptSourceId('opencode', child.id),
+      source: 'opencode',
+      sources: ['opencode'],
+      agent: 'opencode',
+      sessionId: child.id,
+      directory: child.location.directory,
+      parentId: receiptSourceId('opencode', parentSessionId),
+      parentDirectory: directory,
+      name: child.agent ?? null,
+      task: child.title ?? null,
+      model: child.model ? `${child.model.providerID}/${child.model.id}` : null,
+      state: openCodeState(child, active),
+      activity: null,
+      result: null,
+      error: null,
+      created: child.time.created,
+      updated: child.time.updated,
+      receiptId: null,
+      usage: null,
+      controls: { prompt: true, cancel: true },
+    })),
+  );
+}
+
+/** Child session ids for task notifications in transcript order. claude-agent-acp names a task's
+ * first child session after its task id and each resumed generation `${taskId}:generation:N`,
+ * and the parent receives one notification per generation. The ACP subagents RFD form
+ * (agentclientprotocol/claude-agent-acp#1257) keeps one session id per child, so this join
+ * changes when Sail adopts it. Replayed children (`:replay-subagent:`) carry no task id and stay
+ * unjoined. */
+export function taskNotificationSessionIds(taskIds: readonly string[]): string[] {
+  const generations = new Map<string, number>();
+  return taskIds.map((taskId) => {
+    const generation = (generations.get(taskId) ?? 0) + 1;
+    generations.set(taskId, generation);
+    return generation === 1 ? taskId : `${taskId}:generation:${generation}`;
+  });
+}
+
+function notificationState(status: string): SpawnState {
+  if (status === 'completed') return 'completed';
+  if (isFailedStatus(status)) return 'failed';
+  return ['stopped', 'cancelled', 'interrupted'].includes(status) ? 'interrupted' : 'unavailable';
+}
+
+function usage({ tokens, toolUses, durationMs }: TaskNotification): SubagentUsage | null {
+  const value = {
+    ...(tokens === undefined ? {} : { tokens }),
+    ...(toolUses === undefined ? {} : { toolUses }),
+    ...(durationMs === undefined ? {} : { durationMs }),
+  };
+  return Object.keys(value).length ? value : null;
+}
+
+function notificationRuns(transcripts: readonly ParentTranscript[]): SubagentRun[] {
+  return transcripts.flatMap(({ agent, sessionId, directory, entries }) => {
+    const notes = entries.flatMap((entry) =>
+      entry.type === 'user'
+        ? splitTaskNotifications(entry.text).flatMap((segment) =>
+            segment.type === 'notification'
+              ? [{ notification: segment.notification, at: entry.created ?? 0 }]
+              : [],
+          )
+        : [],
+    );
+    const childIds = taskNotificationSessionIds(notes.map((note) => note.notification.taskId));
+    return notes.map(({ notification, at }, index): SubagentRun => ({
+      id: receiptSourceId(agent, childIds[index]),
+      source: 'task-notification',
+      sources: ['task-notification'],
+      agent,
+      sessionId: childIds[index],
+      directory,
+      parentId: receiptSourceId(agent, sessionId),
+      parentDirectory: directory,
+      name: null,
+      task: null,
+      model: null,
+      state: notificationState(notification.status),
+      activity: notification.summary,
+      result: notification.summary,
+      error: null,
+      created: null,
+      updated: at,
+      receiptId: null,
+      usage: usage(notification),
+      controls: nativeControls,
+    }));
+  });
+}
+
+const fallbackFields = [
+  'directory',
+  'parentId',
+  'parentDirectory',
+  'name',
+  'task',
+  'model',
+  'activity',
+  'result',
+  'error',
+  'created',
+  'receiptId',
+  'usage',
+] as const;
+
+function merge(candidates: SubagentRun[]): SubagentRun {
+  const [winner, ...rest] = candidates;
+  const run: SubagentRun = {
+    ...winner,
+    sources: [...new Set(candidates.map((candidate) => candidate.source))],
+    updated: Math.max(...candidates.map((candidate) => candidate.updated)),
+  };
+  for (const field of fallbackFields) {
+    if (run[field] !== null) continue;
+    const value = rest.find((candidate) => candidate[field] !== null)?.[field];
+    if (value !== undefined) Object.assign(run, { [field]: value });
+  }
+  return run;
+}
+
+/** Joins every subagent source into one run per child session. When sources overlap, the
+ * higher-precedence source sets the state and the others only fill fields it lacks. */
+export function subagentRuns({
+  native = {},
+  receipts = [],
+  openCode = [],
+  transcripts = [],
+}: SubagentRunSources): SubagentRun[] {
+  const rank = (run: SubagentRun) => subagentSourcePrecedence.indexOf(run.source);
+  const byId = new Map<string, SubagentRun[]>();
+  for (const run of [
+    ...nativeRuns(native),
+    ...openCodeRuns(openCode),
+    ...receiptRuns(receipts),
+    ...notificationRuns(transcripts),
+  ]) {
+    const candidates = byId.get(run.id) ?? [];
+    candidates.push(run);
+    byId.set(run.id, candidates);
+  }
+  return [...byId.values()]
+    .map((candidates) =>
+      merge(candidates.toSorted((a, b) => rank(a) - rank(b) || b.updated - a.updated)),
+    )
+    .toSorted(
+      (a, b) => (a.created ?? a.updated) - (b.created ?? b.updated) || a.id.localeCompare(b.id),
+    );
+}

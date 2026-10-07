@@ -47,6 +47,22 @@ function state(value: unknown): NativeSubagentOutcome {
   return 'unknown';
 }
 
+export const nativeTranscriptLimit = 500;
+export const nativeMessageLimit = 40_000;
+
+/** Keeps a live child's transcript bounded: the spawn prompt plus the newest entries. Streaming
+ * chunks only ever grow the last entry, so only that one needs trimming. */
+export function boundNativeTranscript(entries: AgentEntry[]): AgentEntry[] {
+  const last = entries.at(-1);
+  const trimmed =
+    last && last.type !== 'tool' && last.text.length > nativeMessageLimit
+      ? [...entries.slice(0, -1), { ...last, text: `…${last.text.slice(1 - nativeMessageLimit)}` }]
+      : entries;
+  if (trimmed.length <= nativeTranscriptLimit) return trimmed;
+  const prompt = trimmed[0]?.id.endsWith(':prompt') ? [trimmed[0]] : [];
+  return [...prompt, ...trimmed.slice(prompt.length - nativeTranscriptLimit)];
+}
+
 function toolActivity(update: Record<string, unknown>, previous: string): string {
   if (
     (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
@@ -147,7 +163,7 @@ export function updateNativeSubagents(
   const id = nativeSubagentId(event.agent, parentSessionId);
   const child = store[id];
   if (!child) return store;
-  const transcript = updateEntries(child.transcript, update);
+  const transcript = boundNativeTranscript(updateEntries(child.transcript, update));
   const settled = ['completed', 'failed', 'interrupted'].includes(child.outcome);
   return {
     ...store,
@@ -227,10 +243,20 @@ function reportsInterruption(transcript: AgentEntry[]): boolean {
   return last?.type === 'assistant' && last.text.trim().toLowerCase() === 'step interrupted';
 }
 
+export function nativeSubagentStatus(child: NativeSubagent): {
+  state: SpawnState;
+  activity: string;
+} {
+  const interrupted = child.outcome === 'completed' && reportsInterruption(child.transcript);
+  return {
+    state: interrupted ? 'interrupted' : spawnState(child.outcome),
+    activity: interrupted ? 'Interrupted' : child.activity,
+  };
+}
+
 export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt[] {
   return Object.values(store).map((child) => {
-    const interrupted = child.outcome === 'completed' && reportsInterruption(child.transcript);
-    const activity = interrupted ? 'Interrupted' : child.activity;
+    const status = nativeSubagentStatus(child);
     return {
       receiptId: `native:${child.agent}:${child.sessionId}`,
       accessKey: '',
@@ -244,14 +270,14 @@ export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt
       worktreeId: null,
       provider: child.agent === 'claude' ? 'claude' : 'codex',
       prompt: child.task,
-      state: interrupted ? 'interrupted' : spawnState(child.outcome),
+      state: status.state,
       created: child.created,
       updated: child.updated,
       result: ['completed', 'failed', 'interrupted', 'unknown'].includes(child.outcome)
-        ? activity
+        ? status.activity
         : null,
       error: child.error ?? null,
-      activity,
+      activity: status.activity,
     };
   });
 }
