@@ -3,9 +3,11 @@ import test from 'node:test';
 import { createShipRun, readyShipIssues } from '../src/lib/issue-shipping.ts';
 import {
   appendShipEvent,
+  beginLatestRefresh,
   ciStatus,
   dependencyUrl,
   shipGatesSettled,
+  shipEvidenceReadiness,
   shipTaskThreadsSettled,
   shipActivity,
   reconciledShipGates,
@@ -19,15 +21,18 @@ import {
   shipCheckpointOwner,
   authorizeShipCheckpointThread,
   shipIssuePresentation,
+  shipMergeClaim,
   shipStatus,
   sortShipIssues,
   validateGateVerdict,
+  validationRevisionDrifted,
 } from '../src/lib/ship-progress.ts';
 import {
   loadSpawnReceipts,
   saveBoundedReceipt,
   type SpawnReceipt,
 } from '../src/lib/agent-results.ts';
+import { recordTaskEvidence } from '../src/lib/task-evidence.ts';
 
 void test('reopened queued issues recover across restart without retrying worker failures', () => {
   const run = fixture();
@@ -100,6 +105,42 @@ function fixture() {
   );
 }
 
+function withMergeEvidence(issue: ReturnType<typeof fixture>['issues'][number]) {
+  const revision = 'revision-one';
+  let evidenceManifests = issue.checkpoint!.requiredGates.reduce(
+    (manifests, gate, index) =>
+      recordTaskEvidence(manifests, revision, issue.checkpoint!.acceptanceCriteria, {
+        id: `evidence-${gate}`,
+        kind: 'gate',
+        name: gate,
+        provider: 'codex',
+        model: 'test',
+        result: 'passed',
+        timestamp: 10 + index,
+        outputReference: `thread:${gate}`,
+        criteria: issue.checkpoint!.acceptanceCriteria,
+      }),
+    issue.evidenceManifests ?? [],
+  );
+  evidenceManifests = recordTaskEvidence(
+    evidenceManifests,
+    revision,
+    issue.checkpoint!.acceptanceCriteria,
+    {
+      id: 'evidence-ci-build',
+      kind: 'command',
+      name: 'ci:build',
+      provider: 'github',
+      model: null,
+      result: 'passed',
+      timestamp: 20,
+      outputReference: 'https://example.test/build',
+      criteria: [],
+    },
+  );
+  return { ...issue, evidenceRevision: revision, evidenceManifests };
+}
+
 void test('restores umbrella, gate verdict and model after receipts are pruned', () => {
   const run = fixture();
   const receipt: SpawnReceipt = {
@@ -121,7 +162,12 @@ void test('restores umbrella, gate verdict and model after receipts are pruned',
     result: 'Unstructured text',
     error: null,
     model: 'concrete-model',
-    validation: { gate: 'code-adversary', requestedModel: 'concrete-model', verdict: 'CLEAN' },
+    validation: {
+      gate: 'code-adversary',
+      requestedModel: 'concrete-model',
+      revision: 'revision-one',
+      verdict: 'CLEAN',
+    },
   };
   run.issues[0].gates = [gateSnapshot(receipt)!];
   const receipts = saveBoundedReceipt([], receipt);
@@ -137,6 +183,7 @@ void test('restores umbrella, gate verdict and model after receipts are pruned',
     false,
   );
   assert.equal(restoredReceipts[0].validation?.verdict, 'CLEAN');
+  assert.equal(restoredReceipts[0].validation?.revision, 'revision-one');
   assert.equal(restored[0].umbrella?.number, 1);
   assert.equal(restored[0].issues[0].gates?.[0].model, 'concrete-model');
   assert.equal(restored[0].issues[0].gates?.[0].verdict, 'CLEAN');
@@ -256,11 +303,13 @@ void test('Ship issues put required action before work, queue, and completion', 
     { ...source, id: 'waiting', number: 3, state: 'working', workerState: 'waiting' },
     { ...source, id: 'failed', number: 2, state: 'failed', error: 'Worker failed' },
     {
-      ...source,
+      ...withMergeEvidence(source),
       id: 'ready',
       number: 7,
       state: 'awaiting_merge',
       pullRequest: 'https://example.test/pull/7',
+      pullRequestHead: 'commit-one',
+      evidenceCommit: 'commit-one',
       checks: [{ name: 'build', state: 'SUCCESS', url: 'https://example.test/build' }],
     },
   ];
@@ -276,6 +325,54 @@ void test('Ship issues put required action before work, queue, and completion', 
   assert.match(shipIssuePresentation(run, run.issues[3]).nextAction, /Respond/);
   assert.equal(shipIssuePresentation(run, run.issues[0]).priority, 4);
   assert.equal(shipIssuePresentation(run, run.issues[5]).nextAction, 'Merge the pull request');
+});
+
+void test('merge readiness rejects missing, failed, and stale revision evidence', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, {
+    state: 'awaiting_merge',
+    pullRequest: 'https://example.test/pull/2',
+    pullRequestHead: 'commit-one',
+    evidenceCommit: 'commit-one',
+    checks: [{ name: 'build', state: 'SUCCESS', url: 'https://example.test/build' }],
+  });
+  assert.match(shipIssuePresentation(run, issue).nextAction, /Revision unknown/);
+  assert.equal(shipMergeClaim(issue), 'PR open');
+
+  const mergeEvidence = withMergeEvidence(issue);
+  const manifest = mergeEvidence.evidenceManifests.at(-1)!;
+  Object.assign(issue, {
+    ...mergeEvidence,
+    evidenceManifests: [
+      { ...manifest, evidence: manifest.evidence.filter((entry) => entry.name !== 'ci:build') },
+    ],
+  });
+  assert.equal(shipEvidenceReadiness(issue).ready, false);
+  assert.match(shipEvidenceReadiness(issue).reason!, /Revision-bound CI evidence missing/);
+  assert.equal(shipMergeClaim(issue), 'PR open');
+
+  Object.assign(issue, mergeEvidence);
+  assert.equal(shipEvidenceReadiness(issue).ready, true);
+  assert.equal(shipIssuePresentation(run, issue).nextAction, 'Merge the pull request');
+  assert.equal(shipMergeClaim(issue), 'Ready for merge');
+
+  issue.refreshError = 'GitHub unavailable';
+  assert.equal(shipEvidenceReadiness(issue).ready, false);
+  assert.match(shipEvidenceReadiness(issue).reason!, /refresh failed/);
+  assert.equal(shipMergeClaim(issue), 'PR open');
+  issue.refreshError = null;
+
+  issue.pullRequestHead = 'commit-two';
+  assert.equal(shipEvidenceReadiness(issue).ready, false);
+  assert.match(shipEvidenceReadiness(issue).reason!, /does not match/);
+  assert.equal(shipMergeClaim(issue), 'PR open');
+  issue.pullRequestHead = 'commit-one';
+
+  issue.evidenceRevision = 'revision-two';
+  assert.equal(shipEvidenceReadiness(issue).stale, true);
+  assert.match(shipIssuePresentation(run, issue).nextAction, /missing or stale/);
+  assert.equal(shipMergeClaim(issue), 'PR open');
 });
 
 void test('worker receipt updates drive presentation freshness', () => {
@@ -466,6 +563,20 @@ void test('accepts typed stage and verdict reports, with gate-specific verdicts'
   assert.doesNotThrow(() => validateGateVerdict('test-adversary', 'PASS'));
 });
 
+void test('validation revision drift remains sticky after the tree returns', () => {
+  const validation = {
+    gate: 'code-adversary' as const,
+    requestedModel: 'test',
+    revision: 'revision-a',
+  };
+  assert.equal(validationRevisionDrifted(validation, 'revision-a'), false);
+  assert.equal(validationRevisionDrifted(validation, 'revision-b'), true);
+  assert.equal(
+    validationRevisionDrifted({ ...validation, revisionDrifted: true }, 'revision-a'),
+    true,
+  );
+});
+
 for (const [states, expected] of [
   [undefined, 'Unknown'],
   [[], 'No checks'],
@@ -548,10 +659,12 @@ void test('null PR lookup keeps durable PR and CI across restart until a real re
       url: issue.pullRequest!,
       state: 'OPEN',
       mergedAt: null,
+      headRefOid: 'head',
       checks: [{ name: 'build', state: 'SUCCESS', url: issue.checks![0].url }],
     }),
   );
   assert.equal(ciStatus(restored.checks), 'Passed');
+  assert.equal(restored.pullRequestHead, 'head');
   assert.equal(restored.refreshError, null);
 });
 
@@ -579,6 +692,16 @@ void test('polling commits all parallel issue updates once, after slow refreshes
   slow.resolve();
   await tick;
   assert.deepEqual(snapshots, [['fast', 'slow']]);
+});
+
+void test('only the latest overlapping pull request refresh can commit', () => {
+  const generations = new Map<string, number>();
+  const first = beginLatestRefresh(generations, 'run:issue');
+  const second = beginLatestRefresh(generations, 'run:issue');
+
+  assert.equal(first(), false);
+  assert.equal(second(), true);
+  assert.equal(beginLatestRefresh(generations, 'other:issue')(), true);
 });
 
 void test('a rejected refresh drains remaining updates and flushes before reporting failure', async () => {

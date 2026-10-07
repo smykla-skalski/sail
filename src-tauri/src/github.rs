@@ -20,6 +20,7 @@ pub struct ShippingPullRequest {
     url: String,
     state: String,
     merged_at: Option<String>,
+    head_ref_oid: String,
     #[serde(default)]
     checks: Vec<PullRequestCheck>,
 }
@@ -58,7 +59,7 @@ pub async fn shipping_pull_request(
                 "--state",
                 "all",
                 "--json",
-                "number,url,state,mergedAt,statusCheckRollup",
+                "number,url,state,mergedAt,headRefOid,statusCheckRollup",
                 "--limit",
                 "2",
             ],

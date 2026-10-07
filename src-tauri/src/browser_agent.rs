@@ -480,7 +480,10 @@ impl BrowserManager {
             "thread_message" => Some("sai-agent-messages-enabled"),
             // Progress belongs to the owning Ship run and must remain available when
             // cross-validation and other coordination actions are disabled.
-            "ship_progress" | "task_checkpoint_read" | "task_checkpoint_update" => None,
+            "ship_progress"
+            | "task_checkpoint_read"
+            | "task_checkpoint_update"
+            | "task_evidence_record" => None,
             _ => return Err("Unknown coordination action.".into()),
         };
         let settings = crate::settings::load_settings(app.clone())?;
@@ -566,6 +569,7 @@ impl BrowserManager {
                 | "ship_progress"
                 | "task_checkpoint_read"
                 | "task_checkpoint_update"
+                | "task_evidence_record"
                 | "agent_status"
                 | "agent_wait"
                 | "agent_result"
@@ -1237,6 +1241,11 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "checkpoint",
     ),
     (
+        "task_evidence_record",
+        "Record a bounded command result against its execution revision and map it to zero or more acceptance criteria. Read the checkpoint before the command and pass its revision as expectedRevision.",
+        "command,result,criteria,outputReference,expectedRevision",
+    ),
+    (
         "agent_status",
         "Inspect a launch receipt with its ID and access key. Only the launching thread can read it.",
         "receiptId,accessKey",
@@ -1383,7 +1392,10 @@ pub fn run_mcp_stdio() {
                             "status":{"type":"string","enum":["running","blocked"]},
                             "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
                             "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","FAIL","BLOCKED"]},
-                            "reason":{"type":"string","maxLength":2000}
+                            "reason":{"type":"string","maxLength":2000},
+                            "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
+                            "outputReference":{"type":"string","minLength":1,"maxLength":2000},
+                            "revision":{"type":"string","minLength":1}
                         },"oneOf":[{"required":["stage","status"]},{"required":["verdict"]}]
                     }});
                 }
@@ -1408,6 +1420,17 @@ pub fn run_mcp_stdio() {
                             "expectedRevision":{"type":["string","null"]},
                             "rebindRevision":{"type":"boolean"}
                         },"required":["checkpoint","expectedSequence","expectedRevision"]
+                    }});
+                }
+                if *name == "task_evidence_record" {
+                    return json!({"name":name,"description":description,"inputSchema":{
+                        "type":"object","properties":{
+                            "command":{"type":"string","minLength":1,"maxLength":1000},
+                            "result":{"type":"string","enum":["passed","failed","pending","blocked"]},
+                            "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
+                            "outputReference":{"type":"string","minLength":1,"maxLength":2000}
+                            ,"expectedRevision":{"type":"string","minLength":1}
+                        },"required":["command","result","criteria","outputReference","expectedRevision"]
                     }});
                 }
                 if *name == "agent_wait" {
@@ -1538,6 +1561,9 @@ mod skill_tests {
         assert!(TOOLS
             .iter()
             .any(|(name, _, _)| *name == "task_checkpoint_update"));
+        assert!(TOOLS
+            .iter()
+            .any(|(name, _, _)| *name == "task_evidence_record"));
         assert_eq!(
             call_bridge(&json!({"name":"sail_skill","arguments":{}}))["content"][0]["text"],
             SAIL_SKILL
