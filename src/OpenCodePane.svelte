@@ -866,7 +866,15 @@
         if (current !== generation || id !== activeID || disposed) return;
         session = latest;
         running = false;
-        onstatus(summary(latest), latest.outcome === 'failed' ? 'failed' : 'done', !stopRequested);
+        onstatus(
+          summary(latest),
+          stopRequested || latest.outcome === 'interrupted'
+            ? 'interrupted'
+            : latest.outcome === 'failed'
+              ? 'failed'
+              : 'done',
+          !stopRequested,
+        );
         await refreshMessages(id, current);
         if (current !== generation || id !== activeID || disposed) return;
         onactivity(summary(latest));

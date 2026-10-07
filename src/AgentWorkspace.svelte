@@ -1118,6 +1118,7 @@
         );
       }
       if (stopRequested) {
+        finalStatus = 'interrupted';
         notifyOnDone = false;
         if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');
         if (current === generation) {
@@ -1170,7 +1171,10 @@
       }
       if (recoveredDraft && result.stopReason !== 'cancelled' && !stopRequested)
         recoveredDraft = false;
-      if (result.stopReason === 'cancelled' || stopRequested) notifyOnDone = false;
+      if (result.stopReason === 'cancelled' || stopRequested) {
+        finalStatus = 'interrupted';
+        notifyOnDone = false;
+      }
       if (external && !queuedMessage && !notifyOnDone) throw new Error('Agent turn was cancelled.');
       if (current === generation && stopRequested)
         markTools(result.stopReason === 'cancelled' ? 'cancelled' : 'status unconfirmed', [
@@ -1180,7 +1184,7 @@
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
-      finalStatus = 'failed';
+      finalStatus = stopRequested ? 'interrupted' : 'failed';
       if (!deliverySessionId && current !== generation && disposed && !ephemeral && !external) {
         const recovered =
           sentImages.length || sentClipboard.length

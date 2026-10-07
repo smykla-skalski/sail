@@ -73,7 +73,7 @@ export async function listSidebarOpenCodeThreads(
     };
     threads.push(thread);
     if (session.outcome)
-      outcomes[threadKey(thread)] = session.outcome === 'failed' ? 'failed' : 'done';
+      outcomes[threadKey(thread)] = session.outcome === 'succeeded' ? 'done' : session.outcome;
   }
   const next = page.cursor.next ?? undefined;
   if (!next || next === cursor || seen.has(next)) return { threads, outcomes };
@@ -194,9 +194,11 @@ export function sidebarThreadStatus(
         ? child.state
         : child.state === 'failed'
           ? 'failed'
-          : child.state === 'completed' || child.state === 'interrupted'
-            ? 'done'
-            : null;
+          : child.state === 'interrupted'
+            ? 'interrupted'
+            : child.state === 'completed'
+              ? 'done'
+              : null;
   }
   if (
     (status === 'working' || status === 'waiting') &&
@@ -205,7 +207,7 @@ export function sidebarThreadStatus(
       : !acpActivityReady)
   )
     status = null;
-  if (status !== 'failed') {
+  if (status !== 'failed' && status !== 'interrupted') {
     const active = activeSubagentsForSource(
       spawnReceipts,
       receiptSourceId(thread.agent, thread.sessionId),

@@ -1089,19 +1089,26 @@ pub async fn acp_prompt(
             .lock()
             .map(|mut cancelled| cancelled.remove(&turn_id))
             .unwrap_or(false);
-        let status = if result.is_err() { "failed" } else { "done" };
+        let interrupted = explicitly_cancelled
+            || result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("stopReason"))
+                .and_then(Value::as_str)
+                == Some("cancelled");
+        let status = if interrupted {
+            "interrupted"
+        } else if result.is_err() {
+            "failed"
+        } else {
+            "done"
+        };
         crate::diagnostics::record("prompt_finished", json!({
             "agent":agent,"sessionId":session_id,"turnId":turn_id,
             "status":status,"explicitlyCancelled":explicitly_cancelled,
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
-        let notify = !explicitly_cancelled
-            && result
-                .as_ref()
-                .ok()
-                .and_then(|value| value.get("stopReason"))
-                .and_then(Value::as_str)
-                != Some("cancelled");
+        let notify = !interrupted;
         let latest = if let Ok(mut prompts) = runtime.prompt_state.lock() {
             if prompts
                 .active

@@ -2488,6 +2488,7 @@
       if (interrupted.some((turn) => turn.agent === agent && turn.sessionId === sessionId))
         return 'interrupted';
       if (state?.finished[sessionId]?.status === 'failed') return 'failed';
+      if (state?.finished[sessionId]?.status === 'interrupted') return 'interrupted';
       if (state?.finished[sessionId] || state?.sessions.includes(sessionId)) return 'completed';
       return 'unavailable';
     } catch {
@@ -3223,9 +3224,12 @@
           const turn = acp.prompt(thread.agent, thread.sessionId, text, crypto.randomUUID());
           void turn
             .then(
-              async () => {
+              async (outcome) => {
                 await recordImplementationModel(thread.directory, thread.model, tracking);
-                updateAgentThreadStatus(thread, 'done');
+                updateAgentThreadStatus(
+                  thread,
+                  outcome.stopReason === 'cancelled' ? 'interrupted' : 'done',
+                );
                 return undefined;
               },
               async (cause) => {
@@ -4268,7 +4272,10 @@
         async (outcome) => {
           if (tracking)
             await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
-          updateAgentThreadStatus(thread, 'done');
+          updateAgentThreadStatus(
+            thread,
+            outcome.stopReason === 'cancelled' ? 'interrupted' : 'done',
+          );
           if (receiptId) {
             const current = spawnReceipts.find((item) => item.receiptId === receiptId);
             updateSpawnReceipt(receiptId, {
@@ -7321,11 +7328,9 @@
             ? 'working'
             : result
               ? result.status === 'fulfilled'
-                ? result.value.outcome === 'failed'
-                  ? 'failed'
-                  : result.value.outcome
-                    ? 'done'
-                    : null
+                ? result.value.outcome === 'succeeded'
+                  ? 'done'
+                  : (result.value.outcome ?? null)
                 : null
               : null;
         if (status && status !== threadAttention[threadKey(thread)]?.status)
@@ -7411,7 +7416,7 @@
               if (!disposed)
                 updateAgentThreadStatus(
                   recoveredThread,
-                  'done',
+                  outcome.stopReason === 'cancelled' ? 'interrupted' : 'done',
                   outcome.stopReason !== 'cancelled',
                 );
             } catch (cause) {
@@ -7711,7 +7716,11 @@
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
-      if (typeof sessionId !== 'string' || (status !== 'done' && status !== 'failed')) return;
+      if (
+        typeof sessionId !== 'string' ||
+        (status !== 'done' && status !== 'failed' && status !== 'interrupted')
+      )
+        return;
       if (
         status === 'done' &&
         typeof turnId === 'string' &&
@@ -7745,9 +7754,11 @@
           state:
             status === 'failed'
               ? 'failed'
-              : event.message.params?.notify === false
+              : status === 'interrupted'
                 ? 'interrupted'
-                : 'completed',
+                : event.message.params?.notify === false
+                  ? 'interrupted'
+                  : 'completed',
           result: spawnOutput.get(receipt.receiptId) ?? receipt.result,
           error:
             typeof event.message.params?.error === 'string'
@@ -8638,7 +8649,9 @@
                 ? 'working'
                 : event.type === 'session.execution.failed'
                   ? 'failed'
-                  : 'done',
+                  : event.type === 'session.execution.interrupted'
+                    ? 'interrupted'
+                    : 'done',
               event.type !== 'session.execution.interrupted',
             );
             if (event.type === 'session.execution.succeeded')

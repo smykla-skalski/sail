@@ -1,4 +1,4 @@
-export type ThreadStatus = 'working' | 'waiting' | 'done' | 'failed';
+export type ThreadStatus = 'working' | 'waiting' | 'done' | 'failed' | 'interrupted';
 
 export type ThreadAttention = { status: ThreadStatus; unread: boolean };
 
@@ -10,7 +10,7 @@ export type ActivitySnapshot = Record<
     alive: boolean;
     active: string[];
     waiting: string[];
-    finished: Record<string, { status: 'done' | 'failed'; notify: boolean }>;
+    finished: Record<string, { status: 'done' | 'failed' | 'interrupted'; notify: boolean }>;
   }
 >;
 
@@ -40,7 +40,7 @@ export function reconcileAttention(
   return next;
 }
 
-const statuses = new Set(['working', 'waiting', 'done', 'failed']);
+const statuses = new Set(['working', 'waiting', 'done', 'failed', 'interrupted']);
 
 function isThreadStatus(value: unknown): value is ThreadStatus {
   return typeof value === 'string' && statuses.has(value);

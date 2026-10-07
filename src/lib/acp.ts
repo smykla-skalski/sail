@@ -163,7 +163,12 @@ export interface AgentActivity {
   sessions: string[];
   finished: Record<
     string,
-    { status: 'done' | 'failed'; notify: boolean; turnId: string; error?: string | null }
+    {
+      status: 'done' | 'failed' | 'interrupted';
+      notify: boolean;
+      turnId: string;
+      error?: string | null;
+    }
   >;
 }
 
