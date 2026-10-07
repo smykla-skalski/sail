@@ -1096,7 +1096,7 @@
     width: 100%;
     margin-top: 5px;
     padding: 10px 12px;
-    border: 1px solid var(--sui-border);
+    border: 1px solid var(--shell-control-border);
     border-radius: 8px;
     color: var(--sui-foreground);
     background: var(--sui-surface);
@@ -1198,7 +1198,7 @@
     margin-top: 12px;
     padding: 10px 12px;
     resize: vertical;
-    border: 1px solid var(--sui-border);
+    border: 1px solid var(--shell-control-border);
     border-radius: 8px;
     color: var(--sui-foreground);
     background: var(--sui-surface);

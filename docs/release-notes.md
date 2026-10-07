@@ -13,4 +13,4 @@ There is no automatic updater. To update, download the next package for your pla
 - Text, input borders, and buttons meet WCAG 2.2 AA contrast in the light and dark themes. Buttons keep the right colors when the theme changes while Sail is in the background.
 - The selected thread in the sidebar shows an accent bar and a bold title.
 - **Ship runs** shows the repository name; hover it for the full path.
-- A new thread shows **Connecting** until its agent session starts, so the thread header and the status bar agree on whether an agent is running.
+- A new thread shows **Connecting** until its agent session starts, and an OpenCode thread without a model shows **Model setup needed** instead of **Needs input**, so the thread header and the status bar agree on whether an agent is running.

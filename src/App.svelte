@@ -10616,9 +10616,7 @@
                   ? 'connecting'
                   : runtimeState !== 'connected'
                     ? 'offline'
-                    : pendingPermissions.length ||
-                        pendingForms.length ||
-                        setup?.model.state === 'action'
+                    : pendingPermissions.length || pendingForms.length
                       ? 'waiting'
                       : running
                         ? 'working'
@@ -10627,6 +10625,15 @@
                           : setupLoading
                             ? 'connecting'
                             : 'offline'}
+                label={runtimeState === 'connected' &&
+                !pendingPermissions.length &&
+                !pendingForms.length &&
+                !running &&
+                !workReady &&
+                !setupLoading &&
+                setup?.model.state === 'action'
+                  ? 'Model setup needed'
+                  : undefined}
               />
             </div>
             <div class="chat-body">

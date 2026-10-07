@@ -4,6 +4,15 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+function secondaryColors() {
+  return browser.execute(() =>
+    [...document.querySelectorAll('.sui-button[data-variant="secondary"]')].map((button) => {
+      const style = getComputedStyle(button);
+      return `${button.textContent?.trim()}: ${style.backgroundColor} ${style.color}`;
+    }),
+  );
+}
+
 describe('agent status bar', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-agent-status-'));
 
@@ -71,6 +80,19 @@ describe('agent status bar', () => {
     });
     expect(popoverLayout.left).toBeGreaterThanOrEqual(0);
     expect(popoverLayout.right).toBeLessThanOrEqual(popoverLayout.width);
+
+    await browser.execute(() => (document.documentElement.dataset.suiTheme = 'dark'));
+    await browser.waitUntil(
+      async () => {
+        const colors = await secondaryColors();
+        return (
+          colors.length >= 2 &&
+          colors.every((color) => color.endsWith('rgb(21, 26, 33) rgb(243, 246, 247)'))
+        );
+      },
+      { timeout: 5000, timeoutMsg: 'Dark secondary buttons kept light-theme colors' },
+    );
+    await browser.execute(() => (document.documentElement.dataset.suiTheme = 'light'));
 
     await browser.keys('Escape');
     await expect(details).not.toExist();

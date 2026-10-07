@@ -87,17 +87,32 @@ function styleChunks(source: Source): Chunk[] {
       css: match[1],
       line: lineAt(source.text, match.index + match[0].indexOf('>') + 1),
     });
-  for (const match of source.text.matchAll(/\sstyle="([^"]*)"/g))
-    chunks.push({
-      file: source.file,
-      css: `${match[1]};`,
-      line: lineAt(source.text, match.index),
-    });
+  const markup = (css: string, index: number) =>
+    chunks.push({ file: source.file, css: `${css};`, line: lineAt(source.text, index) });
+  for (const match of source.text.matchAll(/\sstyle=(?:"([^"]*)"|\{(['"`])([\s\S]*?)\2\})/g))
+    markup(inlineExpressions(match[1] ?? match[3]), match.index);
+  for (const match of source.text.matchAll(
+    /\sstyle:([\w-]+)(?:\|important)?=(?:"([^"]*)"|\{(['"`])([\s\S]*?)\3\})/g,
+  ))
+    markup(`${match[1]}: ${inlineExpressions(match[2] ?? match[4])}`, match.index);
+  for (const match of source.text.matchAll(
+    /\s(fill|stroke|stop-color|flood-color|lighting-color)="([^"]*)"/g,
+  ))
+    markup(`${match[1]}: ${match[2]}`, match.index);
   return chunks;
 }
 
-function withoutComments(css: string) {
-  return css.replaceAll(/\/\*[\s\S]*?\*\//g, (comment) => comment.replaceAll(/[^\n]/g, ' '));
+// Template expressions can hold literal colors, so keep their text without quotes.
+function inlineExpressions(css: string) {
+  return css.replaceAll(/\$\{([^}]*)\}/g, (_, expression: string) =>
+    expression.replaceAll(/['"`]/g, ''),
+  );
+}
+
+function withoutComments(text: string) {
+  return text.replaceAll(/\/\*[\s\S]*?\*\/|<!--[\s\S]*?-->/g, (comment) =>
+    comment.replaceAll(/[^\n]/g, ' '),
+  );
 }
 
 function declarations(chunk: Chunk) {
@@ -126,7 +141,10 @@ function literalColors(value: string): string[] {
 
 void test('every var() reference names a defined custom property', () => {
   const definitions = new Set<string>();
-  for (const text of [readFileSync(join(root, suiStyles), 'utf8'), ...sources.map((s) => s.text)]) {
+  for (const text of [
+    readFileSync(join(root, suiStyles), 'utf8'),
+    ...sources.map((s) => s.text),
+  ].map(withoutComments)) {
     for (const match of text.matchAll(/(--[\w-]+)\s*:/g)) definitions.add(match[1]);
     for (const match of text.matchAll(/style:(--[\w-]+)/g)) definitions.add(match[1]);
     for (const match of text.matchAll(/setProperty\(\s*['"`](--[\w-]+)/g))
@@ -240,12 +258,11 @@ const baseSurfaces: Color[] = [
   '--sui-subtle',
   '--shell-sidebar',
   '--shell-selected',
+  '--shell-hover',
 ];
 // Sidebar subagent rows tint the sidebar with the primary color.
-const surfaces: Color[] = [
-  ...baseSurfaces,
-  { mix: '--sui-primary', percent: 5, over: '--shell-sidebar' },
-];
+const subagentRow: Color = { mix: '--sui-primary', percent: 5, over: '--shell-sidebar' };
+const surfaces: Color[] = [...baseSurfaces, subagentRow];
 const textTokens = [
   '--sui-foreground',
   '--sui-muted',
@@ -273,6 +290,10 @@ const textPairs: [Color, Color][] = [
   ['--sui-danger-ink', '--sui-danger-subtle'],
   ['--sui-warning-ink', '--sui-warning-subtle'],
   ['--sui-success-ink', '--sui-success-subtle'],
+  ...[subagentRow, '--shell-selected', '--shell-hover'].map((row): [Color, Color] => [
+    '--shell-selected-ink',
+    { mix: '--sui-primary', percent: 12, over: row },
+  ]),
 ];
 const componentPairs: [Color, Color][] = [
   ...['--shell-control-border', '--sui-primary', '--sui-focus'].flatMap((token) =>

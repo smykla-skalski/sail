@@ -323,11 +323,13 @@
           ? 'waiting'
           : loading
             ? 'connecting'
-            : busy
+            : running
               ? 'working'
-              : inputReady
-                ? 'ready'
-                : 'offline',
+              : sending
+                ? 'connecting'
+                : inputReady
+                  ? 'ready'
+                  : 'offline',
   );
   const workspaceActivity = $derived(
     workspaceActivityItems({

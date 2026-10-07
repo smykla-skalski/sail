@@ -46,7 +46,8 @@
     y = bounds.bottom + 4 + height <= innerHeight - 8 ? bounds.bottom + 4 : bounds.top - height - 4;
     y = Math.max(8, y);
     const list = items();
-    (focus === 'first' ? list[0] : list.at(-1))?.focus({ preventScroll: true });
+    const target = focus === 'first' ? list[0] : list.at(-1);
+    (target ?? menuElement).focus({ preventScroll: true });
   }
 
   function hide(restoreFocus = false) {
@@ -55,40 +56,42 @@
     if (restoreFocus) triggerElement.focus();
   }
 
-  function triggerKeydown(event: KeyboardEvent) {
-    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
-    event.preventDefault();
-    void show(event.key === 'ArrowDown' ? 'first' : 'last');
-  }
-
-  function menuKeydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      hide(true);
-      return;
-    }
-    if (event.key === 'Tab') {
-      hide();
-      return;
-    }
-    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+  function moveFocus(key: string) {
     const list = items();
     if (!list.length) return;
-    event.preventDefault();
     const index = list.indexOf(document.activeElement as HTMLElement);
     const next =
-      event.key === 'Home'
+      key === 'Home'
         ? 0
-        : event.key === 'End'
+        : key === 'End'
           ? list.length - 1
-          : event.key === 'ArrowDown'
+          : key === 'ArrowDown'
             ? (index + 1) % list.length
             : (index - 1 + list.length) % list.length;
     list[next].focus();
   }
 
-  function menuClick(event: MouseEvent) {
+  function keydown(event: KeyboardEvent) {
+    if (!open) {
+      if (event.target !== triggerElement) return;
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+      event.preventDefault();
+      void show(event.key === 'ArrowDown' ? 'first' : 'last');
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      hide(true);
+    } else if (event.key === 'Tab') hide();
+    else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      moveFocus(event.key);
+    }
+  }
+
+  // Runs before the item's handler so a dialog it opens returns focus to the trigger.
+  function itemClick(event: MouseEvent) {
     const item = (event.target as Element).closest('[role^="menuitem"]');
     if (item && !item.matches(':disabled, [aria-disabled="true"]')) hide(true);
   }
@@ -106,7 +109,7 @@
   onresize={() => hide()}
 />
 
-<div class="menu-button {className}">
+<div class="menu-button {className}" role="none" onkeydown={keydown}>
   <button
     bind:this={triggerElement}
     type="button"
@@ -118,7 +121,6 @@
     {title}
     {disabled}
     onclick={() => (open ? hide() : void show())}
-    onkeydown={triggerKeydown}
     >{#if trigger}{@render trigger()}{:else}{label}{/if}</button
   >
   <div
@@ -130,8 +132,7 @@
     aria-label={menuLabel}
     hidden={!open}
     style={`left: ${x}px; top: ${y}px`}
-    onkeydown={menuKeydown}
-    onclick={menuClick}
+    onclickcapture={itemClick}
   >
     {@render children()}
   </div>

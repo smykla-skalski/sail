@@ -27,6 +27,13 @@ describe('workspace topbar', () => {
     const newAgent = topbarMenuTrigger('New agent');
     const launches = $('[role="menu"][aria-label="New agent"]');
     await expect(newAgent).toBeDisplayed();
+    await expect($('.agent-header .activity-status')).toBeDisplayed();
+    const idle = await browser.execute(() => ({
+      header: document.querySelector('.agent-header .activity-status')?.textContent ?? '',
+      bar: document.querySelector('.agent-status-summary')?.textContent ?? '',
+    }));
+    if (idle.bar.includes('No agents running'))
+      expect(idle.header).not.toMatch(/Working|Needs input/);
     await expect(newAgent).toHaveAttribute('aria-haspopup', 'menu');
     await expect(newAgent).toHaveAttribute('aria-expanded', 'false');
     await expect(launches).not.toBeDisplayed();
@@ -81,6 +88,13 @@ describe('workspace topbar', () => {
 
     await $('.topbar').click();
     await expect(more).not.toBeDisplayed();
+
+    await openTopbarMenu('More actions');
+    await more.$('.agent-menu-launch').click();
+    await expect($('.command-palette')).toBeDisplayed();
+    await browser.keys('Escape');
+    await expect($('.command-palette')).not.toBeDisplayed();
+    await expect(topbarMenuTrigger('More actions')).toBeFocused();
     await openTopbarMenu('More actions');
     await openTopbarMenu('New agent');
     await expect(more).not.toBeDisplayed();
