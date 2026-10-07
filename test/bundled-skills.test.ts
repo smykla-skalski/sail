@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { createServer } from 'vite';
+import { z } from 'zod';
 import {
   bundledSkillChoices,
+  bundledSkillCorePath,
   bundledSkillNames,
   bundledSkillReferences,
 } from '../src/lib/bundled-skill-catalog.ts';
@@ -12,15 +16,13 @@ const skillPath = (skill: string, path = '') =>
   new URL(`../skills/${skill}/${path}`, import.meta.url);
 const read = (skill: string, path: string) => readFileSync(skillPath(skill, path), 'utf8');
 const shipItCore = read('ship-it', 'SKILL.md');
-const bundledModule = new URL('../src/lib/bundled-skills.ts', import.meta.url);
-const globbedCores = Object.fromEntries(
-  [
-    ...readFileSync(bundledModule, 'utf8').matchAll(/'(\.\.\/\.\.\/skills\/[^']+\/SKILL\.md)'/g),
-  ].map(([, path]) => [path, readFileSync(new URL(path, bundledModule), 'utf8')]),
+const cores = Object.fromEntries(
+  bundledSkillNames.map((name) => [bundledSkillCorePath(name), read(name, 'SKILL.md')]),
 );
-const bundled = bundledSkillChoices(globbedCores);
+const bundled = bundledSkillChoices(cores);
 const sailModeRule = (label: string) =>
   new RegExp(`\\*\\*${label}:\\*\\*.*$`, 'm').exec(shipItCore)?.[0] ?? '';
+const quotedValues = (list: string) => [...list.matchAll(/"([^"]+)"/g)].map(([, value]) => value);
 
 function filesOnDisk(skill: string): string[] {
   return ['references', 'scripts'].flatMap((directory) => {
@@ -78,18 +80,33 @@ void test('every file the ship-it workflow links to is bundled', () => {
   }
 });
 
-void test('the Vite glob in bundled-skills.ts gives each skill its own core', () => {
-  assert.deepEqual(
-    bundled.map((skill) => skill.name),
-    [...bundledSkillNames],
-  );
-  for (const skill of bundled) {
-    assert.match(skill.instructions ?? '', new RegExp(`^---\\nname: ${skill.name}\\n`));
-    assert.match(skill.instructions ?? '', new RegExp(`Detailed ${skill.name} references`));
+void test('Vite loads bundled-skills.ts with each skill on its own core', async () => {
+  const server = await createServer({
+    root: fileURLToPath(new URL('..', import.meta.url)),
+    configFile: false,
+    appType: 'custom',
+    logLevel: 'silent',
+    server: { middlewareMode: true, watch: null, hmr: false },
+  });
+  try {
+    const loaded = z
+      .object({
+        bundledSkills: z.array(z.object({ name: z.string(), instructions: z.string() })),
+      })
+      .parse(await server.ssrLoadModule('/src/lib/bundled-skills.ts'));
+    assert.deepEqual(
+      loaded.bundledSkills.map((skill) => skill.name),
+      [...bundledSkillNames],
+    );
+    for (const skill of loaded.bundledSkills) {
+      assert.ok(skill.instructions.startsWith(read(skill.name, 'SKILL.md')), skill.name);
+      assert.match(skill.instructions, new RegExp(`Detailed ${skill.name} references`));
+    }
+  } finally {
+    await server.close();
   }
   assert.throws(
-    () =>
-      bundledSkillChoices({ ...globbedCores, '../../skills/adversarial-test/SKILL.md': undefined }),
+    () => bundledSkillChoices({ ...cores, [bundledSkillCorePath('adversarial-test')]: undefined }),
     /bundled adversarial-test skill core is missing/,
   );
 });
@@ -118,9 +135,16 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
 
   const handoff = sailModeRule('Merge handoff');
   assert.match(handoff, /stop at a mergeable pull request/);
-  assert.match(handoff, /`evidence\.readiness\.ready` for a revision equal to that head/);
+  assert.match(handoff, /`git rev-parse HEAD` equals the PR `headRefOid`/);
+  assert.match(
+    handoff,
+    /`task_checkpoint_read` reports `reconciliation\.revisionMatches` and `evidence\.readiness\.ready`/,
+  );
   assert.match(handoff, /Do not post a merge comment or run a merge command/);
-  assert.match(handoff, /Report `awaiting_merge` through `ship_progress`/);
+  assert.match(
+    handoff,
+    /Report `awaiting_merge` through `ship_progress` when its schema lists that value; otherwise Sail marks the open pull request as awaiting merge/,
+  );
   assert.match(
     handoff,
     /delivery mismatch from `task_checkpoint_read` and a source issue closed by this pull request are the expected handoff, not stops/,
@@ -138,10 +162,34 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   assert.match(gateRouting, /apply only when Sail's gate rule requires a gate session/);
   assert.match(gateRouting, /CI triage uses a fresh native subagent/);
   assert.match(gateRouting, /`mechanism: inline` and `independence: not-applicable`/);
+  const progress = sailModeRule('Progress');
+  assert.match(progress, /NEEDS_FIXES, FAIL and CI fix rounds stay `running`/);
+  assert.match(
+    progress,
+    /when the review or test round cap stops the run, report `status: "blocked"`/,
+  );
+  assert.match(shipItCore, /When they reject it because Sail does not track this thread/);
   assert.match(
     readFileSync(skillPath('sail', 'SKILL.md'), 'utf8'),
-    /delivery-state mismatch, unless\s+the user merged the pull request after you reported `awaiting_merge`/,
+    /delivery-state mismatch, unless\s+the user merged a pull request you left mergeable for them/,
   );
+});
+
+void test('Sail mode names only ship_progress stages and statuses the tool accepts', () => {
+  const schema =
+    /"stage":\{"type":"string","enum":\[([^\]]+)\]\},\s*"status":\{"type":"string","enum":\[([^\]]+)\]\}/.exec(
+      readFileSync(new URL('../src-tauri/src/browser_agent.rs', import.meta.url), 'utf8'),
+    );
+  assert.ok(schema, 'ship_progress schema not found');
+  const progress = sailModeRule('Progress');
+  const stages = /using stages (.*?) and `([a-z_]+)`\./.exec(progress);
+  assert.ok(stages, 'stage list not found');
+  assert.deepEqual(
+    [...[...stages[1].matchAll(/`([a-z_]+)`/g)].map(([, stage]) => stage), stages[2]],
+    quotedValues(schema[1]),
+  );
+  for (const [, status] of progress.matchAll(/status: "([a-z_]+)"/g))
+    assert.ok(quotedValues(schema[2]).includes(status), status);
 });
 
 void test('an installed ship-it skill keeps Sail stage reporting without the bundled contract', () => {
