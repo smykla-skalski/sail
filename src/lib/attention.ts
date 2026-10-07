@@ -1,5 +1,20 @@
 export type ThreadStatus = 'working' | 'waiting' | 'done' | 'failed' | 'interrupted';
 
+export function openCodeExecutionStatus(eventType: string): ThreadStatus | null {
+  switch (eventType) {
+    case 'session.execution.started':
+      return 'working';
+    case 'session.execution.succeeded':
+      return 'done';
+    case 'session.execution.failed':
+      return 'failed';
+    case 'session.execution.interrupted':
+      return 'interrupted';
+    default:
+      return null;
+  }
+}
+
 export type ThreadAttention = { status: ThreadStatus; unread: boolean };
 
 export type AttentionMap = Record<string, ThreadAttention>;

@@ -3,11 +3,19 @@ import assert from 'node:assert/strict';
 import {
   loadAttention,
   markAttentionRead,
+  openCodeExecutionStatus,
   preserveAttentionOnCheckOpen,
   reconcileAttention,
   updateAttention,
   type AttentionMap,
 } from '../src/lib/attention.ts';
+
+void test('OpenCode execution events keep interrupted distinct from completed', () => {
+  assert.equal(openCodeExecutionStatus('session.execution.started'), 'working');
+  assert.equal(openCodeExecutionStatus('session.execution.succeeded'), 'done');
+  assert.equal(openCodeExecutionStatus('session.execution.failed'), 'failed');
+  assert.equal(openCodeExecutionStatus('session.execution.interrupted'), 'interrupted');
+});
 
 void test('background input and completion become unread once', () => {
   let state: AttentionMap = {};

@@ -168,6 +168,7 @@
   import {
     loadAttention,
     markAttentionRead,
+    openCodeExecutionStatus,
     preserveAttentionOnCheckOpen,
     reconcileAttention,
     updateAttention,
@@ -8643,17 +8644,9 @@
               (!event.location?.directory || item.directory === event.location.directory),
           );
           for (const thread of matchingThreads) {
-            updateAgentThreadStatus(
-              thread,
-              event.type === 'session.execution.started'
-                ? 'working'
-                : event.type === 'session.execution.failed'
-                  ? 'failed'
-                  : event.type === 'session.execution.interrupted'
-                    ? 'interrupted'
-                    : 'done',
-              event.type !== 'session.execution.interrupted',
-            );
+            const status = openCodeExecutionStatus(event.type);
+            if (!status) continue;
+            updateAgentThreadStatus(thread, status, event.type !== 'session.execution.interrupted');
             if (event.type === 'session.execution.succeeded')
               recordTurnOutcome(thread, event.id, event.created);
           }

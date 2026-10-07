@@ -49,7 +49,7 @@
     coordinationPrompt,
     type CoordinationMessage,
   } from './lib/coordination';
-  import type { ThreadStatus } from './lib/attention';
+  import { openCodeExecutionStatus, type ThreadStatus } from './lib/attention';
   import { openCodeContextUsage } from './lib/agent-usage';
   import {
     clipboardFiles,
@@ -666,17 +666,10 @@
             void refreshRequests(activeID).catch((cause) => (error = describe(cause)));
           if (id !== activeID) continue;
           if (event.type === 'session.execution.started') running = true;
-          if (
-            event.type === 'session.execution.succeeded' ||
-            event.type === 'session.execution.failed' ||
-            event.type === 'session.execution.interrupted'
-          ) {
+          const executionStatus = openCodeExecutionStatus(event.type);
+          if (executionStatus && executionStatus !== 'working') {
             running = false;
-            if (session)
-              onstatus(
-                summary(session),
-                event.type === 'session.execution.failed' ? 'failed' : 'done',
-              );
+            if (session) onstatus(summary(session), executionStatus);
           }
           if (event.type === 'permission.asked' && session) onstatus(summary(session), 'waiting');
           if (!refreshTimer)

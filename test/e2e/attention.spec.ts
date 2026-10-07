@@ -112,6 +112,21 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await expect(cancelled).toHaveText(expect.stringContaining('done'));
     await expect(cancelled.$('.thread-unread')).not.toExist();
+    const cancelledSidebar = $('.project-agent-row[aria-label*="Slow cancel"]');
+    await expect(cancelledSidebar.$('.activity-status')).toHaveAttribute(
+      'data-state',
+      'interrupted',
+    );
+
+    await waitForComposer();
+    await $('.agent-composer textarea').setValue('Agent interrupted');
+    await $('.agent-actions button').click();
+    const agentInterrupted = $('.project-agent-row[aria-label*="Agent interrupted"]');
+    await expect(agentInterrupted.$('.activity-status')).toHaveAttribute(
+      'data-state',
+      'interrupted',
+    );
+    await expect(agentInterrupted).toHaveText(expect.stringContaining('Interrupted'));
 
     await openSettings();
     await $('.settings-navigation button:nth-of-type(3)').click();

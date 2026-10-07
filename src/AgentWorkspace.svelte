@@ -1184,7 +1184,7 @@
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
-      finalStatus = stopRequested ? 'interrupted' : 'failed';
+      finalStatus = finalStatus === 'interrupted' || stopRequested ? 'interrupted' : 'failed';
       if (!deliverySessionId && current !== generation && disposed && !ephemeral && !external) {
         const recovered =
           sentImages.length || sentClipboard.length

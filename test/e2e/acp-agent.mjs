@@ -264,6 +264,10 @@ for await (const line of createInterface({ input: process.stdin })) {
     const { sessionId } = message.params;
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    if (text === 'Agent interrupted') {
+      send({ id: message.id, result: { stopReason: 'cancelled' } });
+      continue;
+    }
     if (text.startsWith('Gate prompt model unavailable')) {
       send({ id: message.id, error: { code: -1, message: 'Model x is unavailable' } });
       continue;
