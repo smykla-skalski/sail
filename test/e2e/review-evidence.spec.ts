@@ -17,6 +17,7 @@ describe('review evidence', () => {
   });
 
   it('collects current changes and opens the selected evidence', async () => {
+    await browser.setWindowSize(1280, 850);
     const path = realpathSync(repository);
     await browser.execute((directory) => {
       sessionStorage.removeItem('sail-e2e-settings');
@@ -54,10 +55,14 @@ describe('review evidence', () => {
     await browser.setWindowSize(390, 600);
     await $('.mobile-switcher button:nth-child(3)').click();
     await expect($('.review-evidence')).toBeDisplayed();
-    expect(
-      await browser.execute(
-        () => document.querySelector('.review-evidence')?.getBoundingClientRect().width,
-      ),
-    ).toBeLessThanOrEqual(390);
+    const mobileBounds = await browser.execute(() => ({
+      details: document.querySelector('#session-details')!.getBoundingClientRect().toJSON(),
+      evidence: document.querySelector('.review-evidence')!.getBoundingClientRect().toJSON(),
+      topbar: document.querySelector('.topbar')!.getBoundingClientRect().toJSON(),
+      status: document.querySelector('.agent-status-bar')!.getBoundingClientRect().toJSON(),
+    }));
+    expect(mobileBounds.details.top).toBe(mobileBounds.topbar.bottom);
+    expect(mobileBounds.details.bottom).toBeLessThanOrEqual(mobileBounds.status.top);
+    expect(mobileBounds.evidence.width).toBeLessThanOrEqual(390);
   });
 });
