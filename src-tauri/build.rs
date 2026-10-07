@@ -15,6 +15,7 @@ fn main() {
             "working_tree_revision",
             "working_tree_generation",
             "working_tree_commit",
+            "shipping_changed_paths",
             "worktree_overviews",
             "record_turn_snapshot",
             "list_turn_snapshots",

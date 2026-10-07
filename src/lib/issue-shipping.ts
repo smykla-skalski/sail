@@ -3,6 +3,7 @@ import type { SpawnState } from './agent-results';
 import type { ShipEvent, ShipGate, ShipCheck } from './ship-progress';
 import { initialTaskCheckpoint, type TaskCheckpoint } from './task-checkpoint.ts';
 import type { EvidenceManifest } from './task-evidence.ts';
+import type { ShipValidationPolicy } from './ship-risk-policy.ts';
 
 export type ShipIssueState =
   'pending' | 'starting' | 'working' | 'awaiting_merge' | 'failed' | 'merged';
@@ -44,6 +45,8 @@ export interface ShipIssue {
   evidenceManifests?: EvidenceManifest[];
   evidenceRevision?: string;
   evidenceCommit?: string;
+  validationPolicyRequired?: boolean;
+  validationPolicy?: ShipValidationPolicy;
 }
 
 export interface ShipRun {
@@ -123,6 +126,7 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
           workerModel: input.workerModel,
           error: null,
           stage: 'implementing',
+          validationPolicyRequired: true,
           events: [{ at: input.approvedAt, stage: 'implementing' }],
           checkpoint: initialTaskCheckpoint(
             {
@@ -214,6 +218,7 @@ export function createShipRun(
         { id: issue.id, url: issue.url, title: issue.title },
         approvedAt,
       ),
+      validationPolicyRequired: true,
     })),
   };
 }

@@ -679,6 +679,25 @@ const shipIssueSchema = z.object({
   evidenceManifests: evidenceManifestsSchema.optional(),
   evidenceRevision: z.string().min(1).optional(),
   evidenceCommit: z.string().min(1).optional(),
+  validationPolicyRequired: z.boolean().optional(),
+  validationPolicy: z
+    .object({
+      risk: z.enum(['low', 'medium', 'high']),
+      requiredGates: z.array(z.enum(gateNames)),
+      sources: z.array(z.string().min(1)).min(1),
+      revision: z.string().min(1),
+      changedPaths: z.array(z.string()),
+      selectedAt: z.number().int().nonnegative(),
+      history: z.array(
+        z.object({
+          requestedRisk: z.enum(['low', 'medium', 'high']).nullable(),
+          selectedRisk: z.enum(['low', 'medium', 'high']),
+          sources: z.array(z.string().min(1)).min(1),
+          at: z.number().int().nonnegative(),
+        }),
+      ),
+    })
+    .optional(),
 });
 const shipRunSchema = z.object({
   id: z.string(),

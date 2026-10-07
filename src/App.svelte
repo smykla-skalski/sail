@@ -49,6 +49,7 @@
     reconciledShipGates,
     persistShipRefresh,
     settleShipRefresh,
+    type GateName,
     type ShippingPullRequest,
     shipOwner,
     shipCheckpointOwner,
@@ -85,6 +86,14 @@
     taskEvidenceSchema,
     type EvidenceResult,
   } from './lib/task-evidence.ts';
+  import {
+    selectShipValidationPolicy,
+    assertShipGateAllowed,
+    requiredShipGatesSatisfied,
+    shipRiskLevels,
+    type ShipRisk,
+    type ShipValidationConfig,
+  } from './lib/ship-risk-policy.ts';
   import DiffPanel from './DiffPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
@@ -428,6 +437,7 @@
     name:
       | 'worktree_create'
       | 'agent_spawn'
+      | 'validation_policy'
       | 'validation_gate'
       | 'ship_progress'
       | 'task_checkpoint_read'
@@ -497,6 +507,7 @@
     archive: string;
     copy: string[];
     postTurnChecks: string[];
+    validation?: ShipValidationConfig;
   };
   let postTurnResults = $state<PostTurnCheck[]>([]);
   const pendingPostTurnChecks = new SvelteSet<string>();
@@ -2419,8 +2430,8 @@
       }
       const inlineGates = !crossValidation.choices.length && !crossValidation.strictDifferentModel;
       const gateExecution = inlineGates
-        ? 'Run the Code Adversary, Findings Adversary, and Test Adversary in this Ship It session with the implementation agent and model. Do not call validation_gate or require agent coordination.'
-        : 'Run each adversarial review pass and manual test in a fresh subagent session. If a gate session cannot launch, pause and report the reason in this thread.';
+        ? 'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run exactly those gates in this Ship It session with the implementation agent and model. Do not call validation_gate or require agent coordination.'
+        : 'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run exactly those gates in fresh subagent sessions. If a gate session cannot launch, pause and report the reason in this thread.';
       const gateReporting = inlineGates
         ? 'Before every adversary pass, read the checkpoint revision. After the pass, use ship_progress with that revision, its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.'
         : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
@@ -2814,11 +2825,18 @@
       if (
         issue.path &&
         shipGatesSettled(issue) &&
-        shipTaskThreadsSettled(issue, taskThreadStates, spawnReceipts)
+        shipTaskThreadsSettled(issue, taskThreadStates, spawnReceipts) &&
+        (!issue.validationPolicyRequired ||
+          requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
       ) {
         try {
           await updateShipIssue(run, issue, await settledImplementationAttribution(issue.path));
-          if (!shipGatesSettled(issue)) return;
+          if (
+            !shipGatesSettled(issue) ||
+            (issue.validationPolicyRequired &&
+              !requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
+          )
+            return;
           const archivePath = await invoke<string | null>('delete_worktree', {
             repository: run.repository,
             worktree: issue.path,
@@ -3929,14 +3947,83 @@
       };
     }
     if (request.name === 'ship_progress') return reportShipProgress(request, sourceId);
+    if (request.name === 'validation_policy') {
+      const owner = shipOwner(shipRuns, request.directory, sourceId);
+      if (!owner) throw new Error('Only the assigned Ship worker can select validation risk.');
+      const explicitRisk = request.arguments.risk;
+      if (!shipRiskLevels.includes(explicitRisk as ShipRisk))
+        throw new Error('Choose validation risk low, medium, or high.');
+      const [revision, changedPaths, config] = await Promise.all([
+        invoke<string>('working_tree_revision', { path: request.directory }),
+        invoke<string[]>('shipping_changed_paths', { path: request.directory }),
+        invoke<WorktreeConfig | null>('worktree_config', { worktree: request.directory }),
+      ]);
+      const policy = selectShipValidationPolicy(
+        config?.validation,
+        changedPaths,
+        explicitRisk as ShipRisk,
+        revision,
+        owner.issue.validationPolicy,
+        Date.now(),
+      );
+      const checkpointBeforePolicy =
+        owner.issue.checkpoint ??
+        initialTaskCheckpoint(
+          { id: owner.issue.id, url: owner.issue.url, title: owner.issue.title },
+          Date.now(),
+        );
+      const checkpoint = prepareTaskCheckpointUpdate(
+        checkpointBeforePolicy,
+        { requiredGates: policy.requiredGates },
+        revision,
+        checkpointBeforePolicy.sequence,
+        checkpointBeforePolicy.revision,
+        true,
+        Date.now(),
+      );
+      const evidenceManifests = syncEvidenceManifest(
+        owner.issue.evidenceManifests ?? [],
+        revision,
+        checkpoint.acceptanceCriteria,
+        Date.now(),
+      );
+      await updateShipIssue(owner.run, owner.issue, {
+        validationPolicyRequired: true,
+        validationPolicy: policy,
+        checkpoint,
+        evidenceRevision: revision,
+        evidenceManifests,
+        events: appendShipEvent(
+          owner.issue.events,
+          `validation policy: ${policy.risk}`,
+          policy.sources.join(' · '),
+        ),
+      });
+      return {
+        risk: policy.risk,
+        requiredGates: policy.requiredGates,
+        sources: policy.sources,
+        revision: policy.revision,
+        changedPaths: policy.changedPaths,
+      };
+    }
     if (request.name === 'validation_gate') {
       const owner = shipOwner(shipRuns, request.directory, sourceId);
       try {
-        if (owner)
+        if (owner) {
+          const revision = await invoke<string>('working_tree_revision', {
+            path: request.directory,
+          });
+          assertShipGateAllowed(
+            owner.issue.validationPolicy,
+            request.arguments.gate as GateName,
+            revision,
+          );
           await updateShipIssue(owner.run, owner.issue, {
             stage: request.arguments.gate === 'test-adversary' ? 'testing' : 'reviewing',
             events: appendShipEvent(owner.issue.events, String(request.arguments.gate)),
           });
+        }
         const result = await spawnValidationGate(request, project, sourceId);
         if (owner) await updateShipIssue(owner.run, owner.issue, { blockedReason: null });
         return result;
@@ -4087,6 +4174,10 @@
         const owner = shipOwner(shipRuns, request.directory, sourceId);
         if (!owner)
           throw new Error('Only the assigned Ship worker can report inline gate verdicts.');
+        const revision = await invoke<string>('working_tree_revision', {
+          path: request.directory,
+        });
+        assertShipGateAllowed(owner.issue.validationPolicy, report.gate, revision);
         validateGateVerdict(report.gate, report.verdict);
         const now = Date.now();
         const model = resolvedWorkerModel(owner.issue) ?? null;
@@ -4148,8 +4239,14 @@
         if (mutationGeneration !== receipt.validation.mutationGeneration)
           throw new Error('The worktree was modified during validation. Rerun the gate.');
       }
-      validateGateVerdict(receipt.validation.gate, report.verdict);
       const owner = shipOwner(shipRuns, receipt.sourceDirectory, receipt.sourceId);
+      if (owner) {
+        const revision = await invoke<string>('working_tree_revision', {
+          path: receipt.sourceDirectory,
+        });
+        assertShipGateAllowed(owner.issue.validationPolicy, receipt.validation.gate, revision);
+      }
+      validateGateVerdict(receipt.validation.gate, report.verdict);
       const evidenceChanges = owner
         ? await recordGateEvidence(
             owner,

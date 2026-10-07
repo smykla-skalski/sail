@@ -483,7 +483,8 @@ impl BrowserManager {
             "ship_progress"
             | "task_checkpoint_read"
             | "task_checkpoint_update"
-            | "task_evidence_record" => None,
+            | "task_evidence_record"
+            | "validation_policy" => None,
             _ => return Err("Unknown coordination action.".into()),
         };
         let settings = crate::settings::load_settings(app.clone())?;
@@ -565,6 +566,7 @@ impl BrowserManager {
                 | "worktree_list"
                 | "worktree_info"
                 | "agent_spawn"
+                | "validation_policy"
                 | "validation_gate"
                 | "ship_progress"
                 | "task_checkpoint_read"
@@ -1221,6 +1223,11 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "provider,prompt",
     ),
     (
+        "validation_policy",
+        "Select and persist this Ship task's validation risk before validation. Sail combines the explicit choice with repository defaults and changed-path rules, never lowers a prior selection, and returns the required gates and policy sources.",
+        "risk",
+    ),
+    (
         "validation_gate",
         "Start one fresh Ship It validation pass in this worktree using a selected available agent and model. Returns its actual provider, model, and launch receipt. Run passes in order and wait for each result.",
         "gate,prompt",
@@ -1383,6 +1390,13 @@ pub fn run_mcp_stdio() {
                             "implementingModels":{"type":"array","items":{"type":"string"}}
                         },
                         "required":["gate","prompt","implementingModels"]
+                    }});
+                }
+                if *name == "validation_policy" {
+                    return json!({"name":name,"description":description,"inputSchema":{
+                        "type":"object",
+                        "properties":{"risk":{"type":"string","enum":["low","medium","high"]}},
+                        "required":["risk"]
                     }});
                 }
                 if *name == "ship_progress" {
@@ -1564,6 +1578,9 @@ mod skill_tests {
         assert!(TOOLS
             .iter()
             .any(|(name, _, _)| *name == "task_evidence_record"));
+        assert!(TOOLS
+            .iter()
+            .any(|(name, _, _)| *name == "validation_policy"));
         assert_eq!(
             call_bridge(&json!({"name":"sail_skill","arguments":{}}))["content"][0]["text"],
             SAIL_SKILL

@@ -65,6 +65,16 @@ To customize worktrees, commit `.sail/worktree.json` in the repository:
   "run": "mise run dev",
   "archive": "mise run cleanup",
   "postTurnChecks": ["mise run test", "mise run lint"],
+  "validation": {
+    "defaultRisk": "medium",
+    "low": ["test-adversary"],
+    "medium": ["code-adversary", "test-adversary"],
+    "high": ["code-adversary", "findings-adversary", "test-adversary"],
+    "paths": [
+      { "pattern": "src-tauri/**", "risk": "high" },
+      { "pattern": "**/*.sql", "risk": "high" }
+    ]
+  },
   "copy": [".env", "config/local"]
 }
 ```
@@ -72,6 +82,8 @@ To customize worktrees, commit `.sail/worktree.json` in the repository:
 Sail copies listed Git-ignored files and folders into each new worktree, then opens `setup` in a visible terminal. It waits for setup to succeed before starting a selected agent. **Run project** starts `run` in a terminal. On deletion, Sail opens `archive` in a terminal and asks before proceeding if it fails. Deleting a configured worktree also removes its local uncommitted and ignored files after confirmation. Without this config, worktree creation and deletion retain their normal behavior.
 
 Post-turn checks run after a successful Claude, Codex, or OpenCode turn. Add personal commands in **Settings → Agents → Post-turn checks**; both personal and repository commands run in the active worktree. Sail asks you to review each repository command before its first run and whenever it changes. Results and output appear in the thread. Failed, canceled, or timed-out checks offer Retry and leave agent status unchanged. Checks time out after two minutes; Sail runs each command once per completed turn.
+
+Ship validation policies select the strongest risk from the repository default, the worker's explicit choice, every matching changed-path rule, and any earlier escalation. Higher-risk gate lists must include every gate required by lower risks, so a later policy selection cannot silently reduce validation. The Ship view shows the selected risk, required gates, source rules, and bound worktree revision before gates run.
 
 Agents can use the browser pane in their own worktree to navigate, read, click, type, run JavaScript, and capture screenshots. Open a browser pane first; an agent can navigate its blank tab. Sail asks before a thread first controls the pane and before it accesses external sites. Use **Agent browser on/off** in the top bar to disable or restore access for the selected project.
 

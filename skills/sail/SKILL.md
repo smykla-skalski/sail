@@ -36,6 +36,10 @@ browser. Read the tool schemas before calling them.
   with the `ship_progress` verdict; cross-validation gates use their launch
   revision. Re-read after source changes; stale evidence never makes a
   task merge-ready.
+- Before starting Ship validation, call `validation_policy` with an explicit
+  `low`, `medium`, or `high` risk. Inspect the returned selected risk, required
+  gates, policy sources, and revision. Run only the required gates. If the
+  worktree changes, select the policy again; Sail retains earlier escalation.
 - Use `worktree_list` to find project worktrees and live agent threads. Use
   `worktree_info` for details about a listed path.
 - Use `agent_spawn` to start Claude, Codex, or OpenCode without interactive

@@ -131,6 +131,7 @@ void test('approved snapshot survives serialization and does not expand to new i
   assert.equal(shipping.issues[0].branch, 'ship-issue-11-run-id-1');
   assert.equal(shipping.issues[0].checkpoint?.taskId, 'first');
   assert.equal(shipping.issues[0].checkpoint?.source, graph.issues[0].url);
+  assert.equal(shipping.issues[0].validationPolicyRequired, true);
 });
 
 void test('adopts an already-running direct Ship It thread', () => {
@@ -155,6 +156,7 @@ void test('adopts an already-running direct Ship It thread', () => {
   assert.equal(issue.workerModel, 'gpt-5.6-luna');
   assert.equal(issue.checkpoint?.taskId, 'kumahq/kuma#18976');
   assert.equal(issue.checkpoint?.source, issue.url);
+  assert.equal(issue.validationPolicyRequired, true);
   assert.equal(
     shipOwner(adopted, '/repo/worktrees/gateway-fix', 'acp:codex:running-thread')?.issue,
     issue,

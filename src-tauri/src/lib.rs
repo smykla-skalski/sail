@@ -989,6 +989,58 @@ async fn working_tree_commit(path: String) -> Result<Option<String>, String> {
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+async fn shipping_changed_paths(path: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = validate_repository(path)?;
+        let base = worktree_base(Path::new(&root));
+        let merge_base =
+            git_reference(Path::new(&root), &["merge-base", "HEAD", &base]).unwrap_or(base);
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &root,
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                &merge_base,
+                "--",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        let untracked = Command::new("git")
+            .args([
+                "-C",
+                &root,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !untracked.status.success() {
+            return Err(String::from_utf8_lossy(&untracked.stderr).into_owned());
+        }
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .chain(untracked.stdout.split(|byte| *byte == 0))
+            .filter(|name| !name.is_empty())
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorktreeOverview {
@@ -1977,6 +2029,7 @@ pub fn run() {
             working_tree_revision,
             working_tree_generation,
             working_tree_commit,
+            shipping_changed_paths,
             worktree_overviews,
             worktree_snapshots::record_turn_snapshot,
             worktree_snapshots::list_turn_snapshots,
@@ -2114,9 +2167,9 @@ mod tests {
     use super::{
         add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
         git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
-        remove_worktree, repository_namespace, server_args, shipping_default_branch,
-        shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
-        worktree_overviews,
+        remove_worktree, repository_namespace, server_args, shipping_changed_paths,
+        shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
+        working_tree_diff, worktree_overviews,
     };
     use super::{working_tree_commit, working_tree_revision};
     use std::fs;
@@ -2560,6 +2613,31 @@ mod tests {
         let after =
             tauri::async_runtime::block_on(working_tree_revision(parent_path.into())).unwrap();
         assert_ne!(before, after);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shipping_paths_include_commits_and_uncommitted_files_since_base() {
+        let root =
+            std::env::temp_dir().join(format!("sail-shipping-paths-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q", "-b", "main"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(path, &["add", "base.txt"]);
+        git(path, &["commit", "-qm", "seed"]);
+        git(path, &["checkout", "-qb", "feature"]);
+        fs::write(root.join("committed.txt"), "commit\n").unwrap();
+        git(path, &["add", "committed.txt"]);
+        git(path, &["commit", "-qm", "feature"]);
+        fs::write(root.join("base.txt"), "changed\n").unwrap();
+        fs::write(root.join("untracked.txt"), "new\n").unwrap();
+
+        let paths = tauri::async_runtime::block_on(shipping_changed_paths(path.into())).unwrap();
+        assert_eq!(paths, ["base.txt", "committed.txt", "untracked.txt"]);
         fs::remove_dir_all(root).unwrap();
     }
 

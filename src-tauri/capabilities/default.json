@@ -19,6 +19,7 @@
     "allow-working-tree-revision",
     "allow-working-tree-generation",
     "allow-working-tree-commit",
+    "allow-shipping-changed-paths",
     "allow-worktree-overviews",
     "allow-record-turn-snapshot",
     "allow-list-turn-snapshots",

@@ -262,6 +262,30 @@ void test('worktree cleanup waits for every authorized checkpoint thread', () =>
   assert.equal(shipTaskThreadsSettled(issue, {}, receipts), true);
 });
 
+void test('persists the selected revision-bound validation policy', () => {
+  const run = fixture();
+  run.issues[0].validationPolicy = {
+    risk: 'high',
+    requiredGates: ['code-adversary', 'findings-adversary', 'test-adversary'],
+    sources: ['path rule src-tauri/**: high (src-tauri/src/lib.rs)'],
+    revision: 'revision-one',
+    changedPaths: ['src-tauri/src/lib.rs'],
+    selectedAt: 10,
+    history: [
+      {
+        requestedRisk: 'medium',
+        selectedRisk: 'high',
+        sources: ['path rule src-tauri/**: high (src-tauri/src/lib.rs)'],
+        at: 10,
+      },
+    ],
+  };
+
+  const restored = loadShipRuns(JSON.stringify([run]));
+
+  assert.deepEqual(restored[0].issues[0].validationPolicy, run.issues[0].validationPolicy);
+});
+
 void test('dependency failure blocks only dependents and merged dependencies become queued', () => {
   const run = fixture();
   assert.equal(shipStatus(run, run.issues[0]), 'Queued');
