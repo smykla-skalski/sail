@@ -1146,8 +1146,9 @@ fn content_version(content: &str) -> String {
 fn skill_reference(arguments: &Value) -> Result<Value, String> {
     let skill = required(arguments, "skill")?;
     let (core, references) = bundled_skill(skill).ok_or("Unknown bundled skill.")?;
-    let Some(reference) = arguments.get("reference").and_then(Value::as_str) else {
-        return Ok(json!({
+    let reference = match arguments.get("reference") {
+        None => {
+            return Ok(json!({
             "content":[{"type":"text","text":format!(
                 "Bundled skill: {skill}\nCore version: {}\nReferences:\n{}",
                 content_version(core),
@@ -1158,7 +1159,10 @@ fn skill_reference(arguments: &Value) -> Result<Value, String> {
                 "coreVersion":content_version(core),
                 "references":references.iter().map(|(name, content)| json!({"name":name,"version":content_version(content)})).collect::<Vec<_>>()
             }
-        }));
+            }));
+        }
+        Some(Value::String(reference)) => reference.as_str(),
+        Some(_) => return Err("Bundled skill reference must be a string.".into()),
     };
     let (_, content) = references
         .iter()
@@ -1542,6 +1546,18 @@ mod skill_tests {
             result["content"][0]["text"],
             "Unknown bundled skill reference."
         );
+
+        for reference in [json!(null), json!(42), json!(["inputs.md"])] {
+            let result = call_bridge(&json!({
+                "name":"skill_reference",
+                "arguments":{"skill":"ship-it","reference":reference}
+            }));
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["content"][0]["text"],
+                "Bundled skill reference must be a string."
+            );
+        }
     }
 }
 
