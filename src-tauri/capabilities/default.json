@@ -13,6 +13,7 @@
     "allow-start-runtime",
     "allow-validate-repository",
     "allow-list-picker-directory",
+    "dialog:allow-open",
     "allow-working-tree-diff",
     "allow-working-tree-revision",
     "allow-worktree-overviews",
