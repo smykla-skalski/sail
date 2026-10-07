@@ -127,6 +127,23 @@ describe('agent thread attention', () => {
       'interrupted',
     );
     await expect(agentInterrupted).toHaveText(expect.stringContaining('Interrupted'));
+    const interruptedColor = await browser.execute(() => {
+      const status = document.querySelector(
+        '.project-agent-row[aria-label*="Agent interrupted"] .activity-status',
+      );
+      const reference = document.createElement('span');
+      reference.style.color = 'var(--activity-failed)';
+      document.body.append(reference);
+      const colors = [getComputedStyle(status!).color, getComputedStyle(reference).color];
+      reference.remove();
+      return colors;
+    });
+    expect(interruptedColor[0]).toBe(interruptedColor[1]);
+    await browser.refresh();
+    await expect(agentInterrupted.$('.activity-status')).toHaveAttribute(
+      'data-state',
+      'interrupted',
+    );
 
     await openSettings();
     await $('.settings-navigation button:nth-of-type(3)').click();

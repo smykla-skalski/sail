@@ -188,7 +188,7 @@ export function sidebarThreadStatus(
       receipt.targetId === receiptSourceId(thread.agent, thread.sessionId) &&
       receipt.targetDirectory === thread.directory,
   );
-  if (child) {
+  if (child && !(saved && receiptIsSettled(child.state) && thread.updated > child.updated)) {
     status =
       child.state === 'working' || child.state === 'waiting'
         ? child.state

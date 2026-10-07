@@ -15,6 +15,15 @@ export function openCodeExecutionStatus(eventType: string): ThreadStatus | null 
   }
 }
 
+export function openCodeTurnStatus(
+  outcome: 'succeeded' | 'failed' | 'interrupted' | undefined,
+  stopRequested: boolean,
+): ThreadStatus {
+  if (outcome === 'succeeded') return 'done';
+  if (outcome === 'failed') return 'failed';
+  return outcome === 'interrupted' || stopRequested ? 'interrupted' : 'done';
+}
+
 export type ThreadAttention = { status: ThreadStatus; unread: boolean };
 
 export type AttentionMap = Record<string, ThreadAttention>;

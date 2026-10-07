@@ -214,6 +214,18 @@ await test('native child rows use their own outcome without parent attention sta
   assert.equal(status('completed'), 'done');
   assert.equal(status('failed'), 'failed');
   assert.equal(status('interrupted'), 'interrupted');
+  assert.equal(
+    sidebarThreadStatus(
+      { ...thread, updated: 3 },
+      { [JSON.stringify(['codex', '/repo', 'child'])]: { status: 'done', unread: false } },
+      {},
+      true,
+      true,
+      [],
+      [{ ...receipt, state: 'interrupted' }],
+    ),
+    'done',
+  );
   assert.equal(status('unavailable'), null);
 });
 

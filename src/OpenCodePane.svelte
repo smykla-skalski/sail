@@ -49,7 +49,7 @@
     coordinationPrompt,
     type CoordinationMessage,
   } from './lib/coordination';
-  import { openCodeExecutionStatus, type ThreadStatus } from './lib/attention';
+  import { openCodeExecutionStatus, openCodeTurnStatus, type ThreadStatus } from './lib/attention';
   import { openCodeContextUsage } from './lib/agent-usage';
   import {
     clipboardFiles,
@@ -861,11 +861,7 @@
         running = false;
         onstatus(
           summary(latest),
-          stopRequested || latest.outcome === 'interrupted'
-            ? 'interrupted'
-            : latest.outcome === 'failed'
-              ? 'failed'
-              : 'done',
+          openCodeTurnStatus(latest.outcome, stopRequested),
           !stopRequested,
         );
         await refreshMessages(id, current);
@@ -909,7 +905,13 @@
     stopRequested = true;
     try {
       await client.session.interrupt({ sessionID: activeID });
-      running = false;
+    } catch (cause) {
+      stopRequested = false;
+      error = describe(cause);
+      return;
+    }
+    running = false;
+    try {
       await refreshMessages(activeID);
     } catch (cause) {
       error = describe(cause);
