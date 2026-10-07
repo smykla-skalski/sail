@@ -361,7 +361,8 @@ impl ActivePrompt {
     }
 
     fn reports_interruption(&self) -> bool {
-        !self.agent_message_overflow
+        self.agent_message_open
+            && !self.agent_message_overflow
             && self
                 .last_agent_message
                 .trim()
@@ -413,6 +414,22 @@ mod interruption_report_tests {
             &json!({"sessionUpdate":"agent_message_chunk","content":{"text":" but recovered"}}),
         );
         assert!(!active.reports_interruption());
+    }
+
+    #[test]
+    fn later_tool_or_thought_closes_interruption_message() {
+        for update in [
+            json!({"sessionUpdate":"tool_call","toolCallId":"next"}),
+            json!({"sessionUpdate":"agent_thought_chunk","content":{"text":"Continuing"}}),
+        ] {
+            let mut active = prompt();
+            active.observe_update(
+                &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"Step interrupted"}}),
+            );
+            assert!(active.reports_interruption());
+            active.observe_update(&update);
+            assert!(!active.reports_interruption());
+        }
     }
 }
 

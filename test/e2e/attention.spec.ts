@@ -210,6 +210,14 @@ describe('agent thread attention', () => {
     await expect(discussed.$('.activity-status')).toHaveAttribute('data-state', 'done');
     await expect(discussed).toHaveText(expect.stringContaining('Completed'));
 
+    await waitForComposer();
+    await $('.agent-composer textarea').setValue('Continue after interruption');
+    await $('.agent-actions button').click();
+    await $('.agent-launches button').click();
+    const continued = $('.project-agent-row[aria-label*="Continue after interruption"]');
+    await expect(continued.$('.activity-status')).toHaveAttribute('data-state', 'done');
+    await expect(continued).toHaveText(expect.stringContaining('Completed'));
+
     await openSettings();
     await $('.settings-navigation button:nth-of-type(3)').click();
     const options = await $$('.attention-setting input');
