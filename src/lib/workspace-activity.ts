@@ -134,9 +134,22 @@ export function activitySectionItems(
 export function activityHistoryWithoutLiveItems(
   items: WorkspaceActivityItem[],
   events: ActivityHistoryEvent[],
+  agent?: string,
+  sessionId?: string,
 ): ActivityHistoryEvent[] {
   const visible = new Set(
-    items.map((item) => `${item.kind === 'child' ? 'subagent' : item.kind}:${item.sourceId}`),
+    items.map((item) =>
+      item.kind === 'child'
+        ? `subagent:${item.sourceId}`
+        : `${item.kind}:${agent ?? ''}:${sessionId ?? ''}:${item.sourceId}`,
+    ),
   );
-  return events.filter((event) => !visible.has(`${event.kind}:${event.sourceId}`));
+  return events.filter(
+    (event) =>
+      !visible.has(
+        event.kind === 'subagent'
+          ? `subagent:${event.sourceId}`
+          : `${event.kind}:${event.agent ?? ''}:${event.sessionId ?? ''}:${event.sourceId}`,
+      ),
+  );
 }

@@ -12,6 +12,8 @@
   let {
     items,
     events = [],
+    agent,
+    sessionId,
     loading = false,
     error = '',
     onrefresh = () => {},
@@ -20,6 +22,8 @@
   }: {
     items: WorkspaceActivityItem[];
     events?: ActivityHistoryEvent[];
+    agent?: string;
+    sessionId?: string;
     loading?: boolean;
     error?: string;
     onrefresh?: () => void;
@@ -32,7 +36,7 @@
     { id: 'needs-input', label: 'Needs input' },
     { id: 'recent', label: 'Recent' },
   ];
-  const recentEvents = $derived(activityHistoryWithoutLiveItems(items, events));
+  const recentEvents = $derived(activityHistoryWithoutLiveItems(items, events, agent, sessionId));
   let opening = $state('');
   let selectionError = $state('');
 

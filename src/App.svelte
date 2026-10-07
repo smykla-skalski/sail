@@ -1124,8 +1124,7 @@
       return;
     }
     const narrow = window.matchMedia('(max-width: 850px)').matches;
-    const visible =
-      detailsOpen && activeSideTab === 'changes' && (!narrow || mobileView === 'details');
+    const visible = detailsOpen && (!narrow || mobileView === 'details');
     saveViewState();
     if (visible) {
       detailsOpen = false;
@@ -9974,6 +9973,8 @@
                   <WorkspaceActivity
                     items={acpAgent ? mainAgentWorkspaceActivity : mainWorkspaceActivity}
                     events={currentActivityHistory}
+                    agent={acpAgent ?? 'opencode'}
+                    sessionId={acpAgent ? acpThread?.sessionId : (sessionID ?? undefined)}
                     loading={inboxLoading}
                     error={inboxError}
                     onrefresh={() => void refreshInbox()}

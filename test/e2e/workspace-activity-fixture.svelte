@@ -81,6 +81,8 @@
       <WorkspaceActivity
         items={activeItems}
         {events}
+        agent="opencode"
+        sessionId="parent"
         onselect={(item) => {
           if (failSelection) {
             failSelection = false;

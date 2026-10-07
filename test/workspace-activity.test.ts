@@ -135,6 +135,20 @@ await test('durable history excludes sources already shown as live activity', ()
       title: 'Read file',
       outcome: 'completed',
       at: 2,
+      agent: 'codex',
+      sessionId: 'session-1',
+    },
+    {
+      id: 'other-tool-history',
+      workspace: '/repo',
+      kind: 'tool' as const,
+      source: 'codex',
+      sourceId: 'tool',
+      title: 'Read file in another session',
+      outcome: 'completed',
+      at: 2,
+      agent: 'codex',
+      sessionId: 'session-2',
     },
     {
       id: 'parent-history',
@@ -149,7 +163,7 @@ await test('durable history excludes sources already shown as live activity', ()
   ];
 
   assert.deepEqual(
-    activityHistoryWithoutLiveItems(items, events).map((event) => event.id),
-    ['parent-history'],
+    activityHistoryWithoutLiveItems(items, events, 'codex', 'session-1').map((event) => event.id),
+    ['other-tool-history', 'parent-history'],
   );
 });

@@ -265,6 +265,53 @@
     onactivityopen();
   }
 
+  function paneOwnsActivity(event: ActivityHistoryEvent): boolean {
+    return (
+      !('direction' in pane) &&
+      !!pane.agent &&
+      !!pane.thread &&
+      event.workspace === directory &&
+      event.agent === pane.agent &&
+      event.sessionId === pane.thread.sessionId
+    );
+  }
+
+  function paneOwnsChild(event: ActivityHistoryEvent): boolean {
+    if ('direction' in pane || !pane.agent || !pane.thread || event.kind !== 'subagent')
+      return false;
+    const source =
+      pane.agent === 'opencode'
+        ? `opencode:${pane.thread.sessionId}`
+        : `acp:${pane.agent}:${pane.thread.sessionId}`;
+    return spawnReceiptsForSource(spawnReceipts, source, directory).some(
+      (receipt) => receipt.receiptId === event.sourceId,
+    );
+  }
+
+  async function selectPaneActivityHistory(event: ActivityHistoryEvent) {
+    if (event.kind === 'parent' && paneOwnsActivity(event)) {
+      onfocus(pane.id);
+      onactivityopen();
+      return;
+    }
+    const kind = event.kind === 'subagent' ? 'child' : event.kind;
+    if (kind !== 'parent' && (paneOwnsActivity(event) || paneOwnsChild(event))) {
+      await selectPaneActivity({
+        id: event.id,
+        sourceId: event.sourceId,
+        kind,
+        section: 'recent',
+        title: event.title,
+        detail: event.source,
+        status: event.outcome,
+        updated: event.at,
+      });
+      onactivityopen();
+      return;
+    }
+    await onactivityselect(event);
+  }
+
   function reviewEvidence(thread: string | null) {
     const checks = thread ? postTurnChecks.filter((check) => check.thread === thread) : [];
     const captures = reviewCaptures.filter(
@@ -897,11 +944,13 @@
                   <WorkspaceActivity
                     items={paneActivityItems}
                     events={activityEvents}
+                    agent="opencode"
+                    sessionId={pane.thread?.sessionId}
                     loading={activityLoading}
                     error={activityError}
                     onrefresh={onactivityrefresh}
                     onselect={selectPaneActivitySource}
-                    onselecthistory={onactivityselect}
+                    onselecthistory={selectPaneActivityHistory}
                   />
                 {:else}
                   <DiffPanel
@@ -1013,11 +1062,13 @@
                   <WorkspaceActivity
                     items={paneActivityItems}
                     events={activityEvents}
+                    agent={pane.agent}
+                    sessionId={pane.thread?.sessionId}
                     loading={activityLoading}
                     error={activityError}
                     onrefresh={onactivityrefresh}
                     onselect={selectPaneActivitySource}
-                    onselecthistory={onactivityselect}
+                    onselecthistory={selectPaneActivityHistory}
                   />
                 {:else}
                   <DiffPanel

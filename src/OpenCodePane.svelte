@@ -384,6 +384,7 @@
     const target = workspace.querySelector<HTMLElement>(
       `[${attribute}="${CSS.escape(item.sourceId)}"]`,
     );
+    if (!target) throw new Error('The activity source is unavailable.');
     for (let parent = target?.parentElement; parent; parent = parent.parentElement)
       if (parent instanceof HTMLDetailsElement) parent.open = true;
     target?.scrollIntoView({ block: 'center' });
