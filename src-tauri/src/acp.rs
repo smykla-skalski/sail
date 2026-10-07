@@ -1219,8 +1219,14 @@ pub async fn acp_prompt(
                     .map(ActivePrompt::reports_interruption)
             })
             .unwrap_or(false);
-        let interrupted =
-            cancelled_result || reported_interruption || (explicitly_cancelled && result.is_err());
+        let reported_error_interruption = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.trim().eq_ignore_ascii_case("Step interrupted"));
+        let interrupted = cancelled_result
+            || reported_interruption
+            || reported_error_interruption
+            || (explicitly_cancelled && result.is_err());
         if interrupted {
             if let Ok(Value::Object(payload)) = &mut result {
                 payload.insert("sailInterrupted".into(), Value::Bool(true));
@@ -1237,6 +1243,7 @@ pub async fn acp_prompt(
             "agent":agent,"sessionId":session_id,"turnId":turn_id,
             "status":status,"explicitlyCancelled":explicitly_cancelled,
             "reportedInterruption":reported_interruption,
+            "reportedErrorInterruption":reported_error_interruption,
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
         let notify = !explicitly_cancelled && !interrupted;

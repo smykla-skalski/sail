@@ -150,6 +150,16 @@ describe('agent thread attention', () => {
       'interrupted',
     );
     await expect(agentInterrupted).toHaveText(expect.stringContaining('Interrupted'));
+    await waitForComposer();
+    await $('.agent-composer textarea').setValue('Agent error interrupted');
+    await $('.agent-actions button').click();
+    await $('.agent-launches button').click();
+    const errorInterrupted = $('.project-agent-row[aria-label*="Agent error interrupted"]');
+    await expect(errorInterrupted.$('.activity-status')).toHaveAttribute(
+      'data-state',
+      'interrupted',
+    );
+    await expect(errorInterrupted).toHaveText(expect.stringContaining('Interrupted'));
     const interruptedColor = await browser.execute(() => {
       const status = document.querySelector(
         '.project-agent-row[aria-label*="Agent interrupted"] .activity-status',

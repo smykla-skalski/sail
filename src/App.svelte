@@ -6153,6 +6153,9 @@
   }
 
   function saveAgentThread(thread: AgentThread) {
+    const previous = agentThreads.find((item) => threadKey(item) === threadKey(thread));
+    if (previous && previous.updated > thread.updated)
+      thread = { ...thread, updated: previous.updated };
     agentThreads = [
       thread,
       ...agentThreads.filter(
@@ -7640,8 +7643,21 @@
 
   function updateAgentThreadStatus(thread: AgentThread, status: ThreadStatus, notifyOnDone = true) {
     const key = agentThreadKey(thread);
-    if (thread.agent !== 'opencode' && !agentThreads.some((item) => threadKey(item) === key))
-      return;
+    const savedThread = agentThreads.find((item) => threadKey(item) === key);
+    if (thread.agent !== 'opencode' && !savedThread) return;
+    if (savedThread && thread.agent !== 'opencode') {
+      const receiptUpdated = spawnReceipts
+        .filter(
+          (item) =>
+            item.targetId === receiptSourceId(thread.agent, thread.sessionId) &&
+            item.targetDirectory === thread.directory,
+        )
+        .reduce((latest, item) => Math.max(latest, item.updated), 0);
+      saveAgentThread({
+        ...savedThread,
+        updated: Math.max(Date.now(), savedThread.updated + 1, receiptUpdated + 1),
+      });
+    }
     if (thread.agent === 'opencode')
       sidebarOpenCodeOutcomes = recordSidebarOpenCodeOutcome(
         sidebarOpenCodeOutcomes,

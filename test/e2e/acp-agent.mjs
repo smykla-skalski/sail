@@ -268,6 +268,10 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'cancelled' } });
       continue;
     }
+    if (text === 'Agent error interrupted') {
+      send({ id: message.id, error: { code: -1, message: 'Step interrupted' } });
+      continue;
+    }
     if (text === 'Agent text interrupted' || text === 'Agent text interrupted error') {
       update(sessionId, {
         sessionUpdate: 'tool_call',
