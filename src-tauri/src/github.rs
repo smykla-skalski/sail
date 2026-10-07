@@ -99,13 +99,16 @@ pub async fn shipping_pull_request(
             )?;
             let details: serde_json::Value = serde_json::from_str(&details)
                 .map_err(|_| "GitHub returned invalid pull request details.".to_string())?;
-            if !shipping_pull_request_matches(&details, &source, &target, &branch, &base_branch) {
-                continue;
+            if let Some(pr) = shipping_pull_request_snapshot(
+                value,
+                &details,
+                &source,
+                &target,
+                &branch,
+                &base_branch,
+            )? {
+                prs.push(pr);
             }
-            let mut pr: ShippingPullRequest =
-                serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
-            pr.checks = parse_pull_request_checks(value)?.checks;
-            prs.push(pr);
         }
         if prs.len() > 1 {
             return Err("Multiple pull requests use this shipping branch.".to_string());
@@ -114,6 +117,38 @@ pub async fn shipping_pull_request(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn shipping_pull_request_head_matches(
+    listed: &serde_json::Value,
+    details: &serde_json::Value,
+) -> bool {
+    let Some(listed_sha) = listed["headRefOid"].as_str().filter(|sha| !sha.is_empty()) else {
+        return false;
+    };
+    details["head"]["sha"].as_str() == Some(listed_sha)
+}
+
+fn shipping_pull_request_snapshot(
+    listed: &serde_json::Value,
+    details: &serde_json::Value,
+    source: &str,
+    target: &str,
+    branch: &str,
+    base_branch: &str,
+) -> Result<Option<ShippingPullRequest>, String> {
+    if !shipping_pull_request_matches(details, source, target, branch, base_branch) {
+        return Ok(None);
+    }
+    if !shipping_pull_request_head_matches(listed, details) {
+        return Err(
+            "Pull request head changed while loading checks. Refresh and retry.".to_string(),
+        );
+    }
+    let mut pr: ShippingPullRequest =
+        serde_json::from_value(listed.clone()).map_err(|error| error.to_string())?;
+    pr.checks = parse_pull_request_checks(listed)?.checks;
+    Ok(Some(pr))
 }
 
 fn shipping_pull_request_matches(
@@ -1805,7 +1840,8 @@ fn open_url(url: String) -> Result<(), String> {
 mod tests {
     use super::{
         checked_worktree, marked_issue, marker, pull_request_head, shipping_pull_request_matches,
-        validate_external_url, validate_graph, IssueDraft, IssueGraphDraft,
+        shipping_pull_request_snapshot, validate_external_url, validate_graph, IssueDraft,
+        IssueGraphDraft,
     };
     use std::{fs, process::Command};
 
@@ -1853,6 +1889,64 @@ mod tests {
             "fix/issue",
             "main"
         ));
+    }
+
+    #[test]
+    fn shipping_pull_request_rejects_checks_from_an_old_head() {
+        let listed = serde_json::json!({
+            "number": 17,
+            "url": "https://github.com/upstream/repo/pull/17",
+            "state": "OPEN",
+            "mergedAt": null,
+            "headRefOid": "head-a",
+            "statusCheckRollup": [{
+                "__typename": "CheckRun", "name": "build", "status": "COMPLETED",
+                "conclusion": "SUCCESS", "detailsUrl": "https://example.com/build-a"
+            }]
+        });
+        let mut details = serde_json::json!({
+            "head": { "ref": "fix/issue", "repo": { "full_name": "fork/repo" }, "sha": "head-b" },
+            "base": { "ref": "main", "repo": { "full_name": "upstream/repo" } }
+        });
+
+        let rejected = shipping_pull_request_snapshot(
+            &listed,
+            &details,
+            "fork/repo",
+            "upstream/repo",
+            "fix/issue",
+            "main",
+        );
+        assert_eq!(
+            rejected.err().as_deref(),
+            Some("Pull request head changed while loading checks. Refresh and retry.")
+        );
+
+        details["head"]["sha"] = serde_json::json!("head-a");
+        let accepted = shipping_pull_request_snapshot(
+            &listed,
+            &details,
+            "fork/repo",
+            "upstream/repo",
+            "fix/issue",
+            "main",
+        )
+        .ok()
+        .flatten()
+        .unwrap();
+        assert_eq!(accepted.head_ref_oid, "head-a");
+        assert_eq!(accepted.checks[0].state, "SUCCESS");
+
+        details["head"].as_object_mut().unwrap().remove("sha");
+        assert!(shipping_pull_request_snapshot(
+            &listed,
+            &details,
+            "fork/repo",
+            "upstream/repo",
+            "fix/issue",
+            "main",
+        )
+        .is_err());
     }
 
     #[test]

@@ -159,6 +159,44 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
   ];
 }
 
+export async function adoptRegisteredDirectShipRun(
+  registration: Promise<RegisteredWorktree[]>,
+  input: Omit<DirectShipRunInput, 'branch'>,
+  getRuns: () => ShipRun[],
+  setRuns: (runs: ShipRun[]) => void,
+  saveRuns: () => Promise<void>,
+): Promise<boolean> {
+  const branch = registeredShipBranch(await registration, input.directory);
+  const current = getRuns();
+  const previousIssue = current
+    .flatMap((run) => run.issues)
+    .find((issue) => issue.path === input.directory && issue.threadId === input.threadId);
+  const adopted = adoptDirectShipRun(current, { ...input, branch });
+  if (adopted === current) return false;
+  setRuns(adopted);
+  try {
+    await saveRuns();
+  } catch (cause) {
+    const latest = getRuns();
+    setRuns(
+      previousIssue
+        ? latest.map((run) => ({
+            ...run,
+            issues: run.issues.map((issue) =>
+              issue.path === input.directory &&
+              issue.threadId === input.threadId &&
+              issue.workerModel === input.workerModel
+                ? { ...issue, workerModel: previousIssue.workerModel }
+                : issue,
+            ),
+          }))
+        : latest.filter((run) => run.id !== input.id),
+    );
+    throw cause;
+  }
+  return true;
+}
+
 export function isDirectShipRun(run: ShipRun): boolean {
   return run.source.startsWith('direct:');
 }

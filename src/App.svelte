@@ -68,7 +68,7 @@
   } from './lib/ship-progress';
   import type { PublishedGraph } from './lib/issue-graph';
   import {
-    adoptDirectShipRun as createDirectShipRun,
+    adoptRegisteredDirectShipRun,
     createShipRun,
     isDirectShipRun,
     readyShipIssues,
@@ -2389,46 +2389,28 @@
         (thread) =>
           thread.agent === agent && thread.sessionId === sessionId && thread.directory === path,
       )?.model;
-    const previous = shipRuns;
-    const previousIssue = previous
-      .flatMap((run) => run.issues)
-      .find((item) => item.path === path && item.threadId === threadId);
     const project = worktreeAt(projectCatalog, path)?.repository ?? path;
-    const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
-      repository: project,
-      paths: [path],
-    });
-    const branch = registeredShipBranch(registered, path);
-    const directRunId = crypto.randomUUID();
-    const adopted = createDirectShipRun(previous, {
-      id: directRunId,
-      project,
-      directory: path,
-      branch,
-      repository: issue.repository,
-      number: issue.number,
-      provider,
-      threadId,
-      workerModel,
-      approvedAt: Date.now(),
-    });
-    if (adopted === shipRuns) return;
-    shipRuns = adopted;
-    try {
-      await saveShipRuns();
-    } catch (cause) {
-      shipRuns = previousIssue
-        ? shipRuns.map((run) => ({
-            ...run,
-            issues: run.issues.map((item) =>
-              item.path === path && item.threadId === threadId && item.workerModel === workerModel
-                ? { ...item, workerModel: previousIssue.workerModel }
-                : item,
-            ),
-          }))
-        : shipRuns.filter((run) => run.id !== directRunId);
-      throw cause;
-    }
+    const adopted = await adoptRegisteredDirectShipRun(
+      invoke<RegisteredWorktree[]>('registered_worktrees', {
+        repository: project,
+        paths: [path],
+      }),
+      {
+        id: crypto.randomUUID(),
+        project,
+        directory: path,
+        repository: issue.repository,
+        number: issue.number,
+        provider,
+        threadId,
+        workerModel,
+        approvedAt: Date.now(),
+      },
+      () => shipRuns,
+      (runs) => (shipRuns = runs),
+      saveShipRuns,
+    );
+    if (!adopted) return;
     showShipRuns();
   }
 

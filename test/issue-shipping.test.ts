@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   adoptDirectShipRun,
+  adoptRegisteredDirectShipRun,
   createShipRun,
   readyShipIssues,
   registeredShipBranch,
@@ -210,6 +211,103 @@ void test('fills in the recovered direct worker model without duplicating the ru
   });
   assert.equal(switched.length, 1);
   assert.equal(switched[0].issues[0].workerModel, 'provider:replacement-model');
+});
+
+void test('concurrent direct adoptions keep both runs when registrations finish out of order', async () => {
+  let finishFirst!: (worktrees: [{ path: string; branch: string; present: true }]) => void;
+  let finishSecond!: (worktrees: [{ path: string; branch: string; present: true }]) => void;
+  const firstRegistration = new Promise<[{ path: string; branch: string; present: true }]>(
+    (resolve) => (finishFirst = resolve),
+  );
+  const secondRegistration = new Promise<[{ path: string; branch: string; present: true }]>(
+    (resolve) => (finishSecond = resolve),
+  );
+  let runs: ReturnType<typeof adoptDirectShipRun> = [];
+  let saved: ReturnType<typeof adoptDirectShipRun> = [];
+  const getRuns = () => runs;
+  const setRuns = (value: typeof runs) => (runs = value);
+  const saveRuns = async () => {
+    saved = runs;
+  };
+  const common = {
+    project: '/repo',
+    repository: 'owner/repo',
+    provider: 'codex' as const,
+    approvedAt: 100,
+  };
+
+  const first = adoptRegisteredDirectShipRun(
+    firstRegistration,
+    { ...common, id: 'first', directory: '/repo/first', number: 11, threadId: 'acp:codex:one' },
+    getRuns,
+    setRuns,
+    saveRuns,
+  );
+  const second = adoptRegisteredDirectShipRun(
+    secondRegistration,
+    { ...common, id: 'second', directory: '/repo/second', number: 12, threadId: 'acp:codex:two' },
+    getRuns,
+    setRuns,
+    saveRuns,
+  );
+  finishSecond([{ path: '/repo/second', branch: 'fix/two', present: true }]);
+  await second;
+  finishFirst([{ path: '/repo/first', branch: 'fix/one', present: true }]);
+  await first;
+
+  assert.deepEqual(
+    runs.map((item) => [item.id, item.issues[0].branch]),
+    [
+      ['second', 'fix/two'],
+      ['first', 'fix/one'],
+    ],
+  );
+  assert.equal(saved.length, 2);
+});
+
+void test('concurrent adoption of one thread keeps one run', async () => {
+  let finish!: (worktrees: [{ path: string; branch: string; present: true }]) => void;
+  const delayedRegistration = new Promise<[{ path: string; branch: string; present: true }]>(
+    (resolve) => (finish = resolve),
+  );
+  let runs: ReturnType<typeof adoptDirectShipRun> = [];
+  let saved: ReturnType<typeof adoptDirectShipRun> = [];
+  const getRuns = () => runs;
+  const setRuns = (value: typeof runs) => (runs = value);
+  const saveRuns = async () => {
+    saved = runs;
+  };
+  const input = {
+    id: 'first',
+    project: '/repo',
+    directory: '/repo/first',
+    repository: 'owner/repo',
+    number: 11,
+    provider: 'codex' as const,
+    threadId: 'acp:codex:one',
+    approvedAt: 100,
+  };
+
+  const first = adoptRegisteredDirectShipRun(
+    delayedRegistration,
+    input,
+    getRuns,
+    setRuns,
+    saveRuns,
+  );
+  const second = adoptRegisteredDirectShipRun(
+    delayedRegistration,
+    { ...input, id: 'second' },
+    getRuns,
+    setRuns,
+    saveRuns,
+  );
+  finish([{ path: '/repo/first', branch: 'fix/one', present: true }]);
+  await Promise.all([first, second]);
+
+  assert.equal(runs.length, 1);
+  assert.equal(saved.length, 1);
+  assert.equal(runs[0].issues[0].threadId, 'acp:codex:one');
 });
 
 void test('uses one recorded implementation model as the missing worker model', () => {
