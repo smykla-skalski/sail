@@ -165,7 +165,7 @@
     line-height: 1.5;
   }
   .activity-error[role='alert'] {
-    color: var(--sui-destructive, #c33);
+    color: var(--sui-danger-ink);
   }
   .activity-sections {
     flex: 1;

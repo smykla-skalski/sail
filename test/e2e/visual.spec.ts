@@ -11,6 +11,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { chooseTopbarAction } from './topbar';
 import { returnToWorkspace, openSettings } from './settings-window';
 
 const output = process.env.SAIL_VISUAL_AUDIT_DIR;
@@ -93,7 +94,9 @@ async function navigationTargetAudit(compact: boolean) {
       '[aria-label="Add repository"]',
       '.project-group-toggle',
       '.project-repository-select',
-      ...(isCompact ? ['.mobile-switcher button', '.agent-menu-launch'] : ['.breadcrumb-project']),
+      ...(isCompact
+        ? ['.mobile-switcher button', '.topbar .menu-trigger']
+        : ['.breadcrumb-project']),
     ];
     const elements = selectors
       .flatMap((selector) => Array.from(document.querySelectorAll<HTMLElement>(selector)))
@@ -450,13 +453,13 @@ describe('visual layout audit', () => {
 
     await browser.setWindowSize(851, 650);
     const desktopAgentsHeight = await browser.execute(
-      () => document.querySelector('.agent-menu-launch')!.getBoundingClientRect().height,
+      () => document.querySelector('.topbar .menu-trigger')!.getBoundingClientRect().height,
     );
     expect(desktopAgentsHeight).toBeGreaterThanOrEqual(31.5);
 
     await browser.setWindowSize(850, 650);
     const compactAgentsHeight = await browser.execute(
-      () => document.querySelector('.agent-menu-launch')!.getBoundingClientRect().height,
+      () => document.querySelector('.topbar .menu-trigger')!.getBoundingClientRect().height,
     );
     expect(compactAgentsHeight).toBeGreaterThanOrEqual(43.5);
     const compactBreadcrumbHeight = await browser.execute(
@@ -470,7 +473,7 @@ describe('visual layout audit', () => {
     const textStyles = await browser.execute(() => {
       const elements = [
         ...document.querySelectorAll<HTMLElement>(
-          '.project-control, .project-group-toggle, .project-repository-select, .mobile-switcher button, .agent-menu-launch',
+          '.project-control, .project-group-toggle, .project-repository-select, .mobile-switcher button, .topbar .menu-trigger',
         ),
       ].filter((element) => getComputedStyle(element).display !== 'none');
       const styles = elements.map((element) => ({
@@ -495,14 +498,14 @@ describe('visual layout audit', () => {
     await browser.execute((styles) => {
       const elements = [
         ...document.querySelectorAll<HTMLElement>(
-          '.project-control, .project-group-toggle, .project-repository-select, .mobile-switcher button, .agent-menu-launch',
+          '.project-control, .project-group-toggle, .project-repository-select, .mobile-switcher button, .topbar .menu-trigger',
         ),
       ].filter((element) => getComputedStyle(element).display !== 'none');
       elements.forEach((element, index) => (element.style.fontSize = styles[index].inlineFontSize));
     }, textStyles);
 
     await $('.mobile-switcher button:nth-child(2)').click();
-    await $('.agent-menu-launch').click();
+    await chooseTopbarAction('More actions', 'Switch thread');
     await expect($('.command-palette')).toBeDisplayed();
     await browser.keys(['Escape']);
     await expect($('.command-palette')).not.toBeDisplayed();

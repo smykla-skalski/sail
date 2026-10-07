@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { topbarMenuTrigger } from './topbar';
 
 const input = () => $('[aria-label="Search command palette"]');
 
@@ -125,7 +126,7 @@ describe('command palette project flow', () => {
       worktreePath,
     );
     await browser.refresh();
-    await expect($('.agent-launches button')).toBeDisplayed();
+    await expect(topbarMenuTrigger('New agent')).toBeDisplayed();
 
     await openPalette();
     await searchAndEnter('Newest thread');
@@ -217,7 +218,7 @@ describe('command palette project flow', () => {
       );
     }, repoPath);
     await browser.refresh();
-    await expect($('.agent-launches button')).toBeDisplayed();
+    await expect(topbarMenuTrigger('New agent')).toBeDisplayed();
     await openPalette();
     await searchAndEnter(repoPath.split('/').at(-1)!);
     await $('[data-kind="worktree"]').click();
@@ -254,7 +255,7 @@ describe('command palette project flow', () => {
       );
     }, repoPath);
     await browser.refresh();
-    await expect($('.agent-launches button')).toBeDisplayed();
+    await expect(topbarMenuTrigger('New agent')).toBeDisplayed();
     await openPalette();
     await searchAndEnter(repoPath.split('/').at(-1)!);
     await $('[data-kind="worktree"]').click();

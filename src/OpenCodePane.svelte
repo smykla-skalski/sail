@@ -1251,7 +1251,7 @@
     justify-content: space-between;
     gap: 12px;
     padding: 14px 24px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--shell-divider);
   }
   .opencode-pane .agent-heading {
     display: flex;
@@ -1311,7 +1311,7 @@
     font: inherit;
   }
   .opencode-pane .agent-error {
-    color: var(--danger, #d66);
+    color: var(--sui-danger-ink);
   }
   .opencode-pane .agent-picker-controls,
   .opencode-pane .agent-actions {

@@ -2,6 +2,7 @@
   import { tick } from 'svelte';
   import ActivityStatus from './ActivityStatus.svelte';
   import WorkerDependencyMap from './WorkerDependencyMap.svelte';
+  import { locationName } from './lib/command-palette';
   import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './lib/issue-shipping';
   import type { NativeSubagent } from './lib/native-subagents';
   import {
@@ -138,7 +139,12 @@
   <header>
     <div>
       <h2>Ship runs</h2>
-      <p>{scope === 'all' || !repository ? 'All repositories' : repository}</p>
+      {#if scope === 'all' || !repository}<p>All repositories</p>{:else}<p
+          class="ship-repository"
+          title={repository}
+        >
+          {locationName(repository)}
+        </p>{/if}
     </div>
     <div class="ship-actions">
       <button onclick={() => act(onrefresh)} disabled={busy}
@@ -477,7 +483,7 @@
     border-left-color: var(--sui-danger);
   }
   .ship-now-item[data-state='waiting'] {
-    border-left-color: var(--sui-warning, var(--sui-primary));
+    border-left-color: var(--activity-waiting);
   }
   .ship-issue-heading,
   .ship-run-task,

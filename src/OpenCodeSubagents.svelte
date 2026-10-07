@@ -285,7 +285,7 @@
 <style>
   .subagents {
     margin: 12px 0 18px 44px;
-    border: 1px solid var(--shell-divider, var(--border));
+    border: 1px solid var(--shell-divider);
     border-radius: 8px;
     overflow: hidden;
   }
@@ -293,10 +293,10 @@
     padding: 9px 12px;
     font-size: 12px;
     font-weight: 700;
-    border-bottom: 1px solid var(--shell-divider, var(--border));
+    border-bottom: 1px solid var(--shell-divider);
   }
   .subagent + .subagent {
-    border-top: 1px solid var(--shell-divider, var(--border));
+    border-top: 1px solid var(--shell-divider);
   }
   .subagent-toggle {
     width: 100%;
@@ -319,7 +319,7 @@
     font-size: 13px;
   }
   .subagent-activity {
-    color: var(--text-muted, var(--sui-muted));
+    color: var(--sui-muted);
     font-size: 11px;
   }
   .subagent-activity {
@@ -333,20 +333,20 @@
     max-height: 450px;
     overflow: auto;
     padding: 8px 14px 14px 30px;
-    border-top: 1px solid var(--shell-divider, var(--border));
+    border-top: 1px solid var(--shell-divider);
   }
   .subagent-prompt {
-    color: var(--text-muted, var(--sui-muted));
+    color: var(--sui-muted);
   }
   .subagent-error {
-    color: var(--danger, #d66);
+    color: var(--sui-danger-ink);
     padding: 0 12px;
     font-size: 12px;
   }
   .load-older {
     margin: 8px 12px;
     padding: 6px 8px;
-    border: 1px solid var(--shell-divider, var(--border));
+    border: 1px solid var(--shell-divider);
     border-radius: 6px;
     color: inherit;
     background: transparent;

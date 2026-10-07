@@ -428,7 +428,7 @@
     height: 100%;
     overflow: auto;
     padding: 28px;
-    background: var(--surface);
+    background: var(--sui-canvas);
   }
   .task-overview-header {
     display: flex;
@@ -465,10 +465,10 @@
   .task-overview-sort select,
   .task-overview-refresh {
     min-height: 38px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--shell-control-border);
     border-radius: 8px;
-    background: var(--surface);
-    color: var(--text);
+    background: var(--sui-surface);
+    color: var(--sui-foreground);
   }
   .task-overview-search input {
     width: 100%;
@@ -499,17 +499,17 @@
   }
   .task-card {
     min-width: 0;
-    border: 1px solid var(--border);
+    border: 1px solid var(--shell-divider);
     border-radius: 12px;
-    background: var(--surface-raised, var(--surface));
-    box-shadow: 0 5px 18px color-mix(in srgb, var(--text) 6%, transparent);
+    background: var(--sui-surface);
+    box-shadow: 0 5px 18px color-mix(in srgb, var(--sui-foreground) 6%, transparent);
     overflow: hidden;
     content-visibility: auto;
     contain-intrinsic-size: auto 230px;
   }
   .task-card.selected {
-    border-color: color-mix(in srgb, var(--primary) 60%, var(--border));
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 12%, transparent);
+    border-color: color-mix(in srgb, var(--sui-primary) 60%, var(--shell-divider));
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--sui-primary) 12%, transparent);
   }
   .task-card-topline {
     display: flex;
@@ -575,7 +575,7 @@
   }
   .task-card-event {
     min-height: 34px;
-    color: var(--text);
+    color: var(--sui-foreground);
     font-size: 12px;
     line-height: 1.4;
     display: -webkit-box;
@@ -588,14 +588,14 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     margin: 0;
-    border-top: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
+    border-top: 1px solid var(--shell-divider);
+    border-bottom: 1px solid var(--shell-divider);
   }
   .task-card-facts div {
     padding: 9px 15px;
   }
   .task-card-facts div + div {
-    border-left: 1px solid var(--border);
+    border-left: 1px solid var(--shell-divider);
   }
   .task-card-facts dt {
     color: var(--shell-muted);
@@ -631,10 +631,10 @@
     width: calc(100% - 20px);
     min-height: 34px;
     margin: 10px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--shell-divider);
     border-radius: 7px;
-    background: color-mix(in srgb, var(--primary) 7%, var(--surface));
-    color: var(--text);
+    background: color-mix(in srgb, var(--sui-primary) 7%, var(--sui-surface));
+    color: var(--sui-foreground);
     font-weight: 700;
   }
   .task-overview-empty {

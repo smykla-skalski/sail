@@ -3,9 +3,18 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { chooseTopbarAction } from './topbar';
+
+function savedTitles(): Promise<string[]> {
+  return browser.execute(() =>
+    JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]').map(
+      (thread: { title: string }) => thread.title,
+    ),
+  );
+}
 
 async function selectClaudeThread(title: string) {
-  await $('.agent-menu-launch').click();
+  await chooseTopbarAction('More actions', 'Switch thread');
   const search = $('[aria-label="Search command palette"]');
   await search.setValue('Claude');
   await browser.keys('Enter');
@@ -696,12 +705,28 @@ describe('ACP agent threads', () => {
     await expect($('.pane-leaf.focused .agent-conversation')).toHaveText(
       expect.stringContaining('Done: Split action'),
     );
-    await $('[aria-label="Remove thread"]').click();
-    const titles = await browser.execute(() =>
-      JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]').map(
-        (thread: { title: string }) => thread.title,
-      ),
+    await chooseTopbarAction('More actions', 'Delete thread');
+    const dialog = $('.confirmation-dialog');
+    await expect(dialog).toBeDisplayed();
+    await expect(dialog).toHaveText(expect.stringContaining('Delete “Split action” from Sail?'));
+    await expect(dialog.$('.confirmation-primary')).toHaveAttribute('data-variant', 'danger');
+    await dialog.$('button=Cancel').click();
+    await expect(dialog).not.toBeDisplayed();
+    expect(await savedTitles()).toEqual(expect.arrayContaining(['Main action', 'Split action']));
+    await expect($('.pane-leaf.focused .agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Split action'),
     );
+
+    await chooseTopbarAction('More actions', 'Delete thread');
+    await expect(dialog).toBeDisplayed();
+    await browser.keys('Escape');
+    await expect(dialog).not.toBeDisplayed();
+    expect(await savedTitles()).toContain('Split action');
+
+    await chooseTopbarAction('More actions', 'Delete thread');
+    await dialog.$('.confirmation-primary').click();
+    await expect(dialog).not.toBeDisplayed();
+    const titles = await savedTitles();
     expect(titles).toContain('Main action');
     expect(titles).not.toContain('Split action');
   });

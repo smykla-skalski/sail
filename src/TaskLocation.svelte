@@ -35,7 +35,7 @@
     gap: 6px;
     min-width: 0;
     padding: 7px 12px 0;
-    color: var(--text-muted, var(--sui-muted, #6b7280));
+    color: var(--sui-muted);
     font-size: 11px;
     line-height: 1.4;
   }

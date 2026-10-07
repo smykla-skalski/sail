@@ -36,6 +36,7 @@
   import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import PlanPanel from './PlanPanel.svelte';
   import ShipPanel from './ShipPanel.svelte';
+  import AppTopbar from './AppTopbar.svelte';
   import {
     appendShipEvent,
     beginLatestRefresh,
@@ -593,12 +594,17 @@
     directory: string;
   } | null>(null);
 
-  function confirmInApp(title: string, message: string, confirmLabel: string): Promise<boolean> {
+  function confirmInApp(
+    title: string,
+    message: string,
+    confirmLabel: string,
+    { destructive = false }: { destructive?: boolean } = {},
+  ): Promise<boolean> {
     const pending = confirmationQueue.then(
       () =>
         new Promise<boolean>((resolve) => {
           confirmationResolver = resolve;
-          confirmation = { id: crypto.randomUUID(), title, message, confirmLabel };
+          confirmation = { id: crypto.randomUUID(), title, message, confirmLabel, destructive };
         }),
     );
     confirmationQueue = pending.then(() => undefined);
@@ -1087,7 +1093,7 @@
   let error = $state('');
   let chatScroll = $state<HTMLDivElement>();
   let sidebarElement: HTMLElement;
-  let sidebarToggleElement: HTMLButtonElement;
+  let sidebarToggleElement = $state<HTMLButtonElement>();
   let topbarElement = $state<HTMLElement>();
   let topbarHeight = $state(80);
   let chatArea: HTMLElement;
@@ -5957,6 +5963,7 @@
                 ? `Delete worktree “${branch}” at ${path}? This permanently removes uncommitted and ignored files, including copied files. The branch will remain.`
                 : `Delete worktree “${branch}” at ${path}? Uncommitted and ignored files block deletion. The branch will remain.`,
               force ? 'Force delete' : 'Delete worktree',
+              { destructive: true },
             );
     if (!confirmed) return;
     const wasSelected = directory === path;
@@ -5978,6 +5985,7 @@
             'Archive failed',
             `Archive script exited with code ${code}. Delete “${branch}” anyway?`,
             'Delete anyway',
+            { destructive: true },
           );
           if (!deleteAnyway) return;
         }
@@ -8075,6 +8083,19 @@
     focusedPane = 'main';
   }
 
+  async function deleteAgentThread(thread: AgentThread) {
+    const stillRunning = !!runningAgentThreads[agentThreadKey(thread)];
+    const confirmed = await confirmInApp(
+      'Delete thread',
+      `Delete “${thread.title}” from Sail? Its transcript and status are removed from Sail.${
+        stillRunning ? ' The agent is still working, and deleting the thread does not stop it.' : ''
+      }`,
+      'Delete thread',
+      { destructive: true },
+    );
+    if (confirmed) removeAgentThread(thread);
+  }
+
   function removeAgentThread(thread: AgentThread) {
     const usage = { ...agentUsage };
     delete usage[threadKey(thread)];
@@ -9196,6 +9217,7 @@
               'Delete plan session',
               `Delete “${session.title ?? 'Untitled plan'}”? This cannot be undone.`,
               'Delete session',
+              { destructive: true },
             );
     if (!confirmed) return;
     try {
@@ -10281,7 +10303,7 @@
     }
     sidebarVisible = !sidebarVisible;
     if (!sidebarVisible && sidebarElement.contains(document.activeElement))
-      void tick().then(() => sidebarToggleElement.focus());
+      void tick().then(() => sidebarToggleElement?.focus());
   }
 
   function showTaskOverview() {
@@ -10433,148 +10455,70 @@
     </div>
   </aside>
   <div class="main-area">
-    <header class="topbar" bind:this={topbarElement}>
-      <button
-        class="sidebar-toggle"
-        bind:this={sidebarToggleElement}
-        aria-label="Toggle project sidebar"
-        aria-controls="project-sidebar"
-        aria-expanded={sidebarVisible && (!mobileLayout || mobileView === 'sessions')}
-        title="Toggle project sidebar (⌘B / Ctrl+B)"
-        onclick={toggleSidebar}>☰</button
-      >
-      <nav class="mobile-switcher" aria-label="Workspace panels">
-        <button aria-pressed={mobileView === 'sessions'} onclick={() => showMobileView('sessions')}
-          >Projects</button
-        >
-        <button aria-pressed={mobileView === 'chat'} onclick={() => showMobileView('chat')}
-          >Chat</button
-        >
-        <button aria-pressed={mobileView === 'details'} onclick={() => showMobileView('details')}
-          >Details</button
-        >
-      </nav>
-      <div class="breadcrumb">
-        {#if workspaceView === 'overview'}<strong>All worktrees</strong><span class="slash">/</span
-          ><strong>Task overview</strong>{:else}<button
-            class="breadcrumb-project"
-            onclick={() => chooseProject()}
-            disabled={runtimeState !== 'connected' &&
-              !agentAvailability.some((agent) => agent.available)}
-            >{directory ? directory.split('/').filter(Boolean).at(-1) : 'Workspace'} ⌄</button
-          ><span class="slash">/</span><strong>{focusedConversationTitle}</strong>{/if}
-      </div>
-      <div class="topbar-actions">
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-pressed={workspaceView === 'overview'}
-          onclick={() => (workspaceView === 'overview' ? showWorkspace() : showTaskOverview())}
-          >{workspaceView === 'overview' ? 'Workspace' : 'Overview'}</Button
-        >
-        <Button variant="ghost" size="sm" aria-label="Pending requests" onclick={openInbox}
-          >Inbox ({inboxItems.filter((item) => !isInboxOutcome(item) || !item.read).length})</Button
-        >
-        {#if directory}<Button
-            variant="ghost"
-            size="sm"
-            onclick={newPlan}
-            disabled={!planReady || switching || sending}
-            aria-label="New plan"
-            title="Start an Architect plan">New plan</Button
-          >{/if}
-        {#if directory}<div class="agent-launches">
-            {#each agentAvailability as agent (agent.id)}
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={!agent.available}
-                title={agent.reason ?? `New ${agent.name} thread`}
-                onclick={() => openAgent(agent.id)}
-                >+ <HarnessIcon agent={agent.id} /> {agent.name}</Button
-              >
-            {/each}
-            <Button
-              size="sm"
-              variant="ghost"
-              onclick={newWork}
-              disabled={!workReady || switching || sending}
-              title="New OpenCode thread">+ <HarnessIcon agent="opencode" /> OpenCode</Button
-            >
-          </div>{/if}
-        {#if directory}<button
-            class="agent-menu-launch"
-            onclick={() =>
-              reopenCommandPalette({
-                kind: 'agents',
-                repository: selectedRepository(projectCatalog, directory) ?? directory,
-                directory,
-              })}>Agents</button
-          >{/if}
-        {#if actionAgentThread}<Button
-            variant="ghost"
-            size="sm"
-            aria-label="Remove thread"
-            onclick={() => {
-              if (actionAgentThread) removeAgentThread(actionAgentThread);
-            }}>Remove thread</Button
-          >{:else if actionOpenCodeSession}<Button
-            variant="ghost"
-            size="sm"
-            onclick={() => actionOpenCodeSession && startRename(actionOpenCodeSession)}
-            >Rename</Button
-          ><Button
-            variant="ghost"
-            size="sm"
-            onclick={() => actionOpenCodeSession && void removeSession(actionOpenCodeSession)}
-            >Delete</Button
-          >{/if}
-        {#if !acpAgent && sessionID && openCodeUsage[`${directory}:${sessionID}`] !== undefined}<span
-            class="session-usage">Context {openCodeUsage[`${directory}:${sessionID}`]}%</span
-          >{/if}
-        {#if directory}<Button
-            variant="ghost"
-            size="sm"
-            aria-pressed={!browserAccessDisabled}
-            onclick={toggleAgentBrowserAccess}
-            title="Toggle agent browser access for this project"
-            >Agent browser {browserAccessDisabled ? 'off' : 'on'}</Button
-          >{/if}
-        {#if selectedWorktreeConfig?.run}<Button
-            variant="ghost"
-            size="sm"
-            onclick={() => splitFocusedPane('row', 'terminal', selectedWorktreeConfig?.run)}
-            >Run project</Button
-          >{/if}
-        {#if agentTerminals.length}<Button
-            variant="ghost"
-            size="sm"
-            onclick={() => agentTerminalsDialog.showModal()}
-            >Agent terminals ({agentTerminals.length})</Button
-          >{/if}
-        {#if directory && focusedSnapshotThread()}<Button
-            variant="ghost"
-            size="sm"
-            onclick={() => void openSnapshots()}>Restore</Button
-          >{/if}
-        <Button variant="ghost" size="sm" onclick={openCommandsDialog}>Commands</Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          onclick={toggleChanges}
-          aria-controls="session-details"
-          aria-expanded={focusedPane !== 'main'
-            ? changesPanes.includes(focusedPane)
-            : acpAgent
-              ? agentChangesOpen
-              : detailsOpen &&
-                (mainShipFallback ||
-                  (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship'))}
-          title={sessionID || acpAgent ? 'Toggle Changes (⌘L)' : 'Toggle details (⌘L)'}
-          >{sessionID || acpAgent ? 'Changes' : 'Details'}</Button
-        >
-      </div>
-    </header>
+    <AppTopbar
+      bind:element={topbarElement}
+      bind:sidebarToggle={sidebarToggleElement}
+      sidebarExpanded={sidebarVisible && (!mobileLayout || mobileView === 'sessions')}
+      ontogglesidebar={toggleSidebar}
+      {mobileView}
+      onmobileview={(view) => void showMobileView(view)}
+      overview={workspaceView === 'overview'}
+      onoverview={() => (workspaceView === 'overview' ? showWorkspace() : showTaskOverview())}
+      projectName={directory ? locationName(directory) : 'Workspace'}
+      projectDisabled={runtimeState !== 'connected' &&
+        !agentAvailability.some((agent) => agent.available)}
+      onchooseproject={() => void chooseProject()}
+      conversationTitle={focusedConversationTitle}
+      inboxCount={inboxItems.filter((item) => !isInboxOutcome(item) || !item.read).length}
+      oninbox={openInbox}
+      {directory}
+      agents={agentAvailability}
+      onopenagent={(agent) => openAgent(agent)}
+      newWorkDisabled={!workReady || switching || sending}
+      onnewwork={newWork}
+      planDisabled={!planReady || switching || sending}
+      onnewplan={() => void newPlan()}
+      onswitchthread={() =>
+        reopenCommandPalette({
+          kind: 'agents',
+          repository: selectedRepository(projectCatalog, directory) ?? directory,
+          directory,
+        })}
+      threadActions={actionAgentThread
+        ? {
+            kind: 'agent',
+            title: actionAgentThread.title,
+            ondelete: () => actionAgentThread && void deleteAgentThread(actionAgentThread),
+          }
+        : actionOpenCodeSession
+          ? {
+              kind: 'opencode',
+              title: actionOpenCodeSession.title ?? 'Untitled plan',
+              onrename: () => actionOpenCodeSession && startRename(actionOpenCodeSession),
+              ondelete: () => actionOpenCodeSession && void removeSession(actionOpenCodeSession),
+            }
+          : null}
+      contextUsage={!acpAgent && sessionID ? openCodeUsage[`${directory}:${sessionID}`] : undefined}
+      browserAccess={!browserAccessDisabled}
+      ontogglebrowser={toggleAgentBrowserAccess}
+      onrunproject={selectedWorktreeConfig?.run
+        ? () => splitFocusedPane('row', 'terminal', selectedWorktreeConfig?.run)
+        : null}
+      agentTerminalCount={agentTerminals.length}
+      onagentterminals={() => agentTerminalsDialog.showModal()}
+      onrestore={directory && focusedSnapshotThread() ? () => void openSnapshots() : null}
+      oncommands={openCommandsDialog}
+      changesLabel={sessionID || acpAgent ? 'Changes' : 'Details'}
+      changesTitle={sessionID || acpAgent ? 'Toggle Changes (⌘L)' : 'Toggle details (⌘L)'}
+      changesExpanded={focusedPane !== 'main'
+        ? changesPanes.includes(focusedPane)
+        : acpAgent
+          ? agentChangesOpen
+          : detailsOpen &&
+            (mainShipFallback ||
+              (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship'))}
+      ontogglechanges={() => void toggleChanges()}
+    />
     {#if $settingsError}<p class="notice error" role="alert">{$settingsError}</p>{/if}
     {#if setupError}<p class="notice error" role="alert">{setupError}</p>{/if}
     {#if error}<div class="notice error" role="alert">{error}</div>{/if}

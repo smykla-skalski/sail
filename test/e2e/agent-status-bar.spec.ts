@@ -39,9 +39,26 @@ describe('agent status bar', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-composer textarea')).toBeEnabled();
     await $('.agent-composer textarea').setValue('Delayed approval');
+    await browser.execute(() => {
+      const disagreements: string[] = [];
+      const sample = () => {
+        const header = document.querySelector('.agent-header .activity-status')?.textContent ?? '';
+        const summary = document.querySelector('.agent-status-summary')?.textContent ?? '';
+        if (header.includes('Working') && summary.includes('No agents running'))
+          disagreements.push(header.trim());
+      };
+      Reflect.set(window, 'sailStatusDisagreements', disagreements);
+      Reflect.set(window, 'sailStatusSampler', setInterval(sample, 20));
+    });
     await $('.agent-actions button').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await expect(bar).toHaveText(expect.stringContaining('1 need input'));
+    const disagreements = await browser.execute(() => {
+      clearInterval(Reflect.get(window, 'sailStatusSampler'));
+      const samples: unknown = Reflect.get(window, 'sailStatusDisagreements');
+      return Array.isArray(samples) ? samples.map(String) : ['sampler missing'];
+    });
+    expect(disagreements).toEqual([]);
 
     await $('.agent-status-summary').click();
     const details = $('.agent-status-popover');

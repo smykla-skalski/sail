@@ -480,6 +480,8 @@
   const preparedFailures = new Map<string, string>();
   const name = $derived(agentName);
   const isBusy = $derived(busy || running || historyLoading);
+  // The status bar lists a turn only once its thread exists and runs, so starting a
+  // session or replaying history reads as connecting rather than working.
   const visibleStatus = $derived(
     connecting
       ? 'connecting'
@@ -487,9 +489,11 @@
         ? 'offline'
         : permissions.length
           ? 'waiting'
-          : isBusy
-            ? 'working'
-            : 'ready',
+          : (busy && !activeSessionId) || (historyLoading && !busy && !running)
+            ? 'connecting'
+            : isBusy
+              ? 'working'
+              : 'ready',
   );
   const workspaceActivity = $derived(
     workspaceActivityItems({
@@ -2070,7 +2074,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 14px 24px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--shell-divider);
   }
   .agent-header div {
     display: flex;
@@ -2135,31 +2139,31 @@
   .agent-tool-group,
   .agent-tool-current {
     margin: 0 0 8px 42px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--shell-divider);
     border-radius: 8px;
   }
   .agent-hook-notice {
     margin: 0 0 8px 42px;
     padding: 9px 12px;
-    border: 1px solid var(--danger, #d66);
+    border: 1px solid var(--sui-danger);
     border-radius: 8px;
   }
   .agent-tool-failure {
     margin: 0 0 8px 42px;
     padding: 9px 12px;
-    border: 1px solid var(--danger, #d66);
+    border: 1px solid var(--sui-danger);
     border-radius: 8px;
     overflow-wrap: anywhere;
   }
   .agent-tool-failure strong {
-    color: var(--danger, #d66);
+    color: var(--sui-danger-ink);
   }
   .agent-tool-failure > div,
   .agent-tool-failure details {
     margin: 5px 0;
   }
   .agent-tool-failure span {
-    color: var(--text-muted, #888);
+    color: var(--sui-muted);
   }
   .agent-tool-failure pre {
     max-height: 180px;
@@ -2170,7 +2174,7 @@
     margin-left: 0;
   }
   .agent-hook-notice strong {
-    color: var(--danger, #d66);
+    color: var(--sui-danger-ink);
   }
   .agent-hook-notice ul {
     margin: 5px 0 0;
@@ -2181,14 +2185,14 @@
   }
   .agent-hook-details {
     margin-bottom: 8px;
-    color: var(--text-muted, #888);
+    color: var(--sui-muted);
   }
   .agent-tool-group > summary {
     display: flex;
     align-items: center;
     gap: 8px;
     padding: 9px 12px;
-    color: var(--text-muted, #888);
+    color: var(--sui-muted);
   }
   .agent-tool-group-last {
     overflow: hidden;
@@ -2209,7 +2213,7 @@
     padding: 0 12px 10px;
   }
   .agent-tool-current-label {
-    color: var(--text-muted, #888);
+    color: var(--sui-muted);
     font-size: 0.75rem;
     white-space: nowrap;
   }
@@ -2220,7 +2224,7 @@
     gap: 4px 10px;
     margin: 0 0 8px 42px;
     padding: 8px 12px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--shell-divider);
     border-radius: 8px;
   }
   .agent-subagent-card.stopped {
@@ -2232,7 +2236,7 @@
     overflow-wrap: anywhere;
   }
   .agent-subagent-stat {
-    color: var(--text-muted, #888);
+    color: var(--sui-muted);
     font-size: 0.75rem;
     white-space: nowrap;
   }
@@ -2240,7 +2244,7 @@
     padding: 7px 12px;
   }
   .agent-tool-current.running {
-    border-color: var(--accent, var(--border));
+    border-color: var(--sui-primary);
   }
   .agent-tool-current-label {
     display: block;
@@ -2306,12 +2310,12 @@
     align-items: center;
   }
   .agent-error {
-    color: var(--danger, #d66);
+    color: var(--sui-danger-ink);
   }
   .agent-permission {
     margin-bottom: 10px;
     padding: 12px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--shell-divider);
     border-radius: 8px;
   }
   .agent-permission div {

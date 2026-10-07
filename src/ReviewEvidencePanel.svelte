@@ -211,9 +211,9 @@
   .review-evidence {
     margin: 12px;
     padding: 12px;
-    border: 1px solid color-mix(in srgb, var(--primary-color, #16867c) 35%, transparent);
+    border: 1px solid color-mix(in srgb, var(--sui-primary) 35%, transparent);
     border-radius: 10px;
-    background: color-mix(in srgb, var(--primary-color, #16867c) 5%, transparent);
+    background: color-mix(in srgb, var(--sui-primary) 5%, transparent);
   }
   header,
   .turn-heading,
@@ -236,22 +236,22 @@
   header p,
   small,
   header > span {
-    color: var(--shell-muted, #607069);
+    color: var(--shell-muted);
     font-size: 0.75rem;
   }
   header > span {
     padding: 2px 7px;
     border-radius: 999px;
-    background: color-mix(in srgb, #16867c 14%, transparent);
+    background: color-mix(in srgb, var(--sui-primary) 14%, transparent);
   }
   header > span.stale,
   .unavailable {
-    color: #9a5a00;
-    background: color-mix(in srgb, #d98600 12%, transparent);
+    color: var(--sui-warning-ink);
+    background: var(--sui-warning-subtle);
   }
   details {
     margin-top: 10px;
-    border-top: 1px solid var(--border-color, #7774);
+    border-top: 1px solid var(--shell-divider);
     padding-top: 8px;
   }
   summary {
@@ -276,7 +276,7 @@
   }
   li > button:hover,
   .check:hover {
-    background: color-mix(in srgb, var(--primary-color, #16867c) 10%, transparent);
+    background: color-mix(in srgb, var(--sui-primary) 10%, transparent);
   }
   li span,
   .check span {
@@ -298,10 +298,10 @@
     align-items: flex-end;
   }
   .failed {
-    color: var(--danger-color, #b42318);
+    color: var(--sui-danger-ink);
   }
   .running {
-    color: var(--primary-color, #16867c);
+    color: var(--sui-primary);
   }
   .turn-group {
     margin-top: 8px;
@@ -315,7 +315,7 @@
   .unavailable-preview {
     display: grid;
     place-items: center;
-    color: var(--shell-muted, #607069);
+    color: var(--shell-muted);
     font-size: 0.75rem;
   }
   figure {
@@ -326,7 +326,7 @@
     height: 90px;
     padding: 0;
     overflow: hidden;
-    border: 1px solid var(--border-color, #7775);
+    border: 1px solid var(--shell-divider);
     border-radius: 6px;
     background: #111;
   }
@@ -345,16 +345,16 @@
   }
   .empty {
     margin: 8px 0 0;
-    color: var(--shell-muted, #607069);
+    color: var(--shell-muted);
     font-size: 0.8rem;
   }
   dialog {
     max-width: min(900px, 90vw);
     max-height: 90vh;
     padding: 12px;
-    border: 1px solid var(--border-color, #7775);
+    border: 1px solid var(--shell-divider);
     border-radius: 10px;
-    background: var(--surface-color, Canvas);
+    background: var(--sui-surface);
     color: inherit;
   }
   dialog::backdrop {

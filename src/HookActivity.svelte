@@ -32,8 +32,8 @@
 <style>
   .hook-activity {
     margin: 6px 0;
-    border: 1px solid var(--shell-divider, var(--border));
-    border-left: 3px solid var(--accent, #5f8cff);
+    border: 1px solid var(--shell-divider);
+    border-left: 3px solid var(--sui-primary);
     border-radius: 8px;
     font-size: 12px;
   }
@@ -45,7 +45,7 @@
     cursor: pointer;
   }
   .hook-activity > summary > span:last-child {
-    color: var(--text-muted, var(--sui-muted));
+    color: var(--sui-muted);
   }
   .hook-activity-safe {
     display: grid;
@@ -53,13 +53,13 @@
     padding: 0 10px 10px;
   }
   .hook-activity-safe span {
-    color: var(--text-muted, var(--sui-muted));
+    color: var(--sui-muted);
   }
   .hook-diagnostics {
     margin-top: 5px;
   }
   .hook-diagnostics p {
-    color: var(--danger, #d66);
+    color: var(--sui-danger-ink);
   }
   pre {
     max-height: 240px;
