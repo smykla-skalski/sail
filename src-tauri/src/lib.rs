@@ -1182,6 +1182,14 @@ fn git_directory_generation(root: &Path) -> Result<String, String> {
                 metadata.ctime().hash(&mut hash);
                 metadata.ctime_nsec().hash(&mut hash);
             }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                metadata.file_attributes().hash(&mut hash);
+                metadata.creation_time().hash(&mut hash);
+                metadata.last_write_time().hash(&mut hash);
+                metadata.file_size().hash(&mut hash);
+            }
         }
     }
     let mut directories = directories.into_iter().collect::<Vec<_>>();
@@ -1191,16 +1199,22 @@ fn git_directory_generation(root: &Path) -> Result<String, String> {
             .strip_prefix(root)
             .unwrap_or(&directory)
             .hash(&mut hash);
+        #[cfg(unix)]
         if let Ok(metadata) = directory.symlink_metadata() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                metadata.ino().hash(&mut hash);
-                metadata.mtime().hash(&mut hash);
-                metadata.mtime_nsec().hash(&mut hash);
-                metadata.ctime().hash(&mut hash);
-                metadata.ctime_nsec().hash(&mut hash);
-            }
+            use std::os::unix::fs::MetadataExt;
+            metadata.ino().hash(&mut hash);
+            metadata.mtime().hash(&mut hash);
+            metadata.mtime_nsec().hash(&mut hash);
+            metadata.ctime().hash(&mut hash);
+            metadata.ctime_nsec().hash(&mut hash);
+        }
+        #[cfg(windows)]
+        if let Ok(metadata) = directory.symlink_metadata() {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes().hash(&mut hash);
+            metadata.creation_time().hash(&mut hash);
+            metadata.last_write_time().hash(&mut hash);
+            metadata.file_size().hash(&mut hash);
         }
     }
     Ok(format!("{hash:016x}", hash = hash.finish()))
@@ -2087,6 +2101,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(unix, windows))]
+    use super::working_tree_generation;
     use super::{
         add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
         git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
@@ -2094,7 +2110,7 @@ mod tests {
         shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
         worktree_overviews,
     };
-    use super::{working_tree_commit, working_tree_generation, working_tree_revision};
+    use super::{working_tree_commit, working_tree_revision};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
@@ -2413,7 +2429,7 @@ mod tests {
         fs::write(&file, "original\n").unwrap();
         git(path, &["add", "file.txt"]);
         git(path, &["commit", "-qm", "seed"]);
-        fs::write(&file, "changed\n").unwrap();
+        fs::write(&file, "altered!\n").unwrap();
         let before = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
         let mut permissions = fs::metadata(&file).unwrap().permissions();
         permissions.set_mode(permissions.mode() ^ 0o111);
@@ -2448,7 +2464,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn working_tree_generation_detects_reverted_edits() {
         let root =
