@@ -176,7 +176,11 @@ export function setNativeSubagentWaiting(
     [id]: {
       ...child,
       outcome: waiting ? 'waiting' : 'working',
-      activity: waiting ? 'Needs permission' : child.activity,
+      activity: waiting
+        ? 'Needs permission'
+        : child.activity === 'Needs permission'
+          ? 'Working…'
+          : child.activity,
       updated: now,
     },
   };

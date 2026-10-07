@@ -6,6 +6,7 @@ import {
   finalizeNativeSubagentRestore,
   nativeSubagentCounts,
   nativeSubagentReceipts,
+  setNativeSubagentWaiting,
   updateNativeSubagents,
 } from '../src/lib/native-subagents.ts';
 
@@ -152,6 +153,26 @@ await test('late and duplicate events cannot revive a terminal child', () => {
   assert.equal(store['codex:done'].outcome, 'completed');
   assert.equal(store['codex:done'].transcript.at(-1)?.text, 'Late output');
   assert.equal(nativeSubagentReceipts(store)[0].result, 'Completed');
+});
+
+await test('resolved child permission clears its waiting activity', () => {
+  let store = updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'worker',
+      task: 'Task',
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+  );
+  store = setNativeSubagentWaiting(store, 'codex', 'child', true, 2);
+  assert.equal(store['codex:child'].activity, 'Needs permission');
+  store = setNativeSubagentWaiting(store, 'codex', 'child', false, 3);
+  assert.equal(store['codex:child'].outcome, 'working');
+  assert.equal(store['codex:child'].activity, 'Working…');
 });
 
 await test('malformed and self-referential lifecycle events leave parents intact', () => {

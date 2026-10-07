@@ -3,10 +3,19 @@ import type { AttentionMap, ThreadStatus } from './attention';
 import { threadKey } from './recent-threads.ts';
 import {
   activeSubagentsForSource,
+  receiptIsSettled,
   receiptSourceId,
   runningSubagentsForSource,
   type SpawnReceipt,
 } from './agent-results.ts';
+
+export type SidebarThreadRow = {
+  thread: AgentThread;
+  depth: number;
+  hiddenHistoricalChildren: number;
+  historicalChildren: number;
+  historicalExpanded: boolean;
+};
 
 export type SidebarSessionSource = {
   session: {
@@ -29,6 +38,14 @@ export type SidebarSessionSource = {
     }>;
   };
 };
+
+function sidebarThreadIdentity(thread: AgentThread): string {
+  return `${thread.directory}\0${receiptSourceId(thread.agent, thread.sessionId)}`;
+}
+
+function recentThreadFirst(left: AgentThread, right: AgentThread): number {
+  return right.updated - left.updated;
+}
 
 export async function listSidebarOpenCodeThreads(
   source: SidebarSessionSource,
@@ -75,6 +92,80 @@ export function groupSidebarThreads(threads: AgentThread[]): Record<string, Agen
   for (const thread of unique.values()) (grouped[thread.directory] ??= []).push(thread);
   for (const items of Object.values(grouped)) items.sort((a, b) => b.updated - a.updated);
   return grouped;
+}
+
+export function sidebarThreadRows(
+  threads: AgentThread[],
+  receipts: SpawnReceipt[],
+  expanded: string[] = [],
+): SidebarThreadRow[] {
+  const native = receipts.filter((receipt) => receipt.receiptId.startsWith('native:'));
+  const byIdentity = new Map(threads.map((thread) => [sidebarThreadIdentity(thread), thread]));
+  const receiptByChild = new Map<string, SpawnReceipt>(
+    native.flatMap((receipt) =>
+      receipt.targetId && receipt.targetDirectory
+        ? [[`${receipt.targetDirectory}\0${receipt.targetId}`, receipt] as const]
+        : [],
+    ),
+  );
+  const children = new Map<string, AgentThread[]>();
+  const roots: AgentThread[] = [];
+  for (const thread of threads) {
+    const receipt = receiptByChild.get(sidebarThreadIdentity(thread));
+    const parent = receipt
+      ? byIdentity.get(`${receipt.sourceDirectory}\0${receipt.sourceId}`)
+      : undefined;
+    if (!parent || parent === thread) roots.push(thread);
+    else {
+      const parentKey = sidebarThreadIdentity(parent);
+      const nested = children.get(parentKey) ?? [];
+      nested.push(thread);
+      children.set(parentKey, nested);
+    }
+  }
+  roots.sort(recentThreadFirst);
+  for (const nested of children.values()) nested.sort(recentThreadFirst);
+  const rows: SidebarThreadRow[] = [];
+  const visited = new Set<string>();
+  const hasLiveDescendant = (thread: AgentThread, trail = new Set<string>()): boolean => {
+    const key = sidebarThreadIdentity(thread);
+    if (trail.has(key)) return false;
+    const nextTrail = new Set(trail).add(key);
+    return (children.get(key) ?? []).some((child) => {
+      const receipt = receiptByChild.get(sidebarThreadIdentity(child));
+      return !receipt || !receiptIsSettled(receipt.state) || hasLiveDescendant(child, nextTrail);
+    });
+  };
+  const visit = (thread: AgentThread, depth: number): void => {
+    const key = sidebarThreadIdentity(thread);
+    if (visited.has(key)) return;
+    visited.add(key);
+    const nested = children.get(key) ?? [];
+    const historicalExpanded = expanded.includes(threadKey(thread));
+    const historicalChildren = nested.filter((child) => {
+      const receipt = receiptByChild.get(sidebarThreadIdentity(child));
+      return !!receipt && receiptIsSettled(receipt.state) && !hasLiveDescendant(child);
+    }).length;
+    const visible = nested.filter((child) => {
+      const receipt = receiptByChild.get(sidebarThreadIdentity(child));
+      return (
+        !receipt ||
+        !receiptIsSettled(receipt.state) ||
+        hasLiveDescendant(child) ||
+        historicalExpanded
+      );
+    });
+    rows.push({
+      thread,
+      depth,
+      hiddenHistoricalChildren: nested.length - visible.length,
+      historicalChildren,
+      historicalExpanded,
+    });
+    for (const child of visible) visit(child, depth + 1);
+  };
+  for (const root of roots) visit(root, 0);
+  return rows;
 }
 
 export function sidebarThreadStatus(

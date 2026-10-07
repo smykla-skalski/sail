@@ -9,7 +9,7 @@
   import type { AttentionMap, ThreadStatus } from './lib/attention';
   import { activityState } from './lib/activity-state';
   import { threadKey } from './lib/recent-threads';
-  import { sidebarThreadStatus } from './lib/sidebar-agents';
+  import { sidebarThreadRows, sidebarThreadStatus } from './lib/sidebar-agents';
   import {
     isSubagentThread,
     receiptSourceId,
@@ -194,6 +194,7 @@
   let collapsedRepositoryPaths = $derived(new Set(catalog.collapsedRepositories ?? []));
   const collapsedAgentPathsSetting = 'sai-collapsed-agent-worktrees';
   let collapsedAgentPaths = $state<string[]>(loadCollapsedAgentPaths());
+  let expandedHistoricalParents = $state<string[]>([]);
 
   function loadCollapsedAgentPaths(): string[] {
     try {
@@ -267,6 +268,13 @@
       receiptSourceId(thread.agent, thread.sessionId),
       thread.directory,
     );
+  }
+
+  function toggleHistoricalChildren(thread: AgentThread) {
+    const key = threadKey(thread);
+    expandedHistoricalParents = expandedHistoricalParents.includes(key)
+      ? expandedHistoricalParents.filter((item) => item !== key)
+      : [...expandedHistoricalParents, key];
   }
 
   function statusLabel(status: ThreadStatus | null): string {
@@ -727,7 +735,8 @@
       aria-label={`Agent threads in ${path}`}
       hidden={agentListCollapsed(path)}
     >
-      {#each threads[path] as thread (threadKey(thread))}
+      {#each sidebarThreadRows(threads[path], spawnReceipts, expandedHistoricalParents) as row (threadKey(row.thread))}
+        {@const thread = row.thread}
         {@const key = threadKey(thread)}
         {@const status = threadStatus(thread)}
         {@const child = subagentThread(thread)}
@@ -746,6 +755,8 @@
           class:active={selectedThread === key}
           class:subagent={child}
           class="project-agent-row"
+          style:margin-left={`${row.depth * 8}px`}
+          style:width={`calc(100% - ${row.depth * 8}px)`}
           aria-current={selectedThread === key ? 'page' : undefined}
           aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}, ${statusLabel(status)}${childSummary ? `, subagents: ${childSummary}` : ''}`}
           title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
@@ -772,6 +783,16 @@
             compact
           />
         </button>
+        {#if row.historicalChildren}<button
+            class="project-agent-history"
+            style:margin-left={`${(row.depth + 1) * 8}px`}
+            aria-expanded={row.historicalExpanded}
+            aria-label={`${row.historicalExpanded ? 'Collapse' : 'Show'} ${row.historicalChildren} historical subagent${row.historicalChildren === 1 ? '' : 's'} for ${thread.title}`}
+            onclick={() => toggleHistoricalChildren(thread)}
+            >{row.historicalExpanded ? '▾' : '▸'}
+            {row.historicalExpanded ? 'Hide' : 'Show'}
+            {row.historicalChildren} historical</button
+          >{/if}
       {/each}
     </div>
   {/if}

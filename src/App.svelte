@@ -6261,7 +6261,7 @@
       return;
     }
     if (item.kind === 'acp-permission') {
-      const thread = agentThreads.find(
+      const thread = [...agentThreads, ...nativeChildThreads].find(
         (entry) =>
           entry.agent === item.agentId &&
           entry.sessionId === item.sessionId &&
@@ -6318,7 +6318,7 @@
 
   async function decideInbox(item: InboxItem, optionId: string | null) {
     if (item.kind === 'acp-permission') {
-      const thread = agentThreads.find(
+      const thread = [...agentThreads, ...nativeChildThreads].find(
         (entry) =>
           entry.agent === item.agentId &&
           entry.sessionId === item.sessionId &&
