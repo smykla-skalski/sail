@@ -33,6 +33,7 @@
   import type { WorkspaceActivityItem } from './lib/workspace-activity';
   import type { ShipItIssue } from './lib/implementation-models';
   import type { TaskLocation } from './lib/task-location';
+  import type { NativeSubagent } from './lib/native-subagents';
   import { threadKey } from './lib/recent-threads';
   import { getPlan, getHistory, type PlanSnapshot, type HistoryEntry } from './lib/plan';
   import { annotateDiffs } from './lib/diff';
@@ -62,6 +63,7 @@
     onopensubagent: (receipt: SpawnReceipt) => Promise<void>;
     shipRuns: ShipRun[];
     shippingBusy: boolean;
+    nativeSubagents: NativeSubagent[];
     onshiprefresh: () => Promise<void>;
     onshipopen: (path: string, threadId?: string | null) => Promise<void>;
     onshipsettings: () => Promise<void>;
@@ -156,6 +158,7 @@
     onopensubagent,
     shipRuns,
     shippingBusy,
+    nativeSubagents,
     onshiprefresh,
     onshipopen,
     onshipsettings,
@@ -545,6 +548,7 @@
       {onopensubagent}
       {shipRuns}
       {shippingBusy}
+      {nativeSubagents}
       {onshiprefresh}
       {onshipopen}
       {onshipsettings}
@@ -651,6 +655,7 @@
       {onopensubagent}
       {shipRuns}
       {shippingBusy}
+      {nativeSubagents}
       {onshiprefresh}
       {onshipopen}
       {onshipsettings}
@@ -924,6 +929,7 @@
                     repository={project}
                     runs={shipRuns}
                     busy={shippingBusy}
+                    {nativeSubagents}
                     onclose={closeNativeDetails}
                     onrefresh={onshiprefresh}
                     onopen={async (path, threadId) => {
@@ -1050,6 +1056,7 @@
                     repository={project}
                     runs={shipRuns}
                     busy={shippingBusy}
+                    {nativeSubagents}
                     onclose={closeAcpDetails}
                     onrefresh={onshiprefresh}
                     onopen={async (path, threadId) => {

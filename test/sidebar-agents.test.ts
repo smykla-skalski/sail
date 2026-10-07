@@ -130,6 +130,41 @@ await test('active subagent keeps a finished parent visibly working', () => {
   );
 });
 
+await test('native child rows use their own outcome without parent attention state', () => {
+  const thread = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'child',
+    title: 'Child',
+    updated: 1,
+  };
+  const receipt: SpawnReceipt = {
+    receiptId: 'native:codex:child',
+    accessKey: '',
+    requestId: 'native:child',
+    project: '/repo',
+    sourceId: 'acp:codex:parent',
+    sourceDirectory: '/repo',
+    targetId: 'acp:codex:child',
+    turnId: null,
+    targetDirectory: '/repo',
+    worktreeId: null,
+    provider: 'codex',
+    prompt: 'Child',
+    state: 'waiting',
+    created: 1,
+    updated: 2,
+    result: null,
+    error: null,
+  };
+  const status = (state: SpawnReceipt['state']) =>
+    sidebarThreadStatus(thread, {}, {}, true, true, [], [{ ...receipt, state }]);
+  assert.equal(status('waiting'), 'waiting');
+  assert.equal(status('completed'), 'done');
+  assert.equal(status('failed'), 'failed');
+  assert.equal(status('unavailable'), null);
+});
+
 await test('sidebar inventory follows every OpenCode page and excludes child and foreign sessions', async () => {
   const calls: Array<string | undefined> = [];
   const source: SidebarSessionSource = {

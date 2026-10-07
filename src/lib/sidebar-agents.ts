@@ -92,6 +92,21 @@ export function sidebarThreadStatus(
     thread.agent === 'opencode' && saved !== 'working' && saved !== 'waiting'
       ? (openCodeOutcomes[key] ?? saved ?? null)
       : (saved ?? null);
+  const child = spawnReceipts.find(
+    (receipt) =>
+      receipt.targetId === receiptSourceId(thread.agent, thread.sessionId) &&
+      receipt.targetDirectory === thread.directory,
+  );
+  if (child) {
+    status =
+      child.state === 'working' || child.state === 'waiting'
+        ? child.state
+        : child.state === 'failed'
+          ? 'failed'
+          : child.state === 'completed' || child.state === 'interrupted'
+            ? 'done'
+            : null;
+  }
   if (
     (status === 'working' || status === 'waiting') &&
     (thread.agent === 'opencode'

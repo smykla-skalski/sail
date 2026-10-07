@@ -249,12 +249,16 @@
     );
   }
 
-  function activeSubagentCount(thread: AgentThread): number {
-    return runningSubagentsForSource(
+  function subagentCounts(thread: AgentThread): { active: number; waiting: number } {
+    const children = runningSubagentsForSource(
       spawnReceipts,
       receiptSourceId(thread.agent, thread.sessionId),
       thread.directory,
-    ).length;
+    );
+    return {
+      active: children.filter((child) => child.state === 'working').length,
+      waiting: children.filter((child) => child.state === 'waiting').length,
+    };
   }
 
   function subagentThread(thread: AgentThread): boolean {
@@ -727,7 +731,13 @@
         {@const key = threadKey(thread)}
         {@const status = threadStatus(thread)}
         {@const child = subagentThread(thread)}
-        {@const activeChildren = activeSubagentCount(thread)}
+        {@const childCounts = subagentCounts(thread)}
+        {@const childSummary = [
+          childCounts.active ? `${childCounts.active} active` : '',
+          childCounts.waiting ? `${childCounts.waiting} waiting` : '',
+        ]
+          .filter(Boolean)
+          .join(', ')}
         {@const selectable =
           thread.agent === 'opencode'
             ? openCodeAvailable
@@ -737,7 +747,7 @@
           class:subagent={child}
           class="project-agent-row"
           aria-current={selectedThread === key ? 'page' : undefined}
-          aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}, ${statusLabel(status)}${activeChildren ? `, ${activeChildren} subagent${activeChildren === 1 ? '' : 's'} active` : ''}`}
+          aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}, ${statusLabel(status)}${childSummary ? `, subagents: ${childSummary}` : ''}`}
           title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
           aria-disabled={!selectable}
           oncontextmenu={(event) => openMenu({ kind: 'agent', thread }, event)}
@@ -758,9 +768,7 @@
           <span class="project-agent-title">{thread.title}</span>
           <ActivityStatus
             {status}
-            label={activeChildren
-              ? `${statusLabel(status)} · ${activeChildren} subagent${activeChildren === 1 ? '' : 's'}`
-              : statusLabel(status)}
+            label={childSummary ? `${statusLabel(status)} · ${childSummary}` : statusLabel(status)}
             compact
           />
         </button>

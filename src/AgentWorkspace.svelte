@@ -145,6 +145,7 @@
       threadId: string,
       workerModel?: string,
     ) => Promise<void>;
+    nativeEntries?: AgentEntry[];
   }
   let {
     agent,
@@ -180,6 +181,7 @@
     onretrycheck = () => {},
     onworkspaceactivity,
     onshipit,
+    nativeEntries,
   }: Props = $props();
   let mounted = $state(false);
   const promptLocation = $derived(composerTaskLocation(taskLocation, directory, thread?.directory));
@@ -328,6 +330,9 @@
   }
   let error = $state('');
   let entries = $state.raw<AgentEntry[]>([]);
+  $effect(() => {
+    if (nativeEntries) entries = nativeEntries;
+  });
   let visibleCount = $state(50);
   let historyLoaded = $state(true);
   let historyLoading = $state(false);
@@ -718,6 +723,13 @@
     error = '';
     ready = false;
     connecting = true;
+    if (nativeEntries) {
+      entries = nativeEntries;
+      historyLoaded = true;
+      ready = true;
+      connecting = false;
+      return;
+    }
     try {
       const info = await acp.connect(agent);
       if (current !== generation) return;
@@ -737,14 +749,19 @@
           sessionCapabilities &&
           typeof sessionCapabilities === 'object' &&
           'resume' in sessionCapabilities;
-        if (!canResume) {
+        const restoresSubagents =
+          sessionCapabilities &&
+          typeof sessionCapabilities === 'object' &&
+          'subagents' in sessionCapabilities;
+        if (restoresSubagents || !canResume) {
           setReplaying(true);
           replayEntries = [];
         }
-        const session = canResume
-          ? await acp.resume(agent, directory, id)
-          : await acp.load(agent, directory, id);
-        if (current === generation && !canResume) {
+        const session =
+          restoresSubagents || !canResume
+            ? await acp.load(agent, directory, id)
+            : await acp.resume(agent, directory, id);
+        if (current === generation && (restoresSubagents || !canResume)) {
           entries = restoreEntryTimes(replayEntries, entries);
           setReplaying(false);
           replayEntries = [];
@@ -1824,7 +1841,7 @@
         onkeydown={keydown}
         rows="3"
         placeholder={`Message ${name}…`}
-        disabled={!directory}></textarea>
+        disabled={!directory || !!nativeEntries}></textarea>
       <SkillMenu
         id={skillMenuId}
         skills={skillMatches}
@@ -1856,7 +1873,7 @@
             value={modelOption?.currentValue}
             options={modelOption?.options ?? []}
             open={pickerOpen === 'model'}
-            disabled={!ready || isBusy || !directory}
+            disabled={!ready || isBusy || !directory || !!nativeEntries}
             loading={!!creatingSession}
             onopen={() => void openPicker('model')}
             onclose={() => (pickerOpen = null)}
@@ -1869,7 +1886,7 @@
             value={effortOption?.currentValue}
             options={effortOption?.options ?? []}
             open={pickerOpen === 'effort'}
-            disabled={!ready || isBusy || !directory}
+            disabled={!ready || isBusy || !directory || !!nativeEntries}
             loading={!!creatingSession}
             onopen={() => void openPicker('effort')}
             onclose={() => (pickerOpen = null)}
@@ -1881,7 +1898,7 @@
         <div class="agent-actions">
           <Button
             onclick={() => void send()}
-            disabled={!ready || (!draft.trim() && !clipboardAttachments.length)}
+            disabled={!ready || !!nativeEntries || (!draft.trim() && !clipboardAttachments.length)}
             >{isBusy ? 'Queue ↗' : 'Send ↗'}</Button
           >
         </div>

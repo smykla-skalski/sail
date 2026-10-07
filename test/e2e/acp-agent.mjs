@@ -145,11 +145,19 @@ for await (const line of createInterface({ input: process.stdin })) {
   }
   if (message.method === 'initialize') {
     terminalSupport = message.params.clientCapabilities?.terminal === true;
+    const subagents = message.params.clientCapabilities?.subagents;
+    if (!subagents || typeof subagents !== 'object' || Array.isArray(subagents)) {
+      send({ id: message.id, error: { code: -1, message: 'Client subagent support missing' } });
+      continue;
+    }
     send({
       id: message.id,
       result: {
         protocolVersion: 1,
-        agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } },
+        agentCapabilities: {
+          loadSession: true,
+          sessionCapabilities: { resume: {}, subagents: {} },
+        },
         authMethods: agent === 'codex' ? [{ id: 'chat-gpt', name: 'ChatGPT' }] : [],
         _meta: { steering: { supported: true } },
       },
@@ -193,7 +201,8 @@ for await (const line of createInterface({ input: process.stdin })) {
     const session = sessions.get(message.params.sessionId);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
     else {
-      for (const item of session.history) update(message.params.sessionId, item);
+      for (const item of session.history)
+        update(item.sessionId ?? message.params.sessionId, item.update ?? item);
       send({
         id: message.id,
         result: {
@@ -404,6 +413,51 @@ for await (const line of createInterface({ input: process.stdin })) {
     const user = { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } };
     sessions.get(sessionId).history.push(user);
     update(sessionId, user);
+    if (text === 'Native subagents') {
+      const child = `${sessionId}:child`;
+      const grandchild = `${sessionId}:grandchild`;
+      const remember = (target, value) => {
+        sessions.get(sessionId).history.push({ sessionId: target, update: value });
+        update(target, value);
+      };
+      remember(sessionId, {
+        sessionUpdate: 'subagent_spawned',
+        subagentSessionId: child,
+        name: 'explore',
+        task: 'Inspect native delegation',
+        prompt: 'Inspect the child path',
+        capabilities: {},
+      });
+      remember(child, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Child transcript stays separate.' },
+      });
+      remember(child, {
+        sessionUpdate: 'subagent_spawned',
+        subagentSessionId: grandchild,
+        name: 'reader',
+        task: 'Inspect nested delegation',
+        capabilities: {},
+      });
+      remember(grandchild, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'nested-read',
+        title: 'Read nested fixture',
+        status: 'completed',
+      });
+      remember(child, {
+        sessionUpdate: 'subagent_state_update',
+        subagentSessionId: grandchild,
+        state: 'disconnected',
+      });
+      remember(sessionId, {
+        sessionUpdate: 'subagent_state_update',
+        subagentSessionId: child,
+        state: 'completed',
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Post-hook failure demo') {
       update(sessionId, {
         sessionUpdate: 'tool_call',

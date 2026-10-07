@@ -3,6 +3,7 @@
   import ActivityStatus from './ActivityStatus.svelte';
   import WorkerDependencyMap from './WorkerDependencyMap.svelte';
   import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './lib/issue-shipping';
+  import type { NativeSubagent } from './lib/native-subagents';
   import {
     ciStatus,
     dependencyIssue,
@@ -23,6 +24,7 @@
     onrefresh,
     onopen,
     onsettings,
+    nativeSubagents = [],
   }: {
     repository: string;
     active?: boolean;
@@ -32,6 +34,7 @@
     onrefresh: () => Promise<void>;
     onopen: (path: string, threadId?: string | null) => Promise<void>;
     onsettings: () => Promise<void>;
+    nativeSubagents?: NativeSubagent[];
   } = $props();
   let error = $state('');
   let panel: HTMLDivElement;
@@ -255,7 +258,13 @@
         {:else}<p class="ship-muted">No shipping work is active.</p>{/each}
       </div>
     </section>
-    <WorkerDependencyMap {run} selected={issue?.id} onselect={selectIssue} {onopen} />
+    <WorkerDependencyMap
+      {run}
+      {nativeSubagents}
+      selected={issue?.id}
+      onselect={selectIssue}
+      {onopen}
+    />
     <div class="ship-content">
       {#if issue}
         <section
