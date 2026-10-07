@@ -53,6 +53,8 @@ Bundled workflow prompts include only their core contract. Agents load detailed 
 
 Every Ship task also has one durable checkpoint in Sail's persisted run state. The owning agent reads it through `task_checkpoint_read` before resuming and updates objective, acceptance criteria, phase, revision, gates, blockers, questions, and next action through `task_checkpoint_update`. Sail binds each update to the live worktree revision and refreshes GitHub delivery state before returning reconciliation facts, so stale conversation context cannot silently resume work.
 
+Ship task evidence is stored in bounded manifests keyed by the exact worktree revision. Command results, validation gates, and CI checks record their provider, model, result, timestamp, output reference, and acceptance-criteria mapping in the same manifest. A source change makes older manifests stale, and Sail withholds merge-ready status until the current revision has passing required gates and evidence for every acceptance criterion.
+
 Use **+ Group** and **+ Repo** in the sidebar to organize saved repositories. Each repository row has a **+** control to create a worktree. Sail uses the remote default branch when Git records one, then `main` or `master`, then the main checkout branch. Enter a base branch in the form to choose another starting point. By default, new worktrees live in `~/sail/worktrees/<repository>-<id>/<name>` so repositories with the same name stay separate; choose a different parent folder in the form when needed. `SAIL_WORKTREE_ROOT` overrides the default root.
 
 To customize worktrees, commit `.sail/worktree.json` in the repository:

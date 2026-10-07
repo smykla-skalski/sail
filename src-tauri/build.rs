@@ -13,6 +13,8 @@ fn main() {
             "list_picker_directory",
             "working_tree_diff",
             "working_tree_revision",
+            "working_tree_generation",
+            "working_tree_commit",
             "worktree_overviews",
             "record_turn_snapshot",
             "list_turn_snapshots",

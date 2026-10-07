@@ -10,7 +10,9 @@
     dependencyUrl,
     gateNames,
     shipActivity,
+    shipEvidenceReadiness,
     shipIssuePresentation,
+    shipMergeClaim,
     shipStatus,
     sortShipIssues,
   } from './lib/ship-progress';
@@ -112,12 +114,6 @@
     if (!gates.length) return 'Not started';
     const latest = gates.toSorted((left, right) => right.updated - left.updated)[0];
     return `${latest.gate.replaceAll('-', ' ')} · ${latest.verdict ?? latest.state}`;
-  }
-
-  function mergeClaim(item: ShipIssue): string {
-    if (item.state === 'merged') return 'Merged';
-    if (item.pullRequest) return item.state === 'awaiting_merge' ? 'Ready for merge' : 'PR open';
-    return 'PR not opened';
   }
 </script>
 
@@ -247,7 +243,7 @@
               <span><b>Worker</b>{workerClaim(item)}</span>
               <span><b>Review</b>{gateClaim(item)}</span>
               <span><b>CI</b>{ciStatus(item.checks)}</span>
-              <span><b>Merge</b>{mergeClaim(item)}</span>
+              <span><b>Merge</b>{shipMergeClaim(item)}</span>
             </span>
             <time datetime={new Date(presentation.updated ?? run.approvedAt).toISOString()}
               >{presentation.updated
@@ -267,6 +263,10 @@
     />
     <div class="ship-content">
       {#if issue}
+        {@const evidence = shipEvidenceReadiness(issue)}
+        {@const manifest = (issue.evidenceManifests ?? []).find(
+          (candidate) => candidate.revision === issue.evidenceRevision && !candidate.stale,
+        )}
         <section
           id={detailId}
           class="ship-issue-detail"
@@ -326,6 +326,33 @@
               ? ' · Attribution uncertain'
               : ''}
           </p>
+          <h4>Revision evidence</h4>
+          <p class:ship-error={!evidence.ready}>
+            {issue.evidenceRevision ?? 'Revision unknown'} ·
+            {evidence.ready ? 'Merge evidence ready' : evidence.reason}
+          </p>
+          <ol class="ship-gates">
+            {#each issue.checkpoint?.acceptanceCriteria ?? [] as criterion (criterion)}
+              <li>
+                <strong
+                  >{evidence.unverifiedCriteria.includes(criterion)
+                    ? 'Unverified'
+                    : 'Verified'}</strong
+                >
+                <span>{criterion}</span>
+              </li>
+            {:else}<li>Acceptance criteria not recorded.</li>{/each}
+          </ol>
+          <details>
+            <summary>Evidence manifest ({manifest?.evidence.length ?? 0})</summary>
+            {#each manifest?.evidence ?? [] as item (item.id)}
+              <p>
+                {item.kind}: {item.name} · {item.result} · {item.provider} / {item.model ??
+                  'No model'}
+                · {new Date(item.timestamp).toLocaleString()} · {item.outputReference}
+              </p>
+            {:else}<p>No evidence recorded for this revision.</p>{/each}
+          </details>
           <h4>Validation gates</h4>
           <ol class="ship-gates">
             {#each gateNames as name (name)}

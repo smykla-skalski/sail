@@ -4,6 +4,12 @@ import type { SpawnReceipt, SpawnState } from './agent-results';
 import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
 import { taskCheckpointSchema } from './task-checkpoint.ts';
+import {
+  evidenceManifestsSchema,
+  evidenceReadiness,
+  type EvidenceReadiness,
+  type TaskEvidence,
+} from './task-evidence.ts';
 
 export const gateNames = ['code-adversary', 'findings-adversary', 'test-adversary'] as const;
 export type GateName = (typeof gateNames)[number];
@@ -22,6 +28,7 @@ export type ShippingPullRequest = {
   url: string;
   state: string;
   mergedAt: string | null;
+  headRefOid: string;
   checks: ShipCheck[];
 };
 export type ShipEvent = { at: number; stage: string; reason?: string };
@@ -41,6 +48,9 @@ export type ShipIssuePresentation = {
 export type GateMetadata = {
   gate: GateName;
   requestedModel: string;
+  revision?: string;
+  mutationGeneration?: string;
+  revisionDrifted?: boolean;
   verdict?: GateVerdict;
   reason?: string;
 };
@@ -59,6 +69,9 @@ export type ShipGate = GateMetadata & {
 export const gateMetadataSchema = z.object({
   gate: z.enum(gateNames),
   requestedModel: z.string(),
+  revision: z.string().min(1).optional(),
+  mutationGeneration: z.string().min(1).optional(),
+  revisionDrifted: z.boolean().optional(),
   verdict: z.enum(verdicts).optional(),
   reason: z.string().optional(),
 });
@@ -76,9 +89,19 @@ const reportSchema = z.union([
       gate: z.enum(gateNames),
       verdict: z.enum(verdicts),
       reason: z.string().max(2000).optional(),
+      criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
+      outputReference: z.string().min(1).max(2000).optional(),
+      revision: z.string().min(1).optional(),
     })
     .strict(),
-  z.object({ verdict: z.enum(verdicts), reason: z.string().max(2000).optional() }).strict(),
+  z
+    .object({
+      verdict: z.enum(verdicts),
+      reason: z.string().max(2000).optional(),
+      criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
+      outputReference: z.string().min(1).max(2000).optional(),
+    })
+    .strict(),
 ]);
 
 export function parseShipReport(value: unknown) {
@@ -96,6 +119,16 @@ export function validateGateVerdict(gate: GateName, verdict: GateVerdict): void 
   const allowed =
     gate === 'test-adversary' ? ['PASS', 'FAIL', 'BLOCKED'] : ['CLEAN', 'NEEDS_FIXES', 'BLOCKED'];
   if (!allowed.includes(verdict)) throw new Error(`Invalid verdict for ${gate}.`);
+}
+
+export function validationRevisionDrifted(
+  validation: Pick<GateMetadata, 'revision' | 'revisionDrifted'>,
+  currentRevision: string,
+): boolean {
+  return (
+    validation.revisionDrifted === true ||
+    (validation.revision !== undefined && validation.revision !== currentRevision)
+  );
 }
 
 export function gateSnapshot(receipt: SpawnReceipt): ShipGate | null {
@@ -164,6 +197,70 @@ export function shipGatesSettled(issue: ShipIssue): boolean {
   return (issue.gates ?? []).every((gate) => shippingWorkerSettled(gate.state));
 }
 
+export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
+  if (!issue.checkpoint)
+    return {
+      ready: false,
+      stale: false,
+      missingGates: [],
+      failedGates: [],
+      pendingGates: [],
+      failedCommands: [],
+      pendingCommands: [],
+      unverifiedCriteria: [],
+      reason: 'Task checkpoint is missing.',
+    };
+  const readiness = evidenceReadiness(
+    issue.evidenceManifests ?? [],
+    issue.evidenceRevision,
+    issue.checkpoint.requiredGates,
+    issue.checkpoint.acceptanceCriteria,
+  );
+  if (issue.refreshError)
+    return {
+      ...readiness,
+      ready: false,
+      reason: readiness.reason ?? `Pull request refresh failed: ${issue.refreshError}`,
+    };
+  if (issue.pullRequest && issue.pullRequestHead !== issue.evidenceCommit)
+    return {
+      ...readiness,
+      ready: false,
+      reason: readiness.reason ?? 'Evidence commit does not match the pull request head.',
+    };
+  if (!issue.pullRequest || !issue.checks?.length || !issue.evidenceRevision) return readiness;
+  const manifest = (issue.evidenceManifests ?? []).find(
+    (candidate) => candidate.revision === issue.evidenceRevision && !candidate.stale,
+  );
+  const latestCommands = new Map<string, TaskEvidence>();
+  for (const entry of manifest?.evidence ?? [])
+    if (entry.kind === 'command') latestCommands.set(entry.name, entry);
+  const missingChecks = issue.checks
+    .filter((check) => {
+      const entry = latestCommands.get(`ci:${check.name}`);
+      return !entry || entry.provider !== 'github';
+    })
+    .map((check) => check.name);
+  if (!missingChecks.length) return readiness;
+  return {
+    ...readiness,
+    ready: false,
+    reason: readiness.reason ?? `Revision-bound CI evidence missing: ${missingChecks.join(', ')}.`,
+  };
+}
+
+export function shipMergeClaim(issue: ShipIssue): string {
+  if (issue.state === 'merged') return 'Merged';
+  if (!issue.pullRequest) return 'PR not opened';
+  if (
+    issue.state === 'awaiting_merge' &&
+    ciStatus(issue.checks) === 'Passed' &&
+    shipEvidenceReadiness(issue).ready
+  )
+    return 'Ready for merge';
+  return 'PR open';
+}
+
 export function shipTaskThreadsSettled(
   issue: ShipIssue,
   states: Partial<Record<string, SpawnState>>,
@@ -208,6 +305,7 @@ export function refreshedPullRequest(
     };
   return {
     pullRequest: pr.url,
+    pullRequestHead: pr.headRefOid,
     checks: pr.checks,
     refreshError: null,
     refreshedAt: Date.now(),
@@ -219,6 +317,12 @@ export async function settleShipRefresh(refreshes: Promise<void>[]): Promise<voi
   const results = await Promise.allSettled(refreshes);
   const failure = results.find((result) => result.status === 'rejected');
   if (failure) throw failure.reason;
+}
+
+export function beginLatestRefresh(generations: Map<string, number>, key: string): () => boolean {
+  const generation = (generations.get(key) ?? 0) + 1;
+  generations.set(key, generation);
+  return () => generations.get(key) === generation;
 }
 
 export async function persistShipRefresh(
@@ -447,17 +551,24 @@ export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssue
     };
   if (issue.state === 'awaiting_merge') {
     const ci = ciStatus(issue.checks);
-    const ready = ci === 'Passed';
+    const evidence = shipEvidenceReadiness(issue);
+    const ready = ci === 'Passed' && evidence.ready;
     return {
-      status: ci === 'Failed' ? 'failed' : 'queued',
-      label: ci === 'Failed' ? 'Recovery needed' : 'Awaiting merge',
-      priority: ci === 'Failed' || ready ? 0 : 2,
+      status:
+        ci === 'Failed' || (!evidence.ready && !evidence.pendingGates.length) ? 'failed' : 'queued',
+      label:
+        ci === 'Failed' || (!evidence.ready && !evidence.pendingGates.length)
+          ? 'Recovery needed'
+          : 'Awaiting merge',
+      priority: ci === 'Failed' || !evidence.ready || ready ? 0 : 2,
       nextAction:
         ci === 'Failed'
           ? 'Fix failing CI'
           : ci !== 'Passed'
             ? 'Wait for CI and review'
-            : 'Merge the pull request',
+            : !evidence.ready
+              ? (evidence.reason ?? 'Record required evidence')
+              : 'Merge the pull request',
       updated: updated || activity.at || null,
     };
   }
@@ -531,6 +642,7 @@ const shipIssueSchema = z.object({
   receiptId: nullableString,
   threadId: nullableString,
   pullRequest: nullableString,
+  pullRequestHead: z.string().min(1).optional(),
   error: nullableString,
   workerSettled: z.boolean().optional(),
   setupStarted: z.boolean().optional(),
@@ -564,6 +676,9 @@ const shipIssueSchema = z.object({
   refreshError: nullableString.optional(),
   checkpoint: taskCheckpointSchema.optional(),
   checkpointThreadIds: z.array(z.string()).optional(),
+  evidenceManifests: evidenceManifestsSchema.optional(),
+  evidenceRevision: z.string().min(1).optional(),
+  evidenceCommit: z.string().min(1).optional(),
 });
 const shipRunSchema = z.object({
   id: z.string(),

@@ -2,6 +2,7 @@ import type { PublishedGraph } from './issue-graph';
 import type { SpawnState } from './agent-results';
 import type { ShipEvent, ShipGate, ShipCheck } from './ship-progress';
 import { initialTaskCheckpoint, type TaskCheckpoint } from './task-checkpoint.ts';
+import type { EvidenceManifest } from './task-evidence.ts';
 
 export type ShipIssueState =
   'pending' | 'starting' | 'working' | 'awaiting_merge' | 'failed' | 'merged';
@@ -19,6 +20,7 @@ export interface ShipIssue {
   receiptId: string | null;
   threadId: string | null;
   pullRequest: string | null;
+  pullRequestHead?: string;
   workerSettled?: boolean;
   setupStarted?: boolean;
   setupCompleted?: boolean;
@@ -39,6 +41,9 @@ export interface ShipIssue {
   refreshError?: string | null;
   checkpoint?: TaskCheckpoint;
   checkpointThreadIds?: string[];
+  evidenceManifests?: EvidenceManifest[];
+  evidenceRevision?: string;
+  evidenceCommit?: string;
 }
 
 export interface ShipRun {

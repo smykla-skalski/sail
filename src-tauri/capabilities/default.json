@@ -17,6 +17,8 @@
     "dialog:allow-open",
     "allow-working-tree-diff",
     "allow-working-tree-revision",
+    "allow-working-tree-generation",
+    "allow-working-tree-commit",
     "allow-worktree-overviews",
     "allow-record-turn-snapshot",
     "allow-list-turn-snapshots",

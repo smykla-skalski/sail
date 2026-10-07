@@ -944,6 +944,51 @@ async fn working_tree_revision(path: String) -> Result<String, String> {
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+async fn working_tree_generation(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = validate_repository(path)?;
+        git_directory_generation(Path::new(&root))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn working_tree_commit(path: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = validate_repository(path)?;
+        let status = Command::new("git")
+            .args([
+                "-C",
+                &root,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !status.status.success() {
+            return Err("Could not read working tree changes.".into());
+        }
+        if !status.stdout.is_empty() {
+            return Ok(None);
+        }
+        let head = Command::new("git")
+            .args(["-C", &root, "rev-parse", "HEAD"])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !head.status.success() {
+            return Err("Could not read the working tree commit.".into());
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&head.stdout).trim().to_string(),
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorktreeOverview {
@@ -1094,6 +1139,91 @@ fn git_directory_revision(root: &Path) -> Result<String, String> {
     }
     staged.stdout.hash(&mut hash);
     Ok(format!("{:016x}", hash.finish()))
+}
+
+fn git_directory_generation(root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("Could not inspect working tree files.".into());
+    }
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let mut directories = std::collections::HashSet::from([root.to_path_buf()]);
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|item| !item.is_empty())
+    {
+        record.hash(&mut hash);
+        let file = root.join(String::from_utf8_lossy(record).as_ref());
+        if let Some(parent) = file.parent() {
+            let mut current = Some(parent);
+            while let Some(directory) = current {
+                if !directory.starts_with(root) {
+                    break;
+                }
+                directories.insert(directory.to_path_buf());
+                current = directory.parent();
+            }
+        }
+        if let Ok(metadata) = file.symlink_metadata() {
+            metadata.len().hash(&mut hash);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                metadata.mode().hash(&mut hash);
+                metadata.ino().hash(&mut hash);
+                metadata.mtime().hash(&mut hash);
+                metadata.mtime_nsec().hash(&mut hash);
+                metadata.ctime().hash(&mut hash);
+                metadata.ctime_nsec().hash(&mut hash);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                metadata.file_attributes().hash(&mut hash);
+                metadata.creation_time().hash(&mut hash);
+                metadata.last_write_time().hash(&mut hash);
+                metadata.file_size().hash(&mut hash);
+            }
+        }
+    }
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort();
+    for directory in directories {
+        directory
+            .strip_prefix(root)
+            .unwrap_or(&directory)
+            .hash(&mut hash);
+        #[cfg(unix)]
+        if let Ok(metadata) = directory.symlink_metadata() {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ino().hash(&mut hash);
+            metadata.mtime().hash(&mut hash);
+            metadata.mtime_nsec().hash(&mut hash);
+            metadata.ctime().hash(&mut hash);
+            metadata.ctime_nsec().hash(&mut hash);
+        }
+        #[cfg(windows)]
+        if let Ok(metadata) = directory.symlink_metadata() {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes().hash(&mut hash);
+            metadata.creation_time().hash(&mut hash);
+            metadata.last_write_time().hash(&mut hash);
+            metadata.file_size().hash(&mut hash);
+        }
+    }
+    Ok(format!("{hash:016x}", hash = hash.finish()))
 }
 
 fn selected_hunk(patch: &str, ordinal: usize) -> Result<String, String> {
@@ -1845,6 +1975,8 @@ pub fn run() {
             list_picker_directory,
             working_tree_diff,
             working_tree_revision,
+            working_tree_generation,
+            working_tree_commit,
             worktree_overviews,
             worktree_snapshots::record_turn_snapshot,
             worktree_snapshots::list_turn_snapshots,
@@ -1977,7 +2109,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::working_tree_revision;
+    #[cfg(any(unix, windows))]
+    use super::working_tree_generation;
     use super::{
         add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
         git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
@@ -1985,6 +2118,7 @@ mod tests {
         shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
         worktree_overviews,
     };
+    use super::{working_tree_commit, working_tree_revision};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
@@ -2303,7 +2437,7 @@ mod tests {
         fs::write(&file, "original\n").unwrap();
         git(path, &["add", "file.txt"]);
         git(path, &["commit", "-qm", "seed"]);
-        fs::write(&file, "changed\n").unwrap();
+        fs::write(&file, "altered!\n").unwrap();
         let before = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
         let mut permissions = fs::metadata(&file).unwrap().permissions();
         permissions.set_mode(permissions.mode() ^ 0o111);
@@ -2335,6 +2469,57 @@ mod tests {
         git(path, &["commit", "--allow-empty", "-qm", "next"]);
         let committed = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
         assert_ne!(after, committed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn working_tree_generation_detects_reverted_edits() {
+        let root =
+            std::env::temp_dir().join(format!("sail-generation-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        let file = root.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+        git(path, &["add", "file.txt"]);
+        git(path, &["commit", "-qm", "seed"]);
+        let revision = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        let generation =
+            tauri::async_runtime::block_on(working_tree_generation(path.into())).unwrap();
+        fs::write(&file, "changed\n").unwrap();
+        fs::write(&file, "original\n").unwrap();
+        let restored = tauri::async_runtime::block_on(working_tree_revision(path.into())).unwrap();
+        let changed_generation =
+            tauri::async_runtime::block_on(working_tree_generation(path.into())).unwrap();
+        assert_eq!(revision, restored);
+        assert_ne!(generation, changed_generation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn working_tree_commit_requires_a_clean_checkout() {
+        let root = std::env::temp_dir().join(format!("sail-commit-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        fs::write(root.join("file.txt"), "original\n").unwrap();
+        git(path, &["add", "file.txt"]);
+        git(path, &["commit", "-qm", "seed"]);
+        let head = tauri::async_runtime::block_on(working_tree_commit(path.into())).unwrap();
+        assert!(head.is_some());
+        fs::write(root.join("file.txt"), "changed\n").unwrap();
+        let dirty = tauri::async_runtime::block_on(working_tree_commit(
+            root.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        assert_eq!(dirty, None);
         fs::remove_dir_all(root).unwrap();
     }
 

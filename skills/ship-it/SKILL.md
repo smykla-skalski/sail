@@ -42,6 +42,8 @@ Fetch origin, resolve the default branch with `gh repo view`, fast-forward it, b
 
 Small focused commits following repository patterns; add behavior-focused tests. Before every commit run formatter, linter, type checker, build and tests. Never use suppressions or `--no-verify`; fix the root cause.
 
+In a Sail-managed task, bind the checkpoint to the current revision before recording results. Read its revision before each quality command, then pass that value as `expectedRevision` to `task_evidence_record`, map the exact acceptance criteria it verifies, and reference bounded terminal or log output. After any source change, rebind and rerun required evidence; never reuse a stale result.
+
 Signed conventional commits, scope required, title ≤50 chars, no AI attribution or PR refs. Footer: `Refs #<n>` (`Refs owner/repo#<n>` cross-repo) for a GitHub issue, `Refs <KEY-123>` for Jira, none for a description.
 
 ## Phase 5 — Adversarial review
@@ -49,6 +51,8 @@ Signed conventional commits, scope required, title ≤50 chars, no AI attributio
 When the prompt enables Sail cross-validation, record every model that implemented this issue and use Sail's `validation_gate` tool for each pass, passing the complete model set; wait for its receipt before the next pass. The tool selects only a configured, available agent/model pair and verifies the actual model. Prefer a model outside the complete implementation set. Under strict different-model routing, pause if none qualifies. Report the actual provider and model for each pass. Never substitute outside the selected pool. Without that policy, run the gates in this session with the implementation agent and model.
 
 Run `adversarial-review:adversarial-review` with `--base origin/<default> --context <task-context-file>`. Reply starts `Review Verdict: CLEAN` or `NEEDS_FIXES`. On NEEDS_FIXES fix every surviving `blocking:` and `issue:`, rerun gates and the review on the new tip. Unsettled `question:` findings go in the PR body. Phase 6 only after CLEAN.
+
+In Sail, read the checkpoint revision before an inline adversary pass. Every `ship_progress` gate verdict includes that `revision`, the exact acceptance criterion strings verified by the pass, and a bounded output reference. Cross-validation gates use Sail's launch revision.
 
 ## Phase 6 — Adversarial test
 
