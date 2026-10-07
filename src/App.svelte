@@ -3992,7 +3992,7 @@
             throw new Error(
               'Bind the task checkpoint to the current revision before recording evidence.',
             );
-          const previous = structuredClone({
+          const previous = $state.snapshot({
             evidenceRevision: owner.issue.evidenceRevision,
             evidenceManifests: owner.issue.evidenceManifests,
           });
@@ -4017,7 +4017,7 @@
             { evidenceRevision: execution.revision, evidenceManifests },
             false,
           );
-          committed = structuredClone({
+          committed = $state.snapshot({
             evidenceRevision: owner.issue.evidenceRevision,
             evidenceManifests: owner.issue.evidenceManifests,
           });
@@ -4335,7 +4335,7 @@
   }
 
   function validationIssueSnapshot(issue: ShipIssue) {
-    return structuredClone({
+    return $state.snapshot({
       evidenceRevision: issue.evidenceRevision,
       evidenceManifests: issue.evidenceManifests,
       stage: issue.stage,
@@ -4568,7 +4568,7 @@
           return evidenceChanges;
         },
         commit: async (evidenceChanges, registerRollback) => {
-          const previousReceipt = structuredClone(receipt);
+          const previousReceipt = $state.snapshot(receipt);
           const previousIssue = owner ? validationIssueSnapshot(owner.issue) : null;
           let committedReceipt = previousReceipt;
           let committedIssue = previousIssue;
@@ -4617,7 +4617,7 @@
               evidenceSequence,
             },
           });
-          committedReceipt = structuredClone(
+          committedReceipt = $state.snapshot(
             spawnReceipts.find((candidate) => candidate.receiptId === receipt.receiptId)!,
           );
           await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
