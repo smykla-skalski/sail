@@ -309,6 +309,7 @@
     if (spawnRevision && following) void follow();
   });
   let stopRequested = false;
+  let lastExecutionStatus: ThreadStatus | null = null;
   const busy = $derived(sending || running || configuring);
   const inputReady = $derived(
     !!setup?.workReady || (session?.agent === 'architect' && !!setup?.planReady),
@@ -541,6 +542,7 @@
     files = [];
     selectedThreadId = id;
     activeID = id;
+    lastExecutionStatus = null;
     session = null;
     const cached = id ? recallOpenCodeTimeline(directory, id) : null;
     messages = cached?.messages ?? [];
@@ -667,6 +669,8 @@
           if (id !== activeID) continue;
           if (event.type === 'session.execution.started') running = true;
           const executionStatus = openCodeExecutionStatus(event.type);
+          if (executionStatus === 'working') lastExecutionStatus = null;
+          else if (executionStatus) lastExecutionStatus = executionStatus;
           if (executionStatus && executionStatus !== 'working') {
             running = false;
             if (session) onstatus(summary(session), executionStatus);
@@ -746,6 +750,7 @@
     for (const path of paths) if (pickedImages.has(path)) inFlightCaptures.add(path);
     for (const path of paths) if (clipboardPaths.has(path)) inFlightClipboard.add(path);
     let accepted = false;
+    let settledStatus: ThreadStatus | null = null;
     if (!external) {
       draft = '';
       files = [];
@@ -753,6 +758,7 @@
     const queued = running;
     sending = true;
     stopRequested = false;
+    lastExecutionStatus = null;
     error = '';
     try {
       let id = activeID;
@@ -859,11 +865,8 @@
         if (current !== generation || id !== activeID || disposed) return;
         session = latest;
         running = false;
-        onstatus(
-          summary(latest),
-          openCodeTurnStatus(latest.outcome, stopRequested),
-          !stopRequested,
-        );
+        settledStatus = openCodeTurnStatus(latest.outcome, stopRequested, lastExecutionStatus);
+        onstatus(summary(latest), settledStatus, !stopRequested);
         await refreshMessages(id, current);
         if (current !== generation || id !== activeID || disposed) return;
         onactivity(summary(latest));
@@ -877,7 +880,8 @@
         }
         if (!queued) {
           running = false;
-          if (session) onstatus(summary(session), 'failed');
+          if (session && !settledStatus && !lastExecutionStatus)
+            onstatus(summary(session), 'failed');
         }
       }
       if (external) throw cause;

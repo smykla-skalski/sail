@@ -23,6 +23,9 @@ void test('OpenCode uses the reported outcome when a stop races with completion'
   assert.equal(openCodeTurnStatus('failed', true), 'failed');
   assert.equal(openCodeTurnStatus('interrupted', false), 'interrupted');
   assert.equal(openCodeTurnStatus(undefined, true), 'interrupted');
+  assert.equal(openCodeTurnStatus(undefined, false, 'interrupted'), 'interrupted');
+  assert.equal(openCodeTurnStatus(undefined, false, 'failed'), 'failed');
+  assert.equal(openCodeTurnStatus(undefined, true, 'done'), 'done');
 });
 
 void test('background input and completion become unread once', () => {

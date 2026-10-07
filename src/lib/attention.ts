@@ -18,10 +18,14 @@ export function openCodeExecutionStatus(eventType: string): ThreadStatus | null 
 export function openCodeTurnStatus(
   outcome: 'succeeded' | 'failed' | 'interrupted' | undefined,
   stopRequested: boolean,
+  observedStatus: ThreadStatus | null = null,
 ): ThreadStatus {
   if (outcome === 'succeeded') return 'done';
   if (outcome === 'failed') return 'failed';
-  return outcome === 'interrupted' || stopRequested ? 'interrupted' : 'done';
+  if (outcome === 'interrupted') return 'interrupted';
+  if (observedStatus === 'done' || observedStatus === 'failed' || observedStatus === 'interrupted')
+    return observedStatus;
+  return stopRequested ? 'interrupted' : 'done';
 }
 
 export type ThreadAttention = { status: ThreadStatus; unread: boolean };
