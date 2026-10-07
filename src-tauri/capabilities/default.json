@@ -33,6 +33,7 @@
     "allow-cancel-post-turn-check",
     "allow-list-post-turn-checks",
     "allow-run-post-turn-check",
+    "allow-list-hook-activity",
     "allow-create-pull-request",
     "allow-list-open-issues",
     "allow-open-issue",

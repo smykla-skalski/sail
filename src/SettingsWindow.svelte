@@ -35,10 +35,56 @@
     state: string;
   };
   type HookError = { provider: string; source: string; message: string };
+  type HookIntegration = {
+    provider: string;
+    scope: string;
+    file: string;
+    commands: string[];
+    events: string[];
+    trustImpact: string;
+    state: 'enabled' | 'trust-required' | 'disconnected' | 'failing';
+    detail: string;
+    enabled: boolean;
+  };
   let hookReport = $state<{ entries: HookEntry[]; errors: HookError[] } | null>(null);
   let hookError = $state('');
   let hookLoading = $state(false);
   let hookDirectory = '';
+  let hookIntegration = $state<HookIntegration | null>(null);
+  let integrationLoading = $state(false);
+  let integrationError = $state('');
+
+  async function inspectIntegration(directory: string) {
+    hookIntegration = null;
+    integrationError = '';
+    if (!directory) return;
+    integrationLoading = true;
+    try {
+      hookIntegration = await invoke<HookIntegration>('inspect_hook_integration', {
+        worktree: directory,
+      });
+    } catch (cause) {
+      integrationError = String(cause);
+    } finally {
+      integrationLoading = false;
+    }
+  }
+
+  async function changeIntegration(command: 'enable_hook_integration' | 'remove_hook_integration') {
+    if (!snapshot?.directory) return;
+    integrationLoading = true;
+    integrationError = '';
+    try {
+      hookIntegration = await invoke<HookIntegration>(command, {
+        worktree: snapshot.directory,
+      });
+      await inspectHooks(snapshot.directory);
+    } catch (cause) {
+      integrationError = String(cause);
+    } finally {
+      integrationLoading = false;
+    }
+  }
 
   async function inspectHooks(directory: string) {
     hookDirectory = directory;
@@ -153,7 +199,10 @@
         const stop = await listen<SettingsSnapshot>(settingsState, (event) => {
           snapshot = event.payload;
           if (selectedSection === 'agents' && snapshot.directory !== hookDirectory)
-            void inspectHooks(snapshot.directory);
+            void Promise.all([
+              inspectHooks(snapshot.directory),
+              inspectIntegration(snapshot.directory),
+            ]);
           document.documentElement.dataset.suiTheme = snapshot.theme;
           if (!binaryDirty) binaryPath = snapshot.binaryPath;
           if (!personalChecksDirty) personalChecks = snapshot.personalPostTurnChecks.join('\n');
@@ -198,7 +247,10 @@
         onclick={() => {
           selectedSection = 'agents';
           if (snapshot?.directory && snapshot.directory !== hookDirectory)
-            void inspectHooks(snapshot.directory);
+            void Promise.all([
+              inspectHooks(snapshot.directory),
+              inspectIntegration(snapshot.directory),
+            ]);
         }}>Agents</button
       >
     </nav>
@@ -365,6 +417,54 @@
           disabled={!validationAgent || !validationModel.trim()}
           onclick={addValidationChoice}>Add model</Button
         >
+      </section>
+      <section class="settings-card hook-inspector">
+        <h2>Runtime hook integration</h2>
+        <p>
+          Optional Claude project hooks send live outcomes to this Sail process. Codex and OpenCode
+          remain configuration-only because they do not expose this integration here.
+        </p>
+        {#if integrationError}<p class="runtime-diagnostic" role="alert">{integrationError}</p>{/if}
+        {#if hookIntegration}
+          <p class="runtime-binary" data-integration-state={hookIntegration.state}>
+            <strong>{hookIntegration.provider}: {hookIntegration.state}</strong> — {hookIntegration.detail}
+          </p>
+          <dl class="integration-preview">
+            <dt>Scope</dt>
+            <dd>{hookIntegration.scope}</dd>
+            <dt>File</dt>
+            <dd><code>{hookIntegration.file}</code></dd>
+            <dt>Events</dt>
+            <dd>{hookIntegration.events.join(', ')}</dd>
+            <dt>Command</dt>
+            <dd><code>{hookIntegration.commands.join('\n')}</code></dd>
+            <dt>Trust impact</dt>
+            <dd>{hookIntegration.trustImpact}</dd>
+          </dl>
+          {#if hookIntegration.enabled}
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={integrationLoading}
+              onclick={() => void changeIntegration('remove_hook_integration')}
+              >Remove Sail integration</Button
+            >
+          {:else}
+            <Button
+              size="sm"
+              disabled={integrationLoading || hookIntegration.state === 'failing'}
+              onclick={() => void changeIntegration('enable_hook_integration')}
+              >Enable reviewed integration</Button
+            >
+          {/if}
+        {:else}
+          <Button
+            size="sm"
+            disabled={!snapshot?.directory || integrationLoading}
+            onclick={() => snapshot?.directory && void inspectIntegration(snapshot.directory)}
+            >{integrationLoading ? 'Loading preview…' : 'Preview integration'}</Button
+          >
+        {/if}
       </section>
       <section class="settings-card hook-inspector">
         <h2>Configured hooks and plugins</h2>

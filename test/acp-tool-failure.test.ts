@@ -26,7 +26,8 @@ void test('hook failure exposes action, rule, reason, output, and follow-up prom
   );
   assert.deepEqual(failure, {
     kind: 'hook',
-    action: 'git commit -m test',
+    event: null,
+    action: 'Run command',
     rule: 'GIT010',
     reason: 'Add -s -S flags',
     output: 'PreToolUse:Bash says: ❌ GIT010: Add -s -S flags',
@@ -88,6 +89,7 @@ void test('post-action hook failures avoid implying the action was blocked', () 
     }),
   );
   assert.equal(failure?.kind, 'post-hook');
+  assert.equal(failure?.event, 'PostToolUse');
   assert.equal(failure?.rule, 'audit');
   assert.match(fixAcpToolFailurePrompt(failure), /Check the action result before retrying/);
   assert.doesNotMatch(fixAcpToolFailurePrompt(failure), /hook-blocked action/);

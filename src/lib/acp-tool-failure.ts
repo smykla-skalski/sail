@@ -4,6 +4,7 @@ import { toolCommand, toolInput } from './tool-display.ts';
 
 export interface AcpToolFailure {
   kind: 'hook' | 'post-hook' | 'tool';
+  event: string | null;
   action: string;
   rule: string | null;
   reason: string;
@@ -65,7 +66,8 @@ export function acpToolFailure(tool: AgentTool): AcpToolFailure | null {
       'The action failed without a reason from the agent.');
   return {
     kind,
-    action: toolCommand(tool.input) ?? tool.title,
+    event: kind === 'tool' ? null : hookPhase,
+    action: kind === 'tool' ? (toolCommand(tool.input) ?? tool.title) : tool.title,
     rule: kind === 'tool' ? null : rule,
     reason: reason.slice(0, 1000),
     output: output.slice(0, 4000),
