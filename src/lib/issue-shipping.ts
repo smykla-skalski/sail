@@ -1,8 +1,10 @@
 import type { PublishedGraph } from './issue-graph';
+import type { RegisteredWorktree } from './coordination';
 import type { SpawnState } from './agent-results';
 import type { ShipEvent, ShipGate, ShipCheck } from './ship-progress';
 import { initialTaskCheckpoint, type TaskCheckpoint } from './task-checkpoint.ts';
 import type { EvidenceManifest } from './task-evidence.ts';
+import type { ShipValidationPolicy } from './ship-risk-policy.ts';
 
 export type ShipIssueState =
   'pending' | 'starting' | 'working' | 'awaiting_merge' | 'failed' | 'merged';
@@ -44,7 +46,18 @@ export interface ShipIssue {
   evidenceManifests?: EvidenceManifest[];
   evidenceRevision?: string;
   evidenceCommit?: string;
+  validationPolicyRequired?: boolean;
+  validationPolicy?: ShipValidationPolicy;
+  shippingTarget?: ShippingTarget;
 }
+
+export type ShippingTarget = {
+  repository: string;
+  remote: string;
+  baseBranch: string;
+  baseRef: string;
+  baseRevision: string;
+};
 
 export interface ShipRun {
   id: string;
@@ -64,6 +77,7 @@ export type DirectShipRunInput = {
   id: string;
   project: string;
   directory: string;
+  branch: string;
   repository: string;
   number: number;
   provider: ShipRun['provider'];
@@ -71,6 +85,12 @@ export type DirectShipRunInput = {
   workerModel?: string;
   approvedAt: number;
 };
+
+export function registeredShipBranch(worktrees: RegisteredWorktree[], path: string): string {
+  const branch = worktrees.find((worktree) => worktree.path === path && worktree.present)?.branch;
+  if (!branch) throw new Error('The Ship worktree has no registered branch.');
+  return branch;
+}
 
 export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): ShipRun[] {
   const existing = runs.find((run) =>
@@ -114,7 +134,7 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
           title: `Issue #${input.number}`,
           dependsOn: [],
           state: 'working',
-          branch: '',
+          branch: input.branch,
           path: input.directory,
           receiptId: null,
           threadId: input.threadId,
@@ -123,6 +143,7 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
           workerModel: input.workerModel,
           error: null,
           stage: 'implementing',
+          validationPolicyRequired: true,
           events: [{ at: input.approvedAt, stage: 'implementing' }],
           checkpoint: initialTaskCheckpoint(
             {
@@ -136,6 +157,44 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
       ],
     },
   ];
+}
+
+export async function adoptRegisteredDirectShipRun(
+  registration: Promise<RegisteredWorktree[]>,
+  input: Omit<DirectShipRunInput, 'branch'>,
+  getRuns: () => ShipRun[],
+  setRuns: (runs: ShipRun[]) => void,
+  saveRuns: () => Promise<void>,
+): Promise<boolean> {
+  const branch = registeredShipBranch(await registration, input.directory);
+  const current = getRuns();
+  const previousIssue = current
+    .flatMap((run) => run.issues)
+    .find((issue) => issue.path === input.directory && issue.threadId === input.threadId);
+  const adopted = adoptDirectShipRun(current, { ...input, branch });
+  if (adopted === current) return false;
+  setRuns(adopted);
+  try {
+    await saveRuns();
+  } catch (cause) {
+    const latest = getRuns();
+    setRuns(
+      previousIssue
+        ? latest.map((run) => ({
+            ...run,
+            issues: run.issues.map((issue) =>
+              issue.path === input.directory &&
+              issue.threadId === input.threadId &&
+              issue.workerModel === input.workerModel
+                ? { ...issue, workerModel: previousIssue.workerModel }
+                : issue,
+            ),
+          }))
+        : latest.filter((run) => run.id !== input.id),
+    );
+    throw cause;
+  }
+  return true;
 }
 
 export function isDirectShipRun(run: ShipRun): boolean {
@@ -214,6 +273,7 @@ export function createShipRun(
         { id: issue.id, url: issue.url, title: issue.title },
         approvedAt,
       ),
+      validationPolicyRequired: true,
     })),
   };
 }

@@ -1,12 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  commitRevisionBoundEvidence,
   evidenceReadiness,
   evidenceManifestsSchema,
   mergeEvidenceManifests,
+  nextTaskEvidenceSequence,
+  readStableEvidenceBoundary,
   requireEvidenceBaseRevision,
+  requireEvidenceExecutionBoundary,
   requireEvidenceRevision,
   recordTaskEvidence,
+  rollbackTaskEvidenceRecord,
   syncEvidenceManifest,
   type EvidenceManifest,
   type TaskEvidence,
@@ -39,6 +44,40 @@ void test('creates one current manifest and invalidates earlier revisions', () =
   assert.equal(second[1].revision, 'revision-two');
   assert.equal(second[1].stale, false);
   assert.deepEqual(second[1].evidence, []);
+});
+
+void test('a base move stales every kind of evidence without changing the worktree revision', () => {
+  let manifests = recordTaskEvidence(
+    [],
+    'revision',
+    criteria,
+    evidence({ id: 'command', kind: 'command', name: 'npm test', criteria }),
+    'base-one',
+  );
+  manifests = syncEvidenceManifest(manifests, 'revision', criteria, 30, 'base-two');
+  manifests = recordTaskEvidence(
+    manifests,
+    'revision',
+    criteria,
+    evidence({ id: 'new-gate', criteria: [] }),
+    'base-two',
+  );
+
+  assert.equal(manifests.find((manifest) => manifest.baseRevision === 'base-one')?.stale, true);
+  assert.deepEqual(
+    evidenceReadiness(manifests, 'revision', ['code-adversary'], criteria, 'base-two'),
+    {
+      ready: false,
+      stale: false,
+      missingGates: [],
+      failedGates: [],
+      pendingGates: [],
+      failedCommands: [],
+      pendingCommands: [],
+      unverifiedCriteria: criteria,
+      reason: '2 acceptance criteria remain unverified.',
+    },
+  );
 });
 
 void test('blocks readiness for stale, missing, failed, and unverified evidence', () => {
@@ -175,6 +214,57 @@ void test('rejects unknown criteria and bounds manifests and entries', () => {
   assert.equal(manifests.at(-1)?.evidence.length, 100);
 });
 
+void test('the evidence bound retains each latest gate above a full command history', () => {
+  let manifests: EvidenceManifest[] = [];
+  for (let index = 1; index <= 100; index += 1)
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision',
+      criteria,
+      evidence({
+        id: `command-${index}`,
+        kind: 'command',
+        name: `command-${index}`,
+        timestamp: index,
+        criteria: [],
+      }),
+    );
+  const gateNames = ['code-adversary', 'findings-adversary', 'test-adversary'];
+  const gateSequences = gateNames.map((_, index) => nextTaskEvidenceSequence(manifests, index));
+  for (const [index, name] of gateNames.entries())
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision',
+      criteria,
+      evidence({
+        id: `gate-${index}`,
+        name,
+        timestamp: 200 + index,
+        sequence: gateSequences[index],
+        criteria,
+      }),
+    );
+
+  const gateEvidence = manifests[0].evidence.filter((entry) => entry.kind === 'gate');
+  assert.deepEqual(
+    gateEvidence.map((entry) => [entry.name, entry.sequence]),
+    [
+      ['code-adversary', 101],
+      ['findings-adversary', 102],
+      ['test-adversary', 103],
+    ],
+  );
+  assert.equal(
+    evidenceReadiness(
+      manifests,
+      'revision',
+      ['code-adversary', 'findings-adversary', 'test-adversary'],
+      criteria,
+    ).ready,
+    true,
+  );
+});
+
 void test('normalizes duplicate persisted revisions to the newest manifest', () => {
   const first = recordTaskEvidence([], 'revision', criteria, evidence())[0];
   const newest = {
@@ -205,6 +295,7 @@ void test('latest evidence uses timestamps instead of persisted array order', ()
   const older = evidence({ id: 'older', result: 'failed', timestamp: 20, criteria: [] });
   const manifest: EvidenceManifest = {
     revision: 'revision',
+    baseRevision: null,
     acceptanceCriteria: criteria,
     evidence: [newest, older],
     stale: false,
@@ -288,6 +379,154 @@ void test('rejects evidence recorded after its execution revision changed', () =
   assert.doesNotThrow(() => requireEvidenceRevision('revision-a', 'revision-a'));
   assert.throws(() => requireEvidenceRevision(undefined, 'revision-a'), /captured before/);
   assert.throws(() => requireEvidenceRevision('revision-a', 'revision-b'), /Rerun/);
+});
+
+void test('rejects command evidence after mutation generation or shipping base changes', () => {
+  const current = {
+    revision: 'revision-a',
+    mutationGeneration: 'generation-b',
+    baseRevision: 'base-b',
+  };
+
+  assert.doesNotThrow(() =>
+    requireEvidenceExecutionBoundary(
+      {
+        revision: 'revision-a',
+        mutationGeneration: 'generation-b',
+        baseRevision: 'base-b',
+      },
+      current,
+    ),
+  );
+  assert.throws(
+    () =>
+      requireEvidenceExecutionBoundary(
+        {
+          revision: 'revision-a',
+          mutationGeneration: 'generation-a',
+          baseRevision: 'base-b',
+        },
+        current,
+      ),
+    /modified after execution started/,
+  );
+  assert.throws(
+    () =>
+      requireEvidenceExecutionBoundary(
+        {
+          revision: 'revision-a',
+          mutationGeneration: 'generation-b',
+          baseRevision: 'base-a',
+        },
+        current,
+      ),
+    /shipping base changed after execution started/,
+  );
+});
+
+void test('captures a stable command execution boundary after a concurrent change', async () => {
+  const revisions = ['revision-a', 'revision-b', 'revision-b', 'revision-b'];
+  const generations = ['generation-a', 'generation-b', 'generation-b', 'generation-b'];
+  const bases = ['base-a', 'base-b', 'base-b', 'base-b'];
+
+  const boundary = await readStableEvidenceBoundary(
+    async () => revisions.shift()!,
+    async () => generations.shift()!,
+    async () => bases.shift()!,
+  );
+
+  assert.deepEqual(boundary, {
+    revision: 'revision-b',
+    mutationGeneration: 'generation-b',
+    baseRevision: 'base-b',
+  });
+});
+
+for (const drift of ['revision', 'mutationGeneration', 'baseRevision'] as const) {
+  void test(`rolls back only its evidence after durable ${drift} drift`, async () => {
+    const expected = {
+      revision: 'revision-a',
+      mutationGeneration: 'generation-a',
+      baseRevision: 'base-a',
+    };
+    let boundary = { ...expected };
+    const state: { evidenceRevision?: string; evidenceManifests?: EvidenceManifest[] } = {
+      evidenceRevision: 'revision-a',
+      evidenceManifests: [],
+    };
+    let reachSave!: () => void;
+    let finishSave!: () => void;
+    const saving = new Promise<void>((resolve) => (reachSave = resolve));
+    const saved = new Promise<void>((resolve) => (finishSave = resolve));
+    const operation = commitRevisionBoundEvidence({
+      expected,
+      readBoundary: async () => ({ ...boundary }),
+      commit: async (registerRollback) => {
+        const previous = structuredClone(state);
+        state.evidenceManifests = recordTaskEvidence(
+          state.evidenceManifests ?? [],
+          expected.revision,
+          criteria,
+          evidence({ id: 'own', kind: 'command', name: 'npm test', criteria: [] }),
+          expected.baseRevision,
+        );
+        const committed = structuredClone(state);
+        registerRollback(async () => {
+          Object.assign(state, rollbackTaskEvidenceRecord(state, previous, committed, 'own'));
+        });
+        reachSave();
+        await saved;
+      },
+    });
+    await saving;
+    state.evidenceManifests = recordTaskEvidence(
+      state.evidenceManifests ?? [],
+      expected.revision,
+      criteria,
+      evidence({ id: 'concurrent', kind: 'command', name: 'cargo test', criteria: [] }),
+      expected.baseRevision,
+    );
+    boundary = { ...expected, [drift]: `${drift}-changed` };
+    finishSave();
+    await assert.rejects(operation, /Rerun the evidence/);
+    assert.deepEqual(
+      state.evidenceManifests?.[0].evidence.map((entry) => entry.id),
+      ['concurrent'],
+    );
+    assert.equal(state.evidenceRevision, 'revision-a');
+  });
+}
+
+void test('rollback restores evidence evicted by a full manifest', () => {
+  let manifests: EvidenceManifest[] = [];
+  for (let index = 0; index < 100; index += 1)
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision-a',
+      criteria,
+      evidence({
+        id: `prior-${index}`,
+        kind: 'command',
+        name: `command-${index}`,
+        timestamp: index + 1,
+      }),
+      'base-a',
+    );
+  const previous = { evidenceRevision: 'revision-a', evidenceManifests: manifests };
+  const committed = {
+    evidenceRevision: 'revision-a',
+    evidenceManifests: recordTaskEvidence(
+      manifests,
+      'revision-a',
+      criteria,
+      evidence({ id: 'own', kind: 'command', name: 'new command', timestamp: 101 }),
+      'base-a',
+    ),
+  };
+
+  const rolledBack = rollbackTaskEvidenceRecord(committed, previous, committed, 'own');
+
+  assert.deepEqual(rolledBack.evidenceManifests, manifests);
 });
 
 void test('rejects a late evidence snapshot after a newer revision was stored', () => {

@@ -4,6 +4,47 @@ use std::process::Command;
 
 const CONFIG: &str = ".sail/worktree.json";
 
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShipRisk {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub enum ShipGate {
+    #[serde(rename = "code-adversary")]
+    Code,
+    #[serde(rename = "findings-adversary")]
+    Findings,
+    #[serde(rename = "test-adversary")]
+    Test,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShipPathRisk {
+    pub pattern: String,
+    pub risk: ShipRisk,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShipValidationConfig {
+    #[serde(default = "default_ship_risk")]
+    pub default_risk: ShipRisk,
+    pub low: Vec<ShipGate>,
+    pub medium: Vec<ShipGate>,
+    pub high: Vec<ShipGate>,
+    #[serde(default)]
+    pub paths: Vec<ShipPathRisk>,
+}
+
+fn default_ship_risk() -> ShipRisk {
+    ShipRisk::Medium
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorktreeConfig {
@@ -17,6 +58,47 @@ pub struct WorktreeConfig {
     pub copy: Vec<String>,
     #[serde(default, rename = "postTurnChecks")]
     pub post_turn_checks: Vec<String>,
+    pub validation: Option<ShipValidationConfig>,
+}
+
+fn validate(config: &WorktreeConfig) -> Result<(), String> {
+    if config
+        .post_turn_checks
+        .iter()
+        .any(|command| command.trim().is_empty())
+    {
+        return Err("Post-turn check command cannot be empty.".to_string());
+    }
+    if let Some(validation) = &config.validation {
+        let unique = |gates: &[ShipGate]| {
+            gates.iter().collect::<std::collections::HashSet<_>>().len() == gates.len()
+        };
+        if !unique(&validation.low) || !unique(&validation.medium) || !unique(&validation.high) {
+            return Err("Validation gates must be unique within each risk level.".to_string());
+        }
+        if validation
+            .low
+            .iter()
+            .any(|gate| !validation.medium.contains(gate) || !validation.high.contains(gate))
+        {
+            return Err("Higher risks must retain every low-risk gate.".to_string());
+        }
+        if validation
+            .medium
+            .iter()
+            .any(|gate| !validation.high.contains(gate))
+        {
+            return Err("High risk must retain every medium-risk gate.".to_string());
+        }
+        if validation
+            .paths
+            .iter()
+            .any(|rule| rule.pattern.trim().is_empty())
+        {
+            return Err("Validation path pattern cannot be empty.".to_string());
+        }
+    }
+    Ok(())
 }
 
 pub fn read(directory: &Path) -> Result<Option<WorktreeConfig>, String> {
@@ -40,13 +122,7 @@ pub fn read(directory: &Path) -> Result<Option<WorktreeConfig>, String> {
     let value = std::fs::read(&path).map_err(|error| error.to_string())?;
     let config: WorktreeConfig = serde_json::from_slice(&value)
         .map_err(|error| format!("Invalid Sail worktree config: {error}"))?;
-    if config
-        .post_turn_checks
-        .iter()
-        .any(|command| command.trim().is_empty())
-    {
-        return Err("Post-turn check command cannot be empty.".to_string());
-    }
+    validate(&config)?;
     for item in &config.copy {
         let path = Path::new(item);
         if item.is_empty()
@@ -137,4 +213,40 @@ pub fn copy_ignored(
         copy_entry(&source, &destination)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_policy_requires_monotonic_unique_gates() {
+        let valid: WorktreeConfig = serde_json::from_value(serde_json::json!({
+            "validation": {
+                "defaultRisk": "low",
+                "low": ["test-adversary"],
+                "medium": ["code-adversary", "test-adversary"],
+                "high": ["code-adversary", "findings-adversary", "test-adversary"],
+                "paths": [{"pattern": "src-tauri/**", "risk": "high"}]
+            }
+        }))
+        .unwrap();
+        assert!(validate(&valid).is_ok());
+        assert_eq!(
+            serde_json::to_value(&valid).unwrap()["validation"]["low"][0],
+            "test-adversary"
+        );
+
+        let non_monotonic: WorktreeConfig = serde_json::from_value(serde_json::json!({
+            "validation": {
+                "low": ["test-adversary"],
+                "medium": [],
+                "high": ["test-adversary"]
+            }
+        }))
+        .unwrap();
+        assert!(validate(&non_monotonic)
+            .unwrap_err()
+            .contains("retain every low-risk gate"));
+    }
 }

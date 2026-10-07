@@ -7,6 +7,9 @@ import { taskCheckpointSchema } from './task-checkpoint.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
+  nextTaskEvidenceSequence,
+  recordTaskEvidence,
+  type EvidenceManifest,
   type EvidenceReadiness,
   type TaskEvidence,
 } from './task-evidence.ts';
@@ -48,12 +51,51 @@ export type ShipIssuePresentation = {
 export type GateMetadata = {
   gate: GateName;
   requestedModel: string;
+  sequence?: number;
   revision?: string;
   mutationGeneration?: string;
+  baseRevision?: string;
   revisionDrifted?: boolean;
   verdict?: GateVerdict;
   reason?: string;
+  evidenceCriteria?: string[];
+  evidenceOutputReference?: string;
+  evidenceTimestamp?: number;
+  evidenceSequence?: number;
 };
+
+export function nextGateSequence(gates: Pick<ShipGate, 'sequence'>[]): number {
+  return Math.max(0, ...gates.map((gate, index) => (gate.sequence ?? index) + 1));
+}
+
+export function nextValidationReservation(
+  gates: Pick<ShipGate, 'sequence' | 'evidenceSequence'>[],
+  manifests: EvidenceManifest[],
+): { sequence: number; evidenceSequence: number } {
+  return {
+    sequence: nextGateSequence(gates),
+    evidenceSequence: Math.max(
+      nextTaskEvidenceSequence(manifests),
+      ...gates.map((gate) => (gate.evidenceSequence ?? 0) + 1),
+    ),
+  };
+}
+
+export function reserveInlineValidation(
+  reservations: Map<string, { sequence: number; evidenceSequence: number }>,
+  key: string,
+  gates: Pick<ShipGate, 'sequence' | 'evidenceSequence'>[],
+  manifests: EvidenceManifest[],
+): { sequence: number; evidenceSequence: number } {
+  const recorded = nextValidationReservation(gates, manifests);
+  const previous = reservations.get(key);
+  const reserved = {
+    sequence: Math.max(recorded.sequence, (previous?.sequence ?? -1) + 1),
+    evidenceSequence: Math.max(recorded.evidenceSequence, (previous?.evidenceSequence ?? 0) + 1),
+  };
+  reservations.set(key, reserved);
+  return reserved;
+}
 export type ShipGate = GateMetadata & {
   id: string;
   provider: string;
@@ -66,14 +108,57 @@ export type ShipGate = GateMetadata & {
   error: string | null;
 };
 
+export function completedInlineShipGate(
+  gate: Omit<ShipGate, 'state' | 'created' | 'updated' | 'revision'> & { revision: string },
+  now: number,
+): ShipGate {
+  return { ...gate, revision: gate.revision, state: 'completed', created: now, updated: now };
+}
+
+export function requiredValidationGatesSatisfied(
+  policy:
+    | Pick<
+        NonNullable<ShipIssue['validationPolicy']>,
+        'requiredGates' | 'revision' | 'baseRevision'
+      >
+    | undefined,
+  gates: ShipGate[],
+): boolean {
+  if (!policy) return false;
+  return policy.requiredGates.every((name) => {
+    const gate = gates
+      .map((item, index) => ({ item, index }))
+      .filter(
+        ({ item }) =>
+          item.gate === name &&
+          item.revision === policy.revision &&
+          (policy.baseRevision === undefined || item.baseRevision === policy.baseRevision),
+      )
+      .toSorted(
+        (left, right) =>
+          (right.item.sequence ?? right.index) - (left.item.sequence ?? left.index) ||
+          right.item.updated - left.item.updated ||
+          right.item.created - left.item.created,
+      )[0]?.item;
+    if (!gate || gate.state !== 'completed') return false;
+    return name === 'test-adversary' ? gate.verdict === 'PASS' : gate.verdict === 'CLEAN';
+  });
+}
+
 export const gateMetadataSchema = z.object({
   gate: z.enum(gateNames),
   requestedModel: z.string(),
+  sequence: z.number().int().nonnegative().optional(),
   revision: z.string().min(1).optional(),
   mutationGeneration: z.string().min(1).optional(),
+  baseRevision: z.string().min(1).optional(),
   revisionDrifted: z.boolean().optional(),
   verdict: z.enum(verdicts).optional(),
   reason: z.string().optional(),
+  evidenceCriteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
+  evidenceOutputReference: z.string().min(1).max(2000).optional(),
+  evidenceTimestamp: z.number().int().nonnegative().optional(),
+  evidenceSequence: z.number().int().positive().optional(),
 });
 
 const reportSchema = z.union([
@@ -129,6 +214,193 @@ export function validationRevisionDrifted(
     validation.revisionDrifted === true ||
     (validation.revision !== undefined && validation.revision !== currentRevision)
   );
+}
+
+export async function commitRevisionBoundValidation<T>({
+  expectedRevision,
+  expectedMutationGeneration,
+  expectedBaseRevision,
+  readRevision,
+  readMutationGeneration,
+  readBaseRevision,
+  prepare,
+  commit,
+}: {
+  expectedRevision: string | undefined;
+  expectedMutationGeneration: string | undefined;
+  expectedBaseRevision?: string;
+  readRevision: () => Promise<string>;
+  readMutationGeneration: () => Promise<string>;
+  readBaseRevision?: () => Promise<string>;
+  prepare: () => Promise<T>;
+  commit: (prepared: T, registerRollback: (rollback: () => Promise<void>) => void) => Promise<void>;
+}): Promise<void> {
+  if (!expectedRevision)
+    throw new Error('Validation needs the revision captured before execution.');
+  const verifyBoundary = async () => {
+    if ((await readRevision()) !== expectedRevision)
+      throw new Error('The worktree changed during validation. Rerun the gate.');
+    if (
+      expectedMutationGeneration !== undefined &&
+      (await readMutationGeneration()) !== expectedMutationGeneration
+    )
+      throw new Error('The worktree was modified during validation. Rerun the gate.');
+    if (expectedBaseRevision !== undefined && (await readBaseRevision?.()) !== expectedBaseRevision)
+      throw new Error('The shipping base changed during validation. Rerun the gate.');
+  };
+  await verifyBoundary();
+  const prepared = await prepare();
+  await verifyBoundary();
+  let rollback: (() => Promise<void>) | undefined;
+  try {
+    await commit(prepared, (candidate) => (rollback = candidate));
+    await verifyBoundary();
+  } catch (cause) {
+    try {
+      await rollback?.();
+    } catch (rollbackCause) {
+      throw new Error(`Validation commit failed (${String(cause)}) and rollback failed.`, {
+        cause: rollbackCause,
+      });
+    }
+    throw cause;
+  }
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function restoreIfUnchanged<T>(value: T, previousValue: T, committedValue: T): T {
+  return sameValue(value, committedValue) ? previousValue : value;
+}
+
+export function rollbackValidationReceipt(
+  current: SpawnReceipt,
+  previous: SpawnReceipt,
+  committed: SpawnReceipt,
+): SpawnReceipt {
+  if (!current.validation || !previous.validation || !committed.validation) return current;
+  const validation = {
+    ...current.validation,
+    verdict: restoreIfUnchanged(
+      current.validation.verdict,
+      previous.validation.verdict,
+      committed.validation.verdict,
+    ),
+    reason: restoreIfUnchanged(
+      current.validation.reason,
+      previous.validation.reason,
+      committed.validation.reason,
+    ),
+    evidenceCriteria: restoreIfUnchanged(
+      current.validation.evidenceCriteria,
+      previous.validation.evidenceCriteria,
+      committed.validation.evidenceCriteria,
+    ),
+    evidenceOutputReference: restoreIfUnchanged(
+      current.validation.evidenceOutputReference,
+      previous.validation.evidenceOutputReference,
+      committed.validation.evidenceOutputReference,
+    ),
+    evidenceTimestamp: restoreIfUnchanged(
+      current.validation.evidenceTimestamp,
+      previous.validation.evidenceTimestamp,
+      committed.validation.evidenceTimestamp,
+    ),
+    evidenceSequence: restoreIfUnchanged(
+      current.validation.evidenceSequence,
+      previous.validation.evidenceSequence,
+      committed.validation.evidenceSequence,
+    ),
+  };
+  return { ...current, validation };
+}
+
+function rollbackEvidenceEntry(
+  current: EvidenceManifest[],
+  previous: EvidenceManifest[],
+  committed: EvidenceManifest[],
+  evidenceId: string,
+): EvidenceManifest[] {
+  return current.map((manifest) => {
+    const matches = (candidate: EvidenceManifest) =>
+      candidate.revision === manifest.revision && candidate.baseRevision === manifest.baseRevision;
+    const previousEntry = previous.find(matches)?.evidence.find((entry) => entry.id === evidenceId);
+    const committedEntry = committed
+      .find(matches)
+      ?.evidence.find((entry) => entry.id === evidenceId);
+    const currentIndex = manifest.evidence.findIndex((entry) => entry.id === evidenceId);
+    if (currentIndex < 0 || !sameValue(manifest.evidence[currentIndex], committedEntry))
+      return manifest;
+    return {
+      ...manifest,
+      evidence: previousEntry
+        ? manifest.evidence.with(currentIndex, previousEntry)
+        : manifest.evidence.toSpliced(currentIndex, 1),
+    };
+  });
+}
+
+function removeCommittedEvents(
+  current: ShipEvent[] | undefined,
+  previous: ShipEvent[] | undefined,
+  committed: ShipEvent[] | undefined,
+): ShipEvent[] | undefined {
+  const removed = [...(current ?? [])];
+  const previousCounts = new Map<string, number>();
+  for (const event of previous ?? []) {
+    const key = JSON.stringify(event);
+    previousCounts.set(key, (previousCounts.get(key) ?? 0) + 1);
+  }
+  const added = (committed ?? []).filter((event) => {
+    const key = JSON.stringify(event);
+    const count = previousCounts.get(key) ?? 0;
+    if (!count) return true;
+    previousCounts.set(key, count - 1);
+    return false;
+  });
+  for (const event of added) {
+    const index = removed.findIndex((candidate) => sameValue(candidate, event));
+    if (index >= 0) removed.splice(index, 1);
+  }
+  return removed;
+}
+
+type ValidationIssueSnapshot = Pick<
+  ShipIssue,
+  'evidenceRevision' | 'evidenceManifests' | 'stage' | 'blockedReason' | 'gates' | 'events'
+>;
+
+export function rollbackValidationIssue(
+  current: ShipIssue,
+  previous: ValidationIssueSnapshot,
+  committed: ValidationIssueSnapshot,
+  evidenceId: string,
+  gateId?: string,
+): ValidationIssueSnapshot {
+  const restore = <K extends keyof ValidationIssueSnapshot>(key: K) =>
+    sameValue(current[key], committed[key]) ? previous[key] : current[key];
+  const gates = gateId
+    ? (current.gates ?? []).filter((gate) => {
+        if (gate.id !== gateId) return true;
+        const committedGate = committed.gates?.find((candidate) => candidate.id === gateId);
+        return !sameValue(gate, committedGate);
+      })
+    : current.gates;
+  return {
+    evidenceRevision: restore('evidenceRevision'),
+    evidenceManifests: rollbackEvidenceEntry(
+      current.evidenceManifests ?? [],
+      previous.evidenceManifests ?? [],
+      committed.evidenceManifests ?? [],
+      evidenceId,
+    ),
+    stage: restore('stage'),
+    blockedReason: restore('blockedReason'),
+    gates,
+    events: removeCommittedEvents(current.events, previous.events, committed.events),
+  };
 }
 
 export function gateSnapshot(receipt: SpawnReceipt): ShipGate | null {
@@ -197,6 +469,27 @@ export function shipGatesSettled(issue: ShipIssue): boolean {
   return (issue.gates ?? []).every((gate) => shippingWorkerSettled(gate.state));
 }
 
+export function shipCleanupRequest(
+  repository: string,
+  issue: ShipIssue,
+  currentRevision: string | undefined,
+) {
+  if (!issue.path) throw new Error('Ship cleanup requires a worktree.');
+  if (!shipEvidenceReadiness(issue).ready)
+    throw new Error('Ship cleanup requires complete revision-bound evidence.');
+  const expectedRevision =
+    issue.validationPolicy?.revision ?? issue.checkpoint?.revision ?? currentRevision;
+  if (!expectedRevision) throw new Error('Ship cleanup requires a verified worktree revision.');
+  return {
+    repository,
+    worktree: issue.path,
+    force: false,
+    archiveIgnored: true,
+    expectedRevision,
+    expectedBranch: issue.branch,
+  };
+}
+
 export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
   if (!issue.checkpoint)
     return {
@@ -215,7 +508,19 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     issue.evidenceRevision,
     issue.checkpoint.requiredGates,
     issue.checkpoint.acceptanceCriteria,
+    issue.validationPolicy?.baseRevision,
   );
+  if (
+    issue.validationPolicyRequired !== false &&
+    !requiredValidationGatesSatisfied(issue.validationPolicy, issue.gates ?? [])
+  )
+    return {
+      ...readiness,
+      ready: false,
+      reason:
+        readiness.reason ??
+        'Required validation gates are not completed for the selected revision.',
+    };
   if (issue.refreshError)
     return {
       ...readiness,
@@ -230,7 +535,10 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     };
   if (!issue.pullRequest || !issue.checks?.length || !issue.evidenceRevision) return readiness;
   const manifest = (issue.evidenceManifests ?? []).find(
-    (candidate) => candidate.revision === issue.evidenceRevision && !candidate.stale,
+    (candidate) =>
+      candidate.revision === issue.evidenceRevision &&
+      candidate.baseRevision === (issue.validationPolicy?.baseRevision ?? null) &&
+      !candidate.stale,
   );
   const latestCommands = new Map<string, TaskEvidence>();
   for (const entry of manifest?.evidence ?? [])
@@ -247,6 +555,70 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     ready: false,
     reason: readiness.reason ?? `Revision-bound CI evidence missing: ${missingChecks.join(', ')}.`,
   };
+}
+
+export function recoverValidationEvidence(
+  issue: ShipIssue,
+  observedBaseRevision: string | undefined,
+): Pick<ShipIssue, 'evidenceRevision' | 'evidenceManifests'> | null {
+  const checkpoint = issue.checkpoint;
+  if (!checkpoint?.revision) return null;
+  const revision = checkpoint.revision;
+  const baseRevision = issue.validationPolicy?.baseRevision;
+  if (baseRevision !== observedBaseRevision) return null;
+  let manifests = issue.evidenceManifests ?? [];
+  const gates = (issue.gates ?? []).toSorted(
+    (left, right) =>
+      (left.sequence ?? Number.MAX_SAFE_INTEGER) - (right.sequence ?? Number.MAX_SAFE_INTEGER) ||
+      left.created - right.created ||
+      left.id.localeCompare(right.id),
+  );
+  const recoverable = gates.filter(
+    (gate) =>
+      gate.revision === revision &&
+      gate.baseRevision === baseRevision &&
+      gate.verdict &&
+      gate.evidenceTimestamp !== undefined &&
+      gate.evidenceOutputReference,
+  );
+  const evidenceIds = new Set(recoverable.map((gate) => `gate:${gate.id}`));
+  const missing = recoverable.some((gate) =>
+    manifests.every((manifest) =>
+      manifest.evidence.every((entry) => entry.id !== `gate:${gate.id}`),
+    ),
+  );
+  if (!missing && issue.evidenceRevision === revision) return null;
+  if (missing)
+    manifests = manifests.map((manifest) => ({
+      ...manifest,
+      evidence: manifest.evidence.filter((entry) => !evidenceIds.has(entry.id)),
+    }));
+  for (const gate of recoverable) {
+    const evidenceId = `gate:${gate.id}`;
+    const criteria = (gate.evidenceCriteria ?? []).filter((criterion) =>
+      checkpoint.acceptanceCriteria.includes(criterion),
+    );
+    const next = recordTaskEvidence(
+      manifests,
+      revision,
+      checkpoint.acceptanceCriteria,
+      {
+        id: evidenceId,
+        kind: 'gate',
+        name: gate.gate,
+        provider: gate.provider,
+        model: gate.model,
+        result: ['CLEAN', 'PASS'].includes(gate.verdict!) ? 'passed' : 'failed',
+        timestamp: gate.evidenceTimestamp!,
+        outputReference: gate.evidenceOutputReference!,
+        criteria,
+        ...(gate.evidenceSequence !== undefined ? { sequence: gate.evidenceSequence } : {}),
+      },
+      baseRevision,
+    );
+    manifests = next;
+  }
+  return { evidenceRevision: revision, evidenceManifests: manifests };
 }
 
 export function shipMergeClaim(issue: ShipIssue): string {
@@ -679,6 +1051,36 @@ const shipIssueSchema = z.object({
   evidenceManifests: evidenceManifestsSchema.optional(),
   evidenceRevision: z.string().min(1).optional(),
   evidenceCommit: z.string().min(1).optional(),
+  validationPolicyRequired: z.boolean().default(true),
+  validationPolicy: z
+    .object({
+      risk: z.enum(['low', 'medium', 'high']),
+      requiredGates: z.array(z.enum(gateNames)),
+      sources: z.array(z.string().min(1)).min(1),
+      revision: z.string().min(1),
+      mutationGeneration: z.string().min(1).optional(),
+      baseRevision: z.string().min(1).optional(),
+      changedPaths: z.array(z.string()),
+      selectedAt: z.number().int().nonnegative(),
+      history: z.array(
+        z.object({
+          requestedRisk: z.enum(['low', 'medium', 'high']).nullable(),
+          selectedRisk: z.enum(['low', 'medium', 'high']),
+          sources: z.array(z.string().min(1)).min(1),
+          at: z.number().int().nonnegative(),
+        }),
+      ),
+    })
+    .optional(),
+  shippingTarget: z
+    .object({
+      repository: z.string().min(1),
+      remote: z.string().min(1),
+      baseBranch: z.string().min(1),
+      baseRef: z.string().min(1),
+      baseRevision: z.string().min(1),
+    })
+    .optional(),
 });
 const shipRunSchema = z.object({
   id: z.string(),
