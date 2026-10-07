@@ -247,3 +247,57 @@ await test('malformed and self-referential lifecycle events leave parents intact
   );
   assert.equal(restored['codex:broken-child'].error, 'Incomplete subagent history');
 });
+
+function spawnEvent(parent: string, child: string): AgentEvent {
+  return event(parent, {
+    sessionUpdate: 'subagent_spawned',
+    subagentSessionId: child,
+    name: 'explore',
+    task: 'Map the code',
+    capabilities: {},
+  });
+}
+
+await test('a replay of a live session does not duplicate its live children', () => {
+  const live = updateNativeSubagents({}, spawnEvent('root', 'task-1'), '/repo', 1);
+  const replayed = updateNativeSubagents(
+    live,
+    spawnEvent('root', 'root:replay-subagent:toolu_1'),
+    '/repo',
+    2,
+    true,
+  );
+  assert.equal(replayed, live);
+  const nested = updateNativeSubagents(
+    replayed,
+    spawnEvent('root:replay-subagent:toolu_1', 'root:replay-subagent:toolu_2'),
+    '/repo',
+    3,
+    false,
+  );
+  assert.equal(nested, live);
+  const finalized = finalizeNativeSubagentRestore(nested, 'codex', 'root', 4);
+  assert.deepEqual(
+    Object.values(finalized).map((child) => [child.sessionId, child.outcome]),
+    [['task-1', 'working']],
+  );
+});
+
+await test('a first replay still restores historical children', () => {
+  const restored = updateNativeSubagents(
+    {},
+    event('root', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'root:replay-subagent:toolu_1',
+      name: 'explore',
+      task: 'Map the code',
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+    true,
+  );
+  const child = restored['codex:root:replay-subagent:toolu_1'];
+  assert.equal(child?.restored, true);
+  assert.equal(child?.rootSessionId, 'root');
+});

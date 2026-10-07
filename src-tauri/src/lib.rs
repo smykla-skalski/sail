@@ -2024,6 +2024,7 @@ pub fn run() {
             acp::acp_agents,
             acp::acp_connect,
             acp::acp_new_session,
+            acp::acp_forget_session,
             acp::acp_load_session,
             acp::acp_resume_session,
             acp::acp_prompt,

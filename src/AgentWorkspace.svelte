@@ -58,9 +58,13 @@
     acpFinishedPromptStatus,
     acpPromptInterrupted,
     groupAgentEntries,
+    liveSessionView,
     loadRecentTranscript,
     restoreEntryTimes,
     saveRecentTranscript,
+    sessionState,
+    takeBackgroundUpdates,
+    trackBackgroundSession,
     updateEntriesBatch,
     updateEntriesInPlace,
     type AgentEntry,
@@ -479,7 +483,8 @@
   let prompt: HTMLTextAreaElement;
   const preparedFailures = new Map<string, string>();
   const name = $derived(agentName);
-  const isBusy = $derived(busy || running || historyLoading);
+  let liveTurn = $state(false);
+  const isBusy = $derived(busy || running || historyLoading || liveTurn);
   const visibleStatus = $derived(
     connecting
       ? 'connecting'
@@ -552,7 +557,8 @@
   });
 
   $effect(() => {
-    if (ready && !busy && !running && !historyLoaded && !historyAttempted) void loadHistory();
+    if (ready && !busy && !running && !liveTurn && !historyLoaded && !historyAttempted)
+      void loadHistory();
   });
 
   $effect(() => {
@@ -700,7 +706,7 @@
 
   async function loadHistory() {
     const id = activeSessionId;
-    if (!id || historyLoading || !ready || busy || running || historyAttempted) return;
+    if (!id || historyLoading || !ready || busy || running || liveTurn || historyAttempted) return;
     const current = generation;
     historyAttempted = true;
     historyLoading = true;
@@ -772,6 +778,8 @@
   async function activate(id: string | null) {
     rememberTranscript();
     const previousSessionId = activeSessionId;
+    if (previousSessionId && previousSessionId !== id && !nativeEntries && !ephemeral)
+      trackBackgroundSession(agent, previousSessionId);
     rememberDraft(previousSessionId);
     const savedDraft = recallComposerDraft(composerDraftKey(directory, agent, id));
     draft = savedDraft?.text ?? '';
@@ -788,6 +796,11 @@
     selectedThreadId = id;
     activeSessionId = id;
     entries = id && thread ? loadRecentTranscript(thread) : [];
+    const liveView =
+      id && !nativeEntries
+        ? liveSessionView(entries, takeBackgroundUpdates(agent, id), sessionState(agent, id))
+        : null;
+    if (liveView) entries = liveView.entries;
     visibleCount = 50;
     historyLoaded = !id;
     historyLoading = false;
@@ -813,6 +826,7 @@
     configFailure = '';
     authNeeded = false;
     busy = false;
+    liveTurn = false;
     stopRequested = false;
     activeTurnId = null;
     error = '';
@@ -836,43 +850,65 @@
             ? capabilities.loadSession
             : false;
         if (!canLoad) throw new Error(`${name} does not support restoring threads.`);
-        const sessionCapabilities =
-          capabilities && typeof capabilities === 'object' && 'sessionCapabilities' in capabilities
-            ? capabilities.sessionCapabilities
-            : null;
-        const canResume =
-          sessionCapabilities &&
-          typeof sessionCapabilities === 'object' &&
-          'resume' in sessionCapabilities;
-        const restoresSubagents =
-          sessionCapabilities &&
-          typeof sessionCapabilities === 'object' &&
-          'subagents' in sessionCapabilities;
-        if (restoresSubagents || !canResume) {
-          setReplaying(true);
-          replayEntries = [];
-        }
-        const session =
-          restoresSubagents || !canResume
-            ? await acp.load(agent, directory, id)
-            : await acp.resume(agent, directory, id);
-        if (current === generation && (restoresSubagents || !canResume)) {
-          entries = restoreEntryTimes(replayEntries, entries);
-          setReplaying(false);
-          replayEntries = [];
-          historyLoaded = true;
-          rememberTranscript();
-        }
-        if (current === generation) {
-          configOptions = (session.configOptions as AgentConfigOption[] | undefined) ?? [];
-          const selectedModel = configOptions.find(
+        const runtime = (await acp.activity().catch(() => null))?.[agent];
+        if (current !== generation) return;
+        const runningTurn = runtime?.alive ? runtime.activeTurns[id] : undefined;
+        if (liveView && runningTurn !== undefined) {
+          liveTurn = true;
+          activeTurnId = runningTurn;
+          configOptions = liveView.configOptions;
+          const liveModel = configOptions.find(
             (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
           )?.currentValue;
-          if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
+          if (thread && liveModel) onactivity({ ...thread, model: liveModel });
+          if (liveView.availableCommands) updateSkills(liveView.availableCommands);
+          if (commandUpdates[id]) updateSkills(commandUpdates[id]);
+          const latest = (await acp.activity().catch(() => null))?.[agent];
+          if (current === generation && latest?.activeTurns[id] !== runningTurn) {
+            liveTurn = false;
+            activeTurnId = null;
+          }
+        } else {
+          const sessionCapabilities =
+            capabilities &&
+            typeof capabilities === 'object' &&
+            'sessionCapabilities' in capabilities
+              ? capabilities.sessionCapabilities
+              : null;
+          const canResume =
+            sessionCapabilities &&
+            typeof sessionCapabilities === 'object' &&
+            'resume' in sessionCapabilities;
+          const restoresSubagents =
+            sessionCapabilities &&
+            typeof sessionCapabilities === 'object' &&
+            'subagents' in sessionCapabilities;
+          if (restoresSubagents || !canResume) {
+            setReplaying(true);
+            replayEntries = [];
+          }
+          const session =
+            restoresSubagents || !canResume
+              ? await acp.load(agent, directory, id)
+              : await acp.resume(agent, directory, id);
+          if (current === generation && (restoresSubagents || !canResume)) {
+            entries = restoreEntryTimes(replayEntries, entries);
+            setReplaying(false);
+            replayEntries = [];
+            historyLoaded = true;
+            rememberTranscript();
+          }
+          if (current === generation) {
+            configOptions = (session.configOptions as AgentConfigOption[] | undefined) ?? [];
+            const selectedModel = configOptions.find(
+              (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+            )?.currentValue;
+            if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
+          }
+          if (current === generation && Array.isArray(session.availableCommands))
+            updateSkills(session.availableCommands);
+          if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
         }
-        if (current === generation && Array.isArray(session.availableCommands))
-          updateSkills(session.availableCommands);
-        if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
         const waiting = await acp.pendingPermissions(agent, id);
         if (current === generation) for (const request of waiting) queuePermission(request);
       }
@@ -1025,6 +1061,14 @@
           commandUpdates[params.sessionId] = update.availableCommands;
       }
       if (message.method === 'sail/prompt_finished' && typeof params?.sessionId === 'string') {
+        if (
+          liveTurn &&
+          params.sessionId === activeSessionId &&
+          (typeof params.turnId !== 'string' || params.turnId === activeTurnId)
+        ) {
+          liveTurn = false;
+          activeTurnId = null;
+        }
         discardSteeredAttachments(params.sessionId);
         const steer = inFlightSteer;
         if (
@@ -1090,6 +1134,8 @@
       }
       setReplaying(false);
       rememberTranscript();
+      if (activeSessionId && !nativeEntries && !ephemeral)
+        trackBackgroundSession(agent, activeSessionId);
       generation++;
       clearTimeout(updateTimer);
       unlisten?.();

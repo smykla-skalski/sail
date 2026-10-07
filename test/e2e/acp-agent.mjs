@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
@@ -26,6 +27,90 @@ function send(message) {
 
 function update(sessionId, value) {
   send({ method: 'session/update', params: { sessionId, update: value } });
+}
+
+const backgroundWork = new Map();
+
+function trackWork(sessionId, cancel) {
+  const work = backgroundWork.get(sessionId) ?? new Set();
+  work.add(cancel);
+  backgroundWork.set(sessionId, work);
+  return () => work.delete(cancel);
+}
+
+function recordUpdate(sessionId, target, value) {
+  sessions.get(sessionId).history.push({ sessionId: target, update: value });
+  update(target, value);
+}
+
+function sessionFingerprint(params) {
+  const servers = (params.mcpServers ?? []).toSorted((a, b) => a.name.localeCompare(b.name));
+  return JSON.stringify({ cwd: params.cwd, mcpServers: servers });
+}
+
+function restartSession(sessionId, counted) {
+  const session = sessions.get(sessionId);
+  const interruptsWork =
+    activePrompts.has(sessionId) || (backgroundWork.get(sessionId)?.size ?? 0) > 0;
+  if (counted || interruptsWork) {
+    const file = join(session.cwd, 'acp-restarts.txt');
+    const count = existsSync(file) ? Number(readFileSync(file, 'utf8')) || 0 : 0;
+    writeFileSync(file, `${count + 1}\n`);
+  }
+  for (const cancel of backgroundWork.get(sessionId) ?? []) cancel();
+  backgroundWork.delete(sessionId);
+  const promptId = activePrompts.get(sessionId);
+  if (promptId !== undefined) send({ id: promptId, result: { stopReason: 'cancelled' } });
+}
+
+function attachLikeClaudeAdapter(sessionId, params) {
+  const session = sessions.get(sessionId);
+  const next = sessionFingerprint(params);
+  const codexRestartsOnLoad = agent === 'codex' && session.cwd.includes('sail-restart-on-load');
+  if (!session.evicted && session.fingerprint !== undefined) {
+    const changed = session.fingerprint !== next;
+    if (changed || codexRestartsOnLoad) restartSession(sessionId, changed);
+  }
+  session.evicted = false;
+  session.fingerprint = next;
+  session.mcpServers = params.mcpServers ?? [];
+}
+
+function callWorktreeList(server, callback) {
+  const child = spawn(server.command, server.args ?? [], {
+    env: {
+      ...process.env,
+      ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])),
+    },
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  let output = '';
+  let settled = false;
+  const finish = (result) => {
+    if (settled) return;
+    settled = true;
+    child.kill();
+    callback(result);
+  };
+  child.stdout.on('data', (chunk) => {
+    output += chunk;
+    for (const line of output.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const response = JSON.parse(line);
+        if (response.id === 2)
+          finish(response.result?.isError ? 'Worktree tool failed' : 'Worktree tool works');
+      } catch {
+        continue;
+      }
+    }
+  });
+  child.on('error', () => finish('Worktree tool failed'));
+  setTimeout(() => finish('Worktree tool timed out'), 10_000);
+  const request = (id, method, params) =>
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+  request(1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+  request(2, 'tools/call', { name: 'worktree_list', arguments: {} });
 }
 
 function terminalRequest(method, params, callback) {
@@ -176,6 +261,8 @@ for await (const line of createInterface({ input: process.stdin })) {
       cwd: message.params.cwd,
       history: [],
       config: { model: 'test', effort: 'medium' },
+      fingerprint: sessionFingerprint(message.params),
+      mcpServers: message.params.mcpServers ?? [],
     });
     update(sessionId, { sessionUpdate: 'available_commands_update', availableCommands });
     const delayFirstAttentionSession =
@@ -192,6 +279,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     );
   } else if (message.method === 'session/resume') {
     const session = sessions.get(message.params.sessionId);
+    if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
     else
       send({
@@ -204,6 +292,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
   } else if (message.method === 'session/load') {
     const session = sessions.get(message.params.sessionId);
+    if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
     else {
       for (const item of session.history)
@@ -267,6 +356,10 @@ for await (const line of createInterface({ input: process.stdin })) {
     setTimeout(() => send({ id: message.id, result: { outcome: 'injected' } }), 200);
   } else if (message.method === 'session/prompt') {
     const { sessionId } = message.params;
+    if (sessions.get(sessionId)?.evicted) {
+      send({ id: message.id, error: { code: -32002, message: `Session not found: ${sessionId}` } });
+      continue;
+    }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
     if (text === 'Agent interrupted') {
@@ -484,6 +577,101 @@ for await (const line of createInterface({ input: process.stdin })) {
     const user = { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } };
     sessions.get(sessionId).history.push(user);
     update(sessionId, user);
+    if (text === 'Long turn') {
+      let part = 0;
+      const interval = setInterval(() => {
+        part += 1;
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `part-${part} ` },
+        });
+        if (part < 60) return;
+        stop();
+        clearInterval(interval);
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }, 250);
+      const stop = trackWork(sessionId, () => clearInterval(interval));
+      continue;
+    }
+    if (text === 'Background task') {
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Background task started.' },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      const timer = setTimeout(() => {
+        stop();
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: ' Background task finished.' },
+        });
+      }, 6000);
+      const stop = trackWork(sessionId, () => clearTimeout(timer));
+      continue;
+    }
+    if (text === 'Live native subagent') {
+      const child = `${sessionId}:live-child`;
+      const replayed = `${sessionId}:replay-subagent:toolu_live`;
+      const spawned = {
+        sessionUpdate: 'subagent_spawned',
+        name: 'explore',
+        task: 'Inspect live delegation',
+        capabilities: {},
+      };
+      sessions
+        .get(sessionId)
+        .history.push({ sessionId, update: { ...spawned, subagentSessionId: replayed } });
+      update(sessionId, { ...spawned, subagentSessionId: child });
+      update(child, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'live-read',
+        title: 'Read live fixture',
+        status: 'in_progress',
+      });
+      const timer = setTimeout(() => {
+        stop();
+        update(sessionId, {
+          sessionUpdate: 'subagent_state_update',
+          subagentSessionId: child,
+          state: 'completed',
+        });
+        sessions.get(sessionId).history.push({
+          sessionId,
+          update: {
+            sessionUpdate: 'subagent_state_update',
+            subagentSessionId: replayed,
+            state: 'completed',
+          },
+        });
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Live subagent finished.' },
+        });
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }, 6000);
+      const stop = trackWork(sessionId, () => clearTimeout(timer));
+      continue;
+    }
+    if (text === 'Check tools') {
+      const [server] = sessions.get(sessionId).mcpServers;
+      callWorktreeList(server, (result) => {
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: result },
+        });
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      });
+      continue;
+    }
+    if (text === 'Evict session') {
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Session evicted.' },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      sessions.get(sessionId).evicted = true;
+      continue;
+    }
     if (text === 'Native subagents') {
       const child = `${sessionId}:child`;
       const grandchild = `${sessionId}:grandchild`;

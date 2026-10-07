@@ -2,7 +2,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -100,7 +100,7 @@ struct ToolRequest {
 pub struct McpConfig {
     pub command: String,
     pub args: Vec<String>,
-    pub env: HashMap<String, String>,
+    pub env: BTreeMap<String, String>,
     pub token: String,
 }
 
@@ -137,12 +137,18 @@ impl BrowserManager {
                 .to_string_lossy()
                 .into_owned(),
             args: vec!["--browser-mcp".into()],
-            env: HashMap::from([
+            env: BTreeMap::from([
                 ("SAIL_BROWSER_PORT".into(), port.to_string()),
                 ("SAIL_BROWSER_TOKEN".into(), token.clone()),
             ]),
             token,
         })
+    }
+
+    pub fn release(&self, token: &str) {
+        if let Ok(mut clients) = self.0.clients.lock() {
+            clients.remove(token);
+        }
     }
 
     pub fn identify(&self, token: &str, session: &str) {

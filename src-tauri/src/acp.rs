@@ -71,9 +71,76 @@ struct Connection {
     alive: AtomicBool,
     capabilities: Mutex<Value>,
     session_directories: Mutex<HashMap<String, PathBuf>>,
+    session_configs: Mutex<HashMap<String, SessionConfig>>,
     pending_directory: Mutex<Option<PathBuf>>,
     session_creation: Mutex<()>,
     ready: Condvar,
+}
+
+// The adapter fingerprints `cwd` and `mcpServers`, and recreates a live
+// session (killing its turn and background work) when they change. Each
+// session therefore keeps the exact parameters it was first sent.
+#[derive(Clone)]
+struct SessionConfig {
+    cwd: String,
+    directory: PathBuf,
+    server: Value,
+    token: String,
+}
+
+fn mcp_server(config: &crate::browser_agent::McpConfig) -> Value {
+    json!({
+        "name":"sail-browser",
+        "command":config.command,
+        "args":config.args,
+        "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()
+    })
+}
+
+fn session_request_params(cwd: &str, session_id: Option<&str>, server: &Value) -> Value {
+    let mut params = json!({"cwd":cwd,"mcpServers":[server]});
+    if let Some(session_id) = session_id {
+        params["sessionId"] = json!(session_id);
+    }
+    params
+}
+
+fn per_load_mcp() -> bool {
+    std::env::var("SAIL_ACP_PER_LOAD_MCP").as_deref() == Ok("1")
+}
+
+fn canonical_directory(cwd: &str) -> PathBuf {
+    PathBuf::from(cwd)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(cwd))
+}
+
+/// Returns the parameters to send for a restored session, reusing the ones
+/// already sent for it so the adapter keeps the live session.
+fn reuse_session_config(
+    configs: &mut HashMap<String, SessionConfig>,
+    session_id: &str,
+    cwd: &str,
+    mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
+    mut release: impl FnMut(&str),
+) -> Result<SessionConfig, String> {
+    let directory = canonical_directory(cwd);
+    if let Some(existing) = configs.get(session_id) {
+        if existing.directory == directory {
+            return Ok(existing.clone());
+        }
+    }
+    let config = mint()?;
+    let next = SessionConfig {
+        cwd: cwd.to_string(),
+        directory,
+        server: mcp_server(&config),
+        token: config.token,
+    };
+    if let Some(previous) = configs.insert(session_id.to_string(), next.clone()) {
+        release(&previous.token);
+    }
+    Ok(next)
 }
 
 struct PendingPermission {
@@ -787,6 +854,7 @@ fn connect_blocking(
         alive: AtomicBool::new(true),
         capabilities: Mutex::new(Value::Null),
         session_directories: Mutex::new(HashMap::new()),
+        session_configs: Mutex::new(HashMap::new()),
         pending_directory: Mutex::new(None),
         session_creation: Mutex::new(()),
         ready: Condvar::new(),
@@ -926,6 +994,12 @@ fn connect_blocking(
         }
         reader.alive.store(false, Ordering::Release);
         crate::diagnostics::record("agent_disconnected", json!({"agent":agent_id}));
+        if let Ok(mut configs) = reader.session_configs.lock() {
+            let browser = app.state::<crate::browser_agent::BrowserManager>();
+            for (_, config) in configs.drain() {
+                browser.release(&config.token);
+            }
+        }
         app.state::<crate::acp_terminal::AcpTerminalManager>()
             .stop_agent(&agent_id);
         reader.ready.notify_all();
@@ -1014,8 +1088,7 @@ pub async fn acp_new_session(
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let config = browser.config(&cwd, None, Some(&agent))?;
-        let mcp_server = json!({"name":"sail-browser","command":config.command,"args":config.args,
-            "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()});
+        let server = mcp_server(&config);
         let _serial = runtime
             .session_creation
             .lock()
@@ -1026,26 +1099,67 @@ pub async fn acp_new_session(
             .map_err(|error| error.to_string())? = Some(PathBuf::from(&cwd));
         let result = runtime.request(
             "session/new",
-            json!({"cwd":cwd,"mcpServers":[mcp_server]}),
+            session_request_params(&cwd, None, &server),
             Duration::from_secs(60),
         );
         *runtime
             .pending_directory
             .lock()
             .map_err(|error| error.to_string())? = None;
-        let result = result?;
+        let result = result.inspect_err(|_| browser.release(&config.token))?;
         if let Some(id) = result.get("sessionId").and_then(Value::as_str) {
             browser.identify(&config.token, id);
+            if !per_load_mcp() {
+                let previous = runtime
+                    .session_configs
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .insert(
+                        id.to_string(),
+                        SessionConfig {
+                            cwd: cwd.clone(),
+                            directory: canonical_directory(&cwd),
+                            server,
+                            token: config.token.clone(),
+                        },
+                    );
+                if let Some(previous) = previous {
+                    browser.release(&previous.token);
+                }
+            }
             runtime
                 .session_directories
                 .lock()
                 .map_err(|error| error.to_string())?
                 .insert(id.to_string(), PathBuf::from(cwd));
+        } else {
+            browser.release(&config.token);
         }
         Ok(result)
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn acp_forget_session(
+    manager: State<'_, AgentManager>,
+    browser: State<'_, crate::browser_agent::BrowserManager>,
+    agent: String,
+    session_id: String,
+) -> Result<(), String> {
+    let Ok(runtime) = connection(&manager, &agent) else {
+        return Ok(());
+    };
+    let removed = runtime
+        .session_configs
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&session_id);
+    if let Some(config) = removed {
+        browser.release(&config.token);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1081,19 +1195,29 @@ async fn restore_session(
     let runtime = connection(&manager, &agent)?;
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let config = browser.config(&cwd, Some(&session_id), Some(&agent))?;
-        let mcp_server = json!({"name":"sail-browser","command":config.command,"args":config.args,
-            "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()});
+        let params = if per_load_mcp() {
+            let config = browser.config(&cwd, Some(&session_id), Some(&agent))?;
+            session_request_params(&cwd, Some(&session_id), &mcp_server(&config))
+        } else {
+            let mut configs = runtime
+                .session_configs
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let config = reuse_session_config(
+                &mut configs,
+                &session_id,
+                &cwd,
+                || browser.config(&cwd, Some(&session_id), Some(&agent)),
+                |token| browser.release(token),
+            )?;
+            session_request_params(&config.cwd, Some(&session_id), &config.server)
+        };
         runtime
             .session_directories
             .lock()
             .map_err(|error| error.to_string())?
             .insert(session_id.clone(), PathBuf::from(&cwd));
-        let result = runtime.request(
-            method,
-            json!({"cwd":cwd,"sessionId":session_id,"mcpServers":[mcp_server]}),
-            Duration::from_secs(60),
-        );
+        let result = runtime.request(method, params, Duration::from_secs(60));
         if result.is_err() {
             runtime
                 .session_directories

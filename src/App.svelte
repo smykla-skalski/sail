@@ -218,12 +218,17 @@
     acp,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
+    bufferBackgroundUpdate,
     forgetRecentTranscript,
+    invalidateBackgroundSession,
     loadAgentThreads,
     loadInterruptedAgentTurns,
     loadRecentTranscript,
+    rememberSessionState,
     saveAgentThreads,
     updateEntriesInPlace,
+    type AgentCommand,
+    type AgentConfigOption,
     type AgentEntry,
     type AgentAvailability,
     type AgentEvent,
@@ -5414,7 +5419,10 @@
     forgetMissingRecentThreads();
     for (const thread of [...removedThreads, ...removedNative]) {
       forgetThreadAttention(thread);
-      if (thread.agent !== 'opencode') forgetRecentTranscript(thread);
+      if (thread.agent !== 'opencode') {
+        forgetRecentTranscript(thread);
+        void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+      }
     }
     delete paneLayouts[path];
     persistPaneLayouts();
@@ -5503,7 +5511,10 @@
       forgetMissingRecentThreads();
       for (const thread of [...removedThreads, ...removedNative]) {
         forgetThreadAttention(thread);
-        if (thread.agent !== 'opencode') forgetRecentTranscript(thread);
+        if (thread.agent !== 'opencode') {
+          forgetRecentTranscript(thread);
+          void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+        }
       }
       delete paneLayouts[path];
       persistPaneLayouts();
@@ -7607,6 +7618,8 @@
       );
     }
     void tick().then(() => forgetRecentTranscript(thread));
+    if (thread.agent !== 'opencode')
+      void acp.forget(thread.agent, thread.sessionId).catch(() => {});
   }
 
   function agentThreadKey(thread: AgentThread): string {
@@ -8154,6 +8167,23 @@
       const sessionId = params?.sessionId;
       if (typeof sessionId === 'string') {
         const update = params?.update;
+        if (update && typeof update === 'object') {
+          const data = update as Record<string, unknown>;
+          if (replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
+            invalidateBackgroundSession(event.agent, sessionId);
+          else bufferBackgroundUpdate(event.agent, sessionId, data);
+          if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions))
+            rememberSessionState(event.agent, sessionId, {
+              configOptions: data.configOptions as AgentConfigOption[],
+            });
+          if (
+            data.sessionUpdate === 'available_commands_update' &&
+            Array.isArray(data.availableCommands)
+          )
+            rememberSessionState(event.agent, sessionId, {
+              availableCommands: data.availableCommands as AgentCommand[],
+            });
+        }
         const content =
           update && typeof update === 'object' && 'content' in update ? update.content : null;
         const text =
