@@ -46,6 +46,7 @@
     refreshedIssueState,
     refreshedPullRequest,
     shipGatesSettled,
+    shipCleanupRequest,
     shipTaskThreadsSettled,
     reconciledShipGates,
     persistShipRefresh,
@@ -2828,23 +2829,21 @@
         issue.path &&
         shipGatesSettled(issue) &&
         shipTaskThreadsSettled(issue, taskThreadStates, spawnReceipts) &&
-        (!issue.validationPolicyRequired ||
+        (issue.validationPolicyRequired === false ||
           requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
       ) {
         try {
           await updateShipIssue(run, issue, await settledImplementationAttribution(issue.path));
           if (
             !shipGatesSettled(issue) ||
-            (issue.validationPolicyRequired &&
+            (issue.validationPolicyRequired !== false &&
               !requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
           )
             return;
-          const archivePath = await invoke<string | null>('delete_worktree', {
-            repository: run.repository,
-            worktree: issue.path,
-            force: false,
-            archiveIgnored: true,
-          });
+          const archivePath = await invoke<string | null>(
+            'delete_worktree',
+            shipCleanupRequest(run.repository, issue, currentRevision),
+          );
           saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
           await updateShipIssue(run, issue, { path: null, archivePath, error: null });
         } catch (cause) {
@@ -5591,7 +5590,12 @@
           .map((pane) => invoke('terminal_close', { id: terminalRuntimeId(path, pane.id) })),
       );
       worktreeDeletions = { ...worktreeDeletions, [path]: 'Deleting files' };
-      await invoke('delete_worktree', { repository, worktree: path, force: force || !!config });
+      await invoke('delete_worktree', {
+        repository,
+        worktree: path,
+        force: force || !!config,
+        expectedRevision: null,
+      });
       saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
       const removedThreads = agentThreads.filter((thread) => thread.directory === path);
       const removedNative = sidebarOpenCodeThreads.filter((thread) => thread.directory === path);

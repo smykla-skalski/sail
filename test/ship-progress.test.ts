@@ -8,6 +8,7 @@ import {
   completedInlineShipGate,
   dependencyUrl,
   shipGatesSettled,
+  shipCleanupRequest,
   shipEvidenceReadiness,
   shipTaskThreadsSettled,
   shipActivity,
@@ -223,13 +224,50 @@ void test('loads legacy runs and discards malformed records without losing valid
   const run = fixture();
   delete run.umbrella;
   run.issues[0].worktreeUnavailable = true;
+  delete run.issues[0].validationPolicyRequired;
   const restored = loadShipRuns(JSON.stringify([{ id: 'broken', issues: [null] }, run]));
 
   assert.equal(restored.length, 1);
   assert.equal(restored[0].id, 'run');
   assert.equal(restored[0].issues[0].gates, undefined);
   assert.equal(restored[0].issues[0].worktreeUnavailable, true);
+  assert.equal(restored[0].issues[0].validationPolicyRequired, true);
   assert.deepEqual(loadShipRuns('{'), []);
+});
+
+void test('legacy persisted work cannot opt out of validation by omitting the policy flag', () => {
+  const run = fixture();
+  delete run.issues[0].validationPolicyRequired;
+  Object.assign(run.issues[1], { state: 'merged', path: null });
+  delete run.issues[1].validationPolicyRequired;
+
+  const restored = loadShipRuns(JSON.stringify([run]));
+
+  assert.equal(restored[0].issues[0].validationPolicyRequired, true);
+  assert.equal(restored[0].issues[1].validationPolicyRequired, true);
+  assert.equal(shipEvidenceReadiness(restored[0].issues[0]).ready, false);
+});
+
+void test('Ship cleanup binds deletion to the selected validation revision', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/worktree';
+  issue.validationPolicy = {
+    risk: 'low',
+    requiredGates: ['test-adversary'],
+    sources: ['test'],
+    revision: 'validated-revision',
+    changedPaths: [],
+    selectedAt: 1,
+    history: [],
+  };
+
+  assert.deepEqual(shipCleanupRequest('a/b', issue, 'newer-unchecked-revision'), {
+    repository: 'a/b',
+    worktree: '/worktree',
+    force: false,
+    archiveIgnored: true,
+    expectedRevision: 'validated-revision',
+  });
 });
 
 void test('persists canonical task checkpoints with Ship runs', () => {

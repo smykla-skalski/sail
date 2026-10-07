@@ -219,6 +219,24 @@ export function shipGatesSettled(issue: ShipIssue): boolean {
   return (issue.gates ?? []).every((gate) => shippingWorkerSettled(gate.state));
 }
 
+export function shipCleanupRequest(
+  repository: string,
+  issue: ShipIssue,
+  currentRevision: string | undefined,
+) {
+  if (!issue.path) throw new Error('Ship cleanup requires a worktree.');
+  const expectedRevision =
+    issue.validationPolicy?.revision ?? issue.checkpoint?.revision ?? currentRevision;
+  if (!expectedRevision) throw new Error('Ship cleanup requires a verified worktree revision.');
+  return {
+    repository,
+    worktree: issue.path,
+    force: false,
+    archiveIgnored: true,
+    expectedRevision,
+  };
+}
+
 export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
   if (!issue.checkpoint)
     return {
@@ -239,7 +257,7 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     issue.checkpoint.acceptanceCriteria,
   );
   if (
-    issue.validationPolicyRequired &&
+    issue.validationPolicyRequired !== false &&
     !requiredValidationGatesSatisfied(issue.validationPolicy, issue.gates ?? [])
   )
     return {
@@ -712,7 +730,7 @@ const shipIssueSchema = z.object({
   evidenceManifests: evidenceManifestsSchema.optional(),
   evidenceRevision: z.string().min(1).optional(),
   evidenceCommit: z.string().min(1).optional(),
-  validationPolicyRequired: z.boolean().optional(),
+  validationPolicyRequired: z.boolean().default(true),
   validationPolicy: z
     .object({
       risk: z.enum(['low', 'medium', 'high']),

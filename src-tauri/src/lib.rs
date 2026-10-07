@@ -1792,12 +1792,13 @@ async fn delete_worktree(
     worktree: String,
     force: Option<bool>,
     archive_ignored: Option<bool>,
+    expected_revision: Option<String>,
 ) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if archive_ignored == Some(true) {
-            archive_ignored_and_remove(repository, worktree)
+            archive_ignored_and_remove(repository, worktree, expected_revision)
         } else {
-            remove_worktree(repository, worktree, force)?;
+            remove_worktree(repository, worktree, force, expected_revision.as_deref())?;
             Ok(None)
         }
     })
@@ -1808,6 +1809,7 @@ async fn delete_worktree(
 fn archive_ignored_and_remove(
     repository: String,
     worktree: String,
+    expected_revision: Option<String>,
 ) -> Result<Option<String>, String> {
     const IGNORED: &str = "Worktree has ignored files. Move or remove them before deleting.";
     let worktree = PathBuf::from(worktree);
@@ -1828,6 +1830,7 @@ fn archive_ignored_and_remove(
         repository.clone(),
         worktree.to_string_lossy().into_owned(),
         None,
+        expected_revision.as_deref(),
     ) {
         Ok(()) => return Ok(saved_archive()),
         Err(error) if error == IGNORED => {}
@@ -1893,7 +1896,12 @@ fn archive_ignored_and_remove(
             )
         })?;
     }
-    remove_worktree(repository, worktree.to_string_lossy().into_owned(), None)?;
+    remove_worktree(
+        repository,
+        worktree.to_string_lossy().into_owned(),
+        None,
+        expected_revision.as_deref(),
+    )?;
     Ok(saved_archive())
 }
 
@@ -1901,6 +1909,7 @@ fn remove_worktree(
     repository: String,
     worktree: String,
     force: Option<bool>,
+    expected_revision: Option<&str>,
 ) -> Result<(), String> {
     let repository = PathBuf::from(validate_repository(repository)?)
         .canonicalize()
@@ -1923,6 +1932,19 @@ fn remove_worktree(
     }) {
         return Err("This folder is not a worktree of the selected repository.".to_string());
     }
+    let ensure_expected_revision = || -> Result<(), String> {
+        let Some(expected) = expected_revision else {
+            return Ok(());
+        };
+        let actual = git_directory_revision(&worktree)?;
+        if actual != expected {
+            return Err(
+                "Worktree changed after validation. Revalidate before deleting it.".to_string(),
+            );
+        }
+        Ok(())
+    };
+    ensure_expected_revision()?;
     let force = force == Some(true);
     if !force {
         let status = Command::new("git")
@@ -1948,6 +1970,7 @@ fn remove_worktree(
             );
         }
     }
+    ensure_expected_revision()?;
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -2409,28 +2432,29 @@ mod tests {
         let ignored = Path::new(&created.path).join("node_modules/package/file.js");
         fs::create_dir_all(ignored.parent().unwrap()).unwrap();
         fs::write(&ignored, "content").unwrap();
-        let result = remove_worktree(repository_path.into(), created.path.clone(), None);
+        let result = remove_worktree(repository_path.into(), created.path.clone(), None, None);
         assert!(result.unwrap_err().contains("ignored files"));
         assert!(ignored.exists());
         let untracked = Path::new(&created.path).join("notes.txt");
         fs::write(&untracked, "keep").unwrap();
         assert!(
-            archive_ignored_and_remove(repository_path.into(), created.path.clone())
+            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None)
                 .unwrap_err()
                 .contains("changes outside ignored")
         );
         assert!(ignored.exists());
         fs::remove_file(untracked).unwrap();
-        let archive = archive_ignored_and_remove(repository_path.into(), created.path.clone())
-            .unwrap()
-            .unwrap();
+        let archive =
+            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None)
+                .unwrap()
+                .unwrap();
         assert_eq!(
             fs::read_to_string(Path::new(&archive).join("node_modules/package/file.js")).unwrap(),
             "content"
         );
         assert!(!Path::new(&created.path).exists());
         assert_eq!(
-            archive_ignored_and_remove(repository_path.into(), created.path.clone()).unwrap(),
+            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None).unwrap(),
             Some(archive)
         );
         let forced = add_worktree(
@@ -2442,8 +2466,89 @@ mod tests {
         .unwrap();
         fs::create_dir_all(Path::new(&forced.path).join("node_modules")).unwrap();
         fs::write(Path::new(&forced.path).join("node_modules/file"), "content").unwrap();
-        remove_worktree(repository_path.into(), forced.path.clone(), Some(true)).unwrap();
+        remove_worktree(
+            repository_path.into(),
+            forced.path.clone(),
+            Some(true),
+            None,
+        )
+        .unwrap();
         assert!(!Path::new(&forced.path).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_removal_rejects_a_new_clean_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-delete-revision-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = root.join("repository");
+        let parent = root.join("worktrees");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&parent).unwrap();
+        let repository = repository.canonicalize().unwrap();
+        let repository_path = repository.to_str().unwrap();
+        git(repository_path, &["init", "-q"]);
+        fs::write(repository.join("tracked.txt"), "before\n").unwrap();
+        git(repository_path, &["add", "tracked.txt"]);
+        git(
+            repository_path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        );
+        let created = add_worktree(
+            repository_path.into(),
+            "child".into(),
+            Some(parent.to_string_lossy().into_owned()),
+            Some("HEAD".into()),
+        )
+        .unwrap();
+        let expected =
+            tauri::async_runtime::block_on(working_tree_revision(created.path.clone())).unwrap();
+        fs::write(Path::new(&created.path).join("tracked.txt"), "after\n").unwrap();
+        git(&created.path, &["add", "tracked.txt"]);
+        git(
+            &created.path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "new clean commit",
+            ],
+        );
+
+        let error = remove_worktree(
+            repository_path.into(),
+            created.path.clone(),
+            None,
+            Some(&expected),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed after validation"));
+        assert!(Path::new(&created.path).exists());
+        remove_worktree(
+            repository_path.into(),
+            created.path.clone(),
+            Some(true),
+            None,
+        )
+        .unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
