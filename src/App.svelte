@@ -2064,6 +2064,15 @@
 
   async function ensureOpenCodeBrowser(path: string) {
     if (!client || openCodeBrowserServers.has(path)) return;
+    let delayed = false;
+    if (import.meta.env.MODE === 'e2e') {
+      const delay = Number(sessionStorage.getItem('sai-e2e-browser-setup-delay'));
+      if (delay > 0 && delay <= 5_000) {
+        delayed = true;
+        sessionStorage.setItem('sai-e2e-browser-setup-started', path);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
     const config = await invoke<BrowserMcpConfig>('browser_mcp_config', { directory: path });
     await client.mcp.add({
       server: 'sail-browser',
@@ -2076,6 +2085,7 @@
       },
     });
     openCodeBrowserServers.add(path);
+    if (delayed) sessionStorage.setItem('sai-e2e-browser-setup-finished', path);
   }
 
   function toggleAgentBrowserAccess() {
@@ -6073,6 +6083,13 @@
     paletteBusy = true;
     paletteError = '';
     try {
+      if (entry.kind === 'thread') {
+        if (!entry.thread || !(await jumpToRecentThread(threadKey(entry.thread))))
+          throw new Error('This session is no longer available.');
+        closeCommandPalette(false);
+        focusPaneForTyping('main');
+        return;
+      }
       const target = step.directory;
       let expectedProjectLoad = projectLoadGeneration;
       if (target !== directory) {
@@ -6083,17 +6100,6 @@
       if (expectedProjectLoad !== projectLoadGeneration || !directory) return;
       if (step.agent === 'opencode' && entry.kind === 'new-session' && !workReady)
         throw new Error('Complete OpenCode setup in this worktree before starting a session.');
-      const thread =
-        entry.kind === 'thread' && entry.thread
-          ? agentThreads.find(
-              (item) =>
-                item.directory === directory &&
-                item.agent === entry.thread?.agent &&
-                item.sessionId === entry.thread.sessionId,
-            )
-          : null;
-      if (entry.kind === 'thread' && !thread)
-        throw new Error('This session is no longer available.');
       closeCommandPalette(false);
       focusMainPane();
       if (step.agent === 'opencode') {
@@ -6101,7 +6107,6 @@
         else if (entry.kind === 'opencode-session' && entry.sessionId)
           await selectSession(entry.sessionId);
       } else if (entry.kind === 'new-session') openAgent(step.agent);
-      else if (entry.kind === 'thread' && thread) openAgent(step.agent, thread);
       focusPaneForTyping('main');
     } catch (cause) {
       paletteError = describe(cause);
@@ -6268,15 +6273,22 @@
     showWorkspace();
     const jump = ++recentJumpGeneration;
     let expectedProjectLoad = projectLoadGeneration;
-    const target = await invoke<string>('validate_repository', { path: thread.directory }).catch(
-      () => null,
-    );
+    const sameDirectory = thread.directory === directory;
+    const target = sameDirectory
+      ? (await invoke<boolean>('repository_path_available', { path: directory }).catch(() => false))
+        ? directory
+        : null
+      : await invoke<string>('validate_repository', { path: thread.directory }).catch(() => null);
     if (!target || jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
       return false;
     if (thread.directory !== directory || target !== directory) {
       const pending = loadProject(thread.directory, false);
       expectedProjectLoad = projectLoadGeneration;
-      await pending;
+      if (thread.agent === 'opencode') await pending;
+      else
+        void pending.catch((cause) => {
+          if (expectedProjectLoad === projectLoadGeneration) error = describe(cause);
+        });
     }
     if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
       return false;

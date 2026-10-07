@@ -8,6 +8,7 @@ fn main() {
             "list_interrupted_agent_turns",
             "finish_interrupted_agent_turn",
             "start_runtime",
+            "repository_path_available",
             "validate_repository",
             "list_picker_directory",
             "working_tree_diff",
