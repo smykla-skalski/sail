@@ -509,12 +509,20 @@ export const acp = {
     invoke<Record<string, unknown>>('acp_authenticate', { agent, methodId }),
 };
 
+export async function acpFinishedPromptStatus(
+  agent: AgentId,
+  sessionId: string,
+  turnId: string,
+): Promise<'done' | 'failed' | 'interrupted' | null> {
+  const activity = await acp.activity().catch(() => null);
+  const finished = activity?.[agent]?.finished[sessionId];
+  return finished?.turnId === turnId ? finished.status : null;
+}
+
 export async function acpFailedPromptInterrupted(
   agent: AgentId,
   sessionId: string,
   turnId: string,
 ): Promise<boolean> {
-  const activity = await acp.activity().catch(() => null);
-  const finished = activity?.[agent]?.finished[sessionId];
-  return finished?.turnId === turnId && finished.status === 'interrupted';
+  return (await acpFinishedPromptStatus(agent, sessionId, turnId)) === 'interrupted';
 }

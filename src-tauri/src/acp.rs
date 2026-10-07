@@ -1243,7 +1243,7 @@ pub async fn acp_prompt(
         let interrupted = cancelled_result
             || reported_interruption
             || reported_error_interruption
-            || (explicitly_cancelled && result.is_err());
+            || (explicitly_cancelled && result.is_err() && runtime.alive.load(Ordering::Acquire));
         if interrupted {
             if let Ok(Value::Object(payload)) = &mut result {
                 payload.insert("sailInterrupted".into(), Value::Bool(true));
@@ -1391,14 +1391,20 @@ pub fn acp_cancel(
             "agent":agent,"sessionId":session_id,"turnId":cancelled_turn
         }),
     );
-    if let Some(turn_id) = cancelled_turn {
-        runtime
-            .cancelled_prompts
-            .lock()
-            .map_err(|error| error.to_string())?
-            .insert(turn_id);
+    let mut cancelled = runtime
+        .cancelled_prompts
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(turn_id) = cancelled_turn.as_ref() {
+        cancelled.insert(turn_id.clone());
     }
-    runtime.notify("session/cancel", json!({"sessionId":session_id}))
+    let result = runtime.notify("session/cancel", json!({"sessionId":session_id}));
+    if result.is_err() {
+        if let Some(turn_id) = cancelled_turn.as_ref() {
+            cancelled.remove(turn_id);
+        }
+    }
+    result
 }
 
 #[tauri::command]

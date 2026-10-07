@@ -55,7 +55,7 @@
   } from './lib/agent-queue';
   import {
     acp,
-    acpFailedPromptInterrupted,
+    acpFinishedPromptStatus,
     acpPromptInterrupted,
     groupAgentEntries,
     loadRecentTranscript,
@@ -1259,12 +1259,13 @@
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
+      const backendStatus =
+        phase === 'prompt' && deliverySessionId
+          ? await acpFinishedPromptStatus(turnAgent, deliverySessionId, turnId)
+          : null;
       const interrupted =
-        finalStatus === 'interrupted' ||
-        stopRequested ||
-        (phase === 'prompt' &&
-          !!deliverySessionId &&
-          (await acpFailedPromptInterrupted(turnAgent, deliverySessionId, turnId)));
+        backendStatus === 'interrupted' ||
+        (backendStatus !== 'failed' && (finalStatus === 'interrupted' || stopRequested));
       finalStatus = interrupted ? 'interrupted' : 'failed';
       if (interrupted) notifyOnDone = false;
       if (!deliverySessionId && current !== generation && disposed && !ephemeral && !external) {
@@ -1506,18 +1507,26 @@
   async function stop() {
     stopRequested = true;
     diagnostic('stop_requested');
-    if (!activeSessionId) return;
+    if (!activeSessionId) {
+      stopRequested = false;
+      return;
+    }
     const current = generation;
     const sessionId = activeSessionId;
     const pending = permissions;
+    let cancelSent = false;
     try {
       await acp.cancel(agent, sessionId, activeTurnId);
+      cancelSent = true;
       await Promise.all(pending.map((permission) => acp.permission(agent, permission.id, null)));
       if (current !== generation || activeSessionId !== sessionId) return;
       permissions = [];
       markTools('stopping', ['pending', 'in_progress']);
     } catch (cause) {
-      if (current === generation && activeSessionId === sessionId) error = describe(cause);
+      if (current === generation && activeSessionId === sessionId) {
+        if (!cancelSent) stopRequested = false;
+        error = describe(cause);
+      }
     }
   }
 

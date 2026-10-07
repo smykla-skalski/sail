@@ -231,5 +231,15 @@ describe('agent thread attention', () => {
     expect(await browser.execute(() => localStorage.getItem('sai-notification-sound'))).toBe(
       'false',
     );
+
+    await waitForComposer();
+    await $('.agent-composer textarea').setValue('Crash on cancel');
+    await $('.agent-actions button').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    await $('.agent-busy button').click();
+    await $('.agent-launches button').click();
+    const crashed = $('.project-agent-row[aria-label*="Crash on cancel"]');
+    await expect(crashed.$('.activity-status')).toHaveAttribute('data-state', 'failed');
+    await expect(crashed).toHaveText(expect.stringContaining('Failed'));
   });
 });

@@ -667,6 +667,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       if (pending.sessionId === message.params.sessionId) {
         permissions.delete(id);
         const finish = () => {
+          if (pending.text === 'Crash on cancel') process.exit(0);
           if (pending.text === 'Cancel error')
             send({ id: pending.promptId, error: { code: -1, message: 'Step interrupted' } });
           else
