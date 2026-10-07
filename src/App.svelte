@@ -43,11 +43,14 @@
     refreshedIssueState,
     refreshedPullRequest,
     shipGatesSettled,
+    shipTaskThreadsSettled,
     reconciledShipGates,
     persistShipRefresh,
     settleShipRefresh,
     type ShippingPullRequest,
     shipOwner,
+    shipCheckpointOwner,
+    authorizeShipCheckpointThread,
     validateGateVerdict,
   } from './lib/ship-progress';
   import type { PublishedGraph } from './lib/issue-graph';
@@ -63,6 +66,11 @@
     type ShipRun,
   } from './lib/issue-shipping';
   import type { ShipItIssue } from './lib/implementation-models';
+  import {
+    initialTaskCheckpoint,
+    prepareTaskCheckpointUpdate,
+    reconcileTaskCheckpoint,
+  } from './lib/task-checkpoint.ts';
   import DiffPanel from './DiffPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
@@ -404,6 +412,8 @@
       | 'agent_spawn'
       | 'validation_gate'
       | 'ship_progress'
+      | 'task_checkpoint_read'
+      | 'task_checkpoint_update'
       | 'agent_status'
       | 'agent_wait'
       | 'agent_result'
@@ -2366,7 +2376,7 @@
       const gateReporting = inlineGates
         ? 'After every completed adversary pass, use ship_progress with its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.'
         : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
-      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -2644,7 +2654,22 @@
         if (!shippingWorkerSettled((await currentSpawnReceipt(receipt)).state)) return;
         await update({ workerSettled: true });
       }
-      if (issue.path && shipGatesSettled(issue)) {
+      const taskThreadIds = [issue.threadId, ...(issue.checkpointThreadIds ?? [])].filter(
+        (threadId): threadId is string => Boolean(threadId),
+      );
+      const taskThreadStates = Object.fromEntries(
+        await Promise.all(
+          taskThreadIds.map(async (threadId) => [
+            threadId,
+            await directShipWorkerState({ ...issue, threadId }),
+          ]),
+        ),
+      );
+      if (
+        issue.path &&
+        shipGatesSettled(issue) &&
+        shipTaskThreadsSettled(issue, taskThreadStates, spawnReceipts)
+      ) {
         try {
           await updateShipIssue(run, issue, await settledImplementationAttribution(issue.path));
           if (!shipGatesSettled(issue)) return;
@@ -2788,6 +2813,15 @@
       for (const issue of run.issues)
         for (const gate of issue.gates ?? [])
           if (!shippingWorkerSettled(gate.state)) protectedIds.add(gate.id);
+    for (const run of shipRuns)
+      for (const issue of run.issues)
+        if (issue.path) {
+          if (issue.receiptId) protectedIds.add(issue.receiptId);
+          for (const threadId of issue.checkpointThreadIds ?? []) {
+            const handoff = spawnReceipts.find((item) => item.targetId === threadId);
+            if (handoff) protectedIds.add(handoff.receiptId);
+          }
+        }
     spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
     for (const run of shipRuns) {
@@ -2809,6 +2843,16 @@
       ].toSorted((a, b) => a.created - b.created);
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     }
+    if (
+      authorizeShipCheckpointThread(
+        shipRuns,
+        receipt.sourceDirectory,
+        receipt.sourceId,
+        receipt.targetDirectory,
+        receipt.targetId,
+      )
+    )
+      void saveShipRuns().catch((cause) => (error = describe(cause)));
   }
 
   function updateSpawnReceipt(id: string, changes: Partial<SpawnReceipt>, preserveUpdated = false) {
@@ -3607,6 +3651,48 @@
           : {}),
       };
     }
+    if (request.name === 'task_checkpoint_read' || request.name === 'task_checkpoint_update') {
+      const owner = shipCheckpointOwner(shipRuns, request.directory, sourceId);
+      if (!owner) throw new Error('This thread cannot access a Ship task checkpoint.');
+      await refreshShippingIssue(owner.run, owner.issue, true);
+      const checkpoint =
+        owner.issue.checkpoint ??
+        initialTaskCheckpoint(
+          { id: owner.issue.id, url: owner.issue.url, title: owner.issue.title },
+          owner.run.approvedAt,
+        );
+      const currentRevision = await invoke<string>('working_tree_revision', {
+        path: request.directory,
+      });
+      if (request.name === 'task_checkpoint_update') {
+        const patch = request.arguments.checkpoint;
+        if (!patch || typeof patch !== 'object' || Array.isArray(patch))
+          throw new Error('Checkpoint update requires a checkpoint object.');
+        const liveCheckpoint = owner.issue.checkpoint ?? checkpoint;
+        const updated = prepareTaskCheckpointUpdate(
+          liveCheckpoint,
+          patch,
+          currentRevision,
+          request.arguments.expectedSequence,
+          request.arguments.expectedRevision,
+          request.arguments.rebindRevision,
+          Date.now(),
+        );
+        await updateShipIssue(owner.run, owner.issue, { checkpoint: updated });
+      } else if (!owner.issue.checkpoint) {
+        await updateShipIssue(owner.run, owner.issue, { checkpoint });
+      }
+      const saved = owner.issue.checkpoint ?? checkpoint;
+      return {
+        checkpoint: saved,
+        reconciliation: reconcileTaskCheckpoint(saved, currentRevision, {
+          issueState: owner.issue.issueState,
+          pullRequest: owner.issue.pullRequest,
+          deliveryState: owner.issue.state,
+          refreshError: owner.issue.refreshError,
+        }),
+      };
+    }
     if (request.name === 'ship_progress') return reportShipProgress(request, sourceId);
     if (request.name === 'validation_gate') {
       const owner = shipOwner(shipRuns, request.directory, sourceId);
@@ -4245,6 +4331,7 @@
         });
       if (receiptId)
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      if (receiptId) await saveShipRuns();
       await invoke('record_turn_snapshot', {
         path: created.path,
         thread: `acp:${source.agent}:${session.sessionId}`,
@@ -4350,6 +4437,7 @@
       });
     if (receiptId)
       await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+    if (receiptId) await saveShipRuns();
     rememberRecentThread({
       agent: 'opencode',
       sessionId: session.id,

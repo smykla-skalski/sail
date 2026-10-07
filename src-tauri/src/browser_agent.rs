@@ -480,7 +480,7 @@ impl BrowserManager {
             "thread_message" => Some("sai-agent-messages-enabled"),
             // Progress belongs to the owning Ship run and must remain available when
             // cross-validation and other coordination actions are disabled.
-            "ship_progress" => None,
+            "ship_progress" | "task_checkpoint_read" | "task_checkpoint_update" => None,
             _ => return Err("Unknown coordination action.".into()),
         };
         let settings = crate::settings::load_settings(app.clone())?;
@@ -564,6 +564,8 @@ impl BrowserManager {
                 | "agent_spawn"
                 | "validation_gate"
                 | "ship_progress"
+                | "task_checkpoint_read"
+                | "task_checkpoint_update"
                 | "agent_status"
                 | "agent_wait"
                 | "agent_result"
@@ -1225,6 +1227,16 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "",
     ),
     (
+        "task_checkpoint_read",
+        "Read the canonical checkpoint for this thread's Ship task and reconcile it with the current worktree and known GitHub delivery state before resuming.",
+        "",
+    ),
+    (
+        "task_checkpoint_update",
+        "Compare-and-swap canonical Ship task fields after a phase, blocker, question, revision, required-gate, or next-action change. Pass the sequence and revision returned by read; explicitly rebind after inspecting worktree drift.",
+        "checkpoint",
+    ),
+    (
         "agent_status",
         "Inspect a launch receipt with its ID and access key. Only the launching thread can read it.",
         "receiptId,accessKey",
@@ -1375,6 +1387,29 @@ pub fn run_mcp_stdio() {
                         },"oneOf":[{"required":["stage","status"]},{"required":["verdict"]}]
                     }});
                 }
+                if *name == "task_checkpoint_update" {
+                    return json!({"name":name,"description":description,"inputSchema":{
+                        "type":"object","properties":{
+                            "checkpoint":{
+                                "type":"object",
+                                "properties":{
+                                    "objective":{"type":"string","minLength":1},
+                                    "acceptanceCriteria":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},
+                                    "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","review","test","pr","complete"]},
+                                    "status":{"type":"string","enum":["active","blocked","completed"]},
+                                    "requiredGates":{"type":"array","items":{"type":"string","minLength":1}},
+                                    "blocker":{"type":["string","null"]},
+                                    "unresolvedQuestions":{"type":"array","items":{"type":"string","minLength":1}},
+                                    "nextAction":{"type":"string","minLength":1}
+                                },
+                                "additionalProperties":false
+                            },
+                            "expectedSequence":{"type":"integer","minimum":0},
+                            "expectedRevision":{"type":["string","null"]},
+                            "rebindRevision":{"type":"boolean"}
+                        },"required":["checkpoint","expectedSequence","expectedRevision"]
+                    }});
+                }
                 if *name == "agent_wait" {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object","properties":{
@@ -1497,6 +1532,12 @@ mod skill_tests {
     fn skill_is_announced_and_readable_without_a_browser_bridge() {
         assert_eq!(mcp_initialize()["instructions"], SAIL_SKILL);
         assert!(TOOLS.iter().any(|(name, _, _)| *name == "sail_skill"));
+        assert!(TOOLS
+            .iter()
+            .any(|(name, _, _)| *name == "task_checkpoint_read"));
+        assert!(TOOLS
+            .iter()
+            .any(|(name, _, _)| *name == "task_checkpoint_update"));
         assert_eq!(
             call_bridge(&json!({"name":"sail_skill","arguments":{}}))["content"][0]["text"],
             SAIL_SKILL

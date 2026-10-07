@@ -6,6 +6,7 @@ import {
   ciStatus,
   dependencyUrl,
   shipGatesSettled,
+  shipTaskThreadsSettled,
   shipActivity,
   reconciledShipGates,
   refreshedPullRequest,
@@ -15,6 +16,8 @@ import {
   parseShipReport,
   refreshedIssueState,
   shipOwner,
+  shipCheckpointOwner,
+  authorizeShipCheckpointThread,
   shipIssuePresentation,
   shipStatus,
   sortShipIssues,
@@ -150,6 +153,66 @@ void test('loads legacy runs and discards malformed records without losing valid
   assert.equal(restored[0].issues[0].gates, undefined);
   assert.equal(restored[0].issues[0].worktreeUnavailable, true);
   assert.deepEqual(loadShipRuns('{'), []);
+});
+
+void test('persists canonical task checkpoints with Ship runs', () => {
+  const run = fixture();
+  run.issues[0].checkpoint!.objective = 'Concrete objective';
+  run.issues[0].checkpoint!.acceptanceCriteria = ['One observable result'];
+
+  const restored = loadShipRuns(JSON.stringify([run]));
+
+  assert.deepEqual(restored[0].issues[0].checkpoint, run.issues[0].checkpoint);
+});
+
+void test('checkpoint ownership follows same-worktree handoff ancestry', () => {
+  const run = fixture();
+  run.issues[0].path = '/worktree';
+  run.issues[0].threadId = 'owner';
+  assert.equal(
+    authorizeShipCheckpointThread([run], '/worktree', 'owner', '/worktree', 'handoff'),
+    true,
+  );
+  assert.equal(
+    authorizeShipCheckpointThread([run], '/worktree', 'handoff', '/worktree', 'successor'),
+    true,
+  );
+
+  assert.equal(shipCheckpointOwner([run], '/worktree', 'successor')?.issue.id, 'first');
+  assert.equal(shipCheckpointOwner([run], '/worktree', 'unrelated'), undefined);
+  assert.equal(shipCheckpointOwner([run], '/other', 'successor'), undefined);
+  assert.equal(
+    authorizeShipCheckpointThread([run], '/worktree', 'owner', '/other', 'foreign'),
+    false,
+  );
+});
+
+void test('worktree cleanup waits for every authorized checkpoint thread', () => {
+  const issue = fixture().issues[0];
+  issue.checkpointThreadIds = ['handoff'];
+  issue.threadId = 'owner';
+  issue.receiptId = 'owner-receipt';
+  const receipts = [
+    { receiptId: 'owner-receipt', targetId: 'owner', state: 'completed' as const },
+    { receiptId: 'handoff-receipt', targetId: 'handoff', state: 'completed' as const },
+  ];
+  assert.equal(shipTaskThreadsSettled(issue, {}, []), false);
+  assert.equal(
+    shipTaskThreadsSettled(issue, { owner: 'working', handoff: 'completed' }, receipts),
+    false,
+  );
+  assert.equal(
+    shipTaskThreadsSettled(issue, { owner: 'completed', handoff: 'working' }, receipts),
+    false,
+  );
+  assert.equal(
+    shipTaskThreadsSettled(issue, { owner: 'completed', handoff: 'completed' }, [
+      receipts[0],
+      { ...receipts[1], state: 'starting' },
+    ]),
+    false,
+  );
+  assert.equal(shipTaskThreadsSettled(issue, {}, receipts), true);
 });
 
 void test('dependency failure blocks only dependents and merged dependencies become queued', () => {
