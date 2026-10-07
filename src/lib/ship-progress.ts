@@ -80,6 +80,22 @@ export function nextValidationReservation(
     ),
   };
 }
+
+export function reserveInlineValidation(
+  reservations: Map<string, { sequence: number; evidenceSequence: number }>,
+  key: string,
+  gates: Pick<ShipGate, 'sequence' | 'evidenceSequence'>[],
+  manifests: EvidenceManifest[],
+): { sequence: number; evidenceSequence: number } {
+  const recorded = nextValidationReservation(gates, manifests);
+  const previous = reservations.get(key);
+  const reserved = {
+    sequence: Math.max(recorded.sequence, (previous?.sequence ?? -1) + 1),
+    evidenceSequence: Math.max(recorded.evidenceSequence, (previous?.evidenceSequence ?? 0) + 1),
+  };
+  reservations.set(key, reserved);
+  return reserved;
+}
 export type ShipGate = GateMetadata & {
   id: string;
   provider: string;

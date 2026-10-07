@@ -4,6 +4,7 @@ import {
   adoptDirectShipRun,
   createShipRun,
   readyShipIssues,
+  registeredShipBranch,
   resolvedWorkerModel,
   shipIssueStatus,
   shippingWorkerSettled,
@@ -135,10 +136,15 @@ void test('approved snapshot survives serialization and does not expand to new i
 });
 
 void test('adopts an already-running direct Ship It thread', () => {
+  const branch = registeredShipBranch(
+    [{ path: '/repo/worktrees/gateway-fix', branch: 'fix/gateway', present: true }],
+    '/repo/worktrees/gateway-fix',
+  );
   const adopted = adoptDirectShipRun([], {
     id: 'direct-run',
     project: '/repo',
     directory: '/repo/worktrees/gateway-fix',
+    branch,
     repository: 'kumahq/kuma',
     number: 18976,
     provider: 'codex',
@@ -152,6 +158,7 @@ void test('adopts an already-running direct Ship It thread', () => {
   assert.equal(adopted[0].repository, '/repo');
   assert.equal(issue.url, 'https://github.com/kumahq/kuma/issues/18976');
   assert.equal(issue.state, 'working');
+  assert.equal(issue.branch, 'fix/gateway');
   assert.equal(issue.stage, 'implementing');
   assert.equal(issue.workerModel, 'gpt-5.6-luna');
   assert.equal(issue.checkpoint?.taskId, 'kumahq/kuma#18976');
@@ -163,11 +170,23 @@ void test('adopts an already-running direct Ship It thread', () => {
   );
 });
 
+void test('rejects a direct Ship worktree without a registered branch', () => {
+  assert.throws(
+    () =>
+      registeredShipBranch(
+        [{ path: '/repo/worktrees/gateway-fix', branch: null, present: true }],
+        '/repo/worktrees/gateway-fix',
+      ),
+    /no registered branch/,
+  );
+});
+
 void test('fills in the recovered direct worker model without duplicating the run', () => {
   const input = {
     id: 'direct-run',
     project: '/repo',
     directory: '/repo/worktrees/gateway-fix',
+    branch: 'fix/gateway',
     repository: 'kumahq/kuma',
     number: 18976,
     provider: 'codex' as const,

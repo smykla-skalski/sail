@@ -1,4 +1,5 @@
 import type { PublishedGraph } from './issue-graph';
+import type { RegisteredWorktree } from './coordination';
 import type { SpawnState } from './agent-results';
 import type { ShipEvent, ShipGate, ShipCheck } from './ship-progress';
 import { initialTaskCheckpoint, type TaskCheckpoint } from './task-checkpoint.ts';
@@ -76,6 +77,7 @@ export type DirectShipRunInput = {
   id: string;
   project: string;
   directory: string;
+  branch: string;
   repository: string;
   number: number;
   provider: ShipRun['provider'];
@@ -83,6 +85,12 @@ export type DirectShipRunInput = {
   workerModel?: string;
   approvedAt: number;
 };
+
+export function registeredShipBranch(worktrees: RegisteredWorktree[], path: string): string {
+  const branch = worktrees.find((worktree) => worktree.path === path && worktree.present)?.branch;
+  if (!branch) throw new Error('The Ship worktree has no registered branch.');
+  return branch;
+}
 
 export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): ShipRun[] {
   const existing = runs.find((run) =>
@@ -126,7 +134,7 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
           title: `Issue #${input.number}`,
           dependsOn: [],
           state: 'working',
-          branch: '',
+          branch: input.branch,
           path: input.directory,
           receiptId: null,
           threadId: input.threadId,

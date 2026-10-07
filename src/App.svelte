@@ -40,8 +40,8 @@
     appendShipEvent,
     beginLatestRefresh,
     completedInlineShipGate,
-    nextGateSequence,
     nextValidationReservation,
+    reserveInlineValidation,
     gateSnapshot,
     loadShipRuns,
     parseShipReport,
@@ -72,6 +72,7 @@
     createShipRun,
     isDirectShipRun,
     readyShipIssues,
+    registeredShipBranch,
     resolvedWorkerModel,
     shippingWorkerSettled,
     shippingSetupAction,
@@ -87,6 +88,7 @@
     reconcileTaskCheckpoint,
   } from './lib/task-checkpoint.ts';
   import {
+    commitRevisionBoundEvidence,
     evidenceReadiness,
     mergeEvidenceManifests,
     nextTaskEvidenceSequence,
@@ -95,6 +97,7 @@
     requireEvidenceExecutionBoundary,
     requireEvidenceRevision,
     recordTaskEvidence,
+    rollbackTaskEvidenceRecord,
     syncEvidenceManifest,
     taskEvidenceSchema,
     type EvidenceResult,
@@ -2391,11 +2394,17 @@
       .flatMap((run) => run.issues)
       .find((item) => item.path === path && item.threadId === threadId);
     const project = worktreeAt(projectCatalog, path)?.repository ?? path;
+    const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+      repository: project,
+      paths: [path],
+    });
+    const branch = registeredShipBranch(registered, path);
     const directRunId = crypto.randomUUID();
     const adopted = createDirectShipRun(previous, {
       id: directRunId,
       project,
       directory: path,
+      branch,
       repository: issue.repository,
       number: issue.number,
       provider,
@@ -2534,6 +2543,10 @@
 
   const shippingPullRequests = new SvelteMap<string, ShippingPullRequest | null>();
   const shippingPullRequestGenerations = new Map<string, number>();
+  const inlineValidationReservations = new Map<
+    string,
+    { sequence: number; evidenceSequence: number }
+  >();
 
   async function refreshShippingPullRequest(
     run: ShipRun,
@@ -2545,16 +2558,23 @@
     const refreshKey = `${run.id}:${issue.id}`;
     const isLatestRefresh = beginLatestRefresh(shippingPullRequestGenerations, refreshKey);
     try {
-      const targetRepository = issue.shippingTarget?.repository ?? run.remote;
+      const shippingTarget = worktreePath
+        ? await shippingTargetFor(run, issue, worktreePath)
+        : issue.shippingTarget;
+      if (!shippingTarget)
+        throw new Error('Shipping target is unavailable for pull request lookup.');
+      const targetRepository = shippingTarget.repository;
       if (targetRepository.toLowerCase() !== run.remote.toLowerCase())
         throw new Error('Stored shipping target does not match the approved issue repository.');
       const pr = await invoke<ShippingPullRequest | null>('shipping_pull_request', {
         repository: run.repository,
         branch: issue.branch,
         targetRepository,
+        baseBranch: shippingTarget.baseBranch,
       });
       if (!isLatestRefresh()) return;
       if (pr) shippingPullRequests.set(refreshKey, pr);
+      else shippingPullRequests.delete(refreshKey);
       const cleanCommit =
         revision && worktreePath
           ? await invoke<string | null>('working_tree_commit', { path: worktreePath })
@@ -2689,6 +2709,14 @@
     issue: ShipIssue,
     path: string,
   ): Promise<ShippingTarget> {
+    if (!issue.branch) {
+      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+        repository: run.repository,
+        paths: [path],
+      });
+      const branch = registeredShipBranch(registered, path);
+      await updateShipIssue(run, issue, { branch });
+    }
     if (issue.shippingTarget) {
       if (issue.shippingTarget.repository.toLowerCase() !== run.remote.toLowerCase())
         throw new Error('Stored shipping target does not match the approved issue repository.');
@@ -3963,22 +3991,62 @@
         outputReference: request.arguments.outputReference,
         criteria: request.arguments.criteria,
       });
-      const evidenceManifests = recordTaskEvidence(
-        owner.issue.evidenceManifests ?? [],
-        execution.revision,
-        owner.issue.checkpoint.acceptanceCriteria,
-        evidence,
-        execution.baseRevision,
-      );
-      await updateShipIssue(owner.run, owner.issue, {
-        evidenceRevision: execution.revision,
-        evidenceManifests,
+      const readBoundary = () =>
+        readStableEvidenceBoundary(
+          () => invoke<string>('working_tree_revision', { path: request.directory }),
+          () => invoke<string>('working_tree_generation', { path: request.directory }),
+          () =>
+            invoke<string>('shipping_base_revision', {
+              path: request.directory,
+              baseRef: shippingTarget.baseRef,
+            }),
+        );
+      await commitRevisionBoundEvidence({
+        expected: execution,
+        readBoundary,
+        commit: async (registerRollback) => {
+          const checkpoint = owner.issue.checkpoint;
+          if (!checkpoint || checkpoint.revision !== execution.revision)
+            throw new Error(
+              'Bind the task checkpoint to the current revision before recording evidence.',
+            );
+          const previous = structuredClone({
+            evidenceRevision: owner.issue.evidenceRevision,
+            evidenceManifests: owner.issue.evidenceManifests,
+          });
+          let committed = previous;
+          registerRollback(async () => {
+            Object.assign(
+              owner.issue,
+              rollbackTaskEvidenceRecord(owner.issue, previous, committed, evidence.id),
+            );
+            await saveShipRuns();
+          });
+          const evidenceManifests = recordTaskEvidence(
+            owner.issue.evidenceManifests ?? [],
+            execution.revision,
+            checkpoint.acceptanceCriteria,
+            evidence,
+            execution.baseRevision,
+          );
+          await updateShipIssue(
+            owner.run,
+            owner.issue,
+            { evidenceRevision: execution.revision, evidenceManifests },
+            false,
+          );
+          committed = structuredClone({
+            evidenceRevision: owner.issue.evidenceRevision,
+            evidenceManifests: owner.issue.evidenceManifests,
+          });
+          await saveShipRuns();
+        },
       });
       return {
         status: 'recorded',
         evidence,
         readiness: evidenceReadiness(
-          evidenceManifests,
+          owner.issue.evidenceManifests ?? [],
           execution.revision,
           owner.issue.checkpoint.requiredGates,
           owner.issue.checkpoint.acceptanceCriteria,
@@ -4336,6 +4404,12 @@
         const owner = shipOwner(shipRuns, request.directory, sourceId);
         if (!owner)
           throw new Error('Only the assigned Ship worker can report inline gate verdicts.');
+        const { sequence, evidenceSequence } = reserveInlineValidation(
+          inlineValidationReservations,
+          `${owner.run.id}:${owner.issue.id}`,
+          owner.issue.gates ?? [],
+          owner.issue.evidenceManifests ?? [],
+        );
         const policy = owner.issue.validationPolicy;
         const shippingTarget = await shippingTargetFor(owner.run, owner.issue, request.directory);
         const [revision, baseRevision] = await Promise.all([
@@ -4349,7 +4423,6 @@
         validateGateVerdict(report.gate, report.verdict);
         const now = Date.now();
         const model = resolvedWorkerModel(owner.issue) ?? null;
-        const sequence = nextGateSequence(owner.issue.gates ?? []);
         const gateId = `inline:${sourceId}:${report.gate}:${crypto.randomUUID()}`;
         await commitRevisionBoundValidation({
           expectedRevision: policy?.revision,
@@ -4378,7 +4451,7 @@
               {
                 id: `gate:${gateId}`,
                 timestamp: now,
-                sequence: nextTaskEvidenceSequence(owner.issue.evidenceManifests ?? [], sequence),
+                sequence: evidenceSequence,
               },
             );
             requireEvidenceBaseRevision(
@@ -4397,7 +4470,8 @@
               );
               await saveShipRuns();
             });
-            const { evidenceSequence, ...issueEvidenceChanges } = evidenceChanges;
+            const { evidenceSequence: recordedEvidenceSequence, ...issueEvidenceChanges } =
+              evidenceChanges;
             await updateShipIssue(
               owner.run,
               owner.issue,
@@ -4425,7 +4499,7 @@
                       revision,
                       mutationGeneration: policy?.mutationGeneration,
                       baseRevision,
-                      evidenceSequence,
+                      evidenceSequence: recordedEvidenceSequence,
                     },
                     now,
                   ),

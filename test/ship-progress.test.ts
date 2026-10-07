@@ -8,6 +8,7 @@ import {
   completedInlineShipGate,
   dependencyUrl,
   nextValidationReservation,
+  reserveInlineValidation,
   shipGatesSettled,
   shipCleanupRequest,
   shipEvidenceReadiness,
@@ -39,7 +40,7 @@ import {
   saveBoundedReceipt,
   type SpawnReceipt,
 } from '../src/lib/agent-results.ts';
-import { recordTaskEvidence } from '../src/lib/task-evidence.ts';
+import { evidenceReadiness, recordTaskEvidence } from '../src/lib/task-evidence.ts';
 
 void test('reopened queued issues recover across restart without retrying worker failures', () => {
   const run = fixture();
@@ -559,6 +560,51 @@ void test('sequential reservations remain unique before validation launch awaits
 
   assert.deepEqual(first, { sequence: 0, evidenceSequence: 1 });
   assert.deepEqual(second, { sequence: 1, evidenceSequence: 2 });
+});
+
+void test('concurrent inline FAIL then PASS keeps PASS latest at the same millisecond', () => {
+  const reservations = new Map<string, { sequence: number; evidenceSequence: number }>();
+  const first = reserveInlineValidation(reservations, 'run:issue', [], []);
+  const second = reserveInlineValidation(reservations, 'run:issue', [], []);
+  assert.deepEqual(first, { sequence: 0, evidenceSequence: 1 });
+  assert.deepEqual(second, { sequence: 1, evidenceSequence: 2 });
+
+  const criterion = 'The result is verified.';
+  const attempt = (id: string, result: 'passed' | 'failed', sequence: number) => ({
+    id,
+    kind: 'gate' as const,
+    name: 'test-adversary',
+    provider: 'codex',
+    model: 'test',
+    result,
+    timestamp: 100,
+    sequence,
+    outputReference: `thread:${id}`,
+    criteria: [criterion],
+  });
+  let manifests = recordTaskEvidence(
+    [],
+    'revision',
+    [criterion],
+    attempt('pass', 'passed', second.evidenceSequence),
+    'base',
+  );
+  manifests = recordTaskEvidence(
+    manifests,
+    'revision',
+    [criterion],
+    attempt('fail', 'failed', first.evidenceSequence),
+    'base',
+  );
+  const readiness = evidenceReadiness(
+    manifests,
+    'revision',
+    ['test-adversary'],
+    [criterion],
+    'base',
+  );
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.failedGates, []);
 });
 
 void test('validation rollback preserves concurrently recorded command and CI evidence', () => {

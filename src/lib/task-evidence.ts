@@ -225,6 +225,102 @@ export async function readStableEvidenceBoundary(
   return readAttempt(Math.max(1, maxAttempts));
 }
 
+export async function commitRevisionBoundEvidence({
+  expected,
+  readBoundary,
+  commit,
+}: {
+  expected: EvidenceExecutionBoundary;
+  readBoundary: () => Promise<EvidenceExecutionBoundary>;
+  commit: (registerRollback: (rollback: () => Promise<void>) => void) => Promise<void>;
+}): Promise<void> {
+  const verify = async () => requireEvidenceExecutionBoundary(expected, await readBoundary());
+  await verify();
+  let rollback: (() => Promise<void>) | undefined;
+  try {
+    await commit((candidate) => (rollback = candidate));
+    await verify();
+  } catch (cause) {
+    try {
+      await rollback?.();
+    } catch (rollbackCause) {
+      throw new Error(`Evidence commit failed (${String(cause)}) and rollback failed.`, {
+        cause: rollbackCause,
+      });
+    }
+    throw cause;
+  }
+}
+
+function canonicalEvidenceValue(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, item: unknown) =>
+    item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.entries(item).toSorted(([left], [right]) => left.localeCompare(right)),
+        )
+      : item,
+  );
+}
+
+function sameEvidenceValue(left: unknown, right: unknown): boolean {
+  return canonicalEvidenceValue(left) === canonicalEvidenceValue(right);
+}
+
+export function rollbackTaskEvidenceRecord(
+  current: { evidenceRevision?: string; evidenceManifests?: EvidenceManifest[] },
+  previous: { evidenceRevision?: string; evidenceManifests?: EvidenceManifest[] },
+  committed: { evidenceRevision?: string; evidenceManifests?: EvidenceManifest[] },
+  evidenceId: string,
+): { evidenceRevision?: string; evidenceManifests: EvidenceManifest[] } {
+  const previousByIdentity = new Map(
+    (previous.evidenceManifests ?? []).map((manifest) => [
+      manifestIdentity(manifest.revision, manifest.baseRevision),
+      manifest,
+    ]),
+  );
+  const committedByIdentity = new Map(
+    (committed.evidenceManifests ?? []).map((manifest) => [
+      manifestIdentity(manifest.revision, manifest.baseRevision),
+      manifest,
+    ]),
+  );
+  const evidenceManifests = (current.evidenceManifests ?? []).flatMap((manifest) => {
+    const key = manifestIdentity(manifest.revision, manifest.baseRevision);
+    const prior = previousByIdentity.get(key);
+    const saved = committedByIdentity.get(key);
+    if (!saved) return [manifest];
+    const savedEntry = saved.evidence.find((entry) => entry.id === evidenceId);
+    const evidence = savedEntry
+      ? manifest.evidence.filter(
+          (entry) => entry.id !== evidenceId || !sameEvidenceValue(entry, savedEntry),
+        )
+      : manifest.evidence;
+    const evicted = (prior?.evidence ?? []).filter(
+      (entry) =>
+        !saved.evidence.some((candidate) => candidate.id === entry.id) &&
+        !evidence.some((candidate) => candidate.id === entry.id),
+    );
+    const withoutRecord = { ...manifest, evidence: boundEvidence([...evidence, ...evicted]) };
+    if (
+      prior &&
+      sameEvidenceValue(withoutRecord.evidence, prior.evidence) &&
+      sameEvidenceValue({ ...manifest, evidence: saved.evidence }, saved)
+    )
+      return [prior];
+    if (!prior && !evidence.length && sameEvidenceValue(withoutRecord, { ...saved, evidence: [] }))
+      return [];
+    return [withoutRecord];
+  });
+  return {
+    evidenceManifests,
+    evidenceRevision:
+      current.evidenceRevision === committed.evidenceRevision &&
+      sameEvidenceValue(evidenceManifests, previous.evidenceManifests ?? [])
+        ? previous.evidenceRevision
+        : current.evidenceRevision,
+  };
+}
+
 export function requireEvidenceBaseRevision(recorded: string, current: string | undefined): void {
   if (current !== undefined && recorded !== current)
     throw new Error('Newer revision evidence was recorded concurrently. Rerun the gate.');

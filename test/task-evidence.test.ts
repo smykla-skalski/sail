@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  commitRevisionBoundEvidence,
   evidenceReadiness,
   evidenceManifestsSchema,
   mergeEvidenceManifests,
@@ -10,6 +11,7 @@ import {
   requireEvidenceExecutionBoundary,
   requireEvidenceRevision,
   recordTaskEvidence,
+  rollbackTaskEvidenceRecord,
   syncEvidenceManifest,
   type EvidenceManifest,
   type TaskEvidence,
@@ -438,6 +440,93 @@ void test('captures a stable command execution boundary after a concurrent chang
     mutationGeneration: 'generation-b',
     baseRevision: 'base-b',
   });
+});
+
+for (const drift of ['revision', 'mutationGeneration', 'baseRevision'] as const) {
+  void test(`rolls back only its evidence after durable ${drift} drift`, async () => {
+    const expected = {
+      revision: 'revision-a',
+      mutationGeneration: 'generation-a',
+      baseRevision: 'base-a',
+    };
+    let boundary = { ...expected };
+    const state: { evidenceRevision?: string; evidenceManifests?: EvidenceManifest[] } = {
+      evidenceRevision: 'revision-a',
+      evidenceManifests: [],
+    };
+    let reachSave!: () => void;
+    let finishSave!: () => void;
+    const saving = new Promise<void>((resolve) => (reachSave = resolve));
+    const saved = new Promise<void>((resolve) => (finishSave = resolve));
+    const operation = commitRevisionBoundEvidence({
+      expected,
+      readBoundary: async () => ({ ...boundary }),
+      commit: async (registerRollback) => {
+        const previous = structuredClone(state);
+        state.evidenceManifests = recordTaskEvidence(
+          state.evidenceManifests ?? [],
+          expected.revision,
+          criteria,
+          evidence({ id: 'own', kind: 'command', name: 'npm test', criteria: [] }),
+          expected.baseRevision,
+        );
+        const committed = structuredClone(state);
+        registerRollback(async () => {
+          Object.assign(state, rollbackTaskEvidenceRecord(state, previous, committed, 'own'));
+        });
+        reachSave();
+        await saved;
+      },
+    });
+    await saving;
+    state.evidenceManifests = recordTaskEvidence(
+      state.evidenceManifests ?? [],
+      expected.revision,
+      criteria,
+      evidence({ id: 'concurrent', kind: 'command', name: 'cargo test', criteria: [] }),
+      expected.baseRevision,
+    );
+    boundary = { ...expected, [drift]: `${drift}-changed` };
+    finishSave();
+    await assert.rejects(operation, /Rerun the evidence/);
+    assert.deepEqual(
+      state.evidenceManifests?.[0].evidence.map((entry) => entry.id),
+      ['concurrent'],
+    );
+    assert.equal(state.evidenceRevision, 'revision-a');
+  });
+}
+
+void test('rollback restores evidence evicted by a full manifest', () => {
+  let manifests: EvidenceManifest[] = [];
+  for (let index = 0; index < 100; index += 1)
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision-a',
+      criteria,
+      evidence({
+        id: `prior-${index}`,
+        kind: 'command',
+        name: `command-${index}`,
+        timestamp: index + 1,
+      }),
+      'base-a',
+    );
+  const previous = { evidenceRevision: 'revision-a', evidenceManifests: manifests };
+  const committed = {
+    evidenceRevision: 'revision-a',
+    evidenceManifests: recordTaskEvidence(
+      manifests,
+      'revision-a',
+      criteria,
+      evidence({ id: 'own', kind: 'command', name: 'new command', timestamp: 101 }),
+      'base-a',
+    ),
+  };
+
+  const rolledBack = rollbackTaskEvidenceRecord(committed, previous, committed, 'own');
+
+  assert.deepEqual(rolledBack.evidenceManifests, manifests);
 });
 
 void test('rejects a late evidence snapshot after a newer revision was stored', () => {

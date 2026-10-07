@@ -40,11 +40,18 @@ pub async fn shipping_pull_request(
     repository: String,
     branch: String,
     target_repository: Option<String>,
+    base_branch: String,
 ) -> Result<Option<ShippingPullRequest>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let repository = crate::validate_repository(repository)?;
         if branch.is_empty() || branch.starts_with('-') || branch.contains(char::is_whitespace) {
             return Err("Invalid shipping branch.".to_string());
+        }
+        if base_branch.is_empty()
+            || base_branch.starts_with('-')
+            || base_branch.contains(char::is_whitespace)
+        {
+            return Err("Invalid shipping base branch.".to_string());
         }
         let worktree = Path::new(&repository);
         let target = target_repository
@@ -76,20 +83,30 @@ pub async fn shipping_pull_request(
                 "--json",
                 "number,url,state,mergedAt,headRefOid,statusCheckRollup",
                 "--limit",
-                "2",
+                "100",
             ],
         )?;
         let values: Vec<serde_json::Value> =
             serde_json::from_str(&output).map_err(|error| error.to_string())?;
-        let mut prs = values
-            .iter()
-            .map(|value| {
-                let mut pr: ShippingPullRequest =
-                    serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
-                pr.checks = parse_pull_request_checks(value)?.checks;
-                Ok(pr)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let mut prs = Vec::new();
+        for value in &values {
+            let number = value["number"]
+                .as_u64()
+                .ok_or("GitHub returned a pull request without a number.")?;
+            let details = gh_command(
+                worktree,
+                &["api", &format!("repos/{target}/pulls/{number}")],
+            )?;
+            let details: serde_json::Value = serde_json::from_str(&details)
+                .map_err(|_| "GitHub returned invalid pull request details.".to_string())?;
+            if !shipping_pull_request_matches(&details, &source, &target, &branch, &base_branch) {
+                continue;
+            }
+            let mut pr: ShippingPullRequest =
+                serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+            pr.checks = parse_pull_request_checks(value)?.checks;
+            prs.push(pr);
+        }
         if prs.len() > 1 {
             return Err("Multiple pull requests use this shipping branch.".to_string());
         }
@@ -97,6 +114,23 @@ pub async fn shipping_pull_request(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn shipping_pull_request_matches(
+    value: &serde_json::Value,
+    source: &str,
+    target: &str,
+    branch: &str,
+    base_branch: &str,
+) -> bool {
+    value["head"]["ref"].as_str() == Some(branch)
+        && value["head"]["repo"]["full_name"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(source))
+        && value["base"]["ref"].as_str() == Some(base_branch)
+        && value["base"]["repo"]["full_name"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(target))
 }
 
 #[tauri::command]
@@ -1770,8 +1804,8 @@ fn open_url(url: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_worktree, marked_issue, marker, pull_request_head, validate_external_url,
-        validate_graph, IssueDraft, IssueGraphDraft,
+        checked_worktree, marked_issue, marker, pull_request_head, shipping_pull_request_matches,
+        validate_external_url, validate_graph, IssueDraft, IssueGraphDraft,
     };
     use std::{fs, process::Command};
 
@@ -1785,6 +1819,40 @@ mod tests {
             pull_request_head("upstream/repo", "UPSTREAM/repo", "feature"),
             "feature"
         );
+    }
+
+    #[test]
+    fn shipping_pull_request_rejects_wrong_base_or_repository() {
+        let matching = serde_json::json!({
+            "head": { "ref": "fix/issue", "repo": { "full_name": "fork/repo" } },
+            "base": { "ref": "main", "repo": { "full_name": "upstream/repo" } }
+        });
+        assert!(shipping_pull_request_matches(
+            &matching,
+            "fork/repo",
+            "upstream/repo",
+            "fix/issue",
+            "main"
+        ));
+        let mut wrong_base = matching.clone();
+        wrong_base["base"]["ref"] = serde_json::json!("release");
+        assert!(!shipping_pull_request_matches(
+            &wrong_base,
+            "fork/repo",
+            "upstream/repo",
+            "fix/issue",
+            "main"
+        ));
+        assert!(!shipping_pull_request_matches(
+            &serde_json::json!({
+                "head": { "ref": "fix/issue", "repo": { "full_name": "fork/repo" } },
+                "base": { "ref": "main", "repo": { "full_name": "other/repo" } }
+            }),
+            "fork/repo",
+            "upstream/repo",
+            "fix/issue",
+            "main"
+        ));
     }
 
     #[test]
