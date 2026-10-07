@@ -126,7 +126,7 @@ await test('one child reported natively and by an MCP receipt yields one run', (
 
   assert.equal(runs.length, 1);
   assert.deepEqual(runs[0].sources, ['native', 'mcp']);
-  assert.equal(runs[0].receiptId, 'native:claude:task-1');
+  assert.equal(runs[0].receiptId, 'mcp-1');
 });
 
 await test('the higher-precedence source sets the state and others fill missing fields', () => {
@@ -193,6 +193,26 @@ await test('the higher-precedence source sets the state and others fill missing 
       },
       expected: { source: 'mcp', state: 'working', error: null, result: null },
     },
+    {
+      name: 'an older receipt in the same state lends no outcome',
+      sources: {
+        receipts: [
+          receipt({ receiptId: 'old', state: 'completed', result: 'old', updated: 10 }),
+          receipt({ receiptId: 'new', state: 'completed', updated: 20 }),
+        ],
+      },
+      expected: { receiptId: 'new', state: 'completed', result: null },
+    },
+    {
+      name: 'an older terminal receipt does not settle a newer unavailable one',
+      sources: {
+        receipts: [
+          receipt({ receiptId: 'old', state: 'completed', result: 'old', updated: 10 }),
+          receipt({ receiptId: 'new', state: 'unavailable', updated: 20 }),
+        ],
+      },
+      expected: { receiptId: 'new', state: 'unavailable', result: null },
+    },
   ];
   for (const { name, sources, expected } of cases) {
     const runs = subagentRuns(sources);
@@ -253,6 +273,7 @@ await test('native receipts in the receipt list do not add a second run', () => 
 
   assert.equal(runs.length, 1);
   assert.deepEqual(runs[0].sources, ['native']);
+  assert.equal(runs[0].receiptId, null);
 });
 
 await test('receipts for the same child thread keep the latest one', () => {
@@ -327,5 +348,5 @@ await test('OpenCode children are keyed by session id with live state', () => {
   assert.equal(runs[0].parentId, 'opencode:ses-parent');
   assert.equal(runs[0].name, 'general');
   assert.equal(runs[0].task, 'Search the docs');
-  assert.equal(runs[0].model, 'provider-a/model-a');
+  assert.equal(runs[0].model, 'provider-a:model-a');
 });

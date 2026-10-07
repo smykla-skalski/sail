@@ -51,6 +51,7 @@ export type SubagentRun = {
   error: string | null;
   created: number | null;
   updated: number;
+  /** Id of the stored `SpawnReceipt` for this child; native children have none. */
   receiptId: string | null;
   usage: SubagentUsage | null;
   controls: SubagentControls;
@@ -109,7 +110,7 @@ function nativeRuns(store: NativeSubagentStore): SubagentRun[] {
       error: child.error ?? null,
       created: child.created,
       updated: child.updated,
-      receiptId: `native:${child.agent}:${child.sessionId}`,
+      receiptId: null,
       usage: null,
       controls: nativeControls,
     };
@@ -174,7 +175,7 @@ function openCodeRuns(groups: readonly OpenCodeChildSessions[]): SubagentRun[] {
       parentDirectory: directory,
       name: child.agent ?? null,
       task: child.title ?? null,
-      model: child.model ? `${child.model.providerID}/${child.model.id}` : null,
+      model: child.model ? `${child.model.providerID}:${child.model.id}` : null,
       state: openCodeState(child, active),
       activity: null,
       result: null,
@@ -281,21 +282,20 @@ function fill(
   }
 }
 
-/** A known terminal state replaces a state the winner could not confirm, such as a disconnected
- * native child. A live state from a lower source can be stale, so it never does. */
-function stateSource(candidates: SubagentRun[]): SubagentRun {
-  const [winner] = candidates;
-  if (winner.state !== 'unavailable') return winner;
-  return (
-    candidates.find((candidate) =>
-      ['completed', 'failed', 'interrupted'].includes(candidate.state),
-    ) ?? winner
-  );
-}
-
+/** Merges candidates sorted by precedence, newest first within a source. Only lower sources
+ * lend outcome text, because an older record from the winner's own source describes an earlier
+ * turn. A known terminal state from a lower source replaces a state the winner could not
+ * confirm, such as a disconnected native child; a live state from a lower source can be stale,
+ * so it never does. */
 function merge(candidates: SubagentRun[]): SubagentRun {
   const [winner] = candidates;
-  const outcome = stateSource(candidates);
+  const lower = candidates.filter((candidate) => candidate.source !== winner.source);
+  const outcome =
+    winner.state === 'unavailable'
+      ? (lower.find((candidate) =>
+          ['completed', 'failed', 'interrupted'].includes(candidate.state),
+        ) ?? winner)
+      : winner;
   const run: SubagentRun = {
     ...winner,
     sources: [...new Set(candidates.map((candidate) => candidate.source))],
@@ -309,7 +309,7 @@ function merge(candidates: SubagentRun[]): SubagentRun {
   fill(
     run,
     outcomeFields,
-    candidates.filter((candidate) => candidate.state === run.state),
+    lower.filter((candidate) => candidate.state === run.state),
   );
   return run;
 }
