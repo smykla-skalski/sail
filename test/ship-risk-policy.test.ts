@@ -175,6 +175,7 @@ void test('validation inputs retry until paths and config share one stable revis
 
   assert.deepEqual(result, {
     revision: 'revision-b',
+    mutationGeneration: 'generation-b',
     changedPaths: ['current.ts'],
     config: { source: 'current' },
   });
@@ -216,10 +217,52 @@ void test('validation inputs retry when the shipping base moves', async () => {
   assert.deepEqual(observedBases, ['base-a', 'base-b']);
   assert.deepEqual(result, {
     revision: 'revision-a',
+    mutationGeneration: 'generation-a',
     baseRevision: 'base-b',
     changedPaths: ['changed-from-base-b.ts'],
     config: { source: 'repository' },
   });
+});
+
+void test('base rebinding retains risk history and gate floor while invalidating old gates', () => {
+  const previous = selectShipValidationPolicy(
+    config,
+    ['src-tauri/src/lib.rs'],
+    'high',
+    'revision-a',
+    undefined,
+    10,
+    'base-a',
+    'generation-a',
+  );
+  const rebound = selectShipValidationPolicy(
+    { ...config, high: ['code-adversary', 'test-adversary'] },
+    [],
+    'low',
+    'revision-a',
+    previous,
+    20,
+    'base-b',
+    'generation-a',
+  );
+  const oldPass = { ...gate('test-adversary', 'PASS'), baseRevision: 'base-a' };
+
+  assert.equal(rebound.risk, 'high');
+  assert.deepEqual(rebound.requiredGates, previous.requiredGates);
+  assert.equal(rebound.history.length, previous.history.length + 1);
+  assert.equal(requiredShipGatesSatisfied(rebound, [oldPass]), false);
+  assert.equal(
+    requiredShipGatesSatisfied(rebound, [{ ...oldPass, baseRevision: 'base-b' }]),
+    false,
+  );
+  assert.equal(
+    requiredShipGatesSatisfied(rebound, [
+      { ...gate('code-adversary', 'CLEAN'), baseRevision: 'base-b' },
+      { ...gate('findings-adversary', 'CLEAN'), baseRevision: 'base-b' },
+      { ...oldPass, baseRevision: 'base-b' },
+    ]),
+    true,
+  );
 });
 
 void test('validation selection fails when the worktree never stabilizes', async () => {

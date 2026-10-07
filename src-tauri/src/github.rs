@@ -39,6 +39,7 @@ pub async fn shipping_target_repository(repository: String) -> Result<String, St
 pub async fn shipping_pull_request(
     repository: String,
     branch: String,
+    target_repository: Option<String>,
 ) -> Result<Option<ShippingPullRequest>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let repository = crate::validate_repository(repository)?;
@@ -46,7 +47,21 @@ pub async fn shipping_pull_request(
             return Err("Invalid shipping branch.".to_string());
         }
         let worktree = Path::new(&repository);
-        let target = target_repository(worktree)?;
+        let target = target_repository
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("Shipping target repository is missing. Refresh the shipping worktree.")?;
+        if target.starts_with('-')
+            || target.split('/').count() != 2
+            || target.split('/').any(str::is_empty)
+            || !target
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_/.".contains(character))
+        {
+            return Err("Invalid shipping target repository.".to_string());
+        }
+        let remote = branch_remote(worktree, &branch)?;
+        let source = source_repository(worktree, &remote)?;
+        let head = pull_request_head(&source, &target, &branch);
         let output = gh_command(
             worktree,
             &[
@@ -55,7 +70,7 @@ pub async fn shipping_pull_request(
                 "--repo",
                 &target,
                 "--head",
-                &branch,
+                &head,
                 "--state",
                 "all",
                 "--json",
@@ -1271,12 +1286,16 @@ fn pull_request_repos(
 ) -> Result<(String, String), String> {
     let source = source_repository(worktree, remote)?;
     let target = target_repository(worktree)?;
-    let head = if source.eq_ignore_ascii_case(&target) {
+    let head = pull_request_head(&source, &target, branch);
+    Ok((target, head))
+}
+
+fn pull_request_head(source: &str, target: &str, branch: &str) -> String {
+    if source.eq_ignore_ascii_case(target) {
         branch.to_string()
     } else {
         format!("{}:{branch}", source.split('/').next().unwrap_or_default())
-    };
-    Ok((target, head))
+    }
 }
 
 fn source_repository(worktree: &Path, remote: &str) -> Result<String, String> {
@@ -1751,10 +1770,22 @@ fn open_url(url: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_worktree, marked_issue, marker, validate_external_url, validate_graph, IssueDraft,
-        IssueGraphDraft,
+        checked_worktree, marked_issue, marker, pull_request_head, validate_external_url,
+        validate_graph, IssueDraft, IssueGraphDraft,
     };
     use std::{fs, process::Command};
+
+    #[test]
+    fn pull_request_head_qualifies_fork_branches() {
+        assert_eq!(
+            pull_request_head("fork-owner/repo", "upstream/repo", "feature"),
+            "fork-owner:feature"
+        );
+        assert_eq!(
+            pull_request_head("upstream/repo", "UPSTREAM/repo", "feature"),
+            "feature"
+        );
+    }
 
     #[test]
     fn check_probe_accepts_repository_root_only_when_requested() {

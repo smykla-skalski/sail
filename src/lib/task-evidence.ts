@@ -201,28 +201,47 @@ export function recordTaskEvidence(
         manifest.evidence.map((candidate) => candidate.sequence ?? 0),
       ),
     ) + 1;
-  const entry = { ...parsedEntry, sequence: nextSequence };
+  const entry = {
+    ...parsedEntry,
+    sequence: parsedEntry.sequence ?? nextSequence,
+  };
   const unknown = entry.criteria.filter((criterion) => !acceptanceCriteria.includes(criterion));
   if (unknown.length)
     throw new Error(`Evidence references unknown acceptance criteria: ${unknown.join(', ')}`);
   const synced = syncEvidenceManifest(manifests, revision, acceptanceCriteria, entry.timestamp);
   const index = synced.findIndex((manifest) => manifest.revision === revision);
   const manifest = synced[index];
-  const previous = manifest.evidence.findLast(
+  const previousIndex = manifest.evidence.findIndex((candidate) => candidate.id === entry.id);
+  const previous = manifest.evidence[previousIndex];
+  const equivalent = (candidate: TaskEvidence) =>
+    candidate.provider === entry.provider &&
+    candidate.model === entry.model &&
+    candidate.result === entry.result &&
+    candidate.outputReference === entry.outputReference &&
+    JSON.stringify(candidate.criteria) === JSON.stringify(entry.criteria);
+  if (
+    previous &&
+    equivalent(previous) &&
+    (parsedEntry.sequence === undefined || previous.sequence === entry.sequence)
+  )
+    return synced;
+  const previousAttempt = manifest.evidence.findLast(
     (candidate) => candidate.kind === entry.kind && candidate.name === entry.name,
   );
   if (
-    previous &&
-    previous.provider === entry.provider &&
-    previous.model === entry.model &&
-    previous.result === entry.result &&
-    previous.outputReference === entry.outputReference &&
-    JSON.stringify(previous.criteria) === JSON.stringify(entry.criteria)
+    !previous &&
+    parsedEntry.sequence === undefined &&
+    previousAttempt &&
+    equivalent(previousAttempt)
   )
     return synced;
+  const nextEvidence =
+    previousIndex < 0
+      ? [...manifest.evidence, entry]
+      : manifest.evidence.with(previousIndex, entry);
   return synced.with(index, {
     ...manifest,
-    evidence: [...manifest.evidence, entry].slice(-evidenceLimit),
+    evidence: nextEvidence.toSorted(compareEvidence).slice(-evidenceLimit),
     updatedAt: Math.max(manifest.createdAt, manifest.updatedAt, entry.timestamp),
   });
 }

@@ -47,7 +47,16 @@ export interface ShipIssue {
   evidenceCommit?: string;
   validationPolicyRequired?: boolean;
   validationPolicy?: ShipValidationPolicy;
+  shippingTarget?: ShippingTarget;
 }
+
+export type ShippingTarget = {
+  repository: string;
+  remote: string;
+  baseBranch: string;
+  baseRef: string;
+  baseRevision: string;
+};
 
 export interface ShipRun {
   id: string;

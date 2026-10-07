@@ -355,6 +355,76 @@ void test('durable gate receipts recover manifest evidence after restart', () =>
   assert.equal(recoverValidationEvidence(issue), null);
 });
 
+void test('receipt recovery preserves attempt order when an older receipt is missing', () => {
+  const issue = fixture().issues[0];
+  issue.checkpoint!.revision = 'revision-one';
+  issue.checkpoint!.requiredGates = ['test-adversary'];
+  issue.validationPolicy = {
+    risk: 'low',
+    requiredGates: ['test-adversary'],
+    sources: ['test'],
+    revision: 'revision-one',
+    changedPaths: [],
+    selectedAt: 1,
+    history: [],
+  };
+  const gateAttempt = (id: string, sequence: number, verdict: 'PASS' | 'FAIL') => ({
+    id,
+    gate: 'test-adversary' as const,
+    requestedModel: 'test',
+    provider: 'codex',
+    model: 'test',
+    threadId: id,
+    directory: '/worktree',
+    state: 'completed' as const,
+    created: 10 + sequence,
+    updated: 10 + sequence,
+    error: null,
+    verdict,
+    revision: 'revision-one',
+    sequence,
+    evidenceCriteria: issue.checkpoint!.acceptanceCriteria,
+    evidenceOutputReference: `thread:${id}`,
+    evidenceTimestamp: 10 + sequence,
+  });
+  issue.gates = [gateAttempt('older', 1, 'FAIL'), gateAttempt('newer', 2, 'PASS')];
+  Object.assign(issue, recoverValidationEvidence(issue));
+  issue.evidenceManifests![0].evidence = issue.evidenceManifests![0].evidence.filter(
+    (entry) => entry.id !== 'gate:older',
+  );
+
+  Object.assign(issue, recoverValidationEvidence(issue));
+
+  assert.equal(shipEvidenceReadiness(issue).ready, true);
+  assert.deepEqual(
+    issue.evidenceManifests![0].evidence.map((entry) => [entry.id, entry.sequence]),
+    [
+      ['gate:older', 2],
+      ['gate:newer', 3],
+    ],
+  );
+  assert.equal(recoverValidationEvidence(issue), null);
+});
+
+void test('validation generation fence detects edit restore ABA', async () => {
+  const generations = ['clean', 'clean', 'edited-and-restored'];
+  let committed = false;
+  await assert.rejects(
+    commitRevisionBoundValidation({
+      expectedRevision: 'revision-one',
+      expectedMutationGeneration: generations.shift(),
+      readRevision: async () => 'revision-one',
+      readMutationGeneration: async () => generations.shift()!,
+      prepare: async () => 'PASS',
+      commit: async () => {
+        committed = true;
+      },
+    }),
+    /worktree was modified during validation/,
+  );
+  assert.equal(committed, false);
+});
+
 void test('persists canonical task checkpoints with Ship runs', () => {
   const run = fixture();
   run.issues[0].checkpoint!.objective = 'Concrete objective';
@@ -417,6 +487,13 @@ void test('worktree cleanup waits for every authorized checkpoint thread', () =>
 
 void test('persists the selected revision-bound validation policy', () => {
   const run = fixture();
+  run.issues[0].shippingTarget = {
+    repository: 'a/b',
+    remote: 'upstream',
+    baseBranch: 'main',
+    baseRef: 'refs/remotes/upstream/main',
+    baseRevision: 'base-one',
+  };
   run.issues[0].validationPolicy = {
     risk: 'high',
     requiredGates: ['code-adversary', 'findings-adversary', 'test-adversary'],
@@ -437,6 +514,7 @@ void test('persists the selected revision-bound validation policy', () => {
   const restored = loadShipRuns(JSON.stringify([run]));
 
   assert.deepEqual(restored[0].issues[0].validationPolicy, run.issues[0].validationPolicy);
+  assert.deepEqual(restored[0].issues[0].shippingTarget, run.issues[0].shippingTarget);
 });
 
 void test('dependency failure blocks only dependents and merged dependencies become queued', () => {

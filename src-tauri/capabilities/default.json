@@ -21,6 +21,7 @@
     "allow-working-tree-commit",
     "allow-shipping-changed-paths",
     "allow-shipping-base-revision",
+    "allow-shipping-worktree-target",
     "allow-worktree-overviews",
     "allow-record-turn-snapshot",
     "allow-list-turn-snapshots",

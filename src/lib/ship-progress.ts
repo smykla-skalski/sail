@@ -52,6 +52,7 @@ export type GateMetadata = {
   sequence?: number;
   revision?: string;
   mutationGeneration?: string;
+  baseRevision?: string;
   revisionDrifted?: boolean;
   verdict?: GateVerdict;
   reason?: string;
@@ -84,14 +85,23 @@ export function completedInlineShipGate(
 
 export function requiredValidationGatesSatisfied(
   policy:
-    Pick<NonNullable<ShipIssue['validationPolicy']>, 'requiredGates' | 'revision'> | undefined,
+    | Pick<
+        NonNullable<ShipIssue['validationPolicy']>,
+        'requiredGates' | 'revision' | 'baseRevision'
+      >
+    | undefined,
   gates: ShipGate[],
 ): boolean {
   if (!policy) return false;
   return policy.requiredGates.every((name) => {
     const gate = gates
       .map((item, index) => ({ item, index }))
-      .filter(({ item }) => item.gate === name && item.revision === policy.revision)
+      .filter(
+        ({ item }) =>
+          item.gate === name &&
+          item.revision === policy.revision &&
+          (policy.baseRevision === undefined || item.baseRevision === policy.baseRevision),
+      )
       .toSorted(
         (left, right) =>
           (right.item.sequence ?? right.index) - (left.item.sequence ?? left.index) ||
@@ -109,6 +119,7 @@ export const gateMetadataSchema = z.object({
   sequence: z.number().int().nonnegative().optional(),
   revision: z.string().min(1).optional(),
   mutationGeneration: z.string().min(1).optional(),
+  baseRevision: z.string().min(1).optional(),
   revisionDrifted: z.boolean().optional(),
   verdict: z.enum(verdicts).optional(),
   reason: z.string().optional(),
@@ -368,7 +379,13 @@ export function recoverValidationEvidence(
   const revision = checkpoint.revision;
   let manifests = issue.evidenceManifests ?? [];
   let recovered = false;
-  for (const gate of issue.gates ?? []) {
+  const gates = (issue.gates ?? []).toSorted(
+    (left, right) =>
+      (left.sequence ?? Number.MAX_SAFE_INTEGER) - (right.sequence ?? Number.MAX_SAFE_INTEGER) ||
+      left.created - right.created ||
+      left.id.localeCompare(right.id),
+  );
+  for (const gate of gates) {
     if (
       gate.revision !== revision ||
       !gate.verdict ||
@@ -392,6 +409,7 @@ export function recoverValidationEvidence(
       timestamp: gate.evidenceTimestamp,
       outputReference: gate.evidenceOutputReference,
       criteria,
+      ...(gate.sequence === undefined ? {} : { sequence: gate.sequence + 1 }),
     });
     if (JSON.stringify(next) !== JSON.stringify(manifests)) recovered = true;
     manifests = next;
@@ -837,6 +855,7 @@ const shipIssueSchema = z.object({
       requiredGates: z.array(z.enum(gateNames)),
       sources: z.array(z.string().min(1)).min(1),
       revision: z.string().min(1),
+      mutationGeneration: z.string().min(1).optional(),
       baseRevision: z.string().min(1).optional(),
       changedPaths: z.array(z.string()),
       selectedAt: z.number().int().nonnegative(),
@@ -848,6 +867,15 @@ const shipIssueSchema = z.object({
           at: z.number().int().nonnegative(),
         }),
       ),
+    })
+    .optional(),
+  shippingTarget: z
+    .object({
+      repository: z.string().min(1),
+      remote: z.string().min(1),
+      baseBranch: z.string().min(1),
+      baseRef: z.string().min(1),
+      baseRevision: z.string().min(1),
     })
     .optional(),
 });

@@ -16,6 +16,7 @@ fn main() {
             "working_tree_generation",
             "working_tree_commit",
             "shipping_base_revision",
+            "shipping_worktree_target",
             "shipping_changed_paths",
             "worktree_overviews",
             "record_turn_snapshot",

@@ -61,6 +61,7 @@ export type ShipValidationPolicy = {
   requiredGates: GateName[];
   sources: string[];
   revision: string;
+  mutationGeneration?: string;
   baseRevision?: string;
   changedPaths: string[];
   selectedAt: number;
@@ -72,6 +73,7 @@ export const shipValidationPolicySchema = z.object({
   requiredGates: z.array(gateSchema),
   sources: z.array(z.string().min(1)).min(1),
   revision: z.string().min(1),
+  mutationGeneration: z.string().min(1).optional(),
   baseRevision: z.string().min(1).optional(),
   changedPaths: z.array(z.string()),
   selectedAt: z.number().int().nonnegative(),
@@ -132,6 +134,7 @@ export function selectShipValidationPolicy(
   previous: ShipValidationPolicy | undefined,
   now: number,
   baseRevision?: string,
+  mutationGeneration?: string,
 ): ShipValidationPolicy {
   const configured = configValue !== undefined && configValue !== null;
   const config = configured
@@ -169,6 +172,7 @@ export function selectShipValidationPolicy(
     requiredGates,
     sources,
     revision,
+    ...(mutationGeneration ? { mutationGeneration } : {}),
     ...(baseRevision ? { baseRevision } : {}),
     changedPaths: paths.slice(0, 500),
     selectedAt: now,
@@ -190,10 +194,20 @@ export async function readStableShipValidationInputs<T>(
   readConfig: () => Promise<T>,
   maxAttempts = 3,
   readBaseRevision?: () => Promise<string>,
-): Promise<{ revision: string; baseRevision?: string; changedPaths: string[]; config: T }> {
-  async function readAttempt(
-    attemptsRemaining: number,
-  ): Promise<{ revision: string; baseRevision?: string; changedPaths: string[]; config: T }> {
+): Promise<{
+  revision: string;
+  mutationGeneration: string;
+  baseRevision?: string;
+  changedPaths: string[];
+  config: T;
+}> {
+  async function readAttempt(attemptsRemaining: number): Promise<{
+    revision: string;
+    mutationGeneration: string;
+    baseRevision?: string;
+    changedPaths: string[];
+    config: T;
+  }> {
     const mutationGeneration = await readMutationGeneration();
     const revision = await readRevision();
     const baseRevision = await readBaseRevision?.();
@@ -209,7 +223,13 @@ export async function readStableShipValidationInputs<T>(
       currentGeneration === mutationGeneration &&
       currentBaseRevision === baseRevision
     )
-      return { revision, ...(baseRevision ? { baseRevision } : {}), changedPaths, config };
+      return {
+        revision,
+        mutationGeneration,
+        ...(baseRevision ? { baseRevision } : {}),
+        changedPaths,
+        config,
+      };
     if (attemptsRemaining > 1) return readAttempt(attemptsRemaining - 1);
     throw new Error(
       'The worktree kept changing while selecting validation risk. Retry when stable.',

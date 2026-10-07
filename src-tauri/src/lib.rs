@@ -96,11 +96,16 @@ fn existing_shipping_worktree(
     let setup = worktree_config::read(&path)?
         .map(|config| config.setup)
         .unwrap_or_default();
+    let shipping_target = shipping_target(repository, &path, name).ok();
     Ok(Some(CreatedWorktree {
         path: path.to_string_lossy().into_owned(),
         branch: name.to_string(),
-        base: worktree_base(repository),
+        base: shipping_target
+            .as_ref()
+            .map(|target| target.base_ref.clone())
+            .unwrap_or_else(|| worktree_base(repository)),
         setup,
+        shipping_target,
     }))
 }
 
@@ -1052,10 +1057,16 @@ async fn working_tree_commit(path: String) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-async fn shipping_base_revision(path: String) -> Result<String, String> {
+async fn shipping_base_revision(path: String, base_ref: Option<String>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = validate_repository(path)?;
-        let base = worktree_base(Path::new(&root));
+        let base = match base_ref {
+            Some(value) if value.starts_with("refs/") && !value.contains(char::is_whitespace) => {
+                value
+            }
+            Some(_) => return Err("Invalid shipping base reference.".to_string()),
+            None => worktree_base(Path::new(&root)),
+        };
         git_reference(
             Path::new(&root),
             &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
@@ -1510,6 +1521,68 @@ struct CreatedWorktree {
     branch: String,
     base: String,
     setup: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shipping_target: Option<ShippingTarget>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShippingTarget {
+    repository: String,
+    remote: String,
+    base_branch: String,
+    base_ref: String,
+    base_revision: String,
+}
+
+fn shipping_target(
+    repository: &Path,
+    worktree: &Path,
+    branch: &str,
+) -> Result<ShippingTarget, String> {
+    let target = github::target_repository(repository)?;
+    let (remote, configured_remote) = shipping_fetch_source(repository, &target)?;
+    let base_branch = shipping_default_branch(repository, &remote)?;
+    let base_ref = if configured_remote {
+        format!("refs/remotes/{remote}/{base_branch}")
+    } else {
+        "refs/sail-shipping/default".to_string()
+    };
+    let base_revision = git_reference(worktree, &["merge-base", branch, &base_ref])
+        .or_else(|| {
+            git_reference(
+                repository,
+                &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+            )
+        })
+        .ok_or("Cannot resolve the shipping base commit.".to_string())?;
+    Ok(ShippingTarget {
+        repository: target,
+        remote,
+        base_branch,
+        base_ref,
+        base_revision,
+    })
+}
+
+#[tauri::command]
+async fn shipping_worktree_target(
+    repository: String,
+    worktree: String,
+    branch: String,
+) -> Result<ShippingTarget, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = validate_repository(repository)?;
+        let worktree = validate_repository(worktree)?;
+        let actual_branch = git_reference(Path::new(&worktree), &["branch", "--show-current"])
+            .ok_or("Shipping worktree is detached.".to_string())?;
+        if actual_branch != branch {
+            return Err("Shipping worktree branch changed.".to_string());
+        }
+        shipping_target(Path::new(&repository), Path::new(&worktree), &branch)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Serialize)]
@@ -1686,7 +1759,24 @@ async fn create_shipping_worktree(
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        add_worktree(checked, name, None, Some(default_ref))
+        let base_revision = git_reference(
+            Path::new(&checked),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{default_ref}^{{commit}}"),
+            ],
+        )
+        .ok_or("Cannot resolve the fetched shipping base commit.".to_string())?;
+        let mut created = add_worktree(checked, name, None, Some(default_ref.clone()))?;
+        created.shipping_target = Some(ShippingTarget {
+            repository: target,
+            remote: source,
+            base_branch: branch,
+            base_ref: default_ref,
+            base_revision,
+        });
+        Ok(created)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1881,6 +1971,7 @@ fn add_worktree(
         branch: name.to_string(),
         base,
         setup: config.map(|config| config.setup).unwrap_or_default(),
+        shipping_target: None,
     })
 }
 
@@ -2529,6 +2620,7 @@ pub fn run() {
             working_tree_generation,
             working_tree_commit,
             shipping_base_revision,
+            shipping_worktree_target,
             shipping_changed_paths,
             worktree_overviews,
             worktree_snapshots::record_turn_snapshot,
@@ -3591,7 +3683,8 @@ mod tests {
         git(path, &["add", "base.txt"]);
         git(path, &["commit", "-qm", "seed"]);
         git(path, &["checkout", "-qb", "feature"]);
-        let captured = tauri::async_runtime::block_on(shipping_base_revision(path.into())).unwrap();
+        let captured =
+            tauri::async_runtime::block_on(shipping_base_revision(path.into(), None)).unwrap();
         fs::write(root.join("feature.txt"), "feature\n").unwrap();
         git(path, &["add", "feature.txt"]);
         git(path, &["commit", "-qm", "feature"]);
@@ -3602,7 +3695,8 @@ mod tests {
             Some(captured.clone()),
         ))
         .unwrap();
-        let moved = tauri::async_runtime::block_on(shipping_base_revision(path.into())).unwrap();
+        let moved =
+            tauri::async_runtime::block_on(shipping_base_revision(path.into(), None)).unwrap();
         let current_paths = tauri::async_runtime::block_on(shipping_changed_paths(
             path.into(),
             Some(moved.clone()),
