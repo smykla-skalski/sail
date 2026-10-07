@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
+const delayedSessionDirectories = new Set();
 const permissions = new Map();
 const activePrompts = new Map();
 const steerWaiters = new Map();
@@ -177,13 +178,17 @@ for await (const line of createInterface({ input: process.stdin })) {
       config: { model: 'test', effort: 'medium' },
     });
     update(sessionId, { sessionUpdate: 'available_commands_update', availableCommands });
+    const delayFirstAttentionSession =
+      message.params.cwd.includes('sail-attention-') &&
+      !delayedSessionDirectories.has(message.params.cwd);
+    if (delayFirstAttentionSession) delayedSessionDirectories.add(message.params.cwd);
     setTimeout(
       () =>
         send({
           id: message.id,
           result: { sessionId, configOptions: configOptions(sessionId), availableCommands },
         }),
-      1000,
+      delayFirstAttentionSession ? 3000 : 1000,
     );
   } else if (message.method === 'session/resume') {
     const session = sessions.get(message.params.sessionId);

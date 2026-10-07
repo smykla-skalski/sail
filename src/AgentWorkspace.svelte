@@ -1508,7 +1508,6 @@
     stopRequested = true;
     diagnostic('stop_requested');
     if (!activeSessionId) {
-      stopRequested = false;
       return;
     }
     const current = generation;

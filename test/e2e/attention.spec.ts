@@ -48,6 +48,18 @@ describe('agent thread attention', () => {
 
     await $('.agent-launches button').click();
     await waitForComposer();
+    await $('.agent-composer textarea').setValue('Stop during setup');
+    await $('.agent-actions button').click();
+    await $('.agent-busy button').click();
+    const stoppedDuringSetup = $('.project-agent-row[aria-label*="Stop during setup"]');
+    await expect(stoppedDuringSetup.$('.activity-status')).toHaveAttribute(
+      'data-state',
+      'interrupted',
+    );
+    await expect($('.agent-composer textarea')).toHaveValue('Stop during setup');
+
+    await $('.agent-launches button').click();
+    await waitForComposer();
     await $('.agent-composer textarea').setValue('Delayed approval');
     await $('.agent-actions button').click();
     const row = $('.session-item[title="Delayed approval"]');
