@@ -116,6 +116,36 @@ await test('a long-running child keeps its prompt and the newest bounded transcr
   assert.equal(nativeSubagentCounts(store, 'codex', 'parent').active, 1);
 });
 
+await test('an update that changes nothing leaves a long spawn prompt whole', () => {
+  const prompt = 'P'.repeat(nativeMessageLimit + 10_000);
+  let store = updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'worker',
+      task: 'Task',
+      prompt,
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+  );
+  for (const update of [
+    { sessionUpdate: 'usage_update', used: 10, size: 100 },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Working' } },
+  ])
+    store = updateNativeSubagents(store, event('child', update), '/repo', 2);
+
+  assert.deepEqual(
+    store['codex:child'].transcript.map((entry) => [entry.type, 'text' in entry && entry.text]),
+    [
+      ['user', prompt],
+      ['assistant', 'Working'],
+    ],
+  );
+});
+
 await test('replayed lifecycle deduplicates and unfinished history disconnects', () => {
   const spawn = event('parent', {
     sessionUpdate: 'subagent_spawned',

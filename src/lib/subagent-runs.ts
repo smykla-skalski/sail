@@ -33,7 +33,9 @@ export type SubagentRun = {
   /** Thread id of the child session (`acp:<agent>:<session>` or `opencode:<session>`). An MCP
    * child that has no session yet uses `receipt:<receiptId>`. */
   id: string;
+  /** The highest-precedence source that reported this child. */
   source: SubagentSource;
+  /** Every source that reported this child, in precedence order. */
   sources: SubagentSource[];
   agent: string;
   sessionId: string | null;
@@ -61,6 +63,7 @@ export type OpenCodeChildSessions = {
   active: readonly string[];
 };
 
+/** A parent session's complete transcript; the generation join counts notifications in it. */
 export type ParentTranscript = {
   agent: string;
   sessionId: string;
@@ -155,7 +158,7 @@ function receiptRuns(receipts: readonly SpawnReceipt[]): SubagentRun[] {
 function openCodeState(child: SessionInfo, active: readonly string[]): SpawnState {
   if (active.includes(child.id)) return 'working';
   if (child.outcome === 'succeeded') return 'completed';
-  return child.outcome ?? 'unavailable';
+  return child.outcome ?? 'queued';
 }
 
 function openCodeRuns(groups: readonly OpenCodeChildSessions[]): SubagentRun[] {
@@ -187,10 +190,11 @@ function openCodeRuns(groups: readonly OpenCodeChildSessions[]): SubagentRun[] {
 
 /** Child session ids for task notifications in transcript order. claude-agent-acp names a task's
  * first child session after its task id and each resumed generation `${taskId}:generation:N`,
- * and the parent receives one notification per generation. The ACP subagents RFD form
- * (agentclientprotocol/claude-agent-acp#1257) keeps one session id per child, so this join
- * changes when Sail adopts it. Replayed children (`:replay-subagent:`) carry no task id and stay
- * unjoined. */
+ * and the parent receives one notification per generation. Generations are counted by position,
+ * so the ids are only right for a parent's complete transcript, not a recent-entries window. The
+ * ACP subagents RFD form (agentclientprotocol/claude-agent-acp#1257) keeps one session id per
+ * child, so this join changes when Sail adopts it. Replayed children (`:replay-subagent:`) carry
+ * no task id and stay unjoined. */
 export function taskNotificationSessionIds(taskIds: readonly string[]): string[] {
   const generations = new Map<string, number>();
   return taskIds.map((taskId) => {
@@ -252,38 +256,67 @@ function notificationRuns(transcripts: readonly ParentTranscript[]): SubagentRun
   });
 }
 
-const fallbackFields = [
+const descriptiveFields = [
   'directory',
   'parentId',
   'parentDirectory',
   'name',
   'task',
   'model',
-  'activity',
-  'result',
-  'error',
   'created',
   'receiptId',
   'usage',
 ] as const;
+const outcomeFields = ['activity', 'result', 'error'] as const;
+
+function fill(
+  run: SubagentRun,
+  fields: readonly (keyof SubagentRun)[],
+  candidates: SubagentRun[],
+): void {
+  for (const field of fields) {
+    if (run[field] !== null) continue;
+    const value = candidates.find((candidate) => candidate[field] !== null)?.[field];
+    if (value !== undefined) Object.assign(run, { [field]: value });
+  }
+}
+
+/** A known terminal state replaces a state the winner could not confirm, such as a disconnected
+ * native child. A live state from a lower source can be stale, so it never does. */
+function stateSource(candidates: SubagentRun[]): SubagentRun {
+  const [winner] = candidates;
+  if (winner.state !== 'unavailable') return winner;
+  return (
+    candidates.find((candidate) =>
+      ['completed', 'failed', 'interrupted'].includes(candidate.state),
+    ) ?? winner
+  );
+}
 
 function merge(candidates: SubagentRun[]): SubagentRun {
-  const [winner, ...rest] = candidates;
+  const [winner] = candidates;
+  const outcome = stateSource(candidates);
   const run: SubagentRun = {
     ...winner,
     sources: [...new Set(candidates.map((candidate) => candidate.source))],
+    state: outcome.state,
+    activity: outcome.activity,
+    result: outcome.result,
+    error: outcome.error,
     updated: Math.max(...candidates.map((candidate) => candidate.updated)),
   };
-  for (const field of fallbackFields) {
-    if (run[field] !== null) continue;
-    const value = rest.find((candidate) => candidate[field] !== null)?.[field];
-    if (value !== undefined) Object.assign(run, { [field]: value });
-  }
+  fill(run, descriptiveFields, candidates);
+  fill(
+    run,
+    outcomeFields,
+    candidates.filter((candidate) => candidate.state === run.state),
+  );
   return run;
 }
 
 /** Joins every subagent source into one run per child session. When sources overlap, the
- * higher-precedence source sets the state and the others only fill fields it lacks. */
+ * higher-precedence source sets the state; others fill descriptive fields it lacks, and outcome
+ * text only when they report the same state. */
 export function subagentRuns({
   native = {},
   receipts = [],

@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { AgentEntry, AgentEvent } from '../src/lib/acp.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 import {
+  disconnectNativeSubagents,
   nativeSubagentReceipts,
   updateNativeSubagents,
   type NativeSubagentStore,
@@ -129,14 +130,12 @@ await test('one child reported natively and by an MCP receipt yields one run', (
 });
 
 await test('the higher-precedence source sets the state and others fill missing fields', () => {
+  const disconnected = disconnectNativeSubagents(nativeStore(spawned('task-1')), 'claude', 9);
   const cases = [
     {
       name: 'live native beats an MCP receipt',
       sources: { native: nativeStore(spawned('task-1')), receipts: [receipt()] },
-      source: 'native',
-      state: 'working',
-      model: 'opus',
-      result: null,
+      expected: { source: 'native', state: 'working', model: 'opus', result: null },
     },
     {
       name: 'an MCP receipt beats a task notification',
@@ -144,10 +143,7 @@ await test('the higher-precedence source sets the state and others fill missing 
         receipts: [receipt({ state: 'working' })],
         transcripts: transcript(notification('task-1', 'failed', 'Agent crashed')),
       },
-      source: 'mcp',
-      state: 'working',
-      model: 'opus',
-      result: 'Agent crashed',
+      expected: { source: 'mcp', state: 'working', model: 'opus', result: null },
     },
     {
       name: 'live native beats a task notification',
@@ -155,10 +151,7 @@ await test('the higher-precedence source sets the state and others fill missing 
         native: nativeStore(spawned('task-1')),
         transcripts: transcript(notification('task-1', 'killed', 'Agent stopped')),
       },
-      source: 'native',
-      state: 'working',
-      model: null,
-      result: 'Agent stopped',
+      expected: { source: 'native', state: 'working', model: null, result: null },
     },
     {
       name: 'all three sources resolve to native',
@@ -167,19 +160,49 @@ await test('the higher-precedence source sets the state and others fill missing 
         receipts: [receipt({ state: 'working' })],
         transcripts: transcript(notification('task-1', 'completed', 'Done')),
       },
-      source: 'native',
-      state: 'failed',
-      model: 'opus',
-      result: 'Done',
+      expected: { source: 'native', state: 'failed', model: 'opus', result: null },
+    },
+    {
+      name: 'a source in the same state fills the result',
+      sources: {
+        native: nativeStore(spawned('task-1'), settled('task-1', 'completed')),
+        transcripts: transcript(notification('task-1', 'completed', 'Done')),
+      },
+      expected: { source: 'native', state: 'completed', activity: 'Completed', result: 'Done' },
+    },
+    {
+      name: 'a terminal notification settles a disconnected native child',
+      sources: {
+        native: disconnected,
+        transcripts: transcript(notification('task-1', 'completed', 'Done')),
+      },
+      expected: { source: 'native', state: 'completed', activity: 'Done', result: 'Done' },
+    },
+    {
+      name: 'a live receipt does not revive a disconnected native child',
+      sources: { native: disconnected, receipts: [receipt({ state: 'working' })] },
+      expected: { source: 'native', state: 'unavailable', activity: 'Disconnected', result: null },
+    },
+    {
+      name: 'an older receipt in another state lends no outcome',
+      sources: {
+        receipts: [
+          receipt({ receiptId: 'old', state: 'failed', error: 'boom', result: 'old', updated: 10 }),
+          receipt({ receiptId: 'new', state: 'working', updated: 20 }),
+        ],
+      },
+      expected: { source: 'mcp', state: 'working', error: null, result: null },
     },
   ];
-  for (const item of cases) {
-    const runs = subagentRuns(item.sources);
-    assert.equal(runs.length, 1, item.name);
-    assert.equal(runs[0].source, item.source, item.name);
-    assert.equal(runs[0].state, item.state, item.name);
-    assert.equal(runs[0].model, item.model, item.name);
-    assert.equal(runs[0].result, item.result, item.name);
+  for (const { name, sources, expected } of cases) {
+    const runs = subagentRuns(sources);
+    assert.equal(runs.length, 1, name);
+    const run: Record<string, unknown> = { ...runs[0] };
+    assert.deepEqual(
+      Object.fromEntries(Object.keys(expected).map((key) => [key, run[key]])),
+      expected,
+      name,
+    );
   }
 });
 
@@ -298,7 +321,7 @@ await test('OpenCode children are keyed by session id with live state', () => {
       ['opencode:ses-a', 'working'],
       ['opencode:ses-b', 'completed'],
       ['opencode:ses-c', 'failed'],
-      ['opencode:ses-d', 'unavailable'],
+      ['opencode:ses-d', 'queued'],
     ],
   );
   assert.equal(runs[0].parentId, 'opencode:ses-parent');

@@ -50,8 +50,9 @@ function state(value: unknown): NativeSubagentOutcome {
 export const nativeTranscriptLimit = 500;
 export const nativeMessageLimit = 40_000;
 
-/** Keeps a live child's transcript bounded: the spawn prompt plus the newest entries. Streaming
- * chunks only ever grow the last entry, so only that one needs trimming. */
+/** Keeps a live child's transcript bounded after an update changed it: the spawn prompt plus the
+ * newest entries. Streaming chunks only ever grow the last entry, so only that one needs
+ * trimming. */
 export function boundNativeTranscript(entries: AgentEntry[]): AgentEntry[] {
   const last = entries.at(-1);
   const trimmed =
@@ -163,7 +164,8 @@ export function updateNativeSubagents(
   const id = nativeSubagentId(event.agent, parentSessionId);
   const child = store[id];
   if (!child) return store;
-  const transcript = boundNativeTranscript(updateEntries(child.transcript, update));
+  const next = updateEntries(child.transcript, update);
+  const transcript = next === child.transcript ? next : boundNativeTranscript(next);
   const settled = ['completed', 'failed', 'interrupted'].includes(child.outcome);
   return {
     ...store,
