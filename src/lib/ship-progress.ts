@@ -30,6 +30,13 @@ export type ShipActivity = {
   detail: string;
   at?: number;
 };
+export type ShipIssuePresentation = {
+  status: string;
+  label: string;
+  priority: number;
+  nextAction: string;
+  updated: number | null;
+};
 export type GateMetadata = {
   gate: GateName;
   requestedModel: string;
@@ -303,6 +310,125 @@ export function shipActivity(run: ShipRun, issue: ShipIssue): ShipActivity {
     title: 'Queued',
     detail: 'Ready to start when a worker is available.',
   };
+}
+
+export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssuePresentation {
+  const activity = shipActivity(run, issue);
+  const gates = issue.gates ?? [];
+  const currentGates = gateNames.flatMap((name) => {
+    const gate = gates
+      .filter((candidate) => candidate.gate === name)
+      .toSorted((left, right) => right.updated - left.updated)[0];
+    return gate ? [gate] : [];
+  });
+  const failedGate = currentGates.find(
+    (gate) =>
+      ['FAIL', 'NEEDS_FIXES', 'BLOCKED'].includes(gate.verdict ?? '') ||
+      ['failed', 'interrupted'].includes(gate.state) ||
+      !!gate.error,
+  );
+  const unavailableGate = currentGates.find((gate) => gate.state === 'unavailable');
+  const waitingGate = currentGates.find((gate) => gate.state === 'waiting');
+  const updated = Math.max(
+    issue.refreshedAt ?? 0,
+    ...gates.map((gate) => gate.updated),
+    ...(issue.events ?? []).map((event) => event.at),
+  );
+  if (issue.state === 'failed')
+    return {
+      status: 'failed',
+      label: 'Recovery needed',
+      priority: 0,
+      nextAction: 'Inspect the failure and restart shipping',
+      updated: updated || null,
+    };
+  if (issue.blockedReason || shipStatus(run, issue) === 'Blocked' || failedGate)
+    return {
+      status: 'waiting',
+      label: 'Needs input',
+      priority: 0,
+      nextAction: failedGate ? `Resolve ${titleCase(failedGate.gate)}` : 'Resolve the blocker',
+      updated: updated || null,
+    };
+  if (unavailableGate)
+    return {
+      status: 'offline',
+      label: 'Recovery needed',
+      priority: 0,
+      nextAction: `Reconnect ${titleCase(unavailableGate.gate)}`,
+      updated: updated || null,
+    };
+  if (waitingGate)
+    return {
+      status: 'waiting',
+      label: 'Needs input',
+      priority: 0,
+      nextAction: `Respond to ${titleCase(waitingGate.gate)}`,
+      updated: updated || null,
+    };
+  if (issue.workerState === 'waiting')
+    return {
+      status: 'waiting',
+      label: 'Needs input',
+      priority: 0,
+      nextAction: 'Respond to the implementation worker',
+      updated: updated || null,
+    };
+  if (issue.workerState === 'unavailable')
+    return {
+      status: 'offline',
+      label: 'Recovery needed',
+      priority: 0,
+      nextAction: 'Reconnect the implementation worker',
+      updated: updated || null,
+    };
+  if (issue.state === 'starting' || issue.state === 'working' || activity.state === 'active')
+    return {
+      status: 'working',
+      label: 'Working',
+      priority: 1,
+      nextAction: `${activity.title} in progress`,
+      updated: updated || activity.at || null,
+    };
+  if (issue.state === 'awaiting_merge') {
+    const ci = ciStatus(issue.checks);
+    return {
+      status: ci === 'Failed' ? 'failed' : 'queued',
+      label: ci === 'Failed' ? 'Recovery needed' : 'Awaiting merge',
+      priority: ci === 'Failed' ? 0 : 2,
+      nextAction:
+        ci === 'Failed'
+          ? 'Fix failing CI'
+          : ci !== 'Passed'
+            ? 'Wait for CI and review'
+            : 'Merge the pull request',
+      updated: updated || activity.at || null,
+    };
+  }
+  if (issue.state === 'merged')
+    return {
+      status: 'completed',
+      label: 'Completed',
+      priority: 4,
+      nextAction: 'No action — shipping complete',
+      updated: updated || activity.at || null,
+    };
+  const waiting = shipStatus(run, issue) === 'Waiting';
+  return {
+    status: 'queued',
+    label: waiting ? 'Waiting' : 'Queued',
+    priority: waiting ? 3 : 2,
+    nextAction: waiting ? 'Wait for dependencies' : 'Wait for an available worker',
+    updated: updated || null,
+  };
+}
+
+export function sortShipIssues(run: ShipRun): ShipIssue[] {
+  return run.issues.toSorted((left, right) => {
+    const priority =
+      shipIssuePresentation(run, left).priority - shipIssuePresentation(run, right).priority;
+    return priority || left.number - right.number;
+  });
 }
 
 export function ciStatus(checks: ShipCheck[] | undefined): string {

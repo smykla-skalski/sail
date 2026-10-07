@@ -15,7 +15,9 @@ import {
   parseShipReport,
   refreshedIssueState,
   shipOwner,
+  shipIssuePresentation,
   shipStatus,
+  sortShipIssues,
   validateGateVerdict,
 } from '../src/lib/ship-progress.ts';
 import {
@@ -158,6 +160,87 @@ void test('dependency failure blocks only dependents and merged dependencies bec
   assert.equal(shipStatus(run, run.issues[1]), 'Blocked');
   run.issues[0].state = 'merged';
   assert.equal(shipStatus(run, run.issues[1]), 'Queued');
+});
+
+void test('Ship issues put required action before work, queue, and completion', () => {
+  const run = fixture();
+  const source = run.issues[0];
+  run.issues = [
+    { ...source, id: 'merged', number: 6, state: 'merged' },
+    { ...source, id: 'queued', number: 5, state: 'pending' },
+    { ...source, id: 'working', number: 4, state: 'working', workerState: 'working' },
+    { ...source, id: 'waiting', number: 3, state: 'working', workerState: 'waiting' },
+    { ...source, id: 'failed', number: 2, state: 'failed', error: 'Worker failed' },
+  ];
+
+  assert.deepEqual(
+    sortShipIssues(run).map((issue) => issue.id),
+    ['failed', 'waiting', 'working', 'queued', 'merged'],
+  );
+  assert.deepEqual(
+    run.issues.map((issue) => shipIssuePresentation(run, issue).label),
+    ['Completed', 'Queued', 'Working', 'Needs input', 'Recovery needed'],
+  );
+  assert.match(shipIssuePresentation(run, run.issues[3]).nextAction, /Respond/);
+});
+
+void test('latest gate state controls attention without stale failed rounds', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  issue.state = 'working';
+  issue.gates = [
+    {
+      id: 'failed-old',
+      gate: 'code-adversary',
+      requestedModel: 'test',
+      provider: 'codex',
+      model: 'test',
+      threadId: 'old',
+      directory: '/repo',
+      state: 'completed',
+      created: 1,
+      updated: 1,
+      error: null,
+      verdict: 'NEEDS_FIXES',
+    },
+    {
+      id: 'clean-new',
+      gate: 'code-adversary',
+      requestedModel: 'test',
+      provider: 'codex',
+      model: 'test',
+      threadId: 'new',
+      directory: '/repo',
+      state: 'completed',
+      created: 2,
+      updated: 2,
+      error: null,
+      verdict: 'CLEAN',
+    },
+    {
+      id: 'waiting',
+      gate: 'findings-adversary',
+      requestedModel: 'test',
+      provider: 'codex',
+      model: 'test',
+      threadId: 'waiting',
+      directory: '/repo',
+      state: 'waiting',
+      created: 3,
+      updated: 3,
+      error: null,
+    },
+  ];
+
+  assert.deepEqual(shipIssuePresentation(run, issue), {
+    status: 'waiting',
+    label: 'Needs input',
+    priority: 0,
+    nextAction: 'Respond to Findings Adversary',
+    updated: 3,
+  });
+  issue.gates[2].state = 'unavailable';
+  assert.equal(shipIssuePresentation(run, issue).nextAction, 'Reconnect Findings Adversary');
 });
 
 void test('shows the active validation gate before the worker stage', () => {
