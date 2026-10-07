@@ -55,6 +55,8 @@
   } from './lib/agent-queue';
   import {
     acp,
+    acpFinishedPromptStatus,
+    acpPromptInterrupted,
     groupAgentEntries,
     loadRecentTranscript,
     restoreEntryTimes,
@@ -1193,6 +1195,7 @@
         );
       }
       if (stopRequested) {
+        finalStatus = 'interrupted';
         notifyOnDone = false;
         if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');
         if (current === generation) {
@@ -1243,19 +1246,28 @@
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
         throw cause;
       }
-      if (recoveredDraft && result.stopReason !== 'cancelled' && !stopRequested)
-        recoveredDraft = false;
-      if (result.stopReason === 'cancelled' || stopRequested) notifyOnDone = false;
-      if (external && !queuedMessage && !notifyOnDone) throw new Error('Agent turn was cancelled.');
+      if (recoveredDraft && !acpPromptInterrupted(result) && !stopRequested) recoveredDraft = false;
+      if (acpPromptInterrupted(result)) finalStatus = 'interrupted';
+      if (acpPromptInterrupted(result) || stopRequested) notifyOnDone = false;
+      if (external && !queuedMessage && finalStatus === 'interrupted')
+        throw new Error('Agent turn was cancelled.');
       if (current === generation && stopRequested)
-        markTools(result.stopReason === 'cancelled' ? 'cancelled' : 'status unconfirmed', [
+        markTools(acpPromptInterrupted(result) ? 'cancelled' : 'status unconfirmed', [
           'pending',
           'in_progress',
           'stopping',
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
-      finalStatus = 'failed';
+      const backendStatus =
+        phase === 'prompt' && deliverySessionId
+          ? await acpFinishedPromptStatus(turnAgent, deliverySessionId, turnId)
+          : null;
+      const interrupted =
+        backendStatus === 'interrupted' ||
+        (backendStatus !== 'failed' && (finalStatus === 'interrupted' || stopRequested));
+      finalStatus = interrupted ? 'interrupted' : 'failed';
+      if (interrupted) notifyOnDone = false;
       if (!deliverySessionId && current !== generation && disposed && !ephemeral && !external) {
         const recovered =
           sentImages.length || sentClipboard.length
@@ -1495,18 +1507,25 @@
   async function stop() {
     stopRequested = true;
     diagnostic('stop_requested');
-    if (!activeSessionId) return;
+    if (!activeSessionId) {
+      return;
+    }
     const current = generation;
     const sessionId = activeSessionId;
     const pending = permissions;
+    let cancelSent = false;
     try {
       await acp.cancel(agent, sessionId, activeTurnId);
+      cancelSent = true;
       await Promise.all(pending.map((permission) => acp.permission(agent, permission.id, null)));
       if (current !== generation || activeSessionId !== sessionId) return;
       permissions = [];
       markTools('stopping', ['pending', 'in_progress']);
     } catch (cause) {
-      if (current === generation && activeSessionId === sessionId) error = describe(cause);
+      if (current === generation && activeSessionId === sessionId) {
+        if (!cancelSent) stopRequested = false;
+        error = describe(cause);
+      }
     }
   }
 

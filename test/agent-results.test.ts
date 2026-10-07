@@ -231,6 +231,14 @@ await test('ACP reconnect requires the same turn to prove state', () => {
     }),
     'completed',
   );
+  assert.equal(
+    acpReceiptState(working, {
+      ...activity,
+      activeTurns: {},
+      finished: { target: { turnId: 'turn-one', status: 'interrupted', notify: false } },
+    }),
+    'interrupted',
+  );
 });
 
 for (const [state, refresh] of [

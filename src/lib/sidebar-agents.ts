@@ -73,7 +73,7 @@ export async function listSidebarOpenCodeThreads(
     };
     threads.push(thread);
     if (session.outcome)
-      outcomes[threadKey(thread)] = session.outcome === 'failed' ? 'failed' : 'done';
+      outcomes[threadKey(thread)] = session.outcome === 'succeeded' ? 'done' : session.outcome;
   }
   const next = page.cursor.next ?? undefined;
   if (!next || next === cursor || seen.has(next)) return { threads, outcomes };
@@ -92,6 +92,14 @@ export function groupSidebarThreads(threads: AgentThread[]): Record<string, Agen
   for (const thread of unique.values()) (grouped[thread.directory] ??= []).push(thread);
   for (const items of Object.values(grouped)) items.sort((a, b) => b.updated - a.updated);
   return grouped;
+}
+
+export function recordSidebarOpenCodeOutcome(
+  outcomes: Record<string, ThreadStatus>,
+  thread: AgentThread,
+  status: ThreadStatus,
+): Record<string, ThreadStatus> {
+  return { ...outcomes, [threadKey(thread)]: status };
 }
 
 export function sidebarThreadRows(
@@ -188,15 +196,17 @@ export function sidebarThreadStatus(
       receipt.targetId === receiptSourceId(thread.agent, thread.sessionId) &&
       receipt.targetDirectory === thread.directory,
   );
-  if (child) {
+  if (child && !(saved && receiptIsSettled(child.state) && thread.updated > child.updated)) {
     status =
       child.state === 'working' || child.state === 'waiting'
         ? child.state
         : child.state === 'failed'
           ? 'failed'
-          : child.state === 'completed' || child.state === 'interrupted'
-            ? 'done'
-            : null;
+          : child.state === 'interrupted'
+            ? 'interrupted'
+            : child.state === 'completed'
+              ? 'done'
+              : null;
   }
   if (
     (status === 'working' || status === 'waiting') &&
@@ -205,7 +215,7 @@ export function sidebarThreadStatus(
       : !acpActivityReady)
   )
     status = null;
-  if (status !== 'failed') {
+  if (status !== 'failed' && status !== 'interrupted') {
     const active = activeSubagentsForSource(
       spawnReceipts,
       receiptSourceId(thread.agent, thread.sessionId),

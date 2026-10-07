@@ -223,6 +223,6 @@ export function acpReceiptState(receipt: SpawnReceipt, activity: AgentActivity |
   const finished = activity.finished[sessionId];
   if (finished?.turnId !== receipt.turnId) return 'unavailable';
   if (finished.status === 'failed') return 'failed';
-  return finished.notify ? 'completed' : 'interrupted';
+  return finished.status === 'interrupted' ? 'interrupted' : 'completed';
 }
 import type { AgentActivity } from './acp';

@@ -38,6 +38,7 @@ export type TaskOverviewPreferences = {
 const statusPriority: Record<ThreadStatus, number> = {
   waiting: 0,
   failed: 1,
+  interrupted: 1,
   working: 2,
   done: 3,
 };
@@ -176,6 +177,7 @@ export function buildTaskOverviewCards(input: {
       nextAction = `Respond to ${input.agentNames[agent ?? ''] ?? agent}`;
     else if (currentCheckState === 'failed') nextAction = 'Review failed check';
     else if (status === 'failed') nextAction = 'Review agent failure';
+    else if (status === 'interrupted') nextAction = 'Continue interrupted agent';
     else if (status === 'working') nextAction = 'Agent is working';
     else if (recentThread) nextAction = 'Continue task';
 
@@ -222,7 +224,8 @@ export function sortTaskOverviewCards(
   const pins = new Set(pinned);
   const attention = (card: TaskOverviewCard) => {
     if (card.setupFailed || card.setupPending || card.status === 'waiting') return 0;
-    if (card.checkState === 'failed' || card.status === 'failed') return 1;
+    if (card.checkState === 'failed' || card.status === 'failed' || card.status === 'interrupted')
+      return 1;
     if (card.status === 'working' || card.checkState === 'running') return 2;
     if (!card.status) return 3;
     return 4;

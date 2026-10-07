@@ -314,6 +314,123 @@ struct PromptState {
 struct ActivePrompt {
     turn_id: String,
     text: String,
+    last_agent_message: String,
+    agent_message_open: bool,
+    agent_message_overflow: bool,
+    known_tool_calls: HashSet<String>,
+}
+
+impl ActivePrompt {
+    fn observe_update(&mut self, update: &Value) {
+        match update.get("sessionUpdate").and_then(Value::as_str) {
+            Some("agent_message_chunk") => {
+                if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
+                    if !self.agent_message_open {
+                        self.last_agent_message.clear();
+                        self.agent_message_overflow = false;
+                    }
+                    self.agent_message_open = true;
+                    if !self.agent_message_overflow {
+                        if self.last_agent_message.len() + text.len() <= 256 {
+                            self.last_agent_message.push_str(text);
+                        } else {
+                            self.last_agent_message.clear();
+                            self.agent_message_overflow = true;
+                        }
+                    }
+                }
+            }
+            Some("user_message_chunk" | "agent_thought_chunk") => {
+                if update
+                    .pointer("/content/text")
+                    .and_then(Value::as_str)
+                    .is_some()
+                {
+                    self.agent_message_open = false;
+                }
+            }
+            Some("tool_call" | "tool_call_update") => {
+                if let Some(id) = update.get("toolCallId").and_then(Value::as_str) {
+                    if self.known_tool_calls.insert(id.to_string()) {
+                        self.agent_message_open = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn reports_interruption(&self) -> bool {
+        self.agent_message_open
+            && !self.agent_message_overflow
+            && self
+                .last_agent_message
+                .trim()
+                .eq_ignore_ascii_case("Step interrupted")
+    }
+}
+
+#[cfg(test)]
+mod interruption_report_tests {
+    use super::*;
+
+    fn prompt() -> ActivePrompt {
+        ActivePrompt {
+            turn_id: "turn".into(),
+            text: "task".into(),
+            last_agent_message: String::new(),
+            agent_message_open: false,
+            agent_message_overflow: false,
+            known_tool_calls: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn existing_tool_update_keeps_split_interruption_message_together() {
+        let mut active = prompt();
+        for update in [
+            json!({"sessionUpdate":"tool_call","toolCallId":"read"}),
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"Step "}}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"read"}),
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"interrupted"}}),
+        ] {
+            active.observe_update(&update);
+        }
+        assert!(active.reports_interruption());
+    }
+
+    #[test]
+    fn new_tool_or_longer_answer_does_not_report_interruption() {
+        let mut active = prompt();
+        for update in [
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"Step "}}),
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"new"}),
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"interrupted"}}),
+        ] {
+            active.observe_update(&update);
+        }
+        assert!(!active.reports_interruption());
+        active.observe_update(
+            &json!({"sessionUpdate":"agent_message_chunk","content":{"text":" but recovered"}}),
+        );
+        assert!(!active.reports_interruption());
+    }
+
+    #[test]
+    fn later_tool_or_thought_closes_interruption_message() {
+        for update in [
+            json!({"sessionUpdate":"tool_call","toolCallId":"next"}),
+            json!({"sessionUpdate":"agent_thought_chunk","content":{"text":"Continuing"}}),
+        ] {
+            let mut active = prompt();
+            active.observe_update(
+                &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"Step interrupted"}}),
+            );
+            assert!(active.reports_interruption());
+            active.observe_update(&update);
+            assert!(!active.reports_interruption());
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -687,6 +804,15 @@ fn connect_blocking(
                 continue;
             };
             if let Some(update) = message.pointer("/params/update") {
+                if let Some(session_id) =
+                    message.pointer("/params/sessionId").and_then(Value::as_str)
+                {
+                    if let Ok(mut prompts) = reader.prompt_state.lock() {
+                        if let Some(prompt) = prompts.active.get_mut(session_id) {
+                            prompt.observe_update(update);
+                        }
+                    }
+                }
                 if update.get("sessionUpdate").and_then(Value::as_str) == Some("subagent_spawned") {
                     let parent_id = message.pointer("/params/sessionId").and_then(Value::as_str);
                     let child_id = update.get("subagentSessionId").and_then(Value::as_str);
@@ -1067,6 +1193,10 @@ pub async fn acp_prompt(
             ActivePrompt {
                 turn_id: turn_id.clone(),
                 text: text.clone(),
+                last_agent_message: String::new(),
+                agent_message_open: false,
+                agent_message_overflow: false,
+                known_tool_calls: HashSet::new(),
             },
         );
     }
@@ -1077,7 +1207,7 @@ pub async fn acp_prompt(
         }),
     );
     tauri::async_runtime::spawn_blocking(move || {
-        let result = runtime.request(
+        let mut result = runtime.request(
             "session/prompt",
             json!({
                 "sessionId":session_id,"prompt":content
@@ -1089,19 +1219,61 @@ pub async fn acp_prompt(
             .lock()
             .map(|mut cancelled| cancelled.remove(&turn_id))
             .unwrap_or(false);
-        let status = if result.is_err() { "failed" } else { "done" };
+        let cancelled_result = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("stopReason"))
+            .and_then(Value::as_str)
+            == Some("cancelled");
+        let reported_interruption = runtime
+            .prompt_state
+            .lock()
+            .ok()
+            .and_then(|prompts| {
+                prompts
+                    .active
+                    .get(&session_id)
+                    .map(ActivePrompt::reports_interruption)
+            })
+            .unwrap_or(false);
+        let reported_error_interruption = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| {
+                matches!(
+                    error.trim().to_ascii_lowercase().as_str(),
+                    "step interrupted"
+                        | "cancelled"
+                        | "canceled"
+                        | "request cancelled"
+                        | "request canceled"
+                        | "operation cancelled"
+                        | "operation canceled"
+                )
+            });
+        let interrupted = cancelled_result
+            || reported_error_interruption
+            || (reported_interruption && result.is_ok());
+        if interrupted {
+            if let Ok(Value::Object(payload)) = &mut result {
+                payload.insert("sailInterrupted".into(), Value::Bool(true));
+            }
+        }
+        let status = if interrupted {
+            "interrupted"
+        } else if result.is_err() {
+            "failed"
+        } else {
+            "done"
+        };
         crate::diagnostics::record("prompt_finished", json!({
             "agent":agent,"sessionId":session_id,"turnId":turn_id,
             "status":status,"explicitlyCancelled":explicitly_cancelled,
+            "reportedInterruption":reported_interruption,
+            "reportedErrorInterruption":reported_error_interruption,
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
-        let notify = !explicitly_cancelled
-            && result
-                .as_ref()
-                .ok()
-                .and_then(|value| value.get("stopReason"))
-                .and_then(Value::as_str)
-                != Some("cancelled");
+        let notify = !explicitly_cancelled && !interrupted;
         let latest = if let Ok(mut prompts) = runtime.prompt_state.lock() {
             if prompts
                 .active
@@ -1229,14 +1401,20 @@ pub fn acp_cancel(
             "agent":agent,"sessionId":session_id,"turnId":cancelled_turn
         }),
     );
-    if let Some(turn_id) = cancelled_turn {
-        runtime
-            .cancelled_prompts
-            .lock()
-            .map_err(|error| error.to_string())?
-            .insert(turn_id);
+    let mut cancelled = runtime
+        .cancelled_prompts
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(turn_id) = cancelled_turn.as_ref() {
+        cancelled.insert(turn_id.clone());
     }
-    runtime.notify("session/cancel", json!({"sessionId":session_id}))
+    let result = runtime.notify("session/cancel", json!({"sessionId":session_id}));
+    if result.is_err() {
+        if let Some(turn_id) = cancelled_turn.as_ref() {
+            cancelled.remove(turn_id);
+        }
+    }
+    result
 }
 
 #[tauri::command]

@@ -172,11 +172,13 @@
   import {
     groupSidebarThreads,
     listSidebarOpenCodeThreads,
+    recordSidebarOpenCodeOutcome,
     sidebarThreadStatus,
   } from './lib/sidebar-agents';
   import {
     loadAttention,
     markAttentionRead,
+    openCodeExecutionStatus,
     preserveAttentionOnCheckOpen,
     reconcileAttention,
     updateAttention,
@@ -201,6 +203,8 @@
   } from './lib/panes';
   import {
     acp,
+    acpFailedPromptInterrupted,
+    acpPromptInterrupted,
     forgetRecentTranscript,
     loadAgentThreads,
     loadInterruptedAgentTurns,
@@ -2520,6 +2524,7 @@
       if (interrupted.some((turn) => turn.agent === agent && turn.sessionId === sessionId))
         return 'interrupted';
       if (state?.finished[sessionId]?.status === 'failed') return 'failed';
+      if (state?.finished[sessionId]?.status === 'interrupted') return 'interrupted';
       if (state?.finished[sessionId] || state?.sessions.includes(sessionId)) return 'completed';
       return 'unavailable';
     } catch {
@@ -3063,10 +3068,7 @@
         (outcome) => {
           const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
           updateSpawnReceipt(receipt.receiptId, {
-            state:
-              outcome.stopReason === 'cancelled' || current?.state === 'interrupted'
-                ? 'interrupted'
-                : 'completed',
+            state: acpPromptInterrupted(outcome) ? 'interrupted' : 'completed',
             result: spawnOutput.get(receipt.receiptId) ?? current?.result ?? null,
           });
           spawnOutput.delete(receipt.receiptId);
@@ -3074,8 +3076,19 @@
             activeSpawnTargets.delete(receipt.targetId!);
           return undefined;
         },
-        (cause) => {
-          updateSpawnReceipt(receipt.receiptId, { state: 'failed', error: describe(cause) });
+        async (cause) => {
+          const wasInterrupted = await acpFailedPromptInterrupted(
+            receipt.provider,
+            sessionId,
+            receipt.turnId!,
+          );
+          updateSpawnReceipt(receipt.receiptId, {
+            state: wasInterrupted ? 'interrupted' : 'failed',
+            error: wasInterrupted ? null : describe(cause),
+          });
+          spawnOutput.delete(receipt.receiptId);
+          if (activeSpawnTargets.get(receipt.targetId!) === receipt.receiptId)
+            activeSpawnTargets.delete(receipt.targetId!);
           return undefined;
         },
       );
@@ -3286,18 +3299,27 @@
           });
           const tracking = await beginImplementationTurn(thread.directory, thread.model, target.id);
           updateAgentThreadStatus(thread, 'working');
-          const turn = acp.prompt(thread.agent, thread.sessionId, text, crypto.randomUUID());
+          const turnId = crypto.randomUUID();
+          const turn = acp.prompt(thread.agent, thread.sessionId, text, turnId);
           void turn
             .then(
-              async () => {
+              async (outcome) => {
                 await recordImplementationModel(thread.directory, thread.model, tracking);
-                updateAgentThreadStatus(thread, 'done');
+                updateAgentThreadStatus(
+                  thread,
+                  acpPromptInterrupted(outcome) ? 'interrupted' : 'done',
+                );
                 return undefined;
               },
               async (cause) => {
                 await recordImplementationModel(thread.directory, thread.model, tracking);
-                updateAgentThreadStatus(thread, 'failed');
-                error = `Agent message turn failed: ${describe(cause)}`;
+                const interrupted = await acpFailedPromptInterrupted(
+                  thread.agent,
+                  thread.sessionId,
+                  turnId,
+                );
+                updateAgentThreadStatus(thread, interrupted ? 'interrupted' : 'failed');
+                if (!interrupted) error = `Agent message turn failed: ${describe(cause)}`;
                 return undefined;
               },
             )
@@ -4377,14 +4399,11 @@
         async (outcome) => {
           if (tracking)
             await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
-          updateAgentThreadStatus(thread, 'done');
+          updateAgentThreadStatus(thread, acpPromptInterrupted(outcome) ? 'interrupted' : 'done');
           if (receiptId) {
             const current = spawnReceipts.find((item) => item.receiptId === receiptId);
             updateSpawnReceipt(receiptId, {
-              state:
-                outcome.stopReason === 'cancelled' || current?.state === 'interrupted'
-                  ? 'interrupted'
-                  : 'completed',
+              state: acpPromptInterrupted(outcome) ? 'interrupted' : 'completed',
               result: spawnOutput.get(receiptId) ?? current?.result ?? null,
             });
             spawnOutput.delete(receiptId);
@@ -4396,21 +4415,35 @@
         async (cause) => {
           if (tracking)
             await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
-          updateAgentThreadStatus(thread, 'failed');
+          const interrupted = await acpFailedPromptInterrupted(
+            source.agent,
+            session.sessionId,
+            turnId,
+          );
+          updateAgentThreadStatus(thread, interrupted ? 'interrupted' : 'failed');
           if (receiptId) {
-            updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+            updateSpawnReceipt(receiptId, {
+              state: interrupted ? 'interrupted' : 'failed',
+              error: interrupted ? null : describe(cause),
+            });
             spawnOutput.delete(receiptId);
             if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
               activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
           }
-          error = describe(cause);
+          if (!interrupted) error = describe(cause);
           throw cause;
         },
       );
-      await awaitCoordinationStart(finished, async () => {
-        const state = (await acp.activity())[source.agent];
-        return !!state?.active.includes(session.sessionId);
-      });
+      await awaitCoordinationStart(
+        finished.catch(async (cause) => {
+          if (await acpFailedPromptInterrupted(source.agent, session.sessionId, turnId)) return;
+          throw cause;
+        }),
+        async () => {
+          const state = (await acp.activity())[source.agent];
+          return !!state?.active.includes(session.sessionId);
+        },
+      );
       void finished.catch(() => undefined);
       return {
         path: created.path,
@@ -6127,6 +6160,9 @@
   }
 
   function saveAgentThread(thread: AgentThread) {
+    const previous = agentThreads.find((item) => threadKey(item) === threadKey(thread));
+    if (previous && previous.updated > thread.updated)
+      thread = { ...thread, updated: previous.updated };
     agentThreads = [
       thread,
       ...agentThreads.filter(
@@ -7439,11 +7475,9 @@
             ? 'working'
             : result
               ? result.status === 'fulfilled'
-                ? result.value.outcome === 'failed'
-                  ? 'failed'
-                  : result.value.outcome
-                    ? 'done'
-                    : null
+                ? result.value.outcome === 'succeeded'
+                  ? 'done'
+                  : (result.value.outcome ?? null)
                 : null
               : null;
         if (status && status !== threadAttention[threadKey(thread)]?.status)
@@ -7529,15 +7563,21 @@
               if (!disposed)
                 updateAgentThreadStatus(
                   recoveredThread,
-                  'done',
-                  outcome.stopReason !== 'cancelled',
+                  acpPromptInterrupted(outcome) ? 'interrupted' : 'done',
+                  !acpPromptInterrupted(outcome),
                 );
             } catch (cause) {
               if (!disposed) {
                 if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
                 else {
-                  updateAgentThreadStatus(recoveredThread, 'failed');
-                  error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+                  const interrupted = await acpFailedPromptInterrupted(
+                    turn.agent,
+                    turn.sessionId,
+                    turn.turnId,
+                  );
+                  updateAgentThreadStatus(recoveredThread, interrupted ? 'interrupted' : 'failed');
+                  if (!interrupted)
+                    error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
                 }
               }
             }
@@ -7549,8 +7589,14 @@
         } catch (cause) {
           if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
           else {
-            updateAgentThreadStatus(recoveredThread, 'failed');
-            error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+            const interrupted = await acpFailedPromptInterrupted(
+              turn.agent,
+              turn.sessionId,
+              turn.turnId,
+            );
+            updateAgentThreadStatus(recoveredThread, interrupted ? 'interrupted' : 'failed');
+            if (!interrupted)
+              error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
           }
         }
       }),
@@ -7611,8 +7657,27 @@
 
   function updateAgentThreadStatus(thread: AgentThread, status: ThreadStatus, notifyOnDone = true) {
     const key = agentThreadKey(thread);
-    if (thread.agent !== 'opencode' && !agentThreads.some((item) => threadKey(item) === key))
-      return;
+    const savedThread = agentThreads.find((item) => threadKey(item) === key);
+    if (thread.agent !== 'opencode' && !savedThread) return;
+    if (savedThread && thread.agent !== 'opencode') {
+      const receiptUpdated = spawnReceipts
+        .filter(
+          (item) =>
+            item.targetId === receiptSourceId(thread.agent, thread.sessionId) &&
+            item.targetDirectory === thread.directory,
+        )
+        .reduce((latest, item) => Math.max(latest, item.updated), 0);
+      saveAgentThread({
+        ...savedThread,
+        updated: Math.max(Date.now(), savedThread.updated + 1, receiptUpdated + 1),
+      });
+    }
+    if (thread.agent === 'opencode')
+      sidebarOpenCodeOutcomes = recordSidebarOpenCodeOutcome(
+        sidebarOpenCodeOutcomes,
+        thread,
+        status,
+      );
     const { next, notify } = updateAttention(
       threadAttention,
       key,
@@ -7829,7 +7894,11 @@
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
-      if (typeof sessionId !== 'string' || (status !== 'done' && status !== 'failed')) return;
+      if (
+        typeof sessionId !== 'string' ||
+        (status !== 'done' && status !== 'failed' && status !== 'interrupted')
+      )
+        return;
       if (
         status === 'done' &&
         typeof turnId === 'string' &&
@@ -7861,11 +7930,7 @@
       ))
         updateSpawnReceipt(receipt.receiptId, {
           state:
-            status === 'failed'
-              ? 'failed'
-              : event.message.params?.notify === false
-                ? 'interrupted'
-                : 'completed',
+            status === 'failed' ? 'failed' : status === 'interrupted' ? 'interrupted' : 'completed',
           result: spawnOutput.get(receipt.receiptId) ?? receipt.result,
           error:
             typeof event.message.params?.error === 'string'
@@ -8738,6 +8803,7 @@
             event.type === 'session.execution.failed' ||
             event.type === 'session.execution.interrupted')
         ) {
+          ++sidebarInventoryGeneration;
           ++nativeActivityGeneration;
           const matchingThreads = sidebarOpenCodeThreads.filter(
             (item) =>
@@ -8745,15 +8811,9 @@
               (!event.location?.directory || item.directory === event.location.directory),
           );
           for (const thread of matchingThreads) {
-            updateAgentThreadStatus(
-              thread,
-              event.type === 'session.execution.started'
-                ? 'working'
-                : event.type === 'session.execution.failed'
-                  ? 'failed'
-                  : 'done',
-              event.type !== 'session.execution.interrupted',
-            );
+            const status = openCodeExecutionStatus(event.type);
+            if (!status) continue;
+            updateAgentThreadStatus(thread, status, event.type !== 'session.execution.interrupted');
             if (event.type === 'session.execution.succeeded')
               recordTurnOutcome(thread, event.id, event.created);
           }

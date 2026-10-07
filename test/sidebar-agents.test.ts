@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   groupSidebarThreads,
   listSidebarOpenCodeThreads,
+  recordSidebarOpenCodeOutcome,
   sidebarThreadRows,
   sidebarThreadStatus,
   type SidebarSessionSource,
@@ -84,6 +85,44 @@ await test('fresh OpenCode outcome replaces stale saved terminal status', () => 
     ),
     'done',
   );
+  assert.equal(
+    sidebarThreadStatus(
+      thread,
+      { [key]: { status: 'done', unread: false } },
+      { [key]: 'interrupted' },
+      true,
+      true,
+      [],
+    ),
+    'interrupted',
+  );
+});
+
+await test('later OpenCode completion replaces interrupted sidebar outcome when refresh fails', () => {
+  const thread = {
+    agent: 'opencode',
+    directory: '/repo/a',
+    sessionId: 'one',
+    title: 'Agent',
+    updated: 2,
+  };
+  const key = JSON.stringify(['opencode', '/repo/a', 'one']);
+  const otherKey = JSON.stringify(['opencode', '/repo/a', 'two']);
+  const stale = { [key]: 'interrupted' as const, [otherKey]: 'failed' as const };
+  const current = recordSidebarOpenCodeOutcome(stale, thread, 'done');
+  assert.deepEqual(current, { [key]: 'done', [otherKey]: 'failed' });
+  assert.equal(
+    sidebarThreadStatus(
+      thread,
+      { [key]: { status: 'done', unread: false } },
+      current,
+      true,
+      true,
+      [],
+    ),
+    'done',
+  );
+  assert.equal(stale[key], 'interrupted');
 });
 
 await test('active subagent keeps a finished parent visibly working', () => {
@@ -140,6 +179,19 @@ await test('active subagent keeps a finished parent visibly working', () => {
     'failed',
   );
   assert.equal(status([{ ...receipt, state: 'completed' }]), 'done');
+  assert.equal(status([{ ...receipt, state: 'interrupted' }]), 'done');
+  assert.equal(
+    sidebarThreadStatus(
+      thread,
+      { [key]: { status: 'interrupted', unread: false } },
+      {},
+      true,
+      true,
+      [],
+      [receipt],
+    ),
+    'interrupted',
+  );
   assert.equal(status([{ ...receipt, state: 'queued', targetId: null, turnId: null }]), null);
   assert.equal(status([{ ...receipt, sourceDirectory: '/other' }]), 'done');
   assert.equal(status([receipt], false), null);
@@ -189,6 +241,19 @@ await test('native child rows use their own outcome without parent attention sta
   assert.equal(status('waiting'), 'waiting');
   assert.equal(status('completed'), 'done');
   assert.equal(status('failed'), 'failed');
+  assert.equal(status('interrupted'), 'interrupted');
+  assert.equal(
+    sidebarThreadStatus(
+      { ...thread, updated: 3 },
+      { [JSON.stringify(['codex', '/repo', 'child'])]: { status: 'done', unread: false } },
+      {},
+      true,
+      true,
+      [],
+      [{ ...receipt, state: 'interrupted' }],
+    ),
+    'done',
+  );
   assert.equal(status('unavailable'), null);
 });
 
@@ -245,6 +310,12 @@ await test('sidebar inventory follows every OpenCode page and excludes child and
                   outcome: 'failed',
                 },
                 {
+                  id: 'interrupted',
+                  location: { directory: '/repo/a' },
+                  time: { updated: 3 },
+                  outcome: 'interrupted',
+                },
+                {
                   id: 'foreign',
                   location: { directory: '/repo/b' },
                   time: { updated: 3 },
@@ -276,8 +347,8 @@ await test('sidebar inventory follows every OpenCode page and excludes child and
   assert.deepEqual(calls, [undefined, 'page-2']);
   assert.deepEqual(
     result.threads.map((thread) => thread.sessionId),
-    ['first', 'second'],
+    ['first', 'second', 'interrupted'],
   );
   assert.equal(result.threads[0].title, 'Untitled session');
-  assert.deepEqual(Object.values(result.outcomes), ['done', 'failed']);
+  assert.deepEqual(Object.values(result.outcomes), ['done', 'failed', 'interrupted']);
 });

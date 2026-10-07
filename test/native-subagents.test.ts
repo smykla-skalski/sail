@@ -155,6 +155,52 @@ await test('late and duplicate events cannot revive a terminal child', () => {
   assert.equal(nativeSubagentReceipts(store)[0].result, 'Completed');
 });
 
+await test('native child completion reflects its final interruption message', () => {
+  let store = updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'worker',
+      task: 'Task',
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+  );
+  store = updateNativeSubagents(
+    store,
+    event('parent', {
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: 'child',
+      state: 'completed',
+    }),
+    '/repo',
+    2,
+  );
+  for (const update of [
+    { sessionUpdate: 'tool_call', toolCallId: 'read', title: 'Read', status: 'in_progress' },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Step inter' } },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'read', status: 'completed' },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'rupted' } },
+  ])
+    store = updateNativeSubagents(store, event('child', update), '/repo', 3);
+  assert.equal(nativeSubagentReceipts(store)[0].state, 'interrupted');
+  assert.equal(nativeSubagentReceipts(store)[0].result, 'Interrupted');
+  store = updateNativeSubagents(
+    store,
+    event('child', {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'next',
+      title: 'Continue',
+      status: 'completed',
+    }),
+    '/repo',
+    4,
+  );
+  assert.equal(nativeSubagentReceipts(store)[0].state, 'completed');
+});
+
 await test('resolved child permission clears its waiting activity', () => {
   let store = updateNativeSubagents(
     {},

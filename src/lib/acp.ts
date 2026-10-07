@@ -29,6 +29,15 @@ export interface InterruptedAgentTurn {
   text: string;
 }
 
+export interface AcpPromptOutcome {
+  stopReason: string;
+  sailInterrupted?: boolean;
+}
+
+export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
+  return outcome.stopReason === 'cancelled' || outcome.sailInterrupted === true;
+}
+
 export function loadInterruptedAgentTurns(raw: string | null): InterruptedAgentTurn[] {
   try {
     const value: unknown = JSON.parse(raw ?? '[]');
@@ -163,7 +172,12 @@ export interface AgentActivity {
   sessions: string[];
   finished: Record<
     string,
-    { status: 'done' | 'failed'; notify: boolean; turnId: string; error?: string | null }
+    {
+      status: 'done' | 'failed' | 'interrupted';
+      notify: boolean;
+      turnId: string;
+      error?: string | null;
+    }
   >;
 }
 
@@ -461,7 +475,7 @@ export const acp = {
     turnId: string,
     imagePaths: string[] = [],
   ) =>
-    invoke<{ stopReason: string }>('acp_prompt', {
+    invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, sessionId, text, turnId, imagePaths },
     }),
   steer: (agent: AgentId, sessionId: string, text: string, imagePaths: string[] = []) =>
@@ -494,3 +508,21 @@ export const acp = {
   authenticate: (agent: AgentId, methodId: string) =>
     invoke<Record<string, unknown>>('acp_authenticate', { agent, methodId }),
 };
+
+export async function acpFinishedPromptStatus(
+  agent: AgentId,
+  sessionId: string,
+  turnId: string,
+): Promise<'done' | 'failed' | 'interrupted' | null> {
+  const activity = await acp.activity().catch(() => null);
+  const finished = activity?.[agent]?.finished[sessionId];
+  return finished?.turnId === turnId ? finished.status : null;
+}
+
+export async function acpFailedPromptInterrupted(
+  agent: AgentId,
+  sessionId: string,
+  turnId: string,
+): Promise<boolean> {
+  return (await acpFinishedPromptStatus(agent, sessionId, turnId)) === 'interrupted';
+}

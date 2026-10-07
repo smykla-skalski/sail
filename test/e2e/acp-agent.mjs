@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
+const delayedSessionDirectories = new Set();
 const permissions = new Map();
 const activePrompts = new Map();
 const steerWaiters = new Map();
@@ -177,13 +178,17 @@ for await (const line of createInterface({ input: process.stdin })) {
       config: { model: 'test', effort: 'medium' },
     });
     update(sessionId, { sessionUpdate: 'available_commands_update', availableCommands });
+    const delayFirstAttentionSession =
+      message.params.cwd.includes('sail-attention-') &&
+      !delayedSessionDirectories.has(message.params.cwd);
+    if (delayFirstAttentionSession) delayedSessionDirectories.add(message.params.cwd);
     setTimeout(
       () =>
         send({
           id: message.id,
           result: { sessionId, configOptions: configOptions(sessionId), availableCommands },
         }),
-      1000,
+      delayFirstAttentionSession ? 3000 : 1000,
     );
   } else if (message.method === 'session/resume') {
     const session = sessions.get(message.params.sessionId);
@@ -264,6 +269,72 @@ for await (const line of createInterface({ input: process.stdin })) {
     const { sessionId } = message.params;
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    if (text === 'Agent interrupted') {
+      send({ id: message.id, result: { stopReason: 'cancelled' } });
+      continue;
+    }
+    if (text === 'Agent error interrupted') {
+      send({ id: message.id, error: { code: -1, message: 'Step interrupted' } });
+      continue;
+    }
+    if (
+      text === 'Agent text interrupted' ||
+      text === 'Agent text interrupted error' ||
+      text === 'Agent text interrupted unrelated error'
+    ) {
+      update(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'interrupted-step-tool',
+        title: 'Read task',
+        status: 'in_progress',
+      });
+      update(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Step inter' },
+      });
+      update(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'interrupted-step-tool',
+        status: 'completed',
+      });
+      update(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'rupted' },
+      });
+      if (text === 'Agent text interrupted error')
+        send({ id: message.id, error: { code: -1, message: 'Step interrupted' } });
+      else if (text === 'Agent text interrupted unrelated error')
+        send({ id: message.id, error: { code: -1, message: 'Model unavailable' } });
+      else send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Discuss interruption') {
+      update(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'The previous step was interrupted, then recovered.' },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Continue after interruption') {
+      update(sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Step interrupted' },
+      });
+      update(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'recovery-tool',
+        title: 'Continue work',
+        status: 'in_progress',
+      });
+      update(sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'recovery-tool',
+        status: 'completed',
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text.startsWith('Gate prompt model unavailable')) {
       send({ id: message.id, error: { code: -1, message: 'Model x is unavailable' } });
       continue;
@@ -458,6 +529,31 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
+    if (text === 'Native interrupted subagent') {
+      const child = `${sessionId}:interrupted-child`;
+      const remember = (target, value) => {
+        sessions.get(sessionId).history.push({ sessionId: target, update: value });
+        update(target, value);
+      };
+      remember(sessionId, {
+        sessionUpdate: 'subagent_spawned',
+        subagentSessionId: child,
+        name: 'worker',
+        task: 'Inspect interrupted delegation',
+        capabilities: {},
+      });
+      remember(child, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Step interrupted' },
+      });
+      remember(sessionId, {
+        sessionUpdate: 'subagent_state_update',
+        subagentSessionId: child,
+        state: 'completed',
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Post-hook failure demo') {
       update(sessionId, {
         sessionUpdate: 'tool_call',
@@ -606,7 +702,16 @@ for await (const line of createInterface({ input: process.stdin })) {
     for (const [id, pending] of permissions) {
       if (pending.sessionId === message.params.sessionId) {
         permissions.delete(id);
-        const finish = () => send({ id: pending.promptId, result: { stopReason: 'cancelled' } });
+        const finish = () => {
+          if (pending.text === 'Crash on cancel') process.exit(0);
+          if (pending.text === 'Cancel error')
+            send({ id: pending.promptId, error: { code: -1, message: 'Step interrupted' } });
+          else
+            send({
+              id: pending.promptId,
+              result: { stopReason: pending.text === 'Cancel ignored' ? 'end_turn' : 'cancelled' },
+            });
+        };
         if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
         else finish();
       }

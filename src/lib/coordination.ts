@@ -33,6 +33,7 @@ export function projectWorktreeInfo(
       waiting: 0,
       done: 0,
       failed: 0,
+      interrupted: 0,
       unknown: 0,
     };
     for (const thread of known) threadStatuses[attention[threadKey(thread)]?.status ?? 'unknown']++;

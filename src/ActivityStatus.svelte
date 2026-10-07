@@ -53,7 +53,8 @@
   .activity-status[data-state='ready'] {
     --activity-color: var(--activity-completed);
   }
-  .activity-status[data-state='failed'] {
+  .activity-status[data-state='failed'],
+  .activity-status[data-state='interrupted'] {
     --activity-color: var(--activity-failed);
   }
   .activity-status-icon {

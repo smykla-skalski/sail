@@ -49,7 +49,7 @@
     coordinationPrompt,
     type CoordinationMessage,
   } from './lib/coordination';
-  import type { ThreadStatus } from './lib/attention';
+  import { openCodeExecutionStatus, openCodeTurnStatus, type ThreadStatus } from './lib/attention';
   import { openCodeContextUsage } from './lib/agent-usage';
   import {
     clipboardFiles,
@@ -309,6 +309,7 @@
     if (spawnRevision && following) void follow();
   });
   let stopRequested = false;
+  let lastExecutionStatus: ThreadStatus | null = null;
   const busy = $derived(sending || running || configuring);
   const inputReady = $derived(
     !!setup?.workReady || (session?.agent === 'architect' && !!setup?.planReady),
@@ -541,6 +542,7 @@
     files = [];
     selectedThreadId = id;
     activeID = id;
+    lastExecutionStatus = null;
     session = null;
     const cached = id ? recallOpenCodeTimeline(directory, id) : null;
     messages = cached?.messages ?? [];
@@ -666,17 +668,12 @@
             void refreshRequests(activeID).catch((cause) => (error = describe(cause)));
           if (id !== activeID) continue;
           if (event.type === 'session.execution.started') running = true;
-          if (
-            event.type === 'session.execution.succeeded' ||
-            event.type === 'session.execution.failed' ||
-            event.type === 'session.execution.interrupted'
-          ) {
+          const executionStatus = openCodeExecutionStatus(event.type);
+          if (executionStatus === 'working') lastExecutionStatus = null;
+          else if (executionStatus) lastExecutionStatus = executionStatus;
+          if (executionStatus && executionStatus !== 'working') {
             running = false;
-            if (session)
-              onstatus(
-                summary(session),
-                event.type === 'session.execution.failed' ? 'failed' : 'done',
-              );
+            if (session) onstatus(summary(session), executionStatus);
           }
           if (event.type === 'permission.asked' && session) onstatus(summary(session), 'waiting');
           if (!refreshTimer)
@@ -753,6 +750,7 @@
     for (const path of paths) if (pickedImages.has(path)) inFlightCaptures.add(path);
     for (const path of paths) if (clipboardPaths.has(path)) inFlightClipboard.add(path);
     let accepted = false;
+    let settledStatus: ThreadStatus | null = null;
     if (!external) {
       draft = '';
       files = [];
@@ -760,6 +758,7 @@
     const queued = running;
     sending = true;
     stopRequested = false;
+    lastExecutionStatus = null;
     error = '';
     try {
       let id = activeID;
@@ -866,7 +865,8 @@
         if (current !== generation || id !== activeID || disposed) return;
         session = latest;
         running = false;
-        onstatus(summary(latest), latest.outcome === 'failed' ? 'failed' : 'done', !stopRequested);
+        settledStatus = openCodeTurnStatus(latest.outcome, stopRequested, lastExecutionStatus);
+        onstatus(summary(latest), settledStatus, !stopRequested);
         await refreshMessages(id, current);
         if (current !== generation || id !== activeID || disposed) return;
         onactivity(summary(latest));
@@ -880,7 +880,8 @@
         }
         if (!queued) {
           running = false;
-          if (session) onstatus(summary(session), 'failed');
+          if (session && !settledStatus && !lastExecutionStatus)
+            onstatus(summary(session), 'failed');
         }
       }
       if (external) throw cause;
@@ -908,7 +909,13 @@
     stopRequested = true;
     try {
       await client.session.interrupt({ sessionID: activeID });
-      running = false;
+    } catch (cause) {
+      stopRequested = false;
+      error = describe(cause);
+      return;
+    }
+    running = false;
+    try {
       await refreshMessages(activeID);
     } catch (cause) {
       error = describe(cause);

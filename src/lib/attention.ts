@@ -1,4 +1,32 @@
-export type ThreadStatus = 'working' | 'waiting' | 'done' | 'failed';
+export type ThreadStatus = 'working' | 'waiting' | 'done' | 'failed' | 'interrupted';
+
+export function openCodeExecutionStatus(eventType: string): ThreadStatus | null {
+  switch (eventType) {
+    case 'session.execution.started':
+      return 'working';
+    case 'session.execution.succeeded':
+      return 'done';
+    case 'session.execution.failed':
+      return 'failed';
+    case 'session.execution.interrupted':
+      return 'interrupted';
+    default:
+      return null;
+  }
+}
+
+export function openCodeTurnStatus(
+  outcome: 'succeeded' | 'failed' | 'interrupted' | undefined,
+  stopRequested: boolean,
+  observedStatus: ThreadStatus | null = null,
+): ThreadStatus {
+  if (outcome === 'succeeded') return 'done';
+  if (outcome === 'failed') return 'failed';
+  if (outcome === 'interrupted') return 'interrupted';
+  if (observedStatus === 'done' || observedStatus === 'failed' || observedStatus === 'interrupted')
+    return observedStatus;
+  return stopRequested ? 'interrupted' : 'done';
+}
 
 export type ThreadAttention = { status: ThreadStatus; unread: boolean };
 
@@ -10,7 +38,7 @@ export type ActivitySnapshot = Record<
     alive: boolean;
     active: string[];
     waiting: string[];
-    finished: Record<string, { status: 'done' | 'failed'; notify: boolean }>;
+    finished: Record<string, { status: 'done' | 'failed' | 'interrupted'; notify: boolean }>;
   }
 >;
 
@@ -40,7 +68,7 @@ export function reconcileAttention(
   return next;
 }
 
-const statuses = new Set(['working', 'waiting', 'done', 'failed']);
+const statuses = new Set(['working', 'waiting', 'done', 'failed', 'interrupted']);
 
 function isThreadStatus(value: unknown): value is ThreadStatus {
   return typeof value === 'string' && statuses.has(value);

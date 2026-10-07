@@ -31,6 +31,7 @@ const priority: Record<ThreadStatus, number> = {
   waiting: 0,
   working: 1,
   failed: 2,
+  interrupted: 2,
   done: 3,
 };
 
