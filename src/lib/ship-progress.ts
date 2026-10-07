@@ -82,7 +82,12 @@ export function requiredValidationGatesSatisfied(
   return policy.requiredGates.every((name) => {
     const gate = gates
       .filter((item) => item.gate === name && item.revision === policy.revision)
-      .toSorted((left, right) => right.updated - left.updated)[0];
+      .toSorted(
+        (left, right) =>
+          right.updated - left.updated ||
+          right.created - left.created ||
+          right.id.localeCompare(left.id),
+      )[0];
     if (!gate || gate.state !== 'completed') return false;
     return name === 'test-adversary' ? gate.verdict === 'PASS' : gate.verdict === 'CLEAN';
   });

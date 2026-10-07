@@ -1811,12 +1811,54 @@ fn archive_ignored_and_remove(
     worktree: String,
     expected_revision: Option<String>,
 ) -> Result<Option<String>, String> {
+    archive_ignored_and_remove_with_hook(repository, worktree, expected_revision, |_| Ok(()))
+}
+
+fn rollback_staged_archive(
+    staging: &Path,
+    worktree: &Path,
+    moved: &[PathBuf],
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for relative in moved.iter().rev() {
+        let source = staging.join(relative);
+        let destination = worktree.join(relative);
+        if let Some(parent) = destination.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                failures.push(format!("{}: {error}", relative.display()));
+                continue;
+            }
+        }
+        if let Err(error) = std::fs::rename(&source, &destination) {
+            failures.push(format!("{}: {error}", relative.display()));
+        }
+    }
+    if failures.is_empty() {
+        let _ = std::fs::remove_dir_all(staging);
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not restore archived worktree files: {}",
+            failures.join(", ")
+        ))
+    }
+}
+
+fn archive_ignored_and_remove_with_hook<F>(
+    repository: String,
+    worktree: String,
+    expected_revision: Option<String>,
+    mut after_move: F,
+) -> Result<Option<String>, String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+{
     const IGNORED: &str = "Worktree has ignored files. Move or remove them before deleting.";
     let worktree = PathBuf::from(worktree);
     let parent = worktree.parent().ok_or("Worktree parent is missing.")?;
-    let archive = parent
-        .join(".sail-shipping-archive")
-        .join(worktree.file_name().ok_or("Worktree name is missing.")?);
+    let archive_root = parent.join(".sail-shipping-archive");
+    let worktree_name = worktree.file_name().ok_or("Worktree name is missing.")?;
+    let archive = archive_root.join(worktree_name);
     let saved_archive = || {
         archive
             .exists()
@@ -1878,31 +1920,122 @@ fn archive_ignored_and_remove(
     if ignored.is_empty() {
         return Err("Ignored worktree files changed during cleanup. Retry.".to_string());
     }
-    for relative in ignored {
-        let destination = archive.join(&relative);
-        if destination.exists() {
-            return Err(format!(
-                "Ignored file archive already contains {}. Inspect {} before retrying.",
-                relative.display(),
-                archive.display()
-            ));
-        }
-        std::fs::create_dir_all(destination.parent().ok_or("Invalid archive path.")?)
-            .map_err(|error| format!("Cannot prepare ignored file archive: {error}"))?;
-        std::fs::rename(worktree.join(relative), destination).map_err(|error| {
-            format!(
-                "Cannot archive ignored worktree files to {}: {error}",
-                archive.display()
-            )
-        })?;
+    if archive.exists() {
+        return Err(format!(
+            "Ignored file archive already exists. Inspect {} before retrying.",
+            archive.display()
+        ));
     }
-    remove_worktree(
+    std::fs::create_dir_all(&archive_root)
+        .map_err(|error| format!("Cannot prepare ignored file archive: {error}"))?;
+    let staging = archive_root.join(format!(
+        ".staging-{}-{}",
+        worktree_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&staging)
+        .map_err(|error| format!("Cannot prepare ignored file archive: {error}"))?;
+    let mut moved = Vec::new();
+    for relative in ignored {
+        let destination = staging.join(&relative);
+        std::fs::create_dir_all(destination.parent().ok_or("Invalid archive path.")?).map_err(
+            |error| {
+                let rollback = rollback_staged_archive(&staging, &worktree, &moved);
+                format!(
+                    "Cannot prepare ignored file archive: {error}{}",
+                    rollback
+                        .err()
+                        .map(|failure| format!("; {failure}"))
+                        .unwrap_or_default()
+                )
+            },
+        )?;
+        if let Err(error) = std::fs::rename(worktree.join(&relative), &destination) {
+            let rollback = rollback_staged_archive(&staging, &worktree, &moved);
+            return Err(format!(
+                "Cannot archive ignored worktree files to {}: {error}",
+                archive.display(),
+            ) + &rollback
+                .err()
+                .map(|failure| format!("; {failure}"))
+                .unwrap_or_default());
+        }
+        moved.push(relative.clone());
+        if let Err(error) = after_move(&relative) {
+            let rollback = rollback_staged_archive(&staging, &worktree, &moved);
+            return Err(error
+                + &rollback
+                    .err()
+                    .map(|failure| format!("; {failure}"))
+                    .unwrap_or_default());
+        }
+    }
+    if let Err(error) = remove_worktree(
         repository,
         worktree.to_string_lossy().into_owned(),
         None,
         expected_revision.as_deref(),
-    )?;
+    ) {
+        let rollback = rollback_staged_archive(&staging, &worktree, &moved);
+        return Err(error
+            + &rollback
+                .err()
+                .map(|failure| format!("; {failure}"))
+                .unwrap_or_default());
+    }
+    std::fs::rename(&staging, &archive).map_err(|error| {
+        format!(
+            "Worktree was removed, but its ignored files remain preserved at {}: {error}",
+            staging.display()
+        )
+    })?;
     Ok(saved_archive())
+}
+
+struct GuardedRemovalState {
+    reference: String,
+    head: String,
+}
+
+fn guarded_removal_state(
+    worktree: &Path,
+    expected_revision: Option<&str>,
+) -> Result<Option<GuardedRemovalState>, String> {
+    if expected_revision.is_none() {
+        return Ok(None);
+    }
+    let reference = git_reference(worktree, &["symbolic-ref", "-q", "HEAD"])
+        .ok_or("Revision-guarded cleanup requires a branch checkout.")?;
+    let head = git_reference(worktree, &["rev-parse", "HEAD"])
+        .ok_or("Cannot capture the worktree commit before deletion.")?;
+    Ok(Some(GuardedRemovalState { reference, head }))
+}
+
+fn restore_changed_worktree(
+    repository: &Path,
+    worktree: &Path,
+    state: &GuardedRemovalState,
+) -> Result<(), String> {
+    let branch = state
+        .reference
+        .strip_prefix("refs/heads/")
+        .ok_or("Cannot restore a non-local worktree branch.")?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["worktree", "add"])
+        .arg(worktree)
+        .arg(branch)
+        .output()
+        .map_err(|error| format!("Cannot restore the changed worktree: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Cannot restore the changed worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 fn remove_worktree(
@@ -1911,6 +2044,19 @@ fn remove_worktree(
     force: Option<bool>,
     expected_revision: Option<&str>,
 ) -> Result<(), String> {
+    remove_worktree_with_hook(repository, worktree, force, expected_revision, || Ok(()))
+}
+
+fn remove_worktree_with_hook<F>(
+    repository: String,
+    worktree: String,
+    force: Option<bool>,
+    expected_revision: Option<&str>,
+    before_remove: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     let repository = PathBuf::from(validate_repository(repository)?)
         .canonicalize()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
@@ -1971,6 +2117,8 @@ fn remove_worktree(
         }
     }
     ensure_expected_revision()?;
+    let guarded = guarded_removal_state(&worktree, expected_revision)?;
+    before_remove()?;
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -1988,6 +2136,20 @@ fn remove_worktree(
             "Cannot delete worktree: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
+    }
+    if let Some(state) = guarded {
+        let current = git_reference(&repository, &["rev-parse", "--verify", &state.reference]);
+        if current.as_deref() != Some(state.head.as_str()) {
+            let restore = restore_changed_worktree(&repository, &worktree, &state);
+            return Err(format!(
+                "Worktree changed during deletion. Its branch {} preserves the new commit.{}",
+                state.reference,
+                restore
+                    .err()
+                    .map(|error| format!(" {error}"))
+                    .unwrap_or_else(|| " The checkout was restored.".to_string())
+            ));
+        }
     }
     Ok(())
 }
@@ -2188,9 +2350,10 @@ mod tests {
     #[cfg(any(unix, windows))]
     use super::working_tree_generation;
     use super::{
-        add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
-        git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
-        remove_worktree, repository_namespace, server_args, shipping_changed_paths,
+        add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
+        existing_shipping_worktree, git_change_action, git_patch, normalize_picker_path,
+        parse_registered_worktrees, registered_worktrees, remove_worktree,
+        remove_worktree_with_hook, repository_namespace, server_args, shipping_changed_paths,
         shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
         working_tree_diff, worktree_overviews,
     };
@@ -2198,7 +2361,7 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     #[cfg(unix)]
@@ -2549,6 +2712,172 @@ mod tests {
             None,
         )
         .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn ignored_archive_fixture(prefix: &str) -> (PathBuf, String, String, String) {
+        let root = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        let repository = root.join("repository");
+        let parent = root.join("worktrees");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&parent).unwrap();
+        let repository = repository.canonicalize().unwrap();
+        let repository_path = repository.to_string_lossy().into_owned();
+        git(&repository_path, &["init", "-q"]);
+        fs::write(repository.join(".gitignore"), "*.tmp\n").unwrap();
+        fs::write(repository.join("tracked.txt"), "before\n").unwrap();
+        git(&repository_path, &["add", ".gitignore", "tracked.txt"]);
+        git(
+            &repository_path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        );
+        let created = add_worktree(
+            repository_path.clone(),
+            "child".into(),
+            Some(parent.to_string_lossy().into_owned()),
+            Some("HEAD".into()),
+        )
+        .unwrap();
+        fs::write(Path::new(&created.path).join("one.tmp"), "one").unwrap();
+        fs::write(Path::new(&created.path).join("two.tmp"), "two").unwrap();
+        let expected =
+            tauri::async_runtime::block_on(working_tree_revision(created.path.clone())).unwrap();
+        (root, repository_path, created.path, expected)
+    }
+
+    #[test]
+    fn archive_failure_restores_every_moved_ignored_file() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-archive-rollback-test");
+        let mut moved = 0;
+
+        let error = archive_ignored_and_remove_with_hook(
+            repository.clone(),
+            worktree.clone(),
+            Some(expected),
+            |_| {
+                moved += 1;
+                if moved == 1 {
+                    Err("injected archive failure".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected archive failure"));
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("one.tmp")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("two.tmp")).unwrap(),
+            "two"
+        );
+        remove_worktree(repository, worktree, Some(true), None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_revision_drift_restores_every_moved_ignored_file() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-archive-drift-test");
+        let mut changed = false;
+
+        let error = archive_ignored_and_remove_with_hook(
+            repository.clone(),
+            worktree.clone(),
+            Some(expected),
+            |_| {
+                if !changed {
+                    fs::write(Path::new(&worktree).join("tracked.txt"), "after\n").unwrap();
+                    git(&worktree, &["add", "tracked.txt"]);
+                    git(
+                        &worktree,
+                        &[
+                            "-c",
+                            "user.name=Sail Test",
+                            "-c",
+                            "user.email=sail@example.test",
+                            "-c",
+                            "commit.gpgsign=false",
+                            "commit",
+                            "-qm",
+                            "race commit",
+                        ],
+                    );
+                    changed = true;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed after validation"));
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("one.tmp")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("two.tmp")).unwrap(),
+            "two"
+        );
+        remove_worktree(repository, worktree, Some(true), None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removal_race_restores_checkout_at_the_new_commit() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-delete-race-test");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+
+        let error = remove_worktree_with_hook(
+            repository.clone(),
+            worktree.clone(),
+            None,
+            Some(&expected),
+            || {
+                fs::write(Path::new(&worktree).join("tracked.txt"), "after\n").unwrap();
+                git(&worktree, &["add", "tracked.txt"]);
+                git(
+                    &worktree,
+                    &[
+                        "-c",
+                        "user.name=Sail Test",
+                        "-c",
+                        "user.email=sail@example.test",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "-qm",
+                        "racing commit",
+                    ],
+                );
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed during deletion"));
+        assert!(error.contains("checkout was restored"));
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
+            "after\n"
+        );
+        remove_worktree(repository, worktree, Some(true), None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

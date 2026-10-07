@@ -144,6 +144,17 @@ void test('required gates reject stale revisions and non-completed passing verdi
     requiredShipGatesSatisfied(policy, [pass, { ...pass, updated: 2, state: 'failed' }]),
     false,
   );
+  assert.equal(
+    requiredShipGatesSatisfied(policy, [
+      pass,
+      { ...pass, id: 'later-created', created: 2, state: 'failed' },
+    ]),
+    false,
+  );
+  assert.equal(
+    requiredShipGatesSatisfied(policy, [pass, { ...pass, id: 'z-last', state: 'interrupted' }]),
+    false,
+  );
 });
 
 void test('validation inputs retry until paths and config share one stable revision', async () => {
