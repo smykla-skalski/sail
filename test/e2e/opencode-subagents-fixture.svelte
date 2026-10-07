@@ -5,6 +5,7 @@
 
   const calls = {
     list: 0,
+    listTimes: [] as number[],
     summaries: {} as Record<string, number>,
     histories: {} as Record<string, number>,
   };
@@ -26,6 +27,7 @@
     session: {
       list: async () => {
         calls.list++;
+        calls.listTimes.push(Math.round(performance.now()));
         return { data: children, cursor: {} };
       },
       active: async () => Object.fromEntries(children.map((child) => [child.id, {}])),

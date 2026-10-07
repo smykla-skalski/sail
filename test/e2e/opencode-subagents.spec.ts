@@ -2,6 +2,7 @@ import { browser, expect } from '@wdio/globals';
 
 type Calls = {
   list: number;
+  listTimes: number[];
   summaries: Record<string, number>;
   histories: Record<string, number>;
 };
@@ -39,15 +40,17 @@ describe('OpenCode subagents', () => {
     );
 
     const before = await calls();
-    await browser.pause(6_500);
+    await browser.waitUntil(async () => (await calls()).list >= before.list + 2, {
+      timeout: 20_000,
+      interval: 250,
+      timeoutMsg: 'the shared poll did not run twice',
+    });
     const after = await calls();
-    const polls = after.list - before.list;
-    console.info('[opencode-subagents] polls in 6.5 s', polls, before, after);
+    const gaps = after.listTimes.slice(1).map((time, index) => time - after.listTimes[index]);
+    console.info('[opencode-subagents] poll gaps', gaps, before, after);
 
-    expect(polls).toBeGreaterThanOrEqual(1);
-    expect(polls).toBeLessThanOrEqual(3);
-    for (const id of ['child-a', 'child-b'])
-      expect(after.summaries[id] - before.summaries[id]).toBe(polls);
-    expect(after.histories['child-a'] - before.histories['child-a']).toBe(polls);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(2_500);
+    for (const id of ['child-a', 'child-b']) expect(after.summaries[id]).toBe(after.list);
+    expect(after.histories['child-a'] - before.histories['child-a']).toBe(after.list - before.list);
   });
 });
