@@ -51,6 +51,8 @@ Sail connects its MCP server to each Claude, Codex, and OpenCode agent session. 
 
 Bundled workflow prompts include only their core contract. Agents load detailed references on demand through `skill_reference`; the files stay embedded for offline use, every response carries an exact SHA-256 content version, and each load remains visible in the task transcript.
 
+Every Ship task also has one durable checkpoint in Sail's persisted run state. The owning agent reads it through `task_checkpoint_read` before resuming and updates objective, acceptance criteria, phase, revision, gates, blockers, questions, and next action through `task_checkpoint_update`. Sail binds each update to the live worktree revision and refreshes GitHub delivery state before returning reconciliation facts, so stale conversation context cannot silently resume work.
+
 Use **+ Group** and **+ Repo** in the sidebar to organize saved repositories. Each repository row has a **+** control to create a worktree. Sail uses the remote default branch when Git records one, then `main` or `master`, then the main checkout branch. Enter a base branch in the form to choose another starting point. By default, new worktrees live in `~/sail/worktrees/<repository>-<id>/<name>` so repositories with the same name stay separate; choose a different parent folder in the form when needed. `SAIL_WORKTREE_ROOT` overrides the default root.
 
 To customize worktrees, commit `.sail/worktree.json` in the repository:

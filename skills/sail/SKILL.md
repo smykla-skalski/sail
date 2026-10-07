@@ -22,6 +22,13 @@ browser. Read the tool schemas before calling them.
 
 ## Worktrees and agents
 
+- Before resuming a Ship task, call `task_checkpoint_read` and inspect its
+  reconciliation result. Stop on a revision or delivery-state mismatch.
+- Call `task_checkpoint_update` after every phase, blocker, revision,
+  required-gate, unresolved-question, or next-action change. Keep one concrete
+  next action; never infer success from the phase alone. Pass the sequence and
+  revision from the last read. If Git drifted, inspect it and set
+  `rebindRevision` explicitly; on a stale-update error, read and merge again.
 - Use `worktree_list` to find project worktrees and live agent threads. Use
   `worktree_info` for details about a listed path.
 - Use `agent_spawn` to start Claude, Codex, or OpenCode without interactive
