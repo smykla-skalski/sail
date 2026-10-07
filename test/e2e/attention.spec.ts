@@ -203,6 +203,16 @@ describe('agent thread attention', () => {
     await expect(textInterruptedWithError).toHaveText(expect.stringContaining('Interrupted'));
 
     await waitForComposer();
+    await $('.agent-composer textarea').setValue('Agent text interrupted unrelated error');
+    await $('.agent-actions button').click();
+    await $('.agent-launches button').click();
+    const unrelatedError = $(
+      '.project-agent-row[aria-label*="Agent text interrupted unrelated error"]',
+    );
+    await expect(unrelatedError.$('.activity-status')).toHaveAttribute('data-state', 'failed');
+    await expect(unrelatedError).toHaveText(expect.stringContaining('Failed'));
+
+    await waitForComposer();
     await $('.agent-composer textarea').setValue('Discuss interruption');
     await $('.agent-actions button').click();
     await $('.agent-launches button').click();

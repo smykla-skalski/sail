@@ -1239,11 +1239,21 @@ pub async fn acp_prompt(
         let reported_error_interruption = result
             .as_ref()
             .err()
-            .is_some_and(|error| error.trim().eq_ignore_ascii_case("Step interrupted"));
+            .is_some_and(|error| {
+                matches!(
+                    error.trim().to_ascii_lowercase().as_str(),
+                    "step interrupted"
+                        | "cancelled"
+                        | "canceled"
+                        | "request cancelled"
+                        | "request canceled"
+                        | "operation cancelled"
+                        | "operation canceled"
+                )
+            });
         let interrupted = cancelled_result
-            || reported_interruption
             || reported_error_interruption
-            || (explicitly_cancelled && result.is_err() && runtime.alive.load(Ordering::Acquire));
+            || (reported_interruption && result.is_ok());
         if interrupted {
             if let Ok(Value::Object(payload)) = &mut result {
                 payload.insert("sailInterrupted".into(), Value::Bool(true));

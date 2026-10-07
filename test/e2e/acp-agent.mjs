@@ -272,7 +272,11 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, error: { code: -1, message: 'Step interrupted' } });
       continue;
     }
-    if (text === 'Agent text interrupted' || text === 'Agent text interrupted error') {
+    if (
+      text === 'Agent text interrupted' ||
+      text === 'Agent text interrupted error' ||
+      text === 'Agent text interrupted unrelated error'
+    ) {
       update(sessionId, {
         sessionUpdate: 'tool_call',
         toolCallId: 'interrupted-step-tool',
@@ -294,6 +298,8 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
       if (text === 'Agent text interrupted error')
         send({ id: message.id, error: { code: -1, message: 'Step interrupted' } });
+      else if (text === 'Agent text interrupted unrelated error')
+        send({ id: message.id, error: { code: -1, message: 'Model unavailable' } });
       else send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
