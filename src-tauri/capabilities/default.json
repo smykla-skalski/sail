@@ -11,6 +11,7 @@
     "allow-list-interrupted-agent-turns",
     "allow-finish-interrupted-agent-turn",
     "allow-start-runtime",
+    "allow-repository-path-available",
     "allow-validate-repository",
     "allow-list-picker-directory",
     "dialog:allow-open",

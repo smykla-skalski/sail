@@ -637,6 +637,12 @@ fn start_runtime(
 }
 
 #[tauri::command]
+fn repository_path_available(path: String) -> bool {
+    let directory = Path::new(&path);
+    directory.is_dir() && directory.join(".git").exists()
+}
+
+#[tauri::command]
 fn validate_repository(path: String) -> Result<String, String> {
     let directory = Path::new(&path)
         .canonicalize()
@@ -1834,6 +1840,7 @@ pub fn run() {
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,
             start_runtime,
+            repository_path_available,
             validate_repository,
             list_picker_directory,
             working_tree_diff,
