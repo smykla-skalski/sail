@@ -1,6 +1,7 @@
 import type { PublishedGraph } from './issue-graph';
 import type { SpawnState } from './agent-results';
 import type { ShipEvent, ShipGate, ShipCheck } from './ship-progress';
+import { initialTaskCheckpoint, type TaskCheckpoint } from './task-checkpoint.ts';
 
 export type ShipIssueState =
   'pending' | 'starting' | 'working' | 'awaiting_merge' | 'failed' | 'merged';
@@ -36,6 +37,8 @@ export interface ShipIssue {
   checks?: ShipCheck[];
   refreshedAt?: number;
   refreshError?: string | null;
+  checkpoint?: TaskCheckpoint;
+  checkpointThreadIds?: string[];
 }
 
 export interface ShipRun {
@@ -116,6 +119,14 @@ export function adoptDirectShipRun(runs: ShipRun[], input: DirectShipRunInput): 
           error: null,
           stage: 'implementing',
           events: [{ at: input.approvedAt, stage: 'implementing' }],
+          checkpoint: initialTaskCheckpoint(
+            {
+              id: `${input.repository}#${input.number}`,
+              url: `https://github.com/${input.repository}/issues/${input.number}`,
+              title: `Issue #${input.number}`,
+            },
+            input.approvedAt,
+          ),
         },
       ],
     },
@@ -194,6 +205,10 @@ export function createShipRun(
       setupCompleted: false,
       archivePath: null,
       error: null,
+      checkpoint: initialTaskCheckpoint(
+        { id: issue.id, url: issue.url, title: issue.title },
+        approvedAt,
+      ),
     })),
   };
 }

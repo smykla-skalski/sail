@@ -93,6 +93,9 @@ button:disabled {
   min-height: 0;
   overflow: hidden;
 }
+.app-shell[data-details-visible='true'] {
+  grid-template-columns: 248px minmax(0, 1fr) 8px var(--details-width);
+}
 .sidebar {
   width: 248px;
   flex: 0 0 248px;
@@ -106,11 +109,36 @@ button:disabled {
   grid-column: 2;
   grid-row: 1;
 }
+.app-shell > .details-resizer {
+  grid-column: 3;
+  grid-row: 1;
+}
+.app-shell > .side-area {
+  grid-column: 4;
+  grid-row: 1;
+  background: var(--shell-sidebar);
+  border-left: 1px solid var(--shell-divider);
+}
+.app-shell > .ship-fallback {
+  grid-column: 3 / 5;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--shell-divider);
+  background: var(--shell-sidebar);
+}
+.app-shell:not([data-details-visible='true']) > .details-resizer,
+.app-shell:not([data-details-visible='true']) > .side-area {
+  display: none;
+}
 .app-shell[data-sidebar-visible='false'] .sidebar {
   display: none;
 }
 .app-shell[data-sidebar-visible='false'] {
   grid-template-columns: 0 minmax(0, 1fr);
+}
+.app-shell[data-sidebar-visible='false'][data-details-visible='true'] {
+  grid-template-columns: 0 minmax(0, 1fr) 8px var(--details-width);
 }
 .sidebar-toggle {
   flex: 0 0 auto;
@@ -979,14 +1007,8 @@ button:disabled {
   min-height: 0;
 }
 .ship-fallback {
-  position: absolute;
-  z-index: 2;
-  top: var(--topbar-height);
-  right: 0;
-  bottom: 0;
-  width: min(420px, 100%);
-  border-left: 1px solid var(--shell-divider);
-  box-shadow: -8px 0 24px #0002;
+  display: flex;
+  flex-direction: column;
 }
 .agent-launches {
   display: flex;
@@ -1181,7 +1203,7 @@ button:disabled {
 }
 .workspace {
   display: grid;
-  grid-template-columns: minmax(300px, 1fr) 8px minmax(320px, var(--details-width));
+  grid-template-columns: minmax(0, 1fr);
   flex: 1;
   min-height: 0;
 }
@@ -1509,16 +1531,6 @@ button:disabled {
 .pane-picker-empty {
   text-align: center;
 }
-.workspace.single {
-  grid-template-columns: minmax(0, 1fr);
-}
-.pane-split .workspace:not(.single) {
-  grid-template-columns: minmax(0, 1fr) 8px minmax(0, min(42%, var(--details-width)));
-}
-.workspace.closed .details-resizer,
-.workspace.closed .side-area {
-  display: none;
-}
 .details-resizer {
   position: relative;
   width: 8px;
@@ -1558,10 +1570,9 @@ button:disabled {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  padding: 6px 12px;
-  border-left: 1px solid var(--shell-divider);
+  padding: 22px 12px 12px;
   border-bottom: 1px solid var(--shell-divider);
-  background: var(--sui-surface);
+  background: var(--shell-sidebar);
 }
 .side-tabs button {
   min-height: 32px;
@@ -1988,15 +1999,20 @@ button:disabled {
   .app-shell {
     grid-template-columns: 195px minmax(0, 1fr);
   }
+  .app-shell[data-details-visible='true'] {
+    grid-template-columns: 195px minmax(0, 1fr) 8px var(--details-width);
+  }
   .app-shell[data-sidebar-visible='false'] {
     grid-template-columns: 0 minmax(0, 1fr);
   }
-  .workspace {
-    grid-template-columns: minmax(300px, 1fr) 8px minmax(320px, var(--details-width));
+  .app-shell[data-sidebar-visible='false'][data-details-visible='true'] {
+    grid-template-columns: 0 minmax(0, 1fr) 8px var(--details-width);
   }
 }
 @media (max-width: 850px) {
-  .app-shell {
+  .app-shell,
+  .app-shell[data-details-visible='true'],
+  .app-shell[data-sidebar-visible='false'][data-details-visible='true'] {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) auto;
     position: relative;
@@ -2079,17 +2095,31 @@ button:disabled {
     overflow: hidden;
   }
   .workspace .chat-area,
-  .workspace .side-area,
   .pane-agent-content > .native-details {
     display: none;
     height: 100%;
   }
-  .details-resizer {
+  .app-shell > .details-resizer {
     display: none;
   }
+  .app-shell > .side-area {
+    display: none;
+    grid-column: 1;
+    grid-row: 1;
+    z-index: 2;
+    margin-top: var(--topbar-height);
+  }
+  .app-shell > .ship-fallback {
+    grid-column: 1;
+    grid-row: 1;
+    z-index: 2;
+    margin-top: var(--topbar-height);
+  }
   .app-shell[data-mobile-view='chat'] .chat-area,
-  .app-shell[data-mobile-view='details'] .workspace:not(.closed) .side-area,
   .app-shell[data-mobile-view='details'] .pane-leaf.focused .pane-agent-content > .native-details {
+    display: flex;
+  }
+  .app-shell[data-mobile-view='details'][data-details-visible='true'] > .side-area {
     display: flex;
   }
   .app-shell[data-mobile-view='details'] .pane-leaf.focused .pane-agent-content > .agent-workspace {

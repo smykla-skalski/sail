@@ -43,11 +43,14 @@
     refreshedIssueState,
     refreshedPullRequest,
     shipGatesSettled,
+    shipTaskThreadsSettled,
     reconciledShipGates,
     persistShipRefresh,
     settleShipRefresh,
     type ShippingPullRequest,
     shipOwner,
+    shipCheckpointOwner,
+    authorizeShipCheckpointThread,
     validateGateVerdict,
   } from './lib/ship-progress';
   import type { PublishedGraph } from './lib/issue-graph';
@@ -63,6 +66,11 @@
     type ShipRun,
   } from './lib/issue-shipping';
   import type { ShipItIssue } from './lib/implementation-models';
+  import {
+    initialTaskCheckpoint,
+    prepareTaskCheckpointUpdate,
+    reconcileTaskCheckpoint,
+  } from './lib/task-checkpoint.ts';
   import DiffPanel from './DiffPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
@@ -407,6 +415,8 @@
       | 'agent_spawn'
       | 'validation_gate'
       | 'ship_progress'
+      | 'task_checkpoint_read'
+      | 'task_checkpoint_update'
       | 'agent_status'
       | 'agent_wait'
       | 'agent_result'
@@ -1027,7 +1037,7 @@
     Number.isFinite(savedDetailsWidth) && savedDetailsWidth >= 320 ? savedDetailsWidth : 420,
   );
   let workspaceWidth = $state(0);
-  let workspaceElement = $state<HTMLDivElement>();
+  let appShellElement = $state<HTMLDivElement>();
   let resizeStart: { x: number; width: number } | null = null;
   let error = $state('');
   let chatScroll = $state<HTMLDivElement>();
@@ -1046,10 +1056,13 @@
   });
 
   $effect(() => {
-    if (!workspaceElement) return;
-    const element = workspaceElement;
-    const observer = new ResizeObserver(() => (workspaceWidth = element.clientWidth));
+    if (!appShellElement) return;
+    const element = appShellElement;
+    const update = () => (workspaceWidth = element.clientWidth - sidebarElement.clientWidth);
+    const observer = new ResizeObserver(update);
     observer.observe(element);
+    observer.observe(sidebarElement);
+    update();
     return () => observer.disconnect();
   });
 
@@ -1694,6 +1707,19 @@
           : sideTab === 'history'
             ? 'history'
             : 'changes',
+  );
+  let mainDetailsVisible = $derived(
+    workspaceView === 'workspace' &&
+      !mainShipFallback &&
+      !!(sessionID || acpAgent || activeSideTab === 'ship') &&
+      (acpAgent ? agentChangesOpen : detailsOpen),
+  );
+  let shipFallbackVisible = $derived(
+    workspaceView === 'workspace' &&
+      mainShipFallback &&
+      detailsOpen &&
+      activeSideTab === 'ship' &&
+      (!mobileLayout || mobileView === 'details'),
   );
 
   function showShipRuns() {
@@ -2369,7 +2395,7 @@
       const gateReporting = inlineGates
         ? 'After every completed adversary pass, use ship_progress with its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.'
         : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
-      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from the latest default branch. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -2648,7 +2674,22 @@
         if (!shippingWorkerSettled((await currentSpawnReceipt(receipt)).state)) return;
         await update({ workerSettled: true });
       }
-      if (issue.path && shipGatesSettled(issue)) {
+      const taskThreadIds = [issue.threadId, ...(issue.checkpointThreadIds ?? [])].filter(
+        (threadId): threadId is string => Boolean(threadId),
+      );
+      const taskThreadStates = Object.fromEntries(
+        await Promise.all(
+          taskThreadIds.map(async (threadId) => [
+            threadId,
+            await directShipWorkerState({ ...issue, threadId }),
+          ]),
+        ),
+      );
+      if (
+        issue.path &&
+        shipGatesSettled(issue) &&
+        shipTaskThreadsSettled(issue, taskThreadStates, spawnReceipts)
+      ) {
         try {
           await updateShipIssue(run, issue, await settledImplementationAttribution(issue.path));
           if (!shipGatesSettled(issue)) return;
@@ -2792,6 +2833,15 @@
       for (const issue of run.issues)
         for (const gate of issue.gates ?? [])
           if (!shippingWorkerSettled(gate.state)) protectedIds.add(gate.id);
+    for (const run of shipRuns)
+      for (const issue of run.issues)
+        if (issue.path) {
+          if (issue.receiptId) protectedIds.add(issue.receiptId);
+          for (const threadId of issue.checkpointThreadIds ?? []) {
+            const handoff = spawnReceipts.find((item) => item.targetId === threadId);
+            if (handoff) protectedIds.add(handoff.receiptId);
+          }
+        }
     spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
     for (const run of shipRuns) {
@@ -2813,6 +2863,16 @@
       ].toSorted((a, b) => a.created - b.created);
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     }
+    if (
+      authorizeShipCheckpointThread(
+        shipRuns,
+        receipt.sourceDirectory,
+        receipt.sourceId,
+        receipt.targetDirectory,
+        receipt.targetId,
+      )
+    )
+      void saveShipRuns().catch((cause) => (error = describe(cause)));
   }
 
   function updateSpawnReceipt(id: string, changes: Partial<SpawnReceipt>, preserveUpdated = false) {
@@ -3611,6 +3671,48 @@
           : {}),
       };
     }
+    if (request.name === 'task_checkpoint_read' || request.name === 'task_checkpoint_update') {
+      const owner = shipCheckpointOwner(shipRuns, request.directory, sourceId);
+      if (!owner) throw new Error('This thread cannot access a Ship task checkpoint.');
+      await refreshShippingIssue(owner.run, owner.issue, true);
+      const checkpoint =
+        owner.issue.checkpoint ??
+        initialTaskCheckpoint(
+          { id: owner.issue.id, url: owner.issue.url, title: owner.issue.title },
+          owner.run.approvedAt,
+        );
+      const currentRevision = await invoke<string>('working_tree_revision', {
+        path: request.directory,
+      });
+      if (request.name === 'task_checkpoint_update') {
+        const patch = request.arguments.checkpoint;
+        if (!patch || typeof patch !== 'object' || Array.isArray(patch))
+          throw new Error('Checkpoint update requires a checkpoint object.');
+        const liveCheckpoint = owner.issue.checkpoint ?? checkpoint;
+        const updated = prepareTaskCheckpointUpdate(
+          liveCheckpoint,
+          patch,
+          currentRevision,
+          request.arguments.expectedSequence,
+          request.arguments.expectedRevision,
+          request.arguments.rebindRevision,
+          Date.now(),
+        );
+        await updateShipIssue(owner.run, owner.issue, { checkpoint: updated });
+      } else if (!owner.issue.checkpoint) {
+        await updateShipIssue(owner.run, owner.issue, { checkpoint });
+      }
+      const saved = owner.issue.checkpoint ?? checkpoint;
+      return {
+        checkpoint: saved,
+        reconciliation: reconcileTaskCheckpoint(saved, currentRevision, {
+          issueState: owner.issue.issueState,
+          pullRequest: owner.issue.pullRequest,
+          deliveryState: owner.issue.state,
+          refreshError: owner.issue.refreshError,
+        }),
+      };
+    }
     if (request.name === 'ship_progress') return reportShipProgress(request, sourceId);
     if (request.name === 'validation_gate') {
       const owner = shipOwner(shipRuns, request.directory, sourceId);
@@ -4249,6 +4351,7 @@
         });
       if (receiptId)
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      if (receiptId) await saveShipRuns();
       await invoke('record_turn_snapshot', {
         path: created.path,
         thread: `acp:${source.agent}:${session.sessionId}`,
@@ -4351,6 +4454,7 @@
       });
     if (receiptId)
       await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+    if (receiptId) await saveShipRuns();
     rememberRecentThread({
       agent: 'opencode',
       sessionId: session.id,
@@ -9347,7 +9451,9 @@
   class="app-shell"
   data-mobile-view={mobileView}
   data-sidebar-visible={sidebarVisible}
-  style={`--topbar-height: ${topbarHeight}px`}
+  data-details-visible={mainDetailsVisible || shipFallbackVisible}
+  style={`--topbar-height: ${topbarHeight}px; --details-width: ${visibleDetailsWidth}px`}
+  bind:this={appShellElement}
 >
   <aside
     id="project-sidebar"
@@ -9574,15 +9680,7 @@
     {#if setupError}<p class="notice error" role="alert">{setupError}</p>{/if}
     {#if error}<div class="notice error" role="alert">{error}</div>{/if}
     {#snippet mainPaneContent()}
-      <div
-        class:single={acpAgent
-          ? !agentChangesOpen
-          : !detailsOpen || (!sessionID && activeSideTab !== 'ship')}
-        class:closed={acpAgent ? !agentChangesOpen : !detailsOpen}
-        class="workspace"
-        style={`--details-width: ${visibleDetailsWidth}px`}
-        bind:this={workspaceElement}
-      >
+      <div class="workspace">
         <main
           class="chat-area"
           aria-label="Session conversation"
@@ -9938,139 +10036,6 @@
               </div>{/if}
           {/if}
         </main>
-        {#if sessionID || acpAgent || activeSideTab === 'ship'}<div
-            class="details-resizer"
-            role="slider"
-            tabindex="0"
-            aria-label="Pane divider position"
-            aria-orientation="horizontal"
-            aria-controls="session-details"
-            aria-valuemin="300"
-            aria-valuemax={Math.max(300, workspaceWidth - 328)}
-            aria-valuenow={Math.max(300, workspaceWidth - 8 - visibleDetailsWidth)}
-            aria-valuetext={`Details pane ${visibleDetailsWidth} pixels wide`}
-            onpointerdown={startDetailsResize}
-            onpointermove={moveDetailsResize}
-            onpointerup={endDetailsResize}
-            onpointercancel={endDetailsResize}
-            onkeydown={keydownDetailsResize}
-            ondblclick={() => setDetailsWidth(420)}
-          ></div>
-          <section
-            id="session-details"
-            class="side-area"
-            aria-label="Session details"
-            tabindex="-1"
-            bind:this={detailsArea}
-          >
-            <nav class="side-tabs" aria-label="Session detail tabs">
-              {#if !acpAgent && showPlanPanel && sessionID}<button
-                  class:active={activeSideTab === 'plan'}
-                  aria-current={activeSideTab === 'plan' ? 'page' : undefined}
-                  onclick={() => switchSideTab('plan')}>Plan</button
-                >{/if}{#if sessionID || acpAgent}<button
-                  class:active={activeSideTab === 'changes'}
-                  aria-current={activeSideTab === 'changes' ? 'page' : undefined}
-                  onclick={toggleChanges}>Changes ({diffs.length})</button
-                >{/if}{#if sessionID || acpAgent}<button
-                  class:active={activeSideTab === 'history'}
-                  aria-current={activeSideTab === 'history' ? 'page' : undefined}
-                  onclick={() => switchSideTab('history')}>Activity</button
-                >{/if}<button
-                class:active={activeSideTab === 'ship'}
-                aria-current={activeSideTab === 'ship' ? 'page' : undefined}
-                onclick={() => switchSideTab('ship')}>Ship runs ({shipRuns.length})</button
-              >
-            </nav>
-            <div class="side-panel-body">
-              {#if !acpAgent && showPlanPanel}<div
-                  class:inactive={activeSideTab !== 'plan'}
-                  class="side-view"
-                >
-                  <PlanPanel
-                    {snapshot}
-                    client={connecting ? null : client}
-                    {directory}
-                    {sessionID}
-                    {dark}
-                    onchanged={() => refreshSession()}
-                    onselectfile={selectDiffPath}
-                    shipRun={shipRuns.find(
-                      (run) =>
-                        run.repository === (coordinationProject(directory) ?? directory) &&
-                        run.source === snapshot.plan?.sessionID,
-                    ) ?? null}
-                    onship={(graph, provider, limit) =>
-                      startShippingRun(graph, provider, limit, snapshot.plan?.sessionID ?? '')}
-                  />
-                </div>{/if}
-              {#if sessionID || acpAgent}<div
-                  class:inactive={activeSideTab !== 'changes'}
-                  class="side-view"
-                >
-                  <DiffPanel
-                    {directory}
-                    files={diffs}
-                    annotations={acpAgent ? {} : diffAnnotations}
-                    selected={selectedFilePath}
-                    loading={diffLoading}
-                    error={diffError}
-                    onselect={(file) => (selectedFilePath = file)}
-                    onrefresh={() => (acpAgent ? refreshAgentDiff() : refreshDiff())}
-                    onclose={toggleChanges}
-                    scope={diffCommentKey('main')}
-                    comments={diffComments[diffCommentKey('main')] ?? []}
-                    oncomments={updateDiffComments}
-                    oncommentssent={removeSentDiffComments}
-                    onsendcomments={(scope, text) => sendDiffComments('main', scope, text)}
-                    evidence={reviewEvidence(
-                      'main',
-                      acpAgent
-                        ? acpThread
-                          ? `acp:${acpAgent}:${acpThread.sessionId}`
-                          : null
-                        : sessionID
-                          ? `opencode:${sessionID}`
-                          : null,
-                    )}
-                  />
-                </div>{/if}
-              {#if sessionID || acpAgent}<div
-                  class:inactive={activeSideTab !== 'history'}
-                  class="side-view"
-                >
-                  <WorkspaceActivity
-                    items={acpAgent ? mainAgentWorkspaceActivity : mainWorkspaceActivity}
-                    events={currentActivityHistory}
-                    agent={acpAgent ?? 'opencode'}
-                    sessionId={acpAgent ? acpThread?.sessionId : (sessionID ?? undefined)}
-                    loading={inboxLoading}
-                    error={inboxError}
-                    onrefresh={() => void refreshInbox()}
-                    onselect={selectMainActivity}
-                    onselecthistory={selectActivityHistory}
-                  />
-                </div>{/if}
-              <div class:inactive={activeSideTab !== 'ship'} class="side-view">
-                <ShipPanel
-                  repository={coordinationProject(directory) ?? directory}
-                  active={activeSideTab === 'ship' &&
-                    detailsOpen &&
-                    (acpAgent ? agentChangesOpen : true)}
-                  runs={shipRuns}
-                  busy={shippingBusy}
-                  nativeSubagents={Object.values(nativeSubagents)}
-                  onclose={closeShipRuns}
-                  onrefresh={() => tickShippingRuns(true)}
-                  onopen={openShipTarget}
-                  onsettings={async () => {
-                    closeShipRuns();
-                    await openSettings();
-                  }}
-                />
-              </div>
-            </div>
-          </section>{/if}
       </div>
     {/snippet}
     {#if workspaceView === 'overview'}
@@ -10184,12 +10149,143 @@
         onreviewpreview={openReviewPreview}
         onreviewcapturephase={setReviewCapturePhase}
       />
-      {#if mainShipFallback && detailsOpen && activeSideTab === 'ship' && (!mobileLayout || mobileView === 'details')}<section
-          class="ship-fallback"
-          aria-label="Ship run details"
+    </div>
+  </div>
+  {#if shipFallbackVisible}<section class="ship-fallback" aria-label="Ship run details">
+      <ShipPanel
+        repository={coordinationProject(directory) ?? directory}
+        runs={shipRuns}
+        busy={shippingBusy}
+        nativeSubagents={Object.values(nativeSubagents)}
+        onclose={closeShipRuns}
+        onrefresh={() => tickShippingRuns(true)}
+        onopen={openShipTarget}
+        onsettings={async () => {
+          closeShipRuns();
+          await openSettings();
+        }}
+      />
+    </section>{/if}
+  {#if !mainShipFallback && (sessionID || acpAgent || activeSideTab === 'ship')}<div
+      class="details-resizer"
+      role="slider"
+      tabindex="0"
+      aria-label="Pane divider position"
+      aria-orientation="horizontal"
+      aria-controls="session-details"
+      aria-valuemin="300"
+      aria-valuemax={Math.max(300, workspaceWidth - 328)}
+      aria-valuenow={Math.max(300, workspaceWidth - 8 - visibleDetailsWidth)}
+      aria-valuetext={`Details pane ${visibleDetailsWidth} pixels wide`}
+      onpointerdown={startDetailsResize}
+      onpointermove={moveDetailsResize}
+      onpointerup={endDetailsResize}
+      onpointercancel={endDetailsResize}
+      onkeydown={keydownDetailsResize}
+      ondblclick={() => setDetailsWidth(420)}
+      onfocusin={() => focusPane('main')}
+    ></div>
+    <section
+      id="session-details"
+      class="side-area"
+      aria-label="Session details"
+      tabindex="-1"
+      bind:this={detailsArea}
+      onfocusin={() => focusPane('main')}
+      onpointerdown={() => focusPane('main')}
+    >
+      <nav class="side-tabs" aria-label="Session detail tabs">
+        {#if !acpAgent && showPlanPanel && sessionID}<button
+            class:active={activeSideTab === 'plan'}
+            aria-current={activeSideTab === 'plan' ? 'page' : undefined}
+            onclick={() => switchSideTab('plan')}>Plan</button
+          >{/if}{#if sessionID || acpAgent}<button
+            class:active={activeSideTab === 'changes'}
+            aria-current={activeSideTab === 'changes' ? 'page' : undefined}
+            onclick={toggleChanges}>Changes ({diffs.length})</button
+          >{/if}{#if sessionID || acpAgent}<button
+            class:active={activeSideTab === 'history'}
+            aria-current={activeSideTab === 'history' ? 'page' : undefined}
+            onclick={() => switchSideTab('history')}>Activity</button
+          >{/if}<button
+          class:active={activeSideTab === 'ship'}
+          aria-current={activeSideTab === 'ship' ? 'page' : undefined}
+          onclick={() => switchSideTab('ship')}>Ship runs ({shipRuns.length})</button
         >
+      </nav>
+      <div class="side-panel-body">
+        {#if !acpAgent && showPlanPanel}<div
+            class:inactive={activeSideTab !== 'plan'}
+            class="side-view"
+          >
+            <PlanPanel
+              {snapshot}
+              client={connecting ? null : client}
+              {directory}
+              {sessionID}
+              {dark}
+              onchanged={() => refreshSession()}
+              onselectfile={selectDiffPath}
+              shipRun={shipRuns.find(
+                (run) =>
+                  run.repository === (coordinationProject(directory) ?? directory) &&
+                  run.source === snapshot.plan?.sessionID,
+              ) ?? null}
+              onship={(graph, provider, limit) =>
+                startShippingRun(graph, provider, limit, snapshot.plan?.sessionID ?? '')}
+            />
+          </div>{/if}
+        {#if sessionID || acpAgent}<div
+            class:inactive={activeSideTab !== 'changes'}
+            class="side-view"
+          >
+            <DiffPanel
+              {directory}
+              files={diffs}
+              annotations={acpAgent ? {} : diffAnnotations}
+              selected={selectedFilePath}
+              loading={diffLoading}
+              error={diffError}
+              onselect={(file) => (selectedFilePath = file)}
+              onrefresh={() => (acpAgent ? refreshAgentDiff() : refreshDiff())}
+              onclose={toggleChanges}
+              scope={diffCommentKey('main')}
+              comments={diffComments[diffCommentKey('main')] ?? []}
+              oncomments={updateDiffComments}
+              oncommentssent={removeSentDiffComments}
+              onsendcomments={(scope, text) => sendDiffComments('main', scope, text)}
+              evidence={reviewEvidence(
+                'main',
+                acpAgent
+                  ? acpThread
+                    ? `acp:${acpAgent}:${acpThread.sessionId}`
+                    : null
+                  : sessionID
+                    ? `opencode:${sessionID}`
+                    : null,
+              )}
+            />
+          </div>{/if}
+        {#if sessionID || acpAgent}<div
+            class:inactive={activeSideTab !== 'history'}
+            class="side-view"
+          >
+            <WorkspaceActivity
+              items={acpAgent ? mainAgentWorkspaceActivity : mainWorkspaceActivity}
+              events={currentActivityHistory}
+              agent={acpAgent ?? 'opencode'}
+              sessionId={acpAgent ? acpThread?.sessionId : (sessionID ?? undefined)}
+              loading={inboxLoading}
+              error={inboxError}
+              onrefresh={() => void refreshInbox()}
+              onselect={selectMainActivity}
+              onselecthistory={selectActivityHistory}
+            />
+          </div>{/if}
+        <div class:inactive={activeSideTab !== 'ship'} class="side-view">
           <ShipPanel
             repository={coordinationProject(directory) ?? directory}
+            active={activeSideTab === 'ship' && detailsOpen && (acpAgent ? agentChangesOpen : true)}
             runs={shipRuns}
             busy={shippingBusy}
             nativeSubagents={Object.values(nativeSubagents)}
@@ -10201,9 +10297,9 @@
               await openSettings();
             }}
           />
-        </section>{/if}
-    </div>
-  </div>
+        </div>
+      </div>
+    </section>{/if}
   <AgentStatusBar items={agentStatusItems} onopen={(key) => jumpToRecentThread(key)} />
 </div>
 <ConfirmDialog request={confirmation} onanswer={answerConfirmation} />

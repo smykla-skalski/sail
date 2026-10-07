@@ -3,6 +3,7 @@ import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './issue-shipp
 import type { SpawnReceipt, SpawnState } from './agent-results';
 import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
+import { taskCheckpointSchema } from './task-checkpoint.ts';
 
 export const gateNames = ['code-adversary', 'findings-adversary', 'test-adversary'] as const;
 export type GateName = (typeof gateNames)[number];
@@ -121,6 +122,32 @@ export function shipOwner(runs: ShipRun[], directory: string, threadId: string) 
   return undefined;
 }
 
+export function shipCheckpointOwner(runs: ShipRun[], directory: string, threadId: string) {
+  const owner = shipOwner(runs, directory, threadId);
+  if (owner) return owner;
+  for (const run of runs) {
+    const issue = run.issues.find(
+      (item) => item.path === directory && item.checkpointThreadIds?.includes(threadId),
+    );
+    if (issue) return { run, issue };
+  }
+  return undefined;
+}
+
+export function authorizeShipCheckpointThread(
+  runs: ShipRun[],
+  sourceDirectory: string,
+  sourceId: string,
+  targetDirectory: string | null,
+  targetId: string | null,
+): boolean {
+  const owner = shipCheckpointOwner(runs, sourceDirectory, sourceId);
+  if (!owner || !targetId || targetDirectory !== owner.issue.path) return false;
+  if (owner.issue.checkpointThreadIds?.includes(targetId)) return false;
+  owner.issue.checkpointThreadIds = [...(owner.issue.checkpointThreadIds ?? []), targetId];
+  return true;
+}
+
 export function dependencyIssue(run: ShipRun, reference: string): ShipIssue | undefined {
   return run.issues.find((issue) =>
     [issue.id, String(issue.number), `${run.remote}#${issue.number}`].includes(reference),
@@ -135,6 +162,25 @@ export function dependencyUrl(remote: string, reference: string): string | undef
 
 export function shipGatesSettled(issue: ShipIssue): boolean {
   return (issue.gates ?? []).every((gate) => shippingWorkerSettled(gate.state));
+}
+
+export function shipTaskThreadsSettled(
+  issue: ShipIssue,
+  states: Partial<Record<string, SpawnState>>,
+  receipts: Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'>[],
+): boolean {
+  const threadIds = [...new Set([issue.threadId, ...(issue.checkpointThreadIds ?? [])])].filter(
+    (threadId): threadId is string => Boolean(threadId),
+  );
+  return threadIds.every((threadId) => {
+    const live = states[threadId] ?? 'unavailable';
+    const receipt = receipts.find((item) =>
+      threadId === issue.threadId ? item.receiptId === issue.receiptId : item.targetId === threadId,
+    );
+    if (receipt && !shippingWorkerSettled(receipt.state)) return false;
+    if (live !== 'unavailable') return shippingWorkerSettled(live);
+    return receipt !== undefined && shippingWorkerSettled(receipt.state);
+  });
 }
 
 export function reconciledShipGates(issue: ShipIssue, receipts: SpawnReceipt[]): ShipGate[] {
@@ -516,6 +562,8 @@ const shipIssueSchema = z.object({
   checks: z.array(z.object({ name: z.string(), state: z.string(), url: z.string() })).optional(),
   refreshedAt: z.number().optional(),
   refreshError: nullableString.optional(),
+  checkpoint: taskCheckpointSchema.optional(),
+  checkpointThreadIds: z.array(z.string()).optional(),
 });
 const shipRunSchema = z.object({
   id: z.string(),
