@@ -48,12 +48,17 @@ export type ShipIssuePresentation = {
 export type GateMetadata = {
   gate: GateName;
   requestedModel: string;
+  sequence?: number;
   revision?: string;
   mutationGeneration?: string;
   revisionDrifted?: boolean;
   verdict?: GateVerdict;
   reason?: string;
 };
+
+export function nextGateSequence(gates: Pick<ShipGate, 'sequence'>[]): number {
+  return Math.max(gates.length, ...gates.map((gate) => (gate.sequence ?? -1) + 1));
+}
 export type ShipGate = GateMetadata & {
   id: string;
   provider: string;
@@ -81,13 +86,14 @@ export function requiredValidationGatesSatisfied(
   if (!policy) return false;
   return policy.requiredGates.every((name) => {
     const gate = gates
-      .filter((item) => item.gate === name && item.revision === policy.revision)
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => item.gate === name && item.revision === policy.revision)
       .toSorted(
         (left, right) =>
-          right.updated - left.updated ||
-          right.created - left.created ||
-          right.id.localeCompare(left.id),
-      )[0];
+          (right.item.sequence ?? right.index) - (left.item.sequence ?? left.index) ||
+          right.item.updated - left.item.updated ||
+          right.item.created - left.item.created,
+      )[0]?.item;
     if (!gate || gate.state !== 'completed') return false;
     return name === 'test-adversary' ? gate.verdict === 'PASS' : gate.verdict === 'CLEAN';
   });
@@ -96,6 +102,7 @@ export function requiredValidationGatesSatisfied(
 export const gateMetadataSchema = z.object({
   gate: z.enum(gateNames),
   requestedModel: z.string(),
+  sequence: z.number().int().nonnegative().optional(),
   revision: z.string().min(1).optional(),
   mutationGeneration: z.string().min(1).optional(),
   revisionDrifted: z.boolean().optional(),
@@ -239,6 +246,7 @@ export function shipCleanupRequest(
     force: false,
     archiveIgnored: true,
     expectedRevision,
+    expectedBranch: issue.branch,
   };
 }
 

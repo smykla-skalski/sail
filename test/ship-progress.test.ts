@@ -196,6 +196,7 @@ void test('restores umbrella, gate verdict and model after receipts are pruned',
     validation: {
       gate: 'code-adversary',
       requestedModel: 'concrete-model',
+      sequence: 7,
       revision: 'revision-one',
       verdict: 'CLEAN',
     },
@@ -215,9 +216,11 @@ void test('restores umbrella, gate verdict and model after receipts are pruned',
   );
   assert.equal(restoredReceipts[0].validation?.verdict, 'CLEAN');
   assert.equal(restoredReceipts[0].validation?.revision, 'revision-one');
+  assert.equal(restoredReceipts[0].validation?.sequence, 7);
   assert.equal(restored[0].umbrella?.number, 1);
   assert.equal(restored[0].issues[0].gates?.[0].model, 'concrete-model');
   assert.equal(restored[0].issues[0].gates?.[0].verdict, 'CLEAN');
+  assert.equal(restored[0].issues[0].gates?.[0].sequence, 7);
 });
 
 void test('loads legacy runs and discards malformed records without losing valid runs', () => {
@@ -251,6 +254,7 @@ void test('legacy persisted work cannot opt out of validation by omitting the po
 void test('Ship cleanup binds deletion to the selected validation revision', () => {
   const issue = fixture().issues[0];
   issue.path = '/worktree';
+  issue.branch = 'validated-branch';
   issue.validationPolicy = {
     risk: 'low',
     requiredGates: ['test-adversary'],
@@ -267,6 +271,7 @@ void test('Ship cleanup binds deletion to the selected validation revision', () 
     force: false,
     archiveIgnored: true,
     expectedRevision: 'validated-revision',
+    expectedBranch: 'validated-branch',
   });
 });
 

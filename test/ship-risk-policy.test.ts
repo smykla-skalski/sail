@@ -152,18 +152,23 @@ void test('required gates reject stale revisions and non-completed passing verdi
     false,
   );
   assert.equal(
-    requiredShipGatesSatisfied(policy, [pass, { ...pass, id: 'z-last', state: 'interrupted' }]),
+    requiredShipGatesSatisfied(policy, [
+      pass,
+      { ...pass, id: 'random-later-attempt', sequence: 2, verdict: 'FAIL' },
+    ]),
     false,
   );
 });
 
 void test('validation inputs retry until paths and config share one stable revision', async () => {
   const revisions = ['revision-a', 'revision-b', 'revision-b', 'revision-b'];
+  const generations = ['generation-a', 'generation-a', 'generation-b', 'generation-b'];
   const paths = [['stale.ts'], ['current.ts']];
   const configs = [{ source: 'stale' }, { source: 'current' }];
 
   const result = await readStableShipValidationInputs(
     async () => revisions.shift()!,
+    async () => generations.shift()!,
     async () => paths.shift()!,
     async () => configs.shift()!,
   );
@@ -175,12 +180,28 @@ void test('validation inputs retry until paths and config share one stable revis
   });
 });
 
+void test('validation inputs reject revision ABA when mutation generation changes', async () => {
+  const revisions = ['revision-a', 'revision-a', 'revision-a', 'revision-a'];
+  const generations = ['generation-a', 'generation-b', 'generation-b', 'generation-b'];
+  const paths = [['stale.ts'], ['current.ts']];
+
+  const result = await readStableShipValidationInputs(
+    async () => revisions.shift()!,
+    async () => generations.shift()!,
+    async () => paths.shift()!,
+    async () => ({ source: 'repository' }),
+  );
+
+  assert.deepEqual(result.changedPaths, ['current.ts']);
+});
+
 void test('validation selection fails when the worktree never stabilizes', async () => {
   let revision = 0;
 
   await assert.rejects(
     readStableShipValidationInputs(
       async () => `revision-${revision++}`,
+      async () => `generation-${revision}`,
       async () => ['current.ts'],
       async () => ({ source: 'repository' }),
       2,

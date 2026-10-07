@@ -1793,12 +1793,19 @@ async fn delete_worktree(
     force: Option<bool>,
     archive_ignored: Option<bool>,
     expected_revision: Option<String>,
+    expected_branch: Option<String>,
 ) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if archive_ignored == Some(true) {
-            archive_ignored_and_remove(repository, worktree, expected_revision)
+            archive_ignored_and_remove(repository, worktree, expected_revision, expected_branch)
         } else {
-            remove_worktree(repository, worktree, force, expected_revision.as_deref())?;
+            remove_worktree(
+                repository,
+                worktree,
+                force,
+                expected_revision.as_deref(),
+                expected_branch.as_deref(),
+            )?;
             Ok(None)
         }
     })
@@ -1810,8 +1817,54 @@ fn archive_ignored_and_remove(
     repository: String,
     worktree: String,
     expected_revision: Option<String>,
+    expected_branch: Option<String>,
 ) -> Result<Option<String>, String> {
-    archive_ignored_and_remove_with_hook(repository, worktree, expected_revision, |_| Ok(()))
+    archive_ignored_and_remove_with_hook(
+        repository,
+        worktree,
+        expected_revision,
+        expected_branch,
+        |_| Ok(()),
+    )
+}
+
+#[cfg(unix)]
+fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        nix::libc::renamex_np(
+            source.as_ptr(),
+            destination.as_ptr(),
+            nix::libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        nix::libc::renameat2(
+            nix::libc::AT_FDCWD,
+            source.as_ptr(),
+            nix::libc::AT_FDCWD,
+            destination.as_ptr(),
+            nix::libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
 }
 
 fn rollback_staged_archive(
@@ -1829,8 +1882,12 @@ fn rollback_staged_archive(
                 continue;
             }
         }
-        if let Err(error) = std::fs::rename(&source, &destination) {
-            failures.push(format!("{}: {error}", relative.display()));
+        if let Err(error) = rename_without_replace(&source, &destination) {
+            failures.push(format!(
+                "{}: {error}; original remains staged at {}",
+                relative.display(),
+                source.display()
+            ));
         }
     }
     if failures.is_empty() {
@@ -1838,8 +1895,9 @@ fn rollback_staged_archive(
         Ok(())
     } else {
         Err(format!(
-            "Could not restore archived worktree files: {}",
-            failures.join(", ")
+            "Could not restore archived worktree files: {}. Recovery staging: {}",
+            failures.join(", "),
+            staging.display()
         ))
     }
 }
@@ -1848,6 +1906,7 @@ fn archive_ignored_and_remove_with_hook<F>(
     repository: String,
     worktree: String,
     expected_revision: Option<String>,
+    expected_branch: Option<String>,
     mut after_move: F,
 ) -> Result<Option<String>, String>
 where
@@ -1873,6 +1932,7 @@ where
         worktree.to_string_lossy().into_owned(),
         None,
         expected_revision.as_deref(),
+        expected_branch.as_deref(),
     ) {
         Ok(()) => return Ok(saved_archive()),
         Err(error) if error == IGNORED => {}
@@ -1975,6 +2035,7 @@ where
         worktree.to_string_lossy().into_owned(),
         None,
         expected_revision.as_deref(),
+        expected_branch.as_deref(),
     ) {
         let rollback = rollback_staged_archive(&staging, &worktree, &moved);
         return Err(error
@@ -2043,8 +2104,16 @@ fn remove_worktree(
     worktree: String,
     force: Option<bool>,
     expected_revision: Option<&str>,
+    expected_branch: Option<&str>,
 ) -> Result<(), String> {
-    remove_worktree_with_hook(repository, worktree, force, expected_revision, || Ok(()))
+    remove_worktree_with_hook(
+        repository,
+        worktree,
+        force,
+        expected_revision,
+        expected_branch,
+        || Ok(()),
+    )
 }
 
 fn remove_worktree_with_hook<F>(
@@ -2052,6 +2121,7 @@ fn remove_worktree_with_hook<F>(
     worktree: String,
     force: Option<bool>,
     expected_revision: Option<&str>,
+    expected_branch: Option<&str>,
     before_remove: F,
 ) -> Result<(), String>
 where
@@ -2090,7 +2160,22 @@ where
         }
         Ok(())
     };
+    let ensure_expected_branch = || -> Result<(), String> {
+        let Some(expected) = expected_branch else {
+            return Ok(());
+        };
+        let expected = expected.strip_prefix("refs/heads/").unwrap_or(expected);
+        let actual = git_reference(&worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .ok_or("Cannot read the worktree branch before deletion.")?;
+        if actual != expected {
+            return Err(format!(
+                "Worktree branch changed from {expected} to {actual}. Revalidate before deleting it."
+            ));
+        }
+        Ok(())
+    };
     ensure_expected_revision()?;
+    ensure_expected_branch()?;
     let force = force == Some(true);
     if !force {
         let status = Command::new("git")
@@ -2117,6 +2202,7 @@ where
         }
     }
     ensure_expected_revision()?;
+    ensure_expected_branch()?;
     let guarded = guarded_removal_state(&worktree, expected_revision)?;
     before_remove()?;
     let mut command = Command::new("git");
@@ -2595,20 +2681,29 @@ mod tests {
         let ignored = Path::new(&created.path).join("node_modules/package/file.js");
         fs::create_dir_all(ignored.parent().unwrap()).unwrap();
         fs::write(&ignored, "content").unwrap();
-        let result = remove_worktree(repository_path.into(), created.path.clone(), None, None);
+        let result = remove_worktree(
+            repository_path.into(),
+            created.path.clone(),
+            None,
+            None,
+            None,
+        );
         assert!(result.unwrap_err().contains("ignored files"));
         assert!(ignored.exists());
         let untracked = Path::new(&created.path).join("notes.txt");
         fs::write(&untracked, "keep").unwrap();
-        assert!(
-            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None)
-                .unwrap_err()
-                .contains("changes outside ignored")
-        );
+        assert!(archive_ignored_and_remove(
+            repository_path.into(),
+            created.path.clone(),
+            None,
+            None
+        )
+        .unwrap_err()
+        .contains("changes outside ignored"));
         assert!(ignored.exists());
         fs::remove_file(untracked).unwrap();
         let archive =
-            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None)
+            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None, None)
                 .unwrap()
                 .unwrap();
         assert_eq!(
@@ -2617,7 +2712,8 @@ mod tests {
         );
         assert!(!Path::new(&created.path).exists());
         assert_eq!(
-            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None).unwrap(),
+            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None, None)
+                .unwrap(),
             Some(archive)
         );
         let forced = add_worktree(
@@ -2633,6 +2729,7 @@ mod tests {
             repository_path.into(),
             forced.path.clone(),
             Some(true),
+            None,
             None,
         )
         .unwrap();
@@ -2700,6 +2797,7 @@ mod tests {
             created.path.clone(),
             None,
             Some(&expected),
+            None,
         )
         .unwrap_err();
 
@@ -2710,8 +2808,35 @@ mod tests {
             created.path.clone(),
             Some(true),
             None,
+            None,
         )
         .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_removal_rejects_a_same_commit_branch_switch() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-delete-branch-test");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        git(&worktree, &["switch", "-q", "-c", "other"]);
+        let switched =
+            tauri::async_runtime::block_on(working_tree_revision(worktree.clone())).unwrap();
+
+        let error = remove_worktree(
+            repository.clone(),
+            worktree.clone(),
+            None,
+            Some(&expected),
+            Some("child"),
+        )
+        .unwrap_err();
+
+        assert_eq!(switched, expected);
+        assert!(error.contains("branch changed from child to other"));
+        assert!(Path::new(&worktree).exists());
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2765,6 +2890,7 @@ mod tests {
             repository.clone(),
             worktree.clone(),
             Some(expected),
+            None,
             |_| {
                 moved += 1;
                 if moved == 1 {
@@ -2785,7 +2911,48 @@ mod tests {
             fs::read_to_string(Path::new(&worktree).join("two.tmp")).unwrap(),
             "two"
         );
-        remove_worktree(repository, worktree, Some(true), None).unwrap();
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_rollback_never_clobbers_a_recreated_path() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-archive-no-clobber-test");
+        let mut recreated = None;
+
+        let error = archive_ignored_and_remove_with_hook(
+            repository.clone(),
+            worktree.clone(),
+            Some(expected),
+            None,
+            |relative| {
+                fs::write(Path::new(&worktree).join(relative), "recreated").unwrap();
+                recreated = Some(relative.to_path_buf());
+                Err("injected archive failure".to_string())
+            },
+        )
+        .unwrap_err();
+
+        let recreated = recreated.unwrap();
+        assert!(error.contains("Recovery staging:"));
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join(&recreated)).unwrap(),
+            "recreated"
+        );
+        let archive_root = root.join("worktrees/.sail-shipping-archive");
+        let staging = fs::read_dir(&archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".staging-")
+            })
+            .unwrap();
+        assert!(staging.join(recreated).exists());
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2799,6 +2966,7 @@ mod tests {
             repository.clone(),
             worktree.clone(),
             Some(expected),
+            None,
             |_| {
                 if !changed {
                     fs::write(Path::new(&worktree).join("tracked.txt"), "after\n").unwrap();
@@ -2833,7 +3001,7 @@ mod tests {
             fs::read_to_string(Path::new(&worktree).join("two.tmp")).unwrap(),
             "two"
         );
-        remove_worktree(repository, worktree, Some(true), None).unwrap();
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2849,6 +3017,7 @@ mod tests {
             worktree.clone(),
             None,
             Some(&expected),
+            None,
             || {
                 fs::write(Path::new(&worktree).join("tracked.txt"), "after\n").unwrap();
                 git(&worktree, &["add", "tracked.txt"]);
@@ -2877,7 +3046,7 @@ mod tests {
             fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
             "after\n"
         );
-        remove_worktree(repository, worktree, Some(true), None).unwrap();
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

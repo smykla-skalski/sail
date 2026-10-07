@@ -40,6 +40,7 @@
     appendShipEvent,
     beginLatestRefresh,
     completedInlineShipGate,
+    nextGateSequence,
     gateSnapshot,
     loadShipRuns,
     parseShipReport,
@@ -3956,6 +3957,7 @@
         throw new Error('Choose validation risk low, medium, or high.');
       const { revision, changedPaths, config } = await readStableShipValidationInputs(
         () => invoke<string>('working_tree_revision', { path: request.directory }),
+        () => invoke<string>('working_tree_generation', { path: request.directory }),
         () => invoke<string[]>('shipping_changed_paths', { path: request.directory }),
         () => invoke<WorktreeConfig | null>('worktree_config', { worktree: request.directory }),
       );
@@ -4210,6 +4212,7 @@
                 id: `inline:${sourceId}:${report.gate}:${crypto.randomUUID()}`,
                 gate: report.gate,
                 requestedModel: model ?? 'implementation session',
+                sequence: nextGateSequence(owner.issue.gates ?? []),
                 provider: owner.run.provider,
                 model,
                 threadId: sourceId,
@@ -4373,6 +4376,17 @@
           : { kind: 'acp', agent: choice.agent, model: choice.model, title: String(gate) };
       const receiptId = crypto.randomUUID();
       const accessKey = crypto.randomUUID();
+      const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
+      const priorGates = [
+        ...(gateOwner?.issue.gates ?? []),
+        ...spawnReceipts.flatMap((receipt) => {
+          if (receipt.sourceId !== sourceId || receipt.sourceDirectory !== request.directory)
+            return [];
+          const recordedGate = gateSnapshot(receipt);
+          return recordedGate ? [recordedGate] : [];
+        }),
+      ];
+      const sequence = nextGateSequence(priorGates);
       const ensureSelected = async () => {
         const selectedCandidates = currentCandidates.filter((candidate) =>
           crossValidation.choices.some(
@@ -4411,6 +4425,7 @@
         validation: {
           gate: gate as import('./lib/ship-progress').GateName,
           requestedModel: choice.model,
+          sequence,
         },
         state: 'starting',
         created: Date.now(),
@@ -4440,6 +4455,7 @@
           validation: {
             gate: gate as import('./lib/ship-progress').GateName,
             requestedModel: choice.model,
+            sequence,
             revision,
             mutationGeneration,
           },
@@ -5595,6 +5611,7 @@
         worktree: path,
         force: force || !!config,
         expectedRevision: null,
+        expectedBranch: null,
       });
       saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
       const removedThreads = agentThreads.filter((thread) => thread.directory === path);

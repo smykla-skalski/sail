@@ -181,6 +181,7 @@ export function requiredShipGatesSatisfied(
 
 export async function readStableShipValidationInputs<T>(
   readRevision: () => Promise<string>,
+  readMutationGeneration: () => Promise<string>,
   readChangedPaths: () => Promise<string[]>,
   readConfig: () => Promise<T>,
   maxAttempts = 3,
@@ -188,9 +189,13 @@ export async function readStableShipValidationInputs<T>(
   async function readAttempt(
     attemptsRemaining: number,
   ): Promise<{ revision: string; changedPaths: string[]; config: T }> {
+    const mutationGeneration = await readMutationGeneration();
     const revision = await readRevision();
     const [changedPaths, config] = await Promise.all([readChangedPaths(), readConfig()]);
-    if ((await readRevision()) === revision) return { revision, changedPaths, config };
+    const currentRevision = await readRevision();
+    const currentGeneration = await readMutationGeneration();
+    if (currentRevision === revision && currentGeneration === mutationGeneration)
+      return { revision, changedPaths, config };
     if (attemptsRemaining > 1) return readAttempt(attemptsRemaining - 1);
     throw new Error(
       'The worktree kept changing while selecting validation risk. Retry when stable.',
