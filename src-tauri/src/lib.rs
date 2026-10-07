@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -7,14 +7,61 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", windows))]
 use tauri::Emitter;
 use tauri::{Manager, State};
 
-static SHIPPING_WORKTREE_LOCK: Mutex<()> = Mutex::new(());
 const OPENCODE_VERSION: &str = "2.0.24";
+
+#[derive(Clone, Default)]
+struct WorktreeOperationLocks(Arc<WorktreeOperationLockState>);
+
+#[derive(Default)]
+struct WorktreeOperationLockState {
+    active: Mutex<HashSet<PathBuf>>,
+    available: Condvar,
+}
+
+struct WorktreeOperationGuard {
+    state: Arc<WorktreeOperationLockState>,
+    repository: PathBuf,
+}
+
+impl WorktreeOperationLocks {
+    fn lock(&self, repository: &Path) -> Result<WorktreeOperationGuard, String> {
+        let repository = repository
+            .canonicalize()
+            .map_err(|_| "Repository folder no longer exists.".to_string())?;
+        let mut active = self
+            .0
+            .active
+            .lock()
+            .map_err(|_| "Worktree operations are unavailable.".to_string())?;
+        while active.contains(&repository) {
+            active = self
+                .0
+                .available
+                .wait(active)
+                .map_err(|_| "Worktree operations are unavailable.".to_string())?;
+        }
+        active.insert(repository.clone());
+        Ok(WorktreeOperationGuard {
+            state: Arc::clone(&self.0),
+            repository,
+        })
+    }
+}
+
+impl Drop for WorktreeOperationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active.lock() {
+            active.remove(&self.repository);
+            self.state.available.notify_all();
+        }
+    }
+}
 
 fn existing_shipping_worktree(
     repository: &Path,
@@ -1539,12 +1586,16 @@ fn repository_namespace(repository: &Path) -> String {
 
 #[tauri::command]
 async fn create_worktree(
+    operation_locks: State<'_, WorktreeOperationLocks>,
     repository: String,
     name: String,
     destination_parent: Option<String>,
     base_ref: Option<String>,
 ) -> Result<CreatedWorktree, String> {
+    let operation_locks = operation_locks.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let repository = validate_repository(repository)?;
+        let _lock = operation_locks.lock(Path::new(&repository))?;
         add_worktree(repository, name, destination_parent, base_ref)
     })
     .await
@@ -1553,14 +1604,14 @@ async fn create_worktree(
 
 #[tauri::command]
 async fn create_shipping_worktree(
+    operation_locks: State<'_, WorktreeOperationLocks>,
     repository: String,
     name: String,
 ) -> Result<CreatedWorktree, String> {
+    let operation_locks = operation_locks.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _lock = SHIPPING_WORKTREE_LOCK
-            .lock()
-            .map_err(|_| "Shipping worktree creation is unavailable.")?;
-        let checked = validate_repository(repository.clone())?;
+        let checked = validate_repository(repository)?;
+        let _lock = operation_locks.lock(Path::new(&checked))?;
         if let Some(existing) = existing_shipping_worktree(Path::new(&checked), &name)? {
             return Ok(existing);
         }
@@ -1588,7 +1639,7 @@ async fn create_shipping_worktree(
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        add_worktree(repository, name, None, Some(default_ref))
+        add_worktree(checked, name, None, Some(default_ref))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1788,6 +1839,7 @@ fn add_worktree(
 
 #[tauri::command]
 async fn delete_worktree(
+    operation_locks: State<'_, WorktreeOperationLocks>,
     repository: String,
     worktree: String,
     force: Option<bool>,
@@ -1795,12 +1847,15 @@ async fn delete_worktree(
     expected_revision: Option<String>,
     expected_branch: Option<String>,
 ) -> Result<Option<String>, String> {
+    let operation_locks = operation_locks.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let checked = validate_repository(repository)?;
+        let _lock = operation_locks.lock(Path::new(&checked))?;
         if archive_ignored == Some(true) {
-            archive_ignored_and_remove(repository, worktree, expected_revision, expected_branch)
+            archive_ignored_and_remove(checked, worktree, expected_revision, expected_branch)
         } else {
             remove_worktree(
-                repository,
+                checked,
                 worktree,
                 force,
                 expected_revision.as_deref(),
@@ -2186,24 +2241,24 @@ where
         force,
         expected_revision,
         expected_branch,
-        before_remove,
-        || Ok(()),
+        (before_remove, || Ok(()), || Ok(())),
     )
 }
 
-fn remove_worktree_with_hooks<F, G>(
+fn remove_worktree_with_hooks<F, G, H>(
     repository: String,
     worktree: String,
     force: Option<bool>,
     expected_revision: Option<&str>,
     expected_branch: Option<&str>,
-    before_final_identity_check: F,
-    after_final_identity_check: G,
+    hooks: (F, G, H),
 ) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String>,
     G: FnOnce() -> Result<(), String>,
+    H: FnOnce() -> Result<(), String>,
 {
+    let (before_final_identity_check, after_final_identity_check, after_remove) = hooks;
     let repository = PathBuf::from(validate_repository(repository)?)
         .canonicalize()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
@@ -2326,6 +2381,24 @@ where
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    after_remove()?;
+    let listed = git_reference(&repository, &["worktree", "list", "--porcelain", "-z"])
+        .ok_or("Cannot verify repository worktrees after deletion.")?;
+    let re_registered = parse_registered_worktrees(&listed)
+        .into_iter()
+        .any(|entry| {
+            let registered = Path::new(&entry.path);
+            registered == worktree
+                || registered
+                    .canonicalize()
+                    .is_ok_and(|registered| registered == worktree)
+        });
+    if re_registered {
+        return Err(
+            "The worktree path was registered again during deletion. Refresh before continuing."
+                .to_string(),
+        );
+    }
     if let Some(state) = guarded {
         let reference = state
             .reference
@@ -2385,6 +2458,7 @@ pub fn run() {
             Ok(())
         })
         .manage(RuntimeManager::default())
+        .manage(WorktreeOperationLocks::default())
         .manage(acp::AgentManager::default())
         .manage(acp_terminal::AcpTerminalManager::default())
         .manage(terminal::TerminalManager::default())
@@ -3141,11 +3215,14 @@ mod tests {
             Some(true),
             Some(&expected),
             None,
-            || Ok(()),
-            || {
-                git(&repository, &["update-ref", "refs/heads/child", "HEAD"]);
-                Ok(())
-            },
+            (
+                || Ok(()),
+                || {
+                    git(&repository, &["update-ref", "refs/heads/child", "HEAD"]);
+                    Ok(())
+                },
+                || Ok(()),
+            ),
         )
         .unwrap_err();
 
@@ -3185,6 +3262,40 @@ mod tests {
         assert_eq!(
             git_reference(Path::new(&worktree), &["symbolic-ref", "--short", "HEAD"]).as_deref(),
             Some("replacement")
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removal_reports_a_worktree_recreated_at_the_same_path() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-delete-reregister-test");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+
+        let error = remove_worktree_with_hooks(
+            repository.clone(),
+            worktree.clone(),
+            None,
+            Some(&expected),
+            Some("child"),
+            (
+                || Ok(()),
+                || Ok(()),
+                || {
+                    git(&repository, &["worktree", "add", &worktree, "child"]);
+                    Ok(())
+                },
+            ),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("registered again during deletion"));
+        assert!(Path::new(&worktree).is_dir());
+        assert_eq!(
+            git_reference(Path::new(&worktree), &["symbolic-ref", "--short", "HEAD"]).as_deref(),
+            Some("child")
         );
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
