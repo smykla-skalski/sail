@@ -1,4 +1,5 @@
 import type { SpawnReceipt } from './agent-results.ts';
+import type { ActivityHistoryEvent } from './activity-history.ts';
 import { activityState } from './activity-state.ts';
 import type { PostTurnCheck } from './post-turn-checks.ts';
 
@@ -128,4 +129,14 @@ export function activitySectionItems(
   selected: WorkspaceActivitySection,
 ): WorkspaceActivityItem[] {
   return items.filter((item) => item.section === selected);
+}
+
+export function activityHistoryWithoutLiveItems(
+  items: WorkspaceActivityItem[],
+  events: ActivityHistoryEvent[],
+): ActivityHistoryEvent[] {
+  const visible = new Set(
+    items.map((item) => `${item.kind === 'child' ? 'subagent' : item.kind}:${item.sourceId}`),
+  );
+  return events.filter((event) => !visible.has(`${event.kind}:${event.sourceId}`));
 }

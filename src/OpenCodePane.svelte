@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { Button } from '@smykla-skalski/sui';
@@ -8,7 +8,6 @@
   import ActivityStatus from './ActivityStatus.svelte';
   import TaskLocation from './TaskLocation.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
-  import WorkspaceActivity from './WorkspaceActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
@@ -105,6 +104,7 @@
     onhistorychange = () => {},
     onstatus,
     onusage,
+    onworkspaceactivity,
     onshipit,
   }: {
     client: OpenCodeClient | null;
@@ -131,6 +131,10 @@
     onhistorychange?: () => void;
     onstatus: (thread: AgentThread, status: ThreadStatus, notifyOnDone?: boolean) => void;
     onusage?: (sessionID: string, context: number | undefined) => void;
+    onworkspaceactivity?: (
+      items: WorkspaceActivityItem[],
+      onselect: (item: WorkspaceActivityItem) => Promise<void>,
+    ) => void;
     onshipit?: (
       issue: ShipItIssue,
       directory: string,
@@ -385,6 +389,10 @@
     target?.scrollIntoView({ block: 'center' });
     (target instanceof HTMLDetailsElement ? target.querySelector('summary') : target)?.focus();
   }
+  $effect(() => {
+    const items = workspaceActivity;
+    untrack(() => onworkspaceactivity?.(items, selectWorkspaceActivity));
+  });
   const contextUsage = $derived(openCodeContextUsage(messages, setup?.models ?? []));
   const chosenModel = $derived(
     setup?.models.find((model) => `${model.providerID}:${model.id}` === selectedModel),
@@ -1104,11 +1112,6 @@
           >
         </div>{/if}
     </div>
-    <WorkspaceActivity
-      items={workspaceActivity}
-      storageKey={`sai-workspace-activity:${directory}:opencode`}
-      onselect={selectWorkspaceActivity}
-    />
   </div>
   <div class="agent-composer composer-wrap">
     <div class="composer">
