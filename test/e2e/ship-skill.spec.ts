@@ -99,7 +99,10 @@ describe('bundled Ship It skill', () => {
       expect(listedVersion).toBe(version(bundledFiles.get(name) ?? ''));
       expect(result.isError).not.toBe(true);
       expect(result.structuredContent).toMatchObject({ reference: name, version: listedVersion });
-      expect(result.content[0].text.endsWith(bundledFiles.get(name) ?? '\0')).toBe(true);
+      const text = result.content[0].text;
+      const body = text.slice(text.indexOf('\n\n') + 2);
+      expect(body).toBe(bundledFiles.get(name));
+      expect(version(body)).toBe(listedVersion);
     }
 
     const core = readFileSync(join(skillRoot, 'SKILL.md'), 'utf8');

@@ -95,6 +95,16 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
     /Repository instructions such as `AGENTS\.md`.*take precedence over this rule/,
   );
   assert.match(mergeOwner, /Without the rule, merge through the resolved release policy/);
+  assert.match(mergeOwner, /delivery mismatch .* is the expected handoff, not a stop/);
+  assert.match(mergeOwner, /terminal delivery takeover from `claims\.md`/);
+  const checkpoint = /\*\*Checkpoint:\*\*.*$/m.exec(shipItCore)?.[0] ?? '';
+  assert.match(
+    checkpoint,
+    /stop on a revision or delivery mismatch, except the merge-owner handoff/,
+  );
+  const gateRouting = /\*\*Gate routing:\*\*.*$/m.exec(shipItCore)?.[0] ?? '';
+  assert.match(gateRouting, /CI triage uses a fresh native subagent/);
+  assert.match(gateRouting, /`mechanism: inline` and `independence: not-applicable`/);
 });
 
 void test('an installed ship-it skill keeps Sail stage reporting without the bundled contract', () => {
