@@ -49,6 +49,8 @@ Select the repository in the app and complete the repository setup checks, then 
 
 Sail connects its MCP server to each Claude, Codex, and OpenCode agent session. The server sends the bundled [Sail skill](skills/sail/SKILL.md) during initialization and exposes it through the `sail_skill` tool, so agents can discover how to use Sail's worktree, agent, terminal, thread, and embedded browser tools.
 
+Bundled workflow prompts include only their core contract. Agents load detailed references on demand through `skill_reference`; the files stay embedded for offline use, every response carries an exact SHA-256 content version, and each load remains visible in the task transcript.
+
 Use **+ Group** and **+ Repo** in the sidebar to organize saved repositories. Each repository row has a **+** control to create a worktree. Sail uses the remote default branch when Git records one, then `main` or `master`, then the main checkout branch. Enter a base branch in the form to choose another starting point. By default, new worktrees live in `~/sail/worktrees/<repository>-<id>/<name>` so repositories with the same name stay separate; choose a different parent folder in the form when needed. `SAIL_WORKTREE_ROOT` overrides the default root.
 
 To customize worktrees, commit `.sail/worktree.json` in the repository:
