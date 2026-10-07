@@ -13,6 +13,8 @@
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
+  import HookActivityCard from './HookActivity.svelte';
+  import { activityForSession, parseHookActivity, type HookActivity } from './lib/hook-activity';
   import { toolInput } from './lib/tool-display';
   import {
     acpToolFailure,
@@ -184,6 +186,14 @@
     nativeEntries,
   }: Props = $props();
   let mounted = $state(false);
+  let hookActivities = $state<HookActivity[]>([]);
+  function mergeHookActivities(items: HookActivity[]) {
+    const merged = new SvelteMap(hookActivities.map((item) => [item.id, item]));
+    for (const item of items) merged.set(item.id, item);
+    hookActivities = [...merged.values()]
+      .toSorted((left, right) => left.created - right.created)
+      .slice(-500);
+  }
   const promptLocation = $derived(composerTaskLocation(taskLocation, directory, thread?.directory));
   let ready = $state(false);
   let busy = $state(false);
@@ -369,7 +379,17 @@
   let authMethods = $state<AgentAuthMethod[]>([]);
   let authNeeded = $state(false);
   let authenticating = $state(false);
-  let activeSessionId: string | null = null;
+  let activeSessionId = $state<string | null>(null);
+  const visibleHookActivities = $derived(activityForSession(hookActivities, activeSessionId));
+  $effect(() => {
+    const sessionId = activeSessionId;
+    if (!mounted || !sessionId) return;
+    void invoke<unknown[]>('list_hook_activity', { sessionId })
+      .then((items) =>
+        mergeHookActivities(items.map(parseHookActivity).filter((item) => item !== null)),
+      )
+      .catch(() => undefined);
+  });
   let disposed = false;
   let stopRequested = false;
   let activeTurnId: string | null = null;
@@ -885,6 +905,15 @@
   }
 
   onMount(() => {
+    let unlistenHookActivity: (() => void) | undefined;
+    void listen<unknown>('sail:hook-activity', ({ payload }) => {
+      const activity = parseHookActivity(payload);
+      if (activity) mergeHookActivities([activity]);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenHookActivity = unlisten;
+      return undefined;
+    });
     recoveryEligible = !thread && !ephemeral;
     if (recoveryEligible) {
       const recovered = getSetting(failedDraftKey());
@@ -975,6 +1004,7 @@
         if (!disposed) error = `Could not subscribe to agent events: ${describe(cause)}`;
       });
     return () => {
+      unlistenHookActivity?.();
       rememberDraft();
       disposed = true;
       window.removeEventListener('sai-agent-failed-draft', restoreFailedDraft);
@@ -1618,6 +1648,8 @@
                 : 'Tool failure'}
           <div class="agent-tool-failure" role="group" aria-label={label}>
             <strong>{label}</strong>
+            <div><span>Provider:</span> {name}</div>
+            {#if failure.event}<div><span>Event:</span> {failure.event}</div>{/if}
             <div><span>Action:</span> <code>{failure.action}</code></div>
             {#if failure.rule}<div><span>Rule or hook:</span> <code>{failure.rule}</code></div>{/if}
             <div><span>Reason:</span> {failure.reason}</div>
@@ -1753,6 +1785,9 @@
         >
           <Markdown source={message.text} />
         </ChatMessage>
+      {/each}
+      {#each visibleHookActivities as activity (activity.id)}
+        <HookActivityCard {activity} />
       {/each}
       <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
       <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />

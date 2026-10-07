@@ -612,6 +612,12 @@ fn connect_blocking(
         "PATH",
         std::env::join_paths(paths).map_err(|error| error.to_string())?,
     );
+    if let Some(connection_file) = crate::hook_activity::connection_file(
+        app.state::<crate::hook_activity::HookActivityManager>()
+            .inner(),
+    ) {
+        command.env("SAIL_HOOK_CONNECTION_FILE", connection_file);
+    }
     if let (Some(name), Some(binary)) = (definition.binary_env, availability.binary_path) {
         command.env(name, binary);
     }

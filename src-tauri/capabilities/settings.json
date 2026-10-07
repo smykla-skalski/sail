@@ -6,6 +6,9 @@
   "permissions": [
     "allow-diagnostic-event",
     "allow-inspect-agent-hooks",
+    "allow-inspect-hook-integration",
+    "allow-enable-hook-integration",
+    "allow-remove-hook-integration",
     "allow-open-external-url",
     "core:event:allow-listen",
     "core:event:allow-unlisten",

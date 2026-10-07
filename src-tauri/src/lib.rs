@@ -132,6 +132,7 @@ mod child_watchdog;
 mod dev_servers;
 mod diagnostics;
 mod github;
+pub mod hook_activity;
 mod hook_inspector;
 mod post_turn_checks;
 mod settings;
@@ -1809,6 +1810,9 @@ pub fn run() {
                 eprintln!("Sail diagnostics unavailable: {error}");
             }
             browser_agent::start_bridge(_app.handle())?;
+            if let Err(error) = hook_activity::start_bridge(_app.handle()) {
+                eprintln!("Sail hook receiver unavailable: {error}");
+            }
             #[cfg(any(target_os = "macos", windows))]
             configure_pane_menu(_app.handle())?;
             Ok(())
@@ -1820,6 +1824,7 @@ pub fn run() {
         .manage(post_turn_checks::CheckLock::default())
         .manage(browser_agent::BrowserManager::default())
         .manage(browser::CaptureStore::default())
+        .manage(hook_activity::HookActivityManager::default())
         .invoke_handler(tauri::generate_handler![
             diagnostics::diagnostic_event,
             settings::load_settings,
@@ -1851,6 +1856,10 @@ pub fn run() {
             post_turn_checks::list_post_turn_checks,
             post_turn_checks::run_post_turn_check,
             hook_inspector::inspect_agent_hooks,
+            hook_activity::inspect_hook_integration,
+            hook_activity::enable_hook_integration,
+            hook_activity::remove_hook_integration,
+            hook_activity::list_hook_activity,
             github::create_pull_request,
             github::list_open_issues,
             github::open_issue,
@@ -1950,6 +1959,9 @@ pub fn run() {
                 }
                 if let Some(runtime) = app.try_state::<RuntimeManager>() {
                     runtime.shutdown();
+                }
+                if let Some(manager) = app.try_state::<hook_activity::HookActivityManager>() {
+                    hook_activity::cleanup(&manager);
                 }
             }
         });
