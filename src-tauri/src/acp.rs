@@ -681,6 +681,24 @@ fn connect_blocking(
                 continue;
             };
             if let Some(update) = message.pointer("/params/update") {
+                if update.get("sessionUpdate").and_then(Value::as_str) == Some("subagent_spawned") {
+                    let parent_id = message.pointer("/params/sessionId").and_then(Value::as_str);
+                    let child_id = update.get("subagentSessionId").and_then(Value::as_str);
+                    if let (Some(parent_id), Some(child_id)) = (parent_id, child_id) {
+                        if parent_id != child_id {
+                            if let Ok(mut directories) = reader.session_directories.lock() {
+                                if let Some(directory) = directories.get(parent_id).cloned() {
+                                    directories.entry(child_id.to_string()).or_insert(directory);
+                                }
+                            }
+                        }
+                    } else {
+                        crate::diagnostics::record(
+                            "acp_invalid_subagent_update",
+                            json!({"agent":agent_id,"parentSessionId":parent_id}),
+                        );
+                    }
+                }
                 if matches!(
                     update.get("sessionUpdate").and_then(Value::as_str),
                     Some("tool_call_update")
@@ -797,13 +815,23 @@ fn connect_blocking(
     });
     agents.insert(agent, Arc::clone(&runtime));
     drop(agents);
-    let result = runtime.request("initialize", json!({
-        "protocolVersion": 1,
-        "clientCapabilities": {"fs":{"readTextFile":false,"writeTextFile":false},"terminal":true},
-        "clientInfo":{"name":"sail","title":"Sail","version":"0.1.0"}
-    }), Duration::from_secs(60)).inspect_err(|_| {
-        runtime.terminate();
-    })?;
+    let result = runtime
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs":{"readTextFile":false,"writeTextFile":false},
+                    "terminal":true,
+                    "subagents":{}
+                },
+                "clientInfo":{"name":"sail","title":"Sail","version":"0.1.0"}
+            }),
+            Duration::from_secs(60),
+        )
+        .inspect_err(|_| {
+            runtime.terminate();
+        })?;
     if result.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
         runtime.terminate();
         return Err("Agent does not support ACP v1.".into());

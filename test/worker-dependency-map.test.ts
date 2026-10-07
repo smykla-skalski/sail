@@ -5,6 +5,7 @@ import {
   buildWorkerDependencyMap,
   hasWorkerDependencies,
 } from '../src/lib/worker-dependency-map.ts';
+import type { NativeSubagent } from '../src/lib/native-subagents.ts';
 
 function issue(number: number, dependsOn: string[] = []): ShipIssue {
   return {
@@ -35,6 +36,29 @@ function run(issues: ShipIssue[]): ShipRun {
     externalClosed: {},
     dependencyErrors: {},
     issues,
+  };
+}
+
+function nativeChild(
+  sessionId: string,
+  parentSessionId: string,
+  outcome: NativeSubagent['outcome'],
+): NativeSubagent {
+  return {
+    id: `codex:${sessionId}`,
+    agent: 'codex',
+    directory: '/repo',
+    sessionId,
+    parentSessionId,
+    rootSessionId: 'root',
+    name: sessionId,
+    task: `Task ${sessionId}`,
+    outcome,
+    activity: outcome,
+    transcript: [],
+    created: 1,
+    updated: 2,
+    restored: false,
   };
 }
 
@@ -93,4 +117,31 @@ await test('dependency map preserves draft ID case and normalizes only repositor
     ],
   );
   assert.equal(graph.nodes.find((node) => node.id === 'external:99')?.owner, 'owner/repo');
+});
+
+await test('dependency map preserves native child ancestry and deduplicated outcomes', () => {
+  const parent = { ...issue(1), threadId: 'acp:codex:root', path: '/repo' };
+  const graph = buildWorkerDependencyMap(run([parent]), [
+    nativeChild('child', 'root', 'working'),
+    nativeChild('grandchild', 'child', 'unknown'),
+  ]);
+
+  assert.deepEqual(
+    graph.edges.map(({ from, to }) => [from, to]),
+    [
+      [parent.id, 'native:codex:child'],
+      ['native:codex:child', 'native:codex:grandchild'],
+    ],
+  );
+  assert.equal(graph.nodes.find((node) => node.id === 'native:codex:child')?.depth, 1);
+  assert.equal(graph.nodes.find((node) => node.id === 'native:codex:grandchild')?.depth, 2);
+  assert.equal(graph.nodes.find((node) => node.id === 'native:codex:grandchild')?.state, 'Unknown');
+});
+
+await test('dependency map excludes native children owned by another run', () => {
+  const value = run([{ ...issue(1), threadId: 'acp:codex:root' }]);
+  const graph = buildWorkerDependencyMap(value, [
+    { ...nativeChild('foreign', 'other-root', 'working'), rootSessionId: 'other-root' },
+  ]);
+  assert.deepEqual(graph, { nodes: [], edges: [], errors: [] });
 });

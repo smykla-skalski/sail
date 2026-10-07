@@ -1,9 +1,10 @@
 import type { ShipIssue, ShipRun } from './issue-shipping';
+import type { NativeSubagent } from './native-subagents.ts';
 import { ciStatus, dependencyUrl, shipStatus } from './ship-progress.ts';
 
 export type DependencyMapNode = {
   id: string;
-  kind: 'worker' | 'external' | 'missing';
+  kind: 'worker' | 'subagent' | 'external' | 'missing';
   label: string;
   owner: string;
   state: string;
@@ -47,12 +48,25 @@ function dependencyOwner(reference: string, remote: string): string {
   return match?.[1] ?? remote;
 }
 
-export function hasWorkerDependencies(run: ShipRun): boolean {
-  return run.issues.some((issue) => issue.dependsOn.length > 0);
+export function hasWorkerDependencies(run: ShipRun, native: NativeSubagent[] = []): boolean {
+  const threads = new Set(run.issues.flatMap((issue) => (issue.threadId ? [issue.threadId] : [])));
+  return (
+    run.issues.some((issue) => issue.dependsOn.length > 0) ||
+    native.some((child) => threads.has(`acp:${child.agent}:${child.rootSessionId}`))
+  );
 }
 
-export function buildWorkerDependencyMap(run: ShipRun): WorkerDependencyMap {
-  if (!hasWorkerDependencies(run)) return { nodes: [], edges: [], errors: [] };
+export function buildWorkerDependencyMap(
+  run: ShipRun,
+  native: NativeSubagent[] = [],
+): WorkerDependencyMap {
+  const issueThreads = new Set(
+    run.issues.flatMap((issue) => (issue.threadId ? [issue.threadId] : [])),
+  );
+  const relevantNative = native.filter((child) =>
+    issueThreads.has(`acp:${child.agent}:${child.rootSessionId}`),
+  );
+  if (!hasWorkerDependencies(run, relevantNative)) return { nodes: [], edges: [], errors: [] };
   const aliases = localAliases(run);
   const edges: DependencyMapEdge[] = [];
   const errors: string[] = [];
@@ -154,6 +168,43 @@ export function buildWorkerDependencyMap(run: ShipRun): WorkerDependencyMap {
     depth: depth(issue),
     errors: nodeErrors.get(issue.id) ?? [],
   }));
+  const nativeByThread = new Map(
+    relevantNative.map((child) => [`acp:${child.agent}:${child.sessionId}`, child]),
+  );
+  const issueByThread = new Map(
+    run.issues.flatMap((issue) => (issue.threadId ? [[issue.threadId, issue] as const] : [])),
+  );
+  const nativeDepth = (child: NativeSubagent, trail = new Set<string>()): number => {
+    if (trail.has(child.id)) return 0;
+    const parentThread = `acp:${child.agent}:${child.parentSessionId}`;
+    const parent = nativeByThread.get(parentThread);
+    if (parent) return nativeDepth(parent, new Set(trail).add(child.id)) + 1;
+    const issue = issueByThread.get(parentThread);
+    return issue ? (depths.get(issue.id) ?? 0) + 1 : 0;
+  };
+  for (const child of relevantNative) {
+    const id = `native:${child.agent}:${child.sessionId}`;
+    const parentThread = `acp:${child.agent}:${child.parentSessionId}`;
+    const parent = nativeByThread.get(parentThread);
+    const issue = issueByThread.get(parentThread);
+    if (parent || issue)
+      edges.push({
+        from: parent ? `native:${parent.agent}:${parent.sessionId}` : issue!.id,
+        to: id,
+        error: false,
+      });
+    nodes.push({
+      id,
+      kind: 'subagent',
+      label: child.task,
+      owner: `${child.agent} / ${child.name}`,
+      state: child.outcome === 'unknown' ? 'Unknown' : child.outcome,
+      blockingReason: child.error ?? null,
+      checkState: 'Unavailable',
+      depth: nativeDepth(child),
+      errors: child.error ? [child.error] : [],
+    });
+  }
   nodes.push(...external.values());
   return {
     nodes: nodes.toSorted(

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ShipRun } from './lib/issue-shipping';
+  import type { NativeSubagent } from './lib/native-subagents';
   import { buildWorkerDependencyMap } from './lib/worker-dependency-map';
 
   let {
@@ -7,15 +8,17 @@
     selected,
     onselect,
     onopen,
+    nativeSubagents = [],
   }: {
     run: ShipRun;
     selected?: string;
     onselect: (id: string) => Promise<void>;
     onopen: (path: string, threadId?: string | null) => Promise<void>;
+    nativeSubagents?: NativeSubagent[];
   } = $props();
   let view = $state<'map' | 'table'>('map');
   let error = $state('');
-  const graph = $derived(buildWorkerDependencyMap(run));
+  const graph = $derived(buildWorkerDependencyMap(run, nativeSubagents));
   const columns = $derived(
     [...new Set(graph.nodes.map((node) => node.depth))].toSorted((left, right) => left - right),
   );

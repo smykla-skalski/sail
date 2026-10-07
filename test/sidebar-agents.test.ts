@@ -3,10 +3,37 @@ import test from 'node:test';
 import {
   groupSidebarThreads,
   listSidebarOpenCodeThreads,
+  sidebarThreadRows,
   sidebarThreadStatus,
   type SidebarSessionSource,
 } from '../src/lib/sidebar-agents.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
+
+function nativeReceipt(
+  sessionId: string,
+  sourceId: string,
+  state: SpawnReceipt['state'],
+): SpawnReceipt {
+  return {
+    receiptId: `native:codex:${sessionId}`,
+    accessKey: '',
+    requestId: `native:${sessionId}`,
+    project: '/repo',
+    sourceId: `acp:codex:${sourceId}`,
+    sourceDirectory: '/repo',
+    targetId: `acp:codex:${sessionId}`,
+    turnId: null,
+    targetDirectory: '/repo',
+    worktreeId: null,
+    provider: 'codex',
+    prompt: sessionId,
+    state,
+    created: 1,
+    updated: 2,
+    result: state === 'completed' ? 'Completed' : null,
+    error: null,
+  };
+}
 
 await test('sidebar groups every thread by checkout and keeps distinct sessions', () => {
   const grouped = groupSidebarThreads([
@@ -127,6 +154,77 @@ await test('active subagent keeps a finished parent visibly working', () => {
       [{ ...receipt, sourceId: 'opencode:parent' }],
     ),
     'working',
+  );
+});
+
+await test('native child rows use their own outcome without parent attention state', () => {
+  const thread = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'child',
+    title: 'Child',
+    updated: 1,
+  };
+  const receipt: SpawnReceipt = {
+    receiptId: 'native:codex:child',
+    accessKey: '',
+    requestId: 'native:child',
+    project: '/repo',
+    sourceId: 'acp:codex:parent',
+    sourceDirectory: '/repo',
+    targetId: 'acp:codex:child',
+    turnId: null,
+    targetDirectory: '/repo',
+    worktreeId: null,
+    provider: 'codex',
+    prompt: 'Child',
+    state: 'waiting',
+    created: 1,
+    updated: 2,
+    result: null,
+    error: null,
+  };
+  const status = (state: SpawnReceipt['state']) =>
+    sidebarThreadStatus(thread, {}, {}, true, true, [], [{ ...receipt, state }]);
+  assert.equal(status('waiting'), 'waiting');
+  assert.equal(status('completed'), 'done');
+  assert.equal(status('failed'), 'failed');
+  assert.equal(status('unavailable'), null);
+});
+
+await test('native sidebar rows preserve ancestry and collapse settled subtrees', () => {
+  const parent = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'parent',
+    title: 'Parent',
+    updated: 1,
+  };
+  const child = { ...parent, sessionId: 'child', title: 'Child', updated: 3 };
+  const grandchild = { ...parent, sessionId: 'grandchild', title: 'Grandchild', updated: 4 };
+  const sibling = { ...parent, sessionId: 'sibling', title: 'Sibling', updated: 2 };
+  const receipts = [
+    nativeReceipt('child', 'parent', 'working'),
+    nativeReceipt('grandchild', 'child', 'working'),
+    nativeReceipt('sibling', 'parent', 'completed'),
+  ];
+
+  const collapsed = sidebarThreadRows([grandchild, child, sibling, parent], receipts);
+  assert.deepEqual(
+    collapsed.map((row) => [row.thread.sessionId, row.depth]),
+    [
+      ['parent', 0],
+      ['child', 1],
+      ['grandchild', 2],
+    ],
+  );
+  assert.equal(collapsed[0].hiddenHistoricalChildren, 1);
+  const expanded = sidebarThreadRows([grandchild, child, sibling, parent], receipts, [
+    JSON.stringify(['codex', '/repo', 'parent']),
+  ]);
+  assert.deepEqual(
+    expanded.map((row) => row.thread.sessionId),
+    ['parent', 'child', 'grandchild', 'sibling'],
   );
 });
 

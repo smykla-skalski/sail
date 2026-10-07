@@ -256,6 +256,16 @@
     type SpawnState,
   } from './lib/agent-results';
   import {
+    disconnectNativeSubagents,
+    finalizeNativeSubagentRestore,
+    nativeSubagentId,
+    nativeSubagentReceipts,
+    nativeSubagentThreads as threadsForNativeSubagents,
+    setNativeSubagentWaiting,
+    updateNativeSubagents,
+    type NativeSubagentStore,
+  } from './lib/native-subagents';
+  import {
     getSetting,
     removeSetting,
     setSetting,
@@ -550,6 +560,10 @@
   let agentAvailability = $state<AgentAvailability[]>([]);
   let agentDetectionError = $state('');
   let agentThreads = $state<AgentThread[]>(savedAgentThreads);
+  let nativeSubagents = $state<NativeSubagentStore>({});
+  let nativeChildThreads = $derived(threadsForNativeSubagents(nativeSubagents));
+  let nativeChildReceipts = $derived(nativeSubagentReceipts(nativeSubagents));
+  let visibleSpawnReceipts = $derived([...spawnReceipts, ...nativeChildReceipts]);
 
   function isShipItPrompt(text: string): boolean {
     return /^\s*\/ship-it(?:\s|$)/im.test(text);
@@ -628,7 +642,7 @@
   let nativeUnavailableDirectories = $state<string[]>([]);
   let sidebarThreads = $derived(
     groupSidebarThreads(
-      [...agentThreads, ...sidebarOpenCodeThreads].filter(
+      [...agentThreads, ...nativeChildThreads, ...sidebarOpenCodeThreads].filter(
         (thread) => !hiddenSidebarThreadKeys.includes(threadKey(thread)),
       ),
     ),
@@ -646,7 +660,7 @@
             acpActivityReady,
             nativeActivityReady,
             nativeUnavailableDirectories,
-            spawnReceipts,
+            visibleSpawnReceipts,
           ),
         ]),
     ),
@@ -669,7 +683,7 @@
           acpActivityReady,
           nativeActivityReady,
           nativeUnavailableDirectories,
-          spawnReceipts,
+          visibleSpawnReceipts,
         ),
       ]),
     ),
@@ -1390,7 +1404,7 @@
         sessionId: thread.sessionId,
       });
     }
-    for (const receipt of spawnReceipts) {
+    for (const receipt of visibleSpawnReceipts) {
       input.push({
         workspace: receipt.sourceDirectory,
         kind: 'subagent',
@@ -4574,12 +4588,13 @@
         const sessionId = pending.message.params?.sessionId;
         const requestId = pending.message.id;
         if (typeof sessionId !== 'string' || requestId == null) continue;
-        const thread = agentThreads.find(
+        const thread = [...agentThreads, ...nativeChildThreads].find(
           (item) => item.agent === pending.agent && item.sessionId === sessionId,
         );
         if (!thread) continue;
         const location = byDirectory.get(thread.directory);
         if (!location) continue;
+        const nativeChild = nativeSubagents[nativeSubagentId(pending.agent, sessionId)];
         const tool = pending.message.params?.toolCall;
         const title =
           tool && typeof tool === 'object' && 'title' in tool && typeof tool.title === 'string'
@@ -4600,7 +4615,7 @@
           ...location,
           key,
           kind: 'acp-permission',
-          agent: agentAvailability.find((item) => item.id === pending.agent)?.name ?? pending.agent,
+          agent: `${agentAvailability.find((item) => item.id === pending.agent)?.name ?? pending.agent}${nativeChild ? ` · ${nativeChild.name}` : ''}`,
           agentId: pending.agent,
           sessionId,
           requestId,
@@ -6050,7 +6065,11 @@
   }
 
   function forgetMissingRecentThreads() {
-    recentThreadKeys = retainRecentThreads(recentThreadKeys, [...agentThreads, ...nativeThreads]);
+    recentThreadKeys = retainRecentThreads(recentThreadKeys, [
+      ...agentThreads,
+      ...nativeChildThreads,
+      ...nativeThreads,
+    ]);
     setSetting('sai-recent-agent-threads', JSON.stringify(recentThreadKeys));
   }
 
@@ -6065,7 +6084,7 @@
       ),
     ]);
     const availableThreads = new Set(
-      [...agentThreads, ...nativeThreads]
+      [...agentThreads, ...nativeChildThreads, ...nativeThreads]
         .filter(
           (thread) =>
             (thread.agent === 'opencode'
@@ -6091,9 +6110,12 @@
   }
 
   async function jumpToRecentThread(key: string): Promise<boolean> {
-    const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
-      (item) => threadKey(item) === key,
-    );
+    const thread = [
+      ...agentThreads,
+      ...nativeChildThreads,
+      ...nativeThreads,
+      ...sidebarOpenCodeThreads,
+    ].find((item) => threadKey(item) === key);
     if (
       !thread ||
       (thread.agent === 'opencode'
@@ -6116,7 +6138,12 @@
     }
     if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
       return false;
-    const selected = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
+    const selected = [
+      ...agentThreads,
+      ...nativeChildThreads,
+      ...nativeThreads,
+      ...sidebarOpenCodeThreads,
+    ].find(
       (item) =>
         item.directory === directory &&
         item.agent === thread.agent &&
@@ -6141,7 +6168,12 @@
       throw cause;
     }
     if (threadId) {
-      const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
+      const thread = [
+        ...agentThreads,
+        ...nativeChildThreads,
+        ...nativeThreads,
+        ...sidebarOpenCodeThreads,
+      ].find(
         (item) =>
           item.directory === path &&
           (item.agent === 'opencode'
@@ -6229,7 +6261,7 @@
       return;
     }
     if (item.kind === 'acp-permission') {
-      const thread = agentThreads.find(
+      const thread = [...agentThreads, ...nativeChildThreads].find(
         (entry) =>
           entry.agent === item.agentId &&
           entry.sessionId === item.sessionId &&
@@ -6286,7 +6318,7 @@
 
   async function decideInbox(item: InboxItem, optionId: string | null) {
     if (item.kind === 'acp-permission') {
-      const thread = agentThreads.find(
+      const thread = [...agentThreads, ...nativeChildThreads].find(
         (entry) =>
           entry.agent === item.agentId &&
           entry.sessionId === item.sessionId &&
@@ -6687,7 +6719,7 @@
 
   async function selectActivityHistory(event: ActivityHistoryEvent) {
     if (event.kind === 'subagent') {
-      const receipt = spawnReceipts.find((item) => item.receiptId === event.sourceId);
+      const receipt = visibleSpawnReceipts.find((item) => item.receiptId === event.sourceId);
       if (!receipt) throw new Error('The recorded child is no longer available.');
       await openSpawnTarget(receipt);
       return;
@@ -6711,7 +6743,12 @@
         return;
       }
     }
-    const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
+    const thread = [
+      ...agentThreads,
+      ...nativeChildThreads,
+      ...nativeThreads,
+      ...sidebarOpenCodeThreads,
+    ].find(
       (item) =>
         item.directory === event.workspace &&
         item.agent === event.agent &&
@@ -7581,6 +7618,29 @@
   }
 
   function handleAgentEvent(event: AgentEvent) {
+    const eventSessionId = event.message.params?.sessionId;
+    const eventDirectory =
+      typeof eventSessionId === 'string'
+        ? ([...agentThreads, ...nativeChildThreads].find(
+            (thread) => thread.agent === event.agent && thread.sessionId === eventSessionId,
+          )?.directory ?? directory)
+        : directory;
+    nativeSubagents = updateNativeSubagents(
+      nativeSubagents,
+      event,
+      eventDirectory,
+      Date.now(),
+      typeof eventSessionId === 'string' &&
+        (!!replayingAgentSessions[JSON.stringify([event.agent, eventSessionId])] ||
+          !!nativeSubagents[nativeSubagentId(event.agent, eventSessionId)]?.restored),
+    );
+    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
+      nativeSubagents = setNativeSubagentWaiting(
+        nativeSubagents,
+        event.agent,
+        eventSessionId,
+        false,
+      );
     if (event.message.method === 'session/update') {
       const params = event.message.params;
       const sessionId = params?.sessionId;
@@ -7697,6 +7757,7 @@
     } else if (event.message.method === 'session/request_permission') {
       const sessionId = event.message.params?.sessionId;
       if (typeof sessionId !== 'string') return;
+      nativeSubagents = setNativeSubagentWaiting(nativeSubagents, event.agent, sessionId, true);
       for (const thread of agentThreads.filter(
         (item) => item.agent === event.agent && item.sessionId === sessionId,
       ))
@@ -7709,6 +7770,7 @@
       ))
         updateSpawnReceipt(receipt.receiptId, { state: 'waiting' });
     } else if (event.message.method === 'sail/disconnected') {
+      nativeSubagents = disconnectNativeSubagents(nativeSubagents, event.agent);
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
@@ -7730,6 +7792,8 @@
     if (count > 0) next[key] = count;
     else delete next[key];
     replayingAgentSessions = next;
+    if (!replaying && sessionId)
+      nativeSubagents = finalizeNativeSubagentRestore(nativeSubagents, agent, sessionId);
   }
 
   function invalidatePaneSelection(id: string) {
@@ -9303,7 +9367,7 @@
         threads={sidebarThreads}
         attention={threadAttention}
         openCodeOutcomes={sidebarOpenCodeOutcomes}
-        {spawnReceipts}
+        spawnReceipts={visibleSpawnReceipts}
         {acpActivityReady}
         {nativeActivityReady}
         {nativeUnavailableDirectories}
@@ -9544,11 +9608,15 @@
                       coordinationKey(directory, `acp:${acpAgent}:${acpThread.sessionId}`),
                 )}
                 spawnReceipts={spawnReceiptsForSource(
-                  spawnReceipts,
+                  visibleSpawnReceipts,
                   acpThread ? `acp:${acpAgent}:${acpThread.sessionId}` : null,
                   directory,
                 )}
                 onopensubagent={openSpawnTarget}
+                nativeEntries={acpThread
+                  ? nativeSubagents[nativeSubagentId(acpThread.agent, acpThread.sessionId)]
+                      ?.transcript
+                  : undefined}
                 focusPrompt={promptFocusPane === 'main'}
                 picked={pickedAttachments.main}
                 prefill={issuePrefills[directory]}
@@ -9991,6 +10059,7 @@
                     (acpAgent ? agentChangesOpen : true)}
                   runs={shipRuns}
                   busy={shippingBusy}
+                  nativeSubagents={Object.values(nativeSubagents)}
                   onclose={closeShipRuns}
                   onrefresh={() => tickShippingRuns(true)}
                   onopen={openShipTarget}
@@ -10011,7 +10080,7 @@
         statuses={taskOverviewStatuses}
         agentNames={taskOverviewAgentNames}
         checks={postTurnResults}
-        receipts={spawnReceipts}
+        receipts={visibleSpawnReceipts}
         {directory}
         onopen={openTaskOverviewTarget}
         onopencheck={openTaskOverviewCheck}
@@ -10032,10 +10101,11 @@
         {setup}
         {runtimeState}
         {coordinationMessages}
-        {spawnReceipts}
+        spawnReceipts={visibleSpawnReceipts}
         onopensubagent={openSpawnTarget}
         {shipRuns}
         {shippingBusy}
+        nativeSubagents={Object.values(nativeSubagents)}
         onshiprefresh={() => tickShippingRuns(true)}
         onshipopen={openShipTarget}
         onshipsettings={openSettings}
@@ -10122,6 +10192,7 @@
             repository={coordinationProject(directory) ?? directory}
             runs={shipRuns}
             busy={shippingBusy}
+            nativeSubagents={Object.values(nativeSubagents)}
             onclose={closeShipRuns}
             onrefresh={() => tickShippingRuns(true)}
             onopen={openShipTarget}

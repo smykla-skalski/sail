@@ -9,7 +9,7 @@
   import type { AttentionMap, ThreadStatus } from './lib/attention';
   import { activityState } from './lib/activity-state';
   import { threadKey } from './lib/recent-threads';
-  import { sidebarThreadStatus } from './lib/sidebar-agents';
+  import { sidebarThreadRows, sidebarThreadStatus } from './lib/sidebar-agents';
   import {
     isSubagentThread,
     receiptSourceId,
@@ -194,6 +194,7 @@
   let collapsedRepositoryPaths = $derived(new Set(catalog.collapsedRepositories ?? []));
   const collapsedAgentPathsSetting = 'sai-collapsed-agent-worktrees';
   let collapsedAgentPaths = $state<string[]>(loadCollapsedAgentPaths());
+  let expandedHistoricalParents = $state<string[]>([]);
 
   function loadCollapsedAgentPaths(): string[] {
     try {
@@ -249,12 +250,16 @@
     );
   }
 
-  function activeSubagentCount(thread: AgentThread): number {
-    return runningSubagentsForSource(
+  function subagentCounts(thread: AgentThread): { active: number; waiting: number } {
+    const children = runningSubagentsForSource(
       spawnReceipts,
       receiptSourceId(thread.agent, thread.sessionId),
       thread.directory,
-    ).length;
+    );
+    return {
+      active: children.filter((child) => child.state === 'working').length,
+      waiting: children.filter((child) => child.state === 'waiting').length,
+    };
   }
 
   function subagentThread(thread: AgentThread): boolean {
@@ -263,6 +268,13 @@
       receiptSourceId(thread.agent, thread.sessionId),
       thread.directory,
     );
+  }
+
+  function toggleHistoricalChildren(thread: AgentThread) {
+    const key = threadKey(thread);
+    expandedHistoricalParents = expandedHistoricalParents.includes(key)
+      ? expandedHistoricalParents.filter((item) => item !== key)
+      : [...expandedHistoricalParents, key];
   }
 
   function statusLabel(status: ThreadStatus | null): string {
@@ -723,11 +735,18 @@
       aria-label={`Agent threads in ${path}`}
       hidden={agentListCollapsed(path)}
     >
-      {#each threads[path] as thread (threadKey(thread))}
+      {#each sidebarThreadRows(threads[path], spawnReceipts, expandedHistoricalParents) as row (threadKey(row.thread))}
+        {@const thread = row.thread}
         {@const key = threadKey(thread)}
         {@const status = threadStatus(thread)}
         {@const child = subagentThread(thread)}
-        {@const activeChildren = activeSubagentCount(thread)}
+        {@const childCounts = subagentCounts(thread)}
+        {@const childSummary = [
+          childCounts.active ? `${childCounts.active} active` : '',
+          childCounts.waiting ? `${childCounts.waiting} waiting` : '',
+        ]
+          .filter(Boolean)
+          .join(', ')}
         {@const selectable =
           thread.agent === 'opencode'
             ? openCodeAvailable
@@ -736,8 +755,10 @@
           class:active={selectedThread === key}
           class:subagent={child}
           class="project-agent-row"
+          style:margin-left={`${row.depth * 8}px`}
+          style:width={`calc(100% - ${row.depth * 8}px)`}
           aria-current={selectedThread === key ? 'page' : undefined}
-          aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}, ${statusLabel(status)}${activeChildren ? `, ${activeChildren} subagent${activeChildren === 1 ? '' : 's'} active` : ''}`}
+          aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}, ${statusLabel(status)}${childSummary ? `, subagents: ${childSummary}` : ''}`}
           title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
           aria-disabled={!selectable}
           oncontextmenu={(event) => openMenu({ kind: 'agent', thread }, event)}
@@ -758,12 +779,20 @@
           <span class="project-agent-title">{thread.title}</span>
           <ActivityStatus
             {status}
-            label={activeChildren
-              ? `${statusLabel(status)} · ${activeChildren} subagent${activeChildren === 1 ? '' : 's'}`
-              : statusLabel(status)}
+            label={childSummary ? `${statusLabel(status)} · ${childSummary}` : statusLabel(status)}
             compact
           />
         </button>
+        {#if row.historicalChildren}<button
+            class="project-agent-history"
+            style:margin-left={`${(row.depth + 1) * 8}px`}
+            aria-expanded={row.historicalExpanded}
+            aria-label={`${row.historicalExpanded ? 'Collapse' : 'Show'} ${row.historicalChildren} historical subagent${row.historicalChildren === 1 ? '' : 's'} for ${thread.title}`}
+            onclick={() => toggleHistoricalChildren(thread)}
+            >{row.historicalExpanded ? '▾' : '▸'}
+            {row.historicalExpanded ? 'Hide' : 'Show'}
+            {row.historicalChildren} historical</button
+          >{/if}
       {/each}
     </div>
   {/if}

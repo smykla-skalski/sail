@@ -338,10 +338,22 @@ button:disabled {
   cursor: default;
 }
 .project-agent-row.subagent {
-  margin-left: 8px;
-  width: calc(100% - 8px);
   border-left: 2px solid var(--sui-primary);
   background: color-mix(in srgb, var(--sui-primary) 5%, transparent);
+}
+.project-agent-history {
+  margin-top: 1px;
+  margin-bottom: 3px;
+  padding: 2px 5px;
+  border: 0;
+  color: var(--sui-muted);
+  background: transparent;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+.project-agent-history:hover {
+  color: var(--sui-foreground);
 }
 .project-agent-row.subagent:hover,
 .project-agent-row.subagent.active {

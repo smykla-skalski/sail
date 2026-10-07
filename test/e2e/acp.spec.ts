@@ -310,6 +310,57 @@ describe('ACP agent threads', () => {
     );
   });
 
+  it('shows nested native ACP children and restores their separate history', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
+    await $('.agent-composer textarea').setValue('Native subagents');
+    await $('.agent-actions button').click();
+    await expect($('button[aria-label*="for Native subagents"]')).toHaveText(
+      expect.stringContaining('1 historical'),
+    );
+    await $('button[aria-label*="for Native subagents"]').click();
+    await expect($('.sidebar')).toHaveText(expect.stringContaining('Inspect native delegation'));
+    await expect($('.agent-conversation')).not.toHaveText(
+      expect.stringContaining('Child transcript stays separate.'),
+    );
+
+    await $(
+      "//button[contains(@class,'project-agent-row') and contains(.,'Inspect native delegation')]",
+    ).click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Child transcript stays separate.'),
+    );
+    await expect($('button[aria-label*="for Inspect native delegation"]')).toHaveText(
+      expect.stringContaining('1 historical'),
+    );
+    await $('button[aria-label*="for Inspect native delegation"]').click();
+    await expect($('.sidebar')).toHaveText(expect.stringContaining('Inspect nested delegation'));
+
+    await browser.refresh();
+    await selectClaudeThread('Native subagents');
+    await expect($('button[aria-label*="for Native subagents"]')).toHaveText(
+      expect.stringContaining('1 historical'),
+    );
+    await $('button[aria-label*="for Native subagents"]').click();
+    await expect($('.sidebar')).toHaveText(expect.stringContaining('Inspect native delegation'));
+    await $(
+      "//button[contains(@class,'project-agent-row') and contains(.,'Inspect native delegation')]",
+    ).click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Child transcript stays separate.'),
+    );
+  });
+
   it('queues a typed message until the current ACP turn finishes', async () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
