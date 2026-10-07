@@ -5,6 +5,7 @@ import {
   insertSkill,
   mergeSkills,
   promptSkill,
+  progressiveSkillInstructions,
   resolveSkillPrompt,
   skillQuery,
 } from '../src/lib/skills.ts';
@@ -14,6 +15,18 @@ const skills = [
   { id: 'one', name: 'ship-issue', description: 'Ship a GitHub issue' },
   { id: 'two', name: 'review', description: 'Review code' },
 ];
+
+void test('progressive skills keep references discoverable without injecting their bodies', () => {
+  const instructions = progressiveSkillInstructions('ship-it', 'compact core', [
+    'inputs.md',
+    'pr-loop.md',
+  ]);
+  assert.match(instructions, /^compact core/);
+  assert.match(instructions, /inputs\.md, pr-loop\.md/);
+  assert.match(instructions, /skill_reference/);
+  assert.match(instructions, /SHA-256/);
+  assert.doesNotMatch(instructions, /reference body/);
+});
 
 void test('slash matches names and closes after arguments begin', () => {
   assert.equal(skillQuery('/'), '');

@@ -11,6 +11,15 @@ Use them when the user asks you to coordinate agents, inspect or create
 worktrees, operate Sail terminals, message another thread, or use Sail's embedded
 browser. Read the tool schemas before calling them.
 
+## Workflow references
+
+- Bundled workflow prompts contain the core contract only. When that contract
+  links a detailed reference, load it with `skill_reference` instead of guessing.
+- Call `skill_reference` with a skill and no reference to list its bundled files
+  and exact SHA-256 versions. Calls and selected reference names remain visible
+  in the task transcript.
+- References are embedded in Sail and remain available offline.
+
 ## Worktrees and agents
 
 - Use `worktree_list` to find project worktrees and live agent threads. Use

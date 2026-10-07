@@ -4,6 +4,21 @@ export interface SkillChoice {
   id?: string;
   instructions?: string;
 }
+
+export function progressiveSkillInstructions(
+  name: string,
+  core: string,
+  references: string[],
+): string {
+  return [
+    core,
+    '## Sail references',
+    `Detailed ${name} references are bundled offline but omitted from this prompt.`,
+    `Available references: ${references.join(', ')}.`,
+    'Load a reference only when the core workflow calls for it with the Sail MCP `skill_reference` tool.',
+    'The tool response identifies the exact bundled content by SHA-256, and the tool call remains visible in the task transcript.',
+  ].join('\n\n');
+}
 import { getSetting } from './settings.ts';
 import { slashCommands, visibleCommandText } from './slash-commands.ts';
 import {

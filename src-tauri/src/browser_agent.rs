@@ -1,6 +1,7 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -1090,12 +1091,108 @@ pub fn browser_pane_register(
 }
 
 const SAIL_SKILL: &str = include_str!("../../skills/sail/SKILL.md");
+const SHIP_IT_SKILL: &str = include_str!("../../skills/ship-it/SKILL.md");
+const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
+    (
+        "inputs.md",
+        include_str!("../../skills/ship-it/references/inputs.md"),
+    ),
+    (
+        "fallbacks.md",
+        include_str!("../../skills/ship-it/references/fallbacks.md"),
+    ),
+    (
+        "pr-loop.md",
+        include_str!("../../skills/ship-it/references/pr-loop.md"),
+    ),
+];
+const ADVERSARIAL_REVIEW_SKILL: &str = include_str!("../../skills/adversarial-review/SKILL.md");
+const ADVERSARIAL_REVIEW_REFERENCES: &[(&str, &str)] = &[
+    (
+        "code-adversary.md",
+        include_str!("../../skills/adversarial-review/references/code-adversary.md"),
+    ),
+    (
+        "findings-adversary.md",
+        include_str!("../../skills/adversarial-review/references/findings-adversary.md"),
+    ),
+];
+const ADVERSARIAL_TEST_SKILL: &str = include_str!("../../skills/adversarial-test/SKILL.md");
+const ADVERSARIAL_TEST_REFERENCES: &[(&str, &str)] = &[(
+    "test-adversary.md",
+    include_str!("../../skills/adversarial-test/references/test-adversary.md"),
+)];
+
+fn bundled_skill(name: &str) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
+    match name {
+        "ship-it" => Some((SHIP_IT_SKILL, SHIP_IT_REFERENCES)),
+        "adversarial-review" => Some((ADVERSARIAL_REVIEW_SKILL, ADVERSARIAL_REVIEW_REFERENCES)),
+        "adversarial-test" => Some((ADVERSARIAL_TEST_SKILL, ADVERSARIAL_TEST_REFERENCES)),
+        _ => None,
+    }
+}
+
+fn content_version(content: &str) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    format!(
+        "sha256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+fn skill_reference(arguments: &Value) -> Result<Value, String> {
+    let skill = required(arguments, "skill")?;
+    let (core, references) = bundled_skill(skill).ok_or("Unknown bundled skill.")?;
+    let reference = match arguments.get("reference") {
+        None => {
+            return Ok(json!({
+            "content":[{"type":"text","text":format!(
+                "Bundled skill: {skill}\nCore version: {}\nReferences:\n{}",
+                content_version(core),
+                references.iter().map(|(name, content)| format!("- {name} ({})", content_version(content))).collect::<Vec<_>>().join("\n")
+            )}],
+            "structuredContent":{
+                "skill":skill,
+                "coreVersion":content_version(core),
+                "references":references.iter().map(|(name, content)| json!({"name":name,"version":content_version(content)})).collect::<Vec<_>>()
+            }
+            }));
+        }
+        Some(Value::String(reference)) => reference.as_str(),
+        Some(_) => return Err("Bundled skill reference must be a string.".into()),
+    };
+    let (_, content) = references
+        .iter()
+        .find(|(name, _)| *name == reference)
+        .ok_or("Unknown bundled skill reference.")?;
+    let core_version = content_version(core);
+    let version = content_version(content);
+    Ok(json!({
+        "content":[{"type":"text","text":format!(
+            "Bundled skill: {skill}\nCore version: {core_version}\nReference: {reference}\nReference version: {version}\n\n{content}"
+        )}],
+        "structuredContent":{
+            "skill":skill,
+            "coreVersion":core_version,
+            "reference":reference,
+            "version":version
+        }
+    }))
+}
 
 const TOOLS: &[(&str, &str, &str)] = &[
     (
         "sail_skill",
         "Read the Sail skill for using this session's worktree, agent, terminal, thread, and embedded browser tools.",
         "",
+    ),
+    (
+        "skill_reference",
+        "List or load an offline bundled workflow reference. Responses include the exact SHA-256 content version; calls remain visible in the task transcript.",
+        "skill",
     ),
     (
         "worktree_list",
@@ -1230,6 +1327,16 @@ pub fn run_mcp_stdio() {
             "initialize" => mcp_initialize(),
             "ping" => json!({}),
             "tools/list" => json!({"tools": TOOLS.iter().map(|(name, description, fields)| {
+                if *name == "skill_reference" {
+                    return json!({"name":name,"description":description,"inputSchema":{
+                        "type":"object",
+                        "properties":{
+                            "skill":{"type":"string","enum":["ship-it","adversarial-review","adversarial-test"]},
+                            "reference":{"type":"string"}
+                        },
+                        "required":["skill"]
+                    }});
+                }
                 if *name == "agent_spawn" {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object",
@@ -1318,6 +1425,11 @@ fn call_bridge(params: &Value) -> Value {
     if params.get("name").and_then(Value::as_str) == Some("sail_skill") {
         return json!({"content":[{"type":"text","text":SAIL_SKILL}]});
     }
+    if params.get("name").and_then(Value::as_str) == Some("skill_reference") {
+        return skill_reference(params.get("arguments").unwrap_or(&Value::Null)).unwrap_or_else(
+            |error| json!({"content":[{"type":"text","text":error}],"isError":true}),
+        );
+    }
     let port = match std::env::var("SAIL_BROWSER_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
@@ -1389,6 +1501,63 @@ mod skill_tests {
             call_bridge(&json!({"name":"sail_skill","arguments":{}}))["content"][0]["text"],
             SAIL_SKILL
         );
+    }
+
+    #[test]
+    fn bundled_references_are_discoverable_versioned_and_offline() {
+        assert!(TOOLS.iter().any(|(name, _, _)| *name == "skill_reference"));
+        let listed = call_bridge(&json!({
+            "name":"skill_reference",
+            "arguments":{"skill":"ship-it"}
+        }));
+        assert_eq!(listed["structuredContent"]["skill"], "ship-it");
+        assert!(listed["structuredContent"]["coreVersion"]
+            .as_str()
+            .is_some_and(|version| version.starts_with("sha256:")));
+        assert_eq!(
+            listed["structuredContent"]["references"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
+
+        let loaded = call_bridge(&json!({
+            "name":"skill_reference",
+            "arguments":{"skill":"ship-it","reference":"inputs.md"}
+        }));
+        assert_eq!(loaded["structuredContent"]["reference"], "inputs.md");
+        assert_eq!(
+            loaded["structuredContent"]["coreVersion"],
+            listed["structuredContent"]["coreVersion"]
+        );
+        assert!(loaded["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("# Resolving the ship-it input")));
+    }
+
+    #[test]
+    fn bundled_reference_rejects_unknown_names_without_the_bridge() {
+        let result = call_bridge(&json!({
+            "name":"skill_reference",
+            "arguments":{"skill":"ship-it","reference":"../SKILL.md"}
+        }));
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["content"][0]["text"],
+            "Unknown bundled skill reference."
+        );
+
+        for reference in [json!(null), json!(42), json!(["inputs.md"])] {
+            let result = call_bridge(&json!({
+                "name":"skill_reference",
+                "arguments":{"skill":"ship-it","reference":reference}
+            }));
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["content"][0]["text"],
+                "Bundled skill reference must be a string."
+            );
+        }
     }
 }
 
