@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import ActivityStatus from './ActivityStatus.svelte';
   import WorkerDependencyMap from './WorkerDependencyMap.svelte';
   import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './lib/issue-shipping';
   import {
@@ -8,7 +9,9 @@
     dependencyUrl,
     gateNames,
     shipActivity,
+    shipIssuePresentation,
     shipStatus,
+    sortShipIssues,
   } from './lib/ship-progress';
 
   let {
@@ -35,14 +38,21 @@
   let scope = $state<'current' | 'all'>('current');
   let selectedRun = $state('');
   let selectedIssue = $state('');
+  const detailId = `ship-selected-issue-${crypto.randomUUID()}`;
   let wasActive = false;
   const visible = $derived(
     runs.filter((run) => scope === 'all' || !repository || run.repository === repository),
   );
-  const run = $derived(visible.find((item) => item.id === selectedRun) ?? visible.at(-1));
-  const issue = $derived(run?.issues.find((item) => item.id === selectedIssue) ?? run?.issues[0]);
+  const orderedRuns = $derived(
+    visible.toSorted((left, right) => right.approvedAt - left.approvedAt),
+  );
+  const run = $derived(orderedRuns.find((item) => item.id === selectedRun) ?? orderedRuns[0]);
+  const issue = $derived(
+    run?.issues.find((item) => item.id === selectedIssue) ??
+      (run ? sortShipIssues(run)[0] : undefined),
+  );
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
-  const issues = $derived(run?.issues ?? []);
+  const issues = $derived(run ? sortShipIssues(run) : []);
 
   function issueLabel(item: ShipIssue): string {
     return item.title === `Issue #${item.number}`
@@ -65,9 +75,46 @@
   }
 
   async function selectIssue(id: string) {
+    const scrollTop = panel.scrollTop;
     selectedIssue = id;
     await tick();
-    panel.querySelector<HTMLElement>('.ship-issue-detail')?.focus();
+    panel.scrollTop = scrollTop;
+  }
+
+  function runPresentation(item: ShipRun) {
+    const first = sortShipIssues(item)[0];
+    return first
+      ? shipIssuePresentation(item, first)
+      : {
+          status: 'completed',
+          label: 'Empty',
+          priority: 4,
+          nextAction: 'No issues',
+          updated: null,
+        };
+  }
+
+  function workerClaim(item: ShipIssue): string {
+    if (item.state === 'merged') return 'Complete';
+    if (!item.workerState) {
+      if (item.workerSettled) return 'Complete';
+      return item.threadId ? 'Unknown' : 'Not started';
+    }
+    const label = item.workerState.replaceAll('_', ' ');
+    return label.charAt(0).toUpperCase() + label.slice(1);
+  }
+
+  function gateClaim(item: ShipIssue): string {
+    const gates = item.gates ?? [];
+    if (!gates.length) return 'Not started';
+    const latest = gates.toSorted((left, right) => right.updated - left.updated)[0];
+    return `${latest.gate.replaceAll('-', ' ')} · ${latest.verdict ?? latest.state}`;
+  }
+
+  function mergeClaim(item: ShipIssue): string {
+    if (item.state === 'merged') return 'Merged';
+    if (item.pullRequest) return item.state === 'awaiting_merge' ? 'Ready for merge' : 'PR open';
+    return 'PR not opened';
   }
 </script>
 
@@ -116,22 +163,36 @@
       <p>Publish an issue graph from an approved plan, then choose Ship issue graph.</p>
     </section>
   {:else}
-    <label class="ship-run-select"
-      >Run
-      <select
-        value={run.id}
-        onchange={(event) => {
-          selectedRun = event.currentTarget.value;
-          selectedIssue = '';
-        }}
-      >
-        {#each visible as item (item.id)}<option value={item.id}
-            >{item.remote} · {item.umbrella?.title ?? item.issues[0]?.title ?? 'Ship run'} · {new Date(
-              item.approvedAt,
-            ).toLocaleString()}</option
-          >{/each}
-      </select>
-    </label>
+    <section class="ship-run-chooser" aria-label="Choose Ship run">
+      <h3>Runs</h3>
+      <div class="ship-run-list">
+        {#each orderedRuns as item (item.id)}
+          {@const presentation = runPresentation(item)}
+          <button
+            class="ship-run-option"
+            aria-pressed={item.id === run.id}
+            onclick={() => {
+              selectedRun = item.id;
+              selectedIssue = '';
+            }}
+          >
+            <span class="ship-run-task"
+              ><strong>{item.umbrella?.title ?? item.issues[0]?.title ?? 'Ship run'}</strong>
+              <ActivityStatus
+                status={presentation.status}
+                label={presentation.label}
+                compact
+              /></span
+            >
+            <span class="ship-run-meta"
+              ><span>{item.remote}</span><time datetime={new Date(item.approvedAt).toISOString()}
+                >Launched {new Date(item.approvedAt).toLocaleString()}</time
+              ></span
+            >
+          </button>
+        {/each}
+      </div>
+    </section>
     <section class="ship-summary" aria-label="Run progress">
       <div>
         <h3>{run.umbrella?.title ?? run.issues[0]?.title ?? 'Ship run'}</h3>
@@ -153,26 +214,43 @@
         </p>
       </div>
     </section>
-    <section class="ship-now" aria-label="Current shipping activity">
+    <section class="ship-now" aria-label="Shipping issues">
       <div>
-        <h3>Happening now</h3>
-        <p>Latest worker, gate, blocker, and merge state for every issue.</p>
+        <h3>Issues</h3>
+        <p>Needs attention first. Each claim comes from its recorded source.</p>
       </div>
       <div class="ship-now-list">
         {#each issues as item (item.id)}
           {@const activity = shipActivity(run, item)}
+          {@const presentation = shipIssuePresentation(run, item)}
           <button
             class="ship-now-item"
-            data-state={activity.state}
+            data-state={presentation.status}
+            data-ship-issue-id={item.id}
             aria-pressed={item.id === issue?.id}
+            aria-controls={detailId}
             onclick={() => selectIssue(item.id)}
           >
-            <strong>{issueLabel(item)}</strong>
-            <span>{activity.title}</span>
-            <small>{activity.detail}</small>
-            {#if activity.at}<time datetime={new Date(activity.at).toISOString()}
-                >Last signal {new Date(activity.at).toLocaleTimeString()}</time
-              >{/if}
+            <span class="ship-issue-heading"
+              ><strong>{issueLabel(item)}</strong><ActivityStatus
+                status={presentation.status}
+                label={presentation.label}
+                compact
+              /></span
+            >
+            <span class="ship-latest"><b>Latest</b> {activity.title} · {activity.detail}</span>
+            <span class="ship-next"><b>Next</b> {presentation.nextAction}</span>
+            <span class="ship-claims" aria-label={`Issue ${item.number} recorded states`}>
+              <span><b>Worker</b>{workerClaim(item)}</span>
+              <span><b>Review</b>{gateClaim(item)}</span>
+              <span><b>CI</b>{ciStatus(item.checks)}</span>
+              <span><b>Merge</b>{mergeClaim(item)}</span>
+            </span>
+            <time datetime={new Date(presentation.updated ?? run.approvedAt).toISOString()}
+              >{presentation.updated
+                ? `Updated ${new Date(presentation.updated).toLocaleString()}`
+                : 'No confirmed update'}</time
+            >
           </button>
         {:else}<p class="ship-muted">No shipping work is active.</p>{/each}
       </div>
@@ -181,11 +259,12 @@
     <div class="ship-content">
       {#if issue}
         <section
+          id={detailId}
           class="ship-issue-detail"
           tabindex="-1"
           aria-label={`Issue ${issue.number} details`}
         >
-          <h3>Issue details</h3>
+          <h3>{issueLabel(issue)}</h3>
           {#if issue.blockedReason || issue.error}<p class="ship-error" role="status">
               {issue.blockedReason || issue.error}
             </p>{/if}
@@ -289,6 +368,7 @@
     box-sizing: border-box;
     height: 100%;
     overflow: auto;
+    overflow-x: hidden;
     padding: 16px;
     background: var(--sui-surface);
     color: var(--sui-foreground);
@@ -320,16 +400,74 @@
   }
   .ship-now-item {
     display: grid;
-    gap: 4px;
+    min-width: 0;
+    gap: 7px;
     padding: 12px;
     text-align: left;
     border-left: 3px solid var(--sui-primary);
+    overflow-wrap: anywhere;
   }
-  .ship-now-item[data-state='blocked'] {
+  .ship-now-item[aria-pressed='true'],
+  .ship-run-option[aria-pressed='true'] {
+    border-color: var(--sui-primary);
+    background: color-mix(in srgb, var(--sui-primary) 7%, transparent);
+  }
+  .ship-now-item[data-state='failed'],
+  .ship-now-item[data-state='offline'] {
     border-left-color: var(--sui-danger);
   }
   .ship-now-item[data-state='waiting'] {
     border-left-color: var(--sui-warning, var(--sui-primary));
+  }
+  .ship-issue-heading,
+  .ship-run-task,
+  .ship-run-meta {
+    display: flex;
+    min-width: 0;
+    gap: 8px;
+    align-items: start;
+    justify-content: space-between;
+  }
+  .ship-issue-heading strong,
+  .ship-run-task strong,
+  .ship-run-meta span,
+  .ship-run-meta time {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .ship-latest,
+  .ship-next {
+    line-height: 1.4;
+  }
+  .ship-latest b,
+  .ship-next b {
+    display: inline-block;
+    min-width: 42px;
+    color: var(--sui-muted);
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .ship-claims {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .ship-claims > span {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--sui-foreground) 4%, transparent);
+    overflow-wrap: anywhere;
+    font-size: 11px;
+  }
+  .ship-claims b {
+    color: var(--sui-muted);
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
   }
   .ship-now-item time {
     opacity: 0.7;
@@ -345,8 +483,7 @@
   a {
     color: var(--sui-primary);
   }
-  button,
-  select {
+  button {
     font: inherit;
     color: inherit;
     background: transparent;
@@ -367,12 +504,26 @@
     gap: 8px;
     align-items: center;
   }
-  .ship-run-select {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
+  .ship-run-chooser {
+    display: grid;
+    gap: 8px;
     margin: 20px 0;
-    align-items: center;
+  }
+  .ship-run-list {
+    display: grid;
+    gap: 6px;
+  }
+  .ship-run-option {
+    display: grid;
+    min-width: 0;
+    gap: 6px;
+    padding: 10px 12px;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .ship-run-meta {
+    color: var(--sui-muted);
+    font-size: 11px;
   }
   .ship-scope {
     display: flex;
@@ -383,10 +534,6 @@
   .ship-scope button[aria-pressed='true'] {
     border-color: var(--sui-primary);
     color: var(--sui-primary);
-  }
-  select {
-    min-width: 0;
-    flex: 1;
   }
   .ship-summary {
     padding: 16px 0;
@@ -402,6 +549,10 @@
     grid-template-columns: minmax(0, 1fr);
     gap: 24px;
     margin-top: 20px;
+  }
+  .ship-issue-detail {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
   .ship-dependencies {
     display: grid;
@@ -448,5 +599,19 @@
   }
   .ship-empty {
     padding: 40px 0;
+  }
+  @media (max-width: 520px) {
+    .ship-panel {
+      padding: 12px;
+    }
+    .ship-claims {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .ship-issue-heading,
+    .ship-run-task,
+    .ship-run-meta {
+      flex-direction: column;
+      gap: 5px;
+    }
   }
 </style>
