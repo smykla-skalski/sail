@@ -165,6 +165,38 @@ export function validationRevisionDrifted(
   );
 }
 
+export async function commitRevisionBoundValidation<T>({
+  expectedRevision,
+  expectedMutationGeneration,
+  readRevision,
+  readMutationGeneration,
+  prepare,
+  commit,
+}: {
+  expectedRevision: string | undefined;
+  expectedMutationGeneration: string | undefined;
+  readRevision: () => Promise<string>;
+  readMutationGeneration: () => Promise<string>;
+  prepare: () => Promise<T>;
+  commit: (prepared: T) => Promise<void>;
+}): Promise<void> {
+  if (!expectedRevision)
+    throw new Error('Validation needs the revision captured before execution.');
+  const verifyBoundary = async () => {
+    if ((await readRevision()) !== expectedRevision)
+      throw new Error('The worktree changed during validation. Rerun the gate.');
+    if (
+      expectedMutationGeneration !== undefined &&
+      (await readMutationGeneration()) !== expectedMutationGeneration
+    )
+      throw new Error('The worktree was modified during validation. Rerun the gate.');
+  };
+  await verifyBoundary();
+  const prepared = await prepare();
+  await verifyBoundary();
+  await commit(prepared);
+}
+
 export function gateSnapshot(receipt: SpawnReceipt): ShipGate | null {
   if (!receipt.validation) return null;
   return {

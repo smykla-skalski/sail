@@ -22,6 +22,7 @@ import {
   shipOwner,
   shipCheckpointOwner,
   authorizeShipCheckpointThread,
+  commitRevisionBoundValidation,
   shipIssuePresentation,
   shipMergeClaim,
   shipStatus,
@@ -60,6 +61,36 @@ void test('reopened queued issues recover across restart without retrying worker
     assert.equal(failed.state, 'failed');
     assert.equal(failed.issueState, 'OPEN');
   }
+});
+
+void test('validation drift leaves verdict and evidence uncommitted', async () => {
+  await Promise.all(
+    (['revision', 'generation'] as const).map(async (drift) => {
+      let revision = 'revision-one';
+      let generation = 'generation-one';
+      const durable = { verdict: undefined as string | undefined, evidence: [] as string[] };
+
+      await assert.rejects(
+        commitRevisionBoundValidation({
+          expectedRevision: 'revision-one',
+          expectedMutationGeneration: 'generation-one',
+          readRevision: async () => revision,
+          readMutationGeneration: async () => generation,
+          prepare: async () => {
+            if (drift === 'revision') revision = 'revision-two';
+            else generation = 'generation-two';
+            return { verdict: 'PASS', evidence: ['gate passed'] };
+          },
+          commit: async (prepared) => {
+            durable.verdict = prepared.verdict;
+            durable.evidence = prepared.evidence;
+          },
+        }),
+        /worktree (changed|was modified) during validation/,
+      );
+      assert.deepEqual(durable, { verdict: undefined, evidence: [] });
+    }),
+  );
 });
 
 function fixture() {

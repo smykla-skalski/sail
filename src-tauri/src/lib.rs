@@ -1864,7 +1864,27 @@ fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<
 
 #[cfg(windows)]
 fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::rename(source, destination)
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // Omitting MOVEFILE_REPLACE_EXISTING makes the native rename fail atomically
+    // when another process has recreated the destination.
+    let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn rollback_staged_archive(
@@ -2053,20 +2073,51 @@ where
     Ok(saved_archive())
 }
 
+#[derive(Debug, Eq, PartialEq)]
 struct GuardedRemovalState {
-    reference: String,
+    reference: Option<String>,
     head: String,
+}
+
+struct WorktreeHeadLock(PathBuf);
+
+impl Drop for WorktreeHeadLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn lock_worktree_head(worktree: &Path) -> Result<WorktreeHeadLock, String> {
+    use std::ffi::OsString;
+    use std::fs::OpenOptions;
+
+    let head = git_reference(worktree, &["rev-parse", "--git-path", "HEAD"])
+        .ok_or("Cannot locate the worktree HEAD before deletion.")?;
+    let head = PathBuf::from(head);
+    let head = if head.is_absolute() {
+        head
+    } else {
+        worktree.join(head)
+    };
+    let mut lock_name = OsString::from(head.as_os_str());
+    lock_name.push(".lock");
+    let lock = PathBuf::from(lock_name);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .map_err(|error| format!("Cannot lock the worktree checkout before deletion: {error}"))?;
+    Ok(WorktreeHeadLock(lock))
 }
 
 fn guarded_removal_state(
     worktree: &Path,
-    expected_revision: Option<&str>,
+    guarded: bool,
 ) -> Result<Option<GuardedRemovalState>, String> {
-    if expected_revision.is_none() {
+    if !guarded {
         return Ok(None);
     }
-    let reference = git_reference(worktree, &["symbolic-ref", "-q", "HEAD"])
-        .ok_or("Revision-guarded cleanup requires a branch checkout.")?;
+    let reference = git_reference(worktree, &["symbolic-ref", "-q", "HEAD"]);
     let head = git_reference(worktree, &["rev-parse", "HEAD"])
         .ok_or("Cannot capture the worktree commit before deletion.")?;
     Ok(Some(GuardedRemovalState { reference, head }))
@@ -2079,6 +2130,8 @@ fn restore_changed_worktree(
 ) -> Result<(), String> {
     let branch = state
         .reference
+        .as_deref()
+        .ok_or("Cannot restore a detached worktree after it changed during deletion.")?
         .strip_prefix("refs/heads/")
         .ok_or("Cannot restore a non-local worktree branch.")?;
     let output = Command::new("git")
@@ -2126,6 +2179,30 @@ fn remove_worktree_with_hook<F>(
 ) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String>,
+{
+    remove_worktree_with_hooks(
+        repository,
+        worktree,
+        force,
+        expected_revision,
+        expected_branch,
+        before_remove,
+        || Ok(()),
+    )
+}
+
+fn remove_worktree_with_hooks<F, G>(
+    repository: String,
+    worktree: String,
+    force: Option<bool>,
+    expected_revision: Option<&str>,
+    expected_branch: Option<&str>,
+    before_final_identity_check: F,
+    after_final_identity_check: G,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+    G: FnOnce() -> Result<(), String>,
 {
     let repository = PathBuf::from(validate_repository(repository)?)
         .canonicalize()
@@ -2203,8 +2280,34 @@ where
     }
     ensure_expected_revision()?;
     ensure_expected_branch()?;
-    let guarded = guarded_removal_state(&worktree, expected_revision)?;
-    before_remove()?;
+    let guarded = guarded_removal_state(
+        &worktree,
+        expected_revision.is_some() || expected_branch.is_some(),
+    )?;
+    if guarded
+        .as_ref()
+        .is_some_and(|state| state.reference.is_none())
+    {
+        return Err(
+            "Guarded cleanup requires a branch checkout; the worktree is detached.".to_string(),
+        );
+    }
+    before_final_identity_check()?;
+    let _head_lock = guarded
+        .as_ref()
+        .map(|_| lock_worktree_head(&worktree))
+        .transpose()?;
+    if let Some(state) = guarded.as_ref() {
+        let actual = guarded_removal_state(&worktree, true)?
+            .ok_or("Cannot capture the worktree identity before deletion.")?;
+        if actual != *state {
+            return Err(
+                "Worktree checkout changed during deletion. Revalidate before deleting it."
+                    .to_string(),
+            );
+        }
+    }
+    after_final_identity_check()?;
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -2224,12 +2327,16 @@ where
         ));
     }
     if let Some(state) = guarded {
-        let current = git_reference(&repository, &["rev-parse", "--verify", &state.reference]);
+        let reference = state
+            .reference
+            .as_deref()
+            .ok_or("Cannot verify the removed detached worktree.")?;
+        let current = git_reference(&repository, &["rev-parse", "--verify", reference]);
         if current.as_deref() != Some(state.head.as_str()) {
             let restore = restore_changed_worktree(&repository, &worktree, &state);
             return Err(format!(
                 "Worktree changed during deletion. Its branch {} preserves the new commit.{}",
-                state.reference,
+                reference,
                 restore
                     .err()
                     .map(|error| format!(" {error}"))
@@ -2437,11 +2544,11 @@ mod tests {
     use super::working_tree_generation;
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
-        existing_shipping_worktree, git_change_action, git_patch, normalize_picker_path,
-        parse_registered_worktrees, registered_worktrees, remove_worktree,
-        remove_worktree_with_hook, repository_namespace, server_args, shipping_changed_paths,
-        shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
-        working_tree_diff, worktree_overviews,
+        existing_shipping_worktree, git_change_action, git_patch, git_reference,
+        normalize_picker_path, parse_registered_worktrees, registered_worktrees, remove_worktree,
+        remove_worktree_with_hook, remove_worktree_with_hooks, repository_namespace, server_args,
+        shipping_changed_paths, shipping_default_branch, shipping_fetch_source,
+        version_is_compatible, version_number, working_tree_diff, worktree_overviews,
     };
     use super::{working_tree_commit, working_tree_revision};
     use std::fs;
@@ -3011,40 +3118,73 @@ mod tests {
             ignored_archive_fixture("sail-delete-race-test");
         fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
         fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        fs::write(Path::new(&repository).join("tracked.txt"), "after\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "racing commit",
+            ],
+        );
+
+        let error = remove_worktree_with_hooks(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&expected),
+            None,
+            || Ok(()),
+            || {
+                git(&repository, &["update-ref", "refs/heads/child", "HEAD"]);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed during deletion"), "{error}");
+        assert!(error.contains("checkout was restored"));
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
+            "after\n"
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removal_rejects_a_same_commit_branch_switch_before_removal() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-delete-branch-race-test");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        git(&repository, &["branch", "replacement", "HEAD"]);
 
         let error = remove_worktree_with_hook(
             repository.clone(),
             worktree.clone(),
             None,
             Some(&expected),
-            None,
+            Some("child"),
             || {
-                fs::write(Path::new(&worktree).join("tracked.txt"), "after\n").unwrap();
-                git(&worktree, &["add", "tracked.txt"]);
-                git(
-                    &worktree,
-                    &[
-                        "-c",
-                        "user.name=Sail Test",
-                        "-c",
-                        "user.email=sail@example.test",
-                        "-c",
-                        "commit.gpgsign=false",
-                        "commit",
-                        "-qm",
-                        "racing commit",
-                    ],
-                );
+                git(&worktree, &["switch", "replacement"]);
                 Ok(())
             },
         )
         .unwrap_err();
 
-        assert!(error.contains("changed during deletion"));
-        assert!(error.contains("checkout was restored"));
+        assert!(error.contains("checkout changed during deletion"));
+        assert!(Path::new(&worktree).is_dir());
         assert_eq!(
-            fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
-            "after\n"
+            git_reference(Path::new(&worktree), &["symbolic-ref", "--short", "HEAD"]).as_deref(),
+            Some("replacement")
         );
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();

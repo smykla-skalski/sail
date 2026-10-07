@@ -3473,6 +3473,7 @@ dependencies = [
  "webkit2gtk",
  "webview2-com 0.39.1",
  "windows 0.62.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

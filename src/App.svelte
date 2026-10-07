@@ -57,6 +57,7 @@
     shipOwner,
     shipCheckpointOwner,
     authorizeShipCheckpointThread,
+    commitRevisionBoundValidation,
     validateGateVerdict,
     validationRevisionDrifted,
   } from './lib/ship-progress';
@@ -4233,63 +4234,63 @@
         });
         return { status: 'recorded' };
       }
+      const validation = receipt.validation;
       if (shippingWorkerSettled(receipt.state))
         throw new Error('This validation attempt has already finished.');
-      if (receipt.validation.revisionDrifted)
+      if (validation.revisionDrifted)
         throw new Error('The worktree changed during validation. Rerun the gate.');
-      if (receipt.validation.mutationGeneration) {
-        const mutationGeneration = await invoke<string>('working_tree_generation', {
-          path: request.directory,
-        });
-        if (mutationGeneration !== receipt.validation.mutationGeneration)
-          throw new Error('The worktree was modified during validation. Rerun the gate.');
-      }
       const owner = shipOwner(shipRuns, receipt.sourceDirectory, receipt.sourceId);
       if (owner) {
         const revision = await invoke<string>('working_tree_revision', {
           path: receipt.sourceDirectory,
         });
-        assertShipGateAllowed(owner.issue.validationPolicy, receipt.validation.gate, revision);
+        assertShipGateAllowed(owner.issue.validationPolicy, validation.gate, revision);
       }
-      validateGateVerdict(receipt.validation.gate, report.verdict);
-      const evidenceChanges = owner
-        ? await recordGateEvidence(
-            owner,
-            receipt.validation.gate,
-            report.verdict,
-            receipt.provider,
-            receipt.model ?? null,
-            report.criteria,
-            report.outputReference,
-            `thread:${receipt.targetId ?? receipt.receiptId}`,
-            receipt.validation.revision,
-          )
-        : {};
-      updateSpawnReceipt(receipt.receiptId, {
-        validation: { ...receipt.validation, verdict: report.verdict, reason: report.reason },
-      });
-      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
-      if (owner) {
-        if (receipt.validation.mutationGeneration) {
-          const mutationGeneration = await invoke<string>('working_tree_generation', {
-            path: request.directory,
+      validateGateVerdict(validation.gate, report.verdict);
+      await commitRevisionBoundValidation({
+        expectedRevision: validation.revision,
+        expectedMutationGeneration: validation.mutationGeneration,
+        readRevision: () => invoke<string>('working_tree_revision', { path: request.directory }),
+        readMutationGeneration: () =>
+          invoke<string>('working_tree_generation', { path: request.directory }),
+        prepare: async () => {
+          const evidenceChanges = owner
+            ? await recordGateEvidence(
+                owner,
+                validation.gate,
+                report.verdict,
+                receipt.provider,
+                receipt.model ?? null,
+                report.criteria,
+                report.outputReference,
+                `thread:${receipt.targetId ?? receipt.receiptId}`,
+                validation.revision,
+              )
+            : {};
+          if (owner)
+            requireEvidenceBaseRevision(validation.revision!, owner.issue.evidenceRevision);
+          return evidenceChanges;
+        },
+        commit: async (evidenceChanges) => {
+          updateSpawnReceipt(receipt.receiptId, {
+            validation: { ...validation, verdict: report.verdict, reason: report.reason },
           });
-          if (mutationGeneration !== receipt.validation.mutationGeneration)
-            throw new Error('The worktree was modified during validation. Rerun the gate.');
-        }
-        requireEvidenceBaseRevision(receipt.validation.revision!, owner.issue.evidenceRevision);
-        await updateShipIssue(owner.run, owner.issue, {
-          ...evidenceChanges,
-          blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
-            ? report.reason
-            : null,
-          events: appendShipEvent(
-            owner.issue.events,
-            `${receipt.validation.gate}: ${report.verdict}`,
-            report.reason,
-          ),
-        });
-      }
+          await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+          if (owner) {
+            await updateShipIssue(owner.run, owner.issue, {
+              ...evidenceChanges,
+              blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
+                ? report.reason
+                : null,
+              events: appendShipEvent(
+                owner.issue.events,
+                `${validation.gate}: ${report.verdict}`,
+                report.reason,
+              ),
+            });
+          }
+        },
+      });
     } else {
       const owner = shipOwner(shipRuns, request.directory, sourceId);
       if (!owner) throw new Error('Only the assigned Ship worker can report issue progress.');
