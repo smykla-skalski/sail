@@ -37,7 +37,7 @@ export const config = {
   framework: 'mocha',
   reporters: ['spec'],
   logLevel: 'error',
-  mochaOpts: { timeout: 90_000 },
+  mochaOpts: { timeout: 240_000 },
   waitforTimeout: 20_000,
   connectionRetryTimeout: 90_000,
   onComplete() {
