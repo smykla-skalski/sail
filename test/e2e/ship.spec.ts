@@ -199,11 +199,15 @@ describe('native Ship run history', () => {
       expect.stringContaining('Worker'),
     );
     const initialWidth = await browser.execute(() => window.innerWidth);
-    await browser.keys(['Meta', '=']);
-    await browser.keys(['Meta', '=']);
-    await browser.keys(['Meta', '=']);
-    await browser.keys(['Meta', '=']);
-    await browser.waitUntil(async () => (await browser.execute(() => window.innerWidth)) < 850);
+    const zoomTo200 = async (width: number, remaining = 8): Promise<number> => {
+      if (width <= initialWidth / 1.9 || remaining === 0) return width;
+      await browser.keys(['Meta', '=']);
+      await browser.waitUntil(async () => (await browser.execute(() => window.innerWidth)) < width);
+      return zoomTo200(await browser.execute(() => window.innerWidth), remaining - 1);
+    };
+    const zoomedWidth = await zoomTo200(initialWidth);
+    expect(zoomedWidth).toBeLessThanOrEqual(initialWidth / 1.9);
+    expect(zoomedWidth).toBeGreaterThanOrEqual(initialWidth / 2.1);
     await $('.mobile-switcher button:nth-child(3)').click();
     await expect($('.ship-panel')).toBeDisplayed();
     expect(

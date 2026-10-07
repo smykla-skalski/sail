@@ -331,9 +331,18 @@ export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssue
   const waitingGate = currentGates.find((gate) => gate.state === 'waiting');
   const updated = Math.max(
     issue.refreshedAt ?? 0,
+    issue.workerUpdatedAt ?? 0,
     ...gates.map((gate) => gate.updated),
     ...(issue.events ?? []).map((event) => event.at),
   );
+  if (issue.state === 'merged')
+    return {
+      status: 'completed',
+      label: 'Completed',
+      priority: 4,
+      nextAction: 'No action — shipping complete',
+      updated: updated || activity.at || null,
+    };
   if (issue.state === 'failed')
     return {
       status: 'failed',
@@ -392,10 +401,11 @@ export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssue
     };
   if (issue.state === 'awaiting_merge') {
     const ci = ciStatus(issue.checks);
+    const ready = ci === 'Passed';
     return {
       status: ci === 'Failed' ? 'failed' : 'queued',
       label: ci === 'Failed' ? 'Recovery needed' : 'Awaiting merge',
-      priority: ci === 'Failed' ? 0 : 2,
+      priority: ci === 'Failed' || ready ? 0 : 2,
       nextAction:
         ci === 'Failed'
           ? 'Fix failing CI'
@@ -405,14 +415,6 @@ export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssue
       updated: updated || activity.at || null,
     };
   }
-  if (issue.state === 'merged')
-    return {
-      status: 'completed',
-      label: 'Completed',
-      priority: 4,
-      nextAction: 'No action — shipping complete',
-      updated: updated || activity.at || null,
-    };
   const waiting = shipStatus(run, issue) === 'Waiting';
   return {
     status: 'queued',
@@ -504,6 +506,7 @@ const shipIssueSchema = z.object({
       'unavailable',
     ])
     .optional(),
+  workerUpdatedAt: z.number().optional(),
   modelUncertain: z.boolean().optional(),
   gates: z.array(shipGateSchema).optional(),
   events: z

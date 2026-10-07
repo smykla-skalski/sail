@@ -38,6 +38,7 @@
   let scope = $state<'current' | 'all'>('current');
   let selectedRun = $state('');
   let selectedIssue = $state('');
+  const detailId = `ship-selected-issue-${crypto.randomUUID()}`;
   let wasActive = false;
   const visible = $derived(
     runs.filter((run) => scope === 'all' || !repository || run.repository === repository),
@@ -95,8 +96,12 @@
 
   function workerClaim(item: ShipIssue): string {
     if (item.state === 'merged') return 'Complete';
-    if (!item.threadId && item.state === 'pending') return 'Not started';
-    return item.workerState ? shipStatus(run!, item) : item.state.replaceAll('_', ' ');
+    if (!item.workerState) {
+      if (item.workerSettled) return 'Complete';
+      return item.threadId ? 'Unknown' : 'Not started';
+    }
+    const label = item.workerState.replaceAll('_', ' ');
+    return label.charAt(0).toUpperCase() + label.slice(1);
   }
 
   function gateClaim(item: ShipIssue): string {
@@ -223,7 +228,7 @@
             data-state={presentation.status}
             data-ship-issue-id={item.id}
             aria-pressed={item.id === issue?.id}
-            aria-controls="ship-selected-issue"
+            aria-controls={detailId}
             onclick={() => selectIssue(item.id)}
           >
             <span class="ship-issue-heading"
@@ -254,7 +259,7 @@
     <div class="ship-content">
       {#if issue}
         <section
-          id="ship-selected-issue"
+          id={detailId}
           class="ship-issue-detail"
           tabindex="-1"
           aria-label={`Issue ${issue.number} details`}

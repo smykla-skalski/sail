@@ -2782,6 +2782,7 @@
         issue.threadId = receipt.targetId;
         issue.workerModel = receipt.model;
         issue.workerState = receipt.state;
+        issue.workerUpdatedAt = Math.max(issue.workerUpdatedAt ?? 0, receipt.updated);
         void saveShipRuns().catch((cause) => (error = describe(cause)));
       }
     }

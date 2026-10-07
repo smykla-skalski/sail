@@ -166,22 +166,62 @@ void test('Ship issues put required action before work, queue, and completion', 
   const run = fixture();
   const source = run.issues[0];
   run.issues = [
-    { ...source, id: 'merged', number: 6, state: 'merged' },
+    {
+      ...source,
+      id: 'merged',
+      number: 6,
+      state: 'merged',
+      gates: [
+        {
+          id: 'retained-failure',
+          gate: 'test-adversary',
+          requestedModel: 'test',
+          provider: 'codex',
+          model: 'test',
+          threadId: 'old',
+          directory: '/repo',
+          state: 'completed',
+          created: 1,
+          updated: 1,
+          error: null,
+          verdict: 'FAIL',
+        },
+      ],
+    },
     { ...source, id: 'queued', number: 5, state: 'pending' },
     { ...source, id: 'working', number: 4, state: 'working', workerState: 'working' },
     { ...source, id: 'waiting', number: 3, state: 'working', workerState: 'waiting' },
     { ...source, id: 'failed', number: 2, state: 'failed', error: 'Worker failed' },
+    {
+      ...source,
+      id: 'ready',
+      number: 7,
+      state: 'awaiting_merge',
+      pullRequest: 'https://example.test/pull/7',
+      checks: [{ name: 'build', state: 'SUCCESS', url: 'https://example.test/build' }],
+    },
   ];
 
   assert.deepEqual(
     sortShipIssues(run).map((issue) => issue.id),
-    ['failed', 'waiting', 'working', 'queued', 'merged'],
+    ['failed', 'waiting', 'ready', 'working', 'queued', 'merged'],
   );
   assert.deepEqual(
     run.issues.map((issue) => shipIssuePresentation(run, issue).label),
-    ['Completed', 'Queued', 'Working', 'Needs input', 'Recovery needed'],
+    ['Completed', 'Queued', 'Working', 'Needs input', 'Recovery needed', 'Awaiting merge'],
   );
   assert.match(shipIssuePresentation(run, run.issues[3]).nextAction, /Respond/);
+  assert.equal(shipIssuePresentation(run, run.issues[0]).priority, 4);
+  assert.equal(shipIssuePresentation(run, run.issues[5]).nextAction, 'Merge the pull request');
+});
+
+void test('worker receipt updates drive presentation freshness', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, { state: 'working', workerState: 'waiting', workerUpdatedAt: 42 });
+
+  assert.equal(shipIssuePresentation(run, issue).updated, 42);
+  assert.equal(loadShipRuns(JSON.stringify([run]))[0].issues[0].workerUpdatedAt, 42);
 });
 
 void test('latest gate state controls attention without stale failed rounds', () => {

@@ -28,6 +28,7 @@ export interface ShipIssue {
   models?: string[];
   workerModel?: string;
   workerState?: SpawnState;
+  workerUpdatedAt?: number;
   modelUncertain?: boolean;
   gates?: ShipGate[];
   events?: ShipEvent[];
