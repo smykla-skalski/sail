@@ -119,6 +119,19 @@ describe('agent thread attention', () => {
     );
 
     await waitForComposer();
+    await $('.agent-composer textarea').setValue('Cancel error');
+    await $('.agent-actions button').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    await $('.agent-busy button').click();
+    await $('.agent-launches button').click();
+    const cancelledWithError = $('.project-agent-row[aria-label*="Cancel error"]');
+    await expect(cancelledWithError.$('.activity-status')).toHaveAttribute(
+      'data-state',
+      'interrupted',
+    );
+    await expect(cancelledWithError).toHaveText(expect.stringContaining('Interrupted'));
+
+    await waitForComposer();
     await $('.agent-composer textarea').setValue('Cancel ignored');
     await $('.agent-actions button').click();
     await expect($('.agent-permission')).toBeDisplayed();
@@ -165,6 +178,19 @@ describe('agent thread attention', () => {
       'interrupted',
     );
     await expect(textInterrupted).toHaveText(expect.stringContaining('Interrupted'));
+
+    await waitForComposer();
+    await $('.agent-composer textarea').setValue('Agent text interrupted error');
+    await $('.agent-actions button').click();
+    await $('.agent-launches button').click();
+    const textInterruptedWithError = $(
+      '.project-agent-row[aria-label*="Agent text interrupted error"]',
+    );
+    await expect(textInterruptedWithError.$('.activity-status')).toHaveAttribute(
+      'data-state',
+      'interrupted',
+    );
+    await expect(textInterruptedWithError).toHaveText(expect.stringContaining('Interrupted'));
 
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Discuss interruption');

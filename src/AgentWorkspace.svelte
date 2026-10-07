@@ -55,6 +55,7 @@
   } from './lib/agent-queue';
   import {
     acp,
+    acpFailedPromptInterrupted,
     acpPromptInterrupted,
     groupAgentEntries,
     loadRecentTranscript,
@@ -1258,7 +1259,14 @@
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
-      finalStatus = finalStatus === 'interrupted' || stopRequested ? 'interrupted' : 'failed';
+      const interrupted =
+        finalStatus === 'interrupted' ||
+        stopRequested ||
+        (phase === 'prompt' &&
+          !!deliverySessionId &&
+          (await acpFailedPromptInterrupted(turnAgent, deliverySessionId, turnId)));
+      finalStatus = interrupted ? 'interrupted' : 'failed';
+      if (interrupted) notifyOnDone = false;
       if (!deliverySessionId && current !== generation && disposed && !ephemeral && !external) {
         const recovered =
           sentImages.length || sentClipboard.length

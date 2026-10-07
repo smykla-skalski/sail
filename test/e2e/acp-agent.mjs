@@ -268,7 +268,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'cancelled' } });
       continue;
     }
-    if (text === 'Agent text interrupted') {
+    if (text === 'Agent text interrupted' || text === 'Agent text interrupted error') {
       update(sessionId, {
         sessionUpdate: 'tool_call',
         toolCallId: 'interrupted-step-tool',
@@ -288,7 +288,9 @@ for await (const line of createInterface({ input: process.stdin })) {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'rupted' },
       });
-      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      if (text === 'Agent text interrupted error')
+        send({ id: message.id, error: { code: -1, message: 'Step interrupted' } });
+      else send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
     if (text === 'Discuss interruption') {
@@ -641,11 +643,15 @@ for await (const line of createInterface({ input: process.stdin })) {
     for (const [id, pending] of permissions) {
       if (pending.sessionId === message.params.sessionId) {
         permissions.delete(id);
-        const finish = () =>
-          send({
-            id: pending.promptId,
-            result: { stopReason: pending.text === 'Cancel ignored' ? 'end_turn' : 'cancelled' },
-          });
+        const finish = () => {
+          if (pending.text === 'Cancel error')
+            send({ id: pending.promptId, error: { code: -1, message: 'Step interrupted' } });
+          else
+            send({
+              id: pending.promptId,
+              result: { stopReason: pending.text === 'Cancel ignored' ? 'end_turn' : 'cancelled' },
+            });
+        };
         if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
         else finish();
       }

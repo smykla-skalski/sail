@@ -508,3 +508,13 @@ export const acp = {
   authenticate: (agent: AgentId, methodId: string) =>
     invoke<Record<string, unknown>>('acp_authenticate', { agent, methodId }),
 };
+
+export async function acpFailedPromptInterrupted(
+  agent: AgentId,
+  sessionId: string,
+  turnId: string,
+): Promise<boolean> {
+  const activity = await acp.activity().catch(() => null);
+  const finished = activity?.[agent]?.finished[sessionId];
+  return finished?.turnId === turnId && finished.status === 'interrupted';
+}

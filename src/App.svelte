@@ -202,6 +202,7 @@
   } from './lib/panes';
   import {
     acp,
+    acpFailedPromptInterrupted,
     acpPromptInterrupted,
     forgetRecentTranscript,
     loadAgentThreads,
@@ -3069,8 +3070,19 @@
             activeSpawnTargets.delete(receipt.targetId!);
           return undefined;
         },
-        (cause) => {
-          updateSpawnReceipt(receipt.receiptId, { state: 'failed', error: describe(cause) });
+        async (cause) => {
+          const wasInterrupted = await acpFailedPromptInterrupted(
+            receipt.provider,
+            sessionId,
+            receipt.turnId!,
+          );
+          updateSpawnReceipt(receipt.receiptId, {
+            state: wasInterrupted ? 'interrupted' : 'failed',
+            error: wasInterrupted ? null : describe(cause),
+          });
+          spawnOutput.delete(receipt.receiptId);
+          if (activeSpawnTargets.get(receipt.targetId!) === receipt.receiptId)
+            activeSpawnTargets.delete(receipt.targetId!);
           return undefined;
         },
       );
@@ -3281,7 +3293,8 @@
           });
           const tracking = await beginImplementationTurn(thread.directory, thread.model, target.id);
           updateAgentThreadStatus(thread, 'working');
-          const turn = acp.prompt(thread.agent, thread.sessionId, text, crypto.randomUUID());
+          const turnId = crypto.randomUUID();
+          const turn = acp.prompt(thread.agent, thread.sessionId, text, turnId);
           void turn
             .then(
               async (outcome) => {
@@ -3294,8 +3307,13 @@
               },
               async (cause) => {
                 await recordImplementationModel(thread.directory, thread.model, tracking);
-                updateAgentThreadStatus(thread, 'failed');
-                error = `Agent message turn failed: ${describe(cause)}`;
+                const interrupted = await acpFailedPromptInterrupted(
+                  thread.agent,
+                  thread.sessionId,
+                  turnId,
+                );
+                updateAgentThreadStatus(thread, interrupted ? 'interrupted' : 'failed');
+                if (!interrupted) error = `Agent message turn failed: ${describe(cause)}`;
                 return undefined;
               },
             )
@@ -4391,21 +4409,35 @@
         async (cause) => {
           if (tracking)
             await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
-          updateAgentThreadStatus(thread, 'failed');
+          const interrupted = await acpFailedPromptInterrupted(
+            source.agent,
+            session.sessionId,
+            turnId,
+          );
+          updateAgentThreadStatus(thread, interrupted ? 'interrupted' : 'failed');
           if (receiptId) {
-            updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+            updateSpawnReceipt(receiptId, {
+              state: interrupted ? 'interrupted' : 'failed',
+              error: interrupted ? null : describe(cause),
+            });
             spawnOutput.delete(receiptId);
             if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
               activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
           }
-          error = describe(cause);
+          if (!interrupted) error = describe(cause);
           throw cause;
         },
       );
-      await awaitCoordinationStart(finished, async () => {
-        const state = (await acp.activity())[source.agent];
-        return !!state?.active.includes(session.sessionId);
-      });
+      await awaitCoordinationStart(
+        finished.catch(async (cause) => {
+          if (await acpFailedPromptInterrupted(source.agent, session.sessionId, turnId)) return;
+          throw cause;
+        }),
+        async () => {
+          const state = (await acp.activity())[source.agent];
+          return !!state?.active.includes(session.sessionId);
+        },
+      );
       void finished.catch(() => undefined);
       return {
         path: created.path,
@@ -7521,8 +7553,14 @@
               if (!disposed) {
                 if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
                 else {
-                  updateAgentThreadStatus(recoveredThread, 'failed');
-                  error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+                  const interrupted = await acpFailedPromptInterrupted(
+                    turn.agent,
+                    turn.sessionId,
+                    turn.turnId,
+                  );
+                  updateAgentThreadStatus(recoveredThread, interrupted ? 'interrupted' : 'failed');
+                  if (!interrupted)
+                    error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
                 }
               }
             }
@@ -7534,8 +7572,14 @@
         } catch (cause) {
           if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
           else {
-            updateAgentThreadStatus(recoveredThread, 'failed');
-            error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
+            const interrupted = await acpFailedPromptInterrupted(
+              turn.agent,
+              turn.sessionId,
+              turn.turnId,
+            );
+            updateAgentThreadStatus(recoveredThread, interrupted ? 'interrupted' : 'failed');
+            if (!interrupted)
+              error = `Could not continue ${recoveredThread.title}: ${describe(cause)}`;
           }
         }
       }),
