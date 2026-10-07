@@ -173,6 +173,58 @@ export function requireEvidenceRevision(expected: unknown, current: string): voi
     throw new Error('The worktree changed after execution started. Rerun the evidence.');
 }
 
+export type EvidenceExecutionBoundary = {
+  revision: string;
+  mutationGeneration: string;
+  baseRevision: string;
+};
+
+export function requireEvidenceExecutionBoundary(
+  expected: {
+    revision: unknown;
+    mutationGeneration: unknown;
+    baseRevision: unknown;
+  },
+  current: EvidenceExecutionBoundary,
+): void {
+  requireEvidenceRevision(expected.revision, current.revision);
+  if (typeof expected.mutationGeneration !== 'string' || !expected.mutationGeneration)
+    throw new Error('Evidence needs the mutation generation captured before execution.');
+  if (expected.mutationGeneration !== current.mutationGeneration)
+    throw new Error('The worktree was modified after execution started. Rerun the evidence.');
+  if (typeof expected.baseRevision !== 'string' || !expected.baseRevision)
+    throw new Error('Evidence needs the shipping base captured before execution.');
+  if (expected.baseRevision !== current.baseRevision)
+    throw new Error('The shipping base changed after execution started. Rerun the evidence.');
+}
+
+export async function readStableEvidenceBoundary(
+  readRevision: () => Promise<string>,
+  readMutationGeneration: () => Promise<string>,
+  readBaseRevision: () => Promise<string>,
+  maxAttempts = 3,
+): Promise<EvidenceExecutionBoundary> {
+  async function readAttempt(attemptsRemaining: number): Promise<EvidenceExecutionBoundary> {
+    const mutationGeneration = await readMutationGeneration();
+    const [revision, baseRevision] = await Promise.all([readRevision(), readBaseRevision()]);
+    const [currentRevision, currentMutationGeneration, currentBaseRevision] = await Promise.all([
+      readRevision(),
+      readMutationGeneration(),
+      readBaseRevision(),
+    ]);
+    if (
+      revision === currentRevision &&
+      mutationGeneration === currentMutationGeneration &&
+      baseRevision === currentBaseRevision
+    )
+      return { revision, mutationGeneration, baseRevision };
+    if (attemptsRemaining > 1) return readAttempt(attemptsRemaining - 1);
+    throw new Error('The worktree kept changing while capturing evidence. Retry when stable.');
+  }
+
+  return readAttempt(Math.max(1, maxAttempts));
+}
+
 export function requireEvidenceBaseRevision(recorded: string, current: string | undefined): void {
   if (current !== undefined && recorded !== current)
     throw new Error('Newer revision evidence was recorded concurrently. Rerun the gate.');

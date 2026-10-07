@@ -41,6 +41,7 @@
     beginLatestRefresh,
     completedInlineShipGate,
     nextGateSequence,
+    nextValidationReservation,
     gateSnapshot,
     loadShipRuns,
     parseShipReport,
@@ -60,6 +61,8 @@
     shipCheckpointOwner,
     authorizeShipCheckpointThread,
     commitRevisionBoundValidation,
+    rollbackValidationIssue,
+    rollbackValidationReceipt,
     validateGateVerdict,
     validationRevisionDrifted,
   } from './lib/ship-progress';
@@ -87,7 +90,9 @@
     evidenceReadiness,
     mergeEvidenceManifests,
     nextTaskEvidenceSequence,
+    readStableEvidenceBoundary,
     requireEvidenceBaseRevision,
+    requireEvidenceExecutionBoundary,
     requireEvidenceRevision,
     recordTaskEvidence,
     syncEvidenceManifest,
@@ -2462,7 +2467,7 @@
         ? 'Before every adversary pass, read the checkpoint revision. After the pass, use ship_progress with that revision, its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.'
         : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
       const target = shippingTarget;
-      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from ${target.repository}:${target.baseBranch} at ${target.baseRevision}. Use that exact repository and base branch for the pull request. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. Before each quality command, read the checkpoint revision; record the result with task_evidence_record and that expectedRevision, mapping exact acceptance criterion strings and a bounded output reference. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from ${target.repository}:${target.baseBranch} at ${target.baseRevision}. Use that exact repository and base branch for the pull request. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. Before each quality command, read the checkpoint execution boundary; record the result with task_evidence_record and its expectedRevision, expectedMutationGeneration, and expectedBaseRevision, mapping exact acceptance criterion strings and a bounded output reference. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -2770,7 +2775,7 @@
       }
     }
     issue.gates = reconciledShipGates(issue, spawnReceipts);
-    const recoveredEvidence = recoverValidationEvidence(issue);
+    const recoveredEvidence = recoverValidationEvidence(issue, currentBaseRevision);
     if (recoveredEvidence) await update(recoveredEvidence);
     await Promise.all(
       (issue.gates ?? []).map(async (gate) => {
@@ -3922,16 +3927,25 @@
       if (!owner?.issue.checkpoint)
         throw new Error('This thread cannot record evidence for a Ship task.');
       const shippingTarget = await shippingTargetFor(owner.run, owner.issue, request.directory);
-      const [currentRevision, baseRevision] = await Promise.all([
-        invoke<string>('working_tree_revision', { path: request.directory }),
-        invoke<string>('shipping_base_revision', {
-          path: request.directory,
-          baseRef: shippingTarget.baseRef,
-        }),
-      ]);
-      await markValidationRevisionDrift(request.directory, currentRevision);
-      requireEvidenceRevision(request.arguments.expectedRevision, currentRevision);
-      if (owner.issue.checkpoint.revision !== currentRevision)
+      const execution = await readStableEvidenceBoundary(
+        () => invoke<string>('working_tree_revision', { path: request.directory }),
+        () => invoke<string>('working_tree_generation', { path: request.directory }),
+        () =>
+          invoke<string>('shipping_base_revision', {
+            path: request.directory,
+            baseRef: shippingTarget.baseRef,
+          }),
+      );
+      await markValidationRevisionDrift(request.directory, execution.revision);
+      requireEvidenceExecutionBoundary(
+        {
+          revision: request.arguments.expectedRevision,
+          mutationGeneration: request.arguments.expectedMutationGeneration,
+          baseRevision: request.arguments.expectedBaseRevision,
+        },
+        execution,
+      );
+      if (owner.issue.checkpoint.revision !== execution.revision)
         throw new Error(
           'Bind the task checkpoint to the current revision before recording evidence.',
         );
@@ -3951,13 +3965,13 @@
       });
       const evidenceManifests = recordTaskEvidence(
         owner.issue.evidenceManifests ?? [],
-        currentRevision,
+        execution.revision,
         owner.issue.checkpoint.acceptanceCriteria,
         evidence,
-        baseRevision,
+        execution.baseRevision,
       );
       await updateShipIssue(owner.run, owner.issue, {
-        evidenceRevision: currentRevision,
+        evidenceRevision: execution.revision,
         evidenceManifests,
       });
       return {
@@ -3965,10 +3979,10 @@
         evidence,
         readiness: evidenceReadiness(
           evidenceManifests,
-          currentRevision,
+          execution.revision,
           owner.issue.checkpoint.requiredGates,
           owner.issue.checkpoint.acceptanceCriteria,
-          baseRevision,
+          execution.baseRevision,
         ),
       };
     }
@@ -3983,14 +3997,16 @@
           owner.run.approvedAt,
         );
       const shippingTarget = await shippingTargetFor(owner.run, owner.issue, request.directory);
-      const [currentRevision, baseRevision] = await Promise.all([
-        invoke<string>('working_tree_revision', { path: request.directory }),
-        invoke<string>('shipping_base_revision', {
-          path: request.directory,
-          baseRef: shippingTarget.baseRef,
-        }),
-      ]);
-      await markValidationRevisionDrift(request.directory, currentRevision);
+      const execution = await readStableEvidenceBoundary(
+        () => invoke<string>('working_tree_revision', { path: request.directory }),
+        () => invoke<string>('working_tree_generation', { path: request.directory }),
+        () =>
+          invoke<string>('shipping_base_revision', {
+            path: request.directory,
+            baseRef: shippingTarget.baseRef,
+          }),
+      );
+      await markValidationRevisionDrift(request.directory, execution.revision);
       if (request.name === 'task_checkpoint_update') {
         const patch = request.arguments.checkpoint;
         if (!patch || typeof patch !== 'object' || Array.isArray(patch))
@@ -3999,7 +4015,7 @@
         const updated = prepareTaskCheckpointUpdate(
           liveCheckpoint,
           patch,
-          currentRevision,
+          execution.revision,
           request.arguments.expectedSequence,
           request.arguments.expectedRevision,
           request.arguments.rebindRevision,
@@ -4012,22 +4028,22 @@
       const saved = owner.issue.checkpoint ?? checkpoint;
       const evidenceManifests = syncEvidenceManifest(
         owner.issue.evidenceManifests ?? [],
-        currentRevision,
+        execution.revision,
         saved.acceptanceCriteria,
         Date.now(),
-        baseRevision,
+        execution.baseRevision,
       );
       if (
-        owner.issue.evidenceRevision !== currentRevision ||
+        owner.issue.evidenceRevision !== execution.revision ||
         JSON.stringify(owner.issue.evidenceManifests ?? []) !== JSON.stringify(evidenceManifests)
       )
         await updateShipIssue(owner.run, owner.issue, {
-          evidenceRevision: currentRevision,
+          evidenceRevision: execution.revision,
           evidenceManifests,
         });
       return {
         checkpoint: saved,
-        reconciliation: reconcileTaskCheckpoint(saved, currentRevision, {
+        reconciliation: reconcileTaskCheckpoint(saved, execution.revision, {
           issueState: owner.issue.issueState,
           pullRequest: owner.issue.pullRequest,
           deliveryState: owner.issue.state,
@@ -4037,12 +4053,13 @@
           manifests: evidenceManifests,
           readiness: evidenceReadiness(
             evidenceManifests,
-            currentRevision,
+            execution.revision,
             saved.requiredGates,
             saved.acceptanceCriteria,
-            baseRevision,
+            execution.baseRevision,
           ),
         },
+        execution,
       };
     }
     if (request.name === 'ship_progress') return reportShipProgress(request, sourceId);
@@ -4267,6 +4284,17 @@
     };
   }
 
+  function validationIssueSnapshot(issue: ShipIssue) {
+    return structuredClone({
+      evidenceRevision: issue.evidenceRevision,
+      evidenceManifests: issue.evidenceManifests,
+      stage: issue.stage,
+      blockedReason: issue.blockedReason,
+      gates: issue.gates,
+      events: issue.events,
+    });
+  }
+
   async function markValidationRevisionDrift(
     targetDirectory: string,
     currentRevision: string,
@@ -4359,55 +4387,59 @@
             );
             return evidenceChanges;
           },
-          commit: async (evidenceChanges) => {
-            const previous = structuredClone({
-              evidenceRevision: owner.issue.evidenceRevision,
-              evidenceManifests: owner.issue.evidenceManifests,
-              stage: owner.issue.stage,
-              blockedReason: owner.issue.blockedReason,
-              gates: owner.issue.gates,
-              events: owner.issue.events,
+          commit: async (evidenceChanges, registerRollback) => {
+            const previous = validationIssueSnapshot(owner.issue);
+            let committed = previous;
+            registerRollback(async () => {
+              Object.assign(
+                owner.issue,
+                rollbackValidationIssue(owner.issue, previous, committed, `gate:${gateId}`, gateId),
+              );
+              await saveShipRuns();
             });
             const { evidenceSequence, ...issueEvidenceChanges } = evidenceChanges;
-            await updateShipIssue(owner.run, owner.issue, {
-              ...issueEvidenceChanges,
-              stage: report.gate === 'test-adversary' ? 'testing' : 'reviewing',
-              blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
-                ? report.reason
-                : null,
-              gates: [
-                ...(owner.issue.gates ?? []),
-                completedInlineShipGate(
-                  {
-                    id: gateId,
-                    gate: report.gate,
-                    requestedModel: model ?? 'implementation session',
-                    sequence,
-                    provider: owner.run.provider,
-                    model,
-                    threadId: sourceId,
-                    directory: request.directory,
-                    error: null,
-                    verdict: report.verdict,
-                    reason: report.reason,
-                    revision,
-                    mutationGeneration: policy?.mutationGeneration,
-                    baseRevision,
-                    evidenceSequence,
-                  },
-                  now,
+            await updateShipIssue(
+              owner.run,
+              owner.issue,
+              {
+                ...issueEvidenceChanges,
+                stage: report.gate === 'test-adversary' ? 'testing' : 'reviewing',
+                blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
+                  ? report.reason
+                  : null,
+                gates: [
+                  ...(owner.issue.gates ?? []),
+                  completedInlineShipGate(
+                    {
+                      id: gateId,
+                      gate: report.gate,
+                      requestedModel: model ?? 'implementation session',
+                      sequence,
+                      provider: owner.run.provider,
+                      model,
+                      threadId: sourceId,
+                      directory: request.directory,
+                      error: null,
+                      verdict: report.verdict,
+                      reason: report.reason,
+                      revision,
+                      mutationGeneration: policy?.mutationGeneration,
+                      baseRevision,
+                      evidenceSequence,
+                    },
+                    now,
+                  ),
+                ],
+                events: appendShipEvent(
+                  owner.issue.events,
+                  `${report.gate}: ${report.verdict}`,
+                  report.reason,
                 ),
-              ],
-              events: appendShipEvent(
-                owner.issue.events,
-                `${report.gate}: ${report.verdict}`,
-                report.reason,
-              ),
-            });
-            return async () => {
-              Object.assign(owner.issue, previous);
-              await saveShipRuns();
-            };
+              },
+              false,
+            );
+            committed = validationIssueSnapshot(owner.issue);
+            await saveShipRuns();
           },
         });
         return { status: 'recorded' };
@@ -4479,16 +4511,44 @@
             requireEvidenceBaseRevision(validation.revision!, owner.issue.evidenceRevision);
           return evidenceChanges;
         },
-        commit: async (evidenceChanges) => {
+        commit: async (evidenceChanges, registerRollback) => {
           const previousReceipt = structuredClone(receipt);
-          const previousIssue = owner
-            ? structuredClone({
-                evidenceRevision: owner.issue.evidenceRevision,
-                evidenceManifests: owner.issue.evidenceManifests,
-                blockedReason: owner.issue.blockedReason,
-                events: owner.issue.events,
-              })
-            : null;
+          const previousIssue = owner ? validationIssueSnapshot(owner.issue) : null;
+          let committedReceipt = previousReceipt;
+          let committedIssue = previousIssue;
+          registerRollback(async () => {
+            const failures: unknown[] = [];
+            try {
+              const currentReceipt = spawnReceipts.find(
+                (candidate) => candidate.receiptId === receipt.receiptId,
+              );
+              if (currentReceipt) {
+                saveSpawnReceipt(
+                  rollbackValidationReceipt(currentReceipt, previousReceipt, committedReceipt),
+                );
+                await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+              }
+            } catch (cause) {
+              failures.push(cause);
+            }
+            try {
+              if (owner && previousIssue && committedIssue) {
+                Object.assign(
+                  owner.issue,
+                  rollbackValidationIssue(
+                    owner.issue,
+                    previousIssue,
+                    committedIssue,
+                    `gate:${receipt.receiptId}`,
+                  ),
+                );
+                await saveShipRuns();
+              }
+            } catch (cause) {
+              failures.push(cause);
+            }
+            if (failures.length) throw new AggregateError(failures, 'Validation rollback failed.');
+          });
           const evidenceSequence = evidenceChanges?.evidenceSequence;
           updateSpawnReceipt(receipt.receiptId, {
             validation: {
@@ -4501,32 +4561,34 @@
               evidenceSequence,
             },
           });
+          committedReceipt = structuredClone(
+            spawnReceipts.find((candidate) => candidate.receiptId === receipt.receiptId)!,
+          );
           await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
           if (owner && evidenceChanges) {
             const issueEvidenceChanges = {
               evidenceRevision: evidenceChanges.evidenceRevision,
               evidenceManifests: evidenceChanges.evidenceManifests,
             };
-            await updateShipIssue(owner.run, owner.issue, {
-              ...issueEvidenceChanges,
-              blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
-                ? report.reason
-                : null,
-              events: appendShipEvent(
-                owner.issue.events,
-                `${validation.gate}: ${report.verdict}`,
-                report.reason,
-              ),
-            });
+            await updateShipIssue(
+              owner.run,
+              owner.issue,
+              {
+                ...issueEvidenceChanges,
+                blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
+                  ? report.reason
+                  : null,
+                events: appendShipEvent(
+                  owner.issue.events,
+                  `${validation.gate}: ${report.verdict}`,
+                  report.reason,
+                ),
+              },
+              false,
+            );
+            committedIssue = validationIssueSnapshot(owner.issue);
+            await saveShipRuns();
           }
-          return async () => {
-            saveSpawnReceipt(previousReceipt);
-            await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
-            if (owner && previousIssue) {
-              Object.assign(owner.issue, previousIssue);
-              await saveShipRuns();
-            }
-          };
         },
       });
     } else {
@@ -4616,23 +4678,26 @@
       const receiptId = crypto.randomUUID();
       const accessKey = crypto.randomUUID();
       const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
-      const priorGates = [
-        ...(gateOwner?.issue.gates ?? []),
-        ...spawnReceipts.flatMap((receipt) => {
-          if (receipt.sourceId !== sourceId || receipt.sourceDirectory !== request.directory)
-            return [];
-          const recordedGate = gateSnapshot(receipt);
-          return recordedGate ? [recordedGate] : [];
-        }),
-      ];
-      const sequence = nextGateSequence(priorGates);
-      const evidenceSequence = nextTaskEvidenceSequence(
-        gateOwner?.issue.evidenceManifests ?? [],
-        sequence,
-      );
       const shippingTarget = gateOwner
         ? await shippingTargetFor(gateOwner.run, gateOwner.issue, request.directory)
         : undefined;
+      const priorGates = [
+        ...new Map(
+          [
+            ...(gateOwner?.issue.gates ?? []),
+            ...spawnReceipts.flatMap((receipt) => {
+              if (receipt.sourceId !== sourceId || receipt.sourceDirectory !== request.directory)
+                return [];
+              const recordedGate = gateSnapshot(receipt);
+              return recordedGate ? [recordedGate] : [];
+            }),
+          ].map((candidate) => [candidate.id, candidate]),
+        ).values(),
+      ];
+      const { sequence, evidenceSequence } = nextValidationReservation(
+        priorGates,
+        gateOwner?.issue.evidenceManifests ?? [],
+      );
       const ensureSelected = async () => {
         const selectedCandidates = currentCandidates.filter((candidate) =>
           crossValidation.choices.some(

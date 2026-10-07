@@ -5,7 +5,9 @@ import {
   evidenceManifestsSchema,
   mergeEvidenceManifests,
   nextTaskEvidenceSequence,
+  readStableEvidenceBoundary,
   requireEvidenceBaseRevision,
+  requireEvidenceExecutionBoundary,
   requireEvidenceRevision,
   recordTaskEvidence,
   syncEvidenceManifest,
@@ -375,6 +377,67 @@ void test('rejects evidence recorded after its execution revision changed', () =
   assert.doesNotThrow(() => requireEvidenceRevision('revision-a', 'revision-a'));
   assert.throws(() => requireEvidenceRevision(undefined, 'revision-a'), /captured before/);
   assert.throws(() => requireEvidenceRevision('revision-a', 'revision-b'), /Rerun/);
+});
+
+void test('rejects command evidence after mutation generation or shipping base changes', () => {
+  const current = {
+    revision: 'revision-a',
+    mutationGeneration: 'generation-b',
+    baseRevision: 'base-b',
+  };
+
+  assert.doesNotThrow(() =>
+    requireEvidenceExecutionBoundary(
+      {
+        revision: 'revision-a',
+        mutationGeneration: 'generation-b',
+        baseRevision: 'base-b',
+      },
+      current,
+    ),
+  );
+  assert.throws(
+    () =>
+      requireEvidenceExecutionBoundary(
+        {
+          revision: 'revision-a',
+          mutationGeneration: 'generation-a',
+          baseRevision: 'base-b',
+        },
+        current,
+      ),
+    /modified after execution started/,
+  );
+  assert.throws(
+    () =>
+      requireEvidenceExecutionBoundary(
+        {
+          revision: 'revision-a',
+          mutationGeneration: 'generation-b',
+          baseRevision: 'base-a',
+        },
+        current,
+      ),
+    /shipping base changed after execution started/,
+  );
+});
+
+void test('captures a stable command execution boundary after a concurrent change', async () => {
+  const revisions = ['revision-a', 'revision-b', 'revision-b', 'revision-b'];
+  const generations = ['generation-a', 'generation-b', 'generation-b', 'generation-b'];
+  const bases = ['base-a', 'base-b', 'base-b', 'base-b'];
+
+  const boundary = await readStableEvidenceBoundary(
+    async () => revisions.shift()!,
+    async () => generations.shift()!,
+    async () => bases.shift()!,
+  );
+
+  assert.deepEqual(boundary, {
+    revision: 'revision-b',
+    mutationGeneration: 'generation-b',
+    baseRevision: 'base-b',
+  });
 });
 
 void test('rejects a late evidence snapshot after a newer revision was stored', () => {

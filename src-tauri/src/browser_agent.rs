@@ -1249,8 +1249,8 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "task_evidence_record",
-        "Record a bounded command result against its execution revision and map it to zero or more acceptance criteria. Read the checkpoint before the command and pass its revision as expectedRevision.",
-        "command,result,criteria,outputReference,expectedRevision",
+        "Record a bounded command result against its execution boundary and map it to zero or more acceptance criteria. Read the checkpoint before the command and pass its execution revision, mutation generation, and base revision.",
+        "command,result,criteria,outputReference,expectedRevision,expectedMutationGeneration,expectedBaseRevision",
     ),
     (
         "agent_status",
@@ -1444,7 +1444,9 @@ pub fn run_mcp_stdio() {
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
                             "outputReference":{"type":"string","minLength":1,"maxLength":2000}
                             ,"expectedRevision":{"type":"string","minLength":1}
-                        },"required":["command","result","criteria","outputReference","expectedRevision"]
+                            ,"expectedMutationGeneration":{"type":"string","minLength":1}
+                            ,"expectedBaseRevision":{"type":"string","minLength":1}
+                        },"required":["command","result","criteria","outputReference","expectedRevision","expectedMutationGeneration","expectedBaseRevision"]
                     }});
                 }
                 if *name == "agent_wait" {
@@ -1578,6 +1580,14 @@ mod skill_tests {
         assert!(TOOLS
             .iter()
             .any(|(name, _, _)| *name == "task_evidence_record"));
+        assert_eq!(
+            TOOLS
+                .iter()
+                .find(|(name, _, _)| *name == "task_evidence_record")
+                .unwrap()
+                .2,
+            "command,result,criteria,outputReference,expectedRevision,expectedMutationGeneration,expectedBaseRevision"
+        );
         assert!(TOOLS
             .iter()
             .any(|(name, _, _)| *name == "validation_policy"));

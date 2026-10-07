@@ -7,6 +7,7 @@ import {
   ciStatus,
   completedInlineShipGate,
   dependencyUrl,
+  nextValidationReservation,
   shipGatesSettled,
   shipCleanupRequest,
   shipEvidenceReadiness,
@@ -14,6 +15,8 @@ import {
   shipActivity,
   reconciledShipGates,
   recoverValidationEvidence,
+  rollbackValidationIssue,
+  rollbackValidationReceipt,
   refreshedPullRequest,
   persistShipRefresh,
   gateSnapshot,
@@ -109,17 +112,50 @@ void test('validation drift during durable commit rolls the verdict back', async
       readRevision: async () => 'revision-one',
       readMutationGeneration: async () => generation,
       prepare: async () => 'PASS',
-      commit: async (verdict) => {
+      commit: async (verdict, registerRollback) => {
+        registerRollback(async () => {
+          durableVerdict = undefined;
+        });
         durableVerdict = verdict;
         generation = 'edited-during-storage';
-        return async () => {
-          durableVerdict = undefined;
-        };
       },
     }),
     /worktree was modified during validation/,
   );
   assert.equal(durableVerdict, undefined);
+});
+
+void test('a failed durable commit compensates its receipt without erasing concurrent state', async () => {
+  const previous = validationReceipt();
+  let durable = structuredClone(previous);
+
+  await assert.rejects(
+    commitRevisionBoundValidation({
+      expectedRevision: 'revision-one',
+      expectedMutationGeneration: 'generation-one',
+      readRevision: async () => 'revision-one',
+      readMutationGeneration: async () => 'generation-one',
+      prepare: async () => 'CLEAN',
+      commit: async (verdict, registerRollback) => {
+        const committed = {
+          ...durable,
+          validation: { ...durable.validation!, verdict },
+        };
+        registerRollback(async () => {
+          durable = rollbackValidationReceipt(durable, previous, committed);
+        });
+        durable = {
+          ...committed,
+          validation: { ...committed.validation, revisionDrifted: true },
+        };
+        throw new Error('Ship run storage failed.');
+      },
+    }),
+    /Ship run storage failed/,
+  );
+
+  assert.equal(durable.validation?.verdict, undefined);
+  assert.equal(durable.validation?.revisionDrifted, true);
 });
 
 function fixture() {
@@ -165,6 +201,38 @@ function fixture() {
     'run',
     1,
   );
+}
+
+function validationReceipt(): SpawnReceipt {
+  return {
+    receiptId: 'gate',
+    accessKey: 'secret',
+    requestId: 'request',
+    project: '/repo',
+    sourceId: 'worker',
+    sourceDirectory: '/worktree',
+    targetId: 'gate-thread',
+    turnId: 'turn',
+    targetDirectory: '/worktree',
+    worktreeId: '/worktree',
+    provider: 'codex',
+    model: 'test',
+    prompt: '',
+    validation: {
+      gate: 'code-adversary',
+      requestedModel: 'test',
+      sequence: 0,
+      evidenceSequence: 1,
+      revision: 'revision-one',
+      mutationGeneration: 'generation-one',
+      baseRevision: 'base-one',
+    },
+    state: 'working',
+    created: 1,
+    updated: 1,
+    result: null,
+    error: null,
+  };
 }
 
 function withMergeEvidence(issue: ReturnType<typeof fixture>['issues'][number]) {
@@ -371,12 +439,12 @@ void test('durable gate receipts recover manifest evidence after restart', () =>
     },
   ];
 
-  const recovered = recoverValidationEvidence(issue);
+  const recovered = recoverValidationEvidence(issue, undefined);
   assert.ok(recovered);
   Object.assign(issue, recovered);
   assert.equal(issue.evidenceManifests?.[0]?.evidence[0]?.id, 'gate:durable-receipt');
   assert.equal(shipEvidenceReadiness(issue).ready, true);
-  assert.equal(recoverValidationEvidence(issue), null);
+  assert.equal(recoverValidationEvidence(issue, undefined), null);
 });
 
 void test('receipt recovery preserves attempt order when an older receipt is missing', () => {
@@ -412,12 +480,12 @@ void test('receipt recovery preserves attempt order when an older receipt is mis
     evidenceTimestamp: 10 + sequence,
   });
   issue.gates = [gateAttempt('older', 1, 'FAIL'), gateAttempt('newer', 2, 'PASS')];
-  Object.assign(issue, recoverValidationEvidence(issue));
+  Object.assign(issue, recoverValidationEvidence(issue, undefined));
   issue.evidenceManifests![0].evidence = issue.evidenceManifests![0].evidence.filter(
     (entry) => entry.id !== 'gate:older',
   );
 
-  Object.assign(issue, recoverValidationEvidence(issue));
+  Object.assign(issue, recoverValidationEvidence(issue, undefined));
 
   assert.equal(shipEvidenceReadiness(issue).ready, true);
   assert.deepEqual(
@@ -427,7 +495,160 @@ void test('receipt recovery preserves attempt order when an older receipt is mis
       ['gate:newer', 2],
     ],
   );
-  assert.equal(recoverValidationEvidence(issue), null);
+  assert.equal(recoverValidationEvidence(issue, undefined), null);
+});
+
+void test('receipt recovery cannot reactivate evidence from an obsolete shipping base', () => {
+  const issue = fixture().issues[0];
+  issue.checkpoint!.revision = 'revision-one';
+  issue.validationPolicy = {
+    risk: 'low',
+    requiredGates: ['code-adversary'],
+    sources: ['test'],
+    revision: 'revision-one',
+    baseRevision: 'base-one',
+    changedPaths: [],
+    selectedAt: 1,
+    history: [],
+  };
+  issue.evidenceRevision = 'revision-one';
+  issue.evidenceManifests = recordTaskEvidence(
+    [],
+    'revision-one',
+    issue.checkpoint!.acceptanceCriteria,
+    {
+      id: 'current-command',
+      kind: 'command',
+      name: 'npm test',
+      provider: 'codex',
+      model: 'test',
+      result: 'passed',
+      timestamp: 20,
+      outputReference: 'terminal:test',
+      criteria: [],
+    },
+    'base-two',
+  );
+  issue.gates = [
+    {
+      ...gateSnapshot(validationReceipt())!,
+      state: 'completed',
+      verdict: 'CLEAN',
+      evidenceTimestamp: 10,
+      evidenceOutputReference: 'thread:gate',
+    },
+  ];
+
+  const recovered = recoverValidationEvidence(issue, 'base-two');
+
+  assert.equal(recovered, null);
+  assert.equal(issue.evidenceManifests[0].baseRevision, 'base-two');
+  assert.equal(issue.evidenceManifests[0].stale, false);
+  assert.equal(
+    issue.evidenceManifests.some((manifest) => manifest.baseRevision === 'base-one'),
+    false,
+  );
+});
+
+void test('sequential reservations remain unique before validation launch awaits', () => {
+  const first = nextValidationReservation([], []);
+  const firstReceipt = validationReceipt();
+  firstReceipt.validation = { ...firstReceipt.validation!, ...first };
+
+  const second = nextValidationReservation([gateSnapshot(firstReceipt)!], []);
+
+  assert.deepEqual(first, { sequence: 0, evidenceSequence: 1 });
+  assert.deepEqual(second, { sequence: 1, evidenceSequence: 2 });
+});
+
+void test('validation rollback preserves concurrently recorded command and CI evidence', () => {
+  const issue = fixture().issues[0];
+  issue.checkpoint!.revision = 'revision-one';
+  issue.evidenceRevision = 'revision-one';
+  issue.evidenceManifests = recordTaskEvidence(
+    [],
+    'revision-one',
+    issue.checkpoint!.acceptanceCriteria,
+    {
+      id: 'ci-before',
+      kind: 'command',
+      name: 'ci:build',
+      provider: 'github',
+      model: null,
+      result: 'passed',
+      timestamp: 10,
+      outputReference: 'https://example.test/build',
+      criteria: [],
+    },
+    'base-one',
+  );
+  issue.events = [{ at: 1, stage: 'testing' }];
+  const previous = structuredClone({
+    evidenceRevision: issue.evidenceRevision,
+    evidenceManifests: issue.evidenceManifests,
+    stage: issue.stage,
+    blockedReason: issue.blockedReason,
+    gates: issue.gates,
+    events: issue.events,
+  });
+  issue.evidenceManifests = recordTaskEvidence(
+    issue.evidenceManifests,
+    'revision-one',
+    issue.checkpoint!.acceptanceCriteria,
+    {
+      id: 'gate:receipt',
+      kind: 'gate',
+      name: 'code-adversary',
+      provider: 'codex',
+      model: 'test',
+      result: 'failed',
+      timestamp: 20,
+      sequence: 2,
+      outputReference: 'thread:gate',
+      criteria: [],
+    },
+    'base-one',
+  );
+  issue.blockedReason = 'Gate failed.';
+  issue.events = [...issue.events, { at: 2, stage: 'code-adversary', reason: 'Gate failed.' }];
+  const committed = structuredClone({
+    evidenceRevision: issue.evidenceRevision,
+    evidenceManifests: issue.evidenceManifests,
+    stage: issue.stage,
+    blockedReason: issue.blockedReason,
+    gates: issue.gates,
+    events: issue.events,
+  });
+  issue.evidenceManifests = recordTaskEvidence(
+    issue.evidenceManifests,
+    'revision-one',
+    issue.checkpoint!.acceptanceCriteria,
+    {
+      id: 'command-during-store',
+      kind: 'command',
+      name: 'npm test',
+      provider: 'codex',
+      model: 'test',
+      result: 'passed',
+      timestamp: 30,
+      outputReference: 'terminal:test',
+      criteria: [],
+    },
+    'base-one',
+  );
+  issue.events = [...issue.events, { at: 3, stage: 'ci' }];
+
+  const rolledBack = rollbackValidationIssue(issue, previous, committed, 'gate:receipt');
+
+  assert.deepEqual(
+    rolledBack.evidenceManifests?.[0].evidence.map((entry) => entry.id),
+    ['ci-before', 'command-during-store'],
+  );
+  assert.equal(rolledBack.blockedReason, undefined);
+  assert.deepEqual(
+    rolledBack.events?.map((event) => event.stage),
+    ['testing', 'ci'],
+  );
 });
 
 void test('receipt recovery retains every required gate after one hundred commands', () => {
@@ -486,7 +707,7 @@ void test('receipt recovery retains every required gate after one hundred comman
     evidenceTimestamp: 200 + index,
   }));
 
-  Object.assign(issue, recoverValidationEvidence(issue));
+  Object.assign(issue, recoverValidationEvidence(issue, 'base-one'));
 
   const gateEvidence = issue.evidenceManifests[0].evidence.filter((entry) => entry.kind === 'gate');
   assert.equal(gateEvidence.length, 3);
@@ -495,7 +716,7 @@ void test('receipt recovery retains every required gate after one hundred comman
     [101, 102, 103],
   );
   assert.equal(shipEvidenceReadiness(issue).ready, true);
-  assert.equal(recoverValidationEvidence(issue), null);
+  assert.equal(recoverValidationEvidence(issue, 'base-one'), null);
 });
 
 void test('validation generation fence detects edit restore ABA', async () => {

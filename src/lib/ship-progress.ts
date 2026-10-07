@@ -7,7 +7,9 @@ import { taskCheckpointSchema } from './task-checkpoint.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
+  nextTaskEvidenceSequence,
   recordTaskEvidence,
+  type EvidenceManifest,
   type EvidenceReadiness,
   type TaskEvidence,
 } from './task-evidence.ts';
@@ -63,7 +65,20 @@ export type GateMetadata = {
 };
 
 export function nextGateSequence(gates: Pick<ShipGate, 'sequence'>[]): number {
-  return Math.max(gates.length, ...gates.map((gate) => (gate.sequence ?? -1) + 1));
+  return Math.max(0, ...gates.map((gate, index) => (gate.sequence ?? index) + 1));
+}
+
+export function nextValidationReservation(
+  gates: Pick<ShipGate, 'sequence' | 'evidenceSequence'>[],
+  manifests: EvidenceManifest[],
+): { sequence: number; evidenceSequence: number } {
+  return {
+    sequence: nextGateSequence(gates),
+    evidenceSequence: Math.max(
+      nextTaskEvidenceSequence(manifests),
+      ...gates.map((gate) => (gate.evidenceSequence ?? 0) + 1),
+    ),
+  };
 }
 export type ShipGate = GateMetadata & {
   id: string;
@@ -202,7 +217,7 @@ export async function commitRevisionBoundValidation<T>({
   readMutationGeneration: () => Promise<string>;
   readBaseRevision?: () => Promise<string>;
   prepare: () => Promise<T>;
-  commit: (prepared: T) => Promise<(() => Promise<void>) | void>;
+  commit: (prepared: T, registerRollback: (rollback: () => Promise<void>) => void) => Promise<void>;
 }): Promise<void> {
   if (!expectedRevision)
     throw new Error('Validation needs the revision captured before execution.');
@@ -220,13 +235,156 @@ export async function commitRevisionBoundValidation<T>({
   await verifyBoundary();
   const prepared = await prepare();
   await verifyBoundary();
-  const rollback = await commit(prepared);
+  let rollback: (() => Promise<void>) | undefined;
   try {
+    await commit(prepared, (candidate) => (rollback = candidate));
     await verifyBoundary();
   } catch (cause) {
-    await rollback?.();
+    try {
+      await rollback?.();
+    } catch (rollbackCause) {
+      throw new Error(`Validation commit failed (${String(cause)}) and rollback failed.`, {
+        cause: rollbackCause,
+      });
+    }
     throw cause;
   }
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function restoreIfUnchanged<T>(value: T, previousValue: T, committedValue: T): T {
+  return sameValue(value, committedValue) ? previousValue : value;
+}
+
+export function rollbackValidationReceipt(
+  current: SpawnReceipt,
+  previous: SpawnReceipt,
+  committed: SpawnReceipt,
+): SpawnReceipt {
+  if (!current.validation || !previous.validation || !committed.validation) return current;
+  const validation = {
+    ...current.validation,
+    verdict: restoreIfUnchanged(
+      current.validation.verdict,
+      previous.validation.verdict,
+      committed.validation.verdict,
+    ),
+    reason: restoreIfUnchanged(
+      current.validation.reason,
+      previous.validation.reason,
+      committed.validation.reason,
+    ),
+    evidenceCriteria: restoreIfUnchanged(
+      current.validation.evidenceCriteria,
+      previous.validation.evidenceCriteria,
+      committed.validation.evidenceCriteria,
+    ),
+    evidenceOutputReference: restoreIfUnchanged(
+      current.validation.evidenceOutputReference,
+      previous.validation.evidenceOutputReference,
+      committed.validation.evidenceOutputReference,
+    ),
+    evidenceTimestamp: restoreIfUnchanged(
+      current.validation.evidenceTimestamp,
+      previous.validation.evidenceTimestamp,
+      committed.validation.evidenceTimestamp,
+    ),
+    evidenceSequence: restoreIfUnchanged(
+      current.validation.evidenceSequence,
+      previous.validation.evidenceSequence,
+      committed.validation.evidenceSequence,
+    ),
+  };
+  return { ...current, validation };
+}
+
+function rollbackEvidenceEntry(
+  current: EvidenceManifest[],
+  previous: EvidenceManifest[],
+  committed: EvidenceManifest[],
+  evidenceId: string,
+): EvidenceManifest[] {
+  return current.map((manifest) => {
+    const matches = (candidate: EvidenceManifest) =>
+      candidate.revision === manifest.revision && candidate.baseRevision === manifest.baseRevision;
+    const previousEntry = previous.find(matches)?.evidence.find((entry) => entry.id === evidenceId);
+    const committedEntry = committed
+      .find(matches)
+      ?.evidence.find((entry) => entry.id === evidenceId);
+    const currentIndex = manifest.evidence.findIndex((entry) => entry.id === evidenceId);
+    if (currentIndex < 0 || !sameValue(manifest.evidence[currentIndex], committedEntry))
+      return manifest;
+    return {
+      ...manifest,
+      evidence: previousEntry
+        ? manifest.evidence.with(currentIndex, previousEntry)
+        : manifest.evidence.toSpliced(currentIndex, 1),
+    };
+  });
+}
+
+function removeCommittedEvents(
+  current: ShipEvent[] | undefined,
+  previous: ShipEvent[] | undefined,
+  committed: ShipEvent[] | undefined,
+): ShipEvent[] | undefined {
+  const removed = [...(current ?? [])];
+  const previousCounts = new Map<string, number>();
+  for (const event of previous ?? []) {
+    const key = JSON.stringify(event);
+    previousCounts.set(key, (previousCounts.get(key) ?? 0) + 1);
+  }
+  const added = (committed ?? []).filter((event) => {
+    const key = JSON.stringify(event);
+    const count = previousCounts.get(key) ?? 0;
+    if (!count) return true;
+    previousCounts.set(key, count - 1);
+    return false;
+  });
+  for (const event of added) {
+    const index = removed.findIndex((candidate) => sameValue(candidate, event));
+    if (index >= 0) removed.splice(index, 1);
+  }
+  return removed;
+}
+
+type ValidationIssueSnapshot = Pick<
+  ShipIssue,
+  'evidenceRevision' | 'evidenceManifests' | 'stage' | 'blockedReason' | 'gates' | 'events'
+>;
+
+export function rollbackValidationIssue(
+  current: ShipIssue,
+  previous: ValidationIssueSnapshot,
+  committed: ValidationIssueSnapshot,
+  evidenceId: string,
+  gateId?: string,
+): ValidationIssueSnapshot {
+  const restore = <K extends keyof ValidationIssueSnapshot>(key: K) =>
+    sameValue(current[key], committed[key]) ? previous[key] : current[key];
+  const gates = gateId
+    ? (current.gates ?? []).filter((gate) => {
+        if (gate.id !== gateId) return true;
+        const committedGate = committed.gates?.find((candidate) => candidate.id === gateId);
+        return !sameValue(gate, committedGate);
+      })
+    : current.gates;
+  return {
+    evidenceRevision: restore('evidenceRevision'),
+    evidenceManifests: rollbackEvidenceEntry(
+      current.evidenceManifests ?? [],
+      previous.evidenceManifests ?? [],
+      committed.evidenceManifests ?? [],
+      evidenceId,
+    ),
+    stage: restore('stage'),
+    blockedReason: restore('blockedReason'),
+    gates,
+    events: removeCommittedEvents(current.events, previous.events, committed.events),
+  };
 }
 
 export function gateSnapshot(receipt: SpawnReceipt): ShipGate | null {
@@ -385,11 +543,13 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
 
 export function recoverValidationEvidence(
   issue: ShipIssue,
+  observedBaseRevision: string | undefined,
 ): Pick<ShipIssue, 'evidenceRevision' | 'evidenceManifests'> | null {
   const checkpoint = issue.checkpoint;
   if (!checkpoint?.revision) return null;
   const revision = checkpoint.revision;
   const baseRevision = issue.validationPolicy?.baseRevision;
+  if (baseRevision !== observedBaseRevision) return null;
   let manifests = issue.evidenceManifests ?? [];
   const gates = (issue.gates ?? []).toSorted(
     (left, right) =>
@@ -436,9 +596,7 @@ export function recoverValidationEvidence(
         timestamp: gate.evidenceTimestamp!,
         outputReference: gate.evidenceOutputReference!,
         criteria,
-        ...(!missing && gate.evidenceSequence !== undefined
-          ? { sequence: gate.evidenceSequence }
-          : {}),
+        ...(gate.evidenceSequence !== undefined ? { sequence: gate.evidenceSequence } : {}),
       },
       baseRevision,
     );
