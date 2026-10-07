@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   groupSidebarThreads,
   listSidebarOpenCodeThreads,
+  recordSidebarOpenCodeOutcome,
   sidebarThreadRows,
   sidebarThreadStatus,
   type SidebarSessionSource,
@@ -95,6 +96,33 @@ await test('fresh OpenCode outcome replaces stale saved terminal status', () => 
     ),
     'interrupted',
   );
+});
+
+await test('later OpenCode completion replaces interrupted sidebar outcome when refresh fails', () => {
+  const thread = {
+    agent: 'opencode',
+    directory: '/repo/a',
+    sessionId: 'one',
+    title: 'Agent',
+    updated: 2,
+  };
+  const key = JSON.stringify(['opencode', '/repo/a', 'one']);
+  const otherKey = JSON.stringify(['opencode', '/repo/a', 'two']);
+  const stale = { [key]: 'interrupted' as const, [otherKey]: 'failed' as const };
+  const current = recordSidebarOpenCodeOutcome(stale, thread, 'done');
+  assert.deepEqual(current, { [key]: 'done', [otherKey]: 'failed' });
+  assert.equal(
+    sidebarThreadStatus(
+      thread,
+      { [key]: { status: 'done', unread: false } },
+      current,
+      true,
+      true,
+      [],
+    ),
+    'done',
+  );
+  assert.equal(stale[key], 'interrupted');
 });
 
 await test('active subagent keeps a finished parent visibly working', () => {

@@ -163,6 +163,7 @@
   import {
     groupSidebarThreads,
     listSidebarOpenCodeThreads,
+    recordSidebarOpenCodeOutcome,
     sidebarThreadStatus,
   } from './lib/sidebar-agents';
   import {
@@ -7493,6 +7494,12 @@
     const key = agentThreadKey(thread);
     if (thread.agent !== 'opencode' && !agentThreads.some((item) => threadKey(item) === key))
       return;
+    if (thread.agent === 'opencode')
+      sidebarOpenCodeOutcomes = recordSidebarOpenCodeOutcome(
+        sidebarOpenCodeOutcomes,
+        thread,
+        status,
+      );
     const { next, notify } = updateAttention(
       threadAttention,
       key,
@@ -8623,6 +8630,7 @@
             event.type === 'session.execution.failed' ||
             event.type === 'session.execution.interrupted')
         ) {
+          ++sidebarInventoryGeneration;
           ++nativeActivityGeneration;
           const matchingThreads = sidebarOpenCodeThreads.filter(
             (item) =>

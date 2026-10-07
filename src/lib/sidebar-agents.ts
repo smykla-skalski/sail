@@ -94,6 +94,14 @@ export function groupSidebarThreads(threads: AgentThread[]): Record<string, Agen
   return grouped;
 }
 
+export function recordSidebarOpenCodeOutcome(
+  outcomes: Record<string, ThreadStatus>,
+  thread: AgentThread,
+  status: ThreadStatus,
+): Record<string, ThreadStatus> {
+  return { ...outcomes, [threadKey(thread)]: status };
+}
+
 export function sidebarThreadRows(
   threads: AgentThread[],
   receipts: SpawnReceipt[],
