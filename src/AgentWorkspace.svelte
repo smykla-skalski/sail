@@ -287,6 +287,9 @@
   }
   let images = $state<BrowserAttachment[]>([]);
   let clipboardAttachments = $state<{ path: string; name: string; image: boolean }[]>([]);
+  let clipboardImagePreviews = $state<
+    { path: string; name: string; url: string; left: number; top: number; offset: number }[]
+  >([]);
   let pendingPaste: Promise<void> = Promise.resolve();
   let lastPicked = '';
   let lastPrefill = '';
@@ -299,8 +302,58 @@
   }
   function removeClipboardAttachment(attachment: { path: string; image: boolean }) {
     clipboardAttachments = clipboardAttachments.filter((item) => item.path !== attachment.path);
+    const preview = clipboardImagePreviews.find((item) => item.path === attachment.path);
+    if (preview) URL.revokeObjectURL(preview.url);
+    clipboardImagePreviews = clipboardImagePreviews.filter((item) => item.path !== attachment.path);
     if (attachment.image) void invoke('browser_remove_capture', { path: attachment.path });
     else void removeClipboardFile(attachment.path);
+  }
+
+  function clearClipboardImagePreviews() {
+    clipboardImagePreviews.forEach((preview) => URL.revokeObjectURL(preview.url));
+    clipboardImagePreviews = [];
+  }
+
+  function previewPosition(input: HTMLTextAreaElement, offset: number) {
+    const styles = getComputedStyle(input);
+    const mirror = document.createElement('div');
+    const marker = document.createElement('span');
+    for (const property of [
+      'boxSizing',
+      'width',
+      'fontFamily',
+      'fontSize',
+      'fontWeight',
+      'fontStyle',
+      'letterSpacing',
+      'lineHeight',
+      'textTransform',
+      'textIndent',
+      'paddingTop',
+      'paddingRight',
+      'paddingBottom',
+      'paddingLeft',
+      'borderTopWidth',
+      'borderRightWidth',
+      'borderBottomWidth',
+      'borderLeftWidth',
+    ] as const)
+      mirror.style[property] = styles[property];
+    mirror.style.position = 'absolute';
+    mirror.style.visibility = 'hidden';
+    mirror.style.overflow = 'hidden';
+    mirror.style.whiteSpace = 'pre-wrap';
+    mirror.style.overflowWrap = 'break-word';
+    mirror.style.top = '0';
+    mirror.style.left = '-9999px';
+    mirror.textContent = input.value.slice(0, offset);
+    marker.textContent = '\u200b';
+    mirror.append(marker);
+    document.body.append(mirror);
+    const left = input.offsetLeft + marker.offsetLeft - input.scrollLeft;
+    const top = input.offsetTop + marker.offsetTop - input.scrollTop;
+    mirror.remove();
+    return { left, top };
   }
 
   async function pasteFiles(event: ClipboardEvent) {
@@ -308,9 +361,10 @@
     if (!files.length) return;
     event.preventDefault();
     const pastedText = event.clipboardData?.getData('text/plain') ?? '';
-    if (pastedText && event.target instanceof HTMLTextAreaElement) {
-      const input = event.target;
-      const caret = input.selectionStart + pastedText.length;
+    const input = event.target instanceof HTMLTextAreaElement ? event.target : null;
+    const insertionOffset = input ? input.selectionStart + pastedText.length : draft.length;
+    if (pastedText && input) {
+      const caret = insertionOffset;
       draft = insertClipboardText(draft, pastedText, input.selectionStart, input.selectionEnd);
       void tick().then(() => input.setSelectionRange(caret, caret));
     }
@@ -320,9 +374,9 @@
         const image = file.type.startsWith('image/');
         try {
           const path = image ? await stageClipboardImage(file) : await stageClipboardFile(file);
-          return { path, name: file.name || 'image.png', image, failure: null };
+          return { path, name: file.name || 'image.png', image, file, failure: null };
         } catch (cause) {
-          return { path: null, name: file.name, image, failure: describe(cause) };
+          return { path: null, name: file.name, image, file, failure: describe(cause) };
         }
       }),
     );
@@ -337,6 +391,25 @@
       }
     }
     clipboardAttachments = [...clipboardAttachments, ...stagedAttachments];
+    if (input)
+      void tick().then(() => {
+        for (const item of staged) {
+          if (item.failure || !item.path || !item.image) continue;
+          const position = previewPosition(input, insertionOffset);
+          clipboardImagePreviews = [
+            ...clipboardImagePreviews,
+            {
+              path: item.path,
+              name: item.name,
+              url: URL.createObjectURL(item.file),
+              left: position.left,
+              top: position.top,
+              offset: insertionOffset,
+            },
+          ];
+        }
+        return undefined;
+      });
   }
   let error = $state('');
   let entries = $state.raw<AgentEntry[]>([]);
@@ -1061,6 +1134,7 @@
       draft = '';
       images = [];
       clipboardAttachments = [];
+      clearClipboardImagePreviews();
       return;
     }
     if ((!text && (external || !clipboardAttachments.length)) || !ready || isBusy || !directory) {
@@ -1089,6 +1163,7 @@
       draft = '';
       images = [];
       clipboardAttachments = [];
+      clearClipboardImagePreviews();
     }
     const userEntryId = crypto.randomUUID();
     flushUpdates();
@@ -1877,6 +1952,20 @@
         rows="3"
         placeholder={`Message ${name}…`}
         disabled={!directory || !!nativeEntries}></textarea>
+      {#each clipboardImagePreviews as preview (preview.path)}
+        <figure
+          class="clipboard-image-preview"
+          style={`left: ${preview.left}px; top: ${preview.top}px`}
+          data-caret-offset={preview.offset}
+          aria-label={`Pasted ${preview.name}`}
+        >
+          <img src={preview.url} alt="" />
+          <button
+            aria-label={`Remove ${preview.name}`}
+            onclick={() => removeClipboardAttachment({ path: preview.path, image: true })}>×</button
+          >
+        </figure>
+      {/each}
       <SkillMenu
         id={skillMenuId}
         skills={skillMatches}
@@ -1891,8 +1980,8 @@
               ></span
             >{/each}
         </div>{/if}
-      {#if clipboardAttachments.length}<div class="attachments">
-          {#each clipboardAttachments as attachment (attachment.path)}<span
+      {#if clipboardAttachments.some((attachment) => !attachment.image)}<div class="attachments">
+          {#each clipboardAttachments.filter((attachment) => !attachment.image) as attachment (attachment.path)}<span
               >{attachment.image ? '📷' : '📎'}
               {attachment.name}
               <button
@@ -2161,6 +2250,37 @@
     outline: 0;
     padding: 15px 16px;
     font: inherit;
+  }
+  .clipboard-image-preview {
+    position: absolute;
+    z-index: 1;
+    display: flex;
+    width: 108px;
+    height: 72px;
+    margin: 0;
+    overflow: hidden;
+    border: 1px solid var(--sui-border);
+    border-radius: 7px;
+    background: var(--sui-surface);
+    box-shadow: 0 3px 10px #0003;
+  }
+  .clipboard-image-preview img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .clipboard-image-preview button {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    color: var(--sui-foreground);
+    background: #0009;
+    line-height: 1;
   }
   .agent-actions {
     display: flex;

@@ -85,6 +85,7 @@ describe('clipboard chat attachments', () => {
     await browser.execute(async () => {
       const input = document.querySelector<HTMLTextAreaElement>('.agent-composer textarea');
       if (!input) throw new Error('No composer');
+      input.setSelectionRange(9, 9);
       const canvas = document.createElement('canvas');
       canvas.width = canvas.height = 2;
       canvas.getContext('2d')?.fillRect(0, 0, 2, 2);
@@ -100,6 +101,8 @@ describe('clipboard chat attachments', () => {
         new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: data }),
       );
     });
+    await expect($('.clipboard-image-preview')).toBeDisplayed();
+    await expect($('.clipboard-image-preview')).toHaveAttribute('data-caret-offset', '9');
     await expect($('button[aria-label="Remove pixel.png"]')).toBeDisplayed();
     await $('.agent-actions button').click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('image: image/png'));
