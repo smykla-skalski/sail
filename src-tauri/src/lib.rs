@@ -31,9 +31,7 @@ struct WorktreeOperationGuard {
 
 impl WorktreeOperationLocks {
     fn lock(&self, repository: &Path) -> Result<WorktreeOperationGuard, String> {
-        let repository = repository
-            .canonicalize()
-            .map_err(|_| "Repository folder no longer exists.".to_string())?;
+        let repository = git_common_directory(repository)?;
         let mut active = self
             .0
             .active
@@ -52,6 +50,23 @@ impl WorktreeOperationLocks {
             repository,
         })
     }
+}
+
+fn git_common_directory(repository: &Path) -> Result<PathBuf, String> {
+    let repository = repository
+        .canonicalize()
+        .map_err(|_| "Repository folder no longer exists.".to_string())?;
+    let common = git_reference(&repository, &["rev-parse", "--git-common-dir"])
+        .ok_or("Cannot locate the repository Git directory.")?;
+    let common = PathBuf::from(common);
+    let common = if common.is_absolute() {
+        common
+    } else {
+        repository.join(common)
+    };
+    common
+        .canonicalize()
+        .map_err(|_| "Repository Git directory no longer exists.".to_string())
 }
 
 impl Drop for WorktreeOperationGuard {
@@ -1037,12 +1052,44 @@ async fn working_tree_commit(path: String) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-async fn shipping_changed_paths(path: String) -> Result<Vec<String>, String> {
+async fn shipping_base_revision(path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = validate_repository(path)?;
         let base = worktree_base(Path::new(&root));
-        let merge_base =
-            git_reference(Path::new(&root), &["merge-base", "HEAD", &base]).unwrap_or(base);
+        git_reference(
+            Path::new(&root),
+            &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+        )
+        .ok_or("Cannot resolve the shipping base commit.".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn shipping_changed_paths(
+    path: String,
+    base_revision: Option<String>,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = validate_repository(path)?;
+        let base = match base_revision {
+            Some(base) => git_reference(
+                Path::new(&root),
+                &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+            )
+            .ok_or("The selected shipping base commit no longer exists.")?,
+            None => {
+                let reference = worktree_base(Path::new(&root));
+                git_reference(
+                    Path::new(&root),
+                    &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+                )
+                .ok_or("Cannot resolve the shipping base commit.")?
+            }
+        };
+        let merge_base = git_reference(Path::new(&root), &["merge-base", "HEAD", &base])
+            .ok_or("Cannot find the merge base for validation.")?;
         let output = Command::new("git")
             .args([
                 "-C",
@@ -2481,6 +2528,7 @@ pub fn run() {
             working_tree_revision,
             working_tree_generation,
             working_tree_commit,
+            shipping_base_revision,
             shipping_changed_paths,
             worktree_overviews,
             worktree_snapshots::record_turn_snapshot,
@@ -2621,8 +2669,9 @@ mod tests {
         existing_shipping_worktree, git_change_action, git_patch, git_reference,
         normalize_picker_path, parse_registered_worktrees, registered_worktrees, remove_worktree,
         remove_worktree_with_hook, remove_worktree_with_hooks, repository_namespace, server_args,
-        shipping_changed_paths, shipping_default_branch, shipping_fetch_source,
-        version_is_compatible, version_number, working_tree_diff, worktree_overviews,
+        shipping_base_revision, shipping_changed_paths, shipping_default_branch,
+        shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
+        worktree_overviews, WorktreeOperationLocks,
     };
     use super::{working_tree_commit, working_tree_revision};
     use std::fs;
@@ -3302,6 +3351,36 @@ mod tests {
     }
 
     #[test]
+    fn worktree_operations_share_a_common_git_directory_lock() {
+        let (root, repository, worktree, _) = ignored_archive_fixture("sail-common-dir-lock-test");
+        let locks = WorktreeOperationLocks::default();
+        let main_guard = locks.lock(Path::new(&repository)).unwrap();
+        let linked_locks = locks.clone();
+        let linked = worktree.clone();
+        let (ready, started) = std::sync::mpsc::channel();
+        let (acquired, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            let _guard = linked_locks.lock(Path::new(&linked)).unwrap();
+            acquired.send(()).unwrap();
+        });
+
+        started.recv().unwrap();
+        assert!(matches!(
+            received.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(main_guard);
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        waiter.join().unwrap();
+
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn picker_paths_remove_windows_verbatim_prefixes() {
         assert_eq!(
             normalize_picker_path(r"\\?\C:\Users\me\a.txt"),
@@ -3490,8 +3569,49 @@ mod tests {
         fs::write(root.join("base.txt"), "changed\n").unwrap();
         fs::write(root.join("untracked.txt"), "new\n").unwrap();
 
-        let paths = tauri::async_runtime::block_on(shipping_changed_paths(path.into())).unwrap();
+        let paths =
+            tauri::async_runtime::block_on(shipping_changed_paths(path.into(), None)).unwrap();
         assert_eq!(paths, ["base.txt", "committed.txt", "untracked.txt"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shipping_paths_use_the_captured_base_commit_after_the_ref_moves() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-shipping-base-race-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q", "-b", "main"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(path, &["add", "base.txt"]);
+        git(path, &["commit", "-qm", "seed"]);
+        git(path, &["checkout", "-qb", "feature"]);
+        let captured = tauri::async_runtime::block_on(shipping_base_revision(path.into())).unwrap();
+        fs::write(root.join("feature.txt"), "feature\n").unwrap();
+        git(path, &["add", "feature.txt"]);
+        git(path, &["commit", "-qm", "feature"]);
+        git(path, &["branch", "-f", "main", "HEAD"]);
+
+        let captured_paths = tauri::async_runtime::block_on(shipping_changed_paths(
+            path.into(),
+            Some(captured.clone()),
+        ))
+        .unwrap();
+        let moved = tauri::async_runtime::block_on(shipping_base_revision(path.into())).unwrap();
+        let current_paths = tauri::async_runtime::block_on(shipping_changed_paths(
+            path.into(),
+            Some(moved.clone()),
+        ))
+        .unwrap();
+
+        assert_ne!(captured, moved);
+        assert_eq!(captured_paths, ["feature.txt"]);
+        assert!(current_paths.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

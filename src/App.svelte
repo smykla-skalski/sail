@@ -48,8 +48,10 @@
     refreshedPullRequest,
     shipGatesSettled,
     shipCleanupRequest,
+    shipEvidenceReadiness,
     shipTaskThreadsSettled,
     reconciledShipGates,
+    recoverValidationEvidence,
     persistShipRefresh,
     settleShipRefresh,
     type GateName,
@@ -2678,8 +2680,22 @@
         workerModel !== issue.workerModel
       )
         await update({ models, modelUncertain, workerModel });
-      currentRevision = await invoke<string>('working_tree_revision', { path });
+      const [revision, currentBaseRevision] = await Promise.all([
+        invoke<string>('working_tree_revision', { path }),
+        invoke<string>('shipping_base_revision', { path }),
+      ]);
+      currentRevision = revision;
       await markValidationRevisionDrift(path, currentRevision);
+      if (issue.validationPolicy && issue.validationPolicy.baseRevision !== currentBaseRevision)
+        await update({
+          validationPolicy: undefined,
+          blockedReason: 'The shipping base changed. Select validation risk again.',
+          events: appendShipEvent(
+            issue.events,
+            'validation policy invalidated',
+            'shipping base changed',
+          ),
+        });
       if (issue.checkpoint) {
         const evidenceManifests = syncEvidenceManifest(
           issue.evidenceManifests ?? [],
@@ -2699,6 +2715,8 @@
       }
     }
     issue.gates = reconciledShipGates(issue, spawnReceipts);
+    const recoveredEvidence = recoverValidationEvidence(issue);
+    if (recoveredEvidence) await update(recoveredEvidence);
     await Promise.all(
       (issue.gates ?? []).map(async (gate) => {
         const receipt = spawnReceipts.find((item) => item.receiptId === gate.id);
@@ -2831,6 +2849,7 @@
         issue.path &&
         shipGatesSettled(issue) &&
         shipTaskThreadsSettled(issue, taskThreadStates, spawnReceipts) &&
+        shipEvidenceReadiness(issue).ready &&
         (issue.validationPolicyRequired === false ||
           requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
       ) {
@@ -2838,6 +2857,7 @@
           await updateShipIssue(run, issue, await settledImplementationAttribution(issue.path));
           if (
             !shipGatesSettled(issue) ||
+            !shipEvidenceReadiness(issue).ready ||
             (issue.validationPolicyRequired !== false &&
               !requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
           )
@@ -3956,19 +3976,28 @@
       const explicitRisk = request.arguments.risk;
       if (!shipRiskLevels.includes(explicitRisk as ShipRisk))
         throw new Error('Choose validation risk low, medium, or high.');
-      const { revision, changedPaths, config } = await readStableShipValidationInputs(
+      const { revision, baseRevision, changedPaths, config } = await readStableShipValidationInputs(
         () => invoke<string>('working_tree_revision', { path: request.directory }),
         () => invoke<string>('working_tree_generation', { path: request.directory }),
-        () => invoke<string[]>('shipping_changed_paths', { path: request.directory }),
+        (selectedBaseRevision) =>
+          invoke<string[]>('shipping_changed_paths', {
+            path: request.directory,
+            baseRevision: selectedBaseRevision,
+          }),
         () => invoke<WorktreeConfig | null>('worktree_config', { worktree: request.directory }),
+        3,
+        () => invoke<string>('shipping_base_revision', { path: request.directory }),
       );
       const policy = selectShipValidationPolicy(
         config?.validation,
         changedPaths,
         explicitRisk as ShipRisk,
         revision,
-        owner.issue.validationPolicy,
+        owner.issue.validationPolicy?.baseRevision === baseRevision
+          ? owner.issue.validationPolicy
+          : undefined,
         Date.now(),
+        baseRevision,
       );
       const checkpointBeforePolicy =
         owner.issue.checkpoint ??
@@ -4008,6 +4037,7 @@
         requiredGates: policy.requiredGates,
         sources: policy.sources,
         revision: policy.revision,
+        baseRevision: policy.baseRevision,
         changedPaths: policy.changedPaths,
       };
     }
@@ -4015,13 +4045,15 @@
       const owner = shipOwner(shipRuns, request.directory, sourceId);
       try {
         if (owner) {
-          const revision = await invoke<string>('working_tree_revision', {
-            path: request.directory,
-          });
+          const [revision, baseRevision] = await Promise.all([
+            invoke<string>('working_tree_revision', { path: request.directory }),
+            invoke<string>('shipping_base_revision', { path: request.directory }),
+          ]);
           assertShipGateAllowed(
             owner.issue.validationPolicy,
             request.arguments.gate as GateName,
             revision,
+            baseRevision,
           );
           await updateShipIssue(owner.run, owner.issue, {
             stage: request.arguments.gate === 'test-adversary' ? 'testing' : 'reviewing',
@@ -4108,6 +4140,7 @@
     outputReference: string | undefined,
     fallbackReference: string,
     expectedRevision: unknown,
+    evidenceIdentity?: { id: string; timestamp: number },
   ): Promise<Pick<ShipIssue, 'evidenceRevision' | 'evidenceManifests'>> {
     if (!owner.issue.path || !owner.issue.checkpoint)
       throw new Error('Gate evidence needs a canonical task checkpoint and worktree.');
@@ -4120,13 +4153,13 @@
       revision,
       owner.issue.checkpoint.acceptanceCriteria,
       {
-        id: crypto.randomUUID(),
+        id: evidenceIdentity?.id ?? crypto.randomUUID(),
         kind: 'gate',
         name: gate,
         provider,
         model,
         result: ['CLEAN', 'PASS'].includes(verdict) ? 'passed' : 'failed',
-        timestamp: Date.now(),
+        timestamp: evidenceIdentity?.timestamp ?? Date.now(),
         outputReference: outputReference ?? fallbackReference,
         criteria: criteria ?? [],
       },
@@ -4178,10 +4211,11 @@
         const owner = shipOwner(shipRuns, request.directory, sourceId);
         if (!owner)
           throw new Error('Only the assigned Ship worker can report inline gate verdicts.');
-        const revision = await invoke<string>('working_tree_revision', {
-          path: request.directory,
-        });
-        assertShipGateAllowed(owner.issue.validationPolicy, report.gate, revision);
+        const [revision, baseRevision] = await Promise.all([
+          invoke<string>('working_tree_revision', { path: request.directory }),
+          invoke<string>('shipping_base_revision', { path: request.directory }),
+        ]);
+        assertShipGateAllowed(owner.issue.validationPolicy, report.gate, revision, baseRevision);
         validateGateVerdict(report.gate, report.verdict);
         const now = Date.now();
         const model = resolvedWorkerModel(owner.issue) ?? null;
@@ -4196,6 +4230,11 @@
           `thread:${sourceId}`,
           report.revision,
         );
+        if (
+          (await invoke<string>('shipping_base_revision', { path: request.directory })) !==
+          baseRevision
+        )
+          throw new Error('The shipping base changed during validation. Rerun the gate.');
         requireEvidenceBaseRevision(
           evidenceChanges.evidenceRevision!,
           owner.issue.evidenceRevision,
@@ -4241,18 +4280,31 @@
         throw new Error('The worktree changed during validation. Rerun the gate.');
       const owner = shipOwner(shipRuns, receipt.sourceDirectory, receipt.sourceId);
       if (owner) {
-        const revision = await invoke<string>('working_tree_revision', {
-          path: receipt.sourceDirectory,
-        });
-        assertShipGateAllowed(owner.issue.validationPolicy, validation.gate, revision);
+        const [revision, baseRevision] = await Promise.all([
+          invoke<string>('working_tree_revision', { path: receipt.sourceDirectory }),
+          invoke<string>('shipping_base_revision', { path: receipt.sourceDirectory }),
+        ]);
+        assertShipGateAllowed(
+          owner.issue.validationPolicy,
+          validation.gate,
+          revision,
+          baseRevision,
+        );
       }
       validateGateVerdict(validation.gate, report.verdict);
+      const evidenceTimestamp = Date.now();
+      const evidenceCriteria = report.criteria ?? [];
+      const evidenceOutputReference =
+        report.outputReference ?? `thread:${receipt.targetId ?? receipt.receiptId}`;
       await commitRevisionBoundValidation({
         expectedRevision: validation.revision,
         expectedMutationGeneration: validation.mutationGeneration,
+        expectedBaseRevision: owner?.issue.validationPolicy?.baseRevision,
         readRevision: () => invoke<string>('working_tree_revision', { path: request.directory }),
         readMutationGeneration: () =>
           invoke<string>('working_tree_generation', { path: request.directory }),
+        readBaseRevision: () =>
+          invoke<string>('shipping_base_revision', { path: request.directory }),
         prepare: async () => {
           const evidenceChanges = owner
             ? await recordGateEvidence(
@@ -4265,6 +4317,7 @@
                 report.outputReference,
                 `thread:${receipt.targetId ?? receipt.receiptId}`,
                 validation.revision,
+                { id: `gate:${receipt.receiptId}`, timestamp: evidenceTimestamp },
               )
             : {};
           if (owner)
@@ -4273,7 +4326,14 @@
         },
         commit: async (evidenceChanges) => {
           updateSpawnReceipt(receipt.receiptId, {
-            validation: { ...validation, verdict: report.verdict, reason: report.reason },
+            validation: {
+              ...validation,
+              verdict: report.verdict,
+              reason: report.reason,
+              evidenceCriteria,
+              evidenceOutputReference,
+              evidenceTimestamp,
+            },
           });
           await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
           if (owner) {

@@ -7,6 +7,7 @@ import { taskCheckpointSchema } from './task-checkpoint.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
+  recordTaskEvidence,
   type EvidenceReadiness,
   type TaskEvidence,
 } from './task-evidence.ts';
@@ -54,6 +55,9 @@ export type GateMetadata = {
   revisionDrifted?: boolean;
   verdict?: GateVerdict;
   reason?: string;
+  evidenceCriteria?: string[];
+  evidenceOutputReference?: string;
+  evidenceTimestamp?: number;
 };
 
 export function nextGateSequence(gates: Pick<ShipGate, 'sequence'>[]): number {
@@ -108,6 +112,9 @@ export const gateMetadataSchema = z.object({
   revisionDrifted: z.boolean().optional(),
   verdict: z.enum(verdicts).optional(),
   reason: z.string().optional(),
+  evidenceCriteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
+  evidenceOutputReference: z.string().min(1).max(2000).optional(),
+  evidenceTimestamp: z.number().int().nonnegative().optional(),
 });
 
 const reportSchema = z.union([
@@ -168,15 +175,19 @@ export function validationRevisionDrifted(
 export async function commitRevisionBoundValidation<T>({
   expectedRevision,
   expectedMutationGeneration,
+  expectedBaseRevision,
   readRevision,
   readMutationGeneration,
+  readBaseRevision,
   prepare,
   commit,
 }: {
   expectedRevision: string | undefined;
   expectedMutationGeneration: string | undefined;
+  expectedBaseRevision?: string;
   readRevision: () => Promise<string>;
   readMutationGeneration: () => Promise<string>;
+  readBaseRevision?: () => Promise<string>;
   prepare: () => Promise<T>;
   commit: (prepared: T) => Promise<void>;
 }): Promise<void> {
@@ -190,6 +201,8 @@ export async function commitRevisionBoundValidation<T>({
       (await readMutationGeneration()) !== expectedMutationGeneration
     )
       throw new Error('The worktree was modified during validation. Rerun the gate.');
+    if (expectedBaseRevision !== undefined && (await readBaseRevision?.()) !== expectedBaseRevision)
+      throw new Error('The shipping base changed during validation. Rerun the gate.');
   };
   await verifyBoundary();
   const prepared = await prepare();
@@ -269,6 +282,8 @@ export function shipCleanupRequest(
   currentRevision: string | undefined,
 ) {
   if (!issue.path) throw new Error('Ship cleanup requires a worktree.');
+  if (!shipEvidenceReadiness(issue).ready)
+    throw new Error('Ship cleanup requires complete revision-bound evidence.');
   const expectedRevision =
     issue.validationPolicy?.revision ?? issue.checkpoint?.revision ?? currentRevision;
   if (!expectedRevision) throw new Error('Ship cleanup requires a verified worktree revision.');
@@ -343,6 +358,46 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     ready: false,
     reason: readiness.reason ?? `Revision-bound CI evidence missing: ${missingChecks.join(', ')}.`,
   };
+}
+
+export function recoverValidationEvidence(
+  issue: ShipIssue,
+): Pick<ShipIssue, 'evidenceRevision' | 'evidenceManifests'> | null {
+  const checkpoint = issue.checkpoint;
+  if (!checkpoint?.revision) return null;
+  const revision = checkpoint.revision;
+  let manifests = issue.evidenceManifests ?? [];
+  let recovered = false;
+  for (const gate of issue.gates ?? []) {
+    if (
+      gate.revision !== revision ||
+      !gate.verdict ||
+      gate.evidenceTimestamp === undefined ||
+      !gate.evidenceOutputReference
+    )
+      continue;
+    const evidenceId = `gate:${gate.id}`;
+    if (manifests.some((manifest) => manifest.evidence.some((entry) => entry.id === evidenceId)))
+      continue;
+    const criteria = (gate.evidenceCriteria ?? []).filter((criterion) =>
+      checkpoint.acceptanceCriteria.includes(criterion),
+    );
+    const next = recordTaskEvidence(manifests, revision, checkpoint.acceptanceCriteria, {
+      id: evidenceId,
+      kind: 'gate',
+      name: gate.gate,
+      provider: gate.provider,
+      model: gate.model,
+      result: ['CLEAN', 'PASS'].includes(gate.verdict) ? 'passed' : 'failed',
+      timestamp: gate.evidenceTimestamp,
+      outputReference: gate.evidenceOutputReference,
+      criteria,
+    });
+    if (JSON.stringify(next) !== JSON.stringify(manifests)) recovered = true;
+    manifests = next;
+  }
+  if (!recovered && issue.evidenceRevision === revision) return null;
+  return { evidenceRevision: revision, evidenceManifests: manifests };
 }
 
 export function shipMergeClaim(issue: ShipIssue): string {
@@ -782,6 +837,7 @@ const shipIssueSchema = z.object({
       requiredGates: z.array(z.enum(gateNames)),
       sources: z.array(z.string().min(1)).min(1),
       revision: z.string().min(1),
+      baseRevision: z.string().min(1).optional(),
       changedPaths: z.array(z.string()),
       selectedAt: z.number().int().nonnegative(),
       history: z.array(

@@ -195,6 +195,33 @@ void test('validation inputs reject revision ABA when mutation generation change
   assert.deepEqual(result.changedPaths, ['current.ts']);
 });
 
+void test('validation inputs retry when the shipping base moves', async () => {
+  const revisions = ['revision-a', 'revision-a', 'revision-a', 'revision-a'];
+  const generations = ['generation-a', 'generation-a', 'generation-a', 'generation-a'];
+  const bases = ['base-a', 'base-b', 'base-b', 'base-b'];
+  const observedBases: (string | undefined)[] = [];
+
+  const result = await readStableShipValidationInputs(
+    async () => revisions.shift()!,
+    async () => generations.shift()!,
+    async (baseRevision) => {
+      observedBases.push(baseRevision);
+      return [`changed-from-${baseRevision}.ts`];
+    },
+    async () => ({ source: 'repository' }),
+    3,
+    async () => bases.shift()!,
+  );
+
+  assert.deepEqual(observedBases, ['base-a', 'base-b']);
+  assert.deepEqual(result, {
+    revision: 'revision-a',
+    baseRevision: 'base-b',
+    changedPaths: ['changed-from-base-b.ts'],
+    config: { source: 'repository' },
+  });
+});
+
 void test('validation selection fails when the worktree never stabilizes', async () => {
   let revision = 0;
 
@@ -211,8 +238,18 @@ void test('validation selection fails when the worktree never stabilizes', async
 });
 
 void test('gate enforcement rejects missing, stale, and non-required policy', () => {
-  const policy = selectShipValidationPolicy(config, [], 'low', 'revision-a', undefined, 10);
-  assert.doesNotThrow(() => assertShipGateAllowed(policy, 'test-adversary', 'revision-a'));
+  const policy = selectShipValidationPolicy(
+    config,
+    [],
+    'low',
+    'revision-a',
+    undefined,
+    10,
+    'base-a',
+  );
+  assert.doesNotThrow(() =>
+    assertShipGateAllowed(policy, 'test-adversary', 'revision-a', 'base-a'),
+  );
   assert.throws(
     () => assertShipGateAllowed(undefined, 'test-adversary', 'revision-a'),
     /Select validation risk/,
@@ -224,6 +261,10 @@ void test('gate enforcement rejects missing, stale, and non-required policy', ()
   assert.throws(
     () => assertShipGateAllowed(policy, 'code-adversary', 'revision-a'),
     /not required/,
+  );
+  assert.throws(
+    () => assertShipGateAllowed(policy, 'test-adversary', 'revision-a', 'base-b'),
+    /shipping base changed/,
   );
 });
 

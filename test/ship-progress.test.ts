@@ -13,6 +13,7 @@ import {
   shipTaskThreadsSettled,
   shipActivity,
   reconciledShipGates,
+  recoverValidationEvidence,
   refreshedPullRequest,
   persistShipRefresh,
   gateSnapshot,
@@ -65,20 +66,24 @@ void test('reopened queued issues recover across restart without retrying worker
 
 void test('validation drift leaves verdict and evidence uncommitted', async () => {
   await Promise.all(
-    (['revision', 'generation'] as const).map(async (drift) => {
+    (['revision', 'generation', 'base'] as const).map(async (drift) => {
       let revision = 'revision-one';
       let generation = 'generation-one';
+      let baseRevision = 'base-one';
       const durable = { verdict: undefined as string | undefined, evidence: [] as string[] };
 
       await assert.rejects(
         commitRevisionBoundValidation({
           expectedRevision: 'revision-one',
           expectedMutationGeneration: 'generation-one',
+          expectedBaseRevision: 'base-one',
           readRevision: async () => revision,
           readMutationGeneration: async () => generation,
+          readBaseRevision: async () => baseRevision,
           prepare: async () => {
             if (drift === 'revision') revision = 'revision-two';
-            else generation = 'generation-two';
+            else if (drift === 'generation') generation = 'generation-two';
+            else baseRevision = 'base-two';
             return { verdict: 'PASS', evidence: ['gate passed'] };
           },
           commit: async (prepared) => {
@@ -86,7 +91,7 @@ void test('validation drift leaves verdict and evidence uncommitted', async () =
             durable.evidence = prepared.evidence;
           },
         }),
-        /worktree (changed|was modified) during validation/,
+        /(worktree (changed|was modified)|shipping base changed) during validation/,
       );
       assert.deepEqual(durable, { verdict: undefined, evidence: [] });
     }),
@@ -283,27 +288,71 @@ void test('legacy persisted work cannot opt out of validation by omitting the po
 });
 
 void test('Ship cleanup binds deletion to the selected validation revision', () => {
-  const issue = fixture().issues[0];
+  const issue = withMergeEvidence(fixture().issues[0]);
   issue.path = '/worktree';
   issue.branch = 'validated-branch';
-  issue.validationPolicy = {
-    risk: 'low',
-    requiredGates: ['test-adversary'],
-    sources: ['test'],
-    revision: 'validated-revision',
-    changedPaths: [],
-    selectedAt: 1,
-    history: [],
-  };
 
   assert.deepEqual(shipCleanupRequest('a/b', issue, 'newer-unchecked-revision'), {
     repository: 'a/b',
     worktree: '/worktree',
     force: false,
     archiveIgnored: true,
-    expectedRevision: 'validated-revision',
+    expectedRevision: 'revision-one',
     expectedBranch: 'validated-branch',
   });
+});
+
+void test('Ship cleanup rejects a merged task before evidence recovery', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/worktree';
+  issue.branch = 'validated-branch';
+
+  assert.throws(
+    () => shipCleanupRequest('a/b', issue, 'revision-one'),
+    /complete revision-bound evidence/,
+  );
+});
+
+void test('durable gate receipts recover manifest evidence after restart', () => {
+  const issue = fixture().issues[0];
+  issue.checkpoint!.revision = 'revision-one';
+  issue.checkpoint!.requiredGates = ['test-adversary'];
+  issue.validationPolicy = {
+    risk: 'low',
+    requiredGates: ['test-adversary'],
+    sources: ['test'],
+    revision: 'revision-one',
+    changedPaths: [],
+    selectedAt: 1,
+    history: [],
+  };
+  issue.gates = [
+    {
+      id: 'durable-receipt',
+      gate: 'test-adversary',
+      requestedModel: 'test',
+      provider: 'codex',
+      model: 'test',
+      threadId: 'validator',
+      directory: '/worktree',
+      state: 'completed',
+      created: 10,
+      updated: 11,
+      error: null,
+      verdict: 'PASS',
+      revision: 'revision-one',
+      evidenceCriteria: issue.checkpoint!.acceptanceCriteria,
+      evidenceOutputReference: 'thread:validator',
+      evidenceTimestamp: 11,
+    },
+  ];
+
+  const recovered = recoverValidationEvidence(issue);
+  assert.ok(recovered);
+  Object.assign(issue, recovered);
+  assert.equal(issue.evidenceManifests?.[0]?.evidence[0]?.id, 'gate:durable-receipt');
+  assert.equal(shipEvidenceReadiness(issue).ready, true);
+  assert.equal(recoverValidationEvidence(issue), null);
 });
 
 void test('persists canonical task checkpoints with Ship runs', () => {

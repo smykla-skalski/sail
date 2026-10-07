@@ -61,6 +61,7 @@ export type ShipValidationPolicy = {
   requiredGates: GateName[];
   sources: string[];
   revision: string;
+  baseRevision?: string;
   changedPaths: string[];
   selectedAt: number;
   history: ShipRiskSelection[];
@@ -71,6 +72,7 @@ export const shipValidationPolicySchema = z.object({
   requiredGates: z.array(gateSchema),
   sources: z.array(z.string().min(1)).min(1),
   revision: z.string().min(1),
+  baseRevision: z.string().min(1).optional(),
   changedPaths: z.array(z.string()),
   selectedAt: z.number().int().nonnegative(),
   history: z.array(
@@ -129,6 +131,7 @@ export function selectShipValidationPolicy(
   revision: string,
   previous: ShipValidationPolicy | undefined,
   now: number,
+  baseRevision?: string,
 ): ShipValidationPolicy {
   const configured = configValue !== undefined && configValue !== null;
   const config = configured
@@ -166,6 +169,7 @@ export function selectShipValidationPolicy(
     requiredGates,
     sources,
     revision,
+    ...(baseRevision ? { baseRevision } : {}),
     changedPaths: paths.slice(0, 500),
     selectedAt: now,
     history: [...(previous?.history ?? []), selection].slice(-50),
@@ -182,20 +186,30 @@ export function requiredShipGatesSatisfied(
 export async function readStableShipValidationInputs<T>(
   readRevision: () => Promise<string>,
   readMutationGeneration: () => Promise<string>,
-  readChangedPaths: () => Promise<string[]>,
+  readChangedPaths: (baseRevision?: string) => Promise<string[]>,
   readConfig: () => Promise<T>,
   maxAttempts = 3,
-): Promise<{ revision: string; changedPaths: string[]; config: T }> {
+  readBaseRevision?: () => Promise<string>,
+): Promise<{ revision: string; baseRevision?: string; changedPaths: string[]; config: T }> {
   async function readAttempt(
     attemptsRemaining: number,
-  ): Promise<{ revision: string; changedPaths: string[]; config: T }> {
+  ): Promise<{ revision: string; baseRevision?: string; changedPaths: string[]; config: T }> {
     const mutationGeneration = await readMutationGeneration();
     const revision = await readRevision();
-    const [changedPaths, config] = await Promise.all([readChangedPaths(), readConfig()]);
+    const baseRevision = await readBaseRevision?.();
+    const [changedPaths, config] = await Promise.all([
+      readChangedPaths(baseRevision),
+      readConfig(),
+    ]);
     const currentRevision = await readRevision();
     const currentGeneration = await readMutationGeneration();
-    if (currentRevision === revision && currentGeneration === mutationGeneration)
-      return { revision, changedPaths, config };
+    const currentBaseRevision = await readBaseRevision?.();
+    if (
+      currentRevision === revision &&
+      currentGeneration === mutationGeneration &&
+      currentBaseRevision === baseRevision
+    )
+      return { revision, ...(baseRevision ? { baseRevision } : {}), changedPaths, config };
     if (attemptsRemaining > 1) return readAttempt(attemptsRemaining - 1);
     throw new Error(
       'The worktree kept changing while selecting validation risk. Retry when stable.',
@@ -208,10 +222,13 @@ export function assertShipGateAllowed(
   policy: ShipValidationPolicy | undefined,
   gate: GateName,
   revision: string,
+  baseRevision?: string,
 ): void {
   if (!policy) throw new Error('Select validation risk before starting a gate.');
   if (policy.revision !== revision)
     throw new Error('The worktree changed after risk selection. Select risk again.');
+  if (baseRevision !== undefined && policy.baseRevision !== baseRevision)
+    throw new Error('The shipping base changed after risk selection. Select risk again.');
   if (!policy.requiredGates.includes(gate))
     throw new Error('This gate is not required by the selected validation policy.');
 }
