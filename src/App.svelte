@@ -229,6 +229,7 @@
     inboxLocations,
     inboxPermissionDecisionTitle,
     inboxPermissionProfile,
+    inboxRejectedPermissionPolicy,
     inboxTurnMessageIndex,
     isInboxOutcome,
     loadInboxOutcomes,
@@ -6864,26 +6865,33 @@
       const permissionCounts = new SvelteMap<string, number>();
       for (const request of permissions)
         permissionCounts.set(request.sessionID, (permissionCounts.get(request.sessionID) ?? 0) + 1);
+      const permissionPolicies = Object.fromEntries(
+        permissions.map((request) => {
+          return [
+            request.id,
+            automaticPermissionPolicy({
+              profile: capabilityProfileForSession(
+                sessionDetails.get(request.sessionID),
+                location.directory,
+              ),
+              workspace: location.directory,
+              title: request.action,
+              toolCall: openCodePermissionToolCall(request),
+              options: [
+                { optionId: 'once', kind: 'allow_once' },
+                { optionId: 'reject', kind: 'reject_once' },
+              ],
+              resourceTrust: resourceTrust.get(request.id),
+            }),
+          ] as const;
+        }),
+      );
       for (const request of permissions) {
         openCodePermissionRejections.observe(request);
         const key = `opencode:permission:${request.id}`;
         const title =
           request.message?.trim() || `Allow ${request.action} on ${request.resources.join(', ')}?`;
-        const toolCall = openCodePermissionToolCall(request);
-        const policy = automaticPermissionPolicy({
-          profile: capabilityProfileForSession(
-            sessionDetails.get(request.sessionID),
-            location.directory,
-          ),
-          workspace: location.directory,
-          title: request.action,
-          toolCall,
-          options: [
-            { optionId: 'once', kind: 'allow_once' },
-            { optionId: 'reject', kind: 'reject_once' },
-          ],
-          resourceTrust: resourceTrust.get(request.id),
-        });
+        const policy = permissionPolicies[request.id];
         const decisionTitle = permissionDecisionTitle(title, policy);
         items.push({
           ...location,
@@ -6895,6 +6903,7 @@
           text: decisionTitle,
           allow: policy.recommendation !== 'deny',
           policy,
+          permissionPolicies,
           permissionTitle: title,
           receivedAt: openCodeRequestTime(request.id) ?? inboxTime(key),
         });
@@ -6939,16 +6948,21 @@
                       decision: 'reject',
                     }),
                   record: (settledRequest) => {
-                    const settledPolicy = permissionPolicy({
-                      profile: policy.profile,
-                      workspace: location.directory,
-                      title: settledRequest.action,
-                      toolCall: openCodePermissionToolCall(settledRequest),
-                      options: [
-                        { optionId: 'once', kind: 'allow_once' },
-                        { optionId: 'reject', kind: 'reject_once' },
-                      ],
-                    });
+                    const settledPolicy = inboxRejectedPermissionPolicy(
+                      { permissionPolicies },
+                      settledRequest.id,
+                      () =>
+                        permissionPolicy({
+                          profile: policy.profile,
+                          workspace: location.directory,
+                          title: settledRequest.action,
+                          toolCall: openCodePermissionToolCall(settledRequest),
+                          options: [
+                            { optionId: 'once', kind: 'allow_once' },
+                            { optionId: 'reject', kind: 'reject_once' },
+                          ],
+                        }),
+                    );
                     recordDecisionActivity(
                       {
                         agent: 'opencode',
@@ -8775,16 +8789,18 @@
                 decision: 'reject',
               }),
             record: (settledRequest) => {
-              const policy = permissionPolicy({
-                profile,
-                workspace: item.directory,
-                title: settledRequest.action,
-                toolCall: openCodePermissionToolCall(settledRequest),
-                options: [
-                  { optionId: 'once', kind: 'allow_once' },
-                  { optionId: 'reject', kind: 'reject_once' },
-                ],
-              });
+              const policy = inboxRejectedPermissionPolicy(item, settledRequest.id, () =>
+                permissionPolicy({
+                  profile,
+                  workspace: item.directory,
+                  title: settledRequest.action,
+                  toolCall: openCodePermissionToolCall(settledRequest),
+                  options: [
+                    { optionId: 'once', kind: 'allow_once' },
+                    { optionId: 'reject', kind: 'reject_once' },
+                  ],
+                }),
+              );
               recordDecisionActivity(
                 {
                   agent: 'opencode',

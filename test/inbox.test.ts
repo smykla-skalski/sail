@@ -4,6 +4,7 @@ import {
   failedCheckOutcome,
   inboxPermissionDecisionTitle,
   inboxPermissionProfile,
+  inboxRejectedPermissionPolicy,
   inboxLocations,
   inboxTurnMessageIndex,
   loadInboxOutcomes,
@@ -155,6 +156,38 @@ void test('permission settlements retain the session profile stored by the inbox
   };
 
   assert.equal(inboxPermissionProfile(permission, 'build'), 'explore');
+});
+
+void test('inbox rejections retain the displayed canonical resource policy', () => {
+  const displayedPolicy = {
+    profile: 'explore' as const,
+    risk: 'low' as const,
+    recommendation: 'interactive' as const,
+    reason: 'Path-based reads require approval because the provider opens the path later.',
+    policyRevision: '2026-10-07.1',
+  };
+  const permission: InboxItem = {
+    ...item('selected', 123),
+    kind: 'opencode-permission',
+    policy: displayedPolicy,
+    permissionPolicies: {
+      selected: displayedPolicy,
+      collateral: { ...displayedPolicy, profile: 'review' },
+    },
+  };
+  let fallbacks = 0;
+  const fallback = () => {
+    fallbacks++;
+    return { ...displayedPolicy, risk: 'unknown' as const };
+  };
+
+  assert.equal(inboxRejectedPermissionPolicy(permission, 'selected', fallback), displayedPolicy);
+  assert.equal(
+    inboxRejectedPermissionPolicy(permission, 'collateral', fallback),
+    permission.permissionPolicies?.collateral,
+  );
+  assert.equal(inboxRejectedPermissionPolicy(permission, 'unseen', fallback).risk, 'unknown');
+  assert.equal(fallbacks, 1);
 });
 
 void test('rejected inbox permissions record the actual outcome', () => {

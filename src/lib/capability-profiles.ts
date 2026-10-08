@@ -516,7 +516,10 @@ export async function holdCapabilityProfileReservation<T>(
 }
 
 export class CapabilityProfileReservationCoordinator {
-  readonly #active = new Map<string, { profile: CapabilityProfile; count: number }>();
+  readonly #active = new Map<
+    string,
+    { profile: CapabilityProfile; count: number; configured: Promise<void> }
+  >();
 
   async reserve(
     path: string,
@@ -528,7 +531,8 @@ export class CapabilityProfileReservationCoordinator {
       throw new Error(
         `Wait for the pending ${reserved.profile} OpenCode launch before switching to the ${profile} capability profile.`,
       );
-    this.#active.set(path, { profile, count: (reserved?.count ?? 0) + 1 });
+    const configured = reserved?.configured ?? Promise.resolve().then(configure);
+    this.#active.set(path, { profile, count: (reserved?.count ?? 0) + 1, configured });
     let released = false;
     const release = () => {
       if (released) return;
@@ -539,7 +543,7 @@ export class CapabilityProfileReservationCoordinator {
       else this.#active.set(path, { ...current, count: current.count - 1 });
     };
     try {
-      await configure();
+      await configured;
       return release;
     } catch (cause) {
       release();

@@ -25,6 +25,7 @@ export type InboxItem = InboxLocation & {
   options?: { optionId: string; name: string; kind: string }[];
   allow?: boolean;
   policy?: PermissionPolicyDecision;
+  permissionPolicies?: Record<string, PermissionPolicyDecision>;
   permissionTitle?: string;
   generation?: string | number;
   fingerprint?: string;
@@ -67,6 +68,18 @@ export function inboxPermissionProfile(
   fallback: CapabilityProfile,
 ): CapabilityProfile {
   return item.policy?.profile ?? fallback;
+}
+
+export function inboxRejectedPermissionPolicy(
+  item: Pick<InboxItem, 'permissionPolicies' | 'policy' | 'requestId'>,
+  requestId: string,
+  fallback: () => PermissionPolicyDecision,
+): PermissionPolicyDecision {
+  return (
+    item.permissionPolicies?.[requestId] ??
+    (String(item.requestId) === requestId ? item.policy : undefined) ??
+    fallback()
+  );
 }
 
 export function failedCheckOutcome(check: InboxCheck): InboxOutcome | null {

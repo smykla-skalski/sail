@@ -689,6 +689,35 @@ await test('directory profile switches cannot replace a reserved side chat profi
   releaseBuild();
 });
 
+await test('same-profile reservations share one pending configuration', async () => {
+  const reservations = new CapabilityProfileReservationCoordinator();
+  const configured = Promise.withResolvers<void>();
+  let configurations = 0;
+  const configure = async () => {
+    configurations++;
+    await configured.promise;
+  };
+
+  const first = reservations.reserve('/workspace', 'build', configure);
+  await Promise.resolve();
+  const second = reservations.reserve('/workspace', 'build', configure);
+  let secondSettled = false;
+  void second.then(() => {
+    secondSettled = true;
+    return undefined;
+  });
+  await Promise.resolve();
+
+  assert.equal(configurations, 1);
+  assert.equal(secondSettled, false);
+  configured.resolve();
+  const [releaseFirst, releaseSecond] = await Promise.all([first, second]);
+  assert.equal(configurations, 1);
+  assert.equal(secondSettled, true);
+  releaseFirst();
+  releaseSecond();
+});
+
 await test('keeps unknown and high-risk actions interactive', () => {
   for (const [title, toolCall] of [
     ['Do thing', { name: 'provider-specific-action' }],
