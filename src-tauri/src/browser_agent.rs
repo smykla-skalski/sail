@@ -1249,8 +1249,8 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "task_evidence_record",
-        "Record a bounded command result against its execution boundary and map it to zero or more acceptance criteria. Read the checkpoint before the command and pass its execution revision, mutation generation, and base revision.",
-        "command,result,criteria,outputReference,expectedRevision,expectedMutationGeneration,expectedBaseRevision",
+        "Record a bounded command result and privacy-safe economics counters against its execution boundary. Read the checkpoint before the command and pass its execution revision, mutation generation, and base revision.",
+        "command,result,criteria,outputReference,expectedRevision,expectedMutationGeneration,expectedBaseRevision,economics",
     ),
     (
         "agent_status",
@@ -1340,6 +1340,43 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+fn economics_input_schema() -> Value {
+    let counter = || json!({"type":"integer","minimum":0,"maximum":9007199254740991_u64});
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "role":{"type":"string","enum":["primary","subagent","validator","guardian","synthetic","probe"]},
+            "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","review","test","ci","pr","complete"]},
+            "turns":counter(),
+            "toolCalls":counter(),
+            "permissionRequests":counter(),
+            "compactions":counter(),
+            "tokens":{
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{
+                    "input":counter(),
+                    "output":counter(),
+                    "reasoning":counter(),
+                    "cacheRead":counter(),
+                    "cacheWrite":counter()
+                },
+                "required":["input","output","reasoning","cacheRead","cacheWrite"]
+            },
+            "elapsedMs":counter(),
+            "retries":counter(),
+            "findings":counter(),
+            "checks":counter(),
+            "humanInterventions":counter(),
+            "failedCommands":counter(),
+            "approvalLatencyMs":counter(),
+            "repeatedWork":counter()
+        },
+        "required":["role","phase","turns","toolCalls","permissionRequests","compactions","tokens","elapsedMs","retries","findings","checks","humanInterventions","failedCommands","approvalLatencyMs","repeatedWork"]
+    })
+}
+
 pub fn run_mcp_stdio() {
     let input = std::io::stdin();
     let mut output = std::io::stdout().lock();
@@ -1409,8 +1446,9 @@ pub fn run_mcp_stdio() {
                             "reason":{"type":"string","maxLength":2000},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
                             "outputReference":{"type":"string","minLength":1,"maxLength":2000},
-                            "revision":{"type":"string","minLength":1}
-                        },"oneOf":[{"required":["stage","status"]},{"required":["verdict"]}]
+                            "revision":{"type":"string","minLength":1},
+                            "economics":economics_input_schema()
+                        },"oneOf":[{"required":["stage","status"]},{"required":["verdict","economics"]}]
                     }});
                 }
                 if *name == "task_checkpoint_update" {
@@ -1442,11 +1480,12 @@ pub fn run_mcp_stdio() {
                             "command":{"type":"string","minLength":1,"maxLength":1000},
                             "result":{"type":"string","enum":["passed","failed","pending","blocked"]},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
-                            "outputReference":{"type":"string","minLength":1,"maxLength":2000}
-                            ,"expectedRevision":{"type":"string","minLength":1}
-                            ,"expectedMutationGeneration":{"type":"string","minLength":1}
-                            ,"expectedBaseRevision":{"type":"string","minLength":1}
-                        },"required":["command","result","criteria","outputReference","expectedRevision","expectedMutationGeneration","expectedBaseRevision"]
+                            "outputReference":{"type":"string","minLength":1,"maxLength":2000},
+                            "expectedRevision":{"type":"string","minLength":1},
+                            "expectedMutationGeneration":{"type":"string","minLength":1},
+                            "expectedBaseRevision":{"type":"string","minLength":1},
+                            "economics":economics_input_schema()
+                        },"required":["command","result","criteria","outputReference","expectedRevision","expectedMutationGeneration","expectedBaseRevision","economics"]
                     }});
                 }
                 if *name == "agent_wait" {
@@ -1586,7 +1625,7 @@ mod skill_tests {
                 .find(|(name, _, _)| *name == "task_evidence_record")
                 .unwrap()
                 .2,
-            "command,result,criteria,outputReference,expectedRevision,expectedMutationGeneration,expectedBaseRevision"
+            "command,result,criteria,outputReference,expectedRevision,expectedMutationGeneration,expectedBaseRevision,economics"
         );
         assert!(TOOLS
             .iter()
