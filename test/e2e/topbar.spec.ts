@@ -71,6 +71,20 @@ describe('workspace topbar', () => {
 
     const more = await openTopbarMenu('More actions');
     const actions = await more.getText();
+    const placement = await browser.execute(() => {
+      const trigger = document
+        .querySelector('.topbar button[aria-label="More actions"]')!
+        .getBoundingClientRect();
+      const popup = document
+        .querySelector('[role="menu"][aria-label="More actions"]')!
+        .getBoundingClientRect();
+      return { trigger: trigger.toJSON(), popup: popup.toJSON(), width: innerWidth };
+    });
+    expect(Math.abs(placement.popup.right - placement.trigger.right)).toBeLessThanOrEqual(1);
+    expect(placement.popup.top).toBeGreaterThanOrEqual(placement.trigger.bottom);
+    expect(placement.popup.top - placement.trigger.bottom).toBeLessThanOrEqual(6);
+    expect(placement.popup.left).toBeGreaterThanOrEqual(8);
+    expect(placement.popup.right).toBeLessThanOrEqual(placement.width - 8);
     for (const label of ['Task overview', 'Switch thread', 'Commands', 'Agent browser'])
       expect(actions).toContain(label);
     const browserAccess = more.$('[role="menuitemcheckbox"]');
@@ -100,5 +114,15 @@ describe('workspace topbar', () => {
     await expect(more).not.toBeDisplayed();
     await browser.keys('Escape');
     await expect(launches).not.toBeDisplayed();
+
+    await openTopbarMenu('More actions');
+    await browser.keys('Tab');
+    await expect(more).not.toBeDisplayed();
+    expect(
+      await browser.execute(() => {
+        const active = document.activeElement;
+        return !!active && active !== document.body && !active.closest('[role="menu"]');
+      }),
+    ).toBe(true);
   });
 });

@@ -309,6 +309,18 @@ function label(value: Color): string {
     : `${value.mix} ${value.percent}% over ${label(value.over)}`;
 }
 
+void test('both token files define a dark theme that differs from light', () => {
+  for (const [file, blocks] of [
+    [suiStyles, sui],
+    ['src/style.css', shell],
+  ] as const) {
+    assert.ok(Object.keys(blocks.light).length > 0, `${file} has no light tokens`);
+    assert.ok(Object.keys(blocks.dark).length > 0, `${file} has no dark tokens`);
+  }
+  for (const token of ['--sui-canvas', '--sui-foreground', '--sui-surface'])
+    assert.notDeepEqual(resolve(themes.dark, token), resolve(themes.light, token), token);
+});
+
 for (const name of ['light', 'dark'] as const) {
   void test(`${name} token pairs meet WCAG 2.2 AA contrast`, () => {
     const theme = themes[name];

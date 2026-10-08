@@ -78,8 +78,10 @@ describe('ACP agent threads', () => {
       });
       throw cause;
     }
-    await expect($('.agent-picker-controls')).toHaveText(expect.stringContaining('Model'));
-    await expect($('.agent-picker-controls')).toHaveText(expect.stringContaining('Effort'));
+    await expect($('.agent-picker-controls .option-trigger[aria-label^="Model:"]')).toBeDisplayed();
+    await expect(
+      $('.agent-picker-controls .option-trigger[aria-label^="Effort:"]'),
+    ).toBeDisplayed();
     await $('.agent-composer textarea').setValue('/');
     await expect($('.skill-menu')).toHaveText(
       expect.stringContaining('Implement and ship a GitHub issue'),

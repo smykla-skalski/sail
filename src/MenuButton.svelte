@@ -38,13 +38,19 @@
 
   async function show(focus: 'first' | 'last' = 'first') {
     open = true;
+    x = 0;
+    y = 0;
     await tick();
+    // A container query ancestor becomes the containing block of this fixed popup.
+    const origin = menuElement.getBoundingClientRect();
     const bounds = triggerElement.getBoundingClientRect();
     const width = menuElement.offsetWidth;
     const height = menuElement.offsetHeight;
-    x = Math.max(8, Math.min(bounds.right - width, innerWidth - width - 8));
-    y = bounds.bottom + 4 + height <= innerHeight - 8 ? bounds.bottom + 4 : bounds.top - height - 4;
-    y = Math.max(8, y);
+    const left = Math.max(8, Math.min(bounds.right - width, innerWidth - width - 8));
+    const top =
+      bounds.bottom + 4 + height <= innerHeight - 8 ? bounds.bottom + 4 : bounds.top - height - 4;
+    x = left - origin.left;
+    y = Math.max(8, top) - origin.top;
     const list = items();
     const target = focus === 'first' ? list[0] : list.at(-1);
     (target ?? menuElement).focus({ preventScroll: true });
@@ -83,7 +89,7 @@
       event.preventDefault();
       event.stopPropagation();
       hide(true);
-    } else if (event.key === 'Tab') hide();
+    } else if (event.key === 'Tab') hide(true);
     else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
       event.preventDefault();
       moveFocus(event.key);
