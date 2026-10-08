@@ -6,11 +6,11 @@ OpenCode v2.0.24 is a separate prerequisite; it is not bundled. Install the test
 
 There is no automatic updater. To update, download the next package for your platform and install it over the previous version after quitting the app. Verify the new manifest and run the first-project checks again.
 
-## Text size, reading width and theme
+## Text size, chat width and theme
 
 - **Theme default changed.** Settings > General > Appearance now offers System, Light and Dark. System follows the operating system appearance and switches live when it changes. New profiles start on System; a stored Light or Dark choice is kept.
 - No interface text is smaller than 12 px. Sidebar thread titles are 13 px in the foreground color, and status badges, labels, timestamps and counts that were 9 to 11 px are now 12 px.
-- Transcript text sits in a centered column of about 72 characters with line height 1.5 in every thread view. Code blocks and tables scroll horizontally inside it.
+- Chat text uses the full width of the window again, with a 20 px margin on each side, in every thread view. Lines keep line height 1.5, and code blocks and tables scroll horizontally inside the chat.
 - Markdown headings in the transcript have their own sizes.
 - Durations, counts and timestamps use tabular digits, so numbers line up. The Ship run launch time no longer wraps.
 
