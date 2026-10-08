@@ -1388,6 +1388,50 @@ export function rekeyArchivedEconomicsEvidence(
   return economicsRollupSchema.parse(next);
 }
 
+export function reconcileArchivedEconomicsEvidence(
+  rollup: EconomicsRollup,
+  reconciliationKey: string,
+  entry: TaskEvidence,
+): EconomicsRollup {
+  const referenceDigest = evidenceReferenceDigest(entry);
+  const matches = archivedLocations(
+    rollup,
+    (candidate) =>
+      candidate.metadataComplete &&
+      !candidate.identityUncertain &&
+      candidate.reconciliationDigest === reconciliationKey &&
+      candidate.referenceDigest === referenceDigest,
+  ).filter(({ collection }) => collection === 'archivedEvidence' || rollup.stateVersion >= 3);
+  if (matches.length !== 1) return rollup;
+  const next = structuredClone(rollup);
+  migrateCausalProof(next);
+  const incompleteParent = next.causalProofComplete ? null : incompleteCausalStateDigest(next);
+  const match = matches[0];
+  const previous = next[match.collection][match.index];
+  const replacement = {
+    ...previous,
+    identityAliases: mergeIdentityAliases(
+      { identityDigest: previous.identityDigest, contentDigest: previous.contentDigest },
+      [
+        previous.identityAliases,
+        [
+          {
+            identityDigest: evidenceIdentityDigest(entry.id),
+            contentDigest: evidenceContentDigest(entry),
+          },
+        ],
+      ],
+    ),
+  };
+  if (match.collection === 'archivedTombstones') markTombstoneMutation(next, previous, replacement);
+  next[match.collection][match.index] = replacement;
+  if (!next.identityHorizonTruncated) rebuildCausalProof(next);
+  else if (next.causalProofComplete) advanceCausalProof(next);
+  else if (incompleteParent) advanceIncompleteCausalProof(next, incompleteParent);
+  sealRollupState(next);
+  return updateArchivedEconomicsEvidence(next, entry);
+}
+
 export function updateArchivedEconomicsEvidence(
   rollup: EconomicsRollup,
   entry: TaskEvidence,

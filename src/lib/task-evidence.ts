@@ -6,6 +6,7 @@ import {
   evidenceReferenceDigest,
   maxEconomicsCounter,
   mergeEconomicsRollups,
+  reconcileArchivedEconomicsEvidence,
   rekeyArchivedEconomicsEvidence,
   rollUpEconomics,
   taskEconomicsSchema,
@@ -164,9 +165,10 @@ function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
     if (protectedIds.size >= evidenceLimit) break;
     protectedIds.add(entry.id);
   }
-  const retained = sorted
-    .filter((entry) => !protectedIds.has(entry.id))
-    .slice(-(evidenceLimit - protectedIds.size));
+  const remainingCapacity = evidenceLimit - protectedIds.size;
+  const retained = remainingCapacity
+    ? sorted.filter((entry) => !protectedIds.has(entry.id)).slice(-remainingCapacity)
+    : [];
   const protectedEvidence = sorted.filter((entry) => protectedIds.has(entry.id));
   return [...retained, ...protectedEvidence].toSorted(compareEvidence);
 }
@@ -949,6 +951,14 @@ export function recordCiEvidenceObservation(
         }),
         updatedAt: Math.max(manifest.updatedAt, parsedEntry.timestamp),
       });
+    }
+    if (rollup) {
+      const reconciled = reconcileArchivedEconomicsEvidence(
+        rollup,
+        parsedEntry.reconciliationKey!,
+        parsedEntry,
+      );
+      if (reconciled !== rollup) return moveRollup(synced, reconciled, index);
     }
   }
   if (parsedEntry.identityUncertain !== true && parsedEntry.reconciliationKey) {

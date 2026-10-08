@@ -393,6 +393,59 @@ void test('the evidence bound retains each latest gate above a full command hist
   );
 });
 
+void test('keeps the evidence manifest valid when required entries fill its capacity', () => {
+  const requiredCriteria = Array.from({ length: 98 }, (_, index) => `criterion-${index}`);
+  const requiredGates = ['code-adversary', 'findings-adversary', 'test-adversary'];
+  let manifests = requiredGates.reduce<EvidenceManifest[]>(
+    (current, name, index) =>
+      recordTaskEvidence(
+        current,
+        'revision',
+        requiredCriteria,
+        evidence({ id: `gate-${index}`, name, timestamp: index + 1, criteria: [] }),
+      ),
+    [],
+  );
+
+  manifests = requiredCriteria.reduce(
+    (current, criterion, index) =>
+      recordTaskEvidence(
+        current,
+        'revision',
+        requiredCriteria,
+        evidence({
+          id: `proof-${index}`,
+          kind: 'command',
+          name: `proof-${index}`,
+          timestamp: index + 4,
+          criteria: [criterion],
+        }),
+      ),
+    manifests,
+  );
+
+  assert.equal(manifests[0].evidence.length, 100);
+  assert.equal(
+    manifests[0].evidence.some((entry) => entry.id === 'proof-97'),
+    true,
+  );
+  assert.doesNotThrow(() => evidenceManifestsSchema.parse(manifests));
+  assert.doesNotThrow(() =>
+    recordTaskEvidence(
+      manifests,
+      'revision',
+      requiredCriteria,
+      evidence({
+        id: 'later-command',
+        kind: 'command',
+        name: 'later-command',
+        timestamp: 200,
+        criteria: [],
+      }),
+    ),
+  );
+});
+
 void test('older required evidence remains merge-ready after later commands fill the bound', () => {
   const requiredCriteria = ['criterion-one', 'criterion-two', 'criterion-three'];
   const requiredGates = ['code-adversary', 'findings-adversary', 'test-adversary'];
@@ -1549,6 +1602,55 @@ void test('temporary CI identity loss keeps the enriched execution counted once'
   assert.equal(manifests[0].evidence.length, 1);
   assert.equal(manifests[0].evidence[0].id, stable.id);
   assert.equal(manifests[0].evidence[0].identityUncertain, false);
+  assert.equal(summary.totals.checks, 1);
+  assert.equal(summary.identityCoverageComplete, true);
+  assert.equal(summary.accepted, true);
+});
+
+void test('temporary CI identity loss keeps an archived enriched execution counted once', () => {
+  const url = 'https://github.test/actions/runs/archived-identity-refresh';
+  const stable = ciEvidence(
+    { name: 'build', url, databaseId: 50, runId: 10, attempt: 1 },
+    'passed',
+    1,
+  );
+  let manifests = recordCiEvidenceObservation([], 'revision', criteria, stable);
+  manifests = Array.from({ length: 100 }, (_, index) => index).reduce(
+    (current, index) =>
+      recordTaskEvidence(
+        current,
+        'revision',
+        criteria,
+        evidence({
+          id: `archived-refresh-filler-${index}`,
+          kind: 'command',
+          name: `archived-refresh-filler-${index}`,
+          timestamp: index + 2,
+          criteria: [],
+          economics: { ...emptyTaskEconomics('primary', 'implement'), turns: 1 },
+        }),
+      ),
+    manifests,
+  );
+  const fallback = ciEvidence({ name: 'build', url, identityUncertain: true }, 'passed', 200);
+
+  manifests = reconcileCiEvidenceSnapshot(manifests, 'revision', [fallback]);
+  manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, fallback);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+  const archived = manifests[0].economicsRollup?.archivedEvidence.find(
+    (entry) => entry.identityDigest === evidenceIdentityDigest(stable.id),
+  );
+
+  assert.equal(
+    manifests[0].evidence.some((entry) => entry.id === fallback.id),
+    false,
+  );
+  assert.equal(
+    archived?.identityAliases.some(
+      (alias) => alias.identityDigest === evidenceIdentityDigest(fallback.id),
+    ),
+    true,
+  );
   assert.equal(summary.totals.checks, 1);
   assert.equal(summary.identityCoverageComplete, true);
   assert.equal(summary.accepted, true);
