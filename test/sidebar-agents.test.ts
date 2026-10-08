@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  advanceFailedChildNotices,
+  failedChildCount,
+  failedChildLabel,
   groupSidebarThreads,
+  openedFailedChildren,
   listSidebarOpenCodeThreads,
   recordSidebarOpenCodeOutcome,
   sidebarThreadRows,
@@ -351,4 +355,90 @@ await test('sidebar inventory follows every OpenCode page and excludes child and
   );
   assert.equal(result.threads[0].title, 'Untitled session');
   assert.deepEqual(Object.values(result.outcomes), ['done', 'failed', 'interrupted']);
+});
+
+const parentThread = {
+  agent: 'codex',
+  directory: '/repo',
+  sessionId: 'parent',
+  title: 'p',
+  updated: 9,
+};
+const childThread = (sessionId: string) => ({
+  agent: 'codex',
+  directory: '/repo',
+  sessionId,
+  title: sessionId,
+  updated: 5,
+});
+
+await test('a failed child stays listed while completed ones collapse', () => {
+  const rows = sidebarThreadRows(
+    [parentThread, childThread('broke'), childThread('fine')],
+    [nativeReceipt('broke', 'parent', 'failed'), nativeReceipt('fine', 'parent', 'completed')],
+  );
+  assert.deepEqual(
+    rows.map((row) => row.thread.sessionId),
+    ['parent', 'broke'],
+  );
+  assert.equal(rows[0].hiddenHistoricalChildren, 1);
+  assert.equal(rows[0].historicalChildren, 1);
+});
+
+await test('a failed child notice clears after the next parent turn completes', () => {
+  const receipts = [nativeReceipt('broke', 'parent', 'failed')];
+  const turn = { busy: true };
+  const parentBusy = () => turn.busy;
+  const count = (notices: ReturnType<typeof advanceFailedChildNotices>) =>
+    failedChildCount(notices, receipts, 'acp:codex:parent', '/repo');
+
+  // The child fails while the parent's own turn runs, and that turn ending is not "next".
+  let notices = advanceFailedChildNotices({}, receipts, parentBusy);
+  assert.equal(count(notices), 1);
+  turn.busy = false;
+  notices = advanceFailedChildNotices(notices, receipts, parentBusy);
+  assert.equal(count(notices), 1);
+  // The next turn runs, and the notice stays until that turn completes.
+  turn.busy = true;
+  notices = advanceFailedChildNotices(notices, receipts, parentBusy);
+  assert.equal(count(notices), 1);
+  turn.busy = false;
+  notices = advanceFailedChildNotices(notices, receipts, parentBusy);
+  assert.equal(count(notices), 0);
+  // A cleared notice does not return, even when the receipt disappears and comes back.
+  notices = advanceFailedChildNotices(notices, [], parentBusy);
+  assert.equal(count(advanceFailedChildNotices(notices, receipts, parentBusy)), 0);
+});
+
+await test('a failed child notice clears when the child is opened', () => {
+  const receipts = [
+    nativeReceipt('broke', 'parent', 'failed'),
+    nativeReceipt('other', 'parent', 'failed'),
+    nativeReceipt('working', 'parent', 'working'),
+  ];
+  let notices = advanceFailedChildNotices({}, receipts, () => false);
+  assert.equal(failedChildCount(notices, receipts, 'acp:codex:parent', '/repo'), 2);
+  const opened = openedFailedChildren(receipts, childThread('broke'));
+  assert.deepEqual([...opened], ['native:codex:broke']);
+  notices = advanceFailedChildNotices(notices, receipts, () => false, opened);
+  assert.equal(failedChildCount(notices, receipts, 'acp:codex:parent', '/repo'), 1);
+  assert.equal(openedFailedChildren(receipts, null).size, 0);
+  assert.equal(openedFailedChildren(receipts, childThread('working')).size, 0);
+});
+
+await test('failed child notices count only failed native children of that parent', () => {
+  const receipts = [
+    nativeReceipt('a', 'parent', 'failed'),
+    nativeReceipt('b', 'elsewhere', 'failed'),
+    { ...nativeReceipt('c', 'parent', 'failed'), receiptId: 'mcp:c' },
+  ];
+  const notices = advanceFailedChildNotices({}, receipts, () => false);
+  assert.equal(failedChildCount(notices, receipts, 'acp:codex:parent', '/repo'), 1);
+  assert.equal(failedChildCount(notices, receipts, 'acp:codex:parent', '/other'), 0);
+  assert.equal(
+    advanceFailedChildNotices(notices, receipts, () => false),
+    notices,
+  );
+  assert.equal(failedChildLabel(1), '1 failed child');
+  assert.equal(failedChildLabel(2), '2 failed children');
 });

@@ -5,3 +5,11 @@ These installers are development builds. macOS artifacts use ad-hoc signing unle
 OpenCode v2.0.24 is a separate prerequisite; it is not bundled. Install the tested plan-review plugin revision before starting an Architect plan. See [installation and first project](https://github.com/smykla-skalski/sail/blob/main/docs/install.md) and [validation limits](https://github.com/smykla-skalski/sail/blob/main/docs/validation.md).
 
 There is no automatic updater. To update, download the next package for your platform and install it over the previous version after quitting the app. Verify the new manifest and run the first-project checks again.
+
+## Subagent results and status
+
+- A finished subagent shows its agent type, task, duration and tool count. Its result is clamped to three lines, with Expand and Open.
+- A finished subagent no longer repeats its state as the result, and a child with no output appears once.
+- Subagent cards share one screen-reader announcement that speaks state changes only.
+- A finished OpenCode subagent reads "Finished" instead of "Queued". Running and finished children are listed apart, can be opened, and appear in workspace activity.
+- A failed subagent stays in the sidebar, and its parent shows "1 failed child" until the parent's next turn completes or you open the child.

@@ -4,6 +4,15 @@
   import { activityState } from './lib/activity-state';
   import type { SpawnReceipt } from './lib/agent-results';
   import { boundedSpawnOutput, receiptNeedsLiveActivity } from './lib/agent-results';
+  import {
+    lastSignalAge,
+    stateAnnouncement,
+    subagentDurationMs,
+    subagentType,
+    toolCountLabel,
+  } from './lib/subagent-display';
+  import { formatDuration } from './lib/task-notification';
+  import { onMount } from 'svelte';
 
   let {
     receipts,
@@ -14,12 +23,37 @@
   let opening = $state<string[]>([]);
   let openErrors = $state<Record<string, string>>({});
 
+  let now = $state(Date.now());
+  let announcement = $state('');
+  let announced: Record<string, string> = {};
+
+  onMount(() => {
+    const timer = setInterval(() => (now = Date.now()), 1_000);
+    return () => clearInterval(timer);
+  });
+
+  // One announcement per group: it names only children whose state changed since the last
+  // update. Activity text and clock ticks never reach it. The first update only records states.
+  $effect(() => {
+    const changes: string[] = [];
+    const seen: Record<string, string> = {};
+    for (const receipt of receipts) {
+      seen[receipt.receiptId] = receipt.state;
+      const previous = announced[receipt.receiptId];
+      if (previous !== undefined && previous !== receipt.state)
+        changes.push(stateAnnouncement(receipt));
+    }
+    announced = seen;
+    if (changes.length) announcement = changes.join('. ');
+  });
+
   function label(receipt: SpawnReceipt): string {
-    return receipt.provider === 'opencode'
-      ? 'OpenCode'
-      : receipt.provider === 'codex'
-        ? 'Codex'
-        : 'Claude';
+    return subagentType(receipt);
+  }
+
+  function elapsed(receipt: SpawnReceipt): string {
+    const duration = subagentDurationMs(receipt, now);
+    return duration === null ? '' : formatDuration(duration);
   }
 
   function activity(receipt: SpawnReceipt): string {
@@ -73,6 +107,9 @@
   }
 </script>
 
+<div class="spawn-announcer" role="status" aria-live="polite" aria-atomic="true">
+  {announcement}
+</div>
 {#if active.length}
   <section class="spawn-activity" aria-label="Subagent activity">
     <h2>Subagents ({active.length})</h2>
@@ -113,13 +150,18 @@
           <strong>Task</strong>
           {receipt.prompt ?? 'Task details unavailable'}
         </p>
-        <div class="spawn-signal" role="status" aria-live="polite">
+        <div class="spawn-signal">
           <span>{activity(receipt)}</span>
-          <time
-            datetime={signalDate(receipt).toISOString()}
-            title={signalDate(receipt).toLocaleString()}
-            >Last signal {signalDate(receipt).toLocaleTimeString()}</time
-          >
+          <span class="spawn-clock">
+            {#if elapsed(receipt)}<span>{elapsed(receipt)}</span>{/if}
+            {#if receipt.toolCount !== undefined}<span>{toolCountLabel(receipt.toolCount)}</span
+              >{/if}
+            <time
+              datetime={signalDate(receipt).toISOString()}
+              title={signalDate(receipt).toLocaleString()}
+              >Last signal {lastSignalAge(receipt, now) ?? 'unknown'}</time
+            >
+          </span>
         </div>
         {#if !receipt.targetId || !receipt.targetDirectory}<p class="spawn-unavailable">
             Thread unavailable — the child has not confirmed a target yet.
@@ -252,14 +294,27 @@
     color: var(--sui-muted);
     font-size: 0.76rem;
   }
-  .spawn-signal span {
+  .spawn-signal > span:first-child {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .spawn-signal time {
+  .spawn-clock {
+    display: flex;
     flex: none;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 3px 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .spawn-announcer {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   .spawn-unavailable,
   .spawn-error,
@@ -291,8 +346,8 @@
     .spawn-signal {
       display: block;
     }
-    .spawn-signal time {
-      display: block;
+    .spawn-clock {
+      justify-content: flex-start;
       margin-top: 3px;
     }
     .spawn-open {

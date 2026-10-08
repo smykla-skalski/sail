@@ -352,6 +352,8 @@
                 ? 'ready'
                 : 'offline',
   );
+  let openCodeChildReceipts = $state.raw<SpawnReceipt[]>([]);
+  const activityChildren = $derived([...spawnReceipts, ...openCodeChildReceipts]);
   const workspaceActivity = $derived(
     workspaceActivityItems({
       tools: messages.flatMap((message) =>
@@ -370,7 +372,7 @@
             )
           : [],
       ),
-      children: spawnReceipts,
+      children: activityChildren,
       decisions: [
         ...pendingPermissions.map((request) => ({
           id: request.id,
@@ -390,7 +392,7 @@
 
   async function selectWorkspaceActivity(item: WorkspaceActivityItem) {
     if (item.kind === 'child') {
-      const receipt = spawnReceipts.find((entry) => entry.receiptId === item.sourceId);
+      const receipt = activityChildren.find((entry) => entry.receiptId === item.sourceId);
       if (receipt?.targetId && receipt.targetDirectory && onopensubagent) {
         await onopensubagent(receipt);
         return;
@@ -1109,7 +1111,7 @@
         </div>{/if}
       {#each displayMessages as message (message.id)}
         {#if message.type === 'spawn-response'}
-          <SpawnResponse receipt={message.receipt} />
+          <SpawnResponse receipt={message.receipt} onopen={onopensubagent} />
         {:else if message.type === 'user'}
           {@const attribution = coordinationMessageForText(message.text, coordinationMessages)}
           <ChatMessage kind="user" author={attribution ? `From ${attribution.sender}` : 'You'}>
@@ -1174,7 +1176,13 @@
           </ChatMessage>
         {/if}
       {/each}
-      <OpenCodeSubagents {client} parentID={activeID} />
+      <OpenCodeSubagents
+        {client}
+        parentID={activeID}
+        {directory}
+        onopen={onopensubagent}
+        onchildren={(receipts) => (openCodeChildReceipts = receipts)}
+      />
       {#each coordinationMessages.filter((message) => !messages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
         <ChatMessage
           kind="user"
