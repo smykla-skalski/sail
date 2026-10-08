@@ -39,7 +39,7 @@
       ),
     );
   }
-  let values = $state<Record<string, unknown>>(defaults(elicitation.schema));
+  let values = $derived(defaults(elicitation.schema));
   let error = $state('');
 
   async function answer(action: 'accept' | 'decline' | 'cancel') {
