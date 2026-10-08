@@ -2933,6 +2933,7 @@ pub fn run() {
             acp::acp_release_session_fence,
             acp::acp_load_session,
             acp::acp_resume_session,
+            acp::acp_list_sessions,
             acp::acp_prompt,
             acp::acp_steer,
             acp::acp_cancel,

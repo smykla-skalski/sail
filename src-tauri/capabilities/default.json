@@ -77,6 +77,7 @@
     "allow-acp-release-session-fence",
     "allow-acp-load-session",
     "allow-acp-resume-session",
+    "allow-acp-list-sessions",
     "allow-acp-prompt",
     "allow-acp-steer",
     "allow-acp-cancel",

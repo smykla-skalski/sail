@@ -23,6 +23,13 @@ export interface AgentThread {
   title: string;
   updated: number;
   capabilityProfile?: CapabilityProfile;
+  /** The user chose this title in Sail, so agent-provided titles never replace it. */
+  renamed?: boolean;
+}
+
+export interface AgentSessionListing {
+  sessions: { sessionId: string; cwd: string; title?: string | null; updatedAt?: string | null }[];
+  nextCursor?: string | null;
 }
 
 export interface InterruptedAgentTurn {
@@ -665,6 +672,8 @@ export const acp = {
       rememberRestoredState(agent, session.sessionId, session);
       return session;
     }),
+  listSessions: (agent: AgentId, cwd: string, cursor?: string, profile?: CapabilityProfile) =>
+    invoke<AgentSessionListing>('acp_list_sessions', { agent, cwd, cursor, profile }),
   releaseSessionFence: (agent: AgentId, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, sessionId }),
   load: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>

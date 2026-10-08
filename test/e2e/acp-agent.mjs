@@ -26,6 +26,29 @@ function send(message) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
 }
 
+const externalSessionsFile = '.acp-external-sessions.json';
+
+function externalSessions(cwd) {
+  const file = join(cwd, externalSessionsFile);
+  if (!existsSync(file)) return [];
+  return JSON.parse(readFileSync(file, 'utf8')).map((item) => Object.assign({}, item, { cwd }));
+}
+
+function adoptExternalSession(sessionId, cwd) {
+  if (sessions.has(sessionId) || typeof cwd !== 'string') return;
+  const external = externalSessions(cwd).find((item) => item.sessionId === sessionId);
+  if (!external) return;
+  sessions.set(sessionId, {
+    cwd,
+    history: [],
+    config: { model: 'test', effort: 'medium' },
+    fingerprint: sessionFingerprint({ cwd, mcpServers: [] }),
+    mcpServers: [],
+    title: external.title,
+    updated: Date.parse(external.updatedAt) || Date.now(),
+  });
+}
+
 function update(sessionId, value) {
   send({ method: 'session/update', params: { sessionId, update: value } });
 }
@@ -255,7 +278,11 @@ for await (const line of createInterface({ input: process.stdin })) {
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: true,
-          sessionCapabilities: { resume: {}, subagents: {} },
+          sessionCapabilities: {
+            resume: {},
+            subagents: {},
+            ...(agent === 'opencode' ? { list: {} } : {}),
+          },
         },
         authMethods: agent === 'codex' ? [{ id: 'chat-gpt', name: 'ChatGPT' }] : [],
         _meta:
@@ -293,7 +320,31 @@ for await (const line of createInterface({ input: process.stdin })) {
         }),
       delayFirstAttentionSession ? 3000 : 1000,
     );
+  } else if (message.method === 'session/list') {
+    const pageSize = 2;
+    const cwd = message.params.cwd;
+    const known = [...sessions.entries()]
+      .filter(([, session]) => !cwd || session.cwd === cwd)
+      .map(([sessionId, session]) => ({
+        sessionId,
+        cwd: session.cwd,
+        title: session.title ?? sessionId,
+        updatedAt: new Date(session.updated ?? Date.now()).toISOString(),
+      }));
+    const outside = cwd
+      ? externalSessions(cwd).filter((item) => !sessions.has(item.sessionId))
+      : [];
+    const all = [...known, ...outside];
+    const start = Number(message.params.cursor ?? 0);
+    send({
+      id: message.id,
+      result: {
+        sessions: all.slice(start, start + pageSize),
+        nextCursor: start + pageSize < all.length ? String(start + pageSize) : null,
+      },
+    });
   } else if (message.method === 'session/resume') {
+    adoptExternalSession(message.params.sessionId, message.params.cwd);
     const session = sessions.get(message.params.sessionId);
     if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
@@ -307,6 +358,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         },
       });
   } else if (message.method === 'session/load') {
+    adoptExternalSession(message.params.sessionId, message.params.cwd);
     const session = sessions.get(message.params.sessionId);
     if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
