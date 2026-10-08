@@ -526,6 +526,7 @@ await test('ACP listing skips entries without a session id', async () => {
         sessions: [
           { sessionId: '', cwd: '/repo/a', title: 'Empty id' },
           { sessionId: '  ', cwd: '/repo/a', title: 'Blank id' },
+          { sessionId: 42 as unknown as string, cwd: '/repo/a', title: 'Numeric id' },
           { sessionId: 'ses_ok', cwd: '/repo/a', title: 'Real' },
         ],
       }),
