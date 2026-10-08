@@ -397,7 +397,7 @@ await test('shipping receipts survive unrelated spawn traffic', () => {
 await test('conversation activity belongs only to its launching thread', () => {
   const otherSession = { ...receipt, receiptId: 'other-session', sourceId: 'acp:claude:other' };
   const otherDirectory = { ...receipt, receiptId: 'other-directory', sourceDirectory: '/other' };
-  const native = { ...receipt, receiptId: 'native', sourceId: 'opencode:source' };
+  const native = { ...receipt, receiptId: 'native', sourceId: 'acp:opencode:source' };
   assert.deepEqual(
     spawnReceiptsForSource(
       [receipt, otherSession, otherDirectory, native],
@@ -412,7 +412,7 @@ await test('conversation activity belongs only to its launching thread', () => {
 await test('active child activity and thread identity use both session and directory', () => {
   const working = { ...receipt, state: 'working' as const };
   assert.equal(receiptSourceId('codex', 'target'), receipt.targetId);
-  assert.equal(receiptSourceId('opencode', 'target'), 'opencode:target');
+  assert.equal(receiptSourceId('opencode', 'target'), 'acp:opencode:target');
   assert.deepEqual(activeSubagentsForSource([receipt, working], receipt.sourceId, '/repo'), [
     working,
   ]);
@@ -568,7 +568,7 @@ await test('OpenCode handoff prompt recovery requires replacement ownership', ()
   const recoverable = {
     ...receipt,
     provider: 'opencode' as const,
-    targetId: 'opencode:replacement',
+    targetId: 'acp:opencode:replacement',
     receiptId: 'handoff-receipt',
     requestId: 'handoff:handoff-one',
     state: 'starting' as const,
@@ -778,7 +778,7 @@ await test('owned handoff prompts recover across every unsettled restart window'
     ...receipt,
     receiptId: 'handoff-receipt',
     requestId: 'handoff:handoff-one',
-    targetId: 'opencode:replacement',
+    targetId: 'acp:opencode:replacement',
     provider: 'opencode' as const,
     state: 'starting' as const,
   };

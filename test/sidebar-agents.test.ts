@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import type { AgentSessionListing } from '../src/lib/acp.ts';
 import test from 'node:test';
 import {
   advanceFailedChildNotices,
@@ -6,6 +7,7 @@ import {
   failedChildLabel,
   groupSidebarThreads,
   openedFailedChildren,
+  listSidebarAcpThreads,
   listSidebarOpenCodeThreads,
   recordSidebarOpenCodeOutcome,
   sidebarThreadRows,
@@ -73,8 +75,6 @@ await test('fresh OpenCode outcome replaces stale saved terminal status', () => 
       { [key]: { status: 'done', unread: false } },
       { [key]: 'failed' },
       true,
-      true,
-      [],
     ),
     'failed',
   );
@@ -84,8 +84,6 @@ await test('fresh OpenCode outcome replaces stale saved terminal status', () => 
       { [key]: { status: 'failed', unread: false } },
       { [key]: 'done' },
       true,
-      true,
-      [],
     ),
     'done',
   );
@@ -95,8 +93,6 @@ await test('fresh OpenCode outcome replaces stale saved terminal status', () => 
       { [key]: { status: 'done', unread: false } },
       { [key]: 'interrupted' },
       true,
-      true,
-      [],
     ),
     'interrupted',
   );
@@ -116,14 +112,7 @@ await test('later OpenCode completion replaces interrupted sidebar outcome when 
   const current = recordSidebarOpenCodeOutcome(stale, thread, 'done');
   assert.deepEqual(current, { [key]: 'done', [otherKey]: 'failed' });
   assert.equal(
-    sidebarThreadStatus(
-      thread,
-      { [key]: { status: 'done', unread: false } },
-      current,
-      true,
-      true,
-      [],
-    ),
+    sidebarThreadStatus(thread, { [key]: { status: 'done', unread: false } }, current, true),
     'done',
   );
   assert.equal(stale[key], 'interrupted');
@@ -158,42 +147,22 @@ await test('active subagent keeps a finished parent visibly working', () => {
     error: null,
   };
   const status = (receipts: SpawnReceipt[], ready = true) =>
-    sidebarThreadStatus(
-      thread,
-      { [key]: { status: 'done', unread: false } },
-      {},
-      ready,
-      true,
-      [],
-      receipts,
-    );
+    sidebarThreadStatus(thread, { [key]: { status: 'done', unread: false } }, {}, ready, receipts);
   assert.equal(status([receipt]), 'working');
   assert.equal(status([{ ...receipt, state: 'waiting' }]), 'waiting');
   assert.equal(status([{ ...receipt, turnId: null }]), 'working');
   assert.equal(
-    sidebarThreadStatus(
-      thread,
-      { [key]: { status: 'failed', unread: false } },
-      {},
-      true,
-      true,
-      [],
-      [receipt],
-    ),
+    sidebarThreadStatus(thread, { [key]: { status: 'failed', unread: false } }, {}, true, [
+      receipt,
+    ]),
     'failed',
   );
   assert.equal(status([{ ...receipt, state: 'completed' }]), 'done');
   assert.equal(status([{ ...receipt, state: 'interrupted' }]), 'done');
   assert.equal(
-    sidebarThreadStatus(
-      thread,
-      { [key]: { status: 'interrupted', unread: false } },
-      {},
-      true,
-      true,
-      [],
-      [receipt],
-    ),
+    sidebarThreadStatus(thread, { [key]: { status: 'interrupted', unread: false } }, {}, true, [
+      receipt,
+    ]),
     'interrupted',
   );
   assert.equal(status([{ ...receipt, state: 'queued', targetId: null, turnId: null }]), null);
@@ -205,9 +174,7 @@ await test('active subagent keeps a finished parent visibly working', () => {
       { [JSON.stringify(['opencode', '/repo', 'parent'])]: { status: 'done', unread: false } },
       {},
       true,
-      false,
-      [],
-      [{ ...receipt, sourceId: 'opencode:parent' }],
+      [{ ...receipt, sourceId: 'acp:opencode:parent' }],
     ),
     'working',
   );
@@ -241,7 +208,7 @@ await test('native child rows use their own outcome without parent attention sta
     error: null,
   };
   const status = (state: SpawnReceipt['state']) =>
-    sidebarThreadStatus(thread, {}, {}, true, true, [], [{ ...receipt, state }]);
+    sidebarThreadStatus(thread, {}, {}, true, [{ ...receipt, state }]);
   assert.equal(status('waiting'), 'waiting');
   assert.equal(status('completed'), 'done');
   assert.equal(status('failed'), 'failed');
@@ -252,8 +219,6 @@ await test('native child rows use their own outcome without parent attention sta
       { [JSON.stringify(['codex', '/repo', 'child'])]: { status: 'done', unread: false } },
       {},
       true,
-      true,
-      [],
       [{ ...receipt, state: 'interrupted' }],
     ),
     'done',
@@ -379,8 +344,8 @@ await test('OpenCode children nest under their parent', () => {
   const child: SpawnReceipt = {
     ...nativeReceipt('c', 'p', 'working'),
     receiptId: 'opencode-child:c',
-    sourceId: 'opencode:p',
-    targetId: 'opencode:c',
+    sourceId: 'acp:opencode:p',
+    targetId: 'acp:opencode:c',
     provider: 'opencode',
     prompt: 'Review',
   };
@@ -538,4 +503,70 @@ await test('failed child notices count only failed native children of that paren
   );
   assert.equal(failedChildLabel(1), '1 failed child');
   assert.equal(failedChildLabel(2), '2 failed children');
+});
+
+await test('ACP listing pages through the cursor and keeps only the asked directory', async () => {
+  const pages: Record<string, AgentSessionListing> = {
+    first: {
+      sessions: [
+        {
+          sessionId: 'ses_a',
+          cwd: '/repo/a',
+          title: 'Outside Sail',
+          updatedAt: '2026-01-02T00:00:00Z',
+        },
+        { sessionId: 'ses_other', cwd: '/repo/b', title: 'Elsewhere' },
+      ],
+      nextCursor: 'second',
+    },
+    second: {
+      sessions: [{ sessionId: 'ses_b', cwd: '/repo/a/', title: null }],
+      nextCursor: 'second',
+    },
+  };
+  const asked: (string | undefined)[] = [];
+  const threads = await listSidebarAcpThreads(
+    'opencode',
+    (cursor) => {
+      asked.push(cursor);
+      return Promise.resolve(pages[cursor ?? 'first']);
+    },
+    '/repo/a',
+  );
+  assert.deepEqual(asked, [undefined, 'second']);
+  assert.deepEqual(
+    threads.map((thread) => [thread.agent, thread.sessionId, thread.title, thread.updated]),
+    [
+      ['opencode', 'ses_a', 'Outside Sail', Date.parse('2026-01-02T00:00:00Z')],
+      ['opencode', 'ses_b', 'Untitled session', 0],
+    ],
+  );
+});
+
+await test('ACP listing failure reaches the caller instead of an empty list', async () => {
+  await assert.rejects(
+    listSidebarAcpThreads('opencode', () => Promise.reject(new Error('agent exited')), '/repo/a'),
+    /agent exited/,
+  );
+});
+
+await test('a Sail title survives when the agent lists the same thread', () => {
+  const saved = {
+    agent: 'opencode',
+    directory: '/repo/a',
+    sessionId: 'ses_a',
+    title: 'My name',
+    updated: 1,
+    renamed: true,
+  };
+  const listed = { ...saved, title: 'Agent name', updated: 5, renamed: undefined };
+  for (const order of [
+    [saved, listed],
+    [listed, saved],
+  ]) {
+    const [thread] = groupSidebarThreads(order)['/repo/a'];
+    assert.equal(thread.title, 'My name');
+    assert.equal(thread.updated, 5);
+    assert.equal(thread.renamed, true);
+  }
 });

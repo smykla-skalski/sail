@@ -14,6 +14,14 @@ There is no automatic updater. To update, download the next package for your pla
 - Markdown headings in the transcript have their own sizes.
 - Durations, counts and timestamps use tabular digits, so numbers line up. The Ship run launch time no longer wraps.
 
+## OpenCode in the agent pane
+
+- OpenCode threads open in the same pane as Claude and Codex, in the main pane and in split panes. The sidebar, command palette and `project_threads` list OpenCode sessions through `opencode acp`, including sessions started outside Sail.
+- On first start Sail moves saved OpenCode references (pane layouts, recent threads, spawn receipts, Ship runs, messages, post-turn checks) to the ACP form once. OpenCode session ids do not change.
+- **Rename** works for every agent thread. The title is stored in Sail; the agent's own title is not changed.
+- **Delete** removes a thread from Sail only. An OpenCode session stays in OpenCode's store and stays hidden in Sail.
+- **New plan** now opens an OpenCode thread; choose the plan mode there.
+
 ## Keyboard, shortcuts and screen readers
 
 - The command palette also runs app actions: split, terminal, side chat, Inbox, next attention item, task overview, Ship runs, Changes, settings, theme and the shortcut sheet. Each shows its shortcut when it has one. A **⌘K** button in the top bar opens the palette.

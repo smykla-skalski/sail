@@ -88,7 +88,6 @@ export type PaletteEntry = {
     | 'agent'
     | 'new-session'
     | 'thread'
-    | 'opencode-session'
     | 'command'
     | 'action';
   label: string;
@@ -103,14 +102,6 @@ export type PaletteEntry = {
   shortcut?: ShortcutId;
 };
 
-export type PaletteOpenCodeSession = {
-  id: string;
-  title: string;
-  directory: string;
-  parentID: string | null;
-  updated: number;
-};
-
 export type PaletteSearch = {
   step: PaletteStep;
   query: string;
@@ -118,8 +109,6 @@ export type PaletteSearch = {
   currentDirectory: string;
   agents: AgentAvailability[];
   threads: AgentThread[];
-  openCodeAvailable: boolean;
-  openCodeSessions: PaletteOpenCodeSession[];
   commands: SavedCommand[];
   runningThreadKeys: string[];
   actions?: PaletteAction[];
@@ -190,8 +179,6 @@ export function searchCommandPalette({
   currentDirectory,
   agents,
   threads,
-  openCodeAvailable,
-  openCodeSessions,
   commands,
   runningThreadKeys,
   actions = [],
@@ -256,14 +243,8 @@ export function searchCommandPalette({
         ([key, thread]) => {
           const context = directoryContext(catalog, thread.directory);
           if (!context) return [];
-          const agentName =
-            thread.agent === 'opencode'
-              ? 'OpenCode'
-              : (agents.find((agent) => agent.id === thread.agent)?.name ?? thread.agent);
-          const available =
-            thread.agent === 'opencode'
-              ? openCodeAvailable
-              : !!agents.find((agent) => agent.id === thread.agent)?.available;
+          const agentName = agents.find((agent) => agent.id === thread.agent)?.name ?? thread.agent;
+          const available = !!agents.find((agent) => agent.id === thread.agent)?.available;
           return [
             {
               id: `global-thread:${key}`,
@@ -332,24 +313,14 @@ export function searchCommandPalette({
 
   if (step.kind === 'agents') {
     return rank(
-      [
-        {
-          id: 'agent:opencode',
-          kind: 'agent',
-          label: 'OpenCode',
-          detail: openCodeAvailable ? 'Sail architect and work sessions' : 'OpenCode unavailable',
-          agent: 'opencode',
-          disabled: !openCodeAvailable,
-        },
-        ...agents.map((agent) => ({
-          id: `agent:${agent.id}`,
-          kind: 'agent' as const,
-          label: agent.name,
-          detail: agent.available ? 'Agent sessions' : (agent.reason ?? 'Unavailable'),
-          agent: agent.id,
-          disabled: !agent.available,
-        })),
-      ],
+      agents.map((agent) => ({
+        id: `agent:${agent.id}`,
+        kind: 'agent' as const,
+        label: agent.name,
+        detail: agent.available ? 'Agent sessions' : (agent.reason ?? 'Unavailable'),
+        agent: agent.id,
+        disabled: !agent.available,
+      })),
       query,
     );
   }
@@ -358,30 +329,18 @@ export function searchCommandPalette({
     id: `new-session:${step.agent}:${step.directory}`,
     kind: 'new-session',
     label: 'New session',
-    detail: `Start with ${step.agent === 'opencode' ? 'OpenCode' : (agents.find((agent) => agent.id === step.agent)?.name ?? step.agent)}`,
+    detail: `Start with ${agents.find((agent) => agent.id === step.agent)?.name ?? step.agent}`,
   };
-  const existing: PaletteEntry[] =
-    step.agent === 'opencode'
-      ? openCodeSessions
-          .filter((session) => session.directory === step.directory && !session.parentID)
-          .toSorted((a, b) => b.updated - a.updated)
-          .map((session) => ({
-            id: `opencode-session:${session.id}`,
-            kind: 'opencode-session',
-            label: session.title,
-            detail: new Date(session.updated).toLocaleString(),
-            sessionId: session.id,
-          }))
-      : threads
-          .filter((thread) => thread.directory === step.directory && thread.agent === step.agent)
-          .toSorted((a, b) => b.updated - a.updated)
-          .map((thread) => ({
-            id: `thread:${thread.agent}:${thread.directory}:${thread.sessionId}`,
-            kind: 'thread',
-            label: thread.title,
-            detail: new Date(thread.updated).toLocaleString(),
-            thread,
-          }));
+  const existing: PaletteEntry[] = threads
+    .filter((thread) => thread.directory === step.directory && thread.agent === step.agent)
+    .toSorted((a, b) => b.updated - a.updated)
+    .map((thread) => ({
+      id: `thread:${thread.agent}:${thread.directory}:${thread.sessionId}`,
+      kind: 'thread',
+      label: thread.title,
+      detail: new Date(thread.updated).toLocaleString(),
+      thread,
+    }));
   const newSession = !query.trim() || score(create.label, query) !== null ? [create] : [];
   return [...newSession, ...rank(existing, query)].slice(0, 50);
 }

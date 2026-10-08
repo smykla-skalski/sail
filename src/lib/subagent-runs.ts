@@ -118,7 +118,7 @@ function nativeRuns(store: NativeSubagentStore): SubagentRun[] {
 }
 
 function threadSession(threadId: string, provider: string): string | null {
-  const prefix = provider === 'opencode' ? 'opencode:' : `acp:${provider}:`;
+  const prefix = `acp:${provider}:`;
   return threadId.startsWith(prefix) && threadId.length > prefix.length
     ? threadId.slice(prefix.length)
     : null;

@@ -72,8 +72,12 @@ void test('a child in another worktree navigates back to its parent', () => {
 
 void test('OpenCode children use the opencode id form', () => {
   const receipts = [
-    receipt('x', 1, { sourceId: 'opencode:p', targetId: 'opencode:x', provider: 'opencode' }),
+    receipt('x', 1, {
+      sourceId: 'acp:opencode:p',
+      targetId: 'acp:opencode:x',
+      provider: 'opencode',
+    }),
   ];
   const nav = subagentNavigation(receipts, { agent: 'opencode', sessionId: 'x', directory: '/a' });
-  assert.equal(nav?.parent.threadId, 'opencode:p');
+  assert.equal(nav?.parent.threadId, 'acp:opencode:p');
 });

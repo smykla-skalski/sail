@@ -13,7 +13,7 @@
   };
 
   export type TopbarThreadActions =
-    | { kind: 'agent'; title: string; ondelete: () => void }
+    | { kind: 'agent'; title: string; onrename: () => void; ondelete: () => void }
     | { kind: 'opencode'; title: string; onrename: () => void; ondelete: () => void };
 
   type MobileView = 'sessions' | 'chat' | 'details';
@@ -39,8 +39,6 @@
     directory,
     agents,
     onopenagent,
-    newWorkDisabled,
-    onnewwork,
     planDisabled,
     onnewplan,
     onswitchthread,
@@ -81,8 +79,6 @@
     directory: string;
     agents: AgentAvailability[];
     onopenagent: (agent: AgentId) => void;
-    newWorkDisabled: boolean;
-    onnewwork: () => void;
     planDisabled: boolean;
     onnewplan: () => void;
     onswitchthread: () => void;
@@ -225,18 +221,12 @@
                 ><HarnessIcon agent={agent.id} /> {agent.name}</button
               >
             {/each}
-            <button
-              role="menuitem"
-              disabled={newWorkDisabled}
-              title="New OpenCode thread"
-              onclick={onnewwork}><HarnessIcon agent="opencode" /> OpenCode</button
-            >
           </div>
           <div class="menu-separator" role="separator"></div>
           <button
             role="menuitem"
             aria-label="New plan"
-            title="Start an Architect plan"
+            title="Start an OpenCode thread to plan in"
             disabled={planDisabled}
             onclick={onnewplan}>New plan</button
           >
@@ -293,10 +283,10 @@
               onclick={threadActions.onrename}>Rename…</button
             ><button role="menuitem" class="danger" onclick={threadActions.ondelete}
               >Delete session…</button
-            >{:else if threadActions}<button
-              role="menuitem"
-              class="danger"
-              onclick={threadActions.ondelete}>Delete thread…</button
+            >{:else if threadActions}<button role="menuitem" onclick={threadActions.onrename}
+              >Rename…</button
+            ><button role="menuitem" class="danger" onclick={threadActions.ondelete}
+              >Delete thread…</button
             >{/if}
         </div>
       {/if}

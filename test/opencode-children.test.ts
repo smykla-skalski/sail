@@ -217,8 +217,8 @@ await test('child receipts point at the child thread and its parent', () => {
     active: [],
     summaries: { child: message('child') },
   });
-  assert.equal(receipt.sourceId, 'opencode:parent');
-  assert.equal(receipt.targetId, 'opencode:child');
+  assert.equal(receipt.sourceId, 'acp:opencode:parent');
+  assert.equal(receipt.targetId, 'acp:opencode:child');
   assert.equal(receipt.targetDirectory, '/repo');
   assert.equal(receipt.provider, 'opencode');
   assert.equal(receipt.prompt, 'Child child');
