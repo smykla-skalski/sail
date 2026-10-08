@@ -72,6 +72,18 @@ export function runReservedOpenCodeTurn<T>(
   });
 }
 
+export async function holdAcceptedOpenCodeTurn<T>(
+  release: () => void,
+  accepted: Promise<T>,
+  settle: (accepted: T) => Promise<unknown>,
+): Promise<void> {
+  try {
+    await settle(await accepted);
+  } finally {
+    release();
+  }
+}
+
 export async function waitForAuthoritativeOpenCodeSettlement(
   wait: () => Promise<void>,
   settled: () => Promise<boolean>,

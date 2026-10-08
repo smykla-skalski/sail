@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { CapabilityProfileReservationCoordinator } from '../src/lib/capability-profiles.ts';
 import {
+  holdAcceptedOpenCodeTurn,
   openCodeInboxSettled,
   runOpenCodeCleanup,
   runOpenCodePromptStart,
@@ -136,6 +138,34 @@ void test('accepted turns reserve their profile until execution settlement', asy
     'settled',
     'released',
   ]);
+});
+
+void test('coordinated review blocks a build until its accepted inbox settles', async () => {
+  const reservations = new CapabilityProfileReservationCoordinator();
+  const accepted = Promise.withResolvers<{ id: string }>();
+  const retry = Promise.withResolvers<void>();
+  let correlated = false;
+  const releaseReview = await reservations.reserve('/workspace', 'review', async () => {});
+  const held = holdAcceptedOpenCodeTurn(releaseReview, accepted.promise, () =>
+    waitForAuthoritativeOpenCodeSettlement(
+      async () => undefined,
+      async () => correlated,
+      { retry: () => retry.promise },
+    ),
+  );
+
+  accepted.resolve({ id: 'review-inbox' });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  await assert.rejects(
+    reservations.reserve('/workspace', 'build', async () => {}),
+    /pending review OpenCode launch/,
+  );
+  correlated = true;
+  retry.resolve();
+  await held;
+  const releaseBuild = await reservations.reserve('/workspace', 'build', async () => {});
+  releaseBuild();
 });
 
 void test('failed waits retry until provider settlement is authoritative', async () => {

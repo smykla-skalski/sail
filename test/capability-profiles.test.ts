@@ -718,6 +718,26 @@ await test('same-profile reservations share one pending configuration', async ()
   releaseSecond();
 });
 
+await test('same-profile reservations reconfigure after a runtime generation change', async () => {
+  const reservations = new CapabilityProfileReservationCoordinator();
+  let configurations = 0;
+  const configure = async () => {
+    configurations++;
+  };
+
+  const releaseFirst = await reservations.reserve('/workspace', 'review', configure);
+  reservations.beginConfigurationGeneration();
+  const releaseSecond = await reservations.reserve('/workspace', 'review', configure);
+
+  assert.equal(configurations, 2);
+  await assert.rejects(
+    reservations.reserve('/workspace', 'build', configure),
+    /pending review OpenCode launch/,
+  );
+  releaseFirst();
+  releaseSecond();
+});
+
 await test('keeps unknown and high-risk actions interactive', () => {
   for (const [title, toolCall] of [
     ['Do thing', { name: 'provider-specific-action' }],

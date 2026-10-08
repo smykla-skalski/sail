@@ -204,6 +204,7 @@
     recordImplementationModel,
   } from './lib/implementation-models';
   import {
+    holdAcceptedOpenCodeTurn,
     openCodeInboxSettled,
     runOpenCodeCleanup,
     runOpenCodePromptStart,
@@ -2347,6 +2348,7 @@
     client = nextClient;
     nativeActivityReady = false;
     openCodeBrowserServers.clear();
+    openCodeProfileReservations.beginConfigurationGeneration();
     activeBinary = info.binaryPath;
     runtimeState = 'connected';
     runtimeError = '';
@@ -6425,12 +6427,13 @@
     const capabilityProfile: CapabilityProfile = validation
       ? 'review'
       : capabilityProfileForDirectory(created.path);
-    const releaseProfile = await reserveOpenCodeBrowser(created.path, capabilityProfile).catch(
-      (cause) => {
-        if (!validation) throw cause;
-        throw new ValidationCandidateUnavailable('OpenCode is unavailable', cause);
-      },
-    );
+    let releaseProfile: (() => void) | undefined = await reserveOpenCodeBrowser(
+      created.path,
+      capabilityProfile,
+    ).catch((cause) => {
+      if (!validation) throw cause;
+      throw new ValidationCandidateUnavailable('OpenCode is unavailable', cause);
+    });
     try {
       const session = await promptClient.session
         .create({
@@ -6502,6 +6505,11 @@
         updateSpawnReceipt(receiptId, { state: 'working' });
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       }
+      const heldRelease = releaseProfile;
+      releaseProfile = undefined;
+      void holdAcceptedOpenCodeTurn(heldRelease, startingPrompt, (accepted) =>
+        waitForOpenCodeInboxSettlement(promptClient, session.id, accepted.id),
+      ).catch(() => undefined);
       if (receiptId)
         void startingPrompt
           .then(async (inbox) => {
@@ -6550,7 +6558,7 @@
       });
       return { path: created.path, branch: created.branch, threadId: `opencode:${session.id}` };
     } finally {
-      releaseProfile();
+      releaseProfile?.();
     }
   }
 
