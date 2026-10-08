@@ -150,7 +150,7 @@ describe('ACP agent threads', () => {
     await $('#session-details button[aria-label="Close Changes"]').click();
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
     await $('#session-details .side-tabs button:nth-child(2)').click();
-    await $('#session-details button[aria-label="Close Ship runs"]').click();
+    await $('#session-details button[aria-label="Hide Ship panel"]').click();
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
     await expect($('#session-details')).toHaveText(expect.stringContaining('agent-change.txt'));
     await $('#session-details button[aria-label="Close Changes"]').click();

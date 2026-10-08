@@ -6838,6 +6838,20 @@
         deliveryState: owner.issue.state,
         refreshError: owner.issue.refreshError,
       });
+      const storedReconciliation = {
+        revisionMatches: reconciliation.revisionMatches,
+        resumable: reconciliation.resumable,
+        deliveryState: reconciliation.deliveryState,
+        issueState: reconciliation.issueState,
+        reason: reconciliation.reason,
+      };
+      if (
+        JSON.stringify(owner.issue.checkpointReconciliation) !==
+        JSON.stringify(storedReconciliation)
+      )
+        await updateShipIssue(owner.run, owner.issue, {
+          checkpointReconciliation: storedReconciliation,
+        });
       const incomingHandoff = owner.issue.contextHandoffs?.findLast(
         (handoff) => handoff.toThreadId === sourceId && handoff.outcome === 'pending',
       );
@@ -14770,6 +14784,7 @@
         onopensubagent={openSpawnTarget}
         {shipRuns}
         {shippingBusy}
+        {mergeOwner}
         nativeSubagents={Object.values(nativeSubagents)}
         onshiprefresh={() => tickShippingRuns(true)}
         onshipopen={openShipTarget}

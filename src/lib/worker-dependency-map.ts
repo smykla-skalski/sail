@@ -1,6 +1,6 @@
 import type { ShipIssue, ShipRun } from './issue-shipping';
 import type { NativeSubagent } from './native-subagents.ts';
-import { ciStatus, dependencyUrl, shipStatus } from './ship-progress.ts';
+import { ciStatus, dependencyUrl, shipBlock, shipStatus } from './ship-progress.ts';
 
 export type DependencyMapNode = {
   id: string;
@@ -159,7 +159,7 @@ export function buildWorkerDependencyMap(
     owner: `${run.provider} / ${issue.workerModel ?? issue.models?.join(', ') ?? 'Unassigned'}`,
     state: shipStatus(run, issue),
     blockingReason:
-      issue.blockedReason ??
+      shipBlock(issue) ??
       issue.error ??
       (shipStatus(run, issue) === 'Blocked' ? 'Blocked by a failed dependency.' : null),
     checkState: ciStatus(issue.checks),

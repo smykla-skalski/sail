@@ -45,3 +45,20 @@ Maya, the AI power user, runs several agents and moves between them while they w
 | Repeat the long answer in a Codex thread whose agent restarts on any load                                                                          | Switching never restored the running session, and the answer finished.                                                                             |
 
 With the previous per-load MCP settings restored (`SAIL_ACP_PER_LOAD_MCP=1`), four of these tasks fail because switching restarts the session. A real Codex turn kept running through a mid-turn load, but restarted its MCP server; the result is recorded on the tracking issue.
+
+# Ship batch walkthrough — 2026-10-08
+
+Priya, a lead shipping a batch, needs to find the one issue that needs her without scanning every row. This walkthrough runs her path against a private macOS build through embedded WebDriver with a stored 20-issue run: 3 issues that need input, 12 waiting on one of them, and 5 merged. It is a scripted, simulated persona pass, not a study with real users. The worker, GitHub, and checkpoint data are fixtures, so the result covers the layout and navigation, not live shipping.
+
+| Task                                                                 | Result                                                                                                                                                                               |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Open Ship (Cmd+L) with 20 issues and find the issue that needs input | **Needs input** is the first group. Its first row is visible without scrolling at 1280×850 (one action: opening Ship). One more action, a click or Enter, opens that issue's detail. |
+| Count the screens the whole batch needs                              | With Done shown, the 20 rows fit within two window heights (1700 px) at 850 px window height.                                                                                        |
+| Hide finished work                                                   | The 5 merged issues are hidden behind **Show done (5)**. When all 20 are merged, the list says "All 20 issues merged" with **Show done**.                                            |
+| Open an issue in a narrow pane, then go back                         | Below 560 px the detail replaces the list, focus lands on the detail heading, and Escape returns focus to the same row.                                                              |
+| Move through the list with the keyboard                              | ↓ and ↑ move between rows, stop at the ends, and Enter opens the focused row.                                                                                                        |
+| Read an issue's task contract                                        | The detail shows the objective and criteria, risk and gates, evidence, claim, and handoff, or says the worker has not recorded the contract yet.                                     |
+
+Screenshots: [grouped list](visual-audit/screenshots/ship-list-grouped.png), [grouped list, dark](visual-audit/screenshots/ship-list-grouped-dark.png), [drill-in detail](visual-audit/screenshots/ship-detail-drill-in.png), [split view](visual-audit/screenshots/ship-split-detail.png), [split view, dark](visual-audit/screenshots/ship-split-detail-dark.png).
+
+Not exercised in the GUI: a focused or selected row becoming Done while the list is open, and live frozen sorting while focus is in the list. These are covered by unit tests of the grouping and ordering logic only.

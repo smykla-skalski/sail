@@ -254,6 +254,14 @@ export async function completeAuthorizedPromptRecovery(
   await complete();
 }
 
+export type CheckpointReconciliation = {
+  revisionMatches: boolean;
+  resumable: boolean;
+  deliveryState: string;
+  issueState: string;
+  reason: string | null;
+};
+
 export interface ShipIssue {
   id: string;
   number: number;
@@ -296,6 +304,7 @@ export interface ShipIssue {
   dispatchFencePending?: boolean;
   claim?: ShippingClaim;
   checkpoint?: TaskCheckpoint;
+  checkpointReconciliation?: CheckpointReconciliation;
   checkpointThreadIds?: string[];
   contextCompactions?: Partial<Record<ContextProvider, number>>;
   contextEventIds?: string[];
