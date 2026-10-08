@@ -23,6 +23,7 @@
     "allow-shipping-changed-paths",
     "allow-shipping-base-revision",
     "allow-shipping-worktree-target",
+    "allow-shipping-repository-target",
     "allow-worktree-overviews",
     "allow-record-turn-snapshot",
     "allow-list-turn-snapshots",

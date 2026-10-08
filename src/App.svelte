@@ -5152,6 +5152,18 @@
       ? !(await invoke<boolean>('repository_path_available', { path }).catch(() => true))
       : false;
     if (worktreeGone && !issue.worktreeUnavailable) await update({ worktreeUnavailable: true });
+    else if (!worktreeGone && issue.worktreeUnavailable && !isDirectShipRun(run))
+      await update({ worktreeUnavailable: false });
+    if (worktreeGone && !issue.shippingTarget && issue.branch) {
+      const target = await invoke<ShippingTarget>('shipping_repository_target', {
+        repository: run.repository,
+        branch: issue.branch,
+      }).catch(() => null);
+      if (target && target.repository.toLowerCase() === run.remote.toLowerCase())
+        await update({ shippingTarget: target });
+    }
+    const pullRequestPath = worktreeGone ? null : path;
+    const pullRequestLookup = !worktreeGone || !!issue.shippingTarget;
     let currentRevision: string | undefined;
     let currentBaseRevision: string | undefined;
     if (path && !worktreeGone) {
@@ -5287,12 +5299,12 @@
           refreshedAt: Date.now(),
         });
         const branch = worktree?.branch ?? issue.branch;
-        if (branch && issue.state !== 'pending')
+        if (branch && issue.state !== 'pending' && pullRequestLookup)
           await refreshShippingPullRequest(
             run,
             { ...issue, branch },
             currentRevision,
-            path,
+            pullRequestPath,
             currentBaseRevision,
           );
         if (issue.refreshError) return;
@@ -5347,8 +5359,14 @@
       await update({ refreshError: describe(cause) });
       return;
     }
-    if (issue.state !== 'pending')
-      await refreshShippingPullRequest(run, issue, currentRevision, path, currentBaseRevision);
+    if (issue.state !== 'pending' && pullRequestLookup)
+      await refreshShippingPullRequest(
+        run,
+        issue,
+        currentRevision,
+        pullRequestPath,
+        currentBaseRevision,
+      );
     if (issue.refreshError) return;
     if (issue.state === 'merged') {
       if (issue.workerSettled && !issue.path) return;
@@ -5383,7 +5401,11 @@
           requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
       ) {
         try {
-          await updateShipIssue(run, issue, await settledImplementationAttribution(issue.path));
+          await updateShipIssue(
+            run,
+            issue,
+            worktreeGone ? {} : await settledImplementationAttribution(issue.path),
+          );
           if (
             !shipGatesSettled(issue) ||
             !shipEvidenceReadiness(issue).ready ||
@@ -5597,7 +5619,7 @@
             ))
           )
             return;
-          if (pr?.url) await update({ state: 'awaiting_merge', error: null });
+          if (pr?.url) await update({ state: 'awaiting_merge', workerSettled: true, error: null });
           else if (Date.now() - current.updated > 60_000)
             await update({
               state: 'failed',
