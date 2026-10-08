@@ -35,6 +35,7 @@ import {
   promptDispatchAdmissionVisible,
   recoverOpenCodePromptAdmission,
   recoveredClaimLeaseDeadlines,
+  recoveredClaimWorkerFenceRequired,
   readyShipIssues,
   registeredShipBranch,
   refreshShippingIssueAfterClaim,
@@ -1010,7 +1011,7 @@ void test('an expired foreign claim fences its orphaned OpenCode worker before t
   let workerRunning = true;
 
   const result = await fencePredecessorWorkerBeforeTakeover(
-    async () => ({ claim: issue.claim!, active: false }),
+    async () => ({ claim: issue.claim!, active: false, remainingLeaseMillis: 0 }),
     async () => {
       workerRunning = false;
     },
@@ -1030,55 +1031,25 @@ void test('an expired foreign claim fences its orphaned OpenCode worker before t
   );
 });
 
-void test('a recovered claim keeps its persisted lease expiry', () => {
-  const claim = {
-    id: 'claim-1',
-    holder: 'Sail A',
-    task: 'issue-11',
-    acquiredAt: '2026-10-07T10:00:00.000Z',
-    heartbeatAt: '2026-10-07T10:01:00.000Z',
-    expiresAt: '2026-10-07T10:03:00.000Z',
-    status: 'active' as const,
-    commentId: 1,
-  };
-
-  const deadlines = recoveredClaimLeaseDeadlines(
-    5_000,
-    Date.parse('2026-10-07T10:02:30.000Z'),
-    claim,
-  );
+void test('a recovered claim uses the server-relative remaining lease despite wall clock skew', () => {
+  const deadlines = recoveredClaimLeaseDeadlines(5_000, 9_000_000, 30_000);
 
   assert.deepEqual(deadlines, {
     monotonic: 35_000,
-    wall: Date.parse('2026-10-07T10:03:00.000Z'),
+    wall: 9_030_000,
   });
 });
 
 void test('an expired recovered claim is fenced immediately', () => {
-  const claim = {
-    id: 'claim-1',
-    holder: 'Sail A',
-    task: 'issue-11',
-    acquiredAt: '2026-10-07T10:00:00.000Z',
-    heartbeatAt: '2026-10-07T10:01:00.000Z',
-    expiresAt: '2026-10-07T10:03:00.000Z',
-    status: 'active' as const,
-    commentId: 1,
-  };
-
-  const deadlines = recoveredClaimLeaseDeadlines(
-    5_000,
-    Date.parse('2026-10-07T10:04:00.000Z'),
-    claim,
-  );
+  const deadlines = recoveredClaimLeaseDeadlines(5_000, 9_000_000, 0);
 
   assert.deepEqual(deadlines, {
     monotonic: 5_000,
-    wall: Date.parse('2026-10-07T10:04:00.000Z'),
+    wall: 9_000_000,
   });
 });
 
-void test('an inactive predecessor claim preserves a merged issue', () => {
+void test('a released predecessor claim preserves settled terminal cleanup state', async () => {
   const shipping = run();
   const issue = shipping.issues[0];
   issue.state = 'merged';
@@ -1096,16 +1067,34 @@ void test('an inactive predecessor claim preserves a merged issue', () => {
     commentId: 1,
   };
 
+  const result = await fencePredecessorWorkerBeforeTakeover(
+    async () => ({ claim: issue.claim!, active: false, remainingLeaseMillis: 0 }),
+    async () => {
+      if (!recoveredClaimWorkerFenceRequired(issue)) return;
+      throw new Error('OpenCode is unavailable; stop the worker manually.');
+    },
+    async () => undefined,
+  );
   Object.assign(issue, predecessorTakeoverChanges(issue));
 
+  assert.equal(result.fenced, true);
   assert.equal(issue.state, 'merged');
   assert.equal(issue.claim, undefined);
   assert.equal(issue.receiptId, 'settled-receipt');
   assert.equal(issue.threadId, 'settled-thread');
+  assert.equal(recoveredClaimWorkerFenceRequired(issue), false);
   assert.deepEqual(
     readyShipIssues(shipping).map((candidate) => candidate.id),
     ['second', 'dependent'],
   );
+});
+
+void test('an unsettled terminal issue still fences its recovered worker', () => {
+  const issue = run().issues[0];
+  issue.state = 'merged';
+  issue.workerSettled = false;
+
+  assert.equal(recoveredClaimWorkerFenceRequired(issue), true);
 });
 
 void test('an orphan stop failure retains the predecessor takeover fence', async () => {
@@ -1127,7 +1116,7 @@ void test('an orphan stop failure retains the predecessor takeover fence', async
     fencePredecessorWorkerBeforeTakeover(
       async () => {
         events.push('reserve takeover fence');
-        return { claim: issue.claim!, active: false };
+        return { claim: issue.claim!, active: false, remainingLeaseMillis: 0 };
       },
       async () => {
         events.push('stop worker');

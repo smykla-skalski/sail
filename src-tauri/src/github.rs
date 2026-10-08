@@ -95,6 +95,7 @@ pub struct ShippingClaim {
 pub struct ShippingClaimObservation {
     claim: ShippingClaim,
     active: bool,
+    remaining_lease_millis: i64,
 }
 
 const CLAIM_PREFIX: &str = "<!-- sail-claim:v1 ";
@@ -2028,9 +2029,14 @@ fn shipping_claim_observation(
     }
     let active = active_claim_winner(claims, observed_at)
         .is_some_and(|winner| winner.id == stored.id && winner.comment_id == stored.comment_id);
+    let remaining_lease_millis = claim_server_expiry(stored)
+        .map(|expiry| expiry.saturating_sub(observed_at))
+        .unwrap_or_default()
+        .max(0);
     Ok(ShippingClaimObservation {
         claim: stored.clone(),
         active,
+        remaining_lease_millis,
     })
 }
 
@@ -6596,7 +6602,9 @@ mod tests {
                 .unwrap();
 
         assert!(observed.active);
+        assert_eq!(observed.remaining_lease_millis, 1);
         assert!(!expired.active);
+        assert_eq!(expired.remaining_lease_millis, 0);
     }
 
     #[test]
@@ -6624,6 +6632,7 @@ mod tests {
 
         assert!(!stale_observation.active);
         assert!(verified.active);
+        assert_eq!(verified.remaining_lease_millis, 90_000);
         assert_eq!(verified.claim.heartbeat_at, renewed.heartbeat_at);
         assert_eq!(verified.claim.expires_at, renewed.expires_at);
     }

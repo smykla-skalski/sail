@@ -106,6 +106,7 @@
     promptDispatchAdmissionVisible,
     recoverOpenCodePromptAdmission,
     recoveredClaimLeaseDeadlines,
+    recoveredClaimWorkerFenceRequired,
     readyShipIssues,
     registeredShipBranch,
     refreshShippingIssueAfterClaim,
@@ -3669,7 +3670,9 @@
     const claim = issue.claim;
     if (!claim || claim.status !== 'active') return;
     const validationKey = `${run.id}:${issue.id}:${claim.id}:${claim.commentId}`;
-    scheduleRecoveredShippingClaimLeaseFence(run, issue, validationKey, claim);
+    shipClaimLeaseDeadlines.delete(validationKey);
+    shipClaimLeaseWallDeadlines.delete(validationKey);
+    clearShippingClaimLeaseFence(validationKey);
     try {
       const { observation, fenced } = await fencePredecessorWorkerBeforeTakeover(
         () =>
@@ -3680,6 +3683,7 @@
             recoveryId: shippingInstanceId,
           }),
         async () => {
+          if (!recoveredClaimWorkerFenceRequired(issue)) return;
           const blockedReason = 'The predecessor shipping claim expired; fencing its worker.';
           await updateShipIssue(run, issue, {
             claimFencePending: true,
@@ -3702,7 +3706,12 @@
       if (!fenced) {
         if (issue.claim?.id !== claim.id || issue.claim.commentId !== claim.commentId) return;
         await updateShipIssue(run, issue, { claim: observation.claim, refreshError: null });
-        scheduleRecoveredShippingClaimLeaseFence(run, issue, validationKey, observation.claim);
+        scheduleRecoveredShippingClaimLeaseFence(
+          run,
+          issue,
+          validationKey,
+          observation.remainingLeaseMillis,
+        );
         return;
       }
       if (!issue.workerSettled) return;
@@ -3721,9 +3730,13 @@
     run: ShipRun,
     issue: ShipIssue,
     validationKey: string,
-    claim: ShippingClaim,
+    remainingLeaseMillis: number,
   ): void {
-    const deadlines = recoveredClaimLeaseDeadlines(performance.now(), Date.now(), claim);
+    const deadlines = recoveredClaimLeaseDeadlines(
+      performance.now(),
+      Date.now(),
+      remainingLeaseMillis,
+    );
     shipClaimLeaseDeadlines.set(validationKey, deadlines.monotonic);
     shipClaimLeaseWallDeadlines.set(validationKey, deadlines.wall);
     scheduleShippingClaimLeaseFence(run, issue, validationKey, deadlines.monotonic);

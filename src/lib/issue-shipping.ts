@@ -33,6 +33,7 @@ export interface ShippingClaim {
 export interface ShippingClaimObservation {
   claim: ShippingClaim;
   active: boolean;
+  remainingLeaseMillis: number;
 }
 
 export interface DirectShipAuthorization {
@@ -493,10 +494,11 @@ export function claimMonotonicLeaseDeadline(monotonicStart: number, claim: Shipp
 export function recoveredClaimLeaseDeadlines(
   monotonicNow: number,
   wallNow: number,
-  claim: ShippingClaim,
+  remainingLeaseMillis: number,
 ): { monotonic: number; wall: number } {
-  const remaining = Date.parse(claim.expiresAt) - wallNow;
-  const boundedRemaining = Number.isFinite(remaining) ? Math.max(0, remaining) : 0;
+  const boundedRemaining = Number.isFinite(remainingLeaseMillis)
+    ? Math.max(0, remainingLeaseMillis)
+    : 0;
   return {
     monotonic: monotonicNow + boundedRemaining,
     wall: wallNow + boundedRemaining,
@@ -576,6 +578,11 @@ export function predecessorTakeoverChanges(issue: ShipIssue): Partial<ShipIssue>
     blockedReason: null,
     refreshError: null,
   };
+}
+
+export function recoveredClaimWorkerFenceRequired(issue: ShipIssue): boolean {
+  const terminal = issue.state === 'merged' || issue.state === 'failed';
+  return !terminal || issue.workerSettled !== true;
 }
 
 export function resumedShippingIssueChanges(issue: ShipIssue): Partial<ShipIssue> {
