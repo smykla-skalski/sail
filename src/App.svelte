@@ -458,14 +458,15 @@
     acpDisconnectedSessionIds,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
-    bufferBackgroundUpdate,
+    applyLiveTranscriptUpdate,
     forgetRecentTranscript,
-    invalidateBackgroundSession,
+    invalidateLiveTranscript,
     loadAgentThreads,
     loadInterruptedAgentTurns,
     loadRecentTranscript,
     rememberSessionState,
     saveAgentThreads,
+    tracksLiveTranscript,
     updateEntriesInPlace,
     type AgentCommand,
     type AgentConfigOption,
@@ -13235,8 +13236,11 @@
           if (plan)
             saveNativePlan({ agent: event.agent, directory: planDirectory, sessionId }, plan);
           if (replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
-            invalidateBackgroundSession(event.agent, sessionId);
-          else bufferBackgroundUpdate(event.agent, sessionId, data);
+            invalidateLiveTranscript(event.agent, sessionId);
+          else if (tracksLiveTranscript(event.agent, sessionId)) {
+            applyLiveTranscriptUpdate(event.agent, sessionId, data);
+            acpPlans().observe({ agent: event.agent, directory: planDirectory, sessionId }, data);
+          }
           if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions))
             rememberSessionState(event.agent, sessionId, {
               configOptions: data.configOptions as AgentConfigOption[],
