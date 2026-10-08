@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { ShipIssue, ShipRun } from '../../src/lib/issue-shipping';
 
 const waitForComposer = () =>
   browser.waitUntil(
@@ -254,5 +255,112 @@ describe('agent thread attention', () => {
     const crashed = $('.project-agent-row[aria-label*="Crash on cancel"]');
     await expect(crashed.$('.activity-status')).toHaveAttribute('data-state', 'failed');
     await expect(crashed).toHaveText(expect.stringContaining('Failed'));
+  });
+});
+
+const blocked = (id: string, number: number): ShipIssue => ({
+  id,
+  number,
+  url: `https://github.com/fixture/repo/issues/${number}`,
+  title: `Blocked fixture ${number}`,
+  dependsOn: [],
+  state: 'working',
+  branch: id,
+  path: null,
+  receiptId: null,
+  threadId: null,
+  pullRequest: null,
+  error: null,
+  reportedStatus: 'blocked',
+  blockedReason: `Decide ${id}`,
+});
+
+const focusedIssue = () =>
+  browser.execute(() => document.activeElement?.getAttribute('data-ship-issue-id') ?? '');
+
+describe('shared attention items', () => {
+  const repository = mkdtempSync(join(tmpdir(), 'sail-shared-attention-'));
+  before(async () => {
+    execFileSync('git', ['init', '-q', repository]);
+    await browser.setWindowSize(1280, 850);
+  });
+  after(async () => {
+    await browser.execute(() => {
+      localStorage.removeItem('sai-ship-runs');
+      localStorage.removeItem('sai-attention-ledger');
+      localStorage.removeItem('sai-notification-prefs');
+    });
+    rmSync(repository, { recursive: true, force: true });
+  });
+
+  it('counts one list everywhere, opens a clicked Ship notification, and moves with Cmd+J', async () => {
+    const path = realpathSync(repository);
+    const run: ShipRun = {
+      id: 'attention-run',
+      source: 'plan',
+      repository: path,
+      remote: 'fixture/repo',
+      provider: 'claude',
+      limit: 2,
+      approvedAt: 1,
+      externalClosed: {},
+      issues: [blocked('first', 71), blocked('second', 72)],
+    };
+    await browser.execute(
+      (directory, input) => {
+        sessionStorage.removeItem('sail-e2e-settings');
+        localStorage.setItem('sai-directory', directory);
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+        );
+        localStorage.setItem('sai-ship-runs', input);
+        localStorage.removeItem('sai-attention-ledger');
+        localStorage.setItem('sai-notifications-enabled', 'false');
+      },
+      path,
+      JSON.stringify([run]),
+    );
+    await browser.refresh();
+    await expect($('.app-shell')).toBeDisplayed();
+
+    await expect($('[aria-label="Pending requests"]')).toHaveText('Inbox (2)');
+    await expect($('.agent-status-bar')).toHaveText(expect.stringContaining('2 need attention'));
+    await $('[aria-label="Pending requests"]').click();
+    await expect($('.inbox-header span')).toHaveText('2');
+    await expect($$('.inbox-attention')).toBeElementsArrayOfSize(2);
+    await expect($('.inbox-group-heading')).toHaveText(path.split('/').at(-1)!);
+    await $('[aria-label="Close pending requests"]').click();
+
+    await browser.execute(
+      (target) =>
+        window.dispatchEvent(new CustomEvent('sail-e2e-notification-click', { detail: target })),
+      { type: 'ship-issue', runId: run.id, issueId: 'second', repository: path },
+    );
+    await expect($('.ship-panel')).toBeDisplayed();
+    await browser.waitUntil(() =>
+      browser.execute(
+        () => document.activeElement?.getAttribute('data-ship-issue-id') === 'second',
+      ),
+    );
+    await expect($('.side-tabs')).toHaveText(expect.stringContaining('Ship runs (2)'));
+
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'j', metaKey: true, bubbles: true }),
+      ),
+    );
+    await browser.waitUntil(async () => (await focusedIssue()) === 'first');
+    await browser.execute(() =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'j', metaKey: true, bubbles: true }),
+      ),
+    );
+    await browser.waitUntil(async () => (await focusedIssue()) === 'second');
+
+    await $('[aria-label="Pending requests"]').click();
+    await $('.inbox-attention').$('button=Dismiss').click();
+    await expect($('[aria-label="Pending requests"]')).toHaveText('Inbox (1)');
+    await expect($('.agent-status-bar')).toHaveText(expect.stringContaining('1 need attention'));
   });
 });

@@ -4,7 +4,7 @@ use tauri::{Emitter, Manager};
 #[tauri::command]
 pub fn show_attention_notification(
     window: tauri::Window,
-    thread_key: String,
+    target: serde_json::Value,
     title: String,
     body: String,
     sound: bool,
@@ -15,7 +15,7 @@ pub fn show_attention_notification(
         .appname("Sail")
         .summary(&title)
         .body(&body)
-        .action("default", "Open thread");
+        .action("default", "Open");
 
     #[cfg(target_os = "macos")]
     {
@@ -49,7 +49,7 @@ pub fn show_attention_notification(
             ) {
                 let _ = window.show();
                 let _ = window.set_focus();
-                let _ = app.emit("sail-notification-click", thread_key);
+                let _ = app.emit("sail-notification-click", target);
             }
         });
     });

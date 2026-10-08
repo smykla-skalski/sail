@@ -54,6 +54,9 @@ export type InboxOutcome = {
 
 export const maxInboxOutcomes = 100;
 
+/** Only finished work is saved. Requests and attention items are derived on every refresh. */
+export const persistedInboxKinds = ['turn-completed', 'check-failed'] as const;
+
 export type InboxCheck = {
   id: string;
   directory: string;
@@ -117,7 +120,7 @@ export function loadInboxOutcomes(raw: string | null): InboxOutcome[] {
           item &&
           typeof item === 'object' &&
           typeof item.key === 'string' &&
-          ['turn-completed', 'check-failed'].includes(item.kind) &&
+          (persistedInboxKinds as readonly string[]).includes(item.kind) &&
           typeof item.directory === 'string' &&
           typeof item.agentId === 'string' &&
           typeof item.sessionId === 'string' &&
@@ -146,6 +149,14 @@ export function isInboxOutcome(item: InboxItem): boolean {
   return item.kind === 'turn-completed' || item.kind === 'check-failed';
 }
 
+export type InboxOpenRoute = 'outcome' | 'acp-request' | 'opencode-request';
+
+/** How opening an Inbox row reaches its thread and the request or result inside it. */
+export function inboxOpenRoute(item: Pick<InboxItem, 'kind'>): InboxOpenRoute {
+  if (item.kind === 'turn-completed' || item.kind === 'check-failed') return 'outcome';
+  return item.kind === 'acp-permission' ? 'acp-request' : 'opencode-request';
+}
+
 export function inboxTurnMessageIndex(
   messages: { kind: 'user' | 'assistant'; created: number }[],
   completedAt: number,
@@ -167,7 +178,7 @@ export function inboxTurnMessageIndex(
 
 export const maxInboxSeen = 256;
 
-function projectName(path: string): string {
+export function repositoryName(path: string): string {
   return path.split(/[\\/]/).findLast((part) => !!part) ?? path;
 }
 
@@ -175,12 +186,12 @@ export function inboxLocations(catalog: ProjectCatalog): InboxLocation[] {
   return catalog.repositories.flatMap((repository) => [
     {
       directory: repository,
-      project: projectName(repository),
+      project: repositoryName(repository),
       worktree: null,
     },
     ...(catalog.worktrees[repository] ?? []).map((worktree) => ({
       directory: worktree.path,
-      project: projectName(repository),
+      project: repositoryName(repository),
       worktree: worktree.branch,
     })),
   ]);

@@ -3,6 +3,7 @@
   import HarnessIcon from './HarnessIcon.svelte';
   import MenuButton from './MenuButton.svelte';
   import type { AgentAvailability, AgentId } from './lib/acp';
+  import { ariaKeyShortcutsFor } from './lib/shortcuts';
 
   export type TopbarThreadActions =
     | { kind: 'agent'; title: string; ondelete: () => void }
@@ -126,8 +127,12 @@
   </div>
   <div class="topbar-actions">
     <div class="topbar-primary">
-      <Button variant="ghost" size="sm" aria-label="Pending requests" onclick={oninbox}
-        >Inbox ({inboxCount})</Button
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-label="Pending requests"
+        aria-keyshortcuts={ariaKeyShortcutsFor('attention.next')}
+        onclick={oninbox}>Inbox ({inboxCount})</Button
       >
       {#if directory}<MenuButton
           class="new-agent-menu"

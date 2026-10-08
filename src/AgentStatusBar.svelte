@@ -4,12 +4,21 @@
   import HarnessIcon from './HarnessIcon.svelte';
   import { agentStatusCounts, resetLabel, type AgentStatusItem } from './lib/agent-status';
 
-  let { items, onopen }: { items: AgentStatusItem[]; onopen: (key: string) => unknown } = $props();
+  let {
+    items,
+    attentionCount,
+    onopen,
+  }: {
+    items: AgentStatusItem[];
+    attentionCount: number;
+    onopen: (key: string) => unknown;
+  } = $props();
   let expanded = $state(false);
   let now = $state(Date.now());
   let root: HTMLElement;
   let summary: HTMLButtonElement;
   const counts = $derived(agentStatusCounts(items));
+  const label = { working: ' working', need_attention: ' need attention', ready: ' ready' };
 
   function dismiss(event: MouseEvent) {
     if (expanded && !root.contains(event.target as Node)) expanded = false;
@@ -48,14 +57,19 @@
     }}
   >
     <span class="agent-status-title">Agents</span>
-    {#if items.length}
+    {#if items.length || attentionCount}
       <span
         class="agent-status-counts"
-        aria-label={`${counts.working} working, ${counts.waiting} need input, ${counts.ready} ready`}
+        aria-label={`${counts.working} working, ${attentionCount} need attention, ${counts.ready} ready`}
       >
-        {#if counts.working}<span data-state="working">● {counts.working} working</span>{/if}
-        {#if counts.waiting}<span data-state="waiting">! {counts.waiting} need input</span>{/if}
-        {#if counts.ready}<span data-state="ready">✓ {counts.ready} ready</span>{/if}
+        {#if counts.working}<span data-state="working"
+            >● <b>{counts.working}</b><i>{label.working}</i></span
+          >{/if}
+        {#if attentionCount}<span data-state="waiting"
+            >! <b>{attentionCount}</b><i>{label.need_attention}</i></span
+          >{/if}
+        {#if counts.ready}<span data-state="ready">✓ <b>{counts.ready}</b><i>{label.ready}</i></span
+          >{/if}
       </span>
       <span class="agent-status-providers" aria-hidden="true">
         {#each items.slice(0, 4) as item (item.key)}
@@ -157,6 +171,11 @@
   .agent-status-counts span,
   .agent-status-providers span {
     white-space: nowrap;
+  }
+  .agent-status-counts b,
+  .agent-status-counts i {
+    font-weight: inherit;
+    font-style: normal;
   }
   .agent-status-counts [data-state='working'] {
     color: var(--activity-working);
@@ -270,11 +289,8 @@
     .agent-status-counts {
       margin-left: auto;
     }
-    .agent-status-counts span {
-      font-size: 0;
-    }
-    .agent-status-counts span::first-letter {
-      font-size: 11px;
+    .agent-status-counts i {
+      display: none;
     }
     .agent-status-row {
       grid-template-columns: auto minmax(0, 1fr) auto;
