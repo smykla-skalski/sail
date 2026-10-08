@@ -435,6 +435,27 @@
           onclick={addValidationChoice}>Add model</Button
         >
       </section>
+      <section class="settings-card">
+        <h2>Context handoff</h2>
+        <p>
+          Ask Ship workers to checkpoint ten percentage points before this limit, then offer a
+          fresh-thread handoff at the limit.
+        </p>
+        <label for="context-handoff-threshold">Context threshold (%)</label>
+        <input
+          id="context-handoff-threshold"
+          type="number"
+          min="60"
+          max="95"
+          step="1"
+          value={snapshot?.contextHandoffThreshold ?? 85}
+          onchange={(event) =>
+            send({
+              type: 'context-handoff-threshold',
+              value: Number(event.currentTarget.value),
+            })}
+        />
+      </section>
       <section class="settings-card hook-inspector">
         <h2>Runtime hook integration</h2>
         <p>

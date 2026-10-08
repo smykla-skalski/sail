@@ -28,6 +28,7 @@ export type SettingsSnapshot = {
   agentStatusEnabled: boolean;
   agentThreadListEnabled: boolean;
   agentMessagesEnabled: boolean;
+  contextHandoffThreshold: number;
 };
 
 export type SettingsAction =
@@ -41,6 +42,7 @@ export type SettingsAction =
   | { type: 'agent-status'; value: boolean }
   | { type: 'agent-thread-list'; value: boolean }
   | { type: 'agent-messages'; value: boolean }
+  | { type: 'context-handoff-threshold'; value: number }
   | { type: 'detect-agents' }
   | { type: 'cross-validation'; value: ValidationSettings }
   | { type: 'restart-setup' };

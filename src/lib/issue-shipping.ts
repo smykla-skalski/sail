@@ -3,6 +3,7 @@ import type { RegisteredWorktree } from './coordination';
 import type { SpawnState } from './agent-results';
 import type { ShipEvent, ShipGate, ShipCheck } from './ship-progress';
 import { initialTaskCheckpoint, type TaskCheckpoint } from './task-checkpoint.ts';
+import type { ContextHandoff, ContextProvider } from './context-handoff.ts';
 import type { EvidenceManifest } from './task-evidence.ts';
 import type { ShipValidationPolicy } from './ship-risk-policy.ts';
 
@@ -43,6 +44,18 @@ export interface ShipIssue {
   refreshError?: string | null;
   checkpoint?: TaskCheckpoint;
   checkpointThreadIds?: string[];
+  contextCompactions?: Partial<Record<ContextProvider, number>>;
+  contextEventIds?: string[];
+  contextHandoffs?: ContextHandoff[];
+  contextCheckpointRequestedAt?: number;
+  contextCheckpointRequestedSequence?: number;
+  contextHandoffOfferedAt?: number;
+  contextHandoffOfferedSequence?: number;
+  contextPercent?: number;
+  contextPercentByThread?: Record<string, number>;
+  handoffRecoveryRequired?: boolean;
+  retryCount?: number;
+  lostStateFailures?: number;
   evidenceManifests?: EvidenceManifest[];
   evidenceRevision?: string;
   evidenceCommit?: string;

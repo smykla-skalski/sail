@@ -28,7 +28,7 @@
   import type { ReviewCapture, ReviewPreview } from './lib/review-evidence';
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import type { PublishedGraph } from './lib/issue-graph';
-  import type { ShipRun } from './lib/issue-shipping';
+  import type { ShipIssue, ShipRun } from './lib/issue-shipping';
   import type { ActivityHistoryEvent } from './lib/activity-history';
   import type { WorkspaceActivityItem } from './lib/workspace-activity';
   import type { ShipItIssue } from './lib/implementation-models';
@@ -67,6 +67,7 @@
     onshiprefresh: () => Promise<void>;
     onshipopen: (path: string, threadId?: string | null) => Promise<void>;
     onshipsettings: () => Promise<void>;
+    onshiphandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
     onship: (
       graph: PublishedGraph,
       provider: ShipRun['provider'],
@@ -162,6 +163,7 @@
     onshiprefresh,
     onshipopen,
     onshipsettings,
+    onshiphandoff,
     onship,
     onshipit,
     postTurnChecks,
@@ -552,6 +554,7 @@
       {onshiprefresh}
       {onshipopen}
       {onshipsettings}
+      {onshiphandoff}
       {onship}
       {onshipit}
       {postTurnChecks}
@@ -659,6 +662,7 @@
       {onshiprefresh}
       {onshipopen}
       {onshipsettings}
+      {onshiphandoff}
       {onship}
       {onshipit}
       {postTurnChecks}
@@ -937,6 +941,7 @@
                       closeNativeDetails();
                     }}
                     onsettings={onshipsettings}
+                    onhandoff={onshiphandoff}
                   />
                 {:else if nativeTab === 'history'}
                   <PlanHistoryPanel
@@ -1064,6 +1069,7 @@
                       closeAcpDetails();
                     }}
                     onsettings={onshipsettings}
+                    onhandoff={onshiphandoff}
                   />
                 {:else if acpTab === 'activity'}
                   <WorkspaceActivity
