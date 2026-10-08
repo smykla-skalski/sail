@@ -202,8 +202,7 @@ describe('agent sessions survive thread switches', () => {
       const created = await Promise.all(
         pending.map((thread) =>
           core.invoke<{ sessionId: string }>('acp_new_session', {
-            agent: thread.agent,
-            cwd: thread.directory,
+            params: { agent: thread.agent, cwd: thread.directory },
           }),
         ),
       );
