@@ -34,6 +34,7 @@ export type ShipCheck = {
   databaseId?: number;
   runId?: number;
   attempt?: number;
+  statusContextId?: string;
   identityUncertain?: boolean;
 };
 export type ShippingPullRequest = {
@@ -1091,6 +1092,7 @@ const shipIssueSchema = z.object({
         databaseId: z.number().int().positive().optional(),
         runId: z.number().int().positive().optional(),
         attempt: z.number().int().positive().optional(),
+        statusContextId: z.string().min(1).optional(),
         identityUncertain: z.boolean().optional(),
       }),
     )

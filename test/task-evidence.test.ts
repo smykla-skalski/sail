@@ -528,7 +528,7 @@ void test('the evidence bound retains each latest gate above a full command hist
   );
 });
 
-void test('keeps the evidence manifest valid when required entries fill its capacity', () => {
+void test('keeps 98 single-criterion proofs and three required gates merge-ready', () => {
   const requiredCriteria = Array.from({ length: 98 }, (_, index) => `criterion-${index}`);
   const requiredGates = ['code-adversary', 'findings-adversary', 'test-adversary'];
   let manifests = requiredGates.reduce<EvidenceManifest[]>(
@@ -559,25 +559,30 @@ void test('keeps the evidence manifest valid when required entries fill its capa
     manifests,
   );
 
-  assert.equal(manifests[0].evidence.length, 100);
-  assert.equal(
-    manifests[0].evidence.some((entry) => entry.id === 'proof-97'),
-    true,
-  );
+  const readiness = evidenceReadiness(manifests, 'revision', requiredGates, requiredCriteria);
+  assert.equal(manifests[0].evidence.length, 101);
+  assert.equal(manifests[0].evidence.filter((entry) => entry.kind === 'gate').length, 3);
+  assert.equal(manifests[0].evidence.filter((entry) => entry.kind === 'command').length, 98);
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.missingGates, []);
+  assert.deepEqual(readiness.unverifiedCriteria, []);
   assert.doesNotThrow(() => evidenceManifestsSchema.parse(manifests));
-  assert.doesNotThrow(() =>
-    recordTaskEvidence(
-      manifests,
-      'revision',
-      requiredCriteria,
-      evidence({
-        id: 'later-command',
-        kind: 'command',
-        name: 'later-command',
-        timestamp: 200,
-        criteria: [],
-      }),
-    ),
+  const withLaterCommand = recordTaskEvidence(
+    manifests,
+    'revision',
+    requiredCriteria,
+    evidence({
+      id: 'later-command',
+      kind: 'command',
+      name: 'later-command',
+      timestamp: 200,
+      criteria: [],
+    }),
+  );
+  assert.equal(withLaterCommand[0].evidence.length, 101);
+  assert.equal(
+    evidenceReadiness(withLaterCommand, 'revision', requiredGates, requiredCriteria).ready,
+    true,
   );
 });
 
@@ -1241,6 +1246,27 @@ void test('counts each CI execution once across polling and status changes', () 
   manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, retry);
   assert.equal(manifests[0].evidence.length, 2);
   assert.equal(summarizeTaskEconomics(manifests, { ready: false }, 'revision').totals.checks, 2);
+});
+
+void test('uses a stable status context identity across polls', () => {
+  const context = {
+    name: 'external/build',
+    url: 'https://ci.test/build/1',
+    statusContextId: 'SC_kwDOStatusContext1',
+  };
+  const pending = ciEvidence(context, 'pending', 10);
+  const passed = ciEvidence({ ...context, url: 'https://ci.test/build/1/result' }, 'passed', 20);
+  assert.equal(pending.id, passed.id);
+  assert.equal(passed.identityUncertain, false);
+
+  let manifests = recordCiEvidenceObservation([], 'revision', criteria, pending);
+  manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, passed);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+
+  assert.equal(manifests[0].evidence.length, 1);
+  assert.equal(manifests[0].evidence[0].result, 'passed');
+  assert.equal(summary.identityCoverageComplete, true);
+  assert.equal(summary.accepted, true);
 });
 
 void test('keeps a newer live CI state when the same execution is archived', () => {

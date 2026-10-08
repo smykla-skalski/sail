@@ -28,6 +28,7 @@
     databaseId?: number;
     runId?: number;
     attempt?: number;
+    statusContextId?: string;
     identityUncertain?: boolean;
   };
   type PullRequestChecks = { number: number; url: string; checks: PullRequestCheck[] };

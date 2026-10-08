@@ -74,6 +74,24 @@ void test('reopened queued issues recover across restart without retrying worker
   }
 });
 
+void test('status context identity survives Ship run persistence', () => {
+  const run = fixture();
+  run.issues[0].checks = [
+    {
+      name: 'external/build',
+      state: 'SUCCESS',
+      url: 'https://ci.test/build/1',
+      statusContextId: 'SC_kwDOStatusContext1',
+      identityUncertain: false,
+    },
+  ];
+
+  const restored = loadShipRuns(JSON.stringify([run]))[0];
+
+  assert.equal(restored.issues[0].checks?.[0].statusContextId, 'SC_kwDOStatusContext1');
+  assert.equal(restored.issues[0].checks?.[0].identityUncertain, false);
+});
+
 void test('validation drift leaves verdict and evidence uncommitted', async () => {
   await Promise.all(
     (['revision', 'generation', 'base'] as const).map(async (drift) => {

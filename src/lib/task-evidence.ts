@@ -14,6 +14,9 @@ import {
   type EconomicsRollup,
 } from './task-economics.ts';
 
+const evidenceHistoryLimit = 100;
+const evidenceStorageLimit = 200;
+
 export const evidenceResults = ['passed', 'failed', 'pending', 'blocked'] as const;
 export type EvidenceResult = (typeof evidenceResults)[number];
 
@@ -58,7 +61,7 @@ export const evidenceManifestSchema = z
     revision: z.string().min(1),
     baseRevision: z.string().min(1).nullable().default(null),
     acceptanceCriteria: z.array(z.string().min(1).max(2000)).min(1).max(100),
-    evidence: z.array(taskEvidenceSchema).max(100),
+    evidence: z.array(taskEvidenceSchema).max(evidenceStorageLimit),
     stale: z.boolean(),
     createdAt: z.number().int().nonnegative().max(maxEconomicsCounter),
     updatedAt: z.number().int().nonnegative().max(maxEconomicsCounter),
@@ -104,8 +107,6 @@ export type EvidenceReadiness = {
 };
 
 const manifestLimit = 20;
-const evidenceLimit = 100;
-
 function evidenceIsNewer(candidate: TaskEvidence, previous: TaskEvidence): boolean {
   if (candidate.executionOrder && previous.executionOrder) {
     const executionOrder =
@@ -145,7 +146,7 @@ function manifestIdentity(revision: string, baseRevision: string | null | undefi
 
 function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
   const sorted = evidence.toSorted(compareEvidence);
-  if (sorted.length <= evidenceLimit) return sorted;
+  if (sorted.length <= evidenceHistoryLimit) return sorted;
   const latest = latestOutcomeEvidence(sorted);
   const latestGates = new Map<string, TaskEvidence>();
   for (const entry of sorted) {
@@ -163,18 +164,18 @@ function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
   }
   const protectedIds = new Set<string>();
   for (const entry of [...latestGates.values()].toSorted(compareEvidence).toReversed()) {
-    if (protectedIds.size >= evidenceLimit) break;
     protectedIds.add(entry.id);
   }
   for (const entry of [...latestCriteria.values()].toSorted(compareEvidence).toReversed()) {
-    if (protectedIds.size >= evidenceLimit) break;
     protectedIds.add(entry.id);
   }
   for (const entry of latest.filter(isCiObservation).toSorted(compareEvidence).toReversed()) {
-    if (protectedIds.size >= evidenceLimit) break;
+    if (protectedIds.size >= evidenceHistoryLimit) break;
     protectedIds.add(entry.id);
   }
-  const remainingCapacity = evidenceLimit - protectedIds.size;
+  if (protectedIds.size > evidenceStorageLimit)
+    throw new Error('Readiness evidence exceeds the evidence storage limit.');
+  const remainingCapacity = Math.max(0, evidenceHistoryLimit - protectedIds.size);
   const retained = remainingCapacity
     ? sorted.filter((entry) => !protectedIds.has(entry.id)).slice(-remainingCapacity)
     : [];
@@ -465,7 +466,7 @@ function withBoundedEvidence(
   evidence: TaskEvidence[],
 ): EvidenceManifest {
   const sorted = evidence.toSorted(compareEvidence);
-  if (sorted.length <= evidenceLimit) return { ...manifest, evidence: sorted };
+  if (sorted.length <= evidenceHistoryLimit) return { ...manifest, evidence: sorted };
   const retained = boundEvidence(sorted);
   const retainedIds = new Set(retained.map((entry) => entry.id));
   const evicted = sorted.filter((entry) => !retainedIds.has(entry.id));
@@ -860,6 +861,7 @@ export type CiEvidenceIdentityInput = {
   databaseId?: number;
   runId?: number;
   attempt?: number;
+  statusContextId?: string;
   identityUncertain?: boolean;
 };
 
@@ -873,13 +875,17 @@ export function ciEvidenceIdentity(
   executionOrder?: [number, number];
 } {
   const stableRun = check.runId ?? check.databaseId;
-  const uncertain = check.identityUncertain === true || stableRun === undefined;
+  const stableStatus = check.statusContextId;
+  const uncertain =
+    check.identityUncertain === true || (stableRun === undefined && stableStatus === undefined);
   const execution =
-    stableRun === undefined
-      ? `${revision}\u0000${check.name}\u0000legacy\u0000${check.url}`
-      : `${revision}\u0000${check.name}\u0000${check.runId ?? 'no-run'}\u0000${
+    stableRun !== undefined
+      ? `${revision}\u0000${check.name}\u0000${check.runId ?? 'no-run'}\u0000${
           check.databaseId ?? 'no-check'
-        }\u0000${check.attempt ?? 1}`;
+        }\u0000${check.attempt ?? 1}`
+      : stableStatus !== undefined
+        ? `${revision}\u0000${check.name}\u0000status\u0000${stableStatus}`
+        : `${revision}\u0000${check.name}\u0000legacy\u0000${check.url}`;
   return {
     id: `ci:${stableIdentity(execution)}`,
     uncertain,

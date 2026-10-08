@@ -227,6 +227,8 @@ pub struct PullRequestCheck {
     run_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attempt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_context_id: Option<String>,
     identity_uncertain: bool,
 }
 
@@ -1635,13 +1637,15 @@ fn parse_pull_request_checks(pr: &serde_json::Value) -> Result<PullRequestChecks
                 attempt: check["checkSuite"]["workflowRun"]["runAttempt"]
                     .as_u64()
                     .or_else(|| check["checkSuite"]["workflowRun"]["attempt"].as_u64()),
+                status_context_id: check["id"].as_str().map(str::to_string),
                 identity_uncertain: check["databaseId"].as_u64().is_none()
                     && check["checkSuite"]["workflowRun"]["databaseId"]
                         .as_u64()
                         .is_none()
                     && check["checkSuite"]["workflowRun"]["runDatabaseId"]
                         .as_u64()
-                        .is_none(),
+                        .is_none()
+                    && check["id"].as_str().is_none(),
             }
         })
         .collect();
@@ -1660,7 +1664,7 @@ fn check_rollup_with_identities(
     let (owner, name) = target
         .split_once('/')
         .ok_or("GitHub repository identity is invalid.")?;
-    let query = r#"query($owner:String!,$name:String!,$oid:GitObjectID!,$after:String){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$after){nodes{__typename ... on CheckRun{databaseId name status conclusion detailsUrl checkSuite{workflowRun{databaseId runAttempt}}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage endCursor}}}}}}}"#;
+    let query = r#"query($owner:String!,$name:String!,$oid:GitObjectID!,$after:String){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$after){nodes{__typename ... on CheckRun{databaseId name status conclusion detailsUrl checkSuite{workflowRun{databaseId runAttempt}}} ... on StatusContext{id context state targetUrl createdAt}} pageInfo{hasNextPage endCursor}}}}}}}"#;
     let owner_argument = format!("owner={owner}");
     let name_argument = format!("name={name}");
     let oid_argument = format!("oid={oid}");
@@ -2084,6 +2088,31 @@ mod tests {
         assert_eq!(check.database_id, Some(50));
         assert_eq!(check.run_id, Some(10));
         assert_eq!(check.attempt, Some(2));
+        assert!(!check.identity_uncertain);
+    }
+
+    #[test]
+    fn pull_request_checks_preserve_stable_status_context_identity() {
+        let pr = serde_json::json!({
+            "number": 1,
+            "url": "https://github.test/pull/1",
+            "statusCheckRollup": [{
+                "__typename": "StatusContext",
+                "id": "SC_kwDOStatusContext1",
+                "context": "external/build",
+                "state": "SUCCESS",
+                "targetUrl": "https://ci.test/build/1",
+                "createdAt": "2026-10-08T04:00:00Z"
+            }]
+        });
+
+        let parsed = parse_pull_request_checks(&pr).unwrap();
+        let check = &parsed.checks[0];
+        assert_eq!(check.name, "external/build");
+        assert_eq!(
+            check.status_context_id.as_deref(),
+            Some("SC_kwDOStatusContext1")
+        );
         assert!(!check.identity_uncertain);
     }
 
