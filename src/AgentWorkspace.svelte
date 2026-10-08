@@ -489,6 +489,7 @@
   }
   let error = $state('');
   let entries = $state.raw<AgentEntry[]>([]);
+  let showingNativeChild = false;
   let nativePlan = $state<NativePlan | null>(null);
   let planRequested = $state(false);
   let completedTurn = Promise.resolve();
@@ -1078,8 +1079,9 @@
     rememberTranscript();
     const previousSessionId = activeSessionId;
     // Opening a native child leaves the parent running too, so its transcript keeps updating.
-    if (previousSessionId && previousSessionId !== id && !ephemeral)
+    if (previousSessionId && previousSessionId !== id && !ephemeral && !showingNativeChild)
       trackLiveTranscript(agent, previousSessionId, entries, historyLoaded);
+    showingNativeChild = !!nativeEntries;
     rememberDraft(previousSessionId);
     const savedDraft = recallComposerDraft(composerDraftKey(directory, agent, id));
     draft = savedDraft?.text ?? '';

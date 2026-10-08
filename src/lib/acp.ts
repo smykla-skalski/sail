@@ -507,6 +507,8 @@ export interface LiveTranscript {
 }
 
 const liveTranscripts = new Map<string, LiveTranscript>();
+/** Restores in flight per session. Their history replay must not reach a kept transcript. */
+const restoringTranscripts = new Map<string, number>();
 
 function sessionKey(agent: AgentId, sessionId: string): string {
   return JSON.stringify([agent, sessionId]);
@@ -536,6 +538,7 @@ export function trackLiveTranscript(
 ): void {
   const key = sessionKey(agent, sessionId);
   liveTranscripts.delete(key);
+  if (restoringTranscripts.has(key)) return;
   liveTranscripts.set(key, { entries: entries.slice(), complete });
   for (const oldest of liveTranscripts.keys()) {
     if (liveTranscripts.size <= liveTranscriptLimit) break;
@@ -553,18 +556,15 @@ export function applyLiveTranscriptUpdate(
   update: Record<string, unknown>,
   now = Date.now(),
 ): void {
-  const transcript = liveTranscripts.get(sessionKey(agent, sessionId));
+  const key = sessionKey(agent, sessionId);
+  const transcript = liveTranscripts.get(key);
   if (!transcript) return;
-  if (update.sessionUpdate === 'user_message_chunk') {
-    const block = update.content;
-    const text =
-      block && typeof block === 'object' && 'text' in block && typeof block.text === 'string'
-        ? block.text
-        : null;
-    const lastUser = transcript.entries.findLast((entry) => entry.type === 'user');
-    // The sender's own prompt is already a local entry; its echo would duplicate it.
-    if (text !== null && lastUser?.type === 'user' && lastUser.text === text) return;
+  if (restoringTranscripts.has(key)) {
+    liveTranscripts.delete(key);
+    return;
   }
+  // Matches the shown view: the local entry stands for the prompt, so an echo would duplicate it.
+  if (update.sessionUpdate === 'user_message_chunk') return;
   updateEntriesInPlace(transcript.entries, update, now);
 }
 
@@ -657,6 +657,8 @@ function restoreSession(
   if (existing) return existing;
   // A restore replays history, so this session's kept transcript can no longer be trusted.
   invalidateLiveTranscript(agent, sessionId);
+  const live = sessionKey(agent, sessionId);
+  restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
   const request = invoke<Record<string, unknown>>(method, {
     agent,
     cwd,
@@ -671,6 +673,9 @@ function restoreSession(
   void request
     .finally(() => {
       if (restoringSessions.get(key) === request) restoringSessions.delete(key);
+      const remaining = (restoringTranscripts.get(live) ?? 1) - 1;
+      if (remaining > 0) restoringTranscripts.set(live, remaining);
+      else restoringTranscripts.delete(live);
     })
     .catch(() => undefined);
   return request;

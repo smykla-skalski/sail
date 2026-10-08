@@ -381,13 +381,7 @@ void test('a kept transcript applies every update while the session is off scree
     view.entries.map((entry) =>
       entry.type === 'tool' ? `${entry.title}:${entry.status}` : `${entry.type}:${entry.text}`,
     ),
-    [
-      'user:Fix the bug',
-      'assistant:Working on it',
-      'Read file:completed',
-      'user:Also add a test',
-      `assistant:${flood}`,
-    ],
+    ['user:Fix the bug', 'assistant:Working on it', 'Read file:completed', `assistant:${flood}`],
   );
   assert.equal(view.configOptions, configOptions);
   assert.equal(view.complete, true);
