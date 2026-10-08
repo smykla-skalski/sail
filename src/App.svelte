@@ -1747,7 +1747,24 @@
     messages.filter((message) => message.type === 'user' || message.type === 'assistant'),
   );
   let openCodeChildReceipts = $state.raw<SpawnReceipt[]>([]);
-  let navigableReceipts = $derived([...visibleSpawnReceipts, ...openCodeChildReceipts]);
+  // Opening a child replaces the live list with the child's own children, so the parent's list is
+  // kept for the breadcrumb, sibling keys and sidebar nesting.
+  let openCodeChildHistory = $state.raw<Record<string, SpawnReceipt[]>>({});
+  function rememberOpenCodeChildren(receipts: SpawnReceipt[]) {
+    openCodeChildReceipts = receipts;
+    const source = receipts[0]?.sourceId;
+    if (source) openCodeChildHistory = { ...openCodeChildHistory, [source]: receipts };
+  }
+  let navigableReceipts = $derived.by(() => {
+    const live = new Set(openCodeChildReceipts.map((receipt) => receipt.receiptId));
+    return [
+      ...visibleSpawnReceipts,
+      ...openCodeChildReceipts,
+      ...Object.values(openCodeChildHistory)
+        .flat()
+        .filter((receipt) => !live.has(receipt.receiptId)),
+    ];
+  });
   let subagentNav = $derived.by(() => {
     const focused = actionAgentThread
       ? {
@@ -14983,7 +15000,7 @@
                   parentID={sessionID}
                   {directory}
                   onopen={openSpawnTarget}
-                  onchildren={(receipts) => (openCodeChildReceipts = receipts)}
+                  onchildren={rememberOpenCodeChildren}
                 />
                 {#each pendingShellRuns as run (run.id)}
                   <ShellCommandCard
