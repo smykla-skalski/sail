@@ -4,6 +4,7 @@
   import TaskLocation from './TaskLocation.svelte';
   import Markdown from './Markdown.svelte';
   import type { OpenCodeClient, SessionMessageInfo } from './lib/opencode';
+  import { runOpenCodePromptStart } from './lib/opencode-turns';
   import type { AgentId } from './lib/acp';
   import {
     composerTaskLocation,
@@ -176,6 +177,7 @@
     await pendingPaste;
     const text = draft.trim();
     if ((!text && !attachments.length) || !client || !forkID || busy) return;
+    const sessionID = forkID;
     const files = [...attachments];
     busy = true;
     error = '';
@@ -183,11 +185,13 @@
     attachments = [];
     let accepted = false;
     try {
-      const inbox = await client.session.prompt({
-        sessionID: forkID,
-        text,
-        files: files.map((item) => ({ uri: fileUri(item.path), name: item.name })),
-      });
+      const inbox = await runOpenCodePromptStart(directory, () =>
+        client.session.prompt({
+          sessionID,
+          text,
+          files: files.map((item) => ({ uri: fileUri(item.path), name: item.name })),
+        }),
+      );
       accepted = true;
       if (disposed) {
         await client.session.inbox.cancel({ sessionID: forkID, inboxID: inbox.id }).catch(() => {});

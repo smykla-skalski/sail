@@ -39,7 +39,7 @@
     savedShipItOwner,
     type ShipItIssue,
   } from './lib/implementation-models';
-  import { runSerialOpenCodeTurn } from './lib/opencode-turns';
+  import { runOpenCodePromptStart, runSerialOpenCodeTurn } from './lib/opencode-turns';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
   import { withSpawnResponses, type SpawnReceipt } from './lib/agent-results';
@@ -804,18 +804,20 @@
         );
         let response;
         try {
-          response = await source.session.prompt({
-            sessionID: id,
-            text: resolveSkillPrompt(skills, text, implementingModel),
-            skills: promptSkill(skills, text)?.id
-              ? [{ id: promptSkill(skills, text)!.id! }]
-              : undefined,
-            delivery: queued ? 'steer' : undefined,
-            files: paths.map((path) => ({
-              uri: fileUri(path),
-              name: clipboardNames.get(path) ?? path.split(/[\\/]/).at(-1),
-            })),
-          });
+          response = await runOpenCodePromptStart(turnDirectory, () =>
+            source.session.prompt({
+              sessionID: id,
+              text: resolveSkillPrompt(skills, text, implementingModel),
+              skills: promptSkill(skills, text)?.id
+                ? [{ id: promptSkill(skills, text)!.id! }]
+                : undefined,
+              delivery: queued ? 'steer' : undefined,
+              files: paths.map((path) => ({
+                uri: fileUri(path),
+                name: clipboardNames.get(path) ?? path.split(/[\\/]/).at(-1),
+              })),
+            }),
+          );
         } catch (cause) {
           await recordImplementationModel(turnDirectory, implementingModel, tracking);
           throw cause;

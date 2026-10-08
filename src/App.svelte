@@ -188,7 +188,11 @@
     settledImplementationAttribution,
     recordImplementationModel,
   } from './lib/implementation-models';
-  import { runSerialOpenCodeTurn } from './lib/opencode-turns';
+  import {
+    runOpenCodeCleanup,
+    runOpenCodePromptStart,
+    runSerialOpenCodeTurn,
+  } from './lib/opencode-turns';
   import {
     prepareToolFailureDraft,
     openCodeErrorDetails,
@@ -3747,15 +3751,17 @@
             confirmedOwnership.ownershipGeneration !== ownership.ownershipGeneration
           )
             return;
-          const archivePath = await invoke<string | null>('delete_worktree', {
-            request: {
-              ...shipCleanupRequest(run.repository, issue, currentRevision),
-              nativeGeneration: confirmedOwnership.nativeGeneration,
-              ...(confirmedOwnership.openCodeSessionIds.length
-                ? { openCodeSessionIds: confirmedOwnership.openCodeSessionIds }
-                : {}),
-            },
-          });
+          const archivePath = await runOpenCodeCleanup(issue.path, () =>
+            invoke<string | null>('delete_worktree', {
+              request: {
+                ...shipCleanupRequest(run.repository, issue, currentRevision),
+                nativeGeneration: confirmedOwnership.nativeGeneration,
+                ...(confirmedOwnership.openCodeSessionIds.length
+                  ? { openCodeSessionIds: confirmedOwnership.openCodeSessionIds }
+                  : {}),
+              },
+            }),
+          );
           saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
           await updateShipIssue(run, issue, { path: null, archivePath, error: null });
         } catch (cause) {
@@ -4108,6 +4114,7 @@
     if (!client || !receipt.targetId || !receipt.prompt) return;
     const source = client;
     const sessionId = receipt.targetId.slice('opencode:'.length);
+    const prompt = receipt.prompt;
     activeSpawnRequests.add(receipt.receiptId);
     try {
       const [session, inbox, active] = await Promise.all([
@@ -4144,11 +4151,13 @@
         updateSpawnReceipt(receipt.receiptId, { turnId });
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       }
-      const startingPrompt = source.session.prompt({
-        sessionID: sessionId,
-        text: receipt.prompt,
-        id: turnId,
-      });
+      const startingPrompt = runOpenCodePromptStart(receipt.targetDirectory, () =>
+        source.session.prompt({
+          sessionID: sessionId,
+          text: prompt,
+          id: turnId,
+        }),
+      );
       const inboxItem = await startingPrompt;
       updateSpawnReceipt(receipt.receiptId, { state: 'queued', turnId: inboxItem.id });
     } finally {
@@ -4485,10 +4494,12 @@
             session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
             target.id,
           );
-          const turn = promptClient.session.prompt({
-            sessionID: sessionId,
-            text,
-          });
+          const turn = runOpenCodePromptStart(target.directory, () =>
+            promptClient.session.prompt({
+              sessionID: sessionId,
+              text,
+            }),
+          );
           void turn
             .then(() => promptClient.session.wait({ sessionID: sessionId }))
             .then(
@@ -6294,11 +6305,13 @@
     }
     await beforePrompt?.();
     if (receiptId) requireSpawnPromptDispatch(receiptId);
-    const startingPrompt = promptClient.session.prompt({
-      sessionID: session.id,
-      text: prompt,
-      id: turnId,
-    });
+    const startingPrompt = runOpenCodePromptStart(created.path, () =>
+      promptClient.session.prompt({
+        sessionID: session.id,
+        text: prompt,
+        id: turnId,
+      }),
+    );
     if (receiptId) updateSpawnReceipt(receiptId, { state: 'working' });
     if (receiptId)
       void startingPrompt
@@ -6949,15 +6962,17 @@
           .map((pane) => invoke('terminal_close', { id: terminalRuntimeId(path, pane.id) })),
       );
       worktreeDeletions = { ...worktreeDeletions, [path]: 'Deleting files' };
-      await invoke('delete_worktree', {
-        request: {
-          repository,
-          worktree: path,
-          force: force || !!config,
-          expectedRevision: null,
-          expectedBranch: null,
-        },
-      });
+      await runOpenCodeCleanup(path, () =>
+        invoke('delete_worktree', {
+          request: {
+            repository,
+            worktree: path,
+            force: force || !!config,
+            expectedRevision: null,
+            expectedBranch: null,
+          },
+        }),
+      );
       saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
       const removedThreads = agentThreads.filter((thread) => thread.directory === path);
       const removedNative = sidebarOpenCodeThreads.filter((thread) => thread.directory === path);
@@ -8992,6 +9007,7 @@
     if (id === 'main' && !acpAgent) {
       if (!client || !sessionID || running || sending)
         throw new Error('Wait for the current agent turn.');
+      const promptClient = client;
       const current = selection;
       const session = sessionID;
       sending = true;
@@ -9002,7 +9018,9 @@
           path: directory,
           thread: `opencode:${session}`,
         });
-        await client.session.prompt({ sessionID: session, text });
+        await runOpenCodePromptStart(directory, () =>
+          promptClient.session.prompt({ sessionID: session, text }),
+        );
         if (current === selection && session === sessionID)
           void refreshSession(session).catch((cause) => (error = describe(cause)));
       } catch (cause) {
@@ -10999,18 +11017,20 @@
         );
         let response;
         try {
-          response = await source.session.prompt({
-            sessionID: targetId,
-            text: resolveSkillPrompt(sourceSkills, text, implementingModel),
-            skills: promptSkill(sourceSkills, text)?.id
-              ? [{ id: promptSkill(sourceSkills, text)!.id! }]
-              : undefined,
-            delivery: queueTurn ? 'steer' : undefined,
-            files: files.map((filePath) => ({
-              uri: fileUri(filePath),
-              name: clipboardAttachmentNames.get(filePath) ?? filePath.split(/[\\/]/).at(-1),
-            })),
-          });
+          response = await runOpenCodePromptStart(path, () =>
+            source.session.prompt({
+              sessionID: targetId,
+              text: resolveSkillPrompt(sourceSkills, text, implementingModel),
+              skills: promptSkill(sourceSkills, text)?.id
+                ? [{ id: promptSkill(sourceSkills, text)!.id! }]
+                : undefined,
+              delivery: queueTurn ? 'steer' : undefined,
+              files: files.map((filePath) => ({
+                uri: fileUri(filePath),
+                name: clipboardAttachmentNames.get(filePath) ?? filePath.split(/[\\/]/).at(-1),
+              })),
+            }),
+          );
         } catch (cause) {
           await recordImplementationModel(path, implementingModel, tracking);
           throw cause;

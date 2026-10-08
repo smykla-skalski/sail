@@ -2095,6 +2095,25 @@ fn load_open_code_cleanup_sessions(
     Ok(sessions)
 }
 
+fn load_open_code_cleanup_activity<Inbox, Active>(
+    owned: &HashSet<String>,
+    sessions: &[OpenCodeCleanupSession],
+    mut load_inbox: Inbox,
+    load_active: Active,
+) -> Result<(HashSet<String>, HashSet<String>), String>
+where
+    Inbox: FnMut(&str) -> Result<bool, String>,
+    Active: FnOnce() -> Result<HashSet<String>, String>,
+{
+    let mut queued = HashSet::new();
+    for id in owned {
+        if sessions.iter().any(|session| session.id == *id) && load_inbox(id)? {
+            queued.insert(id.clone());
+        }
+    }
+    Ok((load_active()?, queued))
+}
+
 fn verify_open_code_cleanup(
     info: &RuntimeInfo,
     directory: &Path,
@@ -2117,30 +2136,32 @@ fn verify_open_code_cleanup(
     let sessions = load_open_code_cleanup_sessions(&client, info, &directory)?;
     let owned =
         verify_open_code_cleanup_state(&expected, &sessions, &HashSet::new(), &HashSet::new())?;
-    let response = authorize(client.get(format!("{base}/api/session/active")))
-        .send()
-        .map_err(|_| diagnostic.to_string())?;
-    if !response.status().is_success() {
-        return Err(diagnostic.into());
-    }
-    let active: OpenCodeCleanupActive = response.json().map_err(|_| diagnostic.to_string())?;
-    let active = active.data.into_keys().collect::<HashSet<_>>();
-    let mut queued = HashSet::new();
-    for id in &owned {
-        if !sessions.iter().any(|session| session.id == *id) {
-            continue;
-        }
-        let response = authorize(client.get(format!("{base}/api/session/{id}/inbox")))
-            .send()
-            .map_err(|_| diagnostic.to_string())?;
-        if !response.status().is_success() {
-            return Err(diagnostic.into());
-        }
-        let inbox: OpenCodeCleanupInbox = response.json().map_err(|_| diagnostic.to_string())?;
-        if !inbox.data.is_empty() {
-            queued.insert(id.clone());
-        }
-    }
+    let (active, queued) = load_open_code_cleanup_activity(
+        &owned,
+        &sessions,
+        |id| {
+            let response = authorize(client.get(format!("{base}/api/session/{id}/inbox")))
+                .send()
+                .map_err(|_| diagnostic.to_string())?;
+            if !response.status().is_success() {
+                return Err(diagnostic.into());
+            }
+            let inbox: OpenCodeCleanupInbox =
+                response.json().map_err(|_| diagnostic.to_string())?;
+            Ok(!inbox.data.is_empty())
+        },
+        || {
+            let response = authorize(client.get(format!("{base}/api/session/active")))
+                .send()
+                .map_err(|_| diagnostic.to_string())?;
+            if !response.status().is_success() {
+                return Err(diagnostic.into());
+            }
+            let active: OpenCodeCleanupActive =
+                response.json().map_err(|_| diagnostic.to_string())?;
+            Ok(active.data.into_keys().collect())
+        },
+    )?;
     let sessions = load_open_code_cleanup_sessions(&client, info, &directory)?;
     verify_open_code_cleanup_state(&expected, &sessions, &active, &queued)?;
     Ok(())
@@ -2961,12 +2982,12 @@ mod tests {
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
         existing_shipping_worktree, git_change_action, git_patch, git_reference,
-        normalize_picker_path, parse_registered_worktrees, registered_worktrees, remove_worktree,
-        remove_worktree_with_hook, remove_worktree_with_hooks, repository_namespace, server_args,
-        shipping_base_revision, shipping_changed_paths, shipping_default_branch,
-        shipping_fetch_source, verify_open_code_cleanup_state, version_is_compatible,
-        version_number, working_tree_diff, worktree_overviews, OpenCodeCleanupSession,
-        WorktreeOperationLocks,
+        load_open_code_cleanup_activity, normalize_picker_path, parse_registered_worktrees,
+        registered_worktrees, remove_worktree, remove_worktree_with_hook,
+        remove_worktree_with_hooks, repository_namespace, server_args, shipping_base_revision,
+        shipping_changed_paths, shipping_default_branch, shipping_fetch_source,
+        verify_open_code_cleanup_state, version_is_compatible, version_number, working_tree_diff,
+        worktree_overviews, OpenCodeCleanupSession, WorktreeOperationLocks,
     };
     use super::{working_tree_commit, working_tree_revision};
     use std::collections::HashSet;
@@ -4342,6 +4363,47 @@ mod tests {
         assert_eq!(
             error,
             "OpenCode task sessions changed before worktree cleanup."
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_dequeue_during_cleanup_blocks_removal() {
+        use std::cell::Cell;
+
+        let owned = HashSet::from(["root".to_string()]);
+        let sessions = vec![OpenCodeCleanupSession {
+            id: "root".into(),
+            parent_id: None,
+        }];
+        let state = Cell::new(0);
+        let advance = || state.set(state.get() + 1);
+
+        let (active, queued) = load_open_code_cleanup_activity(
+            &owned,
+            &sessions,
+            |_| {
+                let is_queued = state.get() == 0;
+                advance();
+                Ok(is_queued)
+            },
+            || {
+                let is_active = state.get() == 1;
+                advance();
+                Ok(if is_active {
+                    HashSet::from(["root".to_string()])
+                } else {
+                    HashSet::new()
+                })
+            },
+        )
+        .unwrap();
+
+        let error = verify_open_code_cleanup_state(&owned, &sessions, &active, &queued)
+            .expect_err("a prompt transitioning from queued to active must block cleanup");
+
+        assert_eq!(
+            error,
+            "An OpenCode task session is active in this worktree."
         );
     }
 
