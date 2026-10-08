@@ -804,7 +804,9 @@
   });
 
   $effect(() => {
-    if (!prefill || prefill.id === lastPrefill) return;
+    // Wait for the thread switch: activating a session restores its saved draft over the prefill.
+    if (!prefill || prefill.id === lastPrefill || activeSessionId !== (thread?.sessionId ?? null))
+      return;
     lastPrefill = prefill.id;
     draft = [draft.trim(), prefill.text].filter(Boolean).join('\n\n');
     onprefillconsumed?.(prefill.id);
