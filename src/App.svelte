@@ -14933,7 +14933,9 @@
             {#if acpAgent && nativePlan}<section class="native-plan-panel" aria-label="Native plan">
                 <Markdown source={nativePlan.markdown} />
                 {#if nativePlan.tasks.length}<ul>
-                    {#each nativePlan.tasks as task}<li>{task.status}: {task.title}</li>{/each}
+                    {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
+                        {task.status}: {task.title}
+                      </li>{/each}
                   </ul>{/if}
               </section>{:else}<PlanPanel
                 {snapshot}

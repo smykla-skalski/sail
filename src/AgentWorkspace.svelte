@@ -2097,7 +2097,9 @@
           <h3>Plan</h3>
           <Markdown source={nativePlan.markdown} />
           {#if nativePlan.tasks.length}<ul>
-              {#each nativePlan.tasks as task}<li>{task.status}: {task.title}</li>{/each}
+              {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
+                  {task.status}: {task.title}
+                </li>{/each}
             </ul>{/if}
         </section>{/if}
       <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
