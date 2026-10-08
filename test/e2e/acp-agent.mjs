@@ -1000,8 +1000,14 @@ for await (const line of createInterface({ input: process.stdin })) {
   } else if (message.id != null && elicitations.has(message.id)) {
     const pending = elicitations.get(message.id);
     elicitations.delete(message.id);
-    const text = message.result?.action === 'accept' ? `Selected: ${message.result.content?.approach}` : message.result?.action;
-    update(pending.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+    const text =
+      message.result?.action === 'accept'
+        ? `Selected: ${message.result.content?.approach}`
+        : message.result?.action;
+    update(pending.sessionId, {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text },
+    });
     send({ id: pending.promptId, result: { stopReason: 'end_turn' } });
   } else if (message.id != null && permissions.has(message.id)) {
     const pending = permissions.get(message.id);

@@ -850,7 +850,9 @@
     const id = String(message.id);
     if (elicitations.some((item) => String(item.id) === id)) return;
     const properties =
-      schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
+      schema.properties &&
+      typeof schema.properties === 'object' &&
+      !Array.isArray(schema.properties)
         ? (schema.properties as Record<string, Record<string, unknown>>)
         : {};
     elicitationDrafts[id] = Object.fromEntries(
@@ -865,7 +867,10 @@
     if (thread) onstatus(thread, 'waiting');
   }
 
-  async function answerElicitation(elicitation: Elicitation, action: 'accept' | 'decline' | 'cancel') {
+  async function answerElicitation(
+    elicitation: Elicitation,
+    action: 'accept' | 'decline' | 'cancel',
+  ) {
     const id = String(elicitation.id);
     const schema = elicitation.schema;
     const required = Array.isArray(schema.required)
@@ -879,7 +884,12 @@
           return;
         }
     try {
-      await acp.elicitation(agent, elicitation.id, action, action === 'accept' ? content : undefined);
+      await acp.elicitation(
+        agent,
+        elicitation.id,
+        action,
+        action === 'accept' ? content : undefined,
+      );
       elicitations = elicitations.filter((item) => String(item.id) !== id);
       delete elicitationDrafts[id];
       if (thread && !elicitations.length && !permissions.length) onstatus(thread, 'working');
@@ -2240,10 +2250,14 @@
         </div>
       {/each}
       {#each elicitations as elicitation (elicitation.id)}
-        <ElicitationForm {elicitation} {agent} onanswer={(request, action, content) => {
-          if (content) elicitationDrafts[String(request.id)] = content;
-          return answerElicitation(request, action);
-        }} />
+        <ElicitationForm
+          {elicitation}
+          {agent}
+          onanswer={(request, action, content) => {
+            if (content) elicitationDrafts[String(request.id)] = content;
+            return answerElicitation(request, action);
+          }}
+        />
       {/each}
       <textarea
         bind:this={prompt}

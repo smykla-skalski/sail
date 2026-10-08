@@ -39,7 +39,10 @@
     const required = Array.isArray(elicitation.schema.required)
       ? elicitation.schema.required.filter((key): key is string => typeof key === 'string')
       : [];
-    if (action === 'accept' && required.some((key) => values[key] === undefined || values[key] === '')) {
+    if (
+      action === 'accept' &&
+      required.some((key) => values[key] === undefined || values[key] === '')
+    ) {
       error = 'Complete all required fields.';
       return;
     }
@@ -48,23 +51,58 @@
   }
 </script>
 
-<div class="agent-permission" role="group" aria-label="Agent question" data-request-id={elicitation.id} data-session-id={elicitation.sessionId} data-agent-id={agent} tabindex="-1">
+<div
+  class="agent-permission"
+  role="group"
+  aria-label="Agent question"
+  data-request-id={elicitation.id}
+  data-session-id={elicitation.sessionId}
+  data-agent-id={agent}
+  tabindex="-1"
+>
   <strong>{elicitation.schema.title ?? 'Agent question'}</strong>
   {#if elicitation.message}<small>{elicitation.message}</small>{/if}
   {#if error}<small role="alert">{error}</small>{/if}
   {#each Object.entries(properties) as [key, property] (key)}
-    <label>{property.title ?? key}
+    <label
+      >{property.title ?? key}
       {#if property.description}<small>{property.description}</small>{/if}
       {#if property.type === 'boolean'}
-        <input type="checkbox" checked={values[key] === true} onchange={(event) => (values = { ...values, [key]: event.currentTarget.checked })} />
+        <input
+          type="checkbox"
+          checked={values[key] === true}
+          onchange={(event) => (values = { ...values, [key]: event.currentTarget.checked })}
+        />
       {:else if Array.isArray(property.enum)}
-        <select value={String(values[key] ?? '')} onchange={(event) => (values = { ...values, [key]: event.currentTarget.value })}>
-          <option value="">Choose…</option>{#each property.enum as option (String(option))}<option value={String(option)}>{String(option)}</option>{/each}
+        <select
+          value={String(values[key] ?? '')}
+          onchange={(event) => (values = { ...values, [key]: event.currentTarget.value })}
+        >
+          <option value="">Choose…</option>{#each property.enum as option (String(option))}<option
+              value={String(option)}>{String(option)}</option
+            >{/each}
         </select>
       {:else}
-        <input type={property.type === 'number' || property.type === 'integer' ? 'number' : 'text'} value={String(values[key] ?? '')} oninput={(event) => (values = { ...values, [key]: property.type === 'number' || property.type === 'integer' ? Number(event.currentTarget.value) : event.currentTarget.value })} />
+        <input
+          type={property.type === 'number' || property.type === 'integer' ? 'number' : 'text'}
+          value={String(values[key] ?? '')}
+          oninput={(event) =>
+            (values = {
+              ...values,
+              [key]:
+                property.type === 'number' || property.type === 'integer'
+                  ? Number(event.currentTarget.value)
+                  : event.currentTarget.value,
+            })}
+        />
       {/if}
     </label>
   {/each}
-  <div><Button size="sm" variant="primary" onclick={() => void answer('accept')}>Submit</Button><Button size="sm" variant="secondary" onclick={() => void answer('decline')}>Decline</Button><Button size="sm" variant="secondary" onclick={() => void answer('cancel')}>Cancel</Button></div>
+  <div>
+    <Button size="sm" variant="primary" onclick={() => void answer('accept')}>Submit</Button><Button
+      size="sm"
+      variant="secondary"
+      onclick={() => void answer('decline')}>Decline</Button
+    ><Button size="sm" variant="secondary" onclick={() => void answer('cancel')}>Cancel</Button>
+  </div>
 </div>
