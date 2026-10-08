@@ -928,6 +928,12 @@ function fixingGate(issue: ShipIssue): ShipGate | undefined {
   return currentShipGates(issue).find((gate) => fixVerdicts.has(gate.verdict ?? ''));
 }
 
+function legacyFindingsBlock(issue: ShipIssue): boolean {
+  return (issue.gates ?? []).some(
+    (gate) => fixVerdicts.has(gate.verdict ?? '') && gate.reason === issue.blockedReason,
+  );
+}
+
 /**
  * The reason the worker needs the user, or null while it works on its own.
  * Older Sail versions persisted the findings of NEEDS_FIXES and FAIL verdicts
@@ -952,7 +958,7 @@ export function shipBlock(issue: ShipIssue): string | null {
       issue.blockedReason ??
       `${titleCase(crashed.gate)} did not finish.`
     );
-  if (issue.blockedReason && !fixingGate(issue)) return issue.blockedReason;
+  if (issue.blockedReason && !legacyFindingsBlock(issue)) return issue.blockedReason;
   return null;
 }
 
@@ -1007,10 +1013,10 @@ export function shipStatus(run: ShipRun, issue: ShipIssue): string {
     if (wait?.failed) return 'Blocked';
     return wait ? 'Waiting' : 'Queued';
   }
-  if (awaitingMerge(issue)) return 'Awaiting merge';
   if (issue.workerState === 'waiting') return 'Waiting for input';
   if (issue.workerState === 'unavailable') return 'Reconnecting';
   if (fixingTitle(issue)) return 'Fixing';
+  if (awaitingMerge(issue)) return 'Awaiting merge';
   return issue.state === 'starting' ? 'Starting' : 'Running';
 }
 

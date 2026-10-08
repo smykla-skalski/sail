@@ -556,7 +556,8 @@
         <h2>Ship merging</h2>
         <p>
           Repository instructions that say who merges take precedence over this setting. With "You",
-          Ship workers stop at a mergeable pull request.
+          Ship workers stop at a mergeable pull request. A change applies to workers launched
+          afterwards.
         </p>
         <label for="ship-merge-owner">Who merges Ship PRs</label>
         <select

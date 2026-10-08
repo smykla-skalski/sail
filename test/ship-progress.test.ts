@@ -2271,6 +2271,29 @@ void test('a persisted legacy blockedReason with a NEEDS_FIXES verdict shows fix
   assert.equal(shipIssuePresentation(run, issue).label, 'Needs input');
 });
 
+void test('a real Sail block stays a block next to a failing verdict', () => {
+  const { run, issue } = runningIssue({
+    blockedReason: 'Shipping claim lost: heartbeat verification failed',
+    gates: [stateGate('code-adversary', 'NEEDS_FIXES', 10, 'Handle the empty list')],
+  });
+  const presentation = shipIssuePresentation(run, issue);
+  assert.equal(presentation.label, 'Needs input');
+  assert.equal(presentation.reason, 'Shipping claim lost: heartbeat verification failed');
+  assert.equal(shipStatus(run, issue), 'Blocked');
+});
+
+void test('status, activity and presentation agree on fixing CI after awaiting merge was reported', () => {
+  const { run, issue } = readyIssue({
+    state: 'working',
+    workerState: 'working',
+    stage: 'awaiting_merge',
+    checks: [{ name: 'build', state: 'FAILURE', url: 'https://example.test/build' }],
+  });
+  assert.equal(shipIssuePresentation(run, issue).label, 'Fixing (CI)');
+  assert.equal(shipStatus(run, issue), 'Fixing');
+  assert.equal(shipActivity(run, issue).title, 'Fixing (CI)');
+});
+
 void test('a worker block stays a block next to a failing verdict', () => {
   const { run, issue } = runningIssue({
     reportedStatus: 'blocked',
