@@ -1642,7 +1642,7 @@ pub fn run_mcp_stdio() {
                 if *name == "ship_progress" {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object","properties":{
-                            "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging"]},
+                            "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging","awaiting_merge"]},
                             "status":{"type":"string","enum":["running","blocked"]},
                             "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
                             "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","FAIL","BLOCKED"]},

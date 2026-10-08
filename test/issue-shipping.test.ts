@@ -14,6 +14,9 @@ import {
   confirmOpenCodeWorkerStopped,
   createPromptDispatchTracker,
   createShipRun,
+  mergeOwnerRule,
+  parseMergeOwner,
+  shipWorkerPrompt,
   directClaimHandoffChanges,
   directClaimHandoffWaiting,
   directShipPromptAuthorized,
@@ -2023,4 +2026,41 @@ void test('rejects issues outside the approved repository', () => {
       ),
     /Only open issues/,
   );
+});
+
+const promptInput = {
+  issueUrl: 'https://github.com/a/b/issues/2',
+  claimId: 'claim-1',
+  claimTask: 'github:a/b#2',
+  repository: 'a/b',
+  baseBranch: 'main',
+  baseRevision: 'abc123',
+  gateExecution: 'Run the gates.',
+  gateReporting: 'Report the verdicts.',
+};
+
+void test('the worker prompt tells the worker to stop at a mergeable pull request only when the user merges', () => {
+  const you = shipWorkerPrompt({ ...promptInput, mergeOwner: 'you' });
+  assert.match(you, /Merge owner: you merge no pull request; the user does/);
+  assert.match(you, /Stop at a mergeable pull request/);
+  assert.match(you, /stage awaiting_merge and status running/);
+  assert.match(you, /do not post a merge comment or run a merge command/);
+
+  const agent = shipWorkerPrompt({ ...promptInput, mergeOwner: 'agent' });
+  assert.doesNotMatch(agent, /Merge owner/);
+  assert.doesNotMatch(agent, /awaiting_merge/);
+  assert.doesNotMatch(agent, /mergeable pull request/);
+  assert.ok(agent.startsWith('/ship-it https://github.com/a/b/issues/2'));
+  assert.ok(agent.endsWith('Report the verdicts.'));
+  assert.ok(you.startsWith(agent));
+});
+
+void test('the merge owner setting defaults to the user and ignores unknown values', () => {
+  assert.equal(parseMergeOwner(null), 'you');
+  assert.equal(parseMergeOwner(undefined), 'you');
+  assert.equal(parseMergeOwner('you'), 'you');
+  assert.equal(parseMergeOwner('agent'), 'agent');
+  assert.equal(parseMergeOwner('AGENT'), 'you');
+  assert.equal(parseMergeOwner('both'), 'you');
+  assert.equal(mergeOwnerRule('agent'), '');
 });

@@ -49,6 +49,7 @@
     requireValidatorEconomics,
     refreshedIssueState,
     refreshedPullRequest,
+    closedWithoutMerge,
     shipGatesSettled,
     shipCleanupRequest,
     shipEvidenceReadiness,
@@ -118,6 +119,9 @@
     shippingClockWasSuspended,
     shippingClaimOwnedByInstance,
     shippingWorkerSettled,
+    shipWorkerPrompt,
+    parseMergeOwner,
+    type MergeOwner,
     shippingSetupAction,
     settledLostClaimFence,
     terminalClaimReleaseReady,
@@ -979,6 +983,7 @@
   let agentStatusEnabled = $state(getSetting('sai-agent-status-enabled') !== 'false');
   let agentThreadListEnabled = $state(getSetting('sai-agent-thread-list-enabled') !== 'false');
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
+  let mergeOwner = $state<MergeOwner>(parseMergeOwner(getSetting('sai-ship-merge-owner')));
   let inboxItems = $state<InboxItem[]>([]);
   let inboxOutcomes = $state<InboxOutcome[]>(loadInboxOutcomes(getSetting('sai-inbox-outcomes')));
   let durableActivityHistory = $state<ActivityHistoryEvent[]>(
@@ -2026,6 +2031,7 @@
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
+      mergeOwner,
       contextHandoffThreshold,
     };
   }
@@ -2204,6 +2210,9 @@
         } else if (action.type === 'agent-messages') {
           agentMessagesEnabled = action.value;
           setSetting('sai-agent-messages-enabled', String(action.value));
+        } else if (action.type === 'merge-owner') {
+          mergeOwner = parseMergeOwner(action.value);
+          setSetting('sai-ship-merge-owner', mergeOwner);
         } else if (action.type === 'context-handoff-threshold') {
           const previousThreshold = contextHandoffThreshold;
           contextHandoffThreshold = parseContextHandoffThreshold(String(action.value));
@@ -3890,7 +3899,7 @@
     issue: ShipIssue,
     workerState: SpawnState,
   ): Promise<void> {
-    const reason = 'Pull request closed without merging.';
+    const reason = closedWithoutMerge;
     await settleClosedPullRequest(
       workerState,
       async () => {
@@ -3987,7 +3996,17 @@
         ? 'Before every adversary pass, read the checkpoint revision. After the pass, use ship_progress with that revision, its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, validator economics counters, and reason when blocked or failed.'
         : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
       const target = shippingTarget;
-      const prompt = `/ship-it ${issue.url}\n\nSail holds visible claim ${claim.id} for task ${claim.task} on behalf of this worker. Sail already created this issue worktree from ${target.repository}:${target.baseBranch} at ${target.baseRevision}. Use that exact repository and base branch for the pull request. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. Before each quality command, read the checkpoint execution boundary; record the result with task_evidence_record and its expectedRevision, expectedMutationGeneration, and expectedBaseRevision, mapping exact acceptance criterion strings and a bounded output reference. Include the economics counters attributable to that activity (role, phase, turns, tools, permissions, compactions, token categories, elapsed time, retries, findings, checks, human interventions, failed commands, approval latency, and repeated work). Classify activity as primary, subagent, validator, guardian, synthetic, or probe. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
+      const prompt = shipWorkerPrompt({
+        issueUrl: issue.url,
+        claimId: claim.id,
+        claimTask: claim.task,
+        repository: target.repository,
+        baseBranch: target.baseBranch,
+        baseRevision: target.baseRevision,
+        gateExecution,
+        gateReporting,
+        mergeOwner,
+      });
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -7192,9 +7211,8 @@
               {
                 ...issueEvidenceChanges,
                 stage: report.gate === 'test-adversary' ? 'testing' : 'reviewing',
-                blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
-                  ? report.reason
-                  : null,
+                reportedStatus: 'running',
+                blockedReason: report.verdict === 'BLOCKED' ? report.reason : null,
                 gates: [
                   ...(owner.issue.gates ?? []),
                   completedInlineShipGate(
@@ -7366,9 +7384,7 @@
               owner.issue,
               {
                 ...issueEvidenceChanges,
-                blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
-                  ? report.reason
-                  : null,
+                blockedReason: report.verdict === 'BLOCKED' ? report.reason : null,
                 events: appendShipEvent(
                   owner.issue.events,
                   `${validation.gate}: ${report.verdict}`,
@@ -7387,6 +7403,7 @@
       if (!owner) throw new Error('Only the assigned Ship worker can report issue progress.');
       await updateShipIssue(owner.run, owner.issue, {
         stage: report.stage,
+        reportedStatus: report.status,
         blockedReason: report.status === 'blocked' ? report.reason : null,
         events: appendShipEvent(owner.issue.events, report.stage, report.reason),
       });
@@ -14894,6 +14911,7 @@
         repository={coordinationProject(directory) ?? directory}
         runs={shipRuns}
         busy={shippingBusy}
+        {mergeOwner}
         nativeSubagents={Object.values(nativeSubagents)}
         onclose={closeShipRuns}
         onrefresh={() => tickShippingRuns(true)}
@@ -15031,6 +15049,7 @@
             active={activeSideTab === 'ship' && detailsOpen && (acpAgent ? agentChangesOpen : true)}
             runs={shipRuns}
             busy={shippingBusy}
+            {mergeOwner}
             nativeSubagents={Object.values(nativeSubagents)}
             onclose={closeShipRuns}
             onrefresh={() => tickShippingRuns(true)}

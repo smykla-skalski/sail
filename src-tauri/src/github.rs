@@ -52,6 +52,8 @@ pub struct ShippingPullRequest {
     merged_at: Option<String>,
     head_ref_oid: String,
     #[serde(default)]
+    mergeable: Option<bool>,
+    #[serde(default)]
     checks: Vec<PullRequestCheck>,
 }
 
@@ -2825,6 +2827,7 @@ fn shipping_pull_request_snapshot(
     let mut pr: ShippingPullRequest =
         serde_json::from_value(listed.clone()).map_err(|error| error.to_string())?;
     pr.checks = parse_pull_request_checks(listed)?.checks;
+    pr.mergeable = details["mergeable"].as_bool();
     Ok(Some(pr))
 }
 
@@ -5244,6 +5247,45 @@ mod tests {
             "main",
         )
         .is_err());
+    }
+
+    #[test]
+    fn shipping_pull_request_reports_github_mergeability() {
+        let listed = serde_json::json!({
+            "number": 17,
+            "url": "https://github.com/upstream/repo/pull/17",
+            "state": "OPEN",
+            "mergedAt": null,
+            "headRefOid": "head-a",
+            "statusCheckRollup": []
+        });
+        let mut details = serde_json::json!({
+            "head": { "ref": "fix/issue", "repo": { "full_name": "fork/repo" }, "sha": "head-a" },
+            "base": { "ref": "main", "repo": { "full_name": "upstream/repo" } },
+            "mergeable": true
+        });
+        let snapshot = |details: &serde_json::Value| {
+            shipping_pull_request_snapshot(
+                &listed,
+                details,
+                "fork/repo",
+                "upstream/repo",
+                "fix/issue",
+                "main",
+            )
+            .ok()
+            .flatten()
+            .unwrap()
+        };
+
+        assert_eq!(snapshot(&details).mergeable, Some(true));
+        details["mergeable"] = serde_json::json!(false);
+        assert_eq!(snapshot(&details).mergeable, Some(false));
+        details["mergeable"] = serde_json::Value::Null;
+        assert_eq!(snapshot(&details).mergeable, None);
+        details.as_object_mut().unwrap().remove("mergeable");
+        let value = serde_json::to_value(snapshot(&details)).unwrap();
+        assert!(value["mergeable"].is_null());
     }
 
     #[test]
