@@ -16,6 +16,7 @@ import {
   shipStageIndicator,
   shipTaskCriteria,
   shipTaskObjective,
+  shipWorkerRequest,
 } from '../src/lib/ship-list.ts';
 import { initialTaskCheckpoint, updateTaskCheckpoint } from '../src/lib/task-checkpoint.ts';
 
@@ -139,6 +140,30 @@ void test('the default detail issue stays put when another row re-sorts above it
   assert.equal(shipDetailFallback(undefined, [], shown), null);
   for (const issue of run.issues) issue.state = 'merged';
   assert.equal(shipDetailFallback(run, shipRows(run, {}), null), null);
+});
+
+void test('a worker thread opens with its pending request quoted for the reply', () => {
+  const [issue] = fixture(1).issues;
+  issue.threadId = 'acp:claude:s1';
+  working(issue, 'implementing');
+  assert.equal(shipWorkerRequest(issue), null);
+  working(issue, 'implementing', {
+    reportedStatus: 'blocked',
+    blockedReason: 'Which theme token?\nPick one.',
+  });
+  assert.equal(shipWorkerRequest(issue), '> Which theme token?\n> Pick one.\n\n');
+  touched(issue, { unresolvedQuestions: ['Keep the old label?', 'Which theme token?'] }, 5);
+  assert.equal(
+    shipWorkerRequest(issue),
+    '> Which theme token?\n> Pick one.\n> Keep the old label?\n> Which theme token?\n\n',
+  );
+  touched(issue, { status: 'blocked', blocker: 'Need a decision', unresolvedQuestions: [] }, 6);
+  assert.equal(shipWorkerRequest(issue), '> Need a decision\n\n');
+  issue.threadId = null;
+  assert.equal(shipWorkerRequest(issue), null);
+  issue.threadId = 'acp:claude:s1';
+  issue.state = 'merged';
+  assert.equal(shipWorkerRequest(issue), null);
 });
 
 void test('group mapping covers every presentation status', () => {

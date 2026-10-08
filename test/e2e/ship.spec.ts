@@ -627,4 +627,68 @@ describe('native Ship run history', () => {
     await $('[aria-label="Hide Ship panel"]').click();
     await expect($('.ship-panel')).not.toBeDisplayed();
   });
+
+  it('offers a reply to a worker that is waiting on a request', async () => {
+    const run: ShipRun = {
+      id: 'ship-request',
+      source: 'plan',
+      repository,
+      remote: 'fixture/repo',
+      provider: 'claude',
+      limit: 1,
+      approvedAt: 6,
+      externalClosed: {},
+      issues: [
+        batchIssue(0, {
+          title: 'Worker with a question',
+          state: 'working',
+          path: repository,
+          threadId: 'acp:claude:request-fixture',
+          reportedStatus: 'blocked',
+          blockedReason: 'Which theme token should the badge use?',
+        }),
+        batchIssue(1, {
+          title: 'Busy worker',
+          state: 'working',
+          path: repository,
+          threadId: 'acp:claude:busy-fixture',
+        }),
+      ],
+    };
+    await browser.tauri.execute(async ({ core }, input) => {
+      await core.invoke('save_setting', { key: 'sai-details-width', value: '900' });
+      await core.invoke('save_setting', { key: 'sai-ship-runs', value: JSON.stringify([input]) });
+    }, run);
+    await browser.execute(() => {
+      localStorage.clear();
+      localStorage.setItem('sail-settings-migrated-v1', '1');
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+    });
+    await browser.setWindowSize(2560, 1440);
+    expect(await browser.execute(() => window.innerWidth)).toBe(2560);
+    await browser.refresh();
+    await expect($('.app-shell')).toBeDisplayed();
+    await toggleShip();
+    await expect($('.ship-panel')).toBeDisplayed();
+    await openIssue('batch-0');
+    const reply = $('.ship-issue-detail .ship-actions button=Reply to worker');
+    await expect(reply).toBeDisplayed();
+    await capture('ship-reply-to-worker-2560-light');
+    await setTheme('dark');
+    await capture('ship-reply-to-worker-2560-dark');
+    await browser.setWindowSize(1920, 1200);
+    expect(await browser.execute(() => window.innerWidth)).toBe(1920);
+    await capture('ship-reply-to-worker-1920-dark');
+    await setTheme('light');
+    await capture('ship-reply-to-worker-1920-light');
+    await openIssue('batch-1');
+    await expect($('.ship-issue-detail .ship-actions button=Open worker thread')).toBeDisplayed();
+    await browser.setWindowSize(390, 850);
+    expect(
+      await browser.execute(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+    ).toBe(true);
+    await browser.setWindowSize(1280, 850);
+  });
 });
