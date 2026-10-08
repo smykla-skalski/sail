@@ -28,6 +28,8 @@ import {
   refreshedIssueState,
   shipOwner,
   shipCheckpointOwner,
+  repositoryForRemote,
+  shippingWorkerGone,
   authorizeShipCheckpointThread,
   commitRevisionBoundValidation,
   shipIssuePresentation,
@@ -2379,4 +2381,21 @@ void test('a failed dependency wins over an unmerged one', () => {
   second.state = 'failed';
   second.error = 'Worker failed';
   assert.equal(shipIssuePresentation(run, run.issues[2]).label, 'Waiting on #3 (needs input)');
+});
+
+void test('repairs a dead run repository from the catalog checkout with the same remote', () => {
+  const candidates = [
+    { path: '/other', remote: 'kumahq/other' },
+    { path: '/broken', remote: null },
+    { path: '/kuma', remote: 'Kumahq/Kuma' },
+  ];
+  assert.equal(repositoryForRemote(candidates, 'kumahq/kuma'), '/kuma');
+  assert.equal(repositoryForRemote(candidates, 'kong/kong-mesh'), null);
+  assert.equal(repositoryForRemote([], 'kumahq/kuma'), null);
+});
+
+void test('treats a vanished agent session or deleted worktree as a gone worker', () => {
+  assert.equal(shippingWorkerGone(new Error('Agent session is not connected.')), true);
+  assert.equal(shippingWorkerGone('Location not found: /sail/worktrees/gone'), true);
+  assert.equal(shippingWorkerGone(new Error('permission denied')), false);
 });

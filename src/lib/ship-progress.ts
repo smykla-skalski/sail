@@ -1587,3 +1587,17 @@ export function loadShipRuns(raw: string | null): ShipRun[] {
     return [];
   }
 }
+
+export function repositoryForRemote(
+  candidates: { path: string; remote: string | null }[],
+  remote: string,
+): string | null {
+  const wanted = remote.toLowerCase();
+  return candidates.find((item) => item.remote?.toLowerCase() === wanted)?.path ?? null;
+}
+
+// ACP agents report a vanished session or deleted cwd with these messages.
+export function shippingWorkerGone(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return /session is not connected|location not found/i.test(message);
+}

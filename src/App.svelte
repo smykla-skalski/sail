@@ -61,6 +61,8 @@
     reserveInlineValidation,
     gateSnapshot,
     loadShipRuns,
+    repositoryForRemote,
+    shippingWorkerGone,
     parseShipReport,
     requireValidatorEconomics,
     refreshedIssueState,
@@ -574,6 +576,7 @@
     addWorktree,
     assignRepository,
     loadProjectCatalog,
+    owningRepository,
     removeRepository,
     removeWorktree,
     worktreeAt,
@@ -3590,9 +3593,11 @@
     limit: number,
     source: string,
   ): Promise<void> {
-    const repository = coordinationProject(directory) ?? directory;
+    const repository = coordinationProject(directory);
     const remote = graph.issues[0]?.repository ?? '';
-    if (!repository || !remote) throw new Error('Select a published repository issue graph.');
+    if (!remote) throw new Error('Select a published repository issue graph.');
+    if (!repository)
+      throw new Error('Open the project repository or one of its worktrees to ship this plan.');
     const checkoutRemote = await invoke<string>('shipping_target_repository', { repository });
     if (checkoutRemote.toLowerCase() !== remote.toLowerCase())
       throw new Error(`Select a ${remote} checkout to ship this issue graph.`);
@@ -3982,7 +3987,9 @@
       await fenceRecoveredShippingWorker(
         run,
         issue,
-        `Shipping claim recovery failed: ${describe(cause)}`,
+        missingRepositoryPath(cause)
+          ? 'Shipping repository no longer exists. Start a new run from the project.'
+          : `Shipping claim recovery failed: ${describe(cause)}`,
       );
       return false;
     }
@@ -4638,8 +4645,12 @@
           );
     const [, agent, sessionId] = match;
     const turnId = receipt?.turnId ?? null;
-    await acp.cancel(agent, sessionId, turnId);
-    await waitForAcpWorkerTermination(agent, sessionId, turnId, performance.now() + 5_000);
+    try {
+      await acp.cancel(agent, sessionId, turnId);
+      await waitForAcpWorkerTermination(agent, sessionId, turnId, performance.now() + 5_000);
+    } catch (cause) {
+      if (!shippingWorkerGone(cause)) throw cause;
+    }
     if (receipt) updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
   }
 
@@ -5658,11 +5669,47 @@
     for (const issue of readyShipIssues(run, unsettledReceiptIds)) scheduleShipLaunch(run, issue);
   }
 
+  const shipRepairAttempts = new SvelteMap<string, string>();
+
+  // Older runs stored a worktree path as their repository; once that worktree
+  // is deleted every claim and fence call fails, so point them at the checkout.
+  async function repairShipRunRepositories(): Promise<void> {
+    const catalogKey = projectCatalog.repositories.join('\0');
+    const pending = shipRuns.filter((run) => shipRepairAttempts.get(run.id) !== catalogKey);
+    const available = await Promise.all(
+      pending.map((run) =>
+        invoke<boolean>('repository_path_available', { path: run.repository }).catch(() => true),
+      ),
+    );
+    const dead = pending.filter((_, index) => !available[index]);
+    if (!dead.length) return;
+    const candidates = await Promise.all(
+      projectCatalog.repositories.map(async (path) => ({
+        path,
+        remote: await invoke<string>('shipping_target_repository', { repository: path }).catch(
+          () => null,
+        ),
+      })),
+    );
+    let changed = false;
+    for (const run of dead) {
+      const repaired = repositoryForRemote(candidates, run.remote);
+      if (!repaired) {
+        shipRepairAttempts.set(run.id, catalogKey);
+        continue;
+      }
+      run.repository = repaired;
+      changed = true;
+    }
+    if (changed) await saveShipRuns();
+  }
+
   async function tickShippingRuns(refreshCompleted = false): Promise<void> {
     if (shippingBusy || disposed || !isTauri() || !acpRecoveryReady) return;
     detectShippingClockResume();
     shippingBusy = true;
     try {
+      await repairShipRunRepositories();
       await persistShipRefresh(
         shipRuns.map((run) => refreshShippingRun(run, refreshCompleted)),
         saveShipRuns,
@@ -6237,12 +6284,7 @@
   }
 
   function coordinationProject(path: string): string | null {
-    if (projectCatalog.repositories.includes(path)) return path;
-    return (
-      Object.entries(projectCatalog.worktrees).find(([, worktrees]) =>
-        worktrees.some((worktree) => worktree.path === path),
-      )?.[0] ?? null
-    );
+    return owningRepository(projectCatalog, path);
   }
 
   async function coordinationSource(request: CoordinationRequest): Promise<CoordinationSource> {
