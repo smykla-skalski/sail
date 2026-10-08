@@ -69,7 +69,8 @@
     nextValidationReservation,
     reserveInlineValidation,
     gateSnapshot,
-    loadShipRuns,
+    loadShipRunStore,
+    serializeShipRuns,
     parseShipReport,
     requireValidatorEconomics,
     refreshedIssueState,
@@ -663,21 +664,20 @@
       });
   });
   const initialShipArchiveDelay = parseShipArchiveDelay(getSetting('sai-ship-archive-delay'));
+  const storedShipRuns = loadShipRunStore(getSetting('sai-ship-runs'));
+  // Entries this build cannot parse are written back with every save instead of being lost.
+  const unparsedShipRuns = storedShipRuns.unparsed;
   const shipArchiveMigration =
     getSetting(shipArchiveMigrationKey) === 'done'
       ? null
-      : migrateShipArchive(
-          loadShipRuns(getSetting('sai-ship-runs')),
-          initialShipArchiveDelay,
-          Date.now(),
-        );
-  const initialShipRuns = shipArchiveMigration?.runs ?? loadShipRuns(getSetting('sai-ship-runs'));
+      : migrateShipArchive(storedShipRuns.runs, initialShipArchiveDelay, Date.now());
+  const initialShipRuns = shipArchiveMigration?.runs ?? storedShipRuns.runs;
   const initialShipArchiveNotice = shipArchiveMigration?.archived
     ? shipArchiveMigration.archived
     : Number(getSetting('sai-ship-archive-notice')) || 0;
   if (shipArchiveMigration) {
     if (shipArchiveMigration.archived > 0) {
-      setSetting('sai-ship-runs', JSON.stringify(initialShipRuns));
+      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, unparsedShipRuns));
       setSetting('sai-ship-archive-notice', String(initialShipArchiveNotice));
     }
     setSetting(shipArchiveMigrationKey, 'done');
@@ -3073,7 +3073,7 @@
   }
 
   async function saveShipRuns(): Promise<void> {
-    const value = JSON.stringify(shipRuns);
+    const value = serializeShipRuns(shipRuns, unparsedShipRuns);
     await setSettingDurable('sai-ship-runs', value);
   }
 
@@ -3338,7 +3338,7 @@
       await saveShipRuns();
     } catch (cause) {
       Object.assign(current, previous);
-      setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+      setSetting('sai-ship-runs', serializeShipRuns(shipRuns, unparsedShipRuns));
       throw cause;
     }
   }
@@ -4027,7 +4027,7 @@
       await saveShipRuns();
     } catch (cause) {
       shipRuns = shipRuns.filter((item) => item.id !== run.id);
-      setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+      setSetting('sai-ship-runs', serializeShipRuns(shipRuns, unparsedShipRuns));
       throw cause;
     }
     showShipRuns();

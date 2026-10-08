@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readyShipIssues } from '../src/lib/issue-shipping.ts';
+import { migrateShipArchive } from '../src/lib/ship-archive.ts';
 import {
   appendShipEvent,
   beginLatestRefresh,
@@ -23,6 +24,8 @@ import {
   persistShipRefresh,
   gateSnapshot,
   loadShipRuns,
+  loadShipRunStore,
+  serializeShipRuns,
   parseShipReport,
   requireValidatorEconomics,
   refreshedIssueState,
@@ -281,6 +284,31 @@ void test('loads legacy runs and discards malformed records without losing valid
   assert.equal(restored[0].issues[0].worktreeUnavailable, true);
   assert.equal(restored[0].issues[0].validationPolicyRequired, true);
   assert.deepEqual(loadShipRuns('{'), []);
+});
+
+void test('saving keeps stored runs that cannot be parsed', () => {
+  const broken = { id: 'broken', issues: [null], futureField: { kept: true } };
+  const store = loadShipRunStore(JSON.stringify([broken, fixture()]));
+  assert.deepEqual(
+    store.runs.map((run) => run.id),
+    ['run'],
+  );
+  assert.deepEqual(store.unparsed, [broken]);
+
+  const archived = migrateShipArchive(store.runs, '1d', Date.now()).runs;
+  const saved = serializeShipRuns(archived, store.unparsed);
+  assert.deepEqual(JSON.parse(saved)[1], broken);
+  const reloaded = loadShipRunStore(saved);
+  assert.deepEqual(reloaded.unparsed, [broken]);
+  assert.equal(reloaded.runs.length, 1);
+
+  for (const raw of ['{', '{"not":"a list"}']) {
+    const corrupt = loadShipRunStore(raw);
+    assert.deepEqual(corrupt.runs, []);
+    assert.equal(corrupt.unparsed.length, 1, raw);
+    assert.equal(loadShipRunStore(serializeShipRuns([], corrupt.unparsed)).unparsed.length, 1);
+  }
+  assert.deepEqual(loadShipRunStore(null), { runs: [], unparsed: [] });
 });
 
 void test('legacy persisted work cannot opt out of validation by omitting the policy flag', () => {
