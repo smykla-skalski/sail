@@ -247,15 +247,15 @@ const availableCommands = [
   })),
 ];
 
-function requestPermission(sessionId, text, promptId, parent) {
+function requestPermission(sessionId, text, promptId, parent, toolCallId = 'review') {
   const id = ++nextPermission;
-  permissions.set(id, { sessionId, text, promptId, parent });
+  permissions.set(id, { sessionId, text, promptId, parent, toolCallId });
   send({
     id,
     method: 'session/request_permission',
     params: {
       sessionId,
-      toolCall: { toolCallId: 'review', title: 'Run test action' },
+      toolCall: { toolCallId, title: 'Run test action' },
       options: [
         { optionId: 'allow', name: 'Allow once', kind: 'allow_once' },
         { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
@@ -1201,18 +1201,24 @@ for await (const line of createInterface({ input: process.stdin })) {
       }, 4200);
       continue;
     }
+    // Each turn gets its own tool call id, as real agents do.
+    const toolCallId = `review-${message.id}`;
     update(sessionId, {
       sessionUpdate: 'tool_call',
-      toolCallId: 'review',
+      toolCallId,
       title: 'Run test action',
       status: 'pending',
     });
     if (text.startsWith('Delayed'))
-      setTimeout(() => requestPermission(sessionId, text, message.id), 1500);
-    else requestPermission(sessionId, text, message.id);
+      setTimeout(() => requestPermission(sessionId, text, message.id, undefined, toolCallId), 1500);
+    else requestPermission(sessionId, text, message.id, undefined, toolCallId);
   } else if (message.method === 'session/cancel') {
     const activePromptId = activePrompts.get(message.params.sessionId);
-    if (activePromptId !== undefined) {
+    const awaitingPermission = [...permissions.values()].some(
+      (pending) => pending.sessionId === message.params.sessionId,
+    );
+    // A turn waiting on a permission ends through that permission's cancel handling below.
+    if (activePromptId !== undefined && !awaitingPermission) {
       send({ id: activePromptId, result: { stopReason: 'cancelled' } });
       continue;
     }
@@ -1252,7 +1258,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     permissions.delete(message.id);
     update(pending.sessionId, {
       sessionUpdate: 'tool_call_update',
-      toolCallId: 'review',
+      toolCallId: pending.toolCallId,
       status: 'completed',
     });
     if (pending.parent) {
