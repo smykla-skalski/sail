@@ -6,6 +6,14 @@
   import { invoke } from '@tauri-apps/api/core';
   import OptionPicker from './OptionPicker.svelte';
   import { getSetting } from './lib/settings';
+  import {
+    parseThemePreference,
+    resolveTheme,
+    systemDarkQuery,
+    themeSettingKey,
+    watchSystemDark,
+    type ThemePreference,
+  } from './lib/theme';
   import { openExternalLink } from './lib/external-link';
   import type { SetupCheck, SetupReport } from './lib/onboarding';
   import type { ValidationChoice } from './lib/cross-validation';
@@ -16,6 +24,11 @@
     type ModelRouteRole,
   } from './lib/model-routing';
   import { shipRiskLevels, type ShipRisk } from './lib/ship-risk-policy';
+  import {
+    defaultShipArchiveDelay,
+    parseShipArchiveDelay,
+    shipArchiveDelays,
+  } from './lib/ship-archive';
   import {
     settingsAction,
     settingsRequest,
@@ -267,9 +280,15 @@
       .catch((cause: unknown) => (requestError = String(cause)));
   }
 
+  let themePreference = $state<ThemePreference>(parseThemePreference(getSetting(themeSettingKey)));
+  let systemDark = $state(globalThis.matchMedia?.(systemDarkQuery).matches ?? false);
+
+  $effect(() => {
+    document.documentElement.dataset.suiTheme = resolveTheme(themePreference, systemDark);
+  });
+
   onMount(() => {
-    document.documentElement.dataset.suiTheme =
-      getSetting('sai-theme') === 'dark' ? 'dark' : 'light';
+    const stopSystemTheme = watchSystemDark((value) => (systemDark = value));
     let unlisten: (() => void) | undefined;
     let active = true;
     void (async () => {
@@ -281,7 +300,7 @@
             if (snapshot.directory !== integrationDirectory)
               void inspectIntegration(snapshot.directory);
           }
-          document.documentElement.dataset.suiTheme = snapshot.theme;
+          themePreference = snapshot.theme;
           if (!binaryDirty) binaryPath = snapshot.binaryPath;
           if (!personalChecksDirty) personalChecks = snapshot.personalPostTurnChecks.join('\n');
         });
@@ -299,6 +318,7 @@
       active = false;
       unlisten?.();
       clearInterval(poll);
+      stopSystemTheme();
     };
   });
 </script>
@@ -345,13 +365,14 @@
             label="Theme"
             value={snapshot.theme}
             options={[
+              { value: 'system', name: 'System' },
               { value: 'light', name: 'Light' },
               { value: 'dark', name: 'Dark' },
             ]}
             open={themePickerOpen}
             onopen={() => (themePickerOpen = true)}
             onclose={() => (themePickerOpen = false)}
-            onchoose={(value) => send({ type: 'theme', value: value as 'light' | 'dark' })}
+            onchoose={(value) => send({ type: 'theme', value: parseThemePreference(value) })}
           />
         </section>
         <section class="settings-card">
@@ -596,6 +617,28 @@
         >
           <option value="you">You</option>
           <option value="agent">Agent, per repository release policy</option>
+        </select>
+      </section>
+      <section class="settings-card">
+        <h2>Ship archive</h2>
+        <p>
+          Archive a Ship run after all its issues are merged or closed and its claims are released.
+          Archiving only hides the run: checkpoints, evidence, branches and worktrees stay, and the
+          Archived filter brings it back.
+        </p>
+        <label for="ship-archive-delay">Archive finished runs</label>
+        <select
+          id="ship-archive-delay"
+          value={snapshot?.shipArchiveDelay ?? defaultShipArchiveDelay}
+          onchange={(event) =>
+            send({
+              type: 'ship-archive-delay',
+              value: parseShipArchiveDelay(event.currentTarget.value),
+            })}
+        >
+          {#each shipArchiveDelays as option (option.value)}
+            <option value={option.value}>{option.label}</option>
+          {/each}
         </select>
       </section>
       <section class="settings-card">

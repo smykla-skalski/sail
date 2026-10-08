@@ -24,7 +24,7 @@
         {
           "identifier": "e2e",
           "webviews": ["main", "settings"],
-          "permissions": ["wdio:default", "wdio-webdriver:default"]
+          "permissions": ["wdio:default", "wdio-webdriver:default", "core:window:allow-set-theme"]
         }
       ]
     }

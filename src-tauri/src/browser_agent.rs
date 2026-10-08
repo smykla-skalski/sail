@@ -166,17 +166,21 @@ impl BrowserManager {
         if port == 0 {
             return Err("Browser tool bridge is unavailable.".into());
         }
+        let mut env = BTreeMap::from([
+            ("SAIL_BROWSER_PORT".into(), port.to_string()),
+            ("SAIL_BROWSER_TOKEN".into(), token.clone()),
+            ("SAIL_CAPABILITY_PROFILE".into(), "build".into()),
+        ]);
+        if agent.is_none() {
+            env.insert("SAIL_PLAN_TOOLS".into(), "off".into());
+        }
         Ok(McpConfig {
             command: std::env::current_exe()
                 .map_err(|error| error.to_string())?
                 .to_string_lossy()
                 .into_owned(),
             args: vec!["--browser-mcp".into()],
-            env: BTreeMap::from([
-                ("SAIL_BROWSER_PORT".into(), port.to_string()),
-                ("SAIL_BROWSER_TOKEN".into(), token.clone()),
-                ("SAIL_CAPABILITY_PROFILE".into(), "build".into()),
-            ]),
+            env,
             token,
         })
     }
@@ -549,7 +553,11 @@ impl BrowserManager {
             | "task_checkpoint_read"
             | "task_checkpoint_update"
             | "task_evidence_record"
-            | "validation_policy" => None,
+            | "validation_policy"
+            | "sail_plan_propose"
+            | "sail_plan_ask"
+            | "sail_plan_step"
+            | "sail_plan_amend" => None,
             _ => return Err("Unknown coordination action.".into()),
         };
         let settings = crate::settings::load_settings(app.clone())?;
@@ -646,6 +654,10 @@ impl BrowserManager {
                 | "task_checkpoint_read"
                 | "task_checkpoint_update"
                 | "task_evidence_record"
+                | "sail_plan_propose"
+                | "sail_plan_ask"
+                | "sail_plan_step"
+                | "sail_plan_amend"
                 | "agent_status"
                 | "agent_wait"
                 | "agent_result"
@@ -1079,6 +1091,7 @@ fn handle_stream(manager: &BrowserManager, app: &AppHandle, mut stream: TcpStrea
                     let image = request.name == "screenshot";
                     match manager.perform(app, request) {
                         Ok(value) if image => value,
+                        Ok(Value::String(text)) => json!({"content":[{"type":"text","text":text}]}),
                         Ok(value) => json!({"content":[{"type":"text","text":value.to_string()}]}),
                         Err(error) => {
                             json!({"content":[{"type":"text","text":error}],"isError":true})
@@ -1379,6 +1392,26 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "",
     ),
     (
+        "sail_plan_propose",
+        "Submit a structured implementation plan for the user to review step by step in Sail. Use it for risky, ambiguous or multi-file work; small, obvious changes need no plan. Always include an overview flowchart and a sequenceDiagram, as lists of lines. Replaces any previous version; approved and finished steps keep their status if you keep their id, title, detail and files unchanged. Mark only the steps that need a human decision with needsYou. After calling this, end your turn and wait for a <plan-review> message.",
+        "",
+    ),
+    (
+        "sail_plan_ask",
+        "Ask the user every clarifying question at once, as one form, when a wrong guess would be costly. Use single or multi choice with concrete options and put your recommendation in recommended. After calling this, end your turn and wait for <plan-answers>.",
+        "",
+    ),
+    (
+        "sail_plan_step",
+        "Report progress on an approved plan step: in_progress before you start it; done when finished, with check describing how you verified it (outcome pass/fail/none, one-line summary, command if any); blocked with a note if you cannot finish; skipped if it turned out unnecessary. If the result says the plan is paused at a checkpoint, end your turn.",
+        "",
+    ),
+    (
+        "sail_plan_amend",
+        "Add steps to the executing plan when you find work it does not cover. Routine steps inside the files already approved are approved at once and you continue; steps that are high risk, need a decision (needsYou) or reach new files pause the plan for the user. If the result says the plan is paused, end your turn.",
+        "",
+    ),
+    (
         "task_checkpoint_read",
         "Read the canonical checkpoint for this thread's Ship task and reconcile it with the current worktree and known GitHub delivery state before resuming.",
         "",
@@ -1481,6 +1514,86 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+fn plan_lines_schema() -> Value {
+    json!({"type":["array","string"],"items":{"type":"string"}})
+}
+
+fn plan_step_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "id":{"type":"string","pattern":"^[a-z0-9][a-z0-9-]{0,31}$","description":"Stable step id such as s1. Keep the same id when revising a step so its review carries over."},
+            "title":{"type":"string","maxLength":120},
+            "detail":{"type":"string","maxLength":4000,"description":"What changes and how, in markdown."},
+            "rationale":{"type":"string","maxLength":2000},
+            "files":{"type":"array","items":{"type":"string"},"maxItems":50,"description":"Workspace-relative paths or globs this step edits. Edits to anything else are flagged."},
+            "risk":{"type":"string","enum":["low","medium","high"]},
+            "dependsOn":{"type":"array","items":{"type":"string"}},
+            "diagram":{"type":"string","maxLength":4000,"description":"Optional mermaid source for this step. Keep each node label on one short line."},
+            "needsYou":{"type":"string","maxLength":300,"description":"Only when this step needs a human decision: one line saying what to decide."}
+        },
+        "required":["id","title","detail"]
+    })
+}
+
+fn plan_tool_schema(name: &str) -> Option<Value> {
+    match name {
+        "sail_plan_propose" => Some(json!({
+            "type":"object",
+            "properties":{
+                "title":{"type":"string","maxLength":120},
+                "summary":{"type":["array","string"],"items":{"type":"string"},"description":"Goal and approach, as a list of short paragraphs (markdown)."},
+                "steps":{"type":"array","items":plan_step_schema(),"minItems":1,"maxItems":40},
+                "overview":{"type":["array","string"],"items":{"type":"string"},"description":"Required: a mermaid flowchart, as a list of lines, giving the big picture: the components involved and what the change adds or alters between them."},
+                "sequence":{"type":["array","string"],"items":{"type":"string"},"description":"Required: a mermaid sequenceDiagram, as a list of lines, of the runtime interaction the change touches."},
+                "diagrams":{"type":"array","maxItems":4,"items":{"type":"object","properties":{"title":{"type":"string"},"source":plan_lines_schema()},"required":["title","source"]},"description":"Optional extra diagrams, only where a picture adds something: a state machine, a data model, a before/after flow."},
+                "alternatives":{"type":"array","maxItems":8,"items":{"type":"object","properties":{"name":{"type":"string"},"pros":plan_lines_schema(),"cons":plan_lines_schema(),"chosen":{"type":"boolean"}},"required":["name"]},"description":"Approaches considered; mark the chosen one."}
+            },
+            "required":["title","summary","steps","overview","sequence"]
+        })),
+        "sail_plan_ask" => Some(json!({
+            "type":"object",
+            "properties":{
+                "questions":{"type":"array","minItems":1,"maxItems":12,"items":{
+                    "type":"object",
+                    "properties":{
+                        "id":{"type":"string","pattern":"^[a-z0-9][a-z0-9-]{0,31}$"},
+                        "question":{"type":"string","maxLength":500},
+                        "kind":{"type":"string","enum":["text","single","multi","confirm"]},
+                        "options":{"type":"array","maxItems":12,"items":{"type":"object","properties":{"value":{"type":"string"},"label":{"type":"string"},"description":{"type":"string"}},"required":["value","label"]},"description":"Required for single and multi."},
+                        "recommended":{"type":"array","items":{"type":"string"},"description":"Option values you recommend; shown pre-selected."}
+                    },
+                    "required":["id","question","kind"]
+                }}
+            },
+            "required":["questions"]
+        })),
+        "sail_plan_step" => Some(json!({
+            "type":"object",
+            "properties":{
+                "stepID":{"type":"string"},
+                "status":{"type":"string","enum":["in_progress","done","blocked","skipped"]},
+                "note":{"type":"string","maxLength":1000},
+                "check":{"type":"object","properties":{
+                    "outcome":{"type":"string","enum":["pass","fail","none"]},
+                    "summary":{"type":"string","maxLength":500},
+                    "command":{"type":"string","maxLength":300}
+                },"required":["outcome","summary"],"description":"Required with done: how you verified the step."}
+            },
+            "required":["stepID","status"]
+        })),
+        "sail_plan_amend" => Some(json!({
+            "type":"object",
+            "properties":{
+                "reason":{"type":"string","maxLength":500,"description":"What you discovered that the plan did not cover."},
+                "steps":{"type":"array","items":plan_step_schema(),"minItems":1,"maxItems":10,"description":"New steps with new ids."}
+            },
+            "required":["reason","steps"]
+        })),
+        _ => None,
+    }
+}
+
 fn economics_input_schema() -> Value {
     let counter = || json!({"type":"integer","minimum":0,"maximum":9007199254740991_u64});
     json!({
@@ -1574,6 +1687,10 @@ impl CapabilityProfile {
             "task_checkpoint_read",
             "task_checkpoint_update",
             "ship_progress",
+            "sail_plan_propose",
+            "sail_plan_ask",
+            "sail_plan_step",
+            "sail_plan_amend",
         ];
         if CORE.contains(&tool) {
             return true;
@@ -1601,7 +1718,31 @@ impl CapabilityProfile {
     }
 }
 
+fn plan_tools_enabled() -> bool {
+    std::env::var("SAIL_PLAN_TOOLS").as_deref() != Ok("off")
+}
+
+/// The Sail skill without its plan review section for sessions that do not get those tools.
+fn skill_text(plan_tools: bool) -> String {
+    if plan_tools {
+        return SAIL_SKILL.to_string();
+    }
+    let Some(start) = SAIL_SKILL.find("## Plan review") else {
+        return SAIL_SKILL.to_string();
+    };
+    let end = SAIL_SKILL[start + 1..]
+        .find("\n## ")
+        .map_or(SAIL_SKILL.len(), |offset| start + 1 + offset + 1);
+    format!("{}{}", &SAIL_SKILL[..start], &SAIL_SKILL[end..])
+}
+
+/// Native OpenCode sessions have no agent identity for plan review and use their own plugin.
+fn tool_listed(profile: CapabilityProfile, name: &str, plan_tools: bool) -> bool {
+    profile.enables(name) && (plan_tools || plan_tool_schema(name).is_none())
+}
+
 pub fn run_mcp_stdio() {
+    let plan_tools = plan_tools_enabled();
     let input = std::io::stdin();
     let mut output = std::io::stdout().lock();
     for line in input.lock().lines().map_while(Result::ok) {
@@ -1617,7 +1758,10 @@ pub fn run_mcp_stdio() {
             "initialize" => mcp_initialize(),
             "ping" => json!({}),
             "tools/list" => {
-                json!({"tools": TOOLS.iter().filter(|(name, _, _)| profile.enables(name)).map(|(name, description, fields)| {
+                json!({"tools": TOOLS.iter().filter(|(name, _, _)| tool_listed(profile, name, plan_tools)).map(|(name, description, fields)| {
+                if let Some(schema) = plan_tool_schema(name) {
+                    return json!({"name":name,"description":description,"inputSchema":schema});
+                }
                 if *name == "skill_reference" {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object",
@@ -1689,7 +1833,7 @@ pub fn run_mcp_stdio() {
                                     "objective":{"type":"string","minLength":1},
                                     "acceptanceCriteria":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},
                                     "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","review","test","pr","complete"]},
-                                    "status":{"type":"string","enum":["active","blocked","completed"]},
+                                    "status":{"type":"string","enum":["active","blocked","completed","cancelled","failed"]},
                                     "requiredGates":{"type":"array","items":{"type":"string","minLength":1}},
                                     "blocker":{"type":["string","null"]},
                                     "unresolvedQuestions":{"type":"array","items":{"type":"string","minLength":1}},
@@ -1745,7 +1889,7 @@ pub fn run_mcp_stdio() {
             "tools/call" => {
                 let params = message.get("params").unwrap_or(&Value::Null);
                 match params.get("name").and_then(Value::as_str) {
-                    Some(name) if profile.enables(name) => call_bridge(params),
+                    Some(name) if tool_listed(profile, name, plan_tools) => call_bridge(params),
                     Some(name) => json!({"content":[{"type":"text","text":format!(
                         "Tool {name} is disabled by the {} capability profile (policy {}).",
                         profile.as_str(),
@@ -1771,13 +1915,13 @@ fn mcp_initialize() -> Value {
         "protocolVersion":"2024-11-05",
         "capabilities":{"tools":{}},
         "serverInfo":{"name":"sail-browser","version":env!("CARGO_PKG_VERSION")},
-        "instructions":SAIL_SKILL
+        "instructions":skill_text(plan_tools_enabled())
     })
 }
 
 fn call_bridge(params: &Value) -> Value {
     if params.get("name").and_then(Value::as_str) == Some("sail_skill") {
-        return json!({"content":[{"type":"text","text":SAIL_SKILL}]});
+        return json!({"content":[{"type":"text","text":skill_text(plan_tools_enabled())}]});
     }
     if params.get("name").and_then(Value::as_str) == Some("skill_reference") {
         return skill_reference(params.get("arguments").unwrap_or(&Value::Null)).unwrap_or_else(
@@ -1845,8 +1989,8 @@ mod picker_tests {
 #[cfg(test)]
 mod skill_tests {
     use super::{
-        call_bridge, mcp_initialize, BrowserManager, CapabilityProfile, CAPABILITY_POLICY_REVISION,
-        SAIL_SKILL, TOOLS,
+        call_bridge, mcp_initialize, plan_tool_schema, skill_text, tool_listed, BrowserManager,
+        CapabilityProfile, CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
     };
 
     #[test]
@@ -1859,6 +2003,56 @@ mod skill_tests {
         assert!(CapabilityProfile::Release.enables("thread_message"));
         assert!(!CapabilityProfile::Release.enables("agent_spawn"));
         assert_eq!(CapabilityProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn plan_tools_reach_every_profile_with_a_schema() {
+        let names = [
+            "sail_plan_propose",
+            "sail_plan_ask",
+            "sail_plan_step",
+            "sail_plan_amend",
+        ];
+        for name in names {
+            assert!(TOOLS.iter().any(|(tool, _, _)| *tool == name), "{name}");
+            let schema = plan_tool_schema(name).unwrap();
+            assert_eq!(schema["type"], "object");
+            assert!(schema["required"].as_array().is_some_and(|r| !r.is_empty()));
+            for profile in [
+                CapabilityProfile::Explore,
+                CapabilityProfile::Review,
+                CapabilityProfile::Build,
+                CapabilityProfile::Release,
+            ] {
+                assert!(profile.enables(name), "{name} in {}", profile.as_str());
+            }
+        }
+        assert!(plan_tool_schema("terminal_create").is_none());
+        let propose = plan_tool_schema("sail_plan_propose").unwrap();
+        for field in ["steps", "overview", "sequence"] {
+            assert!(propose["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == field));
+        }
+    }
+
+    #[test]
+    fn native_sessions_do_not_hear_about_plan_tools() {
+        assert_eq!(skill_text(true), SAIL_SKILL);
+        let native = skill_text(false);
+        assert!(!native.contains("sail_plan_"));
+        assert!(native.contains("## Terminals"));
+        assert!(native.contains("## Worktrees and agents"));
+    }
+
+    #[test]
+    fn native_sessions_do_not_list_plan_tools() {
+        let profile = CapabilityProfile::Build;
+        assert!(tool_listed(profile, "sail_plan_propose", true));
+        assert!(!tool_listed(profile, "sail_plan_propose", false));
+        assert!(tool_listed(profile, "read_page", false));
     }
 
     #[test]

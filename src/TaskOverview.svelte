@@ -455,13 +455,13 @@
   .task-overview-header .eyebrow {
     margin: 0;
     color: var(--shell-selected-ink);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 800;
     letter-spacing: 0.12em;
   }
   .task-overview-count {
     color: var(--shell-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .task-overview-controls {
     display: grid;
@@ -475,7 +475,7 @@
   .task-overview-refresh {
     min-height: 38px;
     border: 1px solid var(--shell-control-border);
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     background: var(--sui-surface);
     color: var(--sui-foreground);
   }
@@ -487,9 +487,9 @@
   .task-overview-sort {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-8);
     color: var(--shell-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .task-overview-sort select {
     padding: 0 30px 0 10px;
@@ -509,7 +509,7 @@
   .task-card {
     min-width: 0;
     border: 1px solid var(--shell-divider);
-    border-radius: 12px;
+    border-radius: var(--radius-12);
     background: var(--sui-surface);
     box-shadow: 0 5px 18px color-mix(in srgb, var(--sui-foreground) 6%, transparent);
     overflow: hidden;
@@ -528,7 +528,7 @@
   }
   .task-card-repository {
     color: var(--shell-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 0.08em;
@@ -560,7 +560,7 @@
   }
   .task-card-main strong {
     overflow: hidden;
-    font-size: 16px;
+    font-size: var(--type-16);
     line-height: 1.3;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -572,7 +572,7 @@
     gap: 6px;
     min-width: 0;
     color: var(--shell-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .task-card-branch {
     overflow: hidden;
@@ -585,7 +585,7 @@
   .task-card-event {
     min-height: 34px;
     color: var(--sui-foreground);
-    font-size: 12px;
+    font-size: var(--type-12);
     line-height: 1.4;
     display: -webkit-box;
     -webkit-box-orient: vertical;
@@ -608,14 +608,14 @@
   }
   .task-card-facts dt {
     color: var(--shell-muted);
-    font-size: 10px;
+    font-size: var(--type-12);
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 0.06em;
   }
   .task-card-facts dd {
     margin: 3px 0 0;
-    font-size: 12px;
+    font-size: var(--type-12);
     font-weight: 700;
   }
   .task-card-facts dd[data-state='passing'],
@@ -633,7 +633,7 @@
   .task-card-unavailable {
     margin: 10px 15px 0;
     color: var(--activity-failed);
-    font-size: 11px;
+    font-size: var(--type-12);
     line-height: 1.35;
   }
   .task-card-action {

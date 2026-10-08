@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import ActivityStatus from './ActivityStatus.svelte';
+  import ShipActions from './ShipActions.svelte';
   import WorkerDependencyMap from './WorkerDependencyMap.svelte';
   import { locationName } from './lib/command-palette';
   import {
@@ -10,6 +11,8 @@
     type ShipRun,
   } from './lib/issue-shipping';
   import type { NativeSubagent } from './lib/native-subagents';
+  import type { ShipActionId } from './lib/ship-actions';
+  import { shipArchiveNoticeText, shipRunArchived } from './lib/ship-archive';
   import {
     ciStatus,
     dependencyIssue,
@@ -54,6 +57,9 @@
     onopen,
     onsettings,
     onhandoff,
+    onaction,
+    ondismissnotice,
+    archiveNotice = 0,
     nativeSubagents = [],
     focusRequest = null,
   }: {
@@ -67,6 +73,9 @@
     onopen: (path: string, threadId?: string | null) => Promise<void>;
     onsettings: () => Promise<void>;
     onhandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
+    onaction: (id: ShipActionId, run: ShipRun, issue: ShipIssue | null) => Promise<string>;
+    ondismissnotice: () => void;
+    archiveNotice?: number;
     nativeSubagents?: NativeSubagent[];
     focusRequest?: {
       id: number;
@@ -86,15 +95,19 @@
   let detailOpen = $state(false);
   let view = $state<'list' | 'graph'>('list');
   let showDone = $state(false);
+  let showArchived = $state(false);
+  let result = $state({ text: '', failed: false });
   let focusedId = $state('');
   let frozen = $state<ShipOrderSnapshot | null>(null);
   const detailId = `ship-selected-issue-${crypto.randomUUID()}`;
   const headingId = `${detailId}-heading`;
   let wasActive = false;
   const wide = $derived(panelWidth >= shipSplitWidth);
-  const visible = $derived(
+  const inScope = $derived(
     runs.filter((run) => scope === 'all' || !repository || run.repository === repository),
   );
+  const archivedCount = $derived(inScope.filter((run) => shipRunArchived(run)).length);
+  const visible = $derived(inScope.filter((run) => shipRunArchived(run) === showArchived));
   const orderedRuns = $derived(
     visible.toSorted((left, right) => right.approvedAt - left.approvedAt),
   );
@@ -259,6 +272,20 @@
         ?.focus();
   }
 
+  function showResult(text: string, failed: boolean) {
+    result = { text, failed };
+  }
+
+  function chooseArchived(archived: boolean) {
+    showArchived = archived;
+    selectedRun = '';
+    selectedIssue = '';
+    detailOpen = false;
+    showDone = false;
+    frozen = null;
+    if (archived) ondismissnotice();
+  }
+
   function chooseRun(id: string) {
     selectedRun = id;
     selectedIssue = '';
@@ -385,6 +412,26 @@
     </div>
   </header>
   {#if error}<p class="ship-error" role="alert">{error}</p>{/if}
+  {#if archiveNotice > 0}<p class="ship-notice" role="status" data-ship-archive-notice>
+      {shipArchiveNoticeText(archiveNotice)} ·
+      <button class="ship-link" onclick={() => chooseArchived(true)}>Show</button>
+      <button class="ship-link" aria-label="Dismiss archive notice" onclick={ondismissnotice}
+        >Dismiss</button
+      >
+    </p>{/if}
+  {#if result.text}<p
+      class:ship-error={result.failed}
+      role={result.failed ? 'alert' : 'status'}
+      data-ship-result
+    >
+      {result.text}
+    </p>{/if}
+  {#if archivedCount || showArchived}<div class="ship-scope" role="group" aria-label="Run state">
+      <button aria-pressed={!showArchived} onclick={() => chooseArchived(false)}>Active</button
+      ><button aria-pressed={showArchived} onclick={() => chooseArchived(true)}
+        >Archived ({archivedCount})</button
+      >
+    </div>{/if}
   {#if repository}<div class="ship-scope" role="group" aria-label="Repository scope">
       <button aria-pressed={scope === 'current'} onclick={() => (scope = 'current')}
         >Current repository</button
@@ -394,12 +441,17 @@
     </div>{/if}
   {#if !run}
     <section class="ship-empty">
-      <h3>No Ship runs yet</h3>
-      <p>Start one of two ways:</p>
-      <ul>
-        <li>Ask an agent to run <code>/ship-it &lt;issue-url&gt;</code> for one issue.</li>
-        <li>Publish an issue graph from an approved plan, then choose Ship issue graph.</li>
-      </ul>
+      {#if showArchived}
+        <h3>No archived runs</h3>
+        <p>Runs archive after all their issues are merged or closed.</p>
+      {:else}
+        <h3>No Ship runs yet</h3>
+        <p>Start one of two ways:</p>
+        <ul>
+          <li>Ask an agent to run <code>/ship-it &lt;issue-url&gt;</code> for one issue.</li>
+          <li>Publish an issue graph from an approved plan, then choose Ship issue graph.</li>
+        </ul>
+      {/if}
     </section>
   {:else}
     {#if orderedRuns.length > 1}<section class="ship-run-chooser" aria-label="Choose Ship run">
@@ -447,6 +499,7 @@
           aria-label="Merged issues"
         ></progress>
       </div>
+      <div class="ship-actions"><ShipActions {run} {onaction} onresult={showResult} /></div>
       {#if wide || !showDetail}<div class="view-toggle" role="group" aria-label="Issue view">
           <button aria-pressed={view === 'list'} onclick={() => (view = 'list')}>List</button>
           <button aria-pressed={view === 'graph'} onclick={() => (view = 'graph')}>Graph</button>
@@ -560,6 +613,7 @@
               : 'Not refreshed yet'}
           </p>
           <div class="ship-actions">
+            <ShipActions {run} {issue} {onaction} onresult={showResult} />
             {#if issue.pullRequest}<a
                 class="ship-pull-request"
                 href={issue.pullRequest}
@@ -879,12 +933,12 @@
   }
   .ship-summary p {
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .ship-progress {
     display: grid;
     min-width: 120px;
-    gap: 4px;
+    gap: var(--space-4);
   }
   progress {
     display: block;
@@ -907,7 +961,7 @@
   .ship-content {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    gap: 16px;
+    gap: var(--space-16);
     margin-top: 12px;
   }
   .ship-content.split {
@@ -919,11 +973,11 @@
   }
   .ship-now-list {
     display: grid;
-    gap: 12px;
+    gap: var(--space-12);
   }
   .ship-group {
     display: grid;
-    gap: 4px;
+    gap: var(--space-4);
   }
   .ship-group h4 {
     display: flex;
@@ -931,7 +985,7 @@
     align-items: baseline;
     margin: 0;
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
@@ -976,7 +1030,7 @@
   .ship-run-meta {
     display: flex;
     min-width: 0;
-    gap: 8px;
+    gap: var(--space-8);
     align-items: center;
     justify-content: space-between;
   }
@@ -984,20 +1038,30 @@
     flex: 1;
     min-width: 0;
     overflow: hidden;
-    font-size: 13px;
+    font-size: var(--type-13);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .ship-run-task strong,
-  .ship-run-meta span,
-  .ship-run-meta time {
+  .ship-run-meta span {
     min-width: 0;
     overflow-wrap: anywhere;
+  }
+  .ship-run-meta time {
+    flex: none;
+    white-space: nowrap;
+  }
+  .ship-run-task :global(.activity-status) {
+    flex: none;
+  }
+  .ship-summary,
+  .ship-issue-detail {
+    font-variant-numeric: tabular-nums;
   }
   .ship-line {
     overflow: hidden;
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
     line-height: 1.35;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1020,7 +1084,7 @@
     color: inherit;
     background: transparent;
     border: 1px solid var(--shell-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     padding: 7px 10px;
     cursor: pointer;
   }
@@ -1050,12 +1114,12 @@
   .ship-actions {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: var(--space-8);
     align-items: center;
   }
   .ship-run-chooser {
     display: grid;
-    gap: 8px;
+    gap: var(--space-8);
     margin: 12px 0 0;
   }
   .ship-run-chooser h3 {
@@ -1075,12 +1139,12 @@
   }
   .ship-run-meta {
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
   }
   .ship-scope {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: var(--space-8);
     margin-top: 12px;
   }
   .ship-scope button[aria-pressed='true'] {
@@ -1101,7 +1165,7 @@
     margin: 0 0 8px;
     padding: 0;
     list-style: none;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .ship-stage li {
     color: var(--sui-muted);
@@ -1126,10 +1190,13 @@
   .ship-dependencies {
     display: grid;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .ship-dependencies button {
     text-align: left;
+  }
+  .ship-notice {
+    margin: 8px 0 0;
   }
   .ship-error {
     color: var(--sui-danger);
@@ -1139,7 +1206,7 @@
   small,
   .ship-path {
     opacity: 0.7;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .ship-path,
   header p {

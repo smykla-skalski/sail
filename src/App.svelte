@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyboardScrollable } from './lib/scroll-focus';
   class ValidationCandidateUnavailable extends Error {
     constructor(message: string, cause?: unknown) {
       super(cause === undefined ? message : `${message}: ${describe(cause)}`, { cause });
@@ -29,21 +30,29 @@
     type ActivityHistoryInput,
   } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
-  import SpawnActivity from './SpawnActivity.svelte';
-  import SpawnResponse from './SpawnResponse.svelte';
-  import ToolActivity from './ToolActivity.svelte';
-  import ShellCommandCard from './ShellCommandCard.svelte';
   import {
     isShellDraft,
     shellCommand,
-    splitShellCommands,
     withShellContext,
     type ShellResult,
     type ShellRun,
   } from './lib/shell-command';
-  import ChatMessage from './ChatMessage.svelte';
+  import JumpToLatest from './JumpToLatest.svelte';
+  import Transcript from './Transcript.svelte';
+  import {
+    buildTranscript,
+    checkItems,
+    openCodeItems,
+    pendingCoordinationItems,
+    shellItems,
+    streamingItems,
+    subagentItems,
+  } from './lib/transcript';
   import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import PlanHistoryPanel from './PlanHistoryPanel.svelte';
+  import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
+  import { isPlanTool } from './lib/plan-engine';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
   import {
     loadNativePlan,
@@ -51,6 +60,7 @@
     removeStructuredQuestion,
     saveNativePlan,
   } from './lib/planning-state';
+  import { elicitationSummary } from './lib/elicitation-form';
   import ShipPanel from './ShipPanel.svelte';
   import AppTopbar from './AppTopbar.svelte';
   import {
@@ -61,8 +71,9 @@
     reserveInlineValidation,
     gateSnapshot,
     currentShipBlockedReason,
-    loadShipRuns,
+    loadShipRunStore,
     repositoryForRemote,
+    serializeShipRuns,
     shippingWorkerGone,
     unrecoverableGraceExpired,
     unrecoverableIssuePlan,
@@ -95,6 +106,28 @@
     validationRevisionDrifted,
   } from './lib/ship-progress';
   import type { PublishedGraph } from './lib/issue-graph';
+  import {
+    migrateShipArchive,
+    parseShipArchiveDelay,
+    shipArchiveMigrationKey,
+    shipRunArchived,
+    shipRunDueForArchive,
+    type ShipArchiveDelay,
+  } from './lib/ship-archive';
+  import {
+    shipArchiveAction,
+    shipArchiveConfirmation,
+    shipMergeAction,
+    shipMergeConfirmation,
+    shipReopenAction,
+    shipReopenConfirmation,
+    shipRetryAction,
+    shipRetryConfirmation,
+    shipStopAction,
+    shipStopConfirmation,
+    stoppedMessage,
+    type ShipActionId,
+  } from './lib/ship-actions';
   import {
     adoptRegisteredDirectShipRun,
     acpWorkerTerminationConfirmed,
@@ -146,6 +179,7 @@
     shippingSetupAction,
     settledLostClaimFence,
     terminalClaimReleaseReady,
+    terminalClaimReleaseReason,
     type DirectShipAuthorization,
     type ShippingClaim,
     type ShippingClaimObservation,
@@ -168,6 +202,7 @@
     initialTaskCheckpoint,
     prepareTaskCheckpointUpdate,
     reconcileTaskCheckpoint,
+    updateTaskCheckpoint,
   } from './lib/task-checkpoint.ts';
   import {
     ContextPressureRecorder,
@@ -237,6 +272,7 @@
   import DiffPanel from './DiffPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
+  import ShipQueue from './ShipQueue.svelte';
   import TaskOverview from './TaskOverview.svelte';
   import type { GitHubIssue, PullRequestCheck } from './ProjectSidebar.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
@@ -246,7 +282,6 @@
     resolveTaskLocation,
     type TaskLocation as TaskLocationValue,
   } from './lib/task-location';
-  import PostTurnChecks from './PostTurnChecks.svelte';
   import {
     checkKey,
     personalChecks,
@@ -304,12 +339,7 @@
     type AutomaticPermissionRequest,
   } from './lib/permission-resolution';
   import { openCodePermissionRejections } from './lib/opencode-permission-resolution';
-  import {
-    prepareToolFailureDraft,
-    openCodeErrorDetails,
-    reportedHookIdentity,
-    toolFailurePrompt,
-  } from './lib/tool-failure';
+  import { prepareToolFailureDraft, toolFailurePrompt } from './lib/tool-failure';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import type { Confirmation } from './ConfirmDialog.svelte';
   import PathPicker from './PathPicker.svelte';
@@ -465,7 +495,7 @@
     type SessionMessageInfo,
   } from './lib/opencode';
   import { recordDiagnostic } from './lib/diagnostics';
-  import { getPlan, type PlanSnapshot } from './lib/plan';
+  import { getPlan, openCodePlanBackend, type PlanSnapshot } from './lib/plan';
   import { mergeMessages, nearBottom } from './lib/timeline';
   import {
     cachedOpenCodeTimelines,
@@ -480,10 +510,9 @@
     removeClipboardFile,
     stageClipboardFile,
   } from './lib/attachments';
-  import { copyCompletedSelection } from './lib/auto-copy';
+  import { copyCompletedSelection, copyStatusHost } from './lib/auto-copy';
   import {
     coordinationKey,
-    coordinationMessageForText,
     coordinationPrompt,
     enqueueCoordinationMessage,
     loadCoordinationMessages,
@@ -521,7 +550,6 @@
     saveBoundedReceipt,
     spawnPromptDispatchAllowed,
     spawnReceiptsForSource,
-    withSpawnResponses,
     type ReplacementDispatchAction,
     type SpawnReceipt,
     type SpawnState,
@@ -545,6 +573,14 @@
     setSettingDurable,
     settingsError,
   } from './lib/settings';
+  import {
+    parseThemePreference,
+    resolveTheme,
+    systemDarkQuery,
+    themeSettingKey,
+    watchSystemDark,
+    type ThemePreference,
+  } from './lib/theme';
   import {
     commandsForDirectory,
     loadSavedCommands,
@@ -592,7 +628,9 @@
     type WorktreeCreation,
   } from './lib/projects';
 
-  let dark = $state(getSetting('sai-theme') === 'dark');
+  let themePreference = $state<ThemePreference>(parseThemePreference(getSetting(themeSettingKey)));
+  let systemDark = $state(globalThis.matchMedia?.(systemDarkQuery).matches ?? false);
+  const dark = $derived(resolveTheme(themePreference, systemDark) === 'dark');
   const savedAgentThreads = loadAgentThreads();
   const startupInterruptedTurns = loadInterruptedAgentTurns(
     getSetting('sai-interrupted-agent-turns'),
@@ -634,7 +672,28 @@
         return taskLocation;
       });
   });
-  let shipRuns = $state<ShipRun[]>(loadShipRuns(getSetting('sai-ship-runs')));
+  const initialShipArchiveDelay = parseShipArchiveDelay(getSetting('sai-ship-archive-delay'));
+  const storedShipRuns = loadShipRunStore(getSetting('sai-ship-runs'));
+  // Entries this build cannot parse are written back with every save instead of being lost.
+  const unparsedShipRuns = storedShipRuns.unparsed;
+  const shipArchiveMigration =
+    getSetting(shipArchiveMigrationKey) === 'done'
+      ? null
+      : migrateShipArchive(storedShipRuns.runs, initialShipArchiveDelay, Date.now());
+  const initialShipRuns = shipArchiveMigration?.runs ?? storedShipRuns.runs;
+  const initialShipArchiveNotice = shipArchiveMigration?.archived
+    ? shipArchiveMigration.archived
+    : Number(getSetting('sai-ship-archive-notice')) || 0;
+  if (shipArchiveMigration) {
+    if (shipArchiveMigration.archived > 0) {
+      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, unparsedShipRuns));
+      setSetting('sai-ship-archive-notice', String(initialShipArchiveNotice));
+    }
+    setSetting(shipArchiveMigrationKey, 'done');
+  }
+  let shipArchiveDelay = $state<ShipArchiveDelay>(initialShipArchiveDelay);
+  let shipRuns = $state<ShipRun[]>(initialShipRuns);
+  let shipArchiveNotice = $state(initialShipArchiveNotice);
 
   function capabilityProfileForDirectory(path: string): CapabilityProfile {
     const issue = shipRuns
@@ -737,6 +796,10 @@
       | 'task_checkpoint_read'
       | 'task_checkpoint_update'
       | 'task_evidence_record'
+      | 'sail_plan_propose'
+      | 'sail_plan_ask'
+      | 'sail_plan_step'
+      | 'sail_plan_amend'
       | 'agent_status'
       | 'agent_wait'
       | 'agent_result'
@@ -1064,6 +1127,8 @@
   let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
   let copiedStatus = $state('');
   let copiedStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  let copyStatusRegion: HTMLDivElement;
+  let copyStatusHome: { parent: Node; next: Node | null } | undefined;
   let shortcutsDialog: HTMLDialogElement;
   const shortcutPlatform = detectShortcutPlatform();
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
@@ -1090,11 +1155,14 @@
       attentionLedger,
       [
         ...sessionAttention,
-        ...shipAttentionCandidates(shipRuns, {
-          mergeOwner,
-          now: attentionClock,
-          requestThreads: threadRequestKeys(sessionAttention),
-        }),
+        ...shipAttentionCandidates(
+          shipRuns.filter((run) => !shipRunArchived(run)),
+          {
+            mergeOwner,
+            now: attentionClock,
+            requestThreads: threadRequestKeys(sessionAttention),
+          },
+        ),
         ...subagentAttentionCandidates(
           visibleSpawnReceipts,
           threadRequestKeys(sessionAttention),
@@ -1214,7 +1282,7 @@
       openCodeSessions: paletteOpenCodeSessions,
       commands: savedCommands,
       actions: paletteActions({
-        dark,
+        theme: themePreference,
         overview: workspaceView === 'overview',
         hasDirectory: !!directory,
       }),
@@ -1259,7 +1327,9 @@
   let reviewCaptures = $state<(ReviewCapture & { directory: string })[]>([]);
   let mainDiffEvidenceUpdated = $state(Date.now());
   let diffComments = $state<Record<string, DiffComment[]>>({});
-  let pendingAgentBatches = $state<Record<string, { id: string; text: string }>>({});
+  let pendingAgentBatches = $state<
+    Record<string, { id: string; text: string; leavePlanMode?: boolean }>
+  >({});
   let issuePrefills = $state<Record<string, { id: string; text: string }>>({});
   let agentEntrySnapshots = $state.raw<
     Record<string, { sessionId: string | null; entries: AgentEntry[]; ready: boolean }>
@@ -1344,6 +1414,8 @@
     if (!side.parentThreadId && thread) sideChat = { ...side, parentThreadId: thread.sessionId };
   });
   let messages = $state<SessionMessageInfo[]>([]);
+  // Off while history (cache, first page, older pages) mounts, so its failed tools stay silent.
+  let liveTools = $state(false);
   let olderMessageCursor = $state<string | null>(null);
   let loadingOlder = $state(false);
   let restoringTimelineSelection: number | null = null;
@@ -1352,7 +1424,7 @@
   let textTimer: ReturnType<typeof setTimeout> | undefined;
   let timelineSession = '';
   let timelineRefresh = 0;
-  let followChat = true;
+  let followChat = $state(true);
   let followFrame = 0;
   let messageTimers = new SvelteMap<
     string,
@@ -1361,16 +1433,39 @@
   let messageGeneration = new SvelteMap<string, number>();
   let snapshot = $state<PlanSnapshot>({ plan: null, questions: null });
   let nativePlan = $state<NativePlan | null>(null);
+  let nativePlanFeedback = $state('');
+  let nativePlanRevision = $state<{ id: string; feedback: string } | null>(null);
+  let nativePlanRevisionPending = $state(false);
+  let nativePlanRevisionError = $state('');
   let diffs = $state<WorkingDiffInfo[]>([]);
   let diffLoading = $state(false);
   let diffError = $state('');
   let selectedFilePath = $state<string | null>(null);
-  type SideTab = 'plan' | 'changes' | 'history' | 'ship';
+  type SideTab = 'plan' | 'planhistory' | 'changes' | 'history' | 'ship';
   let sideTab = $state<SideTab>('plan');
   let detailsOpen = $state(true);
   let diffRefresh = 0;
   let diffRevision = '';
   let diffRevisionPath = '';
+
+  function requestNativePlanRevision() {
+    const feedback = nativePlanFeedback.trim();
+    if (!feedback) {
+      nativePlanRevisionError = 'Describe what should change before requesting a revision.';
+      return;
+    }
+    nativePlanRevisionError = '';
+    nativePlanRevisionPending = true;
+    nativePlanRevision = { id: crypto.randomUUID(), feedback };
+  }
+
+  function finishNativePlanRevision(id: string, failure: string | null) {
+    if (nativePlanRevision?.id !== id) return;
+    nativePlanRevisionPending = false;
+    nativePlanRevision = null;
+    nativePlanRevisionError = failure ?? '';
+    if (!failure) nativePlanFeedback = '';
+  }
   let draft = $state('');
   const failureRequests = new SvelteMap<string, string>();
   let mainPrompt = $state<HTMLTextAreaElement | undefined>();
@@ -1423,8 +1518,10 @@
     );
   }
   let mobileView = $state<'sessions' | 'chat' | 'details'>('chat');
-  let workspaceView = $state<'workspace' | 'overview'>(
-    getSetting('sai-workspace-view') === 'overview' ? 'overview' : 'workspace',
+  let workspaceView = $state<'workspace' | 'overview' | 'ship-queue'>(
+    ['overview', 'ship-queue'].includes(getSetting('sai-workspace-view') ?? '')
+      ? (getSetting('sai-workspace-view') as 'overview' | 'ship-queue')
+      : 'workspace',
   );
   let sidebarVisible = $state(true);
   let mobileLayout = $state(window.matchMedia('(max-width: 850px)').matches);
@@ -1536,6 +1633,14 @@
       if (acpAgent) void refreshAgentDiff();
       else void refreshDiff();
     }
+  }
+
+  function revealMainPlan(scope: PlanScope, reason: string) {
+    if (!acpPlanScope || planKey(scope) !== planKey(acpPlanScope)) return;
+    if (!['proposed', 'questions', 'amended', 'checkpoint', 'done'].includes(reason)) return;
+    sideTab = 'plan';
+    agentChangesOpen = true;
+    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
   }
 
   async function toggleChanges() {
@@ -1710,9 +1815,13 @@
     const cursor = olderMessageCursor;
     const page = await source.message.list({ sessionID: id, limit: 50, cursor });
     if (current !== selection || id !== sessionID) return;
+    const wasLive = liveTools;
+    liveTools = false;
     messages = mergeMessages(messages, page.data);
     olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
     cacheCurrentTimeline();
+    await tick();
+    if (current === selection && id === sessionID) liveTools = wasLive;
     await restoreOlderMessages(source, id, current, count, anchorID);
   }
   let client = $state<OpenCodeClient | null>(null);
@@ -2106,13 +2215,6 @@
     if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
       void adoptDirectShipRun(saved, path, sourceId).catch((cause) => (error = describe(cause)));
   });
-  const displayChatMessages = $derived(
-    withSpawnResponses(
-      chatMessages,
-      spawnReceiptsForSource(spawnReceipts, sessionID ? `opencode:${sessionID}` : null, directory),
-      (message) => message.time.created,
-    ),
-  );
   $effect(() => {
     if (!sessionID || timelineSession !== sessionID || !setup) return;
     const context = openCodeContextUsage(messages, setup.models);
@@ -2125,6 +2227,42 @@
   });
   let liveOnly = $derived(
     Object.entries(liveText).filter(([id]) => !messages.some((message) => message.id === id)),
+  );
+  const mainCoordinationMessages = $derived(
+    coordinationMessages.filter(
+      (message) =>
+        !!sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`),
+    ),
+  );
+  const mainTranscript = $derived(
+    buildTranscript({
+      base: openCodeItems(
+        chatMessages,
+        spawnReceiptsForSource(
+          spawnReceipts,
+          sessionID ? `opencode:${sessionID}` : null,
+          directory,
+        ),
+        { liveText },
+      ),
+      timed: [
+        ...checkItems(mainPostTurnChecks),
+        ...subagentItems(mainSpawnActivity),
+        ...shellItems(pendingShellRuns),
+      ],
+      trailing: [
+        ...pendingCoordinationItems(
+          mainCoordinationMessages.filter(
+            (message) =>
+              !chatMessages.some(
+                (item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)),
+              ),
+          ),
+          'opencode',
+        ),
+        ...streamingItems(liveOnly, currentSession?.agent ?? 'Agent'),
+      ],
+    }),
   );
   let canSend = $derived(
     runtimeState === 'connected' &&
@@ -2226,17 +2364,44 @@
   let effortChoices = $derived(
     (chosenModel?.variants ?? []).map((variant) => ({ value: variant.id, name: variant.id })),
   );
-  let showPlanPanel = $derived(!!snapshot.plan || !!snapshot.questions || !!nativePlan);
+  let acpPlanTick = $state(0);
+  let acpPlanScope = $derived<PlanScope | null>(
+    acpAgent && acpThread ? { agent: acpAgent, directory, sessionId: acpThread.sessionId } : null,
+  );
+  let acpSnapshot = $derived.by((): PlanSnapshot => {
+    void acpPlanTick;
+    return acpPlanScope ? acpPlans().snapshot(acpPlanScope) : { plan: null, questions: null };
+  });
+  let acpPlanHistory = $derived.by(() => {
+    void acpPlanTick;
+    return acpPlanScope ? acpPlans().history(acpPlanScope) : [];
+  });
+  let mainPlanBackend = $derived(
+    acpPlanScope
+      ? acpPlanBackend(acpPlans(), acpPlanScope, {
+          send: (text, options) => sendPlanMessage('main', text, options),
+        })
+      : null,
+  );
+  let showPlanPanel = $derived(
+    !!snapshot.plan ||
+      !!snapshot.questions ||
+      !!nativePlan ||
+      !!acpSnapshot.plan ||
+      !!acpSnapshot.questions,
+  );
   let activeSideTab = $derived(
     sideTab === 'ship'
       ? 'ship'
       : showPlanPanel && sideTab === 'plan'
         ? 'plan'
-        : acpAgent && sideTab !== 'history'
-          ? 'changes'
-          : sideTab === 'history'
-            ? 'history'
-            : 'changes',
+        : acpAgent && sideTab === 'planhistory' && acpPlanHistory.length
+          ? 'planhistory'
+          : acpAgent && sideTab !== 'history'
+            ? 'changes'
+            : sideTab === 'history'
+              ? 'history'
+              : 'changes',
   );
   let mainDetailsVisible = $derived(
     workspaceView === 'workspace' &&
@@ -2273,17 +2438,22 @@
     sideTab = 'changes';
     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'chat';
   }
-  let diffAnnotations = $derived(annotateDiffs(diffs, snapshot.plan, directory));
+  let diffAnnotations = $derived(
+    annotateDiffs(diffs, acpAgent ? acpSnapshot.plan : snapshot.plan, directory),
+  );
 
-  function setTheme(value: boolean) {
-    dark = value;
-    document.documentElement.dataset.suiTheme = value ? 'dark' : 'light';
-    setSetting('sai-theme', value ? 'dark' : 'light');
+  function setTheme(preference: ThemePreference) {
+    themePreference = preference;
+    setSetting(themeSettingKey, preference);
   }
+
+  $effect(() => {
+    document.documentElement.dataset.suiTheme = dark ? 'dark' : 'light';
+  });
 
   function settingsSnapshot(): SettingsSnapshot {
     return {
-      theme: dark ? 'dark' : 'light',
+      theme: themePreference,
       binaryPath,
       activeBinary,
       runtimeState,
@@ -2307,6 +2477,7 @@
       agentThreadListEnabled,
       agentMessagesEnabled,
       mergeOwner,
+      shipArchiveDelay,
       contextHandoffThreshold,
     };
   }
@@ -2369,6 +2540,10 @@
     let unlistenAgentEvents: (() => void) | undefined;
     let unlistenBrowserAccess: (() => void) | undefined;
     let unlistenCoordination: (() => void) | undefined;
+    const unsubscribePlans = acpPlans().subscribe((change) => {
+      acpPlanTick += 1;
+      revealMainPlan(change.scope, change.reason);
+    });
     let unlistenTerminalExit: (() => void) | undefined;
     const coordinationRetry = setInterval(() => {
       if (isTauri()) retryCoordinationDeliveries();
@@ -2377,7 +2552,8 @@
     let unlistenAgentTerminals: (() => void) | undefined;
     let unlistenNotificationClick: (() => void) | undefined;
     let stopEmulatedClick: (() => void) | undefined;
-    setTheme(dark);
+    setTheme(themePreference);
+    const stopSystemTheme = watchSystemDark((value) => (systemDark = value));
     let stopSettingsRequest: (() => void) | undefined;
     let stopSettingsAction: (() => void) | undefined;
     let stopCloseRequest: (() => void) | undefined;
@@ -2458,7 +2634,7 @@
       );
       void listen<SettingsAction>(settingsAction, (event) => {
         const action = event.payload;
-        if (action.type === 'theme') setTheme(action.value === 'dark');
+        if (action.type === 'theme') setTheme(action.value);
         else if (action.type === 'binary') {
           binaryPath = action.value;
           void retryRuntime();
@@ -2492,6 +2668,10 @@
         } else if (action.type === 'merge-owner') {
           mergeOwner = parseMergeOwner(action.value);
           setSetting('sai-ship-merge-owner', mergeOwner);
+        } else if (action.type === 'ship-archive-delay') {
+          shipArchiveDelay = parseShipArchiveDelay(action.value);
+          setSetting('sai-ship-archive-delay', shipArchiveDelay);
+          void archiveDueShipRuns();
         } else if (action.type === 'context-handoff-threshold') {
           const previousThreshold = contextHandoffThreshold;
           contextHandoffThreshold = parseContextHandoffThreshold(String(action.value));
@@ -2625,10 +2805,12 @@
       unlistenAgentEvents?.();
       unlistenBrowserAccess?.();
       unlistenCoordination?.();
+      unsubscribePlans();
       unlistenTerminalExit?.();
       unlistenAgentTerminals?.();
       unlistenNotificationClick?.();
       stopEmulatedClick?.();
+      stopSystemTheme();
       cancelAnimationFrame(followFrame);
       for (const pending of messageTimers.values()) clearTimeout(pending.timer);
     };
@@ -2906,8 +3088,295 @@
   }
 
   async function saveShipRuns(): Promise<void> {
-    const value = JSON.stringify(shipRuns);
+    const value = serializeShipRuns(shipRuns, unparsedShipRuns);
     await setSettingDurable('sai-ship-runs', value);
+  }
+
+  async function archiveDueShipRuns(): Promise<void> {
+    const now = Date.now();
+    const due = shipRuns.filter((run) => shipRunDueForArchive(run, shipArchiveDelay, now));
+    if (!due.length) return;
+    for (const run of due) {
+      run.archivedAt = now;
+      run.archivedBy = 'auto';
+    }
+    await saveShipRuns();
+  }
+
+  async function confirmShipAction(request: {
+    title: string;
+    message: string;
+    confirmLabel: string;
+    destructive: boolean;
+  }): Promise<boolean> {
+    return confirmInApp(request.title, request.message, request.confirmLabel, {
+      destructive: request.destructive,
+    });
+  }
+
+  const shipMergesInFlight = new SvelteSet<string>();
+
+  async function mergeShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const key = `${run.id}:${issue.id}`;
+    if (shipMergesInFlight.has(key)) throw new Error('A merge request is already in progress.');
+    shipMergesInFlight.add(key);
+    try {
+      return await requestShipMerge(run, issue);
+    } finally {
+      shipMergesInFlight.delete(key);
+    }
+  }
+
+  async function requestShipMerge(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const available = shipMergeAction(issue);
+    if (!available.enabled) throw new Error(available.reason ?? 'This pull request cannot merge.');
+    if (!(await confirmShipAction(shipMergeConfirmation(issue, run.remote)))) return '';
+    const ready = shipMergeAction(issue);
+    if (!ready.enabled) throw new Error(ready.reason ?? 'This pull request cannot merge.');
+    const outcome = await invoke<{
+      method: 'github' | 'bot-comment';
+      strategy: string;
+      comment: string | null;
+    }>('ship_merge_pull_request', {
+      request: {
+        repository: run.repository,
+        expectedRepository: run.remote,
+        pullRequest: issue.pullRequest,
+        expectedHead: issue.checkpoint?.revision,
+        evidenceReady: shipEvidenceReadiness(issue).ready,
+      },
+    });
+    if (outcome.method !== 'bot-comment') {
+      void tickShippingRuns(true);
+      return `Merged the pull request (${outcome.strategy}).`;
+    }
+    const posted = `Posted “${outcome.comment}” on the pull request. The repository's bot merges it.`;
+    // Kept in memory even if saving fails, so this session cannot post the comment again.
+    await updateShipIssue(
+      run,
+      issue,
+      {
+        mergeRequested: {
+          at: Date.now(),
+          head: issue.pullRequestHead ?? null,
+          comment: outcome.comment ?? '',
+        },
+      },
+      false,
+    );
+    void tickShippingRuns(true);
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      return `${posted} Sail could not save that the merge was requested: ${describe(cause)}`;
+    }
+    return posted;
+  }
+
+  function requireShipClaimOwnership(issue: ShipIssue, action: string): void {
+    if (
+      issue.claim?.status === 'active' &&
+      !shippingClaimOwnedByInstance(issue.claim, shippingInstanceId)
+    )
+      throw new Error(
+        `Another Sail instance holds the shipping claim for this issue. ${action} after it releases or expires.`,
+      );
+  }
+
+  /** Stops leftovers and queues a fresh worker that resumes from the saved checkpoint. */
+  async function restartShipIssue(
+    run: ShipRun,
+    issue: ShipIssue,
+    nextAction: string,
+    changes: Partial<ShipIssue> = {},
+  ): Promise<void> {
+    const checkpoint = issue.checkpoint;
+    const resumed =
+      checkpoint && (checkpoint.status === 'cancelled' || checkpoint.status === 'failed')
+        ? updateTaskCheckpoint(
+            checkpoint,
+            {
+              status: 'active',
+              phase: checkpoint.phase === 'complete' ? 'implement' : checkpoint.phase,
+              nextAction,
+            },
+            Date.now(),
+          )
+        : checkpoint;
+    await updateShipIssue(run, issue, {
+      state: 'pending',
+      error: null,
+      blockedReason: null,
+      refreshError: null,
+      workerSettled: false,
+      receiptId: null,
+      threadId: null,
+      cancelledAt: undefined,
+      stage: undefined,
+      reportedStatus: undefined,
+      claimFencePending: false,
+      claimRevalidationPending: false,
+      claimHandoffPending: false,
+      dispatchFencePending: false,
+      retryCount: (issue.retryCount ?? 0) + 1,
+      ...changes,
+      ...(resumed ? { checkpoint: resumed } : {}),
+    });
+    launchReadyShipIssues(run);
+  }
+
+  async function retryShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const available = shipRetryAction(issue);
+    if (!available.enabled) throw new Error(available.reason ?? 'This issue cannot be retried.');
+    requireShipClaimOwnership(issue, 'Retry');
+    if (!(await confirmShipAction(shipRetryConfirmation(issue)))) return '';
+    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+      await stopShippingWorker(issue);
+    const stillRetryable = shipRetryAction(issue);
+    if (!stillRetryable.enabled)
+      throw new Error(stillRetryable.reason ?? 'This issue changed and cannot be retried.');
+    await restartShipIssue(run, issue, 'Resume from the saved checkpoint after the retry.');
+    return 'Retry queued. A fresh worker resumes from the saved checkpoint.';
+  }
+
+  async function reopenShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const available = shipReopenAction(issue);
+    if (!available.enabled)
+      throw new Error(available.reason ?? 'This pull request cannot be reopened.');
+    requireShipClaimOwnership(issue, 'Reopen');
+    if (!(await confirmShipAction(shipReopenConfirmation(issue, run.remote)))) return '';
+    const ready = shipReopenAction(issue);
+    if (!ready.enabled)
+      throw new Error(ready.reason ?? 'This issue changed and cannot be reopened.');
+    const outcome = await invoke<{ head: string; pullRequest: string; alreadyOpen: boolean }>(
+      'ship_reopen_pull_request',
+      {
+        request: {
+          repository: run.repository,
+          expectedRepository: run.remote,
+          pullRequest: issue.pullRequest,
+        },
+      },
+    );
+    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+      await stopShippingWorker(issue);
+    const key = `${run.id}:${issue.id}`;
+    // A lookup started before the reopen would report the pull request closed again.
+    beginLatestRefresh(shippingPullRequestGenerations, key);
+    const cached = shippingPullRequests.get(key);
+    if (cached) shippingPullRequests.set(key, { ...cached, state: 'OPEN' });
+    await restartShipIssue(
+      run,
+      issue,
+      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.`,
+      { pullRequestState: 'OPEN', pullRequestHead: outcome.head },
+    );
+    return outcome.alreadyOpen
+      ? 'The pull request was already open. A fresh worker resumes from the saved checkpoint.'
+      : 'Pull request reopened. A fresh worker resumes from the saved checkpoint.';
+  }
+
+  async function stopShipRun(run: ShipRun): Promise<string> {
+    const available = shipStopAction(run);
+    if (!available.enabled) throw new Error(available.reason ?? 'Nothing to stop.');
+    if (run.issues.some((issue) => activeShipLaunches.has(`${run.id}:${issue.id}`)))
+      throw new Error('A worker is still launching. Stop the run once it has started.');
+    if (!(await confirmShipAction(shipStopConfirmation(run)))) return '';
+    if (run.issues.some((issue) => activeShipLaunches.has(`${run.id}:${issue.id}`)))
+      throw new Error('A worker is still launching. Stop the run once it has started.');
+    const stopping = run.issues.filter((issue) =>
+      ['pending', 'starting', 'working', 'awaiting_merge'].includes(issue.state),
+    );
+    const markStopped = async (issue: ShipIssue) => {
+      if (issue.state === 'merged') return;
+      const checkpoint = issue.checkpoint;
+      return updateShipIssue(run, issue, {
+        state: 'failed',
+        error: stoppedMessage,
+        blockedReason: null,
+        workerSettled: true,
+        cancelledAt: Date.now(),
+        ...(checkpoint && checkpoint.status !== 'completed'
+          ? {
+              checkpoint: updateTaskCheckpoint(
+                checkpoint,
+                { status: 'cancelled', blocker: null },
+                Date.now(),
+              ),
+            }
+          : {}),
+      });
+    };
+    const saved = stopping.filter((issue) => issue.state === 'pending').map(markStopped);
+    const unsettled = stopping.filter((issue) => !issue.cancelledAt);
+    const outcomes = await Promise.allSettled(
+      unsettled.map(async (issue) => {
+        if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+          await stopShippingWorker(issue);
+        await markStopped(issue);
+      }),
+    );
+    await Promise.all(saved);
+    const failures = outcomes.flatMap((outcome, index) =>
+      outcome.status === 'rejected'
+        ? [`#${unsettled[index]?.number}: ${describe(outcome.reason)}`]
+        : [],
+    );
+    if (failures.length) throw new Error(`Could not stop ${failures.join('; ')}`);
+    return 'Run stopped. Claims are released as cancelled.';
+  }
+
+  async function archiveShipRunByUser(run: ShipRun): Promise<string> {
+    const available = shipArchiveAction(run);
+    if (!available.enabled) throw new Error(available.reason ?? 'This run cannot be archived.');
+    if (!(await confirmShipAction(shipArchiveConfirmation(run)))) return '';
+    run.archivedAt = Date.now();
+    run.archivedBy = 'user';
+    await saveShipRuns();
+    return 'Run archived. Use the Archived filter to find it.';
+  }
+
+  async function unarchiveShipRunByUser(run: ShipRun): Promise<string> {
+    delete run.archivedAt;
+    delete run.archivedBy;
+    run.unarchivedAt = Date.now();
+    await saveShipRuns();
+    void tickShippingRuns(true);
+    return 'Run restored.';
+  }
+
+  async function runShipAction(
+    id: ShipActionId,
+    run: ShipRun,
+    issue: ShipIssue | null,
+  ): Promise<string> {
+    if (id === 'merge' && issue) return mergeShipIssue(run, issue);
+    if (id === 'retry' && issue) return retryShipIssue(run, issue);
+    if (id === 'reopen' && issue) return reopenShipIssue(run, issue);
+    if (id === 'stop') return stopShipRun(run);
+    if (id === 'archive') return archiveShipRunByUser(run);
+    if (id === 'unarchive') return unarchiveShipRunByUser(run);
+    throw new Error('Unknown Ship action.');
+  }
+
+  async function openShipQueueIssue(runId: string, issueId: string) {
+    const run = shipRuns.find((item) => item.id === runId);
+    if (!run) return;
+    showWorkspace();
+    if (directory !== run.repository && coordinationProject(directory) !== run.repository)
+      await loadProject(run.repository, false);
+    showShipRuns();
+    shipFocusRequest = {
+      id: (shipFocusRequest?.id ?? 0) + 1,
+      runId,
+      issueId,
+      focus: 'issue',
+    };
+  }
+
+  function dismissShipArchiveNotice() {
+    shipArchiveNotice = 0;
+    setSetting('sai-ship-archive-notice', '0');
   }
 
   async function updateShipIssue(
@@ -2937,7 +3406,7 @@
       await saveShipRuns();
     } catch (cause) {
       Object.assign(current, previous);
-      setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+      setSetting('sai-ship-runs', serializeShipRuns(shipRuns, unparsedShipRuns));
       throw cause;
     }
   }
@@ -2945,6 +3414,7 @@
   function contextProvider(threadId: string): ContextProvider {
     if (threadId.startsWith('opencode:')) return 'opencode';
     if (threadId.startsWith('acp:claude:')) return 'claude';
+    if (threadId.startsWith('acp:opencode:')) return 'opencode';
     return 'codex';
   }
 
@@ -3627,7 +4097,7 @@
       await saveShipRuns();
     } catch (cause) {
       shipRuns = shipRuns.filter((item) => item.id !== run.id);
-      setSetting('sai-ship-runs', JSON.stringify(shipRuns));
+      setSetting('sai-ship-runs', serializeShipRuns(shipRuns, unparsedShipRuns));
       throw cause;
     }
     showShipRuns();
@@ -3770,11 +4240,7 @@
     requireClaim = false,
   ): Promise<DirectShipAuthorization | undefined> {
     await assertShipItIssueRepository(path, issue);
-    const provider: ShipRun['provider'] = threadId.startsWith('opencode:')
-      ? 'opencode'
-      : threadId.startsWith('acp:claude:')
-        ? 'claude'
-        : 'codex';
+    const provider: ShipRun['provider'] = contextProvider(threadId);
     const [, agent, sessionId] = /^acp:([^:]+):(.+)$/.exec(threadId) ?? [];
     const workerModel =
       knownWorkerModel ??
@@ -4453,7 +4919,7 @@
             number: issue.number,
             claim,
             instanceId: shippingInstanceId,
-            reason: issue.state,
+            reason: terminalClaimReleaseReason(issue),
           })
         : heartbeatDue
           ? await invoke<ShippingClaim>('heartbeat_shipping_claim', {
@@ -5298,6 +5764,13 @@
           refreshError: null,
           refreshedAt: Date.now(),
         });
+        if (issue.title === `Issue #${issue.number}`) {
+          const title = await invoke<string>('ship_issue_title', {
+            repository: run.repository,
+            reference: issue.id,
+          }).catch(() => '');
+          if (title) await update({ title });
+        }
         const branch = worktree?.branch ?? issue.branch;
         if (branch && issue.state !== 'pending' && pullRequestLookup)
           await refreshShippingPullRequest(
@@ -5720,13 +6193,14 @@
   // is deleted every claim and fence call fails, so point them at the checkout.
   // Returns when each still-unrecoverable run was first seen dead.
   async function repairShipRunRepositories(): Promise<Map<string, number>> {
+    const runs = shipRuns.filter((run) => !shipRunArchived(run));
     const available = await Promise.all(
-      shipRuns.map((run) =>
+      runs.map((run) =>
         invoke<boolean>('repository_path_available', { path: run.repository }).catch(() => true),
       ),
     );
-    const dead = shipRuns.filter((_, index) => !available[index]);
-    for (const [index, run] of shipRuns.entries())
+    const dead = runs.filter((_, index) => !available[index]);
+    for (const [index, run] of runs.entries())
       if (available[index]) shipRepositoryDeadSince.delete(run.id);
     if (!dead.length) return new SvelteMap();
     const catalogKey = projectCatalog.repositories.join('\0');
@@ -5817,8 +6291,9 @@
     shippingBusy = true;
     try {
       const unrecoverable = await repairShipRunRepositories();
+      const active = shipRuns.filter((run) => !shipRunArchived(run));
       await persistShipRefresh(
-        shipRuns.map((run) => {
+        active.map((run) => {
           const since = unrecoverable.get(run.id);
           if (since === undefined) return refreshShippingRun(run, refreshCompleted);
           return unrecoverableGraceExpired(since, Date.now())
@@ -5827,7 +6302,8 @@
         }),
         saveShipRuns,
       );
-      for (const run of shipRuns) if (!unrecoverable.has(run.id)) launchReadyShipIssues(run);
+      for (const run of active) if (!unrecoverable.has(run.id)) launchReadyShipIssues(run);
+      await archiveDueShipRuns();
     } catch (cause) {
       error = describe(cause);
     } finally {
@@ -6836,6 +7312,17 @@
       source.kind === 'acp'
         ? `acp:${source.agent}:${request.sessionId}`
         : `opencode:${request.sessionId}`;
+    if (isPlanTool(request.name)) {
+      if (source.kind !== 'acp')
+        throw new Error(
+          'Plan review tools need an ACP agent session; OpenCode uses its own plugin.',
+        );
+      return acpPlans().runTool(
+        { agent: source.agent, directory: request.directory, sessionId: request.sessionId },
+        request.name,
+        request.arguments,
+      );
+    }
     if (
       request.name === 'terminal_create' ||
       request.name === 'terminal_write' ||
@@ -8564,7 +9051,7 @@
                   routing: {
                     ...receipt.routing,
                     actual: {
-                      provider: source.agent as 'claude' | 'codex',
+                      provider: source.agent as 'claude' | 'codex' | 'opencode',
                       model: source.model ?? reportedModel ?? null,
                       variant: source.variant ?? reportedVariant ?? null,
                     },
@@ -9066,6 +9553,7 @@
         const nativeChild = nativeSubagents[nativeSubagentId(pending.agent, sessionId)];
         if (pending.message.method === 'elicitation/create') {
           const message = pending.message.params?.message;
+          const schema = pending.message.params?.requestedSchema;
           items.push({
             ...location,
             key: `elicitation:${pending.agent}:${sessionId}:${requestId}`,
@@ -9074,7 +9562,7 @@
             agentId: pending.agent,
             sessionId,
             requestId,
-            text: typeof message === 'string' ? message : 'Agent question',
+            text: elicitationSummary(message, schema),
             receivedAt: pending.receivedAt,
           });
           continue;
@@ -9692,6 +10180,13 @@
     error = '';
   }
 
+  function needsForceDelete(message: string) {
+    return (
+      message === 'Worktree has ignored files. Move or remove them before deleting.' ||
+      message.includes('contains modified or untracked files')
+    );
+  }
+
   async function deleteProjectWorktreeOnce(
     repository: string,
     path: string,
@@ -9797,10 +10292,7 @@
     } catch (cause) {
       if (wasSelected && directory === repository) await loadProject(path);
       const deletionError = describe(cause);
-      if (
-        !force &&
-        deletionError === 'Worktree has ignored files. Move or remove them before deleting.'
-      ) {
+      if (!force && needsForceDelete(deletionError)) {
         error = '';
         retryForce = true;
       } else error = deletionError;
@@ -10680,7 +11172,7 @@
 
   function runPaletteAction(id: PaletteActionId) {
     // Actions that open a dialog or move focus must not get it pulled back to the palette trigger.
-    closeCommandPalette(id === 'theme.toggle' || id === 'sidebar.toggle');
+    closeCommandPalette(id.startsWith('theme.') || id === 'sidebar.toggle');
     switch (id) {
       case 'pane.split':
         splitFocusedPane('row');
@@ -10710,8 +11202,14 @@
       case 'settings.open':
         void openSettings();
         break;
-      case 'theme.toggle':
-        setTheme(!dark);
+      case 'theme.system':
+        setTheme('system');
+        break;
+      case 'theme.light':
+        setTheme('light');
+        break;
+      case 'theme.dark':
+        setTheme('dark');
         break;
       case 'shortcuts.help':
         openShortcutSheet();
@@ -10727,11 +11225,33 @@
     shortcutsDialog.showModal();
   }
 
+  function placeCopyStatus() {
+    const node = window.getSelection()?.anchorNode;
+    const anchor = node instanceof Element ? node : (node?.parentElement ?? null);
+    const host = copyStatusHost(anchor, [...document.querySelectorAll('dialog:modal')]);
+    copyStatusHome ??= {
+      parent: copyStatusRegion.parentNode as Node,
+      next: copyStatusRegion.nextSibling,
+    };
+    if (host) {
+      if (copyStatusRegion.parentNode === host) return false;
+      host.append(copyStatusRegion);
+      return true;
+    }
+    const { parent, next } = copyStatusHome;
+    if (copyStatusRegion.parentNode === parent) return false;
+    parent.insertBefore(copyStatusRegion, next?.parentNode === parent ? next : null);
+    return true;
+  }
+
   async function announceCopied() {
     clearTimeout(copiedStatusTimer);
+    const moved = placeCopyStatus();
     copiedStatus = '';
     // A cleared region makes a repeated "Copied" a new live-region change.
     await tick();
+    // Screen readers skip changes made as a live region is inserted.
+    if (moved) await new Promise((resolve) => setTimeout(resolve, 100));
     copiedStatus = 'Copied';
     copiedStatusTimer = setTimeout(() => (copiedStatus = ''), 2000);
   }
@@ -11012,6 +11532,15 @@
     return thread ? threadKey(thread) : null;
   }
 
+  // ACP OpenCode threads share the agent id with the native server's threads.
+  function usesNativeOpenCode(thread: AgentThread): boolean {
+    return (
+      thread.agent === 'opencode' &&
+      !agentThreads.includes(thread) &&
+      !nativeChildThreads.includes(thread)
+    );
+  }
+
   async function jumpToRecentThread(key: string): Promise<boolean> {
     const thread = [
       ...agentThreads,
@@ -11021,7 +11550,7 @@
     ].find((item) => threadKey(item) === key);
     if (
       !thread ||
-      (thread.agent === 'opencode'
+      (usesNativeOpenCode(thread)
         ? runtimeState !== 'connected'
         : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available))
     )
@@ -11062,7 +11591,7 @@
     if (!selected) return false;
     showSidebarThread(selected);
     focusMainPane();
-    if (selected.agent === 'opencode') {
+    if (usesNativeOpenCode(selected)) {
       if (!(await selectSession(selected.sessionId))) return false;
     } else openAgent(selected.agent, selected, true);
     focusPaneForTyping('main');
@@ -11086,14 +11615,14 @@
       ].find(
         (item) =>
           item.directory === path &&
-          (item.agent === 'opencode'
+          (item.agent === 'opencode' && usesNativeOpenCode(item)
             ? `opencode:${item.sessionId}`
             : `acp:${item.agent}:${item.sessionId}`) === threadId,
       );
       if (!thread)
         throw new Error('Session history is unavailable. Open the worktree to inspect it.');
       if (
-        thread.agent === 'opencode'
+        usesNativeOpenCode(thread)
           ? runtimeState !== 'connected'
           : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available)
       )
@@ -12231,14 +12760,31 @@
       }
       return;
     }
+    return sendAgentPaneBatch(id, text, false);
+  }
+
+  function sendAgentPaneBatch(id: string, text: string, leavePlanMode: boolean): Promise<void> {
     const agent =
       id === 'main' ? acpAgent : leaves(paneLayout).find((leaf) => leaf.id === id)?.agent;
     if (!agent || pendingAgentBatches[id]) throw new Error('Agent pane is not ready for comments.');
-    const batch = { id: crypto.randomUUID(), text };
+    const batch = { id: crypto.randomUUID(), text, leavePlanMode };
     return new Promise<void>((resolve, reject) => {
       batchWaiters.set(batch.id, { resolve, reject });
       pendingAgentBatches = { ...pendingAgentBatches, [id]: batch };
     });
+  }
+
+  async function sendPlanMessage(
+    id: string,
+    text: string,
+    options: { leavePlanMode: boolean },
+  ): Promise<void> {
+    await sendAgentPaneBatch(id, text, options.leavePlanMode);
+  }
+
+  function revealPlanPane(id: string) {
+    if (id === 'main') return;
+    if (!changesPanes.includes(id)) changesPanes = [...changesPanes, id];
   }
 
   function focusMainPane() {
@@ -13581,6 +14127,7 @@
     discardLiveText();
     ++timelineRefresh;
     timelineSession = '';
+    liveTools = false;
     messages = [];
     olderMessageCursor = null;
     loadingOlder = false;
@@ -13651,6 +14198,7 @@
       olderMessageCursor = first.cursor.next ?? null;
       cacheCurrentTimeline();
       await tick();
+      if (valid()) liveTools = true;
       scrollToLatest();
       return;
     }
@@ -13671,6 +14219,8 @@
     if (!valid()) return;
     messages = mergeMessages(messages, acceptProjectedMessages(incoming, observed));
     cacheCurrentTimeline();
+    await tick();
+    if (valid()) liveTools = true;
   }
 
   async function loadOlderMessages() {
@@ -13694,11 +14244,14 @@
     try {
       const page = await client.message.list({ sessionID: id, limit: 50, cursor });
       if (current !== selection || id !== sessionID) return;
+      const wasLive = liveTools;
+      liveTools = false;
       messages = mergeMessages(messages, acceptProjectedMessages(page.data, observed));
       olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
       cacheCurrentTimeline();
       if (!underfilled) followChat = false;
       await tick();
+      if (current === selection && id === sessionID) liveTools = wasLive;
       if (chatScroll)
         chatScroll.scrollTop =
           underfilled && followChat
@@ -14784,6 +15337,12 @@
     setSetting('sai-workspace-view', workspaceView);
   }
 
+  function showShipQueue() {
+    workspaceView = 'ship-queue';
+    mobileView = 'chat';
+    setSetting('sai-workspace-view', workspaceView);
+  }
+
   function showWorkspace() {
     workspaceView = 'workspace';
     setSetting('sai-workspace-view', workspaceView);
@@ -14816,16 +15375,6 @@
     if (cause instanceof Error) return cause.message;
     if (typeof cause === 'object' && cause && 'message' in cause) return String(cause.message);
     return String(cause);
-  }
-  function assistantText(message: SessionMessageInfo): string {
-    return message.type === 'assistant'
-      ? message.content
-          .map((part, ordinal) =>
-            part.type === 'text' ? (liveText[message.id]?.[ordinal] ?? part.text) : '',
-          )
-          .filter(Boolean)
-          .join('\n')
-      : '';
   }
 </script>
 
@@ -14937,6 +15486,8 @@
       onmobileview={(view) => void showMobileView(view)}
       overview={workspaceView === 'overview'}
       onoverview={() => (workspaceView === 'overview' ? showWorkspace() : showTaskOverview())}
+      shipQueue={workspaceView === 'ship-queue'}
+      onshipqueue={() => (workspaceView === 'ship-queue' ? showWorkspace() : showShipQueue())}
       projectName={directory ? locationName(directory) : 'Workspace'}
       projectDisabled={runtimeState !== 'connected' &&
         !agentAvailability.some((agent) => agent.available)}
@@ -15068,7 +15619,17 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
-                onnativeplan={(plan) => (nativePlan = plan)}
+                onnativeplan={(plan) => {
+                  nativePlan = plan;
+                  if (!plan) {
+                    nativePlanFeedback = '';
+                    nativePlanRevision = null;
+                    nativePlanRevisionPending = false;
+                    nativePlanRevisionError = '';
+                  }
+                }}
+                planRevision={nativePlanRevision ?? undefined}
+                onplanrevisionresult={finishNativePlanRevision}
                 onworkspaceactivity={updateMainAgentWorkspaceActivity}
                 ondecision={(thread, permission, optionId) =>
                   recordDecisionActivity(
@@ -15143,6 +15704,7 @@
               <div
                 class="conversation"
                 bind:this={chatScroll}
+                {@attach keyboardScrollable}
                 onscroll={() => {
                   followChat = chatScroll ? nearBottom(chatScroll) : true;
                   if (chatScroll && chatScroll.scrollTop <= 80) void loadOlderMessages();
@@ -15173,141 +15735,42 @@
                           >{/each}
                       </div>{/if}
                   </div>{/if}
-                {#each displayChatMessages as message (message.id)}
-                  {#if message.type === 'spawn-response'}
-                    <SpawnResponse receipt={message.receipt} onopen={openSpawnTarget} />
-                  {:else if message.type === 'user'}
-                    {@const attribution = coordinationMessageForText(
-                      message.text,
-                      coordinationMessages.filter(
-                        (item) =>
-                          item.target === coordinationKey(directory, `opencode:${sessionID}`),
-                      ),
-                    )}
-                    <ChatMessage
-                      kind="user"
-                      author={attribution ? `From ${attribution.sender}` : 'You'}
-                      messageId={message.id}
-                      created={message.time.created}
-                    >
-                      {#each splitShellCommands(message.text) as segment, index (index)}
-                        {#if segment.type === 'shell'}
-                          <ShellCommandCard run={segment.shell} />
-                        {:else}
-                          <Markdown
-                            source={attribution
-                              ? segment.text.replace(
-                                  coordinationPrompt(attribution),
-                                  attribution.text,
-                                )
-                              : segment.text}
-                          />
-                        {/if}
-                      {/each}
-                      {#if message.files?.length}<div class="message-files">
-                          {#each message.files as file, fileIndex (fileIndex)}<span
-                              >{file.name ??
-                                (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
-                            >{/each}
-                        </div>{/if}
-                    </ChatMessage>
-                  {:else if message.type === 'assistant'}<ChatMessage
-                      kind="assistant"
-                      author={message.agent}
-                      messageId={message.id}
-                      created={message.time.created}
-                    >
-                      {#if assistantText(message)}<Markdown source={assistantText(message)} />{/if}
-                      {#each message.content as part, ordinal (ordinal)}
-                        {#if part.type === 'tool'}
-                          {@const reason =
-                            part.state.status === 'error'
-                              ? openCodeErrorDetails(part.state.error)
-                              : ''}
-                          {@const output =
-                            part.state.status === 'completed' || part.state.status === 'error'
-                              ? (part.state.content ?? [])
-                                  .map((item) =>
-                                    item.type === 'text' ? item.text : (item.name ?? item.uri),
-                                  )
-                                  .join('\n')
-                              : ''}
-                          <ToolActivity
-                            activityId={`${message.id}:${part.id}`}
-                            title={part.name}
-                            status={part.state.status}
-                            input={part.state.input}
-                            {output}
-                            error={reason}
-                            source={part.state.status === 'error'
-                              ? (reportedHookIdentity(part.state.metadata) ?? '')
-                              : ''}
-                            onfix={part.state.status === 'error'
-                              ? () =>
-                                  fixOpenCodeToolFailure(
-                                    `${message.id}:${part.id}`,
-                                    part.name,
-                                    part.state.input,
-                                    reason,
-                                    output,
-                                  )
-                              : undefined}
-                          />
-                        {/if}
-                      {/each}
-                      {#if message.retry}<p class="retry-state" role="status">
-                          Retry {message.retry.attempt}: {message.retry.error.message}
-                        </p>{/if}
-                      {#if message.error}<p class="message-error" role="alert">
-                          {message.error.message}
-                        </p>{/if}
-                    </ChatMessage>{/if}
-                {/each}
-                <OpenCodeSubagents
-                  {client}
-                  parentID={sessionID}
-                  {directory}
-                  onopen={openSpawnTarget}
-                  onchildren={rememberOpenCodeChildren}
-                />
-                {#each pendingShellRuns as run (run.id)}
-                  <ShellCommandCard
-                    {run}
-                    pending
-                    onstop={() =>
-                      void invoke('cancel_shell_command', { id: run.id }).catch(() => {})}
-                  />
-                {/each}
-                {#each coordinationMessages.filter((message) => sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`) && !chatMessages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
-                  <ChatMessage
-                    kind="user"
-                    author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
-                  >
-                    <Markdown source={message.text} />
-                  </ChatMessage>
-                {/each}
-                {#each liveOnly as [id, parts] (id)}
-                  <ChatMessage
-                    kind="assistant"
-                    author={`${currentSession?.agent ?? 'Agent'} · streaming`}
-                    messageId={id}
-                  >
-                    <Markdown
-                      source={Object.entries(parts)
-                        .toSorted(([a], [b]) => Number(a) - Number(b))
-                        .map(([, value]) => value)
-                        .join('\n')}
-                    />
-                  </ChatMessage>
-                {/each}
-                <PostTurnChecks
-                  checks={mainPostTurnChecks}
-                  onretry={(check) => void runOnePostTurnCheck(check, true)}
-                />
-                <SpawnActivity
-                  receipts={mainSpawnActivity}
+                <Transcript
+                  items={mainTranscript}
+                  busy={running}
+                  live={liveTools}
+                  coordinationMessages={mainCoordinationMessages}
                   onopen={openSpawnTarget}
                   control={subagentControl}
+                  onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+                  onstopshell={(run) =>
+                    void invoke('cancel_shell_command', { id: run.id }).catch(() => {})}
+                  ontoolfix={(tool) =>
+                    fixOpenCodeToolFailure(
+                      tool.id,
+                      tool.title,
+                      tool.input,
+                      tool.error,
+                      tool.output,
+                    )}
+                >
+                  {#snippet tail()}
+                    <OpenCodeSubagents
+                      {client}
+                      parentID={sessionID}
+                      {directory}
+                      onopen={openSpawnTarget}
+                      onchildren={rememberOpenCodeChildren}
+                    />
+                  {/snippet}
+                </Transcript>
+                <JumpToLatest
+                  following={followChat}
+                  count={mainTranscript.length}
+                  onjump={() => {
+                    followChat = true;
+                    if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
+                  }}
                 />
                 {#if running && runtimeState === 'connected'}<div class="chat-working">
                     <ActivityStatus
@@ -15461,7 +15924,21 @@
         onopencheck={openTaskOverviewCheck}
       />
     {/if}
-    <div class="workspace-pane-host" hidden={workspaceView === 'overview'}>
+    {#if workspaceView === 'ship-queue'}
+      <ShipQueue
+        runs={shipRuns}
+        busy={shippingBusy}
+        {mergeOwner}
+        archiveNotice={shipArchiveNotice}
+        onrefresh={() => tickShippingRuns(true)}
+        onopen={openShipQueueIssue}
+        onaction={runShipAction}
+        ondismissnotice={dismissShipArchiveNotice}
+        onsettings={openSettings}
+        onclose={showWorkspace}
+      />
+    {/if}
+    <div class="workspace-pane-host" hidden={workspaceView !== 'workspace'}>
       <PaneTree
         active={workspaceView === 'workspace'}
         pane={paneLayout}
@@ -15490,6 +15967,9 @@
         onshipopen={openShipTarget}
         onshipsettings={openSettings}
         onshiphandoff={handoffShipIssue}
+        onshipaction={runShipAction}
+        ondismissshipnotice={dismissShipArchiveNotice}
+        {shipArchiveNotice}
         onship={(graph, provider, limit, source) =>
           startShippingRun(graph, provider, limit, source)}
         onshipit={adoptDirectShipRunWithAuthorization}
@@ -15521,6 +16001,8 @@
         ondiffcommentssent={removeSentDiffComments}
         onsenddiffcomments={sendDiffComments}
         {pendingAgentBatches}
+        onsendplan={sendPlanMessage}
+        onrevealplan={revealPlanPane}
         onbatchcomplete={completeAgentBatch}
         onpickedconsumed={markPickConsumed}
         onattachmentsent={assignReviewCaptures}
@@ -15587,6 +16069,9 @@
         onrefresh={() => tickShippingRuns(true)}
         onopen={openShipTarget}
         onhandoff={handoffShipIssue}
+        onaction={runShipAction}
+        ondismissnotice={dismissShipArchiveNotice}
+        archiveNotice={shipArchiveNotice}
         onsettings={async () => {
           closeShipRuns();
           await openSettings();
@@ -15632,6 +16117,10 @@
             role="tab"
             aria-selected={activeSideTab === 'changes'}
             onclick={toggleChanges}>Changes ({diffs.length})</button
+          >{/if}{#if acpAgent && acpPlanHistory.length}<button
+            class:active={activeSideTab === 'planhistory'}
+            aria-current={activeSideTab === 'planhistory' ? 'page' : undefined}
+            onclick={() => switchSideTab('planhistory')}>Plan history</button
           >{/if}{#if sessionID || acpAgent}<button
             class:active={activeSideTab === 'history'}
             role="tab"
@@ -15647,16 +16136,59 @@
       </div>
       <div class="side-panel-body">
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
-            {#if acpAgent && nativePlan}<section class="native-plan-panel" aria-label="Native plan">
+            {#if acpAgent && (acpSnapshot.plan || acpSnapshot.questions)}<PlanPanel
+                snapshot={acpSnapshot}
+                backend={mainPlanBackend}
+                {directory}
+                sessionID={acpThread?.sessionId ?? null}
+                {dark}
+                onchanged={async () => {
+                  acpPlanTick += 1;
+                }}
+                onselectfile={selectDiffPath}
+                shipRun={shipRuns.find(
+                  (run) =>
+                    run.repository === (coordinationProject(directory) ?? directory) &&
+                    run.source === acpSnapshot.plan?.sessionID,
+                ) ?? null}
+                onship={(graph, provider, limit) =>
+                  startShippingRun(graph, provider, limit, acpSnapshot.plan?.sessionID ?? '')}
+              />{:else if acpAgent && nativePlan}<section
+                class="native-plan-panel"
+                aria-label="Native plan"
+              >
                 <Markdown source={nativePlan.markdown} />
                 {#if nativePlan.tasks.length}<ul>
                     {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
                         {task.status}: {task.title}
                       </li>{/each}
                   </ul>{/if}
+                <div class="native-plan-revision">
+                  <label for="native-plan-feedback">Revision feedback</label>
+                  <textarea
+                    id="native-plan-feedback"
+                    bind:value={nativePlanFeedback}
+                    rows="3"
+                    placeholder="Describe what should change in this plan"
+                    disabled={nativePlanRevisionPending}></textarea>
+                  {#if nativePlanRevisionError}<p role="alert">{nativePlanRevisionError}</p>{/if}
+                  {#if nativePlanRevisionError}<Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={requestNativePlanRevision}
+                      disabled={nativePlanRevisionPending}
+                      loading={nativePlanRevisionPending}>Retry revision</Button
+                    >{:else}<Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={requestNativePlanRevision}
+                      disabled={nativePlanRevisionPending}
+                      loading={nativePlanRevisionPending}>Request revision</Button
+                    >{/if}
+                </div>
               </section>{:else}<PlanPanel
                 {snapshot}
-                client={connecting ? null : client}
+                backend={connecting || !client ? null : openCodePlanBackend(client, directory)}
                 {directory}
                 {sessionID}
                 {dark}
@@ -15678,7 +16210,7 @@
             <DiffPanel
               {directory}
               files={diffs}
-              annotations={acpAgent ? {} : diffAnnotations}
+              annotations={diffAnnotations}
               selected={selectedFilePath}
               loading={diffLoading}
               error={diffError}
@@ -15700,6 +16232,18 @@
                     ? `opencode:${sessionID}`
                     : null,
               )}
+            />
+          </div>{/if}
+        {#if acpAgent && acpPlanHistory.length}<div
+            class:inactive={activeSideTab !== 'planhistory'}
+            class="side-view"
+          >
+            <PlanHistoryPanel
+              events={acpPlanHistory}
+              session={undefined}
+              loading={false}
+              error=""
+              onrefresh={() => (acpPlanTick += 1)}
             />
           </div>{/if}
         {#if sessionID || acpAgent}<div
@@ -15731,6 +16275,9 @@
             onrefresh={() => tickShippingRuns(true)}
             onopen={openShipTarget}
             onhandoff={handoffShipIssue}
+            onaction={runShipAction}
+            ondismissnotice={dismissShipArchiveNotice}
+            archiveNotice={shipArchiveNotice}
             onsettings={async () => {
               closeShipRuns();
               await openSettings();
@@ -15929,7 +16476,13 @@
     {/each}
   </dl>
 </dialog>
-<div class="copy-status" role="status" aria-live="polite" aria-atomic="true">
+<div
+  class="copy-status"
+  role="status"
+  aria-live="polite"
+  aria-atomic="true"
+  bind:this={copyStatusRegion}
+>
   {#if copiedStatus}<span>{copiedStatus}</span>{/if}
 </div>
 <dialog class="commands-dialog" bind:this={snapshotsDialog} aria-label="Worktree restore history">

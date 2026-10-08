@@ -75,6 +75,27 @@ reason, and policy revision; unknown and high-risk actions require a person.
 - Use `project_threads` and `thread_message` to contact another thread in the
   same project. Use `worktree_status` for a short sidebar status comment.
 
+## Plan review
+
+- For risky, ambiguous or multi-file work, propose a plan instead of editing:
+  read the code first, then call `sail_plan_propose` (steps, an overview
+  flowchart and a sequence diagram, each as lists of lines) and end your turn.
+  Small, obvious changes need no plan.
+- If requirements are unclear, call `sail_plan_ask` once with every question,
+  prefer choices with a recommendation, and end your turn.
+- The user reviews the plan in Sail, step by step, and answers by sending you a
+  `<plan-review>` or `<plan-answers>` message in this session. On `revise`,
+  address every comment and call `sail_plan_propose` again, keeping the ids of
+  steps you keep.
+- After approval, work only on approved steps. Report each with
+  `sail_plan_step` (`in_progress`, then `done` with a `check`, or `blocked`).
+  Use `sail_plan_amend` for work the plan does not cover. When a result says the
+  plan is paused, end your turn.
+- Sail does not block edits outside the approved files. It flags them in tool
+  results and to the user, so amend the plan instead of editing silently.
+- If your own configuration also provides `plan_propose`, `plan_ask`,
+  `plan_step` or `plan_amend` tools, use the `sail_plan_*` tools instead.
+
 ## Terminals
 
 - Use `terminal_list` to find Sail-owned terminals. `terminal_read` returns

@@ -412,7 +412,7 @@ describe('visual layout audit', () => {
     await capture('desktop-agent-changes');
     await openSettings();
     await $('[aria-label^="Theme:"]').click();
-    await $('.option-menu [role="option"]:nth-child(2)').click();
+    await $('.option-menu [role="option"]:nth-child(3)').click();
     await returnToWorkspace();
     await browser.waitUntil(
       async () =>

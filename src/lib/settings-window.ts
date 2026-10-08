@@ -3,6 +3,8 @@ import type { SetupReport } from './onboarding';
 import type { ValidationSettings } from './cross-validation';
 import type { ModelRoutingSettings } from './model-routing';
 import type { MergeOwner } from './issue-shipping';
+import type { ShipArchiveDelay } from './ship-archive';
+import type { ThemePreference } from './theme';
 import type {
   NotificationPreference,
   NotificationPrefs,
@@ -14,7 +16,7 @@ export const settingsState = 'sail:settings-state';
 export const settingsAction = 'sail:settings-action';
 
 export type SettingsSnapshot = {
-  theme: 'light' | 'dark';
+  theme: ThemePreference;
   binaryPath: string;
   activeBinary: string;
   runtimeState: 'starting' | 'connected' | 'error';
@@ -38,11 +40,12 @@ export type SettingsSnapshot = {
   agentThreadListEnabled: boolean;
   agentMessagesEnabled: boolean;
   mergeOwner: MergeOwner;
+  shipArchiveDelay: ShipArchiveDelay;
   contextHandoffThreshold: number;
 };
 
 export type SettingsAction =
-  | { type: 'theme'; value: 'light' | 'dark' }
+  | { type: 'theme'; value: ThemePreference }
   | { type: 'binary'; value: string }
   | { type: 'notification-pref'; notification: NotificationType; value: NotificationPreference }
   | { type: 'notification-sound'; value: boolean }
@@ -54,6 +57,7 @@ export type SettingsAction =
   | { type: 'agent-thread-list'; value: boolean }
   | { type: 'agent-messages'; value: boolean }
   | { type: 'merge-owner'; value: MergeOwner }
+  | { type: 'ship-archive-delay'; value: ShipArchiveDelay }
   | { type: 'context-handoff-threshold'; value: number }
   | { type: 'detect-agents' }
   | { type: 'cross-validation'; value: ValidationSettings }

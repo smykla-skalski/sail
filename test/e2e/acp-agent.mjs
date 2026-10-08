@@ -8,6 +8,12 @@ const sessions = new Map();
 const delayedSessionDirectories = new Set();
 const permissions = new Map();
 const elicitations = new Map();
+const questionOption = (label, description, preview) => ({
+  const: label,
+  title: label,
+  ...(description ? { description } : {}),
+  ...(preview ? { _meta: { '_claude/askUserQuestionOption': { preview } } } : {}),
+});
 const activePrompts = new Map();
 const steerWaiters = new Map();
 const terminalRequests = new Map();
@@ -404,6 +410,62 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
       continue;
     }
+    if (text === 'Ask user questions') {
+      const id = ++nextPermission;
+      elicitations.set(id, { sessionId, promptId: message.id, ask: true });
+      send({
+        id,
+        method: 'elicitation/create',
+        params: {
+          sessionId,
+          mode: 'form',
+          message: 'Please answer the following questions.',
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              question_0: {
+                type: 'string',
+                title: 'Storage',
+                description: 'Which storage engine should the cache use?',
+                oneOf: [
+                  questionOption(
+                    'Postgres (Recommended)',
+                    'Durable, already deployed, and covered by backups.',
+                    'CREATE TABLE cache (\n  key text PRIMARY KEY,\n  value jsonb NOT NULL\n);',
+                  ),
+                  questionOption('Redis', 'Fastest reads, but adds a service to operate.'),
+                  questionOption('In memory', 'No setup; lost on restart.'),
+                ],
+              },
+              question_0_custom: {
+                type: 'string',
+                title: 'Other',
+                description:
+                  'Type your own answer, or add a note to the option you chose above (optional).',
+              },
+              question_1: {
+                type: 'array',
+                title: 'Rollout',
+                description: 'Which rollout steps should run?',
+                items: {
+                  anyOf: [
+                    questionOption('Feature flag', 'Ship dark, then enable per project.'),
+                    questionOption('Metrics', 'Record hit rate and latency.'),
+                    questionOption('Docs', 'Document the new setting.'),
+                  ],
+                },
+              },
+              question_1_custom: {
+                type: 'string',
+                title: 'Other',
+                description: 'Type your own answer to add to your selection above (optional).',
+              },
+            },
+          },
+        },
+      });
+      continue;
+    }
     if (text === 'Agent interrupted') {
       send({ id: message.id, result: { stopReason: 'cancelled' } });
       continue;
@@ -619,6 +681,63 @@ for await (const line of createInterface({ input: process.stdin })) {
     const user = { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } };
     sessions.get(sessionId).history.push(user);
     update(sessionId, user);
+    if (text === 'Plan revision fixture' || text === 'Slow plan revision fixture') {
+      const plan =
+        agent === 'codex'
+          ? {
+              sessionUpdate: 'plan_update',
+              plan: { markdown: '# Initial plan\n\n- inspect the current flow' },
+            }
+          : {
+              sessionUpdate: 'tool_call',
+              toolCallId: `exit-plan-${message.id}`,
+              title: 'ExitPlanMode',
+              status: 'completed',
+              input: { plan: '# Initial plan\n\n- inspect the current flow' },
+            };
+      recordUpdate(sessionId, sessionId, plan);
+      setTimeout(
+        () => {
+          if (activePrompts.get(sessionId) === message.id)
+            send({ id: message.id, result: { stopReason: 'end_turn' } });
+        },
+        text === 'Slow plan revision fixture' ? 15_000 : 750,
+      );
+      continue;
+    }
+    if (
+      ['Add retries', 'Fail native revision', 'Cancel native revision', 'No revised plan'].includes(
+        text,
+      )
+    ) {
+      if (text === 'Fail native revision') {
+        send({ id: message.id, error: { code: -1, message: 'Fixture revision failed' } });
+        continue;
+      }
+      if (text === 'No revised plan') {
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+        continue;
+      }
+      if (text === 'Cancel native revision') {
+        continue;
+      }
+      const plan =
+        agent === 'codex'
+          ? {
+              sessionUpdate: 'plan_update',
+              plan: { markdown: '# Revised plan\n\n- add retries' },
+            }
+          : {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: `exit-plan-${message.id}`,
+              title: 'ExitPlanMode',
+              status: 'completed',
+              input: { plan: '# Revised plan\n\n- add retries' },
+            };
+      recordUpdate(sessionId, sessionId, plan);
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Long turn') {
       let part = 0;
       const interval = setInterval(() => {
@@ -1001,6 +1120,11 @@ for await (const line of createInterface({ input: process.stdin })) {
       setTimeout(() => requestPermission(sessionId, text, message.id), 1500);
     else requestPermission(sessionId, text, message.id);
   } else if (message.method === 'session/cancel') {
+    const activePromptId = activePrompts.get(message.params.sessionId);
+    if (activePromptId !== undefined) {
+      send({ id: activePromptId, result: { stopReason: 'cancelled' } });
+      continue;
+    }
     for (const [id, pending] of permissions) {
       if (pending.sessionId === message.params.sessionId) {
         permissions.delete(id);
@@ -1022,9 +1146,11 @@ for await (const line of createInterface({ input: process.stdin })) {
     const pending = elicitations.get(message.id);
     elicitations.delete(message.id);
     const text =
-      message.result?.action === 'accept'
-        ? `Selected: ${message.result.content?.approach}`
-        : message.result?.action;
+      message.result?.action !== 'accept'
+        ? message.result?.action
+        : pending.ask
+          ? `Answers: ${JSON.stringify(message.result.content)}`
+          : `Selected: ${message.result.content?.approach}`;
     update(pending.sessionId, {
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text },

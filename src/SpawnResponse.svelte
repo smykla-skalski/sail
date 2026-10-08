@@ -178,7 +178,7 @@
   }
   .spawn-task strong {
     margin-right: 5px;
-    font-size: 0.72rem;
+    font-size: var(--type-12);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }

@@ -31,8 +31,9 @@
     border-radius: 999px;
     color: var(--activity-color);
     background: color-mix(in srgb, var(--activity-color) 8%, transparent);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 700;
+    font-variant-numeric: tabular-nums;
     line-height: 1.2;
     white-space: nowrap;
   }
@@ -41,7 +42,7 @@
     padding: 1px 4px;
     border-color: transparent;
     background: transparent;
-    font-size: 10px;
+    font-size: var(--type-12);
   }
   .activity-status[data-state='working'] {
     --activity-color: var(--activity-working);

@@ -18,3 +18,12 @@
 - Pass the scratch root to review and test subagents. They build in their own subdirectory of it instead of creating scratch directories elsewhere, and never remove the root.
 - Check free space before a build-heavy task with `df -Pk "${TMPDIR:-/tmp}"`. Under 20GB free, report it in your handoff, remove your own earlier scratch roots first, and stop if space stays under 20GB.
 - Leftover target dirs once reached about 150GB across about 190 directories on a dev machine. Issue 339 tracks automatic cleanup in code; this rule is the interim guard.
+
+## Visual checks
+
+- These rules apply to changes with a visible UI effect.
+- Treat large displays as the primary target, because most Sail use is on one, but not the only one. Judge each UI change at 2560x1440 and 1920x1200 first, in light and dark themes, then confirm no horizontal overflow at 390 px; the app's minimum width is 320 px.
+- In the e2e harness, size the window with `browser.setWindowSize(2560, 1440)` and check `browser.execute(() => innerWidth)` before saving a screenshot. A smaller display clamps the window silently; if it does, say so in the PR and do not call the capture 2560.
+- At large sizes, look for wasted space, sparse layouts, and over-stretched elements. The main chat, transcript, and workspace panes use the available width; do not center them or cap their width unless the task asks for it. Max widths remain correct for dialogs, menus, popovers, and forms; when you cap something else, say why in the PR.
+- Large-display work must not regress the keyboard and low-vision checks in `docs/persona-usability.md`: 200% zoom, visible focus, and keyboard reachability.
+- PR screenshots: one per theme at 2560 wide for each changed view. Say in the PR which views were only unit-tested and never seen in the app.

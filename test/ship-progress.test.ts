@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readyShipIssues } from '../src/lib/issue-shipping.ts';
+import { migrateShipArchive } from '../src/lib/ship-archive.ts';
 import {
   appendShipEvent,
   beginLatestRefresh,
@@ -23,6 +24,8 @@ import {
   persistShipRefresh,
   gateSnapshot,
   loadShipRuns,
+  loadShipRunStore,
+  serializeShipRuns,
   parseShipReport,
   requireValidatorEconomics,
   refreshedIssueState,
@@ -286,6 +289,31 @@ void test('loads legacy runs and discards malformed records without losing valid
   assert.equal(restored[0].issues[0].worktreeUnavailable, true);
   assert.equal(restored[0].issues[0].validationPolicyRequired, true);
   assert.deepEqual(loadShipRuns('{'), []);
+});
+
+void test('saving keeps stored runs that cannot be parsed', () => {
+  const broken = { id: 'broken', issues: [null], futureField: { kept: true } };
+  const store = loadShipRunStore(JSON.stringify([broken, fixture()]));
+  assert.deepEqual(
+    store.runs.map((run) => run.id),
+    ['run'],
+  );
+  assert.deepEqual(store.unparsed, [broken]);
+
+  const archived = migrateShipArchive(store.runs, '1d', Date.now()).runs;
+  const saved = serializeShipRuns(archived, store.unparsed);
+  assert.deepEqual(JSON.parse(saved)[1], broken);
+  const reloaded = loadShipRunStore(saved);
+  assert.deepEqual(reloaded.unparsed, [broken]);
+  assert.equal(reloaded.runs.length, 1);
+
+  for (const raw of ['{', '{"not":"a list"}']) {
+    const corrupt = loadShipRunStore(raw);
+    assert.deepEqual(corrupt.runs, []);
+    assert.equal(corrupt.unparsed.length, 1, raw);
+    assert.equal(loadShipRunStore(serializeShipRuns([], corrupt.unparsed)).unparsed.length, 1);
+  }
+  assert.deepEqual(loadShipRunStore(null), { runs: [], unparsed: [] });
 });
 
 void test('legacy persisted work cannot opt out of validation by omitting the policy flag', () => {
@@ -2326,6 +2354,36 @@ void test('refreshing a pull request records its state and mergeability', () => 
     }).pullRequestMergeable,
     null,
   );
+});
+
+void test('a merge request marker lasts until a refresh sees the pull request closed', () => {
+  const { issue } = readyIssue();
+  const open = {
+    url: 'https://example.test/pull/2',
+    state: 'OPEN',
+    mergedAt: null,
+    headRefOid: 'commit-one',
+    checks: [],
+  };
+  issue.mergeRequested = { at: 1, head: 'commit-one', comment: 'squash' };
+  Object.assign(issue, refreshedPullRequest(issue, open));
+  assert.equal(issue.mergeRequested?.comment, 'squash');
+  Object.assign(issue, refreshedPullRequest(issue, null));
+  assert.equal(issue.mergeRequested?.comment, 'squash');
+  const [restored] = loadShipRuns(JSON.stringify([{ ...fixture(), issues: [issue] }]))[0].issues;
+  assert.deepEqual(restored.mergeRequested, { at: 1, head: 'commit-one', comment: 'squash' });
+  for (const state of ['CLOSED', 'MERGED']) {
+    const closed = { ...issue };
+    Object.assign(
+      closed,
+      refreshedPullRequest(closed, {
+        ...open,
+        state,
+        mergedAt: state === 'MERGED' ? '2026-01-01T00:00:00Z' : null,
+      }),
+    );
+    assert.equal(closed.mergeRequested, undefined, state);
+  }
 });
 
 void test('an issue closed before launch is closed, not failed', () => {

@@ -69,10 +69,18 @@ async function openPalette() {
   });
 }
 
-function selectHeader() {
-  return browser.execute(() => {
-    const header = document.querySelector('.agent-header');
-    if (!header || !navigator.clipboard) throw new Error('No selectable header or clipboard');
+function theme() {
+  return browser.execute(() => ({
+    stored: localStorage.getItem('sai-theme'),
+    applied: document.documentElement.dataset.suiTheme,
+    system: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
+  }));
+}
+
+function selectText(selector = '.agent-header') {
+  return browser.execute((target: string) => {
+    const header = document.querySelector(target);
+    if (!header || !navigator.clipboard) throw new Error('No selectable text or clipboard');
     const writes: string[] = [];
     const original = navigator.clipboard.writeText.bind(navigator.clipboard);
     Object.defineProperty(navigator.clipboard, 'writeText', {
@@ -97,7 +105,7 @@ function selectHeader() {
         done(writes);
       }, 150),
     );
-  });
+  }, selector);
 }
 
 describe('palette actions and accessibility', () => {
@@ -213,6 +221,38 @@ describe('palette actions and accessibility', () => {
     );
   });
 
+  it('switches the theme away from System and back from the palette', async () => {
+    const choose = async (query: string) => {
+      await openPalette();
+      await input().setValue(query);
+      await expect($('.palette-entry[data-kind="action"]')).toHaveText(
+        expect.stringContaining(query),
+      );
+      await browser.keys('Enter');
+      await expect($('.command-palette[open]')).not.toExist();
+    };
+
+    await choose('system theme');
+    await browser.waitUntil(async () => (await theme()).stored === 'system');
+    await openPalette();
+    await input().setValue('system theme');
+    await expect($('.palette-entry[data-kind="action"]')).not.toExist();
+    await browser.keys('Escape');
+
+    const fromSystem = (await theme()).system === 'dark' ? 'light' : 'dark';
+    await choose(`${fromSystem} theme`);
+    await browser.waitUntil(async () => {
+      const current = await theme();
+      return current.stored === fromSystem && current.applied === fromSystem;
+    });
+
+    await choose('system theme');
+    await browser.waitUntil(async () => {
+      const current = await theme();
+      return current.stored === 'system' && current.applied === current.system;
+    });
+  });
+
   it('opens the command palette from its top bar button', async () => {
     await $('.topbar-palette').click();
     await expect($('.command-palette[open]')).toBeDisplayed();
@@ -260,8 +300,30 @@ describe('palette actions and accessibility', () => {
     await expect($('.project-menu')).not.toExist();
   });
 
+  it('shows and announces "Copied" for a copy inside a modal dialog', async () => {
+    await pressShortcut('/');
+    await expect($('.shortcuts-dialog[open]')).toBeDisplayed();
+    expect((await selectText('.shortcuts-list')).join(' ')).toContain('Toggle sidebar');
+    const status = $('.shortcuts-dialog .copy-status[role="status"]');
+    await expect(status).toHaveText('Copied');
+    await expect(status).toBeDisplayed();
+    await browser.keys('Escape');
+    await expect($('.shortcuts-dialog[open]')).not.toExist();
+
+    expect((await selectText()).join(' ')).toContain('Accessibility thread');
+    await browser.waitUntil(() =>
+      browser.execute(() => {
+        const region = document.querySelector('.copy-status');
+        return !region?.closest('dialog') && region?.textContent?.trim() === 'Copied';
+      }),
+    );
+    await browser.waitUntil(async () => (await $('.copy-status').getText()) === '', {
+      timeout: 5000,
+    });
+  });
+
   it('copies selections only when select-to-copy is on and announces "Copied"', async () => {
-    expect((await selectHeader()).join(' ')).toContain('Accessibility thread');
+    expect((await selectText()).join(' ')).toContain('Accessibility thread');
     await expect($('.copy-status[role="status"]')).toHaveText('Copied');
     await browser.waitUntil(async () => (await $('.copy-status').getText()) === '', {
       timeout: 5000,
@@ -270,7 +332,7 @@ describe('palette actions and accessibility', () => {
     await browser.execute(() => localStorage.setItem('sai-auto-copy-enabled', 'false'));
     await browser.refresh();
     await expect($('.agent-header')).toBeDisplayed();
-    expect(await selectHeader()).toEqual([]);
+    expect(await selectText()).toEqual([]);
     await expect($('.copy-status')).toHaveText('');
   });
 });

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyboardScrollable } from './lib/scroll-focus';
   import { onMount, tick, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
@@ -9,13 +10,22 @@
   import TaskLocation from './TaskLocation.svelte';
   import Markdown from './Markdown.svelte';
   import ChatMessage from './ChatMessage.svelte';
-  import SpawnActivity from './SpawnActivity.svelte';
-  import PostTurnChecks from './PostTurnChecks.svelte';
-  import ShellCommandCard from './ShellCommandCard.svelte';
+  import {
+    buildTranscript,
+    checkItems,
+    hookItems,
+    nativeItems,
+    pendingCoordinationItems,
+    queuedItems,
+    shellItems,
+    subagentItems,
+    type TranscriptTool,
+  } from './lib/transcript';
+  import { acpPermissionChoices, acpPermissionDetails } from './lib/permission-card';
+  import JumpToLatest from './JumpToLatest.svelte';
+  import PermissionCard from './PermissionCard.svelte';
+  import Transcript from './Transcript.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
-  import SpawnResponse from './SpawnResponse.svelte';
-  import ToolActivity from './ToolActivity.svelte';
-  import HookActivityCard from './HookActivity.svelte';
   import { activityForSession, parseHookActivity, type HookActivity } from './lib/hook-activity';
   import { toolInput } from './lib/tool-display';
   import { agentHeaderStatus } from './lib/agent-status';
@@ -88,7 +98,7 @@
   } from './lib/acp';
   import type { ThreadStatus } from './lib/attention';
   import type { AgentUsage } from './lib/agent-usage';
-  import { withSpawnResponses, type SpawnReceipt } from './lib/agent-results';
+  import type { SpawnReceipt } from './lib/agent-results';
   import {
     parentTurnStopHint,
     permissionAlreadyAnswered,
@@ -102,29 +112,16 @@
     stageClipboardFile,
     stageClipboardImage,
   } from './lib/attachments';
-  import {
-    coordinationMessageForText,
-    coordinationPrompt,
-    type CoordinationMessage,
-  } from './lib/coordination';
-  import {
-    isFailedStatus,
-    notificationStats,
-    splitTaskNotifications,
-    type TaskSegment,
-  } from './lib/task-notification';
+  import { coordinationPrompt, type CoordinationMessage } from './lib/coordination';
   import {
     isShellDraft,
     keepShellRuns,
     shellCommand,
-    splitShellCommands,
     takeShellRuns,
     withShellContext,
     type ShellResult,
     type ShellRun,
-    type ShellSegment,
   } from './lib/shell-command';
-  import { splitKlaudiushMessage, type KlaudiushRule } from './lib/klaudiush';
   import { getSetting, removeSetting, setSetting } from './lib/settings';
   import { recordDiagnostic, type DiagnosticEvent } from './lib/diagnostics';
   import {
@@ -140,6 +137,8 @@
   import { permissionPolicy, type CapabilityProfile } from './lib/capability-profiles';
   import { permissionResolver } from './lib/permission-resolution';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
+  import { acpPlans } from './lib/acp-plans';
+  import { modeAfterPlan } from './lib/plan-engine';
   import {
     loadNativePlan,
     loadStructuredQuestions,
@@ -170,7 +169,7 @@
     onattachmentsent?: (ids: string[], thread: string, turn: string) => void;
     prefill?: { id: string; text: string };
     onprefillconsumed?: (id: string) => void;
-    externalPrompt?: { id: string; text: string };
+    externalPrompt?: { id: string; text: string; leavePlanMode?: boolean };
     onexternalresult?: (id: string, failure: string | null) => void;
     onpromptfocused?: () => void;
     oncreated: (thread: AgentThread) => void;
@@ -180,6 +179,8 @@
     onterminal: (id: string) => void;
     onentrieschange?: (entries: AgentEntry[], sessionId: string | null, ready: boolean) => void;
     onnativeplan?: (plan: NativePlan | null) => void;
+    planRevision?: { id: string; feedback: string };
+    onplanrevisionresult?: (id: string, failure: string | null) => void;
     ondecision?: (thread: AgentThread, permission: AgentPermission, optionId: string) => void;
     ephemeral?: boolean;
     seedContext?: string;
@@ -231,6 +232,8 @@
     onterminal,
     onentrieschange,
     onnativeplan,
+    planRevision,
+    onplanrevisionresult,
     ondecision,
     ephemeral = false,
     seedContext = '',
@@ -489,8 +492,25 @@
   let entries = $state.raw<AgentEntry[]>([]);
   let nativePlan = $state<NativePlan | null>(null);
   let planRequested = $state(false);
+  let completedTurn = Promise.resolve();
+  let lastPlanRevisionId = '';
+  let activePlanRevision: {
+    id: string;
+    feedback: string;
+    sessionId: string | null;
+    generation: number;
+    acceptingUpdates: boolean;
+    revisedPlanSeen: boolean;
+    reported: boolean;
+  } | null = null;
   $effect(() => {
     if (nativeEntries) entries = nativeEntries;
+  });
+  $effect(() => {
+    const revision = planRevision;
+    if (!revision || revision.id === lastPlanRevisionId) return;
+    lastPlanRevisionId = revision.id;
+    void sendPlanRevision(revision);
   });
   let visibleCount = $state(50);
   let historyLoaded = $state(true);
@@ -506,11 +526,6 @@
       visibleCount += total - seenEntryCount;
     seenEntryCount = total;
   });
-  const displayEntries = $derived(
-    withSpawnResponses(groupAgentEntries(visibleEntries), spawnReceipts, (entry) => entry.created),
-  );
-  const toolFailed = (tool: AgentTool) => /fail|error|reject/i.test(tool.status);
-  const toolRunning = (tool: AgentTool) => /^(pending|in_progress|stopping)$/i.test(tool.status);
   let replaying = false;
   function setReplaying(value: boolean) {
     if (replaying === value) return;
@@ -562,7 +577,7 @@
   let selectedThreadId: string | null = null;
   let generation = 0;
   let scroll: HTMLDivElement;
-  let autoFollow = true;
+  let autoFollow = $state(true);
   const spawnRevision = $derived(spawnReceipts.map((receipt) => receipt.updated).join(','));
   $effect(() => {
     if (spawnRevision && autoFollow) void follow();
@@ -570,6 +585,40 @@
   let prompt: HTMLTextAreaElement;
   const preparedFailures = new Map<string, string>();
   const name = $derived(agentName);
+  const transcriptItems = $derived(
+    buildTranscript({
+      base: nativeItems(groupAgentEntries(visibleEntries), spawnReceipts, {
+        name,
+        provider: agent,
+        toolOutput: (tool) => tool.content || toolInput(tool.output),
+      }),
+      timed: [
+        ...hookItems(visibleHookActivities),
+        ...checkItems(postTurnChecks),
+        ...subagentItems(spawnReceipts),
+        ...shellItems(pendingShellRuns),
+      ],
+      trailing: [
+        ...pendingCoordinationItems(
+          coordinationMessages.filter(
+            (message) =>
+              !entries.some(
+                (entry) =>
+                  entry.type === 'user' && entry.text.includes(coordinationPrompt(message)),
+              ),
+          ),
+          agent,
+        ),
+        ...queuedItems(
+          queued.map((message) => ({
+            author: `You · queued${message.attachments.length || message.images.length ? ` · ${message.attachments.length + message.images.length} attachments` : ''}`,
+            text: message.text || 'Attachments',
+          })),
+          agent,
+        ),
+      ],
+    }),
+  );
   let liveTurn = $state(false);
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
   const visibleStatus = $derived(
@@ -679,6 +728,46 @@
         option.type === 'select' && option.options.some((choice) => choice.value === 'plan'),
     ),
   );
+  let workingMode = $state<string | null>(null);
+  let planReviewPlugin = $state<{ source: string; entry: string } | null>(null);
+
+  $effect(() => {
+    const value = planModeOption?.currentValue;
+    if (value && value !== 'plan') workingMode = value;
+  });
+
+  $effect(() => {
+    planReviewPlugin = null;
+    if (agent !== 'opencode' || !directory) return;
+    const path = directory;
+    void (async () => {
+      try {
+        const found = await invoke<{ source: string; entry: string } | null>(
+          'opencode_plan_review_plugin',
+          { directory: path },
+        );
+        if (path === directory) planReviewPlugin = found;
+      } catch {
+        planReviewPlugin = null;
+      }
+    })();
+  });
+
+  async function leavePlanMode() {
+    const id = activeSessionId;
+    const option = planModeOption;
+    planRequested = false;
+    if (!id || !option) return;
+    const target = modeAfterPlan(option, workingMode);
+    if (!target) return;
+    if (settingConfig) await settingConfig;
+    const result = await acp.setConfig(agent, id, option.id, target);
+    configOptions =
+      result.configOptions ??
+      configOptions.map((item) =>
+        item.id === option.id ? Object.assign({}, item, { currentValue: target }) : item,
+      );
+  }
 
   $effect(() => {
     if (isBusy) {
@@ -727,10 +816,12 @@
     }
     const request = externalPrompt;
     lastExternalPrompt = request.id;
-    void send(request.text).then(
-      () => onexternalresult?.(request.id, null),
-      (cause) => onexternalresult?.(request.id, describe(cause)),
-    );
+    void (request.leavePlanMode ? leavePlanMode() : Promise.resolve())
+      .then(() => send(request.text))
+      .then(
+        () => onexternalresult?.(request.id, null),
+        (cause) => onexternalresult?.(request.id, describe(cause)),
+      );
   });
 
   function describe(cause: unknown): string {
@@ -758,9 +849,19 @@
   }
 
   function applyUpdate(update: Record<string, unknown>) {
+    const previousPlan = nativePlan;
     nativePlan = nativePlanUpdate(agent, update, nativePlan);
+    if (
+      !replaying &&
+      nativePlan !== previousPlan &&
+      activePlanRevision?.acceptingUpdates &&
+      activePlanRevision.sessionId === activeSessionId
+    )
+      activePlanRevision.revisedPlanSeen = true;
     if (activeSessionId && nativePlan)
       saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
+    if (activeSessionId && !replaying)
+      acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
     onnativeplan?.(nativePlan);
     if (replaying) {
       updateEntriesInPlace(replayEntries, update);
@@ -879,12 +980,16 @@
       toolCall: tool,
       options,
     });
+    const details = acpPermissionDetails(tool);
     const permission: AgentPermission = {
       id: message.id,
       sessionId: activeSessionId!,
       title,
       options,
       policy,
+      toolCallId: details.toolCallId,
+      command: details.command,
+      files: details.files,
       generation:
         typeof params.sailPermissionGeneration === 'number'
           ? params.sailPermissionGeneration
@@ -1000,8 +1105,10 @@
         ? liveSessionView(entries, backgroundUpdates, sessionState(agent, id))
         : null;
     if (backgroundUpdates && id) {
-      for (const update of backgroundUpdates)
+      for (const update of backgroundUpdates) {
         nativePlan = nativePlanUpdate(agent, update, nativePlan);
+        acpPlans().observe({ agent, directory, sessionId: id }, update);
+      }
       if (nativePlan) saveNativePlan({ agent, directory, sessionId: id }, nativePlan);
       onnativeplan?.(nativePlan);
     }
@@ -1435,7 +1542,12 @@
     };
   });
 
-  async function send(externalText?: string, queuedMessage?: QueuedAgentMessage) {
+  async function send(
+    externalText?: string,
+    queuedMessage?: QueuedAgentMessage,
+    forcePlan = false,
+    onPromptDispatch?: () => void,
+  ) {
     if (externalText === undefined) await pendingPaste;
     const external = externalText !== undefined;
     const text =
@@ -1490,6 +1602,8 @@
     recoveryEligible = false;
     const current = generation;
     const turnId = crypto.randomUUID();
+    let finishTurn!: () => void;
+    completedTurn = new Promise<void>((resolve) => (finishTurn = resolve));
     activeTurnId = turnId;
     let activityThread = thread;
     let finalStatus: ThreadStatus = 'done';
@@ -1549,7 +1663,7 @@
         onactivity({ ...activityThread, model: modelOption?.currentValue || activityThread.model });
       const id = activityThread?.sessionId ?? activeSessionId;
       deliverySessionId = id;
-      if (planRequested) {
+      if (planRequested || forcePlan) {
         if (!id || !planModeOption)
           throw new Error(`${name} does not expose a planning mode for this session.`);
         const result = await acp.setConfig(turnAgent, id, planModeOption.id, 'plan');
@@ -1601,7 +1715,9 @@
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
           : skillText + directClaim,
       );
+      if (stopRequested) throw new Error('Agent turn was cancelled.');
       phase = 'prompt';
+      onPromptDispatch?.();
       if (id && sentImages.length)
         onattachmentsent?.(
           sentImages.map((image) => image.id),
@@ -1692,6 +1808,8 @@
         }
       }
       if (current === generation) {
+        if (external && !queuedMessage && phase !== 'prompt')
+          entries = entries.filter((entry) => entry.id !== userEntryId);
         recordDiagnostic('turn_failed', {
           agent: turnAgent,
           sessionId: deliverySessionId,
@@ -1723,6 +1841,7 @@
       if (activeTurnId === turnId) activeTurnId = null;
       if (activityThread) onstatus(activityThread, finalStatus, notifyOnDone);
       if (current === generation) busy = false;
+      finishTurn();
       if (
         current === generation &&
         !external &&
@@ -1735,6 +1854,49 @@
         setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, false);
       }
     }
+    return finalStatus;
+  }
+
+  async function sendPlanRevision(revision: { id: string; feedback: string }) {
+    const request = {
+      ...revision,
+      sessionId: activeSessionId,
+      generation,
+      acceptingUpdates: false,
+      revisedPlanSeen: false,
+      reported: false,
+    };
+    activePlanRevision = request;
+    try {
+      // A native plan is emitted before its prompt settles. A revision is a
+      // new ACP prompt, never a steering request into the planning turn.
+      await completedTurn;
+      if (request.reported) return;
+      if (
+        disposed ||
+        !request.sessionId ||
+        activeSessionId !== request.sessionId ||
+        generation !== request.generation ||
+        !nativePlan
+      )
+        throw new Error('The native plan is no longer available in this session.');
+      const status = await send(revision.feedback, undefined, true, () => {
+        request.acceptingUpdates = true;
+      });
+      if (status !== 'done' || stopRequested) throw new Error('Plan revision was cancelled.');
+      if (!request.revisedPlanSeen) throw new Error('The agent did not provide a revised plan.');
+      reportPlanRevision(revision.id, null);
+    } catch (cause) {
+      reportPlanRevision(revision.id, describe(cause));
+    } finally {
+      if (activePlanRevision?.id === revision.id) activePlanRevision = null;
+    }
+  }
+
+  function reportPlanRevision(id: string, failure: string | null) {
+    if (!activePlanRevision || activePlanRevision.id !== id || activePlanRevision.reported) return;
+    activePlanRevision.reported = true;
+    onplanrevisionresult?.(id, failure);
   }
 
   async function runShell(command: string) {
@@ -1759,12 +1921,6 @@
     const finished = shellRuns.find((item) => item.id === run.id);
     if (finished) Object.assign(finished, result);
     if (!disposed) void follow();
-  }
-
-  function userSegments(text: string): (TaskSegment | ShellSegment)[] {
-    return splitShellCommands(text).flatMap((part): (TaskSegment | ShellSegment)[] =>
-      part.type === 'text' ? splitTaskNotifications(part.text) : [part],
-    );
   }
 
   function stopShell(run: ShellRun) {
@@ -1919,6 +2075,8 @@
 
   async function stop() {
     stopRequested = true;
+    if (activePlanRevision)
+      reportPlanRevision(activePlanRevision.id, 'Plan revision was cancelled.');
     diagnostic('stop_requested');
     if (!activeSessionId) {
       return;
@@ -2174,6 +2332,7 @@
       class="agent-conversation conversation"
       role="region"
       bind:this={scroll}
+      {@attach keyboardScrollable}
       onscroll={() => {
         autoFollow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80;
         if (scroll.scrollTop <= 80 && !historyLoading) void showEarlier();
@@ -2192,31 +2351,8 @@
       {#if historyLoading}<div class="agent-history-status" role="status">
           Loading history…
         </div>{/if}
-      {#snippet hookNotice(rules: KlaudiushRule[])}
-        <div class="agent-hook-notice">
-          <strong>Action blocked by hook</strong>
-          <ul>
-            {#each rules as rule (rule.code)}
-              <li><code>{rule.code}</code> {rule.reason}</li>
-            {/each}
-          </ul>
-        </div>
-      {/snippet}
-      {#snippet toolRow(tool: AgentTool, revealed: boolean)}
-        <ToolActivity
-          title={tool.title}
-          status={tool.status}
-          activityId={tool.id}
-          input={tool.input}
-          output={tool.content || toolInput(tool.output)}
-          expanded={revealed}
-        >
-          {#each tool.terminalIds as terminalId (terminalId)}
-            <button onclick={() => onterminal(terminalId)}>Open terminal</button>
-          {/each}
-        </ToolActivity>
-      {/snippet}
-      {#snippet failureCard(tool: AgentTool)}
+      {#snippet failureTool(item: TranscriptTool)}
+        {@const tool = item.raw as AgentTool}
         {@const failure = acpToolFailure(tool)}
         {#if failure}
           {@const label =
@@ -2242,170 +2378,51 @@
           </div>
         {/if}
       {/snippet}
-      {#each displayEntries as entry (entry.id)}
-        {#if entry.type === 'spawn-response'}
-          <SpawnResponse receipt={entry.receipt} onopen={onopensubagent} />
-        {:else if entry.type === 'tool-group'}
-          {#each entry.tools.filter(toolFailed) as tool (tool.id)}{@render failureCard(tool)}{/each}
-          {#if isBusy && (entry.id === displayEntries.at(-1)?.id || entry.tools.some(toolRunning))}
-            {#if entry.tools.length > 1}
-              <details class="agent-tool-group">
-                <summary>
-                  {entry.tools.length - 1} earlier {entry.tools.length === 2 ? 'action' : 'actions'}
-                  {#if entry.tools.slice(0, -1).some(toolRunning)}<ActivityStatus
-                      status="working"
-                      compact
-                    />{/if}
-                  {#if entry.tools.slice(0, -1).some(toolFailed)}<ActivityStatus
-                      status="failed"
-                      compact
-                    />{/if}
-                </summary>
-                <div class="agent-tool-list">
-                  {#each entry.tools.slice(0, -1) as tool (tool.id)}
-                    {@render toolRow(tool, true)}
-                  {/each}
-                </div>
-              </details>
-            {/if}
-            {@const latest = entry.tools.at(-1)}
-            {#if latest}
-              <div class="agent-tool-current" class:running={toolRunning(latest)}>
-                <span class="agent-tool-current-label">Latest action</span>
-                {@render toolRow(latest, false)}
-              </div>
-            {/if}
-          {:else}
-            <details class="agent-tool-group">
-              <summary>
-                <span>{entry.tools.length} {entry.tools.length === 1 ? 'action' : 'actions'}</span>
-                <span class="agent-tool-group-last">{entry.tools.at(-1)?.title}</span>
-                {#if entry.tools.at(-1)?.status !== 'completed' && !toolFailed(entry.tools.at(-1)!)}<ActivityStatus
-                    status={entry.tools.at(-1)?.status}
-                    compact
-                  />{/if}
-                {#if entry.tools.slice(0, -1).some(toolRunning)}<ActivityStatus
-                    status="working"
-                    compact
-                  />{/if}
-                {#if entry.tools.some(toolFailed)}<ActivityStatus status="failed" compact />{/if}
-              </summary>
-              <div class="agent-tool-list">
-                {#each entry.tools as tool (tool.id)}
-                  {@render toolRow(tool, true)}
-                {/each}
-              </div>
-            </details>
-          {/if}
-        {:else}
-          {@const segments =
-            entry.type === 'user'
-              ? userSegments(entry.text)
-              : [{ type: 'text' as const, text: entry.text }]}
-          {#each segments as segment, index (index)}
-            {#if segment.type === 'shell'}
-              <ShellCommandCard run={segment.shell} />
-            {:else if segment.type === 'notification'}
-              {@const note = segment.notification}
-              <div
-                class="agent-subagent-card"
-                class:stopped={note.status !== 'completed'}
-                aria-label={`Subagent ${note.status}`}
-                role="group"
-              >
-                <ActivityStatus
-                  status={isFailedStatus(note.status) ? 'failed' : note.status}
-                  compact
-                />
-                <span class="agent-subagent-summary">{note.summary}</span>
-                {#each notificationStats(note) as stat (stat)}<span class="agent-subagent-stat"
-                    >{stat}</span
-                  >{/each}
-              </div>
-            {:else}
-              {@const text = segment.text}
-              {@const hookMessage = entry.type === 'assistant' ? splitKlaudiushMessage(text) : null}
-              {@const attribution =
-                entry.type === 'user'
-                  ? coordinationMessageForText(text, coordinationMessages)
-                  : undefined}
-              <ChatMessage
-                kind={entry.type}
-                created={entry.created}
-                author={entry.type === 'user'
-                  ? attribution
-                    ? `From ${attribution.sender}`
-                    : 'You'
-                  : entry.type === 'thought'
-                    ? `${name} · thinking`
-                    : name}
-              >
-                {#if hookMessage}
-                  {@render hookNotice(hookMessage.rules)}
-                  <details class="agent-hook-details">
-                    <summary>Full hook notice</summary>
-                    <Markdown source={hookMessage.notice} />
-                  </details>
-                  {#if hookMessage.remainder}<Markdown source={hookMessage.remainder} />{/if}
-                {:else}
-                  <Markdown
-                    source={attribution
-                      ? text.replace(coordinationPrompt(attribution), attribution.text)
-                      : text}
-                  />
-                {/if}
-              </ChatMessage>
-            {/if}
-          {/each}
-        {/if}
-      {/each}
-      {#each pendingShellRuns as run (run.id)}
-        <ShellCommandCard {run} pending onstop={() => stopShell(run)} />
-      {/each}
-      {#each coordinationMessages.filter((message) => !entries.some((entry) => entry.type === 'user' && entry.text.includes(coordinationPrompt(message)))) as message (message.id)}
-        <ChatMessage
-          kind="user"
-          author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
-        >
-          <Markdown source={message.text} />
-        </ChatMessage>
-      {/each}
-      {#each visibleHookActivities as activity (activity.id)}
-        <HookActivityCard {activity} />
-      {/each}
-      <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
-      {#if nativePlan}<section class="native-plan" aria-label="Native plan">
-          <h3>Plan</h3>
-          <Markdown source={nativePlan.markdown} />
-          {#if nativePlan.tasks.length}<ul>
-              {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
-                  {task.status}: {task.title}
-                </li>{/each}
-            </ul>{/if}
-        </section>{/if}
-      <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} control={subagentControl} />
-      {#if queued.length}<div class="queued-messages" role="status" aria-label="Queued messages">
-          {#each queued as message, index (index)}
-            <ChatMessage
-              kind="user"
-              author={`You · queued${message.attachments.length || message.images.length ? ` · ${message.attachments.length + message.images.length} attachments` : ''}`}
-            >
-              <Markdown source={message.text || 'Attachments'} />
-            </ChatMessage>
-          {/each}
+      <Transcript
+        items={transcriptItems}
+        busy={isBusy}
+        {coordinationMessages}
+        onopen={onopensubagent}
+        control={subagentControl}
+        {onterminal}
+        {onretrycheck}
+        onstopshell={stopShell}
+        failure={failureTool}
+      >
+        {#snippet queuedActions()}
           {#if queuePaused}<Button size="sm" variant="secondary" onclick={retryQueue}
               >Retry queue</Button
             >{/if}
-        </div>{/if}
-      {#if isBusy}<ChatMessage kind="assistant" author={name}>
-          <div class="agent-busy" role="status">
-            <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
-                size="sm"
-                variant="secondary"
-                onclick={stop}>Stop</Button
-              >{/if}
-          </div>
-        </ChatMessage>{/if}
+        {/snippet}
+        {#snippet tail()}
+          {#if nativePlan}<section class="native-plan" aria-label="Native plan">
+              <h3>Plan</h3>
+              <Markdown source={nativePlan.markdown} />
+              {#if nativePlan.tasks.length}<ul>
+                  {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
+                      {task.status}: {task.title}
+                    </li>{/each}
+                </ul>{/if}
+            </section>{/if}
+          {#if isBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
+              <div class="agent-busy" role="status">
+                <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
+                    size="sm"
+                    variant="secondary"
+                    onclick={stop}>Stop</Button
+                  >{/if}
+              </div>
+            </ChatMessage>{/if}
+        {/snippet}
+      </Transcript>
+      <JumpToLatest
+        following={autoFollow}
+        count={transcriptItems.length}
+        onjump={() => {
+          autoFollow = true;
+          void follow();
+        }}
+      />
     </div>
   </div>
   <div class="agent-composer composer-wrap">
@@ -2413,6 +2430,11 @@
       <TaskLocation location={promptLocation} />
       {#if shellMode}<p class="composer-shell-hint" role="status">
           Shell mode · Enter runs the command in this worktree
+        </p>{/if}
+      {#if planReviewPlugin}<p class="agent-warning" role="status">
+          The OpenCode plan-review plugin is still enabled ({planReviewPlugin.entry} in
+          {planReviewPlugin.source}). OpenCode sees its plan tools next to Sail's sail_plan_* tools.
+          Remove the plugin from your OpenCode config; Sail reviews plans for every agent itself.
         </p>{/if}
       {#if error}<p class="agent-error" role="alert">
           {error} <button onclick={() => void activate(activeSessionId)}>Retry</button>
@@ -2432,28 +2454,18 @@
         </div>
       {/if}
       {#each permissions as permission (acpPermissionIdentity(permission))}
-        <div
-          class="agent-permission"
-          role="group"
-          aria-label="Agent permission request"
-          data-request-id={permission.id}
-          data-session-id={permission.sessionId}
-          data-agent-id={agent}
-          tabindex="-1"
-        >
-          <strong>{permission.title}</strong>
-          {#if permission.policy}<small
-              >{permission.policy.profile} · {permission.policy.risk} risk · policy {permission
-                .policy.policyRevision}: {permission.policy.reason}</small
-            >{/if}
-          <div>
-            {#each permission.options as option (option.optionId)}{#if permission.policy?.recommendation !== 'deny' || !option.kind.startsWith('allow')}<Button
-                  size="sm"
-                  variant={option.kind.startsWith('allow') ? 'primary' : 'secondary'}
-                  onclick={() => answer(permission, option.optionId)}>{option.name}</Button
-                >{/if}{/each}
-          </div>
-        </div>
+        <PermissionCard
+          title={permission.title}
+          policy={permission.policy}
+          command={permission.command}
+          files={permission.files}
+          toolCallId={permission.toolCallId}
+          requestId={permission.id}
+          sessionId={permission.sessionId}
+          agentId={agent}
+          choices={acpPermissionChoices(permission.options, permission.policy)}
+          onchoose={(choice) => answer(permission, choice.id)}
+        />
       {/each}
       {#each answeredNotes as note (note.identity)}
         <p class="agent-permission-answered" role="status" data-answered-id={note.identity}>
@@ -2623,7 +2635,7 @@
   }
   .agent-header div {
     display: flex;
-    gap: 12px;
+    gap: var(--space-12);
     align-items: baseline;
   }
   .agent-header .agent-heading {
@@ -2635,7 +2647,7 @@
   }
   .agent-header .agent-usage {
     flex: none;
-    font-size: 11px;
+    font-size: var(--type-12);
     white-space: nowrap;
   }
   .agent-header span {
@@ -2648,7 +2660,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 4px;
+    gap: var(--space-4);
     min-width: 0;
   }
   .agent-composer-footer {
@@ -2656,12 +2668,12 @@
     align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 0 9px 9px 10px;
   }
   .agent-header .agent-config {
     display: flex;
-    gap: 8px;
+    gap: var(--space-8);
     flex-wrap: wrap;
     margin-left: auto;
     margin-right: 12px;
@@ -2670,7 +2682,7 @@
     flex: 1;
     min-height: 0;
     overflow: auto;
-    padding-inline: 20px;
+    padding-inline: var(--transcript-gutter);
   }
   .agent-history-status {
     display: block;
@@ -2681,23 +2693,11 @@
     margin: 15vh auto;
     text-align: center;
   }
-  .agent-tool-group,
-  .agent-tool-current {
-    margin: 0 0 8px 42px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-  }
-  .agent-hook-notice {
-    margin: 0 0 8px 42px;
-    padding: 9px 12px;
-    border: 1px solid var(--sui-danger);
-    border-radius: 8px;
-  }
   .agent-tool-failure {
     margin: 0 0 8px 42px;
     padding: 9px 12px;
     border: 1px solid var(--sui-danger);
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     overflow-wrap: anywhere;
   }
   .agent-tool-failure strong {
@@ -2715,93 +2715,10 @@
     overflow: auto;
     white-space: pre-wrap;
   }
-  .agent-hook-notice {
-    margin-left: 0;
-  }
-  .agent-hook-notice strong {
-    color: var(--sui-danger-ink);
-  }
-  .agent-hook-notice ul {
-    margin: 5px 0 0;
-    padding-left: 20px;
-  }
-  .agent-hook-notice code {
-    margin-right: 4px;
-  }
-  .agent-hook-details {
-    margin-bottom: 8px;
-    color: var(--sui-muted);
-  }
-  .agent-tool-group > summary {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 9px 12px;
-    color: var(--sui-muted);
-  }
-  .agent-tool-group-last {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .agent-tool-group > summary {
-    cursor: pointer;
-  }
-  .agent-tool-group > summary::before {
-    content: '▸';
-    flex: 0 0 auto;
-  }
-  .agent-tool-group[open] > summary::before {
-    transform: rotate(90deg);
-  }
-  .agent-tool-list {
-    padding: 0 12px 10px;
-  }
-  .agent-tool-current-label {
-    color: var(--sui-muted);
-    font-size: 0.75rem;
-    white-space: nowrap;
-  }
-  .agent-subagent-card {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 4px 10px;
-    margin: 0 0 8px 42px;
-    padding: 8px 12px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-  }
-  .agent-subagent-card.stopped {
-    border-style: dashed;
-  }
-  .agent-subagent-summary {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow-wrap: anywhere;
-  }
-  .agent-subagent-stat {
-    color: var(--sui-muted);
-    font-size: 0.75rem;
-    white-space: nowrap;
-  }
-  .agent-tool-current {
-    padding: 7px 12px;
-  }
-  .agent-tool-current.running {
-    border-color: var(--sui-primary);
-  }
-  .agent-tool-current-label {
-    display: block;
-    margin-bottom: 2px;
-  }
-  .queued-messages :global(.agent-message) {
-    opacity: 0.6;
-  }
   .agent-busy {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: var(--space-12);
   }
   .agent-composer {
     position: relative;
@@ -2857,15 +2774,9 @@
   .agent-error {
     color: var(--sui-danger-ink);
   }
-  .agent-permission {
-    margin-bottom: 10px;
-    padding: 12px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-  }
-  .agent-permission div {
-    display: flex;
-    gap: 8px;
-    margin-top: 10px;
+  .agent-warning {
+    margin: 0;
+    color: var(--sui-warning-ink);
+    font-size: var(--type-12);
   }
 </style>

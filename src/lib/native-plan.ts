@@ -1,6 +1,6 @@
 /** Provider-neutral view of plans announced through ACP session updates. */
 export type NativePlan = {
-  provider: 'claude' | 'codex';
+  provider: 'claude' | 'codex' | 'opencode';
   markdown: string;
   updated: number;
   tasks: { title: string; status: string }[];
@@ -32,6 +32,16 @@ function tasks(value: unknown): NativePlan['tasks'] {
   });
 }
 
+/** ACP's standard `plan` update carries the full entry list on every change. */
+function entries(value: unknown): NativePlan['tasks'] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const entry = record(item);
+    const title = entry && text(entry.content);
+    return title ? [{ title, status: text(entry?.status) ?? 'pending' }] : [];
+  });
+}
+
 /**
  * Codex emits `plan_update`; Claude's ExitPlanMode tool input is the
  * authoritative implementation plan. Task stream updates are deliberately
@@ -44,7 +54,20 @@ export function nativePlanUpdate(
   updated = Date.now(),
 ): NativePlan | null {
   const data = record(update);
-  if (!data || (provider !== 'claude' && provider !== 'codex')) return previous;
+  if (!data || (provider !== 'claude' && provider !== 'codex' && provider !== 'opencode'))
+    return previous;
+  if (provider === 'opencode' && data.sessionUpdate === 'plan') {
+    const progress = entries(data.entries);
+    if (!progress.length) return previous;
+    return {
+      provider,
+      markdown: progress
+        .map((task) => `- [${task.status === 'completed' ? 'x' : ' '}] ${task.title}`)
+        .join('\n'),
+      tasks: progress,
+      updated,
+    };
+  }
   if (provider === 'codex' && data.sessionUpdate === 'plan_update') {
     const plan = markdown(data.plan) ?? markdown(data);
     if (!plan) return previous;

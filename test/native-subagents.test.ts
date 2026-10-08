@@ -833,3 +833,96 @@ await test('a child accepts prompts only when its adapter advertises the capabil
   assert.equal(nativeSubagentAcceptsPrompts(spawnWithCapabilities({ prompt: {} })), true);
   assert.equal(nativeSubagentAcceptsPrompts(undefined), false);
 });
+
+function opencode(sessionId: string, update: Record<string, unknown>): AgentEvent {
+  return {
+    agent: 'opencode',
+    message: { method: 'session/update', params: { sessionId, update } },
+  };
+}
+
+await test('OpenCode children keep their own provider on receipts', () => {
+  let store = updateNativeSubagents(
+    {},
+    opencode('root', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'Explore code',
+      task: 'Explore code',
+    }),
+    '/worktree',
+    1,
+  );
+  store = updateNativeSubagents(
+    store,
+    opencode('child', {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'done' },
+    }),
+    '/worktree',
+    2,
+  );
+  store = updateNativeSubagents(
+    store,
+    opencode('root', {
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: 'child',
+      state: 'completed',
+    }),
+    '/worktree',
+    3,
+  );
+  const [receipt] = nativeSubagentReceipts(store);
+  assert.equal(receipt.provider, 'opencode');
+  assert.equal(receipt.targetId, 'acp:opencode:child');
+  assert.equal(receipt.state, 'completed');
+  assert.equal(receipt.result, 'done');
+});
+
+await test('a resumed OpenCode child re-arms after completing and keeps failure reasons', () => {
+  const state = (value: string, error?: string) =>
+    opencode('root', {
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: 'child',
+      state: value,
+      ...(error ? { error } : {}),
+    });
+  let store = updateNativeSubagents(
+    {},
+    opencode('root', { sessionUpdate: 'subagent_spawned', subagentSessionId: 'child' }),
+    '/worktree',
+    1,
+  );
+  store = updateNativeSubagents(store, state('completed'), '/worktree', 2);
+  assert.equal(store['opencode:child'].outcome, 'completed');
+  store = updateNativeSubagents(store, state('working'), '/worktree', 3);
+  assert.equal(store['opencode:child'].outcome, 'working');
+  store = updateNativeSubagents(store, state('failed', 'boom'), '/worktree', 4);
+  assert.equal(store['opencode:child'].error, 'boom');
+  store = updateNativeSubagents(store, state('working'), '/worktree', 5);
+  store = updateNativeSubagents(store, state('completed'), '/worktree', 6);
+  assert.equal(store['opencode:child'].error, undefined);
+  assert.equal(nativeSubagentReceipts(store)[0].error, null);
+});
+
+await test('a state update keeps the incomplete-history marker on restored children', () => {
+  let store = updateNativeSubagents(
+    {},
+    event('p', { sessionUpdate: 'subagent_spawned', subagentSessionId: 'k' }),
+    '/worktree',
+    1,
+    true,
+  );
+  store = updateNativeSubagents(
+    store,
+    event('p', {
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: 'k',
+      state: 'completed',
+    }),
+    '/worktree',
+    2,
+    true,
+  );
+  assert.equal(store['codex:k'].error, 'Incomplete subagent history');
+});

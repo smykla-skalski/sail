@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import { toolAlert } from './lib/tool-alerts';
   import { toolCommand, toolInput } from './lib/tool-display';
   import ActivityStatus from './ActivityStatus.svelte';
 
@@ -12,6 +13,7 @@
     source = '',
     expanded = false,
     activityId,
+    live = false,
     onfix,
     children,
   }: {
@@ -23,6 +25,8 @@
     source?: string;
     expanded?: boolean;
     activityId?: string;
+    /** False while the host replays history; errors already present then stay silent. */
+    live?: boolean;
     onfix?: () => void;
     children?: import('svelte').Snippet;
   } = $props();
@@ -31,9 +35,13 @@
   $effect(() => {
     if (expanded || status === 'error' || status === 'failed') open = true;
   });
-  // Errors already present on mount come from history; only errors that arrive later interrupt.
   const mountedError = untrack(() => error);
-  const announce = $derived(!!error && error !== mountedError);
+  const mountedLive = untrack(() => live);
+  let alertText = $state('');
+  $effect(() => {
+    const next = toolAlert({ id: activityId, error, mountedError, mountedLive });
+    if (next || !error) alertText = next;
+  });
   const command = $derived(toolCommand(input));
   const formattedInput = $derived(toolInput(input));
 </script>
@@ -59,23 +67,23 @@
           <pre>{output}</pre>
         </div>
       {/if}
-      {#if error}<p class="tool-activity-error" role={announce ? 'alert' : undefined}>
-          {error}
-        </p>{/if}
+      {#if error}<p class="tool-activity-error">{error}</p>{/if}
       {#if source}<p class="tool-activity-source">Reported by {source}</p>{/if}
       {#if onfix}<button class="tool-activity-fix" onclick={onfix}>Fix with agent</button>{/if}
       {#if children}{@render children()}{/if}
     </div>
   {/if}
 </details>
+<!-- Outside the details: closed details hide their content from screen readers. -->
+<span class="tool-activity-alert" role="alert">{alertText}</span>
 
 <style>
   .tool-activity {
     min-width: 0;
     margin: 6px 0;
     border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-    font-size: 12px;
+    border-radius: var(--radius-8);
+    font-size: var(--type-12);
   }
   summary {
     display: flex;
@@ -90,6 +98,14 @@
   }
   .tool-activity-error {
     color: var(--sui-danger-ink);
+  }
+  .tool-activity-alert {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   .tool-activity-summary-error {
     flex-basis: 100%;
@@ -121,7 +137,7 @@
   }
   .tool-activity-section > span {
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 600;
   }
   pre {
@@ -129,7 +145,7 @@
     margin: 3px 0 0;
     overflow: auto;
     font:
-      11px/1.5 ui-monospace,
+      var(--type-12)/1.5 ui-monospace,
       monospace;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -145,7 +161,7 @@
     margin-top: 8px;
     padding: 5px 9px;
     border: 1px solid var(--shell-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     color: inherit;
     background: transparent;
     cursor: pointer;

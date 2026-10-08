@@ -6,6 +6,14 @@ OpenCode v2.0.24 is a separate prerequisite; it is not bundled. Install the test
 
 There is no automatic updater. To update, download the next package for your platform and install it over the previous version after quitting the app. Verify the new manifest and run the first-project checks again.
 
+## Text size, chat width and theme
+
+- **Theme default changed.** Settings > General > Appearance now offers System, Light and Dark. System follows the operating system appearance and switches live when it changes. New profiles start on System; a stored Light or Dark choice is kept.
+- No interface text is smaller than 12 px. Sidebar thread titles are 13 px in the foreground color, and status badges, labels, timestamps and counts that were 9 to 11 px are now 12 px.
+- Chat text uses the full width of the window again, with a 20 px margin on each side, in every thread view. Lines keep line height 1.5, and code blocks and tables scroll horizontally inside the chat.
+- Markdown headings in the transcript have their own sizes.
+- Durations, counts and timestamps use tabular digits, so numbers line up. The Ship run launch time no longer wraps.
+
 ## Keyboard, shortcuts and screen readers
 
 - The command palette also runs app actions: split, terminal, side chat, Inbox, next attention item, task overview, Ship runs, Changes, settings, theme and the shortcut sheet. Each shows its shortcut when it has one. A **⌘K** button in the top bar opens the palette.
@@ -17,6 +25,14 @@ There is no automatic updater. To update, download the next package for your pla
 - Failed tool cards no longer re-announce old errors when a thread loads; only errors that arrive while you watch interrupt a screen reader.
 - Scrollbars appear when you hover a scrollable area, not only while it scrolls.
 
+## Agent questions
+
+- When Claude asks a question, its answer options appear as cards with each option's title and description. Single-choice questions use radio cards (arrow keys move between them) and multi-select questions use checkboxes. Before, Sail dropped the options and showed only a blank text field.
+- The question text is the form heading, its short header sits above it as a label, and forms with several questions show each question above its options.
+- Each question keeps an optional **Other** field for your own answer or a note on the option you picked.
+- When an option comes with a preview, such as a code snippet, Sail shows it under the options for the focused or selected option.
+- The Inbox lists every question in a multi-question request instead of "Please answer the following questions."
+
 ## Attention and notifications
 
 - **Notification default changed.** OS notifications now default to "Only when Sail is in the background". Before, Sail notified whenever the thread was not the one on screen, even while you were using Sail. Choose Never, Only when Sail is in the background, or Always for each type (Needs your input, Turn completed, Ship updates) in Settings. Existing profiles move to the new default, except one that had OS notifications switched off: it keeps Never for every type.
@@ -24,6 +40,23 @@ There is no automatic updater. To update, download the next package for your pla
 - One attention count covers permission and question requests, Ship issues that need input, are ready to merge, were closed without merging or stalled, and waiting subagents. The Dock badge, Inbox button, status bar and Ship tab read the same list; the Ship tab shows the Ship issues that need input instead of the run count. The status bar keeps its counts below 700 px.
 - The Inbox groups items by repository. You can dismiss a Ship or subagent item until its next state change, or snooze it for an hour or until tomorrow at 08:00. Items clear when their state resolves.
 - Cmd+J (Ctrl+J elsewhere) goes to the next item needing attention. Cmd+Shift+J still opens the side chat.
+
+## One transcript view
+
+- Claude, Codex and OpenCode threads now render through one transcript view, so the main thread, the OpenCode pane and the agent workspace look and behave the same.
+- OpenCode tool calls are grouped like Claude and Codex tool calls, and OpenCode thinking shows as a collapsed "Show thinking" row. Thinking is collapsed for every agent.
+- Hooks, post-turn checks and the subagent group card appear in event order between the messages, with one card per turn, instead of after the last message.
+- Messages show their time. The assistant avatar is the provider's mark instead of "S.".
+- Code blocks have a **Copy** button. **Jump to latest (N new)** appears when you scroll away from the end of a live transcript.
+- Permission requests use one card. It shows the exact command and files, links back to the tool call, and never offers "Allow always" for unknown or high-risk actions.
+
+## Ship queue, archive and actions
+
+- **Ship queue** (More actions, Ship queue) lists the issues of every run in one full-width table. Issues that need you come first, merged and closed issues stay hidden until you show them, and a Run filter narrows the table to one run. The header shows worker usage against the run limits; a ship-it coordinator itself starts at most 3 workers and keeps a slot free for gates.
+- Direct `/ship-it` runs now show the real issue title instead of "Issue #N".
+- **Archive.** A run archives after all its issues are merged or closed, its claims are released and its checkpoints are complete. Choose Off, Immediately, 1 day (default) or 7 days under Settings, Ship archive. Archiving only hides the run: checkpoints, evidence, branches and worktrees stay, so a repository's branch cleanup policy is unaffected. The Archived filter in the queue and the Ship panel lists archived runs, and Unarchive brings one back and keeps it out of auto-archive. On upgrade Sail archives the runs that already qualify and shows "N runs archived · Show".
+- **Actions** ask for confirmation and name their target. **Merge** follows the repository's release policy (`.sai/ship-it-release.json` or its instructions): a bot comment such as `squash`, or a GitHub merge pinned to the head SHA. It refuses when the pull request head differs from the checkpoint revision or the evidence is not ready, and it never uses an admin override. **Retry** restarts a failed issue from its checkpoint with a fresh worker. **Stop run** stops unfinished issues and releases their claims as cancelled. **Archive** and **Unarchive** apply to a whole run.
+- Task checkpoints accept `cancelled` and `failed` statuses, matching the ship-it checkpoint contract.
 
 ## Subagent navigation and control
 

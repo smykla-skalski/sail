@@ -5,6 +5,19 @@
 
   let { source, compact = false }: { source: string; compact?: boolean } = $props();
   let blocks = $derived(marked.lexer(source));
+  let copied = $state<string | null>(null);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function copy(key: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      return;
+    }
+    copied = key;
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => (copied = null), 1500);
+  }
 </script>
 
 {#snippet inline(tokens: Token[])}
@@ -35,7 +48,16 @@
     {:else if token.type === 'heading'}<svelte:element this={`h${token.depth}`}
         >{@render inline(token.tokens ?? [])}</svelte:element
       >
-    {:else if token.type === 'code'}<pre><code>{token.text}</code></pre>
+    {:else if token.type === 'code'}<div class="code-block">
+        <button
+          type="button"
+          class="code-copy"
+          aria-label="Copy code"
+          onclick={() => void copy(`${index}`, token.text)}
+          >{copied === `${index}` ? 'Copied' : 'Copy'}</button
+        >
+        <pre><code>{token.text}</code></pre>
+      </div>
     {:else if token.type === 'blockquote'}<blockquote>
         {@render renderBlocks(token.tokens ?? [])}
       </blockquote>
@@ -78,8 +100,41 @@
 <style>
   .markdown {
     overflow-wrap: anywhere;
-    font-size: 14px;
-    line-height: 1.6;
+    font-size: var(--type-14);
+    line-height: 1.5;
+  }
+  .markdown :global(h1),
+  .markdown :global(h2),
+  .markdown :global(h3),
+  .markdown :global(h4),
+  .markdown :global(h5),
+  .markdown :global(h6) {
+    margin: var(--space-16) 0 var(--space-8);
+    font-size: var(--type-14);
+    font-weight: 700;
+    line-height: 1.3;
+  }
+  .markdown :global(h1:first-child),
+  .markdown :global(h2:first-child),
+  .markdown :global(h3:first-child),
+  .markdown :global(h4:first-child),
+  .markdown :global(h5:first-child),
+  .markdown :global(h6:first-child) {
+    margin-top: 0;
+  }
+  .markdown :global(h1) {
+    font-size: var(--type-20);
+  }
+  .markdown :global(h2) {
+    font-size: var(--type-16);
+  }
+  .markdown.compact :global(h1),
+  .markdown.compact :global(h2),
+  .markdown.compact :global(h3),
+  .markdown.compact :global(h4),
+  .markdown.compact :global(h5),
+  .markdown.compact :global(h6) {
+    font-size: inherit;
   }
   .markdown.compact {
     font-size: inherit;
@@ -102,8 +157,32 @@
   .markdown :global(pre) {
     overflow: auto;
     padding: 12px;
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     background: var(--sui-subtle);
+  }
+  .code-block {
+    position: relative;
+    margin: 0 0 10px;
+  }
+  .code-block pre {
+    margin: 0;
+  }
+  .code-copy {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    padding: 2px 8px;
+    border: 1px solid var(--shell-divider);
+    border-radius: var(--radius-6);
+    color: var(--sui-muted);
+    background: var(--sui-surface);
+    font-size: var(--type-12);
+    opacity: 0;
+    cursor: pointer;
+  }
+  .code-block:hover .code-copy,
+  .code-copy:focus-visible {
+    opacity: 1;
   }
   .markdown :global(code) {
     font:
