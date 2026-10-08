@@ -9785,11 +9785,13 @@
     const candidates = [parent, ...projectCatalog.repositories].filter(
       (path): path is string => !!path && path !== missing,
     );
-    for (const candidate of new Set(candidates)) {
-      if (await invoke<boolean>('repository_path_available', { path: candidate }).catch(() => false))
-        return candidate;
-    }
-    return null;
+    const unique = [...new Set(candidates)];
+    const available = await Promise.all(
+      unique.map((path) =>
+        invoke<boolean>('repository_path_available', { path }).catch(() => false),
+      ),
+    );
+    return unique.find((_, index) => available[index]) ?? null;
   }
 
   async function restartSetup() {
