@@ -203,7 +203,7 @@
   .spawn-expand {
     border: 0;
     padding: 3px 5px;
-    color: var(--sui-accent);
+    color: var(--sui-primary);
     background: transparent;
     font: inherit;
     font-size: 0.78rem;

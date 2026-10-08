@@ -208,15 +208,15 @@
   }
   .subagent-group-heading {
     padding: 6px 12px;
-    color: var(--text-muted, var(--sui-muted));
+    color: var(--sui-muted);
     font-size: 11px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    border-bottom: 1px solid var(--shell-divider, var(--border));
+    border-bottom: 1px solid var(--shell-divider);
   }
   .subagent-group + .subagent-group {
-    border-top: 1px solid var(--shell-divider, var(--border));
+    border-top: 1px solid var(--shell-divider);
   }
   .subagent + .subagent {
     border-top: 1px solid var(--shell-divider);
@@ -230,7 +230,7 @@
     margin-right: 8px;
     padding: 3px 6px;
     border: 0;
-    color: var(--sui-accent);
+    color: var(--sui-primary);
     background: transparent;
     font: inherit;
     font-size: 12px;
