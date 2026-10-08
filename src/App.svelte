@@ -319,7 +319,7 @@
   import {
     acpReceiptState,
     acpPromptHasBackendEvidence,
-    acpTurnDispatchProven,
+    acpReplacementDispatchAction,
     acpTurnEvidenceState,
     acpTurnNeedsProviderInspection,
     acpTurnPromptCanRetry,
@@ -329,7 +329,7 @@
     handoffReceiptNeedsResolution,
     handoffPromptNeedsRecovery,
     loadSpawnReceipts,
-    openCodePromptHasBackendEvidence,
+    openCodeDescendantSessions,
     openCodePromptHasHistoryEvidence,
     openCodePromptRecoveryAction,
     openCodePromptSettlement,
@@ -338,11 +338,13 @@
     receiptIsSettled,
     receiptSourceId,
     pendingHandoffReplacement,
+    replacementReceiptForInspection,
     resolvedHandoffRecoveryError,
     saveBoundedReceipt,
     spawnPromptDispatchAllowed,
     spawnReceiptsForSource,
     withSpawnResponses,
+    type ReplacementDispatchAction,
     type SpawnReceipt,
     type SpawnState,
   } from './lib/agent-results';
@@ -2553,6 +2555,39 @@
     return nativeSnapshot.generation;
   }
 
+  async function reconcileProviderOpenCodeDescendants(
+    issue: ShipIssue,
+    threadIds: Iterable<string>,
+  ): Promise<string[]> {
+    if (!issue.path) return [];
+    const roots = [...threadIds]
+      .filter((threadId) => threadId.startsWith('opencode:'))
+      .map((threadId) => threadId.slice('opencode:'.length));
+    if (!roots.length) return [];
+    if (!client) throw new Error('OpenCode is unavailable, so task subagents cannot be settled.');
+    const source = client;
+    const descendants = await openCodeDescendantSessions(roots, issue.path, (parentID, cursor) =>
+      source.session.list({
+        parentID,
+        limit: 50,
+        order: 'desc',
+        ...(cursor ? { cursor } : {}),
+      }),
+    );
+    let authorized = false;
+    for (const child of descendants)
+      authorized =
+        authorizeShipCheckpointThread(
+          shipRuns,
+          child.location.directory,
+          `opencode:${child.parentID}`,
+          child.location.directory,
+          `opencode:${child.id}`,
+        ) || authorized;
+    if (authorized) await saveShipRuns();
+    return descendants.map((child) => `opencode:${child.id}`);
+  }
+
   async function waitForSettledShipWorker(
     issue: ShipIssue,
     threadId = issue.threadId,
@@ -2607,13 +2642,15 @@
     issue: ShipIssue,
     retired: SvelteSet<string>,
     attempts = 300,
-    quietGeneration: number | null = null,
+    quietGeneration: string | null = null,
   ): Promise<{ retired: SvelteSet<string>; nativeGeneration: number }> {
     if (attempts <= 0)
       throw new Error('Task-owned workers kept spawning during handoff cancellation.');
     const nativeGeneration = await reconcileProviderNativeSubagents(issue);
     const ownedReceipts = [...spawnReceipts, ...nativeChildReceipts];
     const lineage = new SvelteSet([...retired, ...shipOwnedThreadIds(issue, ownedReceipts)]);
+    const openCodeDescendants = await reconcileProviderOpenCodeDescendants(issue, lineage);
+    for (const threadId of openCodeDescendants) lineage.add(threadId);
     const owned = [...lineage].filter((threadId) => !retired.has(threadId));
     const unresolvedSpawn = ownedReceipts.some(
       (receipt) =>
@@ -2623,15 +2660,16 @@
         !receipt.targetId &&
         !shippingWorkerSettled(receipt.state),
     );
-    const quiet = shipOwnershipQuietPass(
-      quietGeneration,
+    const currentGeneration = JSON.stringify([
       nativeSubagentGeneration,
-      owned.length > 0 || unresolvedSpawn,
-    );
-    if (quiet.settled) return { retired, nativeGeneration };
+      nativeGeneration,
+      ...openCodeDescendants.toSorted(),
+    ]);
+    if (!owned.length && !unresolvedSpawn && quietGeneration === currentGeneration)
+      return { retired, nativeGeneration };
     if (!owned.length && !unresolvedSpawn) {
       await new Promise((resolve) => setTimeout(resolve, 100));
-      return settleOwnedShipThreads(issue, retired, attempts - 1, quiet.nextGeneration);
+      return settleOwnedShipThreads(issue, retired, attempts - 1, currentGeneration);
     }
     const states = await Promise.all(
       owned.map(async (threadId) => ({
@@ -2650,27 +2688,53 @@
 
   const contextHandoffsInFlight = new SvelteSet<string>();
 
-  async function replacementDispatchProven(receipt: SpawnReceipt): Promise<boolean> {
+  const replacementInspectionError =
+    'Prompt dispatch may have completed before restart; inspect the restored provider session before cancelling and retrying.';
+
+  function preserveReplacementForInspection(receipt: SpawnReceipt, detail?: string): void {
+    saveSpawnReceipt(
+      replacementReceiptForInspection(
+        receipt,
+        detail ? `${replacementInspectionError} ${detail}` : replacementInspectionError,
+        Date.now(),
+      ),
+    );
+  }
+
+  async function replacementDispatchAction(
+    receipt: SpawnReceipt,
+  ): Promise<ReplacementDispatchAction> {
     if (!receipt.targetId || !receipt.targetDirectory || !receipt.turnId || !receipt.prompt)
-      return false;
+      return 'reject';
     if (receipt.provider !== 'opencode') {
       const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
-      return acpTurnDispatchProven(
-        await acp.turnEvidence(receipt.provider, sessionId, receipt.turnId).catch(() => null),
-      );
+      try {
+        return acpReplacementDispatchAction(
+          await acp.turnEvidence(receipt.provider, sessionId, receipt.turnId),
+        );
+      } catch {
+        return 'inspect';
+      }
     }
-    if (!client) return false;
+    if (!client) return 'inspect';
+    const source = client;
     const sessionId = receipt.targetId.slice('opencode:'.length);
     try {
-      const [session, page, inbox] = await Promise.all([
-        client.session.get({ sessionID: sessionId }),
-        client.message.list({ sessionID: sessionId, limit: 50, order: 'desc' }),
-        client.session.inbox.list({ sessionID: sessionId }),
+      const [session, inbox] = await Promise.all([
+        source.session.get({ sessionID: sessionId }),
+        source.session.inbox.list({ sessionID: sessionId }),
       ]);
-      if (session.location.directory !== receipt.targetDirectory) return false;
-      return openCodePromptHasBackendEvidence(receipt, page.data, inbox);
+      if (session.location.directory !== receipt.targetDirectory) return 'reject';
+      const dispatched = await openCodePromptHasHistoryEvidence(receipt, inbox, (cursor) =>
+        source.message.list({
+          sessionID: sessionId,
+          limit: 50,
+          ...(cursor ? { cursor } : { order: 'desc' }),
+        }),
+      );
+      return dispatched ? 'adopt' : 'reject';
     } catch {
-      return false;
+      return 'inspect';
     }
   }
 
@@ -2882,22 +2946,35 @@
       } catch (cause) {
         const replacementReceipt = spawnReceipts.find((item) => item.receiptId === receiptId);
         const replacementThreadId = replacementReceipt?.targetId;
+        const dispatchAction =
+          replacementReceipt &&
+          replacementThreadId &&
+          replacementThreadId !== previousWorker.threadId
+            ? await replacementDispatchAction(replacementReceipt)
+            : 'reject';
         if (
           replacementReceipt &&
           replacementThreadId &&
           replacementThreadId !== previousWorker.threadId &&
-          (await replacementDispatchProven(replacementReceipt))
+          dispatchAction !== 'reject'
         ) {
-          const replacementState = await directShipWorkerState({
-            ...issue,
-            threadId: replacementThreadId,
-          });
+          const replacementState =
+            dispatchAction === 'inspect'
+              ? 'unavailable'
+              : await directShipWorkerState({
+                  ...issue,
+                  threadId: replacementThreadId,
+                });
           const reconciledState =
             replacementState === 'unavailable' ? replacementReceipt.state : replacementState;
-          updateSpawnReceipt(receiptId, {
-            state: reconciledState,
-            error: `Replacement startup confirmation failed: ${describe(cause)}`,
-          });
+          if (dispatchAction === 'inspect')
+            preserveReplacementForInspection(replacementReceipt, describe(cause));
+          else
+            updateSpawnReceipt(receiptId, {
+              state: reconciledState,
+              error: `Replacement startup confirmation failed: ${describe(cause)}`,
+            });
+          await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
           await updateShipIssue(run, issue, {
             receiptId,
             threadId: replacementThreadId,
@@ -2919,9 +2996,14 @@
                 : item,
             ),
             contextPercent: undefined,
+            handoffRecoveryRequired: dispatchAction === 'inspect',
             state: 'working',
-            error: `Replacement worker started, but activity confirmation failed: ${describe(cause)}`,
-            workerSettled: shippingWorkerSettled(reconciledState),
+            error:
+              dispatchAction === 'inspect'
+                ? replacementInspectionError
+                : `Replacement worker started, but activity confirmation failed: ${describe(cause)}`,
+            workerSettled:
+              dispatchAction === 'inspect' ? false : shippingWorkerSettled(reconciledState),
             workerState: replacementState,
           });
           throw cause;
@@ -3680,7 +3762,8 @@
     if (issue.state === 'working') {
       const replacement = pendingHandoffReplacement(issue, spawnReceipts);
       if (replacement) {
-        if (!(await replacementDispatchProven(replacement))) {
+        const dispatchAction = await replacementDispatchAction(replacement);
+        if (dispatchAction === 'reject') {
           updateSpawnReceipt(replacement.receiptId, {
             state: 'failed',
             error: 'Replacement prompt was not proven dispatched; retry the pending handoff.',
@@ -3693,6 +3776,10 @@
             workerState: 'interrupted',
           });
           return;
+        }
+        if (dispatchAction === 'inspect') {
+          preserveReplacementForInspection(replacement);
+          await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
         }
         const handoffId = replacement.requestId.slice('handoff:'.length);
         const startedAt = Date.now();
@@ -3714,12 +3801,14 @@
               : handoff,
           ),
           contextPercent: undefined,
-          error: null,
+          handoffRecoveryRequired: dispatchAction === 'inspect',
+          error: dispatchAction === 'inspect' ? replacementInspectionError : null,
           refreshError: null,
           workerSettled: false,
-          workerState: 'starting',
+          workerState: dispatchAction === 'inspect' ? 'unavailable' : 'starting',
         });
-        receipt = replacement;
+        receipt =
+          spawnReceipts.find((item) => item.receiptId === replacement.receiptId) ?? replacement;
       }
     }
     if (issue.state === 'failed') {

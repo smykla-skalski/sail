@@ -386,12 +386,83 @@ export function acpTurnDispatchProven(evidence: AcpTurnEvidence | null): boolean
   return !!evidence && ['dispatched', 'done', 'failed', 'interrupted'].includes(evidence.status);
 }
 
+export type ReplacementDispatchAction = 'adopt' | 'inspect' | 'reject';
+
+export function acpReplacementDispatchAction(
+  evidence: AcpTurnEvidence | null,
+): ReplacementDispatchAction {
+  if (acpTurnDispatchProven(evidence)) return 'adopt';
+  if (evidence?.status === 'dispatch_uncertain') return 'inspect';
+  return 'reject';
+}
+
+export function replacementReceiptForInspection(
+  receipt: SpawnReceipt,
+  error: string,
+  updated: number,
+): SpawnReceipt {
+  return { ...receipt, state: 'unavailable', error, updated };
+}
+
 export function acpTurnPromptCanRetry(evidence: AcpTurnEvidence | null): boolean {
   return !evidence || evidence.status === 'prepared';
 }
 
 export function acpTurnNeedsProviderInspection(evidence: AcpTurnEvidence | null): boolean {
   return evidence?.status === 'dispatch_uncertain' || evidence?.status === 'dispatched';
+}
+
+export type OpenCodeDescendantSession = {
+  id: string;
+  parentID?: string;
+  location: { directory: string };
+};
+
+export async function openCodeDescendantSessions(
+  rootSessionIds: string[],
+  directory: string,
+  loadPage: (
+    parentID: string,
+    cursor?: string,
+  ) => Promise<{ data: OpenCodeDescendantSession[]; cursor: { next?: string | null } }>,
+): Promise<OpenCodeDescendantSession[]> {
+  const pending = [...new Set(rootSessionIds)];
+  const visitedParents = new Set<string>();
+  const descendants = new Map<string, OpenCodeDescendantSession>();
+  async function collectPages(
+    parentID: string,
+    cursor?: string,
+    seenCursors = new Set<string>(),
+  ): Promise<void> {
+    const page = await loadPage(parentID, cursor);
+    for (const child of page.data) {
+      if (
+        child.id === parentID ||
+        child.parentID !== parentID ||
+        child.location.directory !== directory
+      )
+        continue;
+      if (!descendants.has(child.id)) {
+        descendants.set(child.id, child);
+        pending.push(child.id);
+      }
+    }
+    const next = page.cursor.next ?? undefined;
+    if (!next || seenCursors.has(next)) return;
+    seenCursors.add(next);
+    return collectPages(parentID, next, seenCursors);
+  }
+  async function collectParent(index: number): Promise<void> {
+    if (index >= pending.length) return;
+    const parentID = pending[index];
+    if (!visitedParents.has(parentID)) {
+      visitedParents.add(parentID);
+      await collectPages(parentID);
+    }
+    return collectParent(index + 1);
+  }
+  await collectParent(0);
+  return [...descendants.values()];
 }
 
 export function handoffReceiptNeedsResolution(receipt: SpawnReceipt): boolean {
@@ -446,7 +517,7 @@ export function pendingHandoffReplacement(
         receipt.sourceDirectory === issue.path &&
         receipt.targetDirectory === issue.path &&
         receipt.worktreeId === issue.path &&
-        receipt.state === 'starting' &&
+        ['starting', 'failed', 'unavailable'].includes(receipt.state) &&
         !!receipt.targetId &&
         !!receipt.turnId &&
         !!receipt.prompt,

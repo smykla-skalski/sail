@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   acpReceiptState,
   acpPromptHasBackendEvidence,
+  acpReplacementDispatchAction,
   acpTurnDispatchProven,
   acpTurnEvidenceState,
   acpTurnNeedsProviderInspection,
@@ -15,6 +16,7 @@ import {
   handoffPromptNeedsRecovery,
   isSubagentThread,
   loadSpawnReceipts,
+  openCodeDescendantSessions,
   openCodePromptHasBackendEvidence,
   openCodePromptHasHistoryEvidence,
   openCodePromptRecoveryAction,
@@ -25,6 +27,7 @@ import {
   receiptNeedsLiveActivity,
   receiptSourceId,
   pendingHandoffReplacement,
+  replacementReceiptForInspection,
   resolvedHandoffRecoveryError,
   runningSubagentsForSource,
   saveBoundedReceipt,
@@ -177,6 +180,46 @@ await test('durable ACP evidence distinguishes completion from uncertain dispatc
   assert.equal(acpTurnDispatchProven(evidence), true);
   assert.equal(acpTurnDispatchProven(null), false);
   assert.equal(acpTurnEvidenceState(null), null);
+});
+
+await test('uncertain ACP replacement dispatch requires inspection instead of source restoration', () => {
+  const evidence = {
+    agent: 'codex',
+    sessionId: 'replacement',
+    turnId: 'handoff-turn',
+    status: 'dispatch_uncertain' as const,
+    error: 'transport write failed',
+    updatedAt: 1,
+  };
+
+  const action = acpReplacementDispatchAction(evidence);
+
+  assert.equal(action, 'inspect');
+});
+
+await test('uncertain replacement remains owned even after its prompt promise reports failure', () => {
+  const failed = {
+    ...receipt,
+    receiptId: 'handoff-replacement',
+    requestId: 'handoff:handoff-one',
+    state: 'failed' as const,
+    error: 'transport write failed',
+  };
+
+  const preserved = replacementReceiptForInspection(
+    failed,
+    'Prompt dispatch may have completed before restart; inspect the restored provider session before cancelling and retrying.',
+    3,
+  );
+
+  assert.deepEqual(preserved, {
+    ...failed,
+    state: 'unavailable',
+    error:
+      'Prompt dispatch may have completed before restart; inspect the restored provider session before cancelling and retrying.',
+    updated: 3,
+  });
+  assert.equal(handoffReceiptNeedsResolution(preserved), true);
 });
 
 await test('restart routes a dispatched ACP handoff away from generic continuation recovery', () => {
@@ -417,6 +460,10 @@ await test('handoff replacement created before ownership transfer is adopted aft
   };
 
   assert.equal(pendingHandoffReplacement(issue, [replacement]), replacement);
+  assert.equal(
+    pendingHandoffReplacement(issue, [{ ...replacement, state: 'failed' }])?.state,
+    'failed',
+  );
   assert.equal(pendingHandoffReplacement(issue, [{ ...replacement, turnId: null }]), null);
 });
 
@@ -475,7 +522,7 @@ await test('OpenCode handoff dispatch ignores unrelated session activity', () =>
   assert.equal(openCodePromptHasBackendEvidence(handoff, [], [{ id: 'handoff-turn' }]), true);
 });
 
-await test('OpenCode handoff recovery finds a durable prompt beyond the newest 50 messages', async () => {
+await test('OpenCode replacement adoption finds a durable prompt beyond the newest 50 messages', async () => {
   const handoff = {
     prompt: 'Continue from the canonical checkpoint',
     turnId: 'handoff-turn',
@@ -500,6 +547,52 @@ await test('OpenCode handoff recovery finds a durable prompt beyond the newest 5
   );
 
   assert.equal(dispatched, true);
+});
+
+await test('OpenCode task ownership includes paginated nested descendants', async () => {
+  const pages = new Map([
+    [
+      'root:',
+      {
+        data: [
+          { id: 'child-one', parentID: 'root', location: { directory: '/repo/task' } },
+          { id: 'other-worktree', parentID: 'root', location: { directory: '/repo/other' } },
+        ],
+        cursor: { next: 'older' },
+      },
+    ],
+    [
+      'root:older',
+      {
+        data: [{ id: 'child-two', parentID: 'root', location: { directory: '/repo/task' } }],
+        cursor: { next: null },
+      },
+    ],
+    [
+      'child-one:',
+      {
+        data: [{ id: 'grandchild', parentID: 'child-one', location: { directory: '/repo/task' } }],
+        cursor: { next: null },
+      },
+    ],
+    ['child-two:', { data: [], cursor: { next: null } }],
+    ['grandchild:', { data: [], cursor: { next: null } }],
+  ]);
+
+  const descendants = await openCodeDescendantSessions(
+    ['root'],
+    '/repo/task',
+    async (parentID, cursor) => pages.get(`${parentID}:${cursor ?? ''}`)!,
+  );
+
+  assert.deepEqual(
+    descendants.map((session) => [session.id, session.parentID]),
+    [
+      ['child-one', 'root'],
+      ['child-two', 'root'],
+      ['grandchild', 'child-one'],
+    ],
+  );
 });
 
 await test('completed OpenCode handoff settlement finds its prompt beyond the newest 50 messages', async () => {
