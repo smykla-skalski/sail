@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyboardScrollable } from './lib/scroll-focus';
   import { onMount, tick, untrack } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
@@ -1104,6 +1105,7 @@
       class="agent-conversation conversation"
       role="region"
       bind:this={scroll}
+      {@attach keyboardScrollable}
       aria-label="OpenCode conversation"
       onscroll={() => {
         following = nearBottom(scroll);
