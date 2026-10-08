@@ -26,6 +26,7 @@
   import {
     adjacentRowId,
     shipAllMerged,
+    shipDetailFallback,
     shipDeliveryMismatch,
     shipGroups,
     shipOrderSnapshot,
@@ -36,6 +37,8 @@
     shipStageIndicator,
     shipTaskCriteria,
     shipTaskObjective,
+    shipWorkerRequest,
+    type ShipDetailFallback,
     type ShipOrderSnapshot,
     type ShipRow,
   } from './lib/ship-list';
@@ -70,7 +73,7 @@
     mergeOwner?: MergeOwner;
     onclose: () => void;
     onrefresh: () => Promise<void>;
-    onopen: (path: string, threadId?: string | null) => Promise<void>;
+    onopen: (path: string, threadId?: string | null, prefill?: string | null) => Promise<void>;
     onsettings: () => Promise<void>;
     onhandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
     onaction: (id: ShipActionId, run: ShipRun, issue: ShipIssue | null) => Promise<string>;
@@ -116,10 +119,17 @@
   const pinned = $derived(new Set([selectedIssue, focusedId].filter(Boolean)));
   const groups = $derived(shipGroups(rows, { showDone, pinned }));
   const visibleIds = $derived(groups.flatMap((group) => group.rows.map((row) => row.issue.id)));
+  // Kept once shown so a re-sort does not switch the detail to another issue.
+  const shown: { fallback: ShipDetailFallback | null } = { fallback: null };
+  const fallback = $derived(wide ? shipDetailFallback(run, rows, shown.fallback) : null);
+  $effect(() => {
+    if (fallback && !selectedIssue) shown.fallback = fallback;
+  });
   const issue = $derived(
     run?.issues.find((item) => item.id === selectedIssue) ??
-      (wide ? rows.find((row) => row.group !== 'done')?.issue : undefined),
+      run?.issues.find((item) => item.id === fallback?.issueId),
   );
+  const workerRequest = $derived(issue ? shipWorkerRequest(issue) : null);
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
   const allDone = $derived(!!run && shipAllMerged(run, { mergeOwner }));
   const doneCount = $derived(rows.filter((row) => row.group === 'done').length);
@@ -626,8 +636,8 @@
             >
             <button
               disabled={!issue.path || !issue.threadId || issue.worktreeUnavailable}
-              onclick={() => act(() => onopen(issue!.path!, issue!.threadId))}
-              >Open worker thread</button
+              onclick={() => act(() => onopen(issue!.path!, issue!.threadId, workerRequest))}
+              >{workerRequest ? 'Reply to worker' : 'Open worker thread'}</button
             >
             <a href={issue.url} target="_blank" rel="noreferrer">Open GitHub issue</a>
           </div>

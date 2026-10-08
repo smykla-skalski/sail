@@ -37,6 +37,7 @@
   let {
     items,
     busy = false,
+    live = false,
     coordinationMessages = [],
     onopen,
     control,
@@ -50,6 +51,8 @@
   }: {
     items: TranscriptItem[];
     busy?: boolean;
+    /** True once history has loaded, so tool cards that mount failed announce. */
+    live?: boolean;
     coordinationMessages?: CoordinationMessage[];
     onopen?: (receipt: SpawnReceipt) => Promise<void>;
     control?: SubagentControl;
@@ -95,6 +98,7 @@
     error={tool.error}
     source={tool.source}
     expanded={revealed}
+    {live}
     onfix={toolFailed(tool) && ontoolfix && tool.error ? () => ontoolfix(tool) : undefined}
   >
     {#each tool.terminalIds as terminalId (terminalId)}

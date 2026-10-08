@@ -229,11 +229,14 @@ describe('repository setup', () => {
     await expect($('.worktree-menu')).toBeDisplayed();
     await browser.execute(() => sessionStorage.setItem('sai-e2e-delete-worktree', 'Yes'));
     await $(deleteMenuItem).click();
-    await expect($('.app-shell [role="alert"]')).toHaveText(
-      expect.stringContaining('Cannot delete worktree'),
+    await expect($('.confirmation-dialog')).toHaveText(
+      expect.stringContaining('permanently removes uncommitted and ignored files'),
     );
+    await expect($('.app-shell [role="alert"]')).not.toExist();
     expect(existsSync(dirty)).toBe(true);
     await expect(row).toHaveAttribute('aria-current', 'page');
+    await $('.confirmation-dialog button:first-child').click();
+    expect(existsSync(dirty)).toBe(true);
 
     rmSync(dirty);
     const ignored = join(worktree, 'ignored-secret.txt');

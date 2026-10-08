@@ -262,6 +262,11 @@ export function worktreeAt(
   return null;
 }
 
+export function owningRepository(catalog: ProjectCatalog, path: string): string | null {
+  if (catalog.repositories.includes(path)) return path;
+  return worktreeAt(catalog, path)?.repository ?? null;
+}
+
 export function setWorktreePullRequest(
   catalog: ProjectCatalog,
   repository: string,

@@ -8,6 +8,12 @@ const sessions = new Map();
 const delayedSessionDirectories = new Set();
 const permissions = new Map();
 const elicitations = new Map();
+const questionOption = (label, description, preview) => ({
+  const: label,
+  title: label,
+  ...(description ? { description } : {}),
+  ...(preview ? { _meta: { '_claude/askUserQuestionOption': { preview } } } : {}),
+});
 const activePrompts = new Map();
 const steerWaiters = new Map();
 const terminalRequests = new Map();
@@ -456,6 +462,62 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
       continue;
     }
+    if (text === 'Ask user questions') {
+      const id = ++nextPermission;
+      elicitations.set(id, { sessionId, promptId: message.id, ask: true });
+      send({
+        id,
+        method: 'elicitation/create',
+        params: {
+          sessionId,
+          mode: 'form',
+          message: 'Please answer the following questions.',
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              question_0: {
+                type: 'string',
+                title: 'Storage',
+                description: 'Which storage engine should the cache use?',
+                oneOf: [
+                  questionOption(
+                    'Postgres (Recommended)',
+                    'Durable, already deployed, and covered by backups.',
+                    'CREATE TABLE cache (\n  key text PRIMARY KEY,\n  value jsonb NOT NULL\n);',
+                  ),
+                  questionOption('Redis', 'Fastest reads, but adds a service to operate.'),
+                  questionOption('In memory', 'No setup; lost on restart.'),
+                ],
+              },
+              question_0_custom: {
+                type: 'string',
+                title: 'Other',
+                description:
+                  'Type your own answer, or add a note to the option you chose above (optional).',
+              },
+              question_1: {
+                type: 'array',
+                title: 'Rollout',
+                description: 'Which rollout steps should run?',
+                items: {
+                  anyOf: [
+                    questionOption('Feature flag', 'Ship dark, then enable per project.'),
+                    questionOption('Metrics', 'Record hit rate and latency.'),
+                    questionOption('Docs', 'Document the new setting.'),
+                  ],
+                },
+              },
+              question_1_custom: {
+                type: 'string',
+                title: 'Other',
+                description: 'Type your own answer to add to your selection above (optional).',
+              },
+            },
+          },
+        },
+      });
+      continue;
+    }
     if (text === 'Agent interrupted') {
       send({ id: message.id, result: { stopReason: 'cancelled' } });
       continue;
@@ -743,6 +805,45 @@ for await (const line of createInterface({ input: process.stdin })) {
         // Slow enough that six thread switches still leave the turn running.
       }, 400);
       const stop = trackWork(sessionId, () => clearInterval(interval));
+      continue;
+    }
+    if (text === 'Flood turn') {
+      const { cwd } = sessions.get(sessionId);
+      const say = (value) => recordUpdate(sessionId, sessionId, value);
+      const chunk = (value) =>
+        say({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: value } });
+      const tool = (id, title) =>
+        say({
+          sessionUpdate: 'tool_call',
+          toolCallId: `${id}-${message.id}`,
+          title,
+          status: 'completed',
+        });
+      chunk('Flood waiting.');
+      let phase = 'waiting';
+      const finish = (reason) => {
+        stop();
+        clearInterval(poll);
+        chunk(` Flood ${reason}.`);
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      };
+      const started = Date.now();
+      const poll = setInterval(() => {
+        if (Date.now() - started > 120_000) return finish('timed out');
+        if (phase === 'waiting' && existsSync(join(cwd, 'flood-go.txt'))) {
+          phase = 'sent';
+          for (let index = 1; index <= 90; index += 1) {
+            chunk(`msg-${index} `);
+            tool(`flood-step-${index}`, `Flood step ${index}`);
+          }
+          for (let index = 1; index <= 40; index += 1) chunk(`long-${index} ${'x'.repeat(990)} `);
+          tool('flood-burst', 'Flood burst');
+          for (let index = 1; index <= 2600; index += 1) chunk(`f-${index} `);
+          writeFileSync(join(cwd, 'flood-sent.txt'), 'sent\n');
+        } else if (phase === 'sent' && existsSync(join(cwd, 'flood-release.txt')))
+          finish('finished');
+      }, 100);
+      const stop = trackWork(sessionId, () => clearInterval(poll));
       continue;
     }
     if (text === 'Background task') {
@@ -1136,9 +1237,11 @@ for await (const line of createInterface({ input: process.stdin })) {
     const pending = elicitations.get(message.id);
     elicitations.delete(message.id);
     const text =
-      message.result?.action === 'accept'
-        ? `Selected: ${message.result.content?.approach}`
-        : message.result?.action;
+      message.result?.action !== 'accept'
+        ? message.result?.action
+        : pending.ask
+          ? `Answers: ${JSON.stringify(message.result.content)}`
+          : `Selected: ${message.result.content?.approach}`;
     update(pending.sessionId, {
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text },

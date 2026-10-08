@@ -1613,6 +1613,20 @@ async fn shipping_worktree_target(
     .map_err(|error| error.to_string())?
 }
 
+// For a worktree that is already gone: the branch still lives in the repository.
+#[tauri::command]
+async fn shipping_repository_target(
+    repository: String,
+    branch: String,
+) -> Result<ShippingTarget, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = validate_repository(repository)?;
+        shipping_target(Path::new(&repository), Path::new(&repository), &branch)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RegisteredWorktree {
@@ -2872,6 +2886,7 @@ pub fn run() {
             working_tree_commit,
             shipping_base_revision,
             shipping_worktree_target,
+            shipping_repository_target,
             shipping_changed_paths,
             worktree_overviews,
             worktree_snapshots::record_turn_snapshot,
@@ -2913,6 +2928,7 @@ pub fn run() {
             github::heartbeat_shipping_claim,
             github::release_shipping_claim,
             ship_actions::ship_merge_pull_request,
+            ship_actions::ship_reopen_pull_request,
             ship_actions::ship_issue_title,
             github::pull_request_checks,
             github::failed_check_log,

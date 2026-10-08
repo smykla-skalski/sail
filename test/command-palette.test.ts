@@ -228,7 +228,7 @@ void test('saved commands remain searchable at the root only', () => {
 });
 
 void test('root search offers app actions with their shortcut hints', () => {
-  const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
+  const actions = paletteActions({ theme: 'light', overview: false, hasDirectory: true });
   const entries = search({ kind: 'projects' }, '', { actions }).filter(
     (entry) => entry.kind === 'action',
   );
@@ -248,7 +248,7 @@ void test('root search offers app actions with their shortcut hints', () => {
 });
 
 void test('action entries are searchable by label', () => {
-  const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
+  const actions = paletteActions({ theme: 'light', overview: false, hasDirectory: true });
 
   assert.equal(search({ kind: 'projects' }, 'split pane', { actions })[0]?.actionId, 'pane.split');
   assert.equal(
@@ -266,20 +266,23 @@ void test('action entries are searchable by label', () => {
 const byId = (context: Parameters<typeof paletteActions>[0]) =>
   new Map(paletteActions(context).map((action) => [action.id, action]));
 
-void test('action entries follow the theme, overview and project state', () => {
+const themeLabels = (theme: 'system' | 'light' | 'dark') =>
+  paletteActions({ theme, overview: false, hasDirectory: true })
+    .filter((action) => action.id.startsWith('theme.'))
+    .map((action) => action.label);
+
+void test('theme actions offer every choice except the current one, including System', () => {
+  assert.deepEqual(themeLabels('system'), ['Switch to light theme', 'Switch to dark theme']);
+  assert.deepEqual(themeLabels('light'), ['Follow system theme', 'Switch to dark theme']);
+  assert.deepEqual(themeLabels('dark'), ['Follow system theme', 'Switch to light theme']);
+});
+
+void test('action entries follow the overview and project state', () => {
   assert.equal(
-    byId({ dark: false, overview: false, hasDirectory: true }).get('theme.toggle')?.label,
-    'Switch to dark theme',
-  );
-  assert.equal(
-    byId({ dark: true, overview: true, hasDirectory: true }).get('theme.toggle')?.label,
-    'Switch to light theme',
-  );
-  assert.equal(
-    byId({ dark: true, overview: true, hasDirectory: true }).get('overview.toggle')?.label,
+    byId({ theme: 'dark', overview: true, hasDirectory: true }).get('overview.toggle')?.label,
     'Back to workspace',
   );
-  const noProject = byId({ dark: false, overview: false, hasDirectory: false });
+  const noProject = byId({ theme: 'light', overview: false, hasDirectory: false });
   assert.equal(noProject.get('pane.split')?.disabled, true);
   assert.equal(noProject.get('settings.open')?.disabled, false);
   const entries = search({ kind: 'projects' }, 'split', { actions: [...noProject.values()] });
@@ -287,7 +290,7 @@ void test('action entries follow the theme, overview and project state', () => {
 });
 
 void test('worktree, agent and session steps show no app actions', () => {
-  const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
+  const actions = paletteActions({ theme: 'light', overview: false, hasDirectory: true });
   for (const step of [
     { kind: 'worktrees', repository: '/work/alpha' },
     { kind: 'agents', repository: '/work/alpha', directory: '/work/alpha' },
@@ -302,18 +305,30 @@ void test('worktree, agent and session steps show no app actions', () => {
 });
 
 void test('an exact thread title outranks actions whose detail mentions it', () => {
-  const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
+  const actions = paletteActions({ theme: 'light', overview: false, hasDirectory: true });
   const first = search({ kind: 'projects' }, 'Newest', { actions })[0];
   assert.equal(first?.thread?.sessionId, 'new');
   assert.equal(search({ kind: 'projects' }, 'thread', { actions })[0]?.kind !== 'action', true);
 });
 
 void test('a query that only matches a disabled action activates no other action', () => {
-  const actions = paletteActions({ dark: false, overview: false, hasDirectory: false });
+  const actions = paletteActions({ theme: 'light', overview: false, hasDirectory: false });
   const entries = search({ kind: 'projects' }, 'side chat', { actions });
   assert.deepEqual(
     entries.map((entry) => entry.actionId),
     ['chat.side'],
   );
   assert.equal(entries[0]?.disabled, true);
+});
+
+void test('app actions do not take project slots in the empty-query list', () => {
+  const repositories = Array.from({ length: 60 }, (_, index) => `/work/p${index}`);
+  const actions = paletteActions({ theme: 'system', overview: false, hasDirectory: true });
+  const entries = search({ kind: 'projects' }, '', {
+    actions,
+    catalog: { repositories, groups: [], worktrees: {} },
+    currentDirectory: '/work/p0',
+  });
+  assert.equal(entries.filter((entry) => entry.kind === 'project').length, 50);
+  assert.equal(entries.filter((entry) => entry.kind === 'action').length, actions.length);
 });

@@ -16,7 +16,8 @@ describe('OpenCode failed tool card', () => {
     await expect(failedStatus).toHaveText(expect.stringContaining('Failed'));
     expect((await failedStatus.getCSSProperty('color')).value).not.toBe(workingColor.value);
     await expect($('.tool-activity')).toHaveAttribute('open');
-    await expect($('.tool-activity-error[role="alert"]')).toHaveText('Permission denied');
+    await expect($('.tool-activity-error')).toHaveText('Permission denied');
+    await expect($('.tool-activity-alert[role="alert"]')).toHaveText('Permission denied');
     await expect($('.tool-activity')).toHaveText(expect.stringContaining('blocked output'));
     await expect($('.tool-activity')).toHaveText(expect.stringContaining('Reported by policy'));
     await $('.tool-activity-fix').click();
@@ -24,7 +25,7 @@ describe('OpenCode failed tool card', () => {
 
     await $('button[aria-label="Update failure"]').click();
     await expect($$('.tool-activity')).toBeElementsArrayOfSize(1);
-    await expect($('.tool-activity-error[role="alert"]')).toHaveText('Policy blocked command');
+    await expect($('.tool-activity-alert[role="alert"]')).toHaveText('Policy blocked command');
     await expect($('.tool-activity')).toHaveText(expect.stringContaining('updated output'));
 
     await $('.tool-activity-fix').click();
@@ -35,5 +36,23 @@ describe('OpenCode failed tool card', () => {
     const first = await $('textarea').getValue();
     await $('.tool-activity-fix').click();
     expect(await $('textarea').getValue()).toBe(first);
+  });
+
+  it('announces cards that mount failed live once and keeps history silent', async () => {
+    await $('button[aria-label="Mount history failure"]').click();
+    const history = $('[data-mounted="history"] .tool-activity-alert[role="alert"]');
+    await expect(history).toExist();
+    await expect(history).toHaveText('');
+    await expect($('[data-mounted="history"] .tool-activity-error')).toHaveText('Mounted failure');
+
+    await $('button[aria-label="Mount live failure"]').click();
+    await expect($('[data-mounted="live"] .tool-activity-alert[role="alert"]')).toHaveText(
+      'Mounted failure',
+    );
+
+    await $('button[aria-label="Remount failures"]').click();
+    await expect($('[data-mounted="live"] .tool-activity-error')).toHaveText('Mounted failure');
+    await expect($('[data-mounted="live"] .tool-activity-alert')).toHaveText('');
+    await expect($('[data-mounted="history"] .tool-activity-alert')).toHaveText('');
   });
 });

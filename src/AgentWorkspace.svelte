@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyboardScrollable } from './lib/scroll-focus';
   import { onMount, tick, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
@@ -82,8 +83,8 @@
     restoreEntryTimes,
     saveRecentTranscript,
     sessionState,
-    takeBackgroundUpdates,
-    trackBackgroundSession,
+    takeLiveTranscript,
+    trackLiveTranscript,
     updateEntriesBatch,
     updateEntriesInPlace,
     type AgentEntry,
@@ -489,6 +490,7 @@
   }
   let error = $state('');
   let entries = $state.raw<AgentEntry[]>([]);
+  let showingNativeChild = false;
   let nativePlan = $state<NativePlan | null>(null);
   let planRequested = $state(false);
   let completedTurn = Promise.resolve();
@@ -503,7 +505,8 @@
     reported: boolean;
   } | null = null;
   $effect(() => {
-    if (nativeEntries) entries = nativeEntries;
+    // Until activate() switches sessions, entries still belong to the parent being left.
+    if (nativeEntries && activeSessionId === thread?.sessionId) entries = nativeEntries;
   });
   $effect(() => {
     const revision = planRevision;
@@ -775,9 +778,15 @@
     }
   });
 
-  async function focusPromptWhenReady() {
+  // A busy agent still accepts typing; a prefill focuses so the reply can be queued.
+  async function focusPromptWhenReady(whileBusy = false) {
     await tick();
-    if (!focusPrompt || !focused || isBusy || activeSessionId !== (thread?.sessionId ?? null))
+    if (
+      !focusPrompt ||
+      !focused ||
+      (isBusy && !whileBusy) ||
+      activeSessionId !== (thread?.sessionId ?? null)
+    )
       return;
     prompt.focus();
     onpromptfocused?.();
@@ -797,11 +806,13 @@
   });
 
   $effect(() => {
-    if (!prefill || prefill.id === lastPrefill) return;
+    // Wait for the thread switch: activating a session restores its saved draft over the prefill.
+    if (!prefill || prefill.id === lastPrefill || activeSessionId !== (thread?.sessionId ?? null))
+      return;
     lastPrefill = prefill.id;
     draft = [draft.trim(), prefill.text].filter(Boolean).join('\n\n');
     onprefillconsumed?.(prefill.id);
-    void focusPromptWhenReady();
+    void focusPromptWhenReady(true);
   });
 
   $effect(() => {
@@ -915,8 +926,10 @@
     setReplaying(true);
     replayEntries = [];
     try {
-      await acp.load(agent, directory, id, activeCapabilityProfile);
+      const session = await acp.load(agent, directory, id, activeCapabilityProfile);
       if (current !== generation) return;
+      if (!configOptions.length && Array.isArray(session.configOptions))
+        configOptions = session.configOptions as AgentConfigOption[];
       entries = restoreEntryTimes(replayEntries, entries);
       visibleCount = 50;
       historyLoaded = true;
@@ -1074,9 +1087,10 @@
   async function activate(id: string | null) {
     rememberTranscript();
     const previousSessionId = activeSessionId;
-    // Opening a native child leaves the parent running too, so its updates still need buffering.
-    if (previousSessionId && previousSessionId !== id && !ephemeral)
-      trackBackgroundSession(agent, previousSessionId);
+    // Opening a native child leaves the parent running too, so its transcript keeps updating.
+    if (previousSessionId && previousSessionId !== id && !ephemeral && !showingNativeChild)
+      trackLiveTranscript(agent, previousSessionId, entries, historyLoaded);
+    showingNativeChild = !!nativeEntries;
     rememberDraft(previousSessionId);
     const savedDraft = recallComposerDraft(composerDraftKey(directory, agent, id));
     draft = savedDraft?.text ?? '';
@@ -1098,19 +1112,9 @@
     elicitationDrafts = {};
     onnativeplan?.(nativePlan);
     entries = id && thread ? loadRecentTranscript(thread) : [];
-    const backgroundUpdates = id && !nativeEntries ? takeBackgroundUpdates(agent, id) : null;
+    const kept = id && !nativeEntries ? takeLiveTranscript(agent, id) : null;
     const liveView =
-      id && !nativeEntries
-        ? liveSessionView(entries, backgroundUpdates, sessionState(agent, id))
-        : null;
-    if (backgroundUpdates && id) {
-      for (const update of backgroundUpdates) {
-        nativePlan = nativePlanUpdate(agent, update, nativePlan);
-        acpPlans().observe({ agent, directory, sessionId: id }, update);
-      }
-      if (nativePlan) saveNativePlan({ agent, directory, sessionId: id }, nativePlan);
-      onnativeplan?.(nativePlan);
-    }
+      id && !nativeEntries ? liveSessionView(entries, kept, sessionState(agent, id)) : null;
     if (liveView) entries = liveView.entries;
     visibleCount = 50;
     historyLoaded = !id;
@@ -1177,6 +1181,7 @@
         if (liveView && runningTurn !== undefined) {
           liveTurn = true;
           activeTurnId = runningTurn;
+          historyLoaded = liveView.complete;
           configOptions = liveView.configOptions;
           const liveModel = configOptions.find(
             (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
@@ -1516,7 +1521,7 @@
       setReplaying(false);
       rememberTranscript();
       if (activeSessionId && !nativeEntries && !ephemeral)
-        trackBackgroundSession(agent, activeSessionId);
+        trackLiveTranscript(agent, activeSessionId, entries, historyLoaded);
       generation++;
       clearTimeout(updateTimer);
       unlisten?.();
@@ -2331,6 +2336,7 @@
       class="agent-conversation conversation"
       role="region"
       bind:this={scroll}
+      {@attach keyboardScrollable}
       onscroll={() => {
         autoFollow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80;
         if (scroll.scrollTop <= 80 && !historyLoading) void showEarlier();
@@ -2340,7 +2346,7 @@
       }}
       aria-label={`${name} conversation`}
     >
-      {#if entries.length === 0 && !connecting && !historyLoading}
+      {#if entries.length === 0 && !connecting && !historyLoading && !liveTurn}
         <div class="agent-welcome">
           <h1>Work with {name}</h1>
           <p>Describe the work. Sail will show messages, tools, and approvals here.</p>
@@ -2348,6 +2354,11 @@
       {/if}
       {#if historyLoading}<div class="agent-history-status" role="status">
           Loading history…
+        </div>{:else if liveTurn && !historyLoaded && !nativeEntries}<div
+          class="agent-history-status agent-history-gap"
+          role="note"
+        >
+          Earlier messages load when this turn ends.
         </div>{/if}
       {#snippet failureTool(item: TranscriptTool)}
         {@const tool = item.raw as AgentTool}

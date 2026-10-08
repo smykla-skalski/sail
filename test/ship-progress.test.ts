@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readyShipIssues } from '../src/lib/issue-shipping.ts';
+import { migrateShipArchive } from '../src/lib/ship-archive.ts';
 import {
   appendShipEvent,
   beginLatestRefresh,
@@ -23,11 +24,18 @@ import {
   persistShipRefresh,
   gateSnapshot,
   loadShipRuns,
+  loadShipRunStore,
+  serializeShipRuns,
   parseShipReport,
   requireValidatorEconomics,
   refreshedIssueState,
   shipOwner,
   shipCheckpointOwner,
+  currentShipBlockedReason,
+  repositoryForRemote,
+  unrecoverableGraceExpired,
+  unrecoverableIssuePlan,
+  shippingWorkerGone,
   authorizeShipCheckpointThread,
   commitRevisionBoundValidation,
   shipIssuePresentation,
@@ -281,6 +289,31 @@ void test('loads legacy runs and discards malformed records without losing valid
   assert.equal(restored[0].issues[0].worktreeUnavailable, true);
   assert.equal(restored[0].issues[0].validationPolicyRequired, true);
   assert.deepEqual(loadShipRuns('{'), []);
+});
+
+void test('saving keeps stored runs that cannot be parsed', () => {
+  const broken = { id: 'broken', issues: [null], futureField: { kept: true } };
+  const store = loadShipRunStore(JSON.stringify([broken, fixture()]));
+  assert.deepEqual(
+    store.runs.map((run) => run.id),
+    ['run'],
+  );
+  assert.deepEqual(store.unparsed, [broken]);
+
+  const archived = migrateShipArchive(store.runs, '1d', Date.now()).runs;
+  const saved = serializeShipRuns(archived, store.unparsed);
+  assert.deepEqual(JSON.parse(saved)[1], broken);
+  const reloaded = loadShipRunStore(saved);
+  assert.deepEqual(reloaded.unparsed, [broken]);
+  assert.equal(reloaded.runs.length, 1);
+
+  for (const raw of ['{', '{"not":"a list"}']) {
+    const corrupt = loadShipRunStore(raw);
+    assert.deepEqual(corrupt.runs, []);
+    assert.equal(corrupt.unparsed.length, 1, raw);
+    assert.equal(loadShipRunStore(serializeShipRuns([], corrupt.unparsed)).unparsed.length, 1);
+  }
+  assert.deepEqual(loadShipRunStore(null), { runs: [], unparsed: [] });
 });
 
 void test('legacy persisted work cannot opt out of validation by omitting the policy flag', () => {
@@ -2323,6 +2356,36 @@ void test('refreshing a pull request records its state and mergeability', () => 
   );
 });
 
+void test('a merge request marker lasts until a refresh sees the pull request closed', () => {
+  const { issue } = readyIssue();
+  const open = {
+    url: 'https://example.test/pull/2',
+    state: 'OPEN',
+    mergedAt: null,
+    headRefOid: 'commit-one',
+    checks: [],
+  };
+  issue.mergeRequested = { at: 1, head: 'commit-one', comment: 'squash' };
+  Object.assign(issue, refreshedPullRequest(issue, open));
+  assert.equal(issue.mergeRequested?.comment, 'squash');
+  Object.assign(issue, refreshedPullRequest(issue, null));
+  assert.equal(issue.mergeRequested?.comment, 'squash');
+  const [restored] = loadShipRuns(JSON.stringify([{ ...fixture(), issues: [issue] }]))[0].issues;
+  assert.deepEqual(restored.mergeRequested, { at: 1, head: 'commit-one', comment: 'squash' });
+  for (const state of ['CLOSED', 'MERGED']) {
+    const closed = { ...issue };
+    Object.assign(
+      closed,
+      refreshedPullRequest(closed, {
+        ...open,
+        state,
+        mergedAt: state === 'MERGED' ? '2026-01-01T00:00:00Z' : null,
+      }),
+    );
+    assert.equal(closed.mergeRequested, undefined, state);
+  }
+});
+
 void test('an issue closed before launch is closed, not failed', () => {
   const run = fixture();
   const issue = run.issues[0];
@@ -2379,4 +2442,65 @@ void test('a failed dependency wins over an unmerged one', () => {
   second.state = 'failed';
   second.error = 'Worker failed';
   assert.equal(shipIssuePresentation(run, run.issues[2]).label, 'Waiting on #3 (needs input)');
+});
+
+void test('repairs a dead run repository from the catalog checkout with the same remote', () => {
+  const candidates = [
+    { path: '/other', remote: 'kumahq/other' },
+    { path: '/broken', remote: null },
+    { path: '/kuma', remote: 'Kumahq/Kuma' },
+  ];
+  assert.equal(repositoryForRemote(candidates, 'kumahq/kuma'), '/kuma');
+  assert.equal(repositoryForRemote(candidates, 'kong/kong-mesh'), null);
+  assert.equal(repositoryForRemote([], 'kumahq/kuma'), null);
+  const clones = [
+    { path: '/a/kuma', remote: 'kumahq/kuma' },
+    { path: '/b/kuma', remote: 'kumahq/kuma' },
+  ];
+  assert.equal(repositoryForRemote(clones, 'kumahq/kuma', '/b/kuma'), '/b/kuma');
+  assert.equal(repositoryForRemote(clones, 'kumahq/kuma', '/c/other'), '/a/kuma');
+});
+
+void test('treats a vanished agent session or deleted worktree as a gone worker', () => {
+  assert.equal(shippingWorkerGone(new Error('Agent session is not connected.')), true);
+  assert.equal(shippingWorkerGone('Location not found: /sail/worktrees/gone'), true);
+  assert.equal(shippingWorkerGone(new Error('permission denied')), false);
+});
+
+void test('replaces the persisted missing-repository block reason', () => {
+  assert.equal(
+    currentShipBlockedReason(
+      'Shipping claim recovery failed: Repository path does not exist. Choose an existing directory.',
+    ),
+    'Shipping worktree no longer exists. Start a new run from the project.',
+  );
+  assert.equal(currentShipBlockedReason('Worker paused.'), 'Worker paused.');
+  assert.equal(currentShipBlockedReason(null), 'Shipping claim recovery requires worker fencing.');
+});
+
+void test('plans how to settle issues of a run whose repository is gone', () => {
+  const settled = { state: 'failed' as const, workerSettled: true, worktreeUnavailable: true };
+  assert.equal(unrecoverableIssuePlan(settled), 'none');
+  assert.equal(unrecoverableIssuePlan({ ...settled, refreshError: 'Claim: boom' }), 'clear');
+  assert.equal(unrecoverableIssuePlan({ ...settled, worktreeUnavailable: false }), 'clear');
+  assert.equal(
+    unrecoverableIssuePlan({ ...settled, state: 'merged', claimFencePending: true }),
+    'clear',
+  );
+  assert.equal(unrecoverableIssuePlan({ state: 'merged' }), 'none');
+  assert.equal(unrecoverableIssuePlan({ state: 'awaiting_merge', workerSettled: true }), 'none');
+  assert.equal(unrecoverableIssuePlan({ state: 'awaiting_merge', workerSettled: false }), 'none');
+  assert.equal(unrecoverableIssuePlan({ state: 'working', workerSettled: false }), 'fail');
+  assert.equal(unrecoverableIssuePlan({ state: 'failed', workerSettled: false }), 'fail');
+});
+
+void test('reads the message of error-like objects when matching a gone worker', () => {
+  assert.equal(shippingWorkerGone({ message: 'Agent session is not connected.' }), true);
+  assert.equal(shippingWorkerGone({ message: 'denied' }), false);
+  assert.equal(shippingWorkerGone(null), false);
+});
+
+void test('waits ten minutes before failing work in a vanished repository', () => {
+  assert.equal(unrecoverableGraceExpired(1_000, 1_000 + 9 * 60_000), false);
+  assert.equal(unrecoverableGraceExpired(1_000, 1_000 + 10 * 60_000), true);
 });

@@ -8,7 +8,7 @@ import {
   shipPullRequestReady,
 } from './ship-progress.ts';
 
-export type ShipActionId = 'merge' | 'retry' | 'stop' | 'archive' | 'unarchive';
+export type ShipActionId = 'merge' | 'retry' | 'reopen' | 'stop' | 'archive' | 'unarchive';
 
 export type ShipActionState = { enabled: boolean; reason: string | null };
 
@@ -20,6 +20,8 @@ export function shipMergeBlocker(issue: ShipIssue): string | null {
   if (issue.state === 'merged') return 'Already merged.';
   if (!issue.pullRequest) return 'No pull request yet.';
   if (issue.pullRequestState !== 'OPEN') return 'The pull request is not open.';
+  if (issue.mergeRequested)
+    return `Merge already requested with “${issue.mergeRequested.comment}”. Waiting for the repository's bot to merge it.`;
   const evidence = shipEvidenceReadiness(issue);
   if (!evidence.ready) return evidence.reason ?? 'Merge evidence is not ready.';
   if (!issue.pullRequestHead || issue.pullRequestHead !== issue.checkpoint?.revision)
@@ -42,6 +44,17 @@ export function shipRetryAction(issue: ShipIssue): ShipActionState {
   if (shipClosedBeforeLaunch(issue)) return unavailable('The issue was closed before launch.');
   if (shipClosedWithoutMerge(issue))
     return unavailable('The pull request was closed without merging.');
+  if (issue.claim?.status === 'active' && issue.claimFencePending)
+    return unavailable('Waiting for the shipping claim to settle.');
+  return available;
+}
+
+/** Reopen restores a pull request closed without merging, then resumes its worker from the checkpoint. */
+export function shipReopenAction(issue: ShipIssue): ShipActionState {
+  if (!shipClosedWithoutMerge(issue))
+    return unavailable('Only a pull request closed without merging can be reopened.');
+  if (!issue.pullRequest) return unavailable('No pull request to reopen.');
+  if (issue.state !== 'failed') return unavailable('Waiting for the worker to stop.');
   if (issue.claim?.status === 'active' && issue.claimFencePending)
     return unavailable('Waiting for the shipping claim to settle.');
   return available;
@@ -96,6 +109,17 @@ export function shipRetryConfirmation(issue: ShipIssue): ShipConfirmation {
     title: `Retry ${shipIssueTarget(issue)}?`,
     message: `Sail stops any leftover worker for ${shipIssueTarget(issue)}, takes over its shipping claim and starts a fresh worker from the saved checkpoint in the same worktree.`,
     confirmLabel: 'Retry',
+    destructive: false,
+  };
+}
+
+export function shipReopenConfirmation(issue: ShipIssue, remote: string): ShipConfirmation {
+  const number = issue.pullRequest?.match(/\/pull\/(\d+)/)?.[1];
+  const pullRequest = number ? `pull request #${number}` : 'the pull request';
+  return {
+    title: `Reopen ${pullRequest} for ${shipIssueTarget(issue)}?`,
+    message: `Sail reopens ${pullRequest} in ${remote} and starts a fresh worker from the saved checkpoint to finish ${shipIssueTarget(issue)}. Nothing merges until you confirm Merge.`,
+    confirmLabel: 'Reopen',
     destructive: false,
   };
 }

@@ -6,6 +6,7 @@ import {
   checkpointTouched,
   shipAllMerged,
   shipDeliveryMismatch,
+  shipDetailFallback,
   shipGroupOf,
   shipGroups,
   shipOrderSnapshot,
@@ -15,6 +16,7 @@ import {
   shipStageIndicator,
   shipTaskCriteria,
   shipTaskObjective,
+  shipWorkerRequest,
 } from '../src/lib/ship-list.ts';
 import { initialTaskCheckpoint, updateTaskCheckpoint } from '../src/lib/task-checkpoint.ts';
 
@@ -106,6 +108,62 @@ void test('issues land in the group that tells the user what to do', () => {
     i4: 'waiting',
     i5: 'queued',
   });
+});
+
+void test('the default detail issue stays put when another row re-sorts above it', () => {
+  const run = fixture(3);
+  const [first, , later] = run.issues;
+  Object.assign(first, { state: 'merged' as const });
+  const shown = shipDetailFallback(run, shipRows(run, {}), null);
+  assert.deepEqual(shown, { runId: 'run', issueId: 'i1' });
+
+  working(later, 'testing', { reportedStatus: 'blocked', blockedReason: 'Need a decision' });
+  const resorted = shipRows(run, {});
+  assert.equal(resorted.find((row) => row.group !== 'done')?.issue.id, 'i2');
+  assert.deepEqual(shipDetailFallback(run, resorted, shown), shown);
+
+  const other = { ...run, id: 'other' };
+  assert.deepEqual(shipDetailFallback(other, shipRows(other, {}), shown), {
+    runId: 'other',
+    issueId: 'i2',
+  });
+  const removed = { ...run, issues: run.issues.filter((issue) => issue.id !== 'i1') };
+  assert.deepEqual(shipDetailFallback(removed, shipRows(removed, {}), shown), {
+    runId: 'run',
+    issueId: 'i2',
+  });
+  Object.assign(run.issues[1], { state: 'merged' as const });
+  assert.deepEqual(shipDetailFallback(run, shipRows(run, {}), shown), {
+    runId: 'run',
+    issueId: 'i2',
+  });
+  assert.equal(shipDetailFallback(undefined, [], shown), null);
+  for (const issue of run.issues) issue.state = 'merged';
+  assert.equal(shipDetailFallback(run, shipRows(run, {}), null), null);
+});
+
+void test('a worker thread opens with its pending request quoted for the reply', () => {
+  const [issue] = fixture(1).issues;
+  issue.threadId = 'acp:claude:s1';
+  working(issue, 'implementing');
+  assert.equal(shipWorkerRequest(issue), null);
+  working(issue, 'implementing', {
+    reportedStatus: 'blocked',
+    blockedReason: 'Which theme token?\nPick one.',
+  });
+  assert.equal(shipWorkerRequest(issue), '> Which theme token?\n> Pick one.\n\n');
+  touched(issue, { unresolvedQuestions: ['Keep the old label?', 'Which theme token?'] }, 5);
+  assert.equal(
+    shipWorkerRequest(issue),
+    '> Which theme token?\n> Pick one.\n> Keep the old label?\n> Which theme token?\n\n',
+  );
+  touched(issue, { status: 'blocked', blocker: 'Need a decision', unresolvedQuestions: [] }, 6);
+  assert.equal(shipWorkerRequest(issue), '> Need a decision\n\n');
+  issue.threadId = null;
+  assert.equal(shipWorkerRequest(issue), null);
+  issue.threadId = 'acp:claude:s1';
+  issue.state = 'merged';
+  assert.equal(shipWorkerRequest(issue), null);
 });
 
 void test('group mapping covers every presentation status', () => {
