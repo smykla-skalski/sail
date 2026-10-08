@@ -1429,8 +1429,8 @@ fn economics_input_schema() -> Value {
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CapabilityProfile {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum CapabilityProfile {
     Explore,
     Review,
     Build,
@@ -1438,7 +1438,7 @@ enum CapabilityProfile {
 }
 
 impl CapabilityProfile {
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "explore" => Some(Self::Explore),
             "review" => Some(Self::Review),
@@ -1456,7 +1456,7 @@ impl CapabilityProfile {
             .unwrap_or(Self::Build)
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Explore => "explore",
             Self::Review => "review",
@@ -1504,6 +1504,10 @@ impl CapabilityProfile {
                     | "run_script"
             ),
         }
+    }
+
+    pub(crate) fn enables_terminal(self) -> bool {
+        matches!(self, Self::Build | Self::Release)
     }
 }
 

@@ -484,7 +484,8 @@ function restoreSession(
 
 export const acp = {
   agents: () => invoke<AgentAvailability[]>('acp_agents'),
-  connect: (agent: AgentId) => invoke<Record<string, unknown>>('acp_connect', { agent }),
+  connect: (agent: AgentId, profile?: CapabilityProfile) =>
+    invoke<Record<string, unknown>>('acp_connect', { agent, profile }),
   create: (agent: AgentId, cwd: string, profile?: CapabilityProfile, nativeGeneration?: number) =>
     invoke<{
       sessionId: string;
@@ -564,8 +565,8 @@ export const acp = {
       configId,
       value,
     }),
-  authenticate: (agent: AgentId, methodId: string) =>
-    invoke<Record<string, unknown>>('acp_authenticate', { agent, methodId }),
+  authenticate: (agent: AgentId, methodId: string, profile?: CapabilityProfile) =>
+    invoke<Record<string, unknown>>('acp_authenticate', { agent, methodId, profile }),
 };
 
 export async function acpFinishedPromptStatus(

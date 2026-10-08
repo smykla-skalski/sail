@@ -860,7 +860,7 @@
       return;
     }
     try {
-      const info = await acp.connect(agent);
+      const info = await acp.connect(agent, activeCapabilityProfile);
       if (current !== generation) return;
       authMethods = (info.authMethods as AgentAuthMethod[] | undefined) ?? [];
       if (id) {
@@ -1721,7 +1721,7 @@
     authenticating = true;
     error = '';
     try {
-      await acp.authenticate(agent, methodId);
+      await acp.authenticate(agent, methodId, activeCapabilityProfile);
       authNeeded = false;
       if (activeSessionId) await activate(activeSessionId);
       else if (pickerOpen) await ensureSession('New thread');

@@ -11,6 +11,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::browser_agent::CapabilityProfile;
+
 struct AgentDefinition {
     id: &'static str,
     name: &'static str,
@@ -341,6 +343,7 @@ struct Connection {
     capabilities: Mutex<Value>,
     session_directories: Mutex<HashMap<String, PathBuf>>,
     native_subagents: Mutex<NativeSubagentRegistry>,
+    session_profiles: Mutex<HashMap<String, CapabilityProfile>>,
     pending_directory: Mutex<Option<PathBuf>>,
     session_creation: Mutex<()>,
     ready: Condvar,
@@ -858,14 +861,16 @@ fn stop_process(child: &mut Child) {
     let _ = child.wait();
 }
 
+type ConnectionKey = (String, CapabilityProfile);
+
 #[derive(Clone, Default)]
-pub struct AgentManager(Arc<Mutex<HashMap<String, Arc<Connection>>>>);
+pub struct AgentManager(Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>);
 
 impl AgentManager {
     fn active_sessions_in(&self, directory: &Path) -> Result<Vec<String>, String> {
         let agents = self.0.lock().map_err(|error| error.to_string())?;
         let mut active = Vec::new();
-        for (agent, runtime) in agents.iter() {
+        for ((agent, _profile), runtime) in agents.iter() {
             let directories = runtime
                 .session_directories
                 .lock()
@@ -908,7 +913,7 @@ impl AgentManager {
     ) -> Result<Vec<NativeSubagentSnapshot>, String> {
         let agents = self.0.lock().map_err(|error| error.to_string())?;
         let mut snapshots = Vec::new();
-        for (agent, runtime) in agents.iter() {
+        for ((agent, _profile), runtime) in agents.iter() {
             snapshots.extend(
                 runtime
                     .native_subagents
@@ -925,7 +930,7 @@ impl AgentManager {
 
     pub fn record_interrupted_turns(&self, app: &AppHandle) -> Result<(), String> {
         let agents = self.0.lock().map_err(|error| error.to_string())?;
-        for (agent, runtime) in agents.iter() {
+        for runtime in agents.values() {
             let prompts = runtime
                 .prompt_state
                 .lock()
@@ -938,7 +943,7 @@ impl AgentManager {
             for (session_id, prompt) in &prompts.active {
                 if let Some(directory) = directories.get(session_id) {
                     turns.push(crate::settings::InterruptedAgentTurn {
-                        agent: agent.clone(),
+                        agent: runtime.agent.clone(),
                         session_id: session_id.clone(),
                         directory: directory.to_string_lossy().into_owned(),
                         turn_id: prompt.turn_id.clone(),
@@ -1661,32 +1666,42 @@ pub fn acp_activity(
     manager: State<'_, AgentManager>,
 ) -> Result<HashMap<String, AgentActivity>, String> {
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
-    agents
-        .iter()
-        .map(|(agent, runtime)| {
-            let alive = runtime.alive.load(Ordering::Acquire);
-            let prompts = runtime
-                .prompt_state
-                .lock()
-                .map_err(|error| error.to_string())?;
-            let active = prompts.active.keys().cloned().collect();
-            let active_turns = prompts
+    let mut activity = HashMap::<String, AgentActivity>::new();
+    for runtime in agents.values() {
+        let prompts = runtime
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let directories = runtime
+            .session_directories
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let permission_state = runtime
+            .permission_state
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let item = activity
+            .entry(runtime.agent.clone())
+            .or_insert_with(|| AgentActivity {
+                alive: false,
+                active: Vec::new(),
+                active_turns: HashMap::new(),
+                waiting: Vec::new(),
+                sessions: Vec::new(),
+                finished: HashMap::new(),
+            });
+        item.alive |= runtime.alive.load(Ordering::Acquire);
+        item.active.extend(prompts.active.keys().cloned());
+        item.active_turns.extend(
+            prompts
                 .active
                 .iter()
-                .map(|(session, prompt)| (session.clone(), prompt.turn_id.clone()))
-                .collect();
-            let finished = prompts.finished.clone();
-            let sessions = runtime
-                .session_directories
-                .lock()
-                .map_err(|error| error.to_string())?
-                .keys()
-                .cloned()
-                .collect();
-            let waiting = runtime
-                .permission_state
-                .lock()
-                .map_err(|error| error.to_string())?
+                .map(|(session, prompt)| (session.clone(), prompt.turn_id.clone())),
+        );
+        item.finished.extend(prompts.finished.clone());
+        item.sessions.extend(directories.keys().cloned());
+        item.waiting.extend(
+            permission_state
                 .pending
                 .values()
                 .filter_map(|pending| {
@@ -1695,21 +1710,10 @@ pub fn acp_activity(
                         .pointer("/params/sessionId")
                         .and_then(Value::as_str)
                 })
-                .map(str::to_string)
-                .collect();
-            Ok((
-                agent.clone(),
-                AgentActivity {
-                    alive,
-                    active,
-                    active_turns,
-                    waiting,
-                    sessions,
-                    finished,
-                },
-            ))
-        })
-        .collect()
+                .map(str::to_string),
+        );
+    }
+    Ok(activity)
 }
 
 #[tauri::command]
@@ -1738,7 +1742,7 @@ pub fn acp_pending_inbox(
 ) -> Result<Vec<PendingPermissionInfo>, String> {
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     let mut pending = Vec::new();
-    for (agent, runtime) in agents.iter() {
+    for runtime in agents.values() {
         if !runtime.alive.load(Ordering::Acquire) {
             continue;
         }
@@ -1750,7 +1754,7 @@ pub fn acp_pending_inbox(
             .values()
         {
             pending.push(PendingPermissionInfo {
-                agent: agent.clone(),
+                agent: runtime.agent.clone(),
                 message: permission.message.clone(),
                 received_at: permission.received_at,
             });
@@ -1824,12 +1828,84 @@ fn definition(id: &str) -> Result<&'static AgentDefinition, String> {
         .ok_or_else(|| "Unknown agent.".into())
 }
 
-fn connection(manager: &AgentManager, id: &str) -> Result<Arc<Connection>, String> {
+fn parse_profile(profile: Option<&str>) -> Result<CapabilityProfile, String> {
+    profile
+        .map(|value| {
+            CapabilityProfile::parse(value).ok_or_else(|| {
+                "Unknown capability profile. Expected explore, review, build, or release."
+                    .to_string()
+            })
+        })
+        .transpose()
+        .map(|profile| profile.unwrap_or(CapabilityProfile::Build))
+}
+
+fn client_capabilities(profile: CapabilityProfile) -> Value {
+    json!({
+        "fs":{"readTextFile":false,"writeTextFile":false},
+        "terminal":profile.enables_terminal(),
+        "subagents":{}
+    })
+}
+
+fn authorize_terminal_request_for(
+    profiles: &HashMap<String, CapabilityProfile>,
+    params: &Value,
+) -> Result<(), String> {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or("Terminal request requires a session ID.")?;
+    let profile = profiles
+        .get(session_id)
+        .copied()
+        .ok_or_else(|| "Unknown agent session.".to_string())?;
+    if !profile.enables_terminal() {
+        return Err(format!(
+            "Terminal access is disabled by the {} capability profile.",
+            profile.as_str()
+        ));
+    }
+    Ok(())
+}
+
+fn authorize_terminal_request(runtime: &Connection, params: &Value) -> Result<(), String> {
+    let profiles = runtime
+        .session_profiles
+        .lock()
+        .map_err(|error| error.to_string())?;
+    authorize_terminal_request_for(&profiles, params)
+}
+
+fn connection_for_profile(
+    manager: &AgentManager,
+    id: &str,
+    profile: CapabilityProfile,
+) -> Result<Arc<Connection>, String> {
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     agents
-        .get(id)
+        .get(&(id.to_string(), profile))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".into())
+}
+
+fn connection_for_session(
+    manager: &AgentManager,
+    id: &str,
+    session_id: &str,
+) -> Result<Arc<Connection>, String> {
+    let agents = manager.0.lock().map_err(|error| error.to_string())?;
+    agents
+        .values()
+        .find(|runtime| {
+            runtime.agent == id
+                && runtime
+                    .session_profiles
+                    .lock()
+                    .is_ok_and(|profiles| profiles.contains_key(session_id))
+        })
+        .cloned()
+        .ok_or_else(|| "Agent session is not connected.".into())
 }
 
 #[tauri::command]
@@ -1885,9 +1961,11 @@ pub async fn acp_connect(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     agent: String,
+    profile: Option<String>,
 ) -> Result<Value, String> {
+    let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || connect_blocking(app, &manager, agent))
+    tauri::async_runtime::spawn_blocking(move || connect_blocking(app, &manager, agent, profile))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -1896,10 +1974,12 @@ fn connect_blocking(
     app: AppHandle,
     manager: &AgentManager,
     agent: String,
+    profile: CapabilityProfile,
 ) -> Result<Value, String> {
     let definition = definition(&agent)?;
     let mut agents = manager.0.lock().map_err(|error| error.to_string())?;
-    if let Some(existing) = agents.get(&agent) {
+    let key = (agent.clone(), profile);
+    if let Some(existing) = agents.get(&key) {
         if existing.alive.load(Ordering::Acquire) {
             let existing = Arc::clone(existing);
             drop(agents);
@@ -2026,6 +2106,7 @@ fn connect_blocking(
         capabilities: Mutex::new(Value::Null),
         session_directories: Mutex::new(HashMap::new()),
         native_subagents: Mutex::new(NativeSubagentRegistry::default()),
+        session_profiles: Mutex::new(HashMap::new()),
         pending_directory: Mutex::new(None),
         session_creation: Mutex::new(()),
         ready: Condvar::new(),
@@ -2073,6 +2154,11 @@ fn connect_blocking(
                                     let generation =
                                         fence.generations.entry(directory).or_default();
                                     *generation = generation.saturating_add(1);
+                                }
+                            }
+                            if let Ok(mut profiles) = reader.session_profiles.lock() {
+                                if let Some(profile) = profiles.get(parent_id).copied() {
+                                    profiles.entry(child_id.to_string()).or_insert(profile);
                                 }
                             }
                         }
@@ -2133,6 +2219,13 @@ fn connect_blocking(
                             let method = method.to_string();
                             let params = message.get("params").cloned().unwrap_or(Value::Null);
                             std::thread::spawn(move || {
+                                if let Err(error) = authorize_terminal_request(&runtime, &params) {
+                                    let _ = runtime.write(&json!({
+                                        "jsonrpc":"2.0","id":id,
+                                        "error":{"code":-32000,"message":error}
+                                    }));
+                                    return;
+                                }
                                 let directory = params
                                     .get("sessionId")
                                     .and_then(Value::as_str)
@@ -2260,18 +2353,14 @@ fn connect_blocking(
             },
         );
     });
-    agents.insert(agent, Arc::clone(&runtime));
+    agents.insert(key, Arc::clone(&runtime));
     drop(agents);
     let result = runtime
         .request(
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs":{"readTextFile":false,"writeTextFile":false},
-                    "terminal":true,
-                    "subagents":{}
-                },
+                "clientCapabilities": client_capabilities(profile),
                 "clientInfo":{"name":"sail","title":"Sail","version":"0.1.0"}
             }),
             Duration::from_secs(60),
@@ -2297,7 +2386,7 @@ pub fn acp_pending_permissions(
     agent: String,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
-    let runtime = connection(&manager, &agent)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id)?;
     let permissions = runtime
         .permission_state
         .lock()
@@ -2318,6 +2407,7 @@ pub fn acp_pending_permissions(
 
 #[tauri::command]
 pub async fn acp_new_session(
+    app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
     fence: State<'_, AgentWorktreeFence>,
@@ -2329,11 +2419,14 @@ pub async fn acp_new_session(
     if !PathBuf::from(&cwd).is_dir() {
         return Err("Repository directory does not exist.".into());
     }
-    let runtime = connection(&manager, &agent)?;
+    let profile = parse_profile(profile.as_deref())?;
+    let manager = manager.inner().clone();
     let browser = browser.inner().clone();
     let fence = fence.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let config = browser.config_for_profile(&cwd, None, Some(&agent), profile.as_deref())?;
+        connect_blocking(app, &manager, agent.clone(), profile)?;
+        let runtime = connection_for_profile(&manager, &agent, profile)?;
+        let config = browser.config_for_profile(&cwd, None, Some(&agent), Some(profile.as_str()))?;
         let mcp_server = json!({"name":"sail-browser","command":config.command,"args":config.args,
             "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()});
         let _serial = runtime
@@ -2372,14 +2465,26 @@ pub async fn acp_new_session(
             fence.finish_session(&directory, None)?;
         }
         browser.identify(&config.token, id);
-        if let Err(error) = runtime
-            .session_directories
-            .lock()
-            .map_err(|error| error.to_string())
-            .map(|mut directories| {
-                directories.insert(id.to_string(), PathBuf::from(cwd));
-            })
-        {
+        let persist = (|| -> Result<(), String> {
+            runtime
+                .session_directories
+                .lock()
+                .map_err(|error| error.to_string())?
+                .insert(id.to_string(), directory.clone());
+            runtime
+                .session_profiles
+                .lock()
+                .map_err(|error| error.to_string())?
+                .insert(id.to_string(), profile);
+            Ok(())
+        })();
+        if let Err(error) = persist {
+            if let Ok(mut directories) = runtime.session_directories.lock() {
+                directories.remove(id);
+            }
+            if let Ok(mut profiles) = runtime.session_profiles.lock() {
+                profiles.remove(id);
+            }
             let _ = fence.release_session(&agent, id);
             return Err(error);
         }
@@ -2400,6 +2505,7 @@ pub fn acp_release_session_fence(
 
 #[tauri::command]
 pub async fn acp_load_session(
+    app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
     agent: String,
@@ -2409,18 +2515,22 @@ pub async fn acp_load_session(
 ) -> Result<Value, String> {
     restore_session(
         manager,
+        app,
         browser,
-        agent,
-        cwd,
-        session_id,
-        profile,
-        "session/load",
+        RestoreSessionParams {
+            agent,
+            cwd,
+            session_id,
+            profile,
+            method: "session/load",
+        },
     )
     .await
 }
 
 #[tauri::command]
 pub async fn acp_resume_session(
+    app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
     agent: String,
@@ -2430,33 +2540,51 @@ pub async fn acp_resume_session(
 ) -> Result<Value, String> {
     restore_session(
         manager,
+        app,
         browser,
-        agent,
-        cwd,
-        session_id,
-        profile,
-        "session/resume",
+        RestoreSessionParams {
+            agent,
+            cwd,
+            session_id,
+            profile,
+            method: "session/resume",
+        },
     )
     .await
 }
 
-async fn restore_session(
-    manager: State<'_, AgentManager>,
-    browser: State<'_, crate::browser_agent::BrowserManager>,
+struct RestoreSessionParams {
     agent: String,
     cwd: String,
     session_id: String,
     profile: Option<String>,
     method: &'static str,
+}
+
+async fn restore_session(
+    manager: State<'_, AgentManager>,
+    app: AppHandle,
+    browser: State<'_, crate::browser_agent::BrowserManager>,
+    params: RestoreSessionParams,
 ) -> Result<Value, String> {
-    let runtime = connection(&manager, &agent)?;
+    let RestoreSessionParams {
+        agent,
+        cwd,
+        session_id,
+        profile,
+        method,
+    } = params;
+    let profile = parse_profile(profile.as_deref())?;
+    let manager = manager.inner().clone();
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        connect_blocking(app, &manager, agent.clone(), profile)?;
+        let runtime = connection_for_profile(&manager, &agent, profile)?;
         let config = browser.config_for_profile(
             &cwd,
             Some(&session_id),
             Some(&agent),
-            profile.as_deref(),
+            Some(profile.as_str()),
         )?;
         let mcp_server = json!({"name":"sail-browser","command":config.command,"args":config.args,
             "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()});
@@ -2465,6 +2593,11 @@ async fn restore_session(
             .lock()
             .map_err(|error| error.to_string())?
             .insert(session_id.clone(), PathBuf::from(&cwd));
+        runtime
+            .session_profiles
+            .lock()
+            .map_err(|error| error.to_string())?
+            .insert(session_id.clone(), profile);
         let result = runtime.request(
             method,
             json!({"cwd":cwd,"sessionId":session_id,"mcpServers":[mcp_server]}),
@@ -2473,6 +2606,11 @@ async fn restore_session(
         if result.is_err() {
             runtime
                 .session_directories
+                .lock()
+                .map_err(|error| error.to_string())?
+                .remove(&session_id);
+            runtime
+                .session_profiles
                 .lock()
                 .map_err(|error| error.to_string())?
                 .remove(&session_id);
@@ -2554,7 +2692,7 @@ pub async fn acp_prompt(
         image_paths,
     } = params;
     let content = prepare_prompt_content(&app, &text, image_paths).await?;
-    let runtime = connection(&manager, &agent)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id)?;
     {
         let mut prompts = runtime
             .prompt_state
@@ -2851,7 +2989,7 @@ pub async fn acp_steer(
         text,
         image_paths,
     } = params;
-    let runtime = connection(&manager, &agent)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id)?;
     let supported = runtime
         .capabilities
         .lock()
@@ -2894,7 +3032,7 @@ pub fn acp_cancel(
     session_id: String,
     turn_id: Option<String>,
 ) -> Result<(), String> {
-    let runtime = connection(&manager, &agent)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id)?;
     let cancelled_turn = {
         let mut prompts = runtime
             .prompt_state
@@ -2983,7 +3121,7 @@ pub fn acp_permission(
     let outcome = option_id
         .map(|id| json!({"outcome":"selected","optionId":id}))
         .unwrap_or_else(|| json!({"outcome":"cancelled"}));
-    let runtime = connection(&manager, &agent)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id)?;
     let pending = runtime.respond(
         request_id.clone(),
         &session_id,
@@ -3013,7 +3151,7 @@ pub async fn acp_set_config(
     config_id: String,
     value: String,
 ) -> Result<Value, String> {
-    let runtime = connection(&manager, &agent)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         runtime.request(
             "session/set_config_option",
@@ -3030,8 +3168,10 @@ pub async fn acp_authenticate(
     manager: State<'_, AgentManager>,
     agent: String,
     method_id: String,
+    profile: Option<String>,
 ) -> Result<Value, String> {
-    let runtime = connection(&manager, &agent)?;
+    let profile = parse_profile(profile.as_deref())?;
+    let runtime = connection_for_profile(&manager, &agent, profile)?;
     tauri::async_runtime::spawn_blocking(move || {
         runtime.request(
             "authenticate",
@@ -3175,6 +3315,57 @@ mod native_subagent_fence_tests {
 #[cfg(test)]
 mod capability_profile_tests {
     use super::*;
+
+    #[test]
+    fn client_terminal_capability_matches_profile() {
+        for (profile, expected) in [
+            (CapabilityProfile::Explore, false),
+            (CapabilityProfile::Review, false),
+            (CapabilityProfile::Build, true),
+            (CapabilityProfile::Release, true),
+        ] {
+            assert_eq!(
+                client_capabilities(profile)
+                    .get("terminal")
+                    .and_then(Value::as_bool),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn crafted_terminal_requests_obey_persisted_session_profile() {
+        let profiles = HashMap::from([
+            ("explore-session".into(), CapabilityProfile::Explore),
+            ("review-session".into(), CapabilityProfile::Review),
+            ("build-session".into(), CapabilityProfile::Build),
+            ("release-session".into(), CapabilityProfile::Release),
+        ]);
+
+        for session_id in ["explore-session", "review-session"] {
+            let error = authorize_terminal_request_for(
+                &profiles,
+                &json!({"sessionId":session_id,"command":"/bin/sh","args":["-c","touch escaped"]}),
+            )
+            .unwrap_err();
+            assert!(error.contains("capability profile"));
+        }
+        for session_id in ["build-session", "release-session"] {
+            assert!(authorize_terminal_request_for(
+                &profiles,
+                &json!({"sessionId":session_id,"terminalId":"crafted"}),
+            )
+            .is_ok());
+        }
+        assert_eq!(
+            authorize_terminal_request_for(
+                &profiles,
+                &json!({"sessionId":"unknown","command":"/bin/sh"}),
+            )
+            .unwrap_err(),
+            "Unknown agent session."
+        );
+    }
 
     #[test]
     fn workspace_resource_inspection_rejects_symlinks_that_leave_workspace() {
