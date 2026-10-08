@@ -12,6 +12,38 @@ import type { CiFailureTriage } from './ci-failure-triage.ts';
 export type ShipIssueState =
   'pending' | 'starting' | 'working' | 'awaiting_merge' | 'failed' | 'merged';
 
+export type MergeOwner = 'you' | 'agent';
+
+export const defaultMergeOwner: MergeOwner = 'you';
+
+export function parseMergeOwner(value: string | null | undefined): MergeOwner {
+  return value === 'agent' ? 'agent' : defaultMergeOwner;
+}
+
+const youMergeRule =
+  'Merge owner: you merge no pull request; the user does (Sail\'s "You merge" rule). Repository instructions that state who merges take precedence. Stop at a mergeable pull request, do not post a merge comment or run a merge command, report ship_progress with stage awaiting_merge and status running, and end the turn.';
+
+export function mergeOwnerRule(owner: MergeOwner): string {
+  return owner === 'you' ? youMergeRule : '';
+}
+
+export type ShipWorkerPromptInput = {
+  issueUrl: string;
+  claimId: string;
+  claimTask: string;
+  repository: string;
+  baseBranch: string;
+  baseRevision: string;
+  gateExecution: string;
+  gateReporting: string;
+  mergeOwner: MergeOwner;
+};
+
+export function shipWorkerPrompt(input: ShipWorkerPromptInput): string {
+  const mergeRule = mergeOwnerRule(input.mergeOwner);
+  return `/ship-it ${input.issueUrl}\n\nSail holds visible claim ${input.claimId} for task ${input.claimTask} on behalf of this worker. Sail already created this issue worktree from ${input.repository}:${input.baseBranch} at ${input.baseRevision}. Use that exact repository and base branch for the pull request. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. Before each quality command, read the checkpoint execution boundary; record the result with task_evidence_record and its expectedRevision, expectedMutationGeneration, and expectedBaseRevision, mapping exact acceptance criterion strings and a bounded output reference. Include the economics counters attributable to that activity (role, phase, turns, tools, permissions, compactions, token categories, elapsed time, retries, findings, checks, human interventions, failed commands, approval latency, and repeated work). Classify activity as primary, subagent, validator, guardian, synthetic, or probe. ${input.gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${input.gateReporting}${mergeRule ? ` ${mergeRule}` : ''}`;
+}
+
 export interface ShippingClaim {
   id: string;
   instanceId?: string;
@@ -242,6 +274,9 @@ export interface ShipIssue {
   archivePath?: string | null;
   error: string | null;
   stage?: string;
+  reportedStatus?: 'running' | 'blocked';
+  pullRequestState?: string;
+  pullRequestMergeable?: boolean | null;
   blockedReason?: string | null;
   models?: string[];
   workerModel?: string;
@@ -979,6 +1014,15 @@ export function readyShipIssues(
         ),
     )
     .slice(0, Math.max(0, run.limit - active));
+}
+
+export function shipDependents(run: ShipRun, issue: ShipIssue): ShipIssue[] {
+  const references = new Set([issue.id, String(issue.number), `${run.remote}#${issue.number}`]);
+  return run.issues.filter(
+    (candidate) =>
+      candidate.state === 'pending' &&
+      candidate.dependsOn.some((dependency) => references.has(dependency)),
+  );
 }
 
 export function shipIssueStatus(run: ShipRun, issue: ShipIssue): string {

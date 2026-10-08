@@ -59,6 +59,13 @@ async function start() {
     const { default: TaskOverviewScaleFixture } =
       await import('../test/e2e/task-overview-scale-fixture.svelte');
     mount(TaskOverviewScaleFixture, { target: document.getElementById('root')! });
+  } else if (
+    import.meta.env.MODE === 'e2e' &&
+    new URLSearchParams(location.search).has('opencode-subagents-fixture')
+  ) {
+    const { default: OpenCodeSubagentsFixture } =
+      await import('../test/e2e/opencode-subagents-fixture.svelte');
+    mount(OpenCodeSubagentsFixture, { target: document.getElementById('root')! });
   } else if (new URLSearchParams(location.search).get('window') === 'settings') {
     const { default: SettingsWindow } = await import('./SettingsWindow.svelte');
     mount(SettingsWindow, { target: document.getElementById('root')! });

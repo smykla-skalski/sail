@@ -1,37 +1,27 @@
-# ship-it convergence contract
+# Bounded validation convergence
 
-Use this contract across review, test, CI and merge. It bounds discretionary iteration without weakening any repository requirement.
+Use [convergence-policy.json](convergence-policy.json) directly in Claude Code, Codex, OpenCode and Sail. Do not translate it into harness-specific limits. Start the elapsed budget when the first review worker is dispatched and persist the selected mode, start time, review-cycle count, fix-pass count and full-quality-gate count in the durable checkpoint.
 
-## Default budget
+## Default bounded mode
 
-- Run one Code Adversary pass and one independent Findings challenge for a routine change.
-- Apply at most one fix pass for surviving findings. Run focused tests while implementing and fixing, then run the repository's full quality gate once on the final delivery tip. A later source change makes that result stale and requires one replacement full-gate result for the new delivery tip.
-- Do not start another review or test cycle for a routine source change or a non-blocking finding.
-- Create follow-up issues for later non-blocking findings instead of extending the active delivery loop.
-- Stop the active review, test and CI-fix loop after two review cycles or 90 minutes from the start of review, whichever comes first.
+Routine work gets one review cycle: one Code Adversary pass followed by one independent Findings challenge. Batch every surviving blocking finding into at most one fix pass. During that pass, run focused tests for the changed behavior and each reproduced failure. Run the repository's complete local quality gate once against the final candidate revision before delivery.
 
-A review cycle is one complete attempt to establish the required review and test verdicts for a revision, including fixes caused by that attempt. The initial Code Adversary and Findings challenge belong to the first cycle. A permitted re-review belongs to the second and final cycle.
+A source-changing fix does not by itself start another adversarial review or broad manual-test pass. Re-attest the new revision from the independent findings record, the focused fix verification and the final quality gate. Start a second and final review cycle only when the fix touches security, risks data loss, changes destructive concurrency, or leaves an acceptance criterion unresolved. The second cycle has the same one-Code-pass and one-Findings-challenge shape.
 
-## Re-review exceptions
+When the single fix pass is spent, convert later non-blocking findings into follow-up issues and continue delivery. Never defer a repository-required check, mandatory human approval, unresolved acceptance criterion, security defect, data-loss risk or destructive-concurrency defect. If one of those remains unresolved, or a second review cycle or 90 elapsed minutes would be exceeded, stop with the exact blocking condition and next human action.
 
-Start the second review cycle only when the first cycle or a later required gate leaves one of these unresolved:
+Review, manual testing, CI fixes and hosted-review feedback share these counters. They do not each reset the budget. An ordinary later suggestion becomes a follow-up issue. A reproduced test or CI failure is an unresolved acceptance failure and may enter the second cycle; if it cannot be resolved inside the remaining budget, stop instead of claiming success.
 
-- a security defect;
-- a data-loss risk;
-- destructive concurrency behavior;
-- an acceptance-criterion failure.
+## Copilot and repository controls
 
-If an exception remains unresolved when the cycle or time cap is reached, stop and report the concrete blocker. Never relabel it as non-blocking or defer it merely to finish the pull request.
+Never wait for Copilot. Ignore optional Copilot requests, comments, quota failures and missing reviews. If repository policy explicitly requires Copilot, immediately activate its configured non-Copilot fallback; when no compliant fallback exists, hard-stop with the policy action required instead of polling. Continue waiting for repository-required checks and mandatory non-Copilot human review within their existing hosted-gate deadlines.
 
-## Exhaustive review
+The convergence budget never bypasses repository checks, permissions, commit signatures, branch protection, merge policy or mandatory human review. Those controls remain release gates even after the time or cycle budget is exhausted.
 
-Exhaustive review is opt-in. Use it only when the user explicitly requests exhaustive review for the current change. Record that choice before exceeding the default budget and report the extra cycles in the final result.
+## Exhaustive opt-in
 
-Exhaustive review changes only the discretionary cycle and time limits. It never waives repository-required checks, permissions, commit signatures, required human approvals, acceptance criteria or hard safety stops.
+Use `exhaustive` mode only when the user's current request explicitly asks for exhaustive review. Repository risk level, a complex diff or agent preference does not activate it. Record the exact authorization and user-directed limits in the checkpoint. Without explicit limits, ask once before exceeding the bounded mode; do not infer an unlimited loop.
 
-## Hosted gates and merge
+## Completion signal
 
-- Required CI must pass on the delivered revision. Diagnose and fix required failures within the same budget; at the cap, block with the failed check and required next action.
-- Never request or wait for Copilot review. Process an existing actionable Copilot comment like any other feedback, but its absence or pending state is not a gate.
-- Preserve repository-required human review and other hosted approvals. A required pending approval is a blocker, not permission to extend adversarial review.
-- Once the current revision satisfies acceptance criteria, the full quality gate, required CI and required approvals, proceed to merge. Measure completion by the merged pull request and closed issue, not by the number of review iterations.
+Treat merged pull requests and closed issues as completion metrics. Review iterations are diagnostic only and never a reason to extend an otherwise complete run.

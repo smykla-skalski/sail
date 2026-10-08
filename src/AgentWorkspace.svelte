@@ -119,6 +119,7 @@
   import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
   import { permissionPolicy, type CapabilityProfile } from './lib/capability-profiles';
   import { permissionResolver } from './lib/permission-resolution';
+  import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
   import {
     acpPermissionIdentity,
     enqueueAcpPermission,
@@ -152,6 +153,7 @@
     onreplaychange?: (agent: AgentId, sessionId: string | null, replaying: boolean) => void;
     onterminal: (id: string) => void;
     onentrieschange?: (entries: AgentEntry[], sessionId: string | null, ready: boolean) => void;
+    onnativeplan?: (plan: NativePlan | null) => void;
     ondecision?: (thread: AgentThread, permission: AgentPermission, optionId: string) => void;
     ephemeral?: boolean;
     seedContext?: string;
@@ -199,6 +201,7 @@
     onreplaychange,
     onterminal,
     onentrieschange,
+    onnativeplan,
     ondecision,
     ephemeral = false,
     seedContext = '',
@@ -442,6 +445,8 @@
   }
   let error = $state('');
   let entries = $state.raw<AgentEntry[]>([]);
+  let nativePlan = $state<NativePlan | null>(null);
+  let planRequested = $state(false);
   $effect(() => {
     if (nativeEntries) entries = nativeEntries;
   });
@@ -609,6 +614,12 @@
         option.type === 'select',
     ),
   );
+  const planModeOption = $derived(
+    configOptions.find(
+      (option) =>
+        option.type === 'select' && option.options.some((choice) => choice.value === 'plan'),
+    ),
+  );
 
   $effect(() => {
     if (isBusy) {
@@ -688,6 +699,8 @@
   }
 
   function applyUpdate(update: Record<string, unknown>) {
+    nativePlan = nativePlanUpdate(agent, update, nativePlan);
+    onnativeplan?.(nativePlan);
     if (replaying) {
       updateEntriesInPlace(replayEntries, update);
       return;
@@ -840,6 +853,8 @@
     setReplaying(false);
     replayEntries = [];
     permissions = [];
+    nativePlan = null;
+    onnativeplan?.(null);
     selectedThreadId = id;
     activeSessionId = id;
     entries = id && thread ? loadRecentTranscript(thread) : [];
@@ -1312,6 +1327,12 @@
         onactivity({ ...activityThread, model: modelOption?.currentValue || activityThread.model });
       const id = activityThread?.sessionId ?? activeSessionId;
       deliverySessionId = id;
+      if (planRequested) {
+        if (!id || !planModeOption)
+          throw new Error(`${name} does not expose a planning mode for this session.`);
+        const result = await acp.setConfig(turnAgent, id, planModeOption.id, 'plan');
+        configOptions = result.configOptions ?? configOptions;
+      }
       if (shipIssue && id && !ephemeral) {
         recordShipItOwner(turnDirectory, `acp:${turnAgent}:${id}`);
         directAuthorization = await onshipit?.(
@@ -2077,6 +2098,15 @@
         <HookActivityCard {activity} />
       {/each}
       <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
+      {#if nativePlan}<section class="native-plan" aria-label="Native plan">
+          <h3>Plan</h3>
+          <Markdown source={nativePlan.markdown} />
+          {#if nativePlan.tasks.length}<ul>
+              {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
+                  {task.status}: {task.title}
+                </li>{/each}
+            </ul>{/if}
+        </section>{/if}
       <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
       {#if queued.length}<div class="queued-messages" role="status" aria-label="Queued messages">
           {#each queued as message, index (index)}
@@ -2236,6 +2266,12 @@
           />
         </div>
         <div class="agent-actions">
+          {#if planModeOption}<Button
+              size="sm"
+              variant={planRequested ? 'primary' : 'secondary'}
+              onclick={() => (planRequested = !planRequested)}
+              disabled={!ready || isBusy || !!nativeEntries}>Plan</Button
+            >{/if}
           <Button
             onclick={() => void send()}
             disabled={!ready || !!nativeEntries || (!draft.trim() && !clipboardAttachments.length)}
@@ -2248,6 +2284,12 @@
 </div>
 
 <style>
+  .native-plan {
+    margin: 0.75rem;
+    padding: 0.75rem;
+    border: 1px solid var(--shell-divider);
+    border-radius: 0.5rem;
+  }
   .agent-workspace {
     position: relative;
     display: flex;

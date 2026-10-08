@@ -69,6 +69,65 @@ function state(value: unknown): NativeSubagentOutcome {
   return 'unknown';
 }
 
+export const nativeTranscriptLimit = 500;
+export const nativeMessageLimit = 40_000;
+
+/** The newest text that fits the message limit after an ellipsis, never starting inside a
+ * surrogate pair. */
+function messageTail(text: string): string {
+  const start = text.length + 1 - nativeMessageLimit;
+  const code = text.charCodeAt(start);
+  return `…${text.slice(code >= 0xdc00 && code <= 0xdfff ? start + 1 : start)}`;
+}
+
+/** The oldest text that fits the message limit before an ellipsis, never ending inside a
+ * surrogate pair. */
+function messageHead(text: string): string {
+  const end = nativeMessageLimit - 1;
+  const code = text.charCodeAt(end - 1);
+  return `${text.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end)}…`;
+}
+
+/** Caps a raw tool value. Structured values over the limit become their capped JSON text, so a
+ * tool's input keeps its leading fields and its output keeps the newest text. */
+function boundValue(value: unknown, cut: (text: string) => string): unknown {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  return typeof text === 'string' && text.length > nativeMessageLimit ? cut(text) : value;
+}
+
+function boundEntry(entry: AgentEntry): AgentEntry {
+  if (entry.type !== 'tool')
+    return entry.text.length > nativeMessageLimit && !entry.id.endsWith(':prompt')
+      ? { ...entry, text: messageTail(entry.text) }
+      : entry;
+  const content =
+    entry.content.length > nativeMessageLimit ? messageTail(entry.content) : entry.content;
+  const input = boundValue(entry.input, messageHead);
+  const output = boundValue(entry.output, messageTail);
+  if (content === entry.content && input === entry.input && output === entry.output) return entry;
+  return {
+    ...entry,
+    content,
+    ...(input === undefined ? {} : { input }),
+    ...(output === undefined ? {} : { output }),
+  };
+}
+
+/** Keeps a live child's transcript bounded after an update changed it: the spawn prompt, which
+ * stays whole, plus the newest entries. Streaming chunks only ever grow the last entry and a tool
+ * update only rewrites its own tool, so only those need trimming. */
+export function boundNativeTranscript(entries: AgentEntry[], toolCallId?: string): AgentEntry[] {
+  const index = toolCallId
+    ? entries.findIndex((entry) => entry.type === 'tool' && entry.id === toolCallId)
+    : entries.length - 1;
+  const entry = index >= 0 ? entries[index] : undefined;
+  const bounded = entry && boundEntry(entry);
+  const trimmed = bounded && bounded !== entry ? entries.with(index, bounded) : entries;
+  if (trimmed.length <= nativeTranscriptLimit) return trimmed;
+  const prompt = trimmed[0]?.id.endsWith(':prompt') ? [trimmed[0]] : [];
+  return [...prompt, ...trimmed.slice(prompt.length - nativeTranscriptLimit)];
+}
+
 function toolActivity(update: Record<string, unknown>, previous: string): string {
   if (
     (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
@@ -179,7 +238,23 @@ export function updateNativeSubagents(
   const id = nativeSubagentId(event.agent, parentSessionId);
   const child = store[id];
   if (!child) return store;
-  const transcript = updateEntries(child.transcript, update);
+  const toolCallId = typeof update.toolCallId === 'string' ? update.toolCallId : undefined;
+  // An update for a tool the bound already evicted would come back as a blank stub.
+  const evicted =
+    update.sessionUpdate === 'tool_call_update' &&
+    toolCallId !== undefined &&
+    child.transcript.length >= nativeTranscriptLimit &&
+    !child.transcript.some((entry) => entry.type === 'tool' && entry.id === toolCallId);
+  const next = evicted ? child.transcript : updateEntries(child.transcript, update);
+  const transcript =
+    next === child.transcript
+      ? next
+      : boundNativeTranscript(
+          next,
+          update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update'
+            ? toolCallId
+            : undefined,
+        );
   const settled = ['completed', 'failed', 'interrupted'].includes(child.outcome);
   return {
     ...store,
@@ -322,10 +397,20 @@ function reportsInterruption(transcript: AgentEntry[]): boolean {
   return last?.type === 'assistant' && last.text.trim().toLowerCase() === 'step interrupted';
 }
 
+export function nativeSubagentStatus(child: NativeSubagent): {
+  state: SpawnState;
+  activity: string;
+} {
+  const interrupted = child.outcome === 'completed' && reportsInterruption(child.transcript);
+  return {
+    state: interrupted ? 'interrupted' : spawnState(child.outcome),
+    activity: interrupted ? 'Interrupted' : child.activity,
+  };
+}
+
 export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt[] {
   return Object.values(store).map((child) => {
-    const interrupted = child.outcome === 'completed' && reportsInterruption(child.transcript);
-    const activity = interrupted ? 'Interrupted' : child.activity;
+    const status = nativeSubagentStatus(child);
     return {
       receiptId: `native:${child.agent}:${child.sessionId}`,
       accessKey: '',
@@ -339,14 +424,14 @@ export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt
       worktreeId: null,
       provider: child.agent === 'claude' ? 'claude' : 'codex',
       prompt: child.task,
-      state: interrupted ? 'interrupted' : spawnState(child.outcome),
+      state: status.state,
       created: child.created,
       updated: child.updated,
       result: ['completed', 'failed', 'interrupted', 'unknown'].includes(child.outcome)
-        ? activity
+        ? status.activity
         : null,
       error: child.error ?? null,
-      activity,
+      activity: status.activity,
     };
   });
 }

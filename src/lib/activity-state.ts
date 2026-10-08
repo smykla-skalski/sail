@@ -1,5 +1,7 @@
 export type ActivityState =
   | 'working'
+  | 'fixing'
+  | 'stalled'
   | 'waiting'
   | 'queued'
   | 'completed'
@@ -18,6 +20,8 @@ export type ActivityStateInfo = {
 
 const activityStates: Record<ActivityState, ActivityStateInfo> = {
   working: { state: 'working', label: 'Working', icon: '●' },
+  fixing: { state: 'fixing', label: 'Fixing', icon: '↻' },
+  stalled: { state: 'stalled', label: 'Stalled', icon: '‖' },
   waiting: { state: 'waiting', label: 'Needs input', icon: '!' },
   queued: { state: 'queued', label: 'Queued', icon: '◷' },
   completed: { state: 'completed', label: 'Completed', icon: '✓' },
@@ -34,6 +38,8 @@ const aliases: Record<string, ActivityState> = {
   running: 'working',
   in_progress: 'working',
   stopping: 'working',
+  fixing: 'fixing',
+  stalled: 'stalled',
   waiting: 'waiting',
   needs_input: 'waiting',
   blocked: 'waiting',

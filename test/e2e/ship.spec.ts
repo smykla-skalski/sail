@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ShipRun } from '../../src/lib/issue-shipping';
 
+const validationGates = () =>
+  $("//h4[normalize-space()='Validation gates']/following-sibling::ol[1]");
+
 describe('native Ship run history', () => {
   const root = mkdtempSync(join(tmpdir(), 'sail-ship-view-'));
   const repository = realpathSync(root);
@@ -267,8 +270,8 @@ describe('native Ship run history', () => {
       expect.stringContaining('Audited takeover of expired-claim'),
     );
     await expect($('.ship-issue-detail')).toHaveText(expect.stringContaining('Released'));
-    await expect($('.ship-gates')).toHaveText(expect.stringContaining('codex / model-test'));
-    await expect($('.ship-gates')).toHaveText(expect.stringContaining('FAIL'));
+    await expect(validationGates()).toHaveText(expect.stringContaining('codex / model-test'));
+    await expect(validationGates()).toHaveText(expect.stringContaining('FAIL'));
     await expect($('.ship-policy')).toHaveText(expect.stringContaining('Selected risk high'));
     await expect($('.ship-policy')).toHaveText(expect.stringContaining('src-tauri/**: high'));
     await expect($('.ship-checks summary')).toHaveText('CI: Failed');
@@ -303,7 +306,7 @@ describe('native Ship run history', () => {
     );
     await $('.ship-panel header button').click();
     await expect($('.ship-issue-detail')).toHaveText(expect.stringContaining('Refresh failed:'));
-    await expect($('.ship-gates')).toHaveText(
+    await expect(validationGates()).toHaveText(
       expect.stringContaining('Reproduced fixture failure'),
     );
     await $('[data-ship-issue-id="dependent"]').click();
@@ -325,7 +328,7 @@ describe('native Ship run history', () => {
         new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
       ),
     );
-    await expect($('.ship-gates')).toHaveText(
+    await expect(validationGates()).toHaveText(
       expect.stringContaining('Reproduced fixture failure'),
     );
     await $('[aria-label="Close Ship runs"]').click();

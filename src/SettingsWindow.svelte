@@ -553,6 +553,27 @@
         {/each}
       </section>
       <section class="settings-card">
+        <h2>Ship merging</h2>
+        <p>
+          Repository instructions that say who merges take precedence over this setting. With "You",
+          Ship workers stop at a mergeable pull request. A change applies to workers launched
+          afterwards.
+        </p>
+        <label for="ship-merge-owner">Who merges Ship PRs</label>
+        <select
+          id="ship-merge-owner"
+          value={snapshot?.mergeOwner ?? 'you'}
+          onchange={(event) =>
+            send({
+              type: 'merge-owner',
+              value: event.currentTarget.value === 'agent' ? 'agent' : 'you',
+            })}
+        >
+          <option value="you">You</option>
+          <option value="agent">Agent, per repository release policy</option>
+        </select>
+      </section>
+      <section class="settings-card">
         <h2>Context handoff</h2>
         <p>
           Ask Ship workers to checkpoint ten percentage points before this limit, then offer a

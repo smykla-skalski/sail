@@ -163,6 +163,18 @@ void test('model history survives equivalent references and rejects a second iss
     repository: 'example/repo',
     number: 1,
   });
+  const flagged = await Promise.all(
+    ['--risk high', '--issue --risk LOW', '--risk medium --issue'].map((flags) =>
+      beginShipItRun(directory, `/ship-it ${flags} https://github.com/example/repo/issues/1`),
+    ),
+  );
+  assert.deepEqual(
+    flagged,
+    Array.from({ length: 3 }, () => ({ repository: 'example/repo', number: 1 })),
+  );
+  assert.equal(await beginShipItRun(directory, '/ship-it --risk extreme #2'), null);
+  assert.equal(await beginShipItRun(directory, '/ship-it --risk #2'), null);
+  assert.equal(await beginShipItRun(directory, '/ship-it --riskhigh #2'), null);
   assert.equal(await beginShipItRun(directory, 'What does `/ship-it #2` do?'), null);
   assert.equal(await beginShipItRun(directory, 'Explain this:\n```\n/ship-it #2\n```'), null);
   assert.equal(await beginShipItRun(directory, '/review /ship-it #2', 'review'), null);

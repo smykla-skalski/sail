@@ -2,6 +2,7 @@ import type { AgentAvailability } from './acp';
 import type { SetupReport } from './onboarding';
 import type { ValidationSettings } from './cross-validation';
 import type { ModelRoutingSettings } from './model-routing';
+import type { MergeOwner } from './issue-shipping';
 
 export const settingsRequest = 'sail:settings-request';
 export const settingsState = 'sail:settings-state';
@@ -30,6 +31,7 @@ export type SettingsSnapshot = {
   agentStatusEnabled: boolean;
   agentThreadListEnabled: boolean;
   agentMessagesEnabled: boolean;
+  mergeOwner: MergeOwner;
   contextHandoffThreshold: number;
 };
 
@@ -44,6 +46,7 @@ export type SettingsAction =
   | { type: 'agent-status'; value: boolean }
   | { type: 'agent-thread-list'; value: boolean }
   | { type: 'agent-messages'; value: boolean }
+  | { type: 'merge-owner'; value: MergeOwner }
   | { type: 'context-handoff-threshold'; value: number }
   | { type: 'detect-agents' }
   | { type: 'cross-validation'; value: ValidationSettings }

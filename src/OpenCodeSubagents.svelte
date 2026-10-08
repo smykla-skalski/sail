@@ -1,200 +1,51 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
-  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
-  import type { OpenCodeClient, SessionInfo, SessionMessageInfo } from './lib/opencode';
+  import type { SessionInfo } from './lib/opencode';
   import Markdown from './Markdown.svelte';
   import ToolActivity from './ToolActivity.svelte';
   import ActivityStatus from './ActivityStatus.svelte';
   import { activityState } from './lib/activity-state';
   import { openCodeErrorDetails } from './lib/tool-failure';
-  import { mergeMessages } from './lib/timeline';
-  import { needsChildSummary } from './lib/opencode-subagent-summary';
+  import {
+    emptyOpenCodeChildren,
+    openCodeChildren,
+    type OpenCodeChildClient,
+    type OpenCodeChildView,
+  } from './lib/opencode-children';
 
-  let { client, parentID }: { client: OpenCodeClient | null; parentID: string | null } = $props();
-  let children = $state<SessionInfo[]>([]);
-  let active = $state<string[]>([]);
-  let summaries = $state<Record<string, SessionMessageInfo>>({});
-  let histories = $state<Record<string, SessionMessageInfo[]>>({});
-  let historyCursors = $state<Record<string, string | null>>({});
-  let historyErrors = $state<Record<string, string>>({});
-  let childCursor = $state<string | null>(null);
-  let loadingOlderChildren = $state(false);
-  let loadingOlderHistory = $state<string[]>([]);
-  let loadError = $state('');
+  let { client, parentID }: { client: OpenCodeChildClient | null; parentID: string | null } =
+    $props();
+  let snapshot = $state.raw(emptyOpenCodeChildren());
   let expanded = $state<string[]>([]);
-  let generation = 0;
-  let refreshing = false;
-  const summaryUpdates = new SvelteMap<string, number>();
-
-  async function collectThroughOverlap<T extends { id: string }>(
-    readPage: (cursor?: string) => Promise<{ data: T[]; cursor: { next?: string | null } }>,
-    known: Set<string>,
-    cursor?: string,
-    singlePage = false,
-    received: T[] = [],
-    seen?: Set<string>,
-  ): Promise<{ data: T[]; next: string | null }> {
-    const page = await readPage(cursor);
-    const data = [...received, ...page.data];
-    const next = page.cursor.next ?? null;
-    const visited = seen ?? new SvelteSet<string>();
-    if (
-      singlePage ||
-      !known.size ||
-      !page.data.length ||
-      page.data.some((item) => known.has(item.id)) ||
-      !next ||
-      visited.has(next)
-    )
-      return { data, next };
-    visited.add(next);
-    return collectThroughOverlap(readPage, known, next, false, data, visited);
-  }
-
-  async function loadSummaries(source: OpenCodeClient, sessions: SessionInfo[], current: number) {
-    const stale = sessions.filter((child) => needsChildSummary(child, active, summaryUpdates));
-    if (!stale.length) return;
-    const snapshots = await Promise.all(
-      stale.map(async (child) => {
-        const response = await source.message.list({
-          sessionID: child.id,
-          limit: 1,
-          order: 'desc',
-          type: 'assistant',
-        });
-        return [child.id, child.time.updated, response.data[0]] as const;
-      }),
-    );
-    if (current !== generation) return;
-    const next = { ...summaries };
-    for (const [id, updated, message] of snapshots) {
-      summaryUpdates.set(id, updated);
-      if (message) next[id] = message;
-    }
-    summaries = next;
-  }
-
-  async function loadHistory(id: string, cursor?: string) {
-    if (!client || !parentID || loadingOlderHistory.includes(id)) return;
-    const source = client;
-    const current = generation;
-    loadingOlderHistory = [...loadingOlderHistory, id];
-    try {
-      const known = new Set((histories[id] ?? []).map((message) => message.id));
-      const page = await collectThroughOverlap(
-        (next) =>
-          source.message.list({
-            sessionID: id,
-            limit: 25,
-            order: 'desc',
-            ...(next ? { cursor: next } : {}),
-          }),
-        known,
-        cursor,
-        !!cursor,
-      );
-      if (current !== generation) return;
-      histories = { ...histories, [id]: mergeMessages(histories[id] ?? [], page.data) };
-      if (cursor || !known.size || !(id in historyCursors))
-        historyCursors = { ...historyCursors, [id]: page.next };
-      const nextErrors = { ...historyErrors };
-      delete nextErrors[id];
-      historyErrors = nextErrors;
-    } catch (cause) {
-      if (current === generation) historyErrors = { ...historyErrors, [id]: String(cause) };
-    } finally {
-      if (current === generation)
-        loadingOlderHistory = loadingOlderHistory.filter((item) => item !== id);
-    }
-  }
-
-  async function loadOlderChildren() {
-    if (!client || !parentID || !childCursor || loadingOlderChildren) return;
-    const source = client;
-    const current = generation;
-    const cursor = childCursor;
-    loadingOlderChildren = true;
-    try {
-      const page = await source.session.list({ parentID, limit: 50, order: 'desc', cursor });
-      if (current !== generation) return;
-      const known = new Set(children.map((child) => child.id));
-      children = [...children, ...page.data.filter((child) => !known.has(child.id))];
-      childCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
-      await loadSummaries(source, page.data, current);
-      loadError = '';
-    } catch (cause) {
-      if (current === generation) loadError = String(cause);
-    } finally {
-      if (current === generation) loadingOlderChildren = false;
-    }
-  }
-
-  async function refresh() {
-    if (!client || !parentID || refreshing) return;
-    const source = client;
-    const current = generation;
-    refreshing = true;
-    try {
-      const known = new Set(children.map((child) => child.id));
-      const [sessions, running] = await Promise.all([
-        collectThroughOverlap(
-          (cursor) =>
-            source.session.list({
-              parentID,
-              limit: 50,
-              order: 'desc',
-              ...(cursor ? { cursor } : {}),
-            }),
-          known,
-        ),
-        source.session.active(),
-      ]);
-      if (current !== generation) return;
-      const fresh = new Set(sessions.data.map((child) => child.id));
-      children = [...sessions.data, ...children.filter((child) => !fresh.has(child.id))];
-      if (!known.size) childCursor = sessions.next;
-      active = Object.keys(running);
-      await Promise.all([
-        loadSummaries(source, sessions.data, current),
-        ...expanded.map((id) => loadHistory(id)),
-      ]);
-      loadError = '';
-    } catch (cause) {
-      if (current === generation) loadError = String(cause);
-    } finally {
-      if (current === generation) refreshing = false;
-    }
-  }
+  let view: OpenCodeChildView | null = null;
+  const {
+    children,
+    active,
+    summaries,
+    histories,
+    historyCursors,
+    historyErrors,
+    childCursor,
+    loadingOlderChildren,
+    loadingOlderHistory,
+    loadError,
+  } = $derived(snapshot);
 
   $effect(() => {
-    ++generation;
-    refreshing = false;
     expanded = [];
-    children = [];
-    summaries = {};
-    summaryUpdates.clear();
-    active = [];
-    histories = {};
-    historyCursors = {};
-    historyErrors = {};
-    childCursor = null;
-    loadingOlderChildren = false;
-    loadingOlderHistory = [];
-    loadError = '';
-    if (client && parentID) untrack(() => void refresh());
-  });
-
-  onMount(() => {
-    const timer = setInterval(() => void refresh(), 3000);
+    snapshot = emptyOpenCodeChildren();
+    if (!client || !parentID) return;
+    const current = openCodeChildren.watch(client, parentID, (next) => (snapshot = next));
+    view = current;
     return () => {
-      clearInterval(timer);
-      ++generation;
+      current.close();
+      if (view === current) view = null;
     };
   });
 
   function toggle(id: string) {
     expanded = expanded.includes(id) ? expanded.filter((item) => item !== id) : [...expanded, id];
-    if (expanded.includes(id)) void loadHistory(id);
+    if (expanded.includes(id)) view?.expand(id);
+    else view?.collapse(id);
   }
 
   function activity(child: SessionInfo): string {
@@ -233,12 +84,12 @@
           <div class="subagent-history">
             {#if historyErrors[child.id]}<p class="subagent-error" role="alert">
                 {historyErrors[child.id]}
-                <button onclick={() => void loadHistory(child.id)}>Retry</button>
+                <button onclick={() => void view?.loadHistory(child.id)}>Retry</button>
               </p>{/if}
             {#if historyCursors[child.id]}<button
                 class="load-older"
                 disabled={loadingOlderHistory.includes(child.id)}
-                onclick={() => void loadHistory(child.id, historyCursors[child.id]!)}
+                onclick={() => void view?.loadHistory(child.id, historyCursors[child.id]!)}
                 >{loadingOlderHistory.includes(child.id)
                   ? 'Loading…'
                   : 'Load earlier activity'}</button
@@ -276,7 +127,7 @@
     {#if childCursor}<button
         class="load-older"
         disabled={loadingOlderChildren}
-        onclick={() => void loadOlderChildren()}
+        onclick={() => void view?.loadOlderChildren()}
         >{loadingOlderChildren ? 'Loading…' : 'Load older subagents'}</button
       >{/if}
   </section>
