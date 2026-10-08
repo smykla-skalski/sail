@@ -16,6 +16,7 @@
     childPermissions,
     parentTurnStopHint,
     permissionAlreadyAnswered,
+    permissionResolutionLabel,
     stoppableSubagents,
     subagentStop,
     type SubagentControl,
@@ -246,7 +247,7 @@
           {/each}
           {#each permissions.answered as note (note.key)}
             <p class="spawn-permission-answered" role="status" data-answered-key={note.key}>
-              Answered · {note.title}
+              {permissionResolutionLabel(note.outcome)} · {note.title}
             </p>
           {/each}
           {#if stop === 'stop'}

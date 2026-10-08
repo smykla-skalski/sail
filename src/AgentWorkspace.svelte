@@ -102,6 +102,9 @@
   import {
     parentTurnStopHint,
     permissionAlreadyAnswered,
+    permissionResolution,
+    permissionResolutionLabel,
+    type PermissionResolution,
     type SubagentControl,
   } from './lib/subagent-control';
   import type { BrowserAttachment } from './lib/browser-pick';
@@ -543,12 +546,18 @@
     untrack(() => onentrieschange?.(snapshot, activeSessionId, available));
   });
   let permissions = $state<AgentPermission[]>([]);
-  let answeredNotes = $state<{ identity: string; title: string }[]>([]);
+  let answeredNotes = $state<{ identity: string; title: string; outcome: PermissionResolution }[]>(
+    [],
+  );
 
-  function noteAnswered(permission: AgentPermission) {
+  // Requests this surface dropped after "no longer pending", kept until their resolution event
+  // says how they were settled. The event and the rejection arrive in either order.
+  let settledElsewhere: AgentPermission[] = [];
+
+  function noteAnswered(permission: AgentPermission, outcome: PermissionResolution) {
     const identity = acpPermissionIdentity(permission);
     if (answeredNotes.some((note) => note.identity === identity)) return;
-    answeredNotes = [...answeredNotes, { identity, title: permission.title }];
+    answeredNotes = [...answeredNotes, { identity, title: permission.title, outcome }];
   }
   let elicitations = $state<Elicitation[]>([]);
   let elicitationDrafts = $state<Record<string, Record<string, unknown>>>({});
@@ -1105,6 +1114,7 @@
     replayEntries = [];
     permissions = [];
     answeredNotes = [];
+    settledElsewhere = [];
     selectedThreadId = id;
     activeSessionId = id;
     nativePlan = id ? loadNativePlan({ agent, directory, sessionId: id }) : null;
@@ -1453,7 +1463,7 @@
           return;
         permissionInventoryRevision++;
         const shown = permissions;
-        permissions = removeResolvedAcpPermission(permissions, {
+        const resolvedIdentity = {
           id: params.requestId,
           sessionId: params.sessionId,
           generation:
@@ -1464,8 +1474,14 @@
             typeof params.sailPermissionFingerprint === 'string'
               ? params.sailPermissionFingerprint
               : undefined,
-        });
-        for (const gone of shown) if (!permissions.includes(gone)) noteAnswered(gone);
+        };
+        permissions = removeResolvedAcpPermission(permissions, resolvedIdentity);
+        const outcome = permissionResolution(params);
+        for (const gone of shown) if (!permissions.includes(gone)) noteAnswered(gone, outcome);
+        const waiting = settledElsewhere;
+        settledElsewhere = removeResolvedAcpPermission(waiting, resolvedIdentity);
+        for (const gone of waiting)
+          if (!settledElsewhere.includes(gone)) noteAnswered(gone, outcome);
         if (thread && running && permissions.length === 0) onstatus(thread, 'working');
       } else if (message.method === 'session/update') {
         const update = params.update;
@@ -2149,11 +2165,13 @@
         },
       });
       permissions = permissions.filter((item) => acpPermissionIdentity(item) !== identity);
-      noteAnswered(permission);
+      noteAnswered(permission, 'answered');
     } catch (cause) {
       if (permissionAlreadyAnswered(cause)) {
+        // Settled elsewhere; its resolution event records whether it was answered or cancelled.
+        if (permissions.some((item) => acpPermissionIdentity(item) === identity))
+          settledElsewhere = [...settledElsewhere, permission].slice(-20);
         permissions = permissions.filter((item) => acpPermissionIdentity(item) !== identity);
-        noteAnswered(permission);
         if (thread && lastRequest) onstatus(thread, 'working');
         return;
       }
@@ -2478,7 +2496,7 @@
       {/each}
       {#each answeredNotes as note (note.identity)}
         <p class="agent-permission-answered" role="status" data-answered-id={note.identity}>
-          Answered · {note.title}
+          {permissionResolutionLabel(note.outcome)} · {note.title}
         </p>
       {/each}
       {#if nativeEntries}

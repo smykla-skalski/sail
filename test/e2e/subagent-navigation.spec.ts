@@ -182,6 +182,30 @@ describe('subagent navigation and control', () => {
     await expect($('button[aria-label="Go to parent thread"]')).not.toExist();
   });
 
+  it('shows a request cancelled by Stop as Cancelled, not Answered', async () => {
+    await startChildPermission();
+    await $('button.spawn-open').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    const request = await childRequest();
+    await browser.execute(async (value) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('acp_cancel', {
+        agent: value.agent,
+        sessionId: value.sessionId,
+        turnId: null,
+      });
+    }, request);
+    await expect($('.agent-permission-answered')).toHaveText(expect.stringContaining('Cancelled'));
+    await expect($('.agent-permission-answered')).not.toHaveText(
+      expect.stringContaining('Answered'),
+    );
+    expect(await answerOutsideUi(request, 'allow')).toContain('no longer pending');
+    await $('button[aria-label="Go to parent thread"]').click();
+    await expect($('.spawn-permission-answered')).not.toHaveText(
+      expect.stringContaining('Answered'),
+    );
+  });
+
   it('resolves one request once and shows Answered on both surfaces', async () => {
     await startChildPermission();
     await $('button.spawn-open').click();

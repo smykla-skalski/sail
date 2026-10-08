@@ -739,7 +739,7 @@ impl PermissionState {
 fn resolve_session_permissions(
     permissions: &mut HashMap<String, PendingPermission>,
     session_id: &str,
-    mut resolve: impl FnMut(&Value) -> Result<(), String>,
+    mut resolve: impl FnMut(&Value, &PendingPermission) -> Result<(), String>,
 ) -> Result<(), String> {
     let ids = permissions
         .iter()
@@ -753,14 +753,13 @@ fn resolve_session_permissions(
         })
         .collect::<Vec<_>>();
     for key in ids {
-        let Some(request_id) = permissions
-            .get(&key)
-            .and_then(|pending| pending.message.get("id"))
-            .cloned()
-        else {
+        let Some(pending) = permissions.get(&key) else {
             continue;
         };
-        resolve(&request_id)?;
+        let Some(request_id) = pending.message.get("id") else {
+            continue;
+        };
+        resolve(request_id, pending)?;
         permissions.remove(&key);
     }
     Ok(())
@@ -1546,7 +1545,7 @@ mod interruption_report_tests {
         ]);
 
         let mut ids = Vec::new();
-        resolve_session_permissions(&mut permissions, "target", |id| {
+        resolve_session_permissions(&mut permissions, "target", |id, _| {
             ids.push(id.clone());
             Ok(())
         })
@@ -1581,8 +1580,9 @@ mod interruption_report_tests {
             ),
         ]);
 
-        let result =
-            resolve_session_permissions(&mut permissions, "target", |_| Err("write failed".into()));
+        let result = resolve_session_permissions(&mut permissions, "target", |_, _| {
+            Err("write failed".into())
+        });
 
         assert_eq!(result, Err("write failed".into()));
         assert_eq!(permissions.len(), 2);
@@ -2781,7 +2781,8 @@ fn connect_blocking(
                                     message: json!({"method":"sail/permission_resolved","params":{
                                         "sessionId":session_id,"requestId":request_id,
                                         "sailPermissionGeneration":generation,
-                                        "sailPermissionFingerprint":event_fingerprint
+                                        "sailPermissionFingerprint":event_fingerprint,
+                                        "sailPermissionOutcome":"cancelled"
                                     }}),
                                 },
                             );
@@ -3740,23 +3741,30 @@ pub fn acp_cancel(
         }
         return result;
     }
-    resolve_session_permissions(&mut permission_state.pending, &session_id, |request_id| {
-        runtime.write(&json!({
-            "jsonrpc":"2.0",
-            "id":request_id,
-            "result":{"outcome":{"outcome":"cancelled"}}
-        }))?;
-        let _ = app.emit(
-            "acp-event",
-            AgentEvent {
-                agent: agent.clone(),
-                message: json!({"method":"sail/permission_resolved","params":{
-                    "sessionId":session_id,"requestId":request_id
-                }}),
-            },
-        );
-        Ok(())
-    })
+    resolve_session_permissions(
+        &mut permission_state.pending,
+        &session_id,
+        |request_id, pending| {
+            runtime.write(&json!({
+                "jsonrpc":"2.0",
+                "id":request_id,
+                "result":{"outcome":{"outcome":"cancelled"}}
+            }))?;
+            let _ = app.emit(
+                "acp-event",
+                AgentEvent {
+                    agent: agent.clone(),
+                    message: json!({"method":"sail/permission_resolved","params":{
+                        "sessionId":session_id,"requestId":request_id,
+                        "sailPermissionGeneration":pending.generation,
+                        "sailPermissionFingerprint":pending.fingerprint,
+                        "sailPermissionOutcome":"cancelled"
+                    }}),
+                },
+            );
+            Ok(())
+        },
+    )
 }
 
 #[derive(Deserialize)]
@@ -3784,6 +3792,11 @@ pub fn acp_permission(
         request_generation,
         request_fingerprint,
     } = params;
+    let resolution = if option_id.is_some() {
+        "selected"
+    } else {
+        "cancelled"
+    };
     let outcome = option_id
         .map(|id| json!({"outcome":"selected","optionId":id}))
         .unwrap_or_else(|| json!({"outcome":"cancelled"}));
@@ -3806,7 +3819,8 @@ pub fn acp_permission(
                 "sessionId":session_id,"requestId":request_id,
                 "sailPermissionGeneration":pending.generation,
                 "sailPermissionFingerprint":pending.fingerprint,
-                "sailCapabilityProfile":runtime.profile.as_str()
+                "sailCapabilityProfile":runtime.profile.as_str(),
+                "sailPermissionOutcome":resolution
             }}),
         },
     );

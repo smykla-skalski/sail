@@ -7,7 +7,7 @@
     }
   }
 
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { emitTo, listen } from '@tauri-apps/api/event';
@@ -380,6 +380,7 @@
     detectShortcutPlatform,
     matches as shortcutMatches,
     shortcutFor,
+    terminalOwnsKey,
     shortcutLabel,
     ariaKeyShortcutsFor,
     shortcuts as shortcutRegistry,
@@ -387,7 +388,9 @@
   import { subagentNavigation } from './lib/subagent-nav';
   import {
     parentTurnStopHint,
+    answeredPermissionKey,
     permissionAlreadyAnswered,
+    permissionResolution,
     stoppableSubagents,
     subagentStop,
     type AnsweredPermission,
@@ -1901,16 +1904,35 @@
     goToSubagentTarget(direction < 0 ? subagentNav?.previous : subagentNav?.next);
   }
   let answeredPermissions = $state<AnsweredPermission[]>([]);
+  // Inbox items can go before their resolution event arrives, so their titles are kept here.
+  const permissionTitles = new SvelteMap<string, string>();
+  $effect(() => {
+    const items = inboxItems;
+    untrack(() => {
+      for (const item of items)
+        if (item.kind === 'acp-permission' && item.permissionTitle)
+          permissionTitles.set(item.key, item.permissionTitle);
+    });
+  });
   function recordAnsweredPermission(
     agentId: string,
     sessionId: string,
-    requestId: string | number,
+    params: Record<string, unknown> | undefined,
   ) {
-    const key = `acp:${agentId}:${sessionId}:${requestId}`;
-    if (answeredPermissions.some((item) => item.key === key)) return;
+    const requestId = params?.requestId;
+    if (typeof requestId !== 'string' && typeof requestId !== 'number') return;
+    const inboxKey = `acp:${agentId}:${sessionId}:${requestId}`;
+    const key = answeredPermissionKey(agentId, sessionId, requestId, params);
     const title =
-      inboxItems.find((item) => item.key === key)?.permissionTitle ?? 'Permission request';
-    answeredPermissions = [...answeredPermissions, { key, agentId, sessionId, title }].slice(-50);
+      inboxItems.find((item) => item.key === inboxKey)?.permissionTitle ??
+      permissionTitles.get(inboxKey) ??
+      'Permission request';
+    permissionTitles.delete(inboxKey);
+    if (answeredPermissions.some((item) => item.key === key)) return;
+    answeredPermissions = [
+      ...answeredPermissions,
+      { key, agentId, sessionId, title, outcome: permissionResolution(params) },
+    ].slice(-50);
   }
   const shipOwnedThreads = $derived.by(() => {
     const owned = new SvelteSet<string>();
@@ -11705,10 +11727,8 @@
     try {
       await decideInboxItem(item, optionId);
     } catch (cause) {
-      // Another surface answered first: this one reports "Answered" instead of an error.
+      // Settled elsewhere: its resolution event records whether it was answered or cancelled.
       if (item.kind !== 'acp-permission' || !permissionAlreadyAnswered(cause)) throw cause;
-      if (item.agentId && item.requestId != null)
-        recordAnsweredPermission(item.agentId, item.sessionId, item.requestId);
       await refreshInbox();
     }
   }
@@ -13220,11 +13240,8 @@
       )
     )
       void saveShipRuns().catch((cause) => (error = describe(cause)));
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
-      const resolvedId = event.message.params?.requestId;
-      if (typeof resolvedId === 'string' || typeof resolvedId === 'number')
-        recordAnsweredPermission(event.agent, eventSessionId, resolvedId);
-    }
+    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
+      recordAnsweredPermission(event.agent, eventSessionId, event.message.params);
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       nativeSubagents = setNativeSubagentWaiting(
         nativeSubagents,
@@ -14890,7 +14907,11 @@
       ['subagent.previous', () => goToSubagentSibling(-1)],
       ['subagent.next', () => goToSubagentSibling(1)],
     ] as const) {
-      if (shortcutMatches(event, id) && subagentNav) {
+      if (
+        shortcutMatches(event, id) &&
+        subagentNav &&
+        !terminalOwnsKey(event, event.target as Element | null)
+      ) {
         event.preventDefault();
         if (!event.repeat && !document.querySelector('dialog[open]')) go();
         return;
