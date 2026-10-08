@@ -153,7 +153,7 @@ pub fn diagnostic_event(details: UiDiagnostic) {
     ) || details
         .agent
         .as_deref()
-        .is_some_and(|agent| !matches!(agent, "claude" | "codex"))
+        .is_some_and(|agent| !matches!(agent, "claude" | "codex" | "opencode"))
     {
         return;
     }

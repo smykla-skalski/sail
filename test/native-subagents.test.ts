@@ -833,3 +833,48 @@ await test('a child accepts prompts only when its adapter advertises the capabil
   assert.equal(nativeSubagentAcceptsPrompts(spawnWithCapabilities({ prompt: {} })), true);
   assert.equal(nativeSubagentAcceptsPrompts(undefined), false);
 });
+
+function opencode(sessionId: string, update: Record<string, unknown>): AgentEvent {
+  return {
+    agent: 'opencode',
+    message: { method: 'session/update', params: { sessionId, update } },
+  };
+}
+
+await test('OpenCode children keep their own provider on receipts', () => {
+  let store = updateNativeSubagents(
+    {},
+    opencode('root', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'Explore code',
+      task: 'Explore code',
+    }),
+    '/worktree',
+    1,
+  );
+  store = updateNativeSubagents(
+    store,
+    opencode('child', {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'done' },
+    }),
+    '/worktree',
+    2,
+  );
+  store = updateNativeSubagents(
+    store,
+    opencode('root', {
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: 'child',
+      state: 'completed',
+    }),
+    '/worktree',
+    3,
+  );
+  const [receipt] = nativeSubagentReceipts(store);
+  assert.equal(receipt.provider, 'opencode');
+  assert.equal(receipt.targetId, 'acp:opencode:child');
+  assert.equal(receipt.state, 'completed');
+  assert.equal(receipt.result, 'done');
+});

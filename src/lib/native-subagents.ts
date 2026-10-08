@@ -453,7 +453,7 @@ export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt
       turnId: null,
       targetDirectory: child.directory,
       worktreeId: null,
-      provider: child.agent === 'claude' ? 'claude' : 'codex',
+      provider: child.agent === 'claude' || child.agent === 'opencode' ? child.agent : 'codex',
       prompt: child.task,
       state: status.state,
       created: child.created,

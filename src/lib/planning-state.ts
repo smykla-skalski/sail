@@ -55,7 +55,7 @@ function validPlan(plan: unknown): plan is NativePlan {
   const value = record(plan);
   return (
     !!value &&
-    (value.provider === 'claude' || value.provider === 'codex') &&
+    (value.provider === 'claude' || value.provider === 'codex' || value.provider === 'opencode') &&
     typeof value.markdown === 'string' &&
     typeof value.updated === 'number' &&
     Array.isArray(value.tasks)

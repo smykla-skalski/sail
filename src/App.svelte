@@ -3217,6 +3217,7 @@
   function contextProvider(threadId: string): ContextProvider {
     if (threadId.startsWith('opencode:')) return 'opencode';
     if (threadId.startsWith('acp:claude:')) return 'claude';
+    if (threadId.startsWith('acp:opencode:')) return 'opencode';
     return 'codex';
   }
 
@@ -4040,11 +4041,7 @@
     requireClaim = false,
   ): Promise<DirectShipAuthorization | undefined> {
     await assertShipItIssueRepository(path, issue);
-    const provider: ShipRun['provider'] = threadId.startsWith('opencode:')
-      ? 'opencode'
-      : threadId.startsWith('acp:claude:')
-        ? 'claude'
-        : 'codex';
+    const provider: ShipRun['provider'] = contextProvider(threadId);
     const [, agent, sessionId] = /^acp:([^:]+):(.+)$/.exec(threadId) ?? [];
     const workerModel =
       knownWorkerModel ??
@@ -8696,7 +8693,7 @@
                   routing: {
                     ...receipt.routing,
                     actual: {
-                      provider: source.agent as 'claude' | 'codex',
+                      provider: source.agent as 'claude' | 'codex' | 'opencode',
                       model: source.model ?? reportedModel ?? null,
                       variant: source.variant ?? reportedVariant ?? null,
                     },

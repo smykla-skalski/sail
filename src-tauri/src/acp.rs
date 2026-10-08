@@ -2076,13 +2076,69 @@ fn parse_profile(profile: Option<&str>) -> Result<CapabilityProfile, String> {
         .map(|profile| profile.unwrap_or(CapabilityProfile::Build))
 }
 
-fn client_capabilities(profile: CapabilityProfile) -> Value {
-    json!({
+fn client_capabilities(agent: &str, profile: CapabilityProfile) -> Value {
+    let mut capabilities = json!({
         "fs":{"readTextFile":false,"writeTextFile":false},
         "terminal":profile.enables_terminal(),
         "subagents":{},
         "plan":{},
         "elicitation":{"form":{}}
+    });
+    if agent == "opencode" {
+        capabilities["_meta"] = json!({OPENCODE_CHILD_UPDATES: true});
+    }
+    capabilities
+}
+
+const OPENCODE_CHILD_UPDATES: &str = "opencode/child-session-updates";
+const OPENCODE_CHILD_UPDATE_METHOD: &str = "opencode/session/child_update";
+
+/// Rewrites OpenCode's child-session extension notification into the `session/update`
+/// shapes Claude and Codex already use, so the registry and frontend need no OpenCode branch.
+fn opencode_child_update(message: &Value) -> Option<Option<Value>> {
+    let method = message.get("method")?.as_str()?;
+    if method.trim_start_matches('_') != OPENCODE_CHILD_UPDATE_METHOD {
+        return None;
+    }
+    let params = message.get("params")?;
+    let child = params.get("childSessionId").and_then(Value::as_str);
+    let parent = params.get("parentSessionId").and_then(Value::as_str);
+    let (Some(child), Some(parent)) = (child, parent) else {
+        return Some(None);
+    };
+    let title = params
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty());
+    let wrap = |session_id: &str, update: Value| {
+        Some(json!({"method":"session/update","params":{"sessionId":session_id,"update":update}}))
+    };
+    Some(match params.get("type").and_then(Value::as_str) {
+        Some("update") => params
+            .get("update")
+            .filter(|update| update.is_object())
+            .and_then(|update| wrap(child, update.clone())),
+        Some("status") => match params.get("status").and_then(Value::as_str) {
+            Some("created") => wrap(
+                parent,
+                json!({
+                    "sessionUpdate":"subagent_spawned",
+                    "subagentSessionId":child,
+                    "name":title.unwrap_or("Subagent"),
+                    "task":title.unwrap_or("Delegated task")
+                }),
+            ),
+            Some(status @ ("completed" | "failed" | "interrupted")) => wrap(
+                parent,
+                json!({
+                    "sessionUpdate":"subagent_state_update",
+                    "subagentSessionId":child,
+                    "state":if status == "interrupted" { "cancelled" } else { status }
+                }),
+            ),
+            _ => None,
+        },
+        _ => None,
     })
 }
 
@@ -2504,6 +2560,12 @@ fn connect_blocking(
                 );
                 continue;
             };
+            if let Some(translated) = opencode_child_update(&message) {
+                let Some(translated) = translated else {
+                    continue;
+                };
+                message = translated;
+            }
             if message.get("method").is_some() {
                 if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
                     params.insert("sailCapabilityProfile".into(), profile.as_str().into());
@@ -2797,7 +2859,7 @@ fn connect_blocking(
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": client_capabilities(profile),
+                "clientCapabilities": client_capabilities(&runtime.agent, profile),
                 "clientInfo":{"name":"sail","title":"Sail","version":"0.1.0"}
             }),
             Duration::from_secs(60),
@@ -4168,7 +4230,7 @@ mod capability_profile_tests {
             (CapabilityProfile::Release, true),
         ] {
             assert_eq!(
-                client_capabilities(profile)
+                client_capabilities("codex", profile)
                     .get("terminal")
                     .and_then(Value::as_bool),
                 Some(expected)
@@ -4177,9 +4239,93 @@ mod capability_profile_tests {
     }
 
     #[test]
+    fn only_opencode_opts_into_child_session_updates() {
+        let meta = |agent| {
+            client_capabilities(agent, CapabilityProfile::Build)
+                .get("_meta")
+                .cloned()
+        };
+        assert_eq!(
+            meta("opencode"),
+            Some(json!({"opencode/child-session-updates":true}))
+        );
+        assert_eq!(meta("codex"), None);
+        assert_eq!(meta("claude"), None);
+    }
+
+    #[test]
+    fn opencode_child_updates_become_standard_subagent_updates() {
+        let notify = |params: Value| json!({"jsonrpc":"2.0","method":"opencode/session/child_update","params":params});
+        let base = json!({"rootSessionId":"ses_root","childSessionId":"ses_child","parentSessionId":"ses_root","depth":1,"title":"Explore code"});
+        let with = |extra: Value| {
+            let mut params = base.clone();
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            notify(params)
+        };
+
+        let spawned = opencode_child_update(&with(json!({"type":"status","status":"created"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            spawned.pointer("/params/sessionId"),
+            Some(&json!("ses_root"))
+        );
+        assert_eq!(
+            spawned.pointer("/params/update"),
+            Some(
+                &json!({"sessionUpdate":"subagent_spawned","subagentSessionId":"ses_child","name":"Explore code","task":"Explore code"})
+            )
+        );
+
+        for (status, state) in [
+            ("completed", "completed"),
+            ("failed", "failed"),
+            ("interrupted", "cancelled"),
+        ] {
+            let done = opencode_child_update(&with(json!({"type":"status","status":status})))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                done.pointer("/params/update/sessionUpdate"),
+                Some(&json!("subagent_state_update"))
+            );
+            assert_eq!(done.pointer("/params/update/state"), Some(&json!(state)));
+        }
+        assert_eq!(
+            opencode_child_update(&with(json!({"type":"status","status":"running"}))),
+            Some(None)
+        );
+
+        let inner =
+            json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}});
+        let update = opencode_child_update(&with(json!({"type":"update","update":inner})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            update.pointer("/params/sessionId"),
+            Some(&json!("ses_child"))
+        );
+        assert_eq!(update.pointer("/params/update"), Some(&inner));
+
+        assert_eq!(
+            opencode_child_update(&json!({"method":"session/update","params":{}})),
+            None
+        );
+        assert_eq!(
+            opencode_child_update(
+                &json!({"method":"opencode/session/child_update","params":{"type":"status"}})
+            ),
+            Some(None)
+        );
+    }
+
+    #[test]
     fn client_advertises_plan_capability() {
         assert_eq!(
-            client_capabilities(CapabilityProfile::Build).get("plan"),
+            client_capabilities("codex", CapabilityProfile::Build).get("plan"),
             Some(&json!({}))
         );
     }
