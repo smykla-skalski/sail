@@ -130,6 +130,25 @@ await test('spawn receipts stay scoped to the launching source and project', () 
   );
 });
 
+await test('spawn receipts persist requested and actual route identity', () => {
+  const routed: SpawnReceipt = {
+    ...receipt,
+    routing: {
+      role: 'implementation',
+      risk: 'high',
+      independentReviewRequired: true,
+      requested: { provider: 'codex', model: 'gpt-6.1-sol', variant: 'xhigh' },
+      actual: { provider: 'codex', model: 'gpt-6.1-sol', variant: 'xhigh' },
+    },
+  };
+  assert.deepEqual(loadSpawnReceipts(JSON.stringify([routed]))[0].routing, routed.routing);
+  const invalid = {
+    ...routed,
+    routing: { ...routed.routing!, requested: { ...routed.routing!.requested, model: null } },
+  };
+  assert.equal(loadSpawnReceipts(JSON.stringify([invalid]))[0].routing, undefined);
+});
+
 await test('receipts survive restart with bounded results and honest states', () => {
   const saved = saveBoundedReceipt([], {
     ...receipt,

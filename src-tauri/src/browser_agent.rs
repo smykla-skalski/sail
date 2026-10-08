@@ -1271,8 +1271,8 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "agent_spawn",
-        "Start Claude, Codex, or OpenCode with a prompt in a new worktree by default. An explicit existing target shares its files. Agent spawns start without interactive approval. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
-        "provider,prompt",
+        "Start an agent using an explicit role and task-risk model route, or a legacy provider selection. A new worktree is used by default; an explicit existing target shares its files. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
+        "role,risk,prompt",
     ),
     (
         "validation_policy",
@@ -1544,6 +1544,8 @@ pub fn run_mcp_stdio() {
                         "type":"object",
                         "properties":{
                             "provider":{"type":"string","enum":["claude","codex","opencode"]},
+                            "role":{"type":"string","enum":["exploration","implementation","debugging","review","ci-triage"]},
+                            "risk":{"type":"string","enum":["low","medium","high"]},
                             "prompt":{"type":"string"},
                             "receiptId":{"type":"string","format":"uuid"},
                             "accessKey":{"type":"string","format":"uuid"},
@@ -1552,7 +1554,8 @@ pub fn run_mcp_stdio() {
                                 {"type":"object","properties":{"kind":{"const":"existing"},"path":{"type":"string"}},"required":["kind","path"]}
                             ]}
                         },
-                        "required":["provider","prompt"]
+                        "required":["prompt"],
+                        "anyOf":[{"required":["role","risk"]},{"required":["provider"]}]
                     }});
                 }
                 if *name == "validation_gate" {

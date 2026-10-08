@@ -190,6 +190,12 @@
     type ShipValidationConfig,
   } from './lib/ship-risk-policy.ts';
   import {
+    modelRoutingSettingsKey,
+    parseModelRoutingSettings,
+    selectModelRoute,
+    type ModelRouteRole,
+  } from './lib/model-routing.ts';
+  import {
     syntheticCiEconomics,
     taskEconomicsSchema,
     type TaskEconomics,
@@ -661,7 +667,7 @@
     agent: string;
   };
   type CoordinationSource =
-    | { kind: 'acp'; agent: string; model?: string; title: string }
+    | { kind: 'acp'; agent: string; model?: string; variant?: string; title: string }
     | { kind: 'opencode'; agent: string; model?: ModelRef; title: string };
   let browserApprovalQueue: Promise<unknown> = Promise.resolve();
   let agentSpawnQueue: Promise<unknown> = Promise.resolve();
@@ -945,6 +951,7 @@
   let attentionRevision = 0;
   let notificationsEnabled = $state(getSetting('sai-notifications-enabled') !== 'false');
   let crossValidation = $state(parseValidationSettings(getSetting(validationSettingsKey)));
+  let modelRouting = $state(parseModelRoutingSettings(getSetting(modelRoutingSettingsKey)));
   let contextHandoffThreshold = $state(
     parseContextHandoffThreshold(getSetting('sai-context-handoff-threshold')),
   );
@@ -1991,6 +1998,7 @@
       agents: agentAvailability,
       agentsError: agentDetectionError,
       crossValidation,
+      modelRouting,
       notificationsEnabled,
       notificationSound,
       personalPostTurnChecks,
@@ -2201,6 +2209,9 @@
         else if (action.type === 'cross-validation') {
           crossValidation = action.value;
           setSetting(validationSettingsKey, JSON.stringify(action.value));
+        } else if (action.type === 'model-routing') {
+          modelRouting = action.value;
+          setSetting(modelRoutingSettingsKey, JSON.stringify(action.value));
         } else if (action.type === 'restart-setup') void restartSetup();
         void sendSettingsState();
       }).then((unlisten) => (stopSettingsAction = unlisten));
@@ -7380,6 +7391,31 @@
     ];
     if (implementationAttributionUncertain(request.directory))
       throw new Error('Concurrent agent turns prevent reliable implementation model attribution.');
+    const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
+    const routeRisk = gateOwner?.issue.validationPolicy?.risk ?? 'medium';
+    const configuredReviewRoute = modelRouting.routes.find(
+      (candidate) => candidate.role === 'review' && candidate.risk === routeRisk,
+    );
+    const reviewSelection = configuredReviewRoute
+      ? selectModelRoute(modelRouting, {
+          role: 'review',
+          risk: routeRisk,
+          implementingModels: usedModels,
+        })
+      : null;
+    if (reviewSelection && !reviewSelection.route)
+      throw new Error(reviewSelection.reason ?? 'No eligible review route.');
+    const validationSettings = reviewSelection?.route
+      ? {
+          choices: [
+            {
+              agent: reviewSelection.route.provider,
+              model: reviewSelection.route.model,
+            },
+          ],
+          strictDifferentModel: reviewSelection.independentReviewRequired,
+        }
+      : crossValidation;
     const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
       repository: project,
       paths: [request.directory],
@@ -7392,22 +7428,22 @@
       client && runtimeState === 'connected'
         ? (await inspectRepository(client, request.directory)).models
         : [];
-    const available = crossValidation.choices.filter((choice) =>
+    const available = validationSettings.choices.filter((choice) =>
       choice.agent === 'opencode'
         ? models.some((model) => `${model.providerID}:${model.id}` === choice.model)
         : agents.some((agent) => agent.id === choice.agent && agent.available),
     );
     async function tryChoice(candidates: ValidationChoice[], reasons: string[]): Promise<unknown> {
       const currentCandidates = candidates.filter((candidate) =>
-        crossValidation.choices.some(
+        validationSettings.choices.some(
           (selected) => selected.agent === candidate.agent && selected.model === candidate.model,
         ),
       );
       if (!currentCandidates.length) {
-        const unavailable = selectValidationChoice(crossValidation, [], usedModels);
+        const unavailable = selectValidationChoice(validationSettings, [], usedModels);
         throw new Error([unavailable.reason, ...reasons].filter(Boolean).join(' '));
       }
-      const route = selectValidationChoice(crossValidation, currentCandidates, usedModels);
+      const route = selectValidationChoice(validationSettings, currentCandidates, usedModels);
       if (!route.choice) throw new Error(route.reason ?? 'No eligible validation model.');
       const choice: ValidationChoice = route.choice;
       const gateSource: CoordinationSource =
@@ -7418,13 +7454,19 @@
               model: {
                 providerID: choice.model.slice(0, choice.model.indexOf(':')),
                 id: choice.model.slice(choice.model.indexOf(':') + 1),
+                variant: reviewSelection?.route?.variant,
               },
               title: String(gate),
             }
-          : { kind: 'acp', agent: choice.agent, model: choice.model, title: String(gate) };
+          : {
+              kind: 'acp',
+              agent: choice.agent,
+              model: choice.model,
+              variant: reviewSelection?.route?.variant,
+              title: String(gate),
+            };
       const receiptId = crypto.randomUUID();
       const accessKey = crypto.randomUUID();
-      const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
       const shippingTarget = gateOwner
         ? await shippingTargetFor(gateOwner.run, gateOwner.issue, request.directory)
         : undefined;
@@ -7447,7 +7489,7 @@
       );
       const ensureSelected = async () => {
         const selectedCandidates = currentCandidates.filter((candidate) =>
-          crossValidation.choices.some(
+          validationSettings.choices.some(
             (selected) => selected.agent === candidate.agent && selected.model === candidate.model,
           ),
         );
@@ -7460,7 +7502,7 @@
           ...new Set([...implementationModels(request.directory), ...active, ...usedModels]),
         ];
         const current = selectValidationChoice(
-          crossValidation,
+          validationSettings,
           selectedCandidates,
           latestModels,
         ).choice;
@@ -7487,6 +7529,21 @@
           evidenceSequence,
           protocolVersion: 2,
         },
+        ...(reviewSelection?.route
+          ? {
+              routing: {
+                role: 'review' as const,
+                risk: routeRisk,
+                independentReviewRequired: reviewSelection.independentReviewRequired,
+                requested: {
+                  provider: reviewSelection.route.provider,
+                  model: reviewSelection.route.model,
+                  variant: reviewSelection.route.variant ?? null,
+                },
+                actual: null,
+              },
+            }
+          : {}),
         state: 'starting',
         created: Date.now(),
         updated: Date.now(),
@@ -7589,6 +7646,8 @@
   ) {
     if (!agentWorktreesEnabled) throw new Error('Agent worktree access is disabled in settings.');
     const provider = request.arguments.provider;
+    const role = request.arguments.role;
+    const risk = request.arguments.risk;
     const prompt = request.arguments.prompt;
     const target = request.arguments.target;
     const suppliedReceiptId = request.arguments.receiptId;
@@ -7604,8 +7663,20 @@
       throw new Error('Provide both receiptId and accessKey as UUIDs.');
     const receiptId = (suppliedReceiptId as string | undefined) ?? request.id;
     const receiptAccessKey = (suppliedAccessKey as string | undefined) ?? crypto.randomUUID();
-    if (typeof provider !== 'string' || !['claude', 'codex', 'opencode'].includes(provider))
-      throw new Error('Choose Claude, Codex, or OpenCode as the provider.');
+    const routed = role !== undefined || risk !== undefined;
+    if (
+      routed &&
+      (typeof role !== 'string' ||
+        !['exploration', 'implementation', 'debugging', 'review', 'ci-triage'].includes(role) ||
+        typeof risk !== 'string' ||
+        !shipRiskLevels.includes(risk as ShipRisk))
+    )
+      throw new Error('Choose both a routing role and low, medium, or high task risk.');
+    if (
+      !routed &&
+      (typeof provider !== 'string' || !['claude', 'codex', 'opencode'].includes(provider))
+    )
+      throw new Error('Choose a routing role and task risk, or a legacy provider.');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Starting prompt must be 1–8000 characters.');
     if (target !== undefined && (typeof target !== 'object' || target === null))
@@ -7627,8 +7698,24 @@
     if (existing && typeof path !== 'string')
       throw new Error('Existing worktree path is required.');
 
+    const routeSelection = routed
+      ? selectModelRoute(modelRouting, {
+          role: role as ModelRouteRole,
+          risk: risk as ShipRisk,
+          implementingModels:
+            role === 'review' ? implementationModels(request.directory) : undefined,
+        })
+      : null;
+    if (routeSelection && !routeSelection.route)
+      throw new Error(routeSelection.reason ?? 'No eligible model route.');
+    const route = routeSelection?.route;
+    const selectedProvider = route?.provider ?? provider;
     const chosenProvider: SpawnReceipt['provider'] =
-      provider === 'claude' ? 'claude' : provider === 'codex' ? 'codex' : 'opencode';
+      selectedProvider === 'claude'
+        ? 'claude'
+        : selectedProvider === 'codex'
+          ? 'codex'
+          : 'opencode';
     if (chosenProvider === 'opencode') {
       if (!client || runtimeState !== 'connected') throw new Error('OpenCode is unavailable.');
     } else {
@@ -7686,6 +7773,21 @@
       updated: Date.now(),
       result: null,
       error: null,
+      ...(route && routeSelection
+        ? {
+            routing: {
+              role: route.role,
+              risk: route.risk,
+              independentReviewRequired: routeSelection.independentReviewRequired,
+              requested: {
+                provider: route.provider,
+                model: route.model,
+                variant: route.variant ?? null,
+              },
+              actual: null,
+            },
+          }
+        : {}),
     });
     activeSpawnRequests.add(receiptId);
 
@@ -7795,8 +7897,29 @@
       await coordinationSource(request);
       const selectedSource: CoordinationSource =
         chosenProvider === 'opencode'
-          ? { kind: 'opencode', agent: 'OpenCode', title: source.title }
-          : { kind: 'acp', agent: chosenProvider, title: source.title };
+          ? {
+              kind: 'opencode',
+              agent: 'OpenCode',
+              title: source.title,
+              ...(route
+                ? {
+                    model: {
+                      providerID: route.model.slice(0, route.model.indexOf(':')),
+                      id: route.model.slice(route.model.indexOf(':') + 1),
+                      variant: route.variant,
+                    },
+                  }
+                : {}),
+            }
+          : {
+              kind: 'acp',
+              agent: chosenProvider,
+              title: source.title,
+              model: route?.model,
+              variant: route?.variant,
+            };
+      if (route?.provider === 'opencode' && !route.model.includes(':'))
+        throw new Error('OpenCode routes require an exact provider:model ID.');
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out before the agent could start.');
       const requireResponseTime = async () => {
@@ -7819,6 +7942,9 @@
         accessKey: receiptAccessKey,
         sourceId,
         targetId: started.threadId,
+        ...(routeSelection
+          ? { independentReviewRequired: routeSelection.independentReviewRequired }
+          : {}),
         status: 'started',
       };
     })();
@@ -7845,10 +7971,17 @@
     }
     if (!validation)
       await beginShipItRun(created.path, prompt, promptSkill(skills, prompt)?.name ?? null);
+    const routingRole = receiptId
+      ? spawnReceipts.find((item) => item.receiptId === receiptId)?.routing?.role
+      : undefined;
+    const routedProfile: CapabilityProfile =
+      routingRole === 'exploration' ? 'explore' : routingRole === 'review' ? 'review' : 'build';
     if (source.kind === 'acp') {
       const capabilityProfile: CapabilityProfile = validation
         ? 'review'
-        : capabilityProfileForDirectory(created.path);
+        : routingRole
+          ? routedProfile
+          : capabilityProfileForDirectory(created.path);
       const session = await acp
         .create(source.agent, created.path, capabilityProfile, nativeGeneration)
         .catch((cause) => {
@@ -7856,11 +7989,12 @@
           throw new ValidationCandidateUnavailable(`${source.agent} is unavailable`, cause);
         });
       try {
-        const reportedModel = session.configOptions?.find(
+        let configOptions = session.configOptions ?? [];
+        const reportedModel = configOptions.find(
           (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
         )?.currentValue;
         if (source.model) {
-          const modelOption = session.configOptions?.find(
+          const modelOption = configOptions.find(
             (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
           );
           if (!modelOption?.options.some((option) => option.value === source.model)) {
@@ -7881,6 +8015,30 @@
             const message = `Cannot verify ${source.agent} selected model ${source.model}.`;
             throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
           }
+          configOptions = changed.configOptions ?? configOptions;
+        }
+        const reportedVariant = configOptions.find(
+          (option) =>
+            option.type === 'select' &&
+            /(variant|effort|reasoning)/i.test(`${option.id} ${option.name}`),
+        )?.currentValue;
+        if (source.variant) {
+          const variantOption = configOptions.find(
+            (option) =>
+              option.type === 'select' &&
+              /(variant|effort|reasoning)/i.test(`${option.id} ${option.name}`),
+          );
+          if (!variantOption?.options.some((option) => option.value === source.variant))
+            throw new Error(`Variant ${source.variant} is unavailable in ${source.agent}.`);
+          const changed = await acp.setConfig(
+            source.agent,
+            session.sessionId,
+            variantOption.id,
+            source.variant,
+          );
+          const actual = changed.configOptions?.find((option) => option.id === variantOption.id);
+          if (actual?.currentValue !== source.variant)
+            throw new Error(`Cannot verify ${source.agent} selected variant ${source.variant}.`);
         }
         const thread: AgentThread = {
           agent: source.agent,
@@ -7892,13 +8050,27 @@
           capabilityProfile,
         };
         saveAgentThread(thread);
-        if (receiptId)
+        if (receiptId) {
+          const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
           updateSpawnReceipt(receiptId, {
             targetId: `acp:${source.agent}:${session.sessionId}`,
             model: source.model ?? reportedModel,
             targetDirectory: created.path,
             worktreeId: created.path,
+            ...(receipt?.routing
+              ? {
+                  routing: {
+                    ...receipt.routing,
+                    actual: {
+                      provider: source.agent as 'claude' | 'codex',
+                      model: source.model ?? reportedModel ?? null,
+                      variant: source.variant ?? reportedVariant ?? null,
+                    },
+                  },
+                }
+              : {}),
           });
+        }
         if (receiptId)
           await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
         if (receiptId) await saveShipRuns();
@@ -8006,7 +8178,9 @@
     const promptClient = client;
     const capabilityProfile: CapabilityProfile = validation
       ? 'review'
-      : capabilityProfileForDirectory(created.path);
+      : routingRole
+        ? routedProfile
+        : capabilityProfileForDirectory(created.path);
     let releaseProfile: (() => void) | undefined = await reserveOpenCodeBrowser(
       created.path,
       capabilityProfile,
@@ -8033,18 +8207,33 @@
       if (
         source.model &&
         (session.model?.providerID !== source.model.providerID ||
-          session.model.id !== source.model.id)
+          session.model.id !== source.model.id ||
+          (source.model.variant !== undefined && session.model.variant !== source.model.variant))
       ) {
-        const message = `Cannot verify OpenCode selected model ${source.model.providerID}:${source.model.id}.`;
+        const message = `Cannot verify OpenCode selected model ${source.model.providerID}:${source.model.id}${source.model.variant ? ` / ${source.model.variant}` : ''}.`;
         throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
       }
-      if (receiptId)
+      if (receiptId) {
+        const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
         updateSpawnReceipt(receiptId, {
           targetId: `opencode:${session.id}`,
           model: session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
           targetDirectory: created.path,
           worktreeId: created.path,
+          ...(receipt?.routing
+            ? {
+                routing: {
+                  ...receipt.routing,
+                  actual: {
+                    provider: 'opencode',
+                    model: session.model ? `${session.model.providerID}:${session.model.id}` : null,
+                    variant: session.model?.variant ?? null,
+                  },
+                },
+              }
+            : {}),
         });
+      }
       if (receiptId)
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       if (receiptId) await saveShipRuns();
