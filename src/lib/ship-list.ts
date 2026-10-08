@@ -133,14 +133,17 @@ export function shipGroups(
 
 export type ShipDetailFallback = { runId: string; issueId: string };
 
-/** The issue a split view shows with nothing selected: the remembered one while it exists, else the first unfinished row. */
+/** The issue a split view shows with nothing selected: the remembered one until it finishes, else the first unfinished row. */
 export function shipDetailFallback(
   run: ShipRun | undefined,
   rows: ShipRow[],
   remembered: ShipDetailFallback | null,
 ): ShipDetailFallback | null {
   if (!run) return null;
-  if (remembered?.runId === run.id && run.issues.some((issue) => issue.id === remembered.issueId))
+  if (
+    remembered?.runId === run.id &&
+    rows.some((row) => row.issue.id === remembered.issueId && row.group !== 'done')
+  )
     return remembered;
   const first = rows.find((row) => row.group !== 'done')?.issue;
   return first ? { runId: run.id, issueId: first.id } : null;

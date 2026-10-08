@@ -131,6 +131,11 @@ void test('the default detail issue stays put when another row re-sorts above it
     runId: 'run',
     issueId: 'i2',
   });
+  Object.assign(run.issues[1], { state: 'merged' as const });
+  assert.deepEqual(shipDetailFallback(run, shipRows(run, {}), shown), {
+    runId: 'run',
+    issueId: 'i2',
+  });
   assert.equal(shipDetailFallback(undefined, [], shown), null);
   for (const issue of run.issues) issue.state = 'merged';
   assert.equal(shipDetailFallback(run, shipRows(run, {}), null), null);
