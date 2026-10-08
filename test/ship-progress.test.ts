@@ -2431,7 +2431,7 @@ void test('plans how to settle issues of a run whose repository is gone', () => 
   );
   assert.equal(unrecoverableIssuePlan({ state: 'merged' }), 'none');
   assert.equal(unrecoverableIssuePlan({ state: 'awaiting_merge', workerSettled: true }), 'none');
-  assert.equal(unrecoverableIssuePlan({ state: 'awaiting_merge', workerSettled: false }), 'fail');
+  assert.equal(unrecoverableIssuePlan({ state: 'awaiting_merge', workerSettled: false }), 'none');
   assert.equal(unrecoverableIssuePlan({ state: 'working', workerSettled: false }), 'fail');
   assert.equal(unrecoverableIssuePlan({ state: 'failed', workerSettled: false }), 'fail');
 });

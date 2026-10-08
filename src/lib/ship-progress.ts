@@ -1630,10 +1630,7 @@ export function unrecoverableIssuePlan(
   >,
 ): 'none' | 'clear' | 'fail' {
   const claimDirty = !!issue.claim || !!issue.claimFencePending || !!issue.refreshError;
-  if (
-    issue.state === 'merged' ||
-    (issue.state === 'awaiting_merge' && issue.workerSettled === true)
-  )
+  if (issue.state === 'merged' || issue.state === 'awaiting_merge')
     return claimDirty ? 'clear' : 'none';
   if (issue.state === 'failed' && issue.workerSettled === true)
     return claimDirty || issue.worktreeUnavailable !== true ? 'clear' : 'none';
