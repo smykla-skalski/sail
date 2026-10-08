@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   matchingSkills,
@@ -10,6 +11,20 @@ import {
   skillQuery,
 } from '../src/lib/skills.ts';
 import { validationSettingsKey } from '../src/lib/cross-validation.ts';
+
+const shipItCore = readFileSync(new URL('../skills/ship-it/SKILL.md', import.meta.url), 'utf8');
+const convergence = readFileSync(
+  new URL('../skills/ship-it/references/convergence.md', import.meta.url),
+  'utf8',
+);
+const prLoop = readFileSync(
+  new URL('../skills/ship-it/references/pr-loop.md', import.meta.url),
+  'utf8',
+);
+const shipItOpenAi = readFileSync(
+  new URL('../skills/ship-it/agents/openai.yaml', import.meta.url),
+  'utf8',
+);
 
 const skills = [
   { id: 'one', name: 'ship-issue', description: 'Ship a GitHub issue' },
@@ -26,6 +41,39 @@ void test('progressive skills keep references discoverable without injecting the
   assert.match(instructions, /skill_reference/);
   assert.match(instructions, /SHA-256/);
   assert.doesNotMatch(instructions, /reference body/);
+});
+
+void test('ship-it uses one bounded convergence contract across delivery phases', () => {
+  assert.match(shipItCore, /Read \[references\/convergence\.md\]/);
+  assert.match(shipItCore, /Convergence cap \(Phases 5–10\)/);
+  assert.match(
+    shipItCore,
+    /Run focused formatting, linting and tests while implementing and fixing/,
+  );
+  assert.doesNotMatch(shipItCore, /Before every commit run formatter, linter, type checker/);
+  assert.match(prLoop, /Apply \[convergence\.md\]\(convergence\.md\) throughout this loop/);
+
+  assert.match(convergence, /one Code Adversary pass and one independent Findings challenge/);
+  assert.match(convergence, /at most one fix pass/);
+  assert.match(convergence, /full quality gate once on the final delivery tip/);
+  assert.match(convergence, /after two review cycles or 90 minutes/);
+  assert.match(convergence, /security defect/);
+  assert.match(convergence, /data-loss risk/);
+  assert.match(convergence, /destructive concurrency behavior/);
+  assert.match(convergence, /acceptance-criterion failure/);
+  assert.match(convergence, /follow-up issues for later non-blocking findings/);
+  assert.match(convergence, /Required CI must pass/);
+  assert.match(convergence, /Preserve repository-required human review/);
+});
+
+void test('exhaustive review is explicit and Copilot is never a delivery gate', () => {
+  assert.match(convergence, /Exhaustive review is opt-in/);
+  assert.match(convergence, /only when the user explicitly requests exhaustive review/);
+  assert.match(convergence, /never waives repository-required checks/);
+  assert.match(convergence, /Never request or wait for Copilot review/);
+  assert.doesNotMatch(prLoop, /add-reviewer copilot-pull-request-reviewer/);
+  assert.doesNotMatch(shipItCore, /CI or Copilot is pending/);
+  assert.doesNotMatch(shipItOpenAi, /Copilot review/);
 });
 
 void test('slash matches names and closes after arguments begin', () => {

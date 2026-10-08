@@ -1106,6 +1106,10 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         include_str!("../../skills/ship-it/references/inputs.md"),
     ),
     (
+        "convergence.md",
+        include_str!("../../skills/ship-it/references/convergence.md"),
+    ),
+    (
         "fallbacks.md",
         include_str!("../../skills/ship-it/references/fallbacks.md"),
     ),
@@ -1651,7 +1655,7 @@ mod skill_tests {
             listed["structuredContent"]["references"]
                 .as_array()
                 .map(Vec::len),
-            Some(3)
+            Some(4)
         );
 
         let loaded = call_bridge(&json!({
@@ -1666,6 +1670,14 @@ mod skill_tests {
         assert!(loaded["content"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains("# Resolving the ship-it input")));
+
+        let convergence = call_bridge(&json!({
+            "name":"skill_reference",
+            "arguments":{"skill":"ship-it","reference":"convergence.md"}
+        }));
+        assert!(convergence["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("# ship-it convergence contract")));
     }
 
     #[test]
