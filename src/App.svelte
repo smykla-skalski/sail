@@ -9761,6 +9761,16 @@
       return true;
     } catch (cause) {
       if (current !== selection) return false;
+      if (missingRepositoryPath(cause)) {
+        const fallback = await availableFallbackDirectory(path);
+        if (current !== selection) return false;
+        if (fallback) {
+          void loadProject(fallback, false).catch((loadCause) => {
+            if (directory === fallback) error = describe(loadCause);
+          });
+          return false;
+        }
+      }
       setupError = describe(cause);
       workReady = false;
       planReady = false;
@@ -9768,6 +9778,18 @@
     } finally {
       if (current === selection) setupLoading = false;
     }
+  }
+
+  async function availableFallbackDirectory(missing: string): Promise<string | null> {
+    const parent = worktreeAt(projectCatalog, missing)?.repository;
+    const candidates = [parent, ...projectCatalog.repositories].filter(
+      (path): path is string => !!path && path !== missing,
+    );
+    for (const candidate of new Set(candidates)) {
+      if (await invoke<boolean>('repository_path_available', { path: candidate }).catch(() => false))
+        return candidate;
+    }
+    return null;
   }
 
   async function restartSetup() {
