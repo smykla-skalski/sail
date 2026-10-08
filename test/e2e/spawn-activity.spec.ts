@@ -161,13 +161,12 @@ describe('live subagent activity', () => {
       )!;
       const result = card.querySelector<HTMLElement>('.spawn-result')!;
       const button = card.querySelector<HTMLButtonElement>('.spawn-expand')!;
-      const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
       const clamped = result.clientHeight;
       button.click();
-      await settle();
+      await new Promise((resolve) => setTimeout(resolve, 50));
       const expanded = { height: result.clientHeight, aria: button.getAttribute('aria-expanded') };
       button.click();
-      await settle();
+      await new Promise((resolve) => setTimeout(resolve, 50));
       return {
         clamped,
         expanded,
