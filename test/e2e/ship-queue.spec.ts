@@ -374,7 +374,8 @@ describe('Ship queue, archive and actions', () => {
   });
 
   it('declining the confirmation merges nothing', async () => {
-    await row('ready').$('[data-ship-action="merge"]').click();
+    await expect(row('ready').$('[data-ship-action="merge"]')).toBeDisabled();
+    await row('moved').$('[data-ship-action="merge"]').click();
     const dialog = $('.confirmation-dialog');
     await expect(dialog).toBeDisplayed();
     await dialog.$('button=Cancel').click();
