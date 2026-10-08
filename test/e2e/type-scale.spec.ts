@@ -19,10 +19,12 @@ declare global {
 
 const axeSource = readFileSync(resolve('node_modules/axe-core/axe.min.js'), 'utf8');
 const prose =
-  'Sail keeps long agent output readable by holding transcript text to a comfortable reading ' +
-  'column. Wide windows used to stretch every line across the pane, so eyes had to travel far ' +
-  'from the end of one line to the start of the next. This paragraph is long enough to wrap ' +
-  'several times and measure how many characters each rendered line holds.';
+  'Sail keeps long agent output across the whole chat pane, so wide windows show more of each ' +
+  'answer instead of a narrow column surrounded by empty space. Only a small fixed gutter ' +
+  'separates the text from the pane edges. This paragraph is long enough to wrap several ' +
+  'times even on a 2560 px window, so each rendered line shows how much of the width it uses. ' +
+  'The same rule applies to the main conversation, the agent workspace transcript and the ' +
+  'OpenCode pane transcript, which all share one gutter token.';
 
 async function capture(name: string) {
   const output = process.env.SAIL_VISUAL_AUDIT_DIR;
@@ -31,11 +33,22 @@ async function capture(name: string) {
   await browser.saveScreenshot(join(output, `${name}.png`));
 }
 
-/** Returns the longest rendered line, in characters, of each matching element. */
-function longestLines(selector: string) {
+type Span = { chars: number; gutters: number[]; rightGap: number; contentWidth: number };
+
+/**
+ * Returns, for each matching element, its longest rendered line in characters,
+ * its transcript container's horizontal padding, and the gap between the
+ * element's right edge and the container's content box.
+ */
+function textSpans(selector: string) {
   return browser.execute((target) => {
     const range = document.createRange();
-    return [...document.querySelectorAll<HTMLElement>(target)].map((element) => {
+    return [...document.querySelectorAll<HTMLElement>(target)].map((element): Span => {
+      const container = element.closest<HTMLElement>('.conversation, .agent-conversation');
+      if (!container) throw new Error(`No transcript container for ${target}`);
+      const style = getComputedStyle(container);
+      const left = container.getBoundingClientRect().left + container.clientLeft;
+      const contentRight = left + container.clientWidth - Number.parseFloat(style.paddingRight);
       const lines = new Map<number, number>();
       const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
       for (let text = walker.nextNode(); text; text = walker.nextNode()) {
@@ -49,9 +62,26 @@ function longestLines(selector: string) {
           lines.set(line, (lines.get(line) ?? 0) + 1);
         }
       }
-      return Math.max(0, ...lines.values());
+      return {
+        chars: Math.max(0, ...lines.values()),
+        gutters: [style.paddingLeft, style.paddingRight].map(Number.parseFloat),
+        rightGap: contentRight - element.getBoundingClientRect().right,
+        contentWidth: contentRight - left - Number.parseFloat(style.paddingLeft),
+      };
     });
   }, selector);
+}
+
+/** Asserts that transcript text fills its pane up to the shared 20 px gutter. */
+function expectFullWidth(spans: Span[]) {
+  expect(spans.length).toBeGreaterThan(0);
+  for (const span of spans) {
+    expect(span.gutters).toEqual([20, 20]);
+    expect(Math.abs(span.rightGap)).toBeLessThanOrEqual(1);
+  }
+  const widest = spans.reduce((best, span) => (span.chars > best.chars ? span : best));
+  // 14 px body text averages about 7 px per character; 10 px leaves room for wrapping.
+  expect(widest.chars).toBeGreaterThan(widest.contentWidth / 10);
 }
 
 /** Lists visible text rendered below 12 px, plus horizontal document overflow. */
@@ -90,7 +120,7 @@ async function contrastViolations() {
   });
 }
 
-describe('type scale and reading column', () => {
+describe('type scale and full-width transcript', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-type-scale-'));
 
   before(async () => {
@@ -115,7 +145,7 @@ describe('type scale and reading column', () => {
     rmSync(repository, { recursive: true, force: true });
   });
 
-  it('keeps main transcript lines at 80 characters or fewer at 1280 px', async () => {
+  it('fills the main transcript width at 1280 px', async () => {
     await browser.execute((text) => {
       const conversation = document.querySelector('.chat-area .conversation');
       if (!conversation) throw new Error('No main conversation');
@@ -125,13 +155,13 @@ describe('type scale and reading column', () => {
       message.querySelector('p')!.textContent = text;
       conversation.append(message);
     }, prose);
-    const [main] = await longestLines('.measure-probe .message-body p');
+    const main = await textSpans('.measure-probe .message-body p');
     await browser.execute(() => document.querySelector('.measure-probe')?.remove());
-    expect(main).toBeGreaterThan(55);
-    expect(main).toBeLessThanOrEqual(80);
+    expectFullWidth(main);
+    expect(main[0].chars).toBeGreaterThan(80);
   });
 
-  it('keeps agent transcript lines at 80 characters or fewer at 1280 px', async () => {
+  it('fills the agent transcript width at 1280 px', async () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer textarea').setValue(prose);
@@ -140,10 +170,10 @@ describe('type scale and reading column', () => {
     await $('.permission-card .permission-link').click();
     await $('.permission-card .permission-actions button').click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Done: Sail keeps'));
-    const lines = await longestLines('.agent-conversation .message-body :is(p, .markdown)');
-    expect(lines.length).toBeGreaterThan(1);
-    for (const line of lines) expect(line).toBeLessThanOrEqual(80);
-    expect(Math.max(...lines)).toBeGreaterThan(55);
+    const spans = await textSpans('.agent-conversation .message-body :is(p, .markdown)');
+    expect(spans.length).toBeGreaterThan(1);
+    expectFullWidth(spans);
+    expect(Math.max(...spans.map((span) => span.chars))).toBeGreaterThan(80);
     await capture('desktop-type-scale-light');
   });
 
@@ -171,6 +201,22 @@ describe('type scale and reading column', () => {
     );
     expect(sizes).toEqual(['20px', '16px', '14px', '14px']);
   });
+
+  for (const theme of ['light', 'dark'] as const)
+    for (const [width, height] of [
+      [1920, 1200],
+      [2560, 1440],
+    ] as const)
+      it(`fills the agent transcript width in ${theme} at ${width} px`, async () => {
+        await browser.setWindowSize(width, height);
+        await browser.execute((value) => {
+          document.documentElement.dataset.suiTheme = value;
+        }, theme);
+        await browser.pause(300);
+        expect(await browser.execute(() => innerWidth)).toBe(width);
+        expectFullWidth(await textSpans('.agent-conversation .message-body :is(p, .markdown)'));
+        await capture(`${width}x${height}-chat-width-${theme}`);
+      });
 
   for (const theme of ['light', 'dark'] as const)
     for (const [width, height] of [
