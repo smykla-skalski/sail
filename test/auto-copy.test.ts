@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { copyCompletedSelection, resetAutoCopy } from '../src/lib/auto-copy.ts';
+import { copyCompletedSelection, copyStatusHost, resetAutoCopy } from '../src/lib/auto-copy.ts';
 
 function environment(
   options: {
@@ -107,4 +107,16 @@ void test('falls back to the copy command when the async clipboard is missing', 
   copyCompletedSelection({ enabled: true, oncopied: () => announced++ }, env);
   assert.equal(execCopies(), 1);
   assert.equal(announced, 1);
+});
+
+const inside = (dialog: object | null) => ({ closest: () => dialog });
+
+void test('the Copied region moves into the open modal that holds the selection', () => {
+  const inbox = { name: 'inbox' };
+  const sheet = { name: 'sheet' };
+  assert.equal(copyStatusHost(inside(null), []), null);
+  assert.equal(copyStatusHost(null, []), null);
+  assert.equal(copyStatusHost(inside(inbox), [inbox, sheet]), inbox);
+  assert.equal(copyStatusHost(inside(null), [inbox, sheet]), sheet);
+  assert.equal(copyStatusHost(inside({ name: 'closed' }), [inbox]), inbox);
 });

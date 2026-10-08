@@ -55,3 +55,18 @@ export function copyCompletedSelection(
   if (environment.writeText) void environment.writeText(text).then(oncopied, () => {});
   else if (environment.execCommandCopy()) oncopied?.();
 }
+
+/**
+ * Returns the open modal dialog that should host the Copied live region, or
+ * null when no modal is open. A modal makes the rest of the document inert,
+ * so a region outside it is neither shown nor announced.
+ */
+export function copyStatusHost<T>(
+  anchor: { closest(selector: string): T | null } | null,
+  openModals: readonly T[],
+): T | null {
+  if (!openModals.length) return null;
+  const owner = anchor?.closest('dialog');
+  if (owner && openModals.includes(owner)) return owner;
+  return openModals[openModals.length - 1];
+}
