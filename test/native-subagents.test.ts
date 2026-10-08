@@ -904,3 +904,25 @@ await test('a resumed OpenCode child re-arms after completing and keeps failure 
   assert.equal(store['opencode:child'].error, undefined);
   assert.equal(nativeSubagentReceipts(store)[0].error, null);
 });
+
+await test('a state update keeps the incomplete-history marker on restored children', () => {
+  let store = updateNativeSubagents(
+    {},
+    event('p', { sessionUpdate: 'subagent_spawned', subagentSessionId: 'k' }),
+    '/worktree',
+    1,
+    true,
+  );
+  store = updateNativeSubagents(
+    store,
+    event('p', {
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: 'k',
+      state: 'completed',
+    }),
+    '/worktree',
+    2,
+    true,
+  );
+  assert.equal(store['codex:k'].error, 'Incomplete subagent history');
+});

@@ -80,6 +80,8 @@ function state(value: unknown): NativeSubagentOutcome {
   return 'unknown';
 }
 
+const incompleteHistory = 'Incomplete subagent history';
+
 export const nativeTranscriptLimit = 500;
 export const nativeMessageLimit = 40_000;
 
@@ -220,7 +222,7 @@ export function updateNativeSubagents(
           : (previous?.capabilityProfile ??
             store[nativeSubagentId(event.agent, parentSessionId)]?.capabilityProfile ??
             capabilityProfile),
-        ...(malformed ? { error: 'Incomplete subagent history' } : {}),
+        ...(malformed ? { error: incompleteHistory } : {}),
       },
     };
   }
@@ -234,7 +236,8 @@ export function updateNativeSubagents(
     const outcome = state(update.state);
     const { error: previousError, ...settledChild } = child;
     const reason = typeof update.error === 'string' ? update.error.trim() : '';
-    const error = reason || (outcome === 'working' || outcome === 'completed' ? '' : previousError);
+    const resumed = outcome === 'working' || outcome === 'completed';
+    const error = reason || (resumed && previousError !== incompleteHistory ? '' : previousError);
     return {
       ...store,
       [id]: {
