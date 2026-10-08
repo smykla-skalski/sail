@@ -6,6 +6,14 @@
   import { invoke } from '@tauri-apps/api/core';
   import OptionPicker from './OptionPicker.svelte';
   import { getSetting } from './lib/settings';
+  import {
+    parseThemePreference,
+    resolveTheme,
+    systemDarkQuery,
+    themeSettingKey,
+    watchSystemDark,
+    type ThemePreference,
+  } from './lib/theme';
   import { openExternalLink } from './lib/external-link';
   import type { SetupCheck, SetupReport } from './lib/onboarding';
   import type { ValidationChoice } from './lib/cross-validation';
@@ -272,9 +280,15 @@
       .catch((cause: unknown) => (requestError = String(cause)));
   }
 
+  let themePreference = $state<ThemePreference>(parseThemePreference(getSetting(themeSettingKey)));
+  let systemDark = $state(globalThis.matchMedia?.(systemDarkQuery).matches ?? false);
+
+  $effect(() => {
+    document.documentElement.dataset.suiTheme = resolveTheme(themePreference, systemDark);
+  });
+
   onMount(() => {
-    document.documentElement.dataset.suiTheme =
-      getSetting('sai-theme') === 'dark' ? 'dark' : 'light';
+    const stopSystemTheme = watchSystemDark((value) => (systemDark = value));
     let unlisten: (() => void) | undefined;
     let active = true;
     void (async () => {
@@ -286,7 +300,7 @@
             if (snapshot.directory !== integrationDirectory)
               void inspectIntegration(snapshot.directory);
           }
-          document.documentElement.dataset.suiTheme = snapshot.theme;
+          themePreference = snapshot.theme;
           if (!binaryDirty) binaryPath = snapshot.binaryPath;
           if (!personalChecksDirty) personalChecks = snapshot.personalPostTurnChecks.join('\n');
         });
@@ -304,6 +318,7 @@
       active = false;
       unlisten?.();
       clearInterval(poll);
+      stopSystemTheme();
     };
   });
 </script>
@@ -350,13 +365,14 @@
             label="Theme"
             value={snapshot.theme}
             options={[
+              { value: 'system', name: 'System' },
               { value: 'light', name: 'Light' },
               { value: 'dark', name: 'Dark' },
             ]}
             open={themePickerOpen}
             onopen={() => (themePickerOpen = true)}
             onclose={() => (themePickerOpen = false)}
-            onchoose={(value) => send({ type: 'theme', value: value as 'light' | 'dark' })}
+            onchoose={(value) => send({ type: 'theme', value: parseThemePreference(value) })}
           />
         </section>
         <section class="settings-card">

@@ -1296,7 +1296,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 12px;
+    gap: var(--space-12);
     padding: 14px 24px;
     border-bottom: 1px solid var(--shell-divider);
   }
@@ -1305,7 +1305,7 @@
     min-width: 0;
     flex: 1;
     align-items: baseline;
-    gap: 12px;
+    gap: var(--space-12);
   }
   .opencode-pane .agent-heading > span:not(.harness-icon) {
     overflow: hidden;
@@ -1315,18 +1315,18 @@
   }
   .opencode-pane .agent-usage {
     flex: none;
-    font-size: 11px;
+    font-size: var(--type-12);
     white-space: nowrap;
   }
   .opencode-pane .agent-conversation {
     flex: 1;
     min-height: 0;
-    padding-inline: 20px;
+    padding-inline: var(--transcript-gutter);
   }
   .opencode-pane .agent-busy {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: var(--space-12);
   }
   .opencode-pane .agent-welcome {
     max-width: 650px;
@@ -1338,7 +1338,7 @@
     align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 0 9px 9px 10px;
   }
   .opencode-pane .agent-composer {
@@ -1365,6 +1365,6 @@
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: 4px;
+    gap: var(--space-4);
   }
 </style>

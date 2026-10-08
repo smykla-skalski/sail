@@ -564,6 +564,14 @@
     settingsError,
   } from './lib/settings';
   import {
+    parseThemePreference,
+    resolveTheme,
+    systemDarkQuery,
+    themeSettingKey,
+    watchSystemDark,
+    type ThemePreference,
+  } from './lib/theme';
+  import {
     commandsForDirectory,
     loadSavedCommands,
     selectedRepository,
@@ -609,7 +617,9 @@
     type WorktreeCreation,
   } from './lib/projects';
 
-  let dark = $state(getSetting('sai-theme') === 'dark');
+  let themePreference = $state<ThemePreference>(parseThemePreference(getSetting(themeSettingKey)));
+  let systemDark = $state(globalThis.matchMedia?.(systemDarkQuery).matches ?? false);
+  const dark = $derived(resolveTheme(themePreference, systemDark) === 'dark');
   const savedAgentThreads = loadAgentThreads();
   const startupInterruptedTurns = loadInterruptedAgentTurns(
     getSetting('sai-interrupted-agent-turns'),
@@ -2414,15 +2424,18 @@
     annotateDiffs(diffs, acpAgent ? acpSnapshot.plan : snapshot.plan, directory),
   );
 
-  function setTheme(value: boolean) {
-    dark = value;
-    document.documentElement.dataset.suiTheme = value ? 'dark' : 'light';
-    setSetting('sai-theme', value ? 'dark' : 'light');
+  function setTheme(preference: ThemePreference) {
+    themePreference = preference;
+    setSetting(themeSettingKey, preference);
   }
+
+  $effect(() => {
+    document.documentElement.dataset.suiTheme = dark ? 'dark' : 'light';
+  });
 
   function settingsSnapshot(): SettingsSnapshot {
     return {
-      theme: dark ? 'dark' : 'light',
+      theme: themePreference,
       binaryPath,
       activeBinary,
       runtimeState,
@@ -2521,7 +2534,8 @@
     let unlistenAgentTerminals: (() => void) | undefined;
     let unlistenNotificationClick: (() => void) | undefined;
     let stopEmulatedClick: (() => void) | undefined;
-    setTheme(dark);
+    setTheme(themePreference);
+    const stopSystemTheme = watchSystemDark((value) => (systemDark = value));
     let stopSettingsRequest: (() => void) | undefined;
     let stopSettingsAction: (() => void) | undefined;
     let stopCloseRequest: (() => void) | undefined;
@@ -2602,7 +2616,7 @@
       );
       void listen<SettingsAction>(settingsAction, (event) => {
         const action = event.payload;
-        if (action.type === 'theme') setTheme(action.value === 'dark');
+        if (action.type === 'theme') setTheme(action.value);
         else if (action.type === 'binary') {
           binaryPath = action.value;
           void retryRuntime();
@@ -2778,6 +2792,7 @@
       unlistenAgentTerminals?.();
       unlistenNotificationClick?.();
       stopEmulatedClick?.();
+      stopSystemTheme();
       cancelAnimationFrame(followFrame);
       for (const pending of messageTimers.values()) clearTimeout(pending.timer);
     };
@@ -10928,7 +10943,7 @@
         void openSettings();
         break;
       case 'theme.toggle':
-        setTheme(!dark);
+        setTheme(dark ? 'light' : 'dark');
         break;
       case 'shortcuts.help':
         openShortcutSheet();

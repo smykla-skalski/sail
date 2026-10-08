@@ -933,12 +933,12 @@
   }
   .ship-summary p {
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .ship-progress {
     display: grid;
     min-width: 120px;
-    gap: 4px;
+    gap: var(--space-4);
   }
   progress {
     display: block;
@@ -961,7 +961,7 @@
   .ship-content {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    gap: 16px;
+    gap: var(--space-16);
     margin-top: 12px;
   }
   .ship-content.split {
@@ -973,11 +973,11 @@
   }
   .ship-now-list {
     display: grid;
-    gap: 12px;
+    gap: var(--space-12);
   }
   .ship-group {
     display: grid;
-    gap: 4px;
+    gap: var(--space-4);
   }
   .ship-group h4 {
     display: flex;
@@ -985,7 +985,7 @@
     align-items: baseline;
     margin: 0;
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
@@ -1030,7 +1030,7 @@
   .ship-run-meta {
     display: flex;
     min-width: 0;
-    gap: 8px;
+    gap: var(--space-8);
     align-items: center;
     justify-content: space-between;
   }
@@ -1038,20 +1038,30 @@
     flex: 1;
     min-width: 0;
     overflow: hidden;
-    font-size: 13px;
+    font-size: var(--type-13);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .ship-run-task strong,
-  .ship-run-meta span,
-  .ship-run-meta time {
+  .ship-run-meta span {
     min-width: 0;
     overflow-wrap: anywhere;
+  }
+  .ship-run-meta time {
+    flex: none;
+    white-space: nowrap;
+  }
+  .ship-run-task :global(.activity-status) {
+    flex: none;
+  }
+  .ship-summary,
+  .ship-issue-detail {
+    font-variant-numeric: tabular-nums;
   }
   .ship-line {
     overflow: hidden;
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
     line-height: 1.35;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1074,7 +1084,7 @@
     color: inherit;
     background: transparent;
     border: 1px solid var(--shell-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     padding: 7px 10px;
     cursor: pointer;
   }
@@ -1104,12 +1114,12 @@
   .ship-actions {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: var(--space-8);
     align-items: center;
   }
   .ship-run-chooser {
     display: grid;
-    gap: 8px;
+    gap: var(--space-8);
     margin: 12px 0 0;
   }
   .ship-run-chooser h3 {
@@ -1129,12 +1139,12 @@
   }
   .ship-run-meta {
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
   }
   .ship-scope {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: var(--space-8);
     margin-top: 12px;
   }
   .ship-scope button[aria-pressed='true'] {
@@ -1155,7 +1165,7 @@
     margin: 0 0 8px;
     padding: 0;
     list-style: none;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .ship-stage li {
     color: var(--sui-muted);
@@ -1180,7 +1190,7 @@
   .ship-dependencies {
     display: grid;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .ship-dependencies button {
     text-align: left;
@@ -1196,7 +1206,7 @@
   small,
   .ship-path {
     opacity: 0.7;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .ship-path,
   header p {

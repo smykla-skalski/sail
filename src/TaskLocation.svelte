@@ -36,7 +36,7 @@
     min-width: 0;
     padding: 7px 12px 0;
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     line-height: 1.4;
   }
   .task-location-marker,

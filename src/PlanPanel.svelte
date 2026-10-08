@@ -917,14 +917,14 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 20px;
     border-bottom: 1px solid var(--shell-divider);
   }
   .eyebrow {
     margin: 0 0 3px;
     color: var(--sui-primary);
-    font-size: 10px;
+    font-size: var(--type-12);
     font-weight: 700;
     letter-spacing: 0.08em;
   }
@@ -934,11 +934,11 @@
   }
   h3 {
     margin: 0 0 8px;
-    font-size: 16px;
+    font-size: var(--type-16);
   }
   h4 {
     margin: 0;
-    font-size: 14px;
+    font-size: var(--type-14);
   }
   .panel-scroll {
     flex: 1;
@@ -949,7 +949,7 @@
   .muted {
     margin: 0 0 18px;
     color: var(--sui-muted);
-    font-size: 13px;
+    font-size: var(--type-13);
     line-height: 1.55;
     white-space: pre-wrap;
   }
@@ -959,7 +959,7 @@
   .review-context,
   .execute-confirm {
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
     line-height: 1.5;
   }
   .execute-confirm {
@@ -972,8 +972,8 @@
     margin: 12px 0 20px;
     padding: 12px;
     border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-    font-size: 12px;
+    border-radius: var(--radius-8);
+    font-size: var(--type-12);
     line-height: 1.5;
   }
   .diagram-validation {
@@ -985,7 +985,7 @@
   .execution-progress > div {
     display: flex;
     justify-content: space-between;
-    gap: 8px;
+    gap: var(--space-8);
   }
   .execution-progress span {
     color: var(--sui-muted);
@@ -1017,7 +1017,7 @@
     justify-content: space-between;
     margin: 24px 0 10px;
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.06em;
@@ -1025,7 +1025,7 @@
   .alternative {
     padding: 12px 0;
     border-bottom: 1px solid var(--shell-divider);
-    font-size: 13px;
+    font-size: var(--type-13);
   }
   .alternative :global(.sui-badge) {
     margin-left: 8px;
@@ -1056,20 +1056,20 @@
   }
   .step-number {
     color: var(--sui-primary);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 700;
   }
   .step-card > p {
     margin: 10px 0;
     color: var(--sui-muted);
-    font-size: 13px;
+    font-size: var(--type-13);
     line-height: 1.5;
     white-space: pre-wrap;
   }
   .step-card details {
     margin-top: 10px;
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
     line-height: 1.5;
   }
   .step-card details p {
@@ -1088,7 +1088,7 @@
   .edit-field {
     display: block;
     margin-top: 12px;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .edit-field input {
     display: block;
@@ -1096,7 +1096,7 @@
     margin-top: 5px;
     padding: 10px 12px;
     border: 1px solid var(--shell-control-border);
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     color: var(--sui-foreground);
     background: var(--sui-surface);
     font: 13px/1.5 var(--sui-font);
@@ -1107,12 +1107,12 @@
   }
   .step-card .files {
     font-family: ui-monospace, monospace;
-    font-size: 11px;
+    font-size: var(--type-12);
   }
   .step-execution {
     margin-top: 10px;
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
     line-height: 1.5;
     overflow-wrap: anywhere;
   }
@@ -1157,14 +1157,14 @@
   .stale-answers {
     margin: 8px 20px;
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .question-recommendation {
     margin: 0 0 12px;
   }
   .question-error {
     color: var(--sui-danger);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .stale-answers p {
     overflow-wrap: anywhere;
@@ -1175,7 +1175,7 @@
     gap: 10px;
     padding: 9px;
     border: 1px solid var(--shell-divider);
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     margin-bottom: 7px;
     cursor: pointer;
   }
@@ -1185,7 +1185,7 @@
   }
   .answer-option strong {
     display: block;
-    font-size: 13px;
+    font-size: var(--type-13);
   }
   .answer-option small {
     display: block;
@@ -1198,7 +1198,7 @@
     padding: 10px 12px;
     resize: vertical;
     border: 1px solid var(--shell-control-border);
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     color: var(--sui-foreground);
     background: var(--sui-surface);
     font: 13px/1.5 var(--sui-font);
@@ -1213,7 +1213,7 @@
   .panel-actions {
     display: flex;
     justify-content: flex-end;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 16px 20px;
     border-top: 1px solid var(--shell-divider);
   }
@@ -1232,7 +1232,7 @@
   }
   .panel-empty p {
     color: var(--sui-muted);
-    font-size: 13px;
+    font-size: var(--type-13);
     line-height: 1.5;
   }
   .panel-error {
@@ -1240,7 +1240,7 @@
     padding: 10px;
     color: var(--sui-danger-ink);
     background: var(--sui-danger-subtle);
-    border-radius: 8px;
-    font-size: 12px;
+    border-radius: var(--radius-8);
+    font-size: var(--type-12);
   }
 </style>

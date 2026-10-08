@@ -187,6 +187,60 @@ void test('literal colors stay in token files or the reviewed allowlist', () => 
   assert.deepEqual(stale, [], 'Update the literal color allowlist');
 });
 
+// Reviewed font sizes below the 12 px minimum; counts must match exactly. SpawnActivity
+// uses 0 to hide a long label on narrow screens behind a readable ::after label.
+const smallTypeAllowlist: Record<string, Record<string, number>> = {
+  'src/SpawnActivity.svelte': { '0': 1 },
+};
+const minimumFontSize = 12;
+
+function fontSize(property: string, value: string, tokens: Theme): number | null {
+  const size =
+    property === 'font-size'
+      ? value.trim()
+      : property === 'font'
+        ? /(var\(--[\w-]+\)|\d*\.?\d+(?:px|rem)\b)/.exec(value)?.[1]
+        : undefined;
+  if (size === undefined) return null;
+  const reference = /^var\((--[\w-]+)\)$/.exec(size);
+  if (reference) {
+    const token = tokens[reference[1]];
+    return token === undefined ? null : fontSize('font-size', token, tokens);
+  }
+  const length = /^(\d*\.?\d+)(px|rem)?$/.exec(size);
+  if (!length || (!length[2] && Number(length[1]) !== 0)) return null;
+  return Number(length[1]) * (length[2] === 'rem' ? 16 : 1);
+}
+
+void test('font sizes stay at or above 12 px outside the reviewed allowlist', () => {
+  const tokens = themeBlocks(readFileSync(join(root, 'src/style.css'), 'utf8')).light;
+  assert.equal(fontSize('font-size', 'var(--type-11)', tokens), 11);
+  assert.equal(fontSize('font', '600 0.8125rem/1.125rem var(--sui-font)', tokens), 13);
+  assert.equal(fontSize('font', 'var(--type-12)/1.5 ui-monospace, monospace', tokens), 12);
+  const found: Record<string, Record<string, number>> = {};
+  const locations: string[] = [];
+  for (const chunk of sources.flatMap(styleChunks)) {
+    for (const declaration of declarations(chunk)) {
+      const size = fontSize(declaration.property, declaration.value, tokens);
+      if (size === null || size >= minimumFontSize) continue;
+      const value = String(size);
+      found[chunk.file] ??= {};
+      found[chunk.file][value] = (found[chunk.file][value] ?? 0) + 1;
+      if (found[chunk.file][value] > (smallTypeAllowlist[chunk.file]?.[value] ?? 0))
+        locations.push(`${chunk.file}:${declaration.line} ${declaration.value.trim()}`);
+    }
+  }
+  assert.deepEqual(locations, [], 'Use var(--type-12) or a larger type token from src/style.css');
+  const stale = Object.entries(smallTypeAllowlist).flatMap(([file, sizes]) =>
+    Object.entries(sizes)
+      .filter(([size, count]) => (found[file]?.[size] ?? 0) !== count)
+      .map(
+        ([size, count]) => `${file} ${size}px: allowed ${count}, found ${found[file]?.[size] ?? 0}`,
+      ),
+  );
+  assert.deepEqual(stale, [], 'Update the small font size allowlist');
+});
+
 type Theme = Record<string, string>;
 type Rgb = [number, number, number];
 
@@ -345,3 +399,23 @@ for (const name of ['light', 'dark'] as const) {
     assert.deepEqual(failures, []);
   });
 }
+
+void test('all three transcript renderers share the reading column gutter', () => {
+  const containers: [string, RegExp][] = [
+    ['src/style.css', /\n\.conversation \{[^}]*padding: 28px var\(--transcript-gutter\);/],
+    [
+      'src/AgentWorkspace.svelte',
+      /\n {2}\.agent-conversation \{[^}]*padding-inline: var\(--transcript-gutter\);/,
+    ],
+    [
+      'src/OpenCodePane.svelte',
+      /\n {2}\.opencode-pane \.agent-conversation \{[^}]*padding-inline: var\(--transcript-gutter\);/,
+    ],
+  ];
+  for (const [file, rule] of containers)
+    assert.match(readFileSync(join(root, file), 'utf8'), rule, file);
+  assert.doesNotMatch(
+    readFileSync(join(root, 'src/style.css'), 'utf8'),
+    /\.chat-area > (?:\.chat-body > )?\.conversation[^{]*\{[^}]*padding-inline/,
+  );
+});

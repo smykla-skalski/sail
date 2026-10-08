@@ -310,7 +310,7 @@
     gap: 6px;
     padding: 8px 10px;
     border: 1px solid var(--activity-waiting);
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     background: color-mix(in srgb, var(--activity-waiting) 8%, var(--sui-surface));
     font-size: 0.83rem;
   }
@@ -324,7 +324,7 @@
     min-height: 28px;
     padding: 3px 10px;
     border: 1px solid var(--shell-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     color: var(--sui-foreground);
     background: transparent;
     font: inherit;
@@ -353,7 +353,7 @@
     padding: 10px 12px;
     border: 1px solid color-mix(in srgb, var(--spawn-color) 35%, transparent);
     border-left: 3px solid var(--spawn-color);
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     background: color-mix(in srgb, var(--spawn-color) 5%, var(--sui-surface));
   }
   .spawn-active.state-waiting {
@@ -374,14 +374,14 @@
   .spawn-heading {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-8);
   }
   .spawn-toggle {
     flex: 1;
     min-width: 0;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 0;
     border: 0;
     color: inherit;
@@ -437,14 +437,14 @@
   .spawn-task strong {
     margin-right: 5px;
     color: var(--sui-muted);
-    font-size: 0.72rem;
+    font-size: var(--type-12);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
   .spawn-signal {
     display: flex;
     justify-content: space-between;
-    gap: 12px;
+    gap: var(--space-12);
     margin: 5px 0 0 42px;
     color: var(--sui-muted);
     font-size: 0.76rem;

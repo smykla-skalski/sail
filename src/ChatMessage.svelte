@@ -71,12 +71,12 @@
   .thought-details > summary {
     cursor: pointer;
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .message-time {
     margin-left: 8px;
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 400;
     font-variant-numeric: tabular-nums;
   }

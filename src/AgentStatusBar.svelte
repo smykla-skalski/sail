@@ -151,7 +151,7 @@
     color: var(--sui-foreground);
     background: transparent;
     font: inherit;
-    font-size: 11px;
+    font-size: var(--type-12);
     text-align: left;
   }
   .agent-status-summary:hover {
@@ -166,7 +166,7 @@
     display: flex;
     align-items: center;
     min-width: 0;
-    gap: 12px;
+    gap: var(--space-12);
   }
   .agent-status-counts span,
   .agent-status-providers span {
@@ -176,6 +176,9 @@
   .agent-status-counts i {
     font-weight: inherit;
     font-style: normal;
+  }
+  .agent-status-counts b {
+    font-variant-numeric: tabular-nums;
   }
   .agent-status-counts [data-state='working'] {
     color: var(--activity-working);
@@ -203,7 +206,7 @@
     width: min(560px, calc(100vw - 24px));
     overflow: hidden;
     border: 1px solid var(--shell-divider);
-    border-radius: 12px;
+    border-radius: var(--radius-12);
     background: var(--sui-canvas);
     box-shadow: 0 18px 50px #0004;
   }
@@ -219,7 +222,7 @@
   .agent-status-metrics small,
   .agent-status-list p {
     color: var(--shell-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
   }
   .agent-status-list {
     max-height: min(420px, 65vh);
@@ -235,7 +238,7 @@
     width: 100%;
     grid-template-columns: 92px minmax(0, 1fr) max-content 10px;
     align-items: center;
-    gap: 12px;
+    gap: var(--space-12);
     padding: 11px 16px;
     border: 0;
     border-bottom: 1px solid var(--shell-divider);
