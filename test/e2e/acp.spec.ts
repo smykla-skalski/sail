@@ -26,10 +26,10 @@ async function selectClaudeThread(title: string) {
   await browser.keys('Enter');
 }
 
-/** Codex asks to sign in once per app run; later threads in the same run are already signed in. */
-async function signInToCodex() {
+/** Codex asks to sign in on its first thread in an app run; later threads are signed in. */
+async function signInToCodex(firstInRun: boolean) {
   const auth = $('.agent-auth');
-  if (!(await auth.isExisting())) return;
+  if (!firstInRun && !(await auth.isExisting())) return;
   await expect(auth).toHaveText(expect.stringContaining('Sign in with ChatGPT'));
   await auth.$('button').click();
   await expect(auth).not.toBeExisting();
@@ -193,7 +193,7 @@ describe('ACP agent threads', () => {
     await $('.agent-launches button:nth-child(2)').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Codex'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await signInToCodex();
+    await signInToCodex(true);
     await expect($('.option-trigger[aria-label^="Model:"]')).toHaveText('Test model');
     await expect($('.option-trigger[aria-label^="Effort:"]')).toHaveText('Medium');
     await $('.agent-composer textarea').setValue('Try Codex');
@@ -417,7 +417,7 @@ describe('ACP agent threads', () => {
     await $('.agent-launches button:nth-child(2)').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Codex'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await signInToCodex();
+    await signInToCodex(false);
     await $('.agent-composer textarea').setValue('Plan revision fixture');
     await $(sendButton).click();
     await expect($('[aria-label="Native plan"]')).toHaveText(
@@ -526,12 +526,17 @@ describe('ACP agent threads', () => {
     await expect($('.sidebar')).toHaveText(expect.stringContaining('Inspect native delegation'));
     // The child's result shows on its subagent card; its transcript stays out of the parent's.
     expect(
-      await browser.execute(() =>
-        [...document.querySelectorAll('.agent-conversation .agent-message')]
-          .filter((message) => !message.querySelector('[class*="spawn-"]'))
-          .some((message) => message.textContent?.includes('Child transcript stays separate.')),
-      ),
-    ).toBe(false);
+      await browser.execute(() => {
+        const conversation = document.querySelector('.agent-conversation');
+        if (!conversation) return 'missing conversation';
+        const walker = document.createTreeWalker(conversation, NodeFilter.SHOW_TEXT);
+        const places: string[] = [];
+        for (let node = walker.nextNode(); node; node = walker.nextNode())
+          if (node.textContent?.includes('Child transcript stays separate.'))
+            places.push(node.parentElement?.closest('[class*="spawn-"]') ? 'card' : 'transcript');
+        return places.join(',');
+      }),
+    ).toMatch(/^card(,card)*$/);
 
     await $(
       "//button[contains(@class,'project-agent-row') and contains(.,'Inspect native delegation')]",

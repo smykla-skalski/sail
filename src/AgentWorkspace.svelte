@@ -2233,7 +2233,7 @@
   }
 
   function setConfig(configId: string, value: string) {
-    if (!activeSessionId || isBusy) return;
+    if (!activeSessionId || shownBusy) return;
     configFailure = '';
     const sessionId = activeSessionId;
     const previous = settingConfig;
