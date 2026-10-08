@@ -128,3 +128,29 @@ void test('reconciliation stops stale, blocked, and externally inconsistent resu
     'Missing credentials.',
   );
 });
+
+void test('a checkpoint can end cancelled or failed and is then not resumable', () => {
+  const base = initialTaskCheckpoint(task, 10);
+  const stopped = updateTaskCheckpoint(base, { status: 'cancelled' }, 20);
+  assert.equal(stopped.phase, 'resolve');
+  const failed = updateTaskCheckpoint(
+    { ...base, revision: 'rev' },
+    { status: 'failed', phase: 'complete' },
+    20,
+  );
+  assert.equal(taskCheckpointSchema.parse(failed).status, 'failed');
+  assert.throws(
+    () => updateTaskCheckpoint(base, { phase: 'complete', status: 'active' }, 20),
+    /must occur together/,
+  );
+  assert.throws(
+    () => updateTaskCheckpoint(base, { status: 'completed' }, 20),
+    /must occur together/,
+  );
+  const result = reconcileTaskCheckpoint({ ...stopped, revision: 'rev' }, 'rev', {
+    issueState: 'OPEN',
+    deliveryState: 'open',
+  });
+  assert.equal(result.resumable, false);
+  assert.match(result.reason!, /Retry the issue/);
+});
