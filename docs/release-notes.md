@@ -10,6 +10,6 @@ There is no automatic updater. To update, download the next package for your pla
 
 - Ship shows "Fixing · round N" while a worker repairs NEEDS_FIXES or FAIL findings, and "Fixing (CI)" while it repairs failing checks. Only a blocked worker report or a BLOCKED verdict shows "Needs input", with the checkpoint blocker as the reason.
 - A pull request with no required checks can reach "Ready to merge". A pull request closed without merging shows "Closed without merge". An issue closed before its worker launched shows "Closed" instead of failed.
-- Dependent issues show "Waiting on #N", or "Waiting on #N (needs input)" when that dependency needs you.
+- Dependent issues show "Waiting on #N", or "Waiting on #N (needs input)" when that dependency has failed.
 - Settings has a new "Who merges Ship PRs" choice. "You" is the default: workers stop at a mergeable pull request and report `awaiting_merge`. "Agent, per repository release policy" leaves merging to the worker. Repository instructions that say who merges take precedence.
 - Stored `blockedReason` text from earlier fix rounds is ignored while a NEEDS_FIXES or FAIL verdict is current.
