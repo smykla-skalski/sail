@@ -3411,6 +3411,7 @@
     generation: number;
     nativeGeneration: number;
     ownershipGeneration: string;
+    openCodeSessionIds: string[];
     receipts: SpawnReceipt[];
   } | null> {
     const nativeGeneration = await reconcileProviderNativeSubagents(issue);
@@ -3435,6 +3436,9 @@
     const knownThreadIds = shipOwnedThreadIds(issue, receipts);
     const openCodeDescendants = await reconcileProviderOpenCodeDescendants(issue, knownThreadIds);
     const threadIds = [...new Set([...knownThreadIds, ...openCodeDescendants])];
+    const openCodeSessionIds = threadIds
+      .filter((threadId) => threadId.startsWith('opencode:'))
+      .map((threadId) => threadId.slice('opencode:'.length));
     const ownershipGeneration = shipOwnershipQuietGeneration(
       generation,
       nativeGeneration,
@@ -3471,7 +3475,13 @@
       !shipTaskThreadsSettled(issue, states, receipts, openCodeDescendants)
     )
       return null;
-    return { generation, nativeGeneration, ownershipGeneration, receipts };
+    return {
+      generation,
+      nativeGeneration,
+      ownershipGeneration,
+      openCodeSessionIds,
+      receipts,
+    };
   }
 
   function missingRepositoryPath(cause: unknown): boolean {
@@ -3741,6 +3751,9 @@
             request: {
               ...shipCleanupRequest(run.repository, issue, currentRevision),
               nativeGeneration: confirmedOwnership.nativeGeneration,
+              ...(confirmedOwnership.openCodeSessionIds.length
+                ? { openCodeSessionIds: confirmedOwnership.openCodeSessionIds }
+                : {}),
             },
           });
           saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
@@ -4020,17 +4033,13 @@
     });
   }
 
-  async function settleOpenCodeReceipt(
-    receipt: SpawnReceipt,
-    source: OpenCodeClient,
-    outcome: 'succeeded' | 'failed' | 'interrupted' | undefined,
-  ) {
+  async function settleOpenCodeReceipt(receipt: SpawnReceipt, source: OpenCodeClient) {
     const sessionId = receipt.targetId?.slice('opencode:'.length);
     if (!sessionId || !receipt.prompt) {
       updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
       return;
     }
-    const settled = await openCodePromptSettlement(receipt, outcome, (cursor) =>
+    const settled = await openCodePromptSettlement(receipt, (cursor) =>
       source.message.list({
         sessionID: sessionId,
         limit: 50,
@@ -4079,13 +4088,13 @@
           updateSpawnReceipt(receipt.receiptId, { state: 'waiting' });
         else if (active[sessionId]?.type === 'running')
           updateSpawnReceipt(receipt.receiptId, { state: 'working' });
-        else if (session.outcome) await settleOpenCodeReceipt(receipt, client, session.outcome);
+        else if (session.outcome) await settleOpenCodeReceipt(receipt, client);
         else if (inbox.some((item) => item.id === receipt.turnId))
           updateSpawnReceipt(receipt.receiptId, { state: 'queued' });
         else if (!receipt.turnId && inbox.length === 1)
           updateSpawnReceipt(receipt.receiptId, { state: 'queued', turnId: inbox[0].id });
         else if (receipt.state === 'starting') return receipt;
-        else await settleOpenCodeReceipt(receipt, client, session.outcome);
+        else await settleOpenCodeReceipt(receipt, client);
       } catch {
         updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
       }
@@ -6303,9 +6312,8 @@
                 session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
                 tracking,
               );
-            const outcome = await promptClient.session.get({ sessionID: session.id });
             const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
-            if (receipt) await settleOpenCodeReceipt(receipt, promptClient, outcome.outcome);
+            if (receipt) await settleOpenCodeReceipt(receipt, promptClient);
           } catch (cause) {
             if (tracking) abandonImplementationTurn(created.path, tracking);
             updateSpawnReceipt(receiptId, { state: 'unavailable', error: describe(cause) });

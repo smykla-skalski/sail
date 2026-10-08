@@ -293,6 +293,7 @@ export function openCodePromptHasBackendEvidence(
 export type OpenCodePromptRecoveryAction = 'adopt' | 'inspect' | 'dispatch';
 
 type OpenCodeHistoryMessage = {
+  id?: string;
   type: string;
   text?: string;
   outcome?: 'succeeded' | 'failed' | 'interrupted';
@@ -348,16 +349,40 @@ export async function openCodePromptHasHistoryEvidence(
 
 export async function openCodePromptSettlement(
   receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
-  outcome: 'succeeded' | 'failed' | 'interrupted' | undefined,
   loadPage: (cursor?: string) => Promise<OpenCodeHistoryPage>,
 ): Promise<Pick<SpawnReceipt, 'state' | 'result'>> {
-  const history = await loadOpenCodePromptHistory(receipt, [], loadPage);
-  if (!history.hasPromptEvidence) return { state: 'unavailable', result: null };
-  const idle = history.latestMessages.find((message) => message.type === 'idle');
-  const finished = idle?.outcome ?? outcome;
-  if (!finished) return { state: 'unavailable', result: null };
+  const seen = new Set<string>();
+  const messages: OpenCodeHistoryMessage[] = [];
+  async function collect(cursor?: string): Promise<void> {
+    const page = await loadPage(cursor);
+    messages.push(...page.data);
+    const next = page.cursor.next ?? undefined;
+    if (!next) return;
+    if (seen.has(next)) throw new Error('OpenCode message history cursor did not advance.');
+    seen.add(next);
+    return collect(next);
+  }
+  await collect();
+  let promptIndex = messages.findIndex(
+    (message) => message.type === 'user' && message.id === receipt.turnId,
+  );
+  if (promptIndex < 0)
+    promptIndex = messages.findIndex(
+      (message) => message.type === 'user' && message.text === receipt.prompt,
+    );
+  if (promptIndex < 0) return { state: 'unavailable', result: null };
+  let idleIndex = -1;
+  for (let index = promptIndex - 1; index >= 0; index -= 1)
+    if (messages[index].type === 'idle') {
+      idleIndex = index;
+      break;
+    }
+  const idle = messages[idleIndex];
+  const finished = idle?.outcome;
+  if (idleIndex < 0 || !finished) return { state: 'unavailable', result: null };
+  const turnMessages = messages.slice(idleIndex + 1, promptIndex).toReversed();
   const result =
-    history.latestMessages
+    turnMessages
       .flatMap((message) =>
         message.type === 'assistant' && message.time?.completed
           ? (message.content ?? []).flatMap((part) =>

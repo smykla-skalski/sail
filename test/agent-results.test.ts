@@ -604,27 +604,68 @@ await test('completed OpenCode handoff settlement finds its prompt beyond the ne
     [
       undefined,
       {
-        data: Array.from({ length: 50 }, (_, index) => ({
-          type: 'assistant',
-          text: `Completed output ${index}`,
-        })),
+        data: [
+          { type: 'idle', outcome: 'succeeded' as const },
+          ...Array.from({ length: 49 }, (_, index) => ({
+            type: 'assistant',
+            text: `Completed output ${index}`,
+          })),
+        ],
         cursor: { next: 'older' },
       },
     ],
     [
       'older',
       {
-        data: [{ type: 'user', text: 'Continue from the canonical checkpoint' }],
+        data: [
+          {
+            id: 'handoff-turn',
+            type: 'user',
+            text: 'Continue from the canonical checkpoint',
+          },
+        ],
         cursor: { next: null },
       },
     ],
   ]);
 
-  const settled = await openCodePromptSettlement(handoff, 'succeeded', async (cursor) =>
-    pages.get(cursor)!,
-  );
+  const settled = await openCodePromptSettlement(handoff, async (cursor) => pages.get(cursor)!);
 
   assert.deepEqual(settled, { state: 'completed', result: null });
+});
+
+await test('OpenCode handoff settlement ignores a later successful turn', async () => {
+  const handoff = {
+    prompt: 'Continue from the canonical checkpoint',
+    turnId: 'handoff-turn',
+  };
+  const page = {
+    data: [
+      { type: 'idle', outcome: 'succeeded' as const },
+      {
+        type: 'assistant',
+        time: { completed: 6 },
+        content: [{ type: 'text', text: 'Later prompt output' }],
+      },
+      { id: 'later-turn', type: 'user', text: 'Fix something else' },
+      { type: 'idle', outcome: 'failed' as const },
+      {
+        type: 'assistant',
+        time: { completed: 3 },
+        content: [{ type: 'text', text: 'Handoff failure output' }],
+      },
+      {
+        id: 'handoff-turn',
+        type: 'user',
+        text: 'Continue from the canonical checkpoint',
+      },
+    ],
+    cursor: { next: null },
+  };
+
+  const settled = await openCodePromptSettlement(handoff, async () => page);
+
+  assert.deepEqual(settled, { state: 'failed', result: 'Handoff failure output' });
 });
 
 await test('unrelated OpenCode activity after a pre-dispatch crash requires inspection', () => {
