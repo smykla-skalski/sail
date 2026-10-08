@@ -478,6 +478,22 @@ export function shipCheckpointOwner(runs: ShipRun[], directory: string, threadId
   return undefined;
 }
 
+function shipSpawnOwner(runs: ShipRun[], directory: string, threadId: string) {
+  const checkpointOwner = shipCheckpointOwner(runs, directory, threadId);
+  if (checkpointOwner) return checkpointOwner;
+  for (const run of runs) {
+    const issue = run.issues.find(
+      (item) =>
+        item.path === directory &&
+        item.contextHandoffs?.some(
+          (handoff) => handoff.fromThreadId === threadId || handoff.toThreadId === threadId,
+        ),
+    );
+    if (issue) return { run, issue };
+  }
+  return undefined;
+}
+
 export function authorizeShipCheckpointThread(
   runs: ShipRun[],
   sourceDirectory: string,
@@ -485,7 +501,7 @@ export function authorizeShipCheckpointThread(
   targetDirectory: string | null,
   targetId: string | null,
 ): boolean {
-  const owner = shipCheckpointOwner(runs, sourceDirectory, sourceId);
+  const owner = shipSpawnOwner(runs, sourceDirectory, sourceId);
   if (!owner || !targetId || targetDirectory !== owner.issue.path) return false;
   if (owner.issue.checkpointThreadIds?.includes(targetId)) return false;
   owner.issue.checkpointThreadIds = [...(owner.issue.checkpointThreadIds ?? []), targetId];
@@ -673,14 +689,59 @@ export function shipMergeClaim(issue: ShipIssue): string {
   return 'PR open';
 }
 
+export function shipOwnedThreadIds(
+  issue: ShipIssue,
+  receipts: Array<
+    Partial<Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetId' | 'targetDirectory'>>
+  > = [],
+): string[] {
+  const lineage = new Set(
+    [
+      issue.threadId,
+      ...(issue.checkpointThreadIds ?? []),
+      ...(issue.contextHandoffs ?? []).flatMap((handoff) => [
+        handoff.fromThreadId,
+        handoff.toThreadId,
+      ]),
+    ].filter(Boolean),
+  );
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const receipt of receipts) {
+      if (
+        receipt.sourceDirectory !== issue.path ||
+        receipt.targetDirectory !== issue.path ||
+        !receipt.sourceId ||
+        !lineage.has(receipt.sourceId) ||
+        !receipt.targetId ||
+        lineage.has(receipt.targetId)
+      )
+        continue;
+      lineage.add(receipt.targetId);
+      expanded = true;
+    }
+  }
+  return [...lineage].filter((threadId): threadId is string => Boolean(threadId));
+}
+
 export function shipTaskThreadsSettled(
   issue: ShipIssue,
   states: Partial<Record<string, SpawnState>>,
-  receipts: Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'>[],
+  receipts: Array<
+    Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'> &
+      Partial<Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetDirectory'>>
+  >,
 ): boolean {
-  const threadIds = [...new Set([issue.threadId, ...(issue.checkpointThreadIds ?? [])])].filter(
-    (threadId): threadId is string => Boolean(threadId),
-  );
+  const threadIds = [
+    ...new Set([
+      ...shipOwnedThreadIds(issue, receipts),
+      ...(issue.contextHandoffs ?? []).flatMap((handoff) => [
+        handoff.fromThreadId,
+        handoff.toThreadId,
+      ]),
+    ]),
+  ].filter((threadId): threadId is string => Boolean(threadId));
   return threadIds.every((threadId) => {
     const live = states[threadId] ?? 'unavailable';
     const receipt = receipts.find((item) =>
@@ -690,6 +751,18 @@ export function shipTaskThreadsSettled(
     if (live !== 'unavailable') return shippingWorkerSettled(live);
     return receipt !== undefined && shippingWorkerSettled(receipt.state);
   });
+}
+
+export function shipOwnershipQuietPass(
+  previousGeneration: number | null,
+  currentGeneration: number,
+  hasUnsettledOwnership: boolean,
+): { settled: boolean; nextGeneration: number | null } {
+  if (hasUnsettledOwnership) return { settled: false, nextGeneration: null };
+  return {
+    settled: previousGeneration === currentGeneration,
+    nextGeneration: currentGeneration,
+  };
 }
 
 export function reconciledShipGates(issue: ShipIssue, receipts: SpawnReceipt[]): ShipGate[] {
@@ -1101,6 +1174,46 @@ const shipIssueSchema = z.object({
   refreshError: nullableString.optional(),
   checkpoint: taskCheckpointSchema.optional(),
   checkpointThreadIds: z.array(z.string()).optional(),
+  contextCompactions: z
+    .object({
+      claude: z.number().int().nonnegative().optional(),
+      codex: z.number().int().nonnegative().optional(),
+      opencode: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
+  contextEventIds: z.array(z.string().min(1)).max(200).optional(),
+  contextHandoffs: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        provider: z.enum(['claude', 'codex', 'opencode']),
+        fromThreadId: z.string().min(1),
+        toThreadId: z.string().nullable(),
+        context: z.number().min(0).max(100),
+        compactions: z.number().int().nonnegative(),
+        checkpointSequence: z.number().int().nonnegative(),
+        revision: z.string().nullable(),
+        offeredAt: z.number().int().nonnegative(),
+        startedAt: z.number().int().nonnegative().nullable(),
+        retriesBefore: z.number().int().nonnegative(),
+        lostStateFailuresBefore: z.number().int().nonnegative(),
+        retriesAfter: z.number().int().nonnegative().nullable(),
+        lostStateFailuresAfter: z.number().int().nonnegative().nullable(),
+        outcome: z.enum(['pending', 'reduced', 'unchanged', 'regressed', 'failed']),
+        error: z.string().nullable(),
+      }),
+    )
+    .max(100)
+    .optional(),
+  contextCheckpointRequestedAt: z.number().int().nonnegative().optional(),
+  contextCheckpointRequestedSequence: z.number().int().nonnegative().optional(),
+  contextHandoffOfferedAt: z.number().int().nonnegative().optional(),
+  contextHandoffOfferedSequence: z.number().int().nonnegative().optional(),
+  contextPercent: z.number().min(0).max(100).optional(),
+  contextPercentByThread: z.record(z.string().min(1), z.number().min(0).max(100)).optional(),
+  handoffRecoveryRequired: z.boolean().optional(),
+  retryCount: z.number().int().nonnegative().optional(),
+  lostStateFailures: z.number().int().nonnegative().optional(),
   evidenceManifests: evidenceManifestsSchema.optional(),
   evidenceRevision: z.string().min(1).optional(),
   evidenceCommit: z.string().min(1).optional(),
@@ -1155,7 +1268,19 @@ export function loadShipRuns(raw: string | null): ShipRun[] {
     if (!Array.isArray(value)) return [];
     return value.flatMap((item) => {
       const parsed = shipRunSchema.safeParse(item);
-      return parsed.success ? [parsed.data] : [];
+      if (!parsed.success) return [];
+      for (const issue of parsed.data.issues)
+        issue.contextHandoffs = issue.contextHandoffs?.map((handoff) =>
+          handoff.outcome === 'pending' &&
+          !handoff.toThreadId &&
+          handoff.fromThreadId !== issue.threadId
+            ? Object.assign({}, handoff, {
+                outcome: 'failed' as const,
+                error: 'Retired stale handoff offer during recovery.',
+              })
+            : handoff,
+        );
+      return [parsed.data];
     });
   } catch {
     return [];

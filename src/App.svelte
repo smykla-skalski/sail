@@ -51,6 +51,8 @@
     shipGatesSettled,
     shipCleanupRequest,
     shipEvidenceReadiness,
+    shipOwnedThreadIds,
+    shipOwnershipQuietPass,
     shipTaskThreadsSettled,
     reconciledShipGates,
     recoverValidationEvidence,
@@ -88,6 +90,16 @@
     prepareTaskCheckpointUpdate,
     reconcileTaskCheckpoint,
   } from './lib/task-checkpoint.ts';
+  import {
+    ContextPressureRecorder,
+    contextCheckpointLead,
+    contextHandoffPrompt,
+    contextPressureStage,
+    handoffOutcome,
+    parseContextHandoffThreshold,
+    updateThreadContextPressure,
+    type ContextProvider,
+  } from './lib/context-handoff.ts';
   import {
     commitRevisionBoundEvidence,
     evidenceReadiness,
@@ -305,13 +317,24 @@
   } from './lib/coordination';
   import {
     acpReceiptState,
+    acpPromptHasBackendEvidence,
+    acpTurnDispatchProven,
+    acpTurnEvidenceState,
+    acpTurnNeedsProviderInspection,
+    acpTurnPromptCanRetry,
+    activeSpawnReceiptForThread,
     activeSubagentsForSource,
+    handoffReceiptNeedsResolution,
+    handoffPromptNeedsRecovery,
     loadSpawnReceipts,
     receiptForSource,
     receiptNeedsRefresh,
     receiptIsSettled,
     receiptSourceId,
+    pendingHandoffReplacement,
+    resolvedHandoffRecoveryError,
     saveBoundedReceipt,
+    spawnPromptDispatchAllowed,
     spawnReceiptsForSource,
     withSpawnResponses,
     type SpawnReceipt,
@@ -323,6 +346,7 @@
     nativeSubagentId,
     nativeSubagentReceipts,
     nativeSubagentThreads as threadsForNativeSubagents,
+    reconcileNativeSubagents,
     setNativeSubagentWaiting,
     updateNativeSubagents,
     type NativeSubagentStore,
@@ -629,6 +653,7 @@
   let agentDetectionError = $state('');
   let agentThreads = $state<AgentThread[]>(savedAgentThreads);
   let nativeSubagents = $state<NativeSubagentStore>({});
+  let nativeSubagentGeneration = 0;
   let nativeChildThreads = $derived(threadsForNativeSubagents(nativeSubagents));
   let nativeChildReceipts = $derived(nativeSubagentReceipts(nativeSubagents));
   let visibleSpawnReceipts = $derived([...spawnReceipts, ...nativeChildReceipts]);
@@ -780,6 +805,9 @@
   let attentionRevision = 0;
   let notificationsEnabled = $state(getSetting('sai-notifications-enabled') !== 'false');
   let crossValidation = $state(parseValidationSettings(getSetting(validationSettingsKey)));
+  let contextHandoffThreshold = $state(
+    parseContextHandoffThreshold(getSetting('sai-context-handoff-threshold')),
+  );
   let notificationSound = $state(getSetting('sai-notification-sound') !== 'false');
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
   let agentTerminalsEnabled = $state(getSetting('sai-agent-terminals-enabled') === 'true');
@@ -1360,6 +1388,8 @@
   let diffPollTimer: ReturnType<typeof setInterval> | undefined;
   let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
   let healthTimer: ReturnType<typeof setInterval> | undefined;
+  const shipContextTimers = new SvelteMap<string, ReturnType<typeof setTimeout>>();
+  const openCodePressureRecorder = new ContextPressureRecorder();
   let connecting = $state(false);
   let disposed = false;
   let hasConnected = false;
@@ -1829,6 +1859,7 @@
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
+      contextHandoffThreshold,
     };
   }
 
@@ -2006,6 +2037,26 @@
         } else if (action.type === 'agent-messages') {
           agentMessagesEnabled = action.value;
           setSetting('sai-agent-messages-enabled', String(action.value));
+        } else if (action.type === 'context-handoff-threshold') {
+          const previousThreshold = contextHandoffThreshold;
+          contextHandoffThreshold = parseContextHandoffThreshold(String(action.value));
+          setSetting('sai-context-handoff-threshold', String(contextHandoffThreshold));
+          if (contextHandoffThreshold < previousThreshold)
+            for (const run of shipRuns)
+              for (const issue of run.issues)
+                if (
+                  issue.state === 'working' &&
+                  issue.path &&
+                  issue.threadId &&
+                  issue.contextPercent !== undefined &&
+                  issue.contextPercent < previousThreshold
+                )
+                  void recordShipContextPressure(
+                    issue.path,
+                    issue.threadId,
+                    issue.contextPercent,
+                    Math.max(0, contextHandoffThreshold - contextCheckpointLead - 1),
+                  ).catch((cause) => (error = describe(cause)));
         } else if (action.type === 'detect-agents') void detectAgents();
         else if (action.type === 'cross-validation') {
           crossValidation = action.value;
@@ -2098,6 +2149,8 @@
       clearInterval(healthTimer);
       clearInterval(sidebarRefreshTimer);
       clearTimeout(sidebarInventoryTimer);
+      for (const timer of shipContextTimers.values()) clearTimeout(timer);
+      shipContextTimers.clear();
       clearInterval(diffPollTimer);
       discardLiveText();
       unlistenAgentEvents?.();
@@ -2336,6 +2389,554 @@
       Object.assign(current, previous);
       setSetting('sai-ship-runs', JSON.stringify(shipRuns));
       throw cause;
+    }
+  }
+
+  function contextProvider(threadId: string): ContextProvider {
+    if (threadId.startsWith('opencode:')) return 'opencode';
+    if (threadId.startsWith('acp:claude:')) return 'claude';
+    return 'codex';
+  }
+
+  async function recordShipContextPressure(
+    path: string,
+    threadId: string,
+    context: number | undefined,
+    previousContext?: number,
+  ): Promise<void> {
+    const owner = shipCheckpointOwner(shipRuns, path, threadId);
+    if (!owner || context === undefined) return;
+    const primary = owner.issue.threadId === threadId;
+    const pressure = updateThreadContextPressure(
+      owner.issue.contextPercentByThread,
+      threadId,
+      context,
+      owner.issue.threadId ?? undefined,
+    );
+    const previous =
+      previousContext ?? pressure.previous ?? (primary ? owner.issue.contextPercent : undefined);
+    const stage = contextPressureStage(previous, context, contextHandoffThreshold);
+    const changes: Partial<ShipIssue> = {
+      contextPercentByThread: pressure.contexts,
+      ...(primary ? { contextPercent: context } : {}),
+    };
+    if (!primary) {
+      await updateShipIssue(owner.run, owner.issue, changes);
+      return;
+    }
+    const checkpoint = owner.issue.checkpoint;
+    const handoffInFlight = owner.issue.contextHandoffs?.some(
+      (handoff) =>
+        handoff.fromThreadId === threadId &&
+        !handoff.toThreadId &&
+        handoff.outcome === 'pending' &&
+        contextHandoffsInFlight.has(handoff.id),
+    );
+    if (stage && handoffInFlight) {
+      await updateShipIssue(owner.run, owner.issue, changes);
+      return;
+    }
+    if ((stage === 'checkpoint' || stage === 'handoff') && checkpoint) {
+      changes.contextCheckpointRequestedAt = Date.now();
+      changes.contextCheckpointRequestedSequence = checkpoint.sequence;
+      coordinationMessages = enqueueCoordinationMessage(coordinationMessages, {
+        id: crypto.randomUUID(),
+        target: coordinationKey(path, threadId),
+        sender: 'Sail · context guard',
+        text: `Context reached ${context}%. Update the canonical task checkpoint now, before the ${contextHandoffThreshold}% handoff threshold. Record the current revision, semantic state, pending gates, blockers, and one concrete next action.`,
+        created: Date.now(),
+      });
+      setSetting('sai-coordination-messages', JSON.stringify(coordinationMessages));
+      setTimeout(retryCoordinationDeliveries, 0);
+    }
+    if (stage === 'handoff' && checkpoint) {
+      changes.contextHandoffOfferedAt = Date.now();
+      changes.contextHandoffOfferedSequence = checkpoint.sequence;
+      const pending = owner.issue.contextHandoffs?.findLast(
+        (handoff) =>
+          handoff.fromThreadId === threadId && !handoff.toThreadId && handoff.outcome === 'pending',
+      );
+      if (pending && !contextHandoffsInFlight.has(pending.id))
+        changes.contextHandoffs = (owner.issue.contextHandoffs ?? []).map((handoff) =>
+          handoff.id === pending.id
+            ? Object.assign({}, handoff, {
+                context,
+                compactions: owner.issue.contextCompactions?.[contextProvider(threadId)] ?? 0,
+                checkpointSequence: checkpoint.sequence,
+                revision: checkpoint.revision,
+                offeredAt: Date.now(),
+                retriesBefore: owner.issue.retryCount ?? 0,
+                lostStateFailuresBefore: owner.issue.lostStateFailures ?? 0,
+                error: null,
+              })
+            : handoff,
+        );
+      else if (!pending)
+        changes.contextHandoffs = [
+          ...(owner.issue.contextHandoffs ?? []),
+          {
+            id: crypto.randomUUID(),
+            provider: contextProvider(threadId),
+            fromThreadId: threadId,
+            toThreadId: null,
+            context,
+            compactions: owner.issue.contextCompactions?.[contextProvider(threadId)] ?? 0,
+            checkpointSequence: checkpoint.sequence,
+            revision: checkpoint.revision,
+            offeredAt: Date.now(),
+            startedAt: null,
+            retriesBefore: owner.issue.retryCount ?? 0,
+            lostStateFailuresBefore: owner.issue.lostStateFailures ?? 0,
+            retriesAfter: null,
+            lostStateFailuresAfter: null,
+            outcome: 'pending' as const,
+            error: null,
+          },
+        ].slice(-100);
+    }
+    await updateShipIssue(owner.run, owner.issue, changes);
+  }
+
+  function recordOpenCodeContextPressure(path: string, id: string, context: number): Promise<void> {
+    if (!shipCheckpointOwner(shipRuns, path, `opencode:${id}`)) return Promise.resolve();
+    return openCodePressureRecorder.record(`${path}:${id}`, context, () =>
+      recordShipContextPressure(path, `opencode:${id}`, context),
+    );
+  }
+
+  async function recordShipContextEvent(
+    path: string,
+    threadId: string,
+    eventId: string,
+    kind: 'compaction' | 'retry',
+  ): Promise<void> {
+    const owner = shipCheckpointOwner(shipRuns, path, threadId);
+    if (!owner || owner.issue.contextEventIds?.includes(eventId)) return;
+    const provider = contextProvider(threadId);
+    const contextEventIds = [...(owner.issue.contextEventIds ?? []), eventId].slice(-200);
+    await updateShipIssue(owner.run, owner.issue, {
+      contextEventIds,
+      ...(kind === 'compaction'
+        ? {
+            contextCompactions: {
+              ...owner.issue.contextCompactions,
+              [provider]: (owner.issue.contextCompactions?.[provider] ?? 0) + 1,
+            },
+          }
+        : { retryCount: (owner.issue.retryCount ?? 0) + 1 }),
+    });
+  }
+
+  async function reconcileProviderNativeSubagents(issue: ShipIssue): Promise<number> {
+    if (!issue.path) return 0;
+    const nativeSnapshot = await acp.nativeSubagents(issue.path);
+    const previous = nativeSubagents;
+    nativeSubagents = reconcileNativeSubagents(nativeSubagents, nativeSnapshot.subagents);
+    if (nativeSubagents !== previous) nativeSubagentGeneration += 1;
+    let authorized = false;
+    for (const child of nativeSnapshot.subagents)
+      authorized =
+        authorizeShipCheckpointThread(
+          shipRuns,
+          child.directory,
+          `acp:${child.agent}:${child.parentSessionId}`,
+          child.directory,
+          `acp:${child.agent}:${child.sessionId}`,
+        ) || authorized;
+    if (authorized) await saveShipRuns();
+    return nativeSnapshot.generation;
+  }
+
+  async function waitForSettledShipWorker(
+    issue: ShipIssue,
+    threadId = issue.threadId,
+    attempts = 50,
+  ): Promise<SpawnState> {
+    if (issue.path) await reconcileProviderNativeSubagents(issue);
+    const state = await directShipWorkerState({ ...issue, threadId });
+    if (shippingWorkerSettled(state) || attempts <= 1) return state;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return waitForSettledShipWorker(issue, threadId, attempts - 1);
+  }
+
+  async function cancelShipThread(
+    issue: ShipIssue,
+    threadId: string,
+    attempts = 50,
+  ): Promise<SpawnState> {
+    const launch = activeSpawnReceiptForThread(
+      spawnReceipts,
+      activeSpawnRequests,
+      threadId,
+      issue.path ?? '',
+    );
+    if (launch && (launch.state === 'queued' || launch.state === 'starting')) {
+      updateSpawnReceipt(launch.receiptId, {
+        state: 'interrupted',
+        error: 'Launch cancelled before prompt dispatch.',
+      });
+      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      return 'interrupted';
+    }
+    const current = await directShipWorkerState({ ...issue, threadId });
+    if (launch && shippingWorkerSettled(current)) {
+      if (attempts <= 1)
+        throw new Error('A task-owned worker launch did not settle before handoff.');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return cancelShipThread(issue, threadId, attempts - 1);
+    }
+    if (shippingWorkerSettled(current)) return current;
+    if (threadId.startsWith('opencode:')) {
+      if (!client) throw new Error('OpenCode is unavailable, so a task worker cannot stop.');
+      await client.session.interrupt({ sessionID: threadId.slice('opencode:'.length) });
+    } else {
+      const match = /^acp:([^:]+):(.+)$/.exec(threadId);
+      if (!match) throw new Error('A task worker identity cannot be stopped safely.');
+      await acp.cancel(match[1], match[2], null);
+    }
+    return waitForSettledShipWorker(issue, threadId);
+  }
+
+  async function settleOwnedShipThreads(
+    issue: ShipIssue,
+    retired: SvelteSet<string>,
+    attempts = 300,
+    quietGeneration: number | null = null,
+  ): Promise<{ retired: SvelteSet<string>; nativeGeneration: number }> {
+    if (attempts <= 0)
+      throw new Error('Task-owned workers kept spawning during handoff cancellation.');
+    const nativeGeneration = await reconcileProviderNativeSubagents(issue);
+    const ownedReceipts = [...spawnReceipts, ...nativeChildReceipts];
+    const lineage = new SvelteSet([...retired, ...shipOwnedThreadIds(issue, ownedReceipts)]);
+    const owned = [...lineage].filter((threadId) => !retired.has(threadId));
+    const unresolvedSpawn = ownedReceipts.some(
+      (receipt) =>
+        receipt.sourceDirectory === issue.path &&
+        receipt.targetDirectory === issue.path &&
+        lineage.has(receipt.sourceId) &&
+        !receipt.targetId &&
+        !shippingWorkerSettled(receipt.state),
+    );
+    const quiet = shipOwnershipQuietPass(
+      quietGeneration,
+      nativeSubagentGeneration,
+      owned.length > 0 || unresolvedSpawn,
+    );
+    if (quiet.settled) return { retired, nativeGeneration };
+    if (!owned.length && !unresolvedSpawn) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return settleOwnedShipThreads(issue, retired, attempts - 1, quiet.nextGeneration);
+    }
+    const states = await Promise.all(
+      owned.map(async (threadId) => ({
+        threadId,
+        state: await cancelShipThread(issue, threadId),
+      })),
+    );
+    for (const { threadId, state } of states) {
+      if (!shippingWorkerSettled(state))
+        throw new Error('A task-owned worker did not settle, so the handoff was not started.');
+      retired.add(threadId);
+    }
+    if (unresolvedSpawn) await new Promise((resolve) => setTimeout(resolve, 100));
+    return settleOwnedShipThreads(issue, retired, attempts - 1, null);
+  }
+
+  const contextHandoffsInFlight = new SvelteSet<string>();
+
+  async function replacementDispatchProven(receipt: SpawnReceipt): Promise<boolean> {
+    if (!receipt.targetId || !receipt.targetDirectory || !receipt.turnId || !receipt.prompt)
+      return false;
+    if (receipt.provider !== 'opencode') {
+      const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
+      return acpTurnDispatchProven(
+        await acp.turnEvidence(receipt.provider, sessionId, receipt.turnId).catch(() => null),
+      );
+    }
+    if (!client) return false;
+    const sessionId = receipt.targetId.slice('opencode:'.length);
+    try {
+      const [session, page, inbox, active] = await Promise.all([
+        client.session.get({ sessionID: sessionId }),
+        client.message.list({ sessionID: sessionId, limit: 50, order: 'desc' }),
+        client.session.inbox.list({ sessionID: sessionId }),
+        client.session.active(),
+      ]);
+      if (session.location.directory !== receipt.targetDirectory) return false;
+      return (
+        page.data.some((message) => message.type === 'user' && message.text === receipt.prompt) ||
+        inbox.some((item) => item.id === receipt.turnId) ||
+        active[sessionId]?.type === 'running' ||
+        Boolean(session.outcome)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  async function retryUncertainHandoff(
+    run: ShipRun,
+    issue: ShipIssue,
+    handoff: NonNullable<ShipIssue['contextHandoffs']>[number],
+  ): Promise<void> {
+    const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+    if (
+      !receipt ||
+      receipt.provider === 'opencode' ||
+      !receipt.targetId ||
+      !receipt.turnId ||
+      !handoffReceiptNeedsResolution(receipt)
+    )
+      throw new Error('This handoff no longer needs provider inspection.');
+    const confirmed = await confirmInApp(
+      'Cancel and retry context handoff?',
+      'Inspect the restored provider session first. Continue only after confirming that its work must not be adopted. Sail will cancel that session before creating a fresh worker.',
+      'Cancel and retry',
+    );
+    if (!confirmed) return;
+    const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
+    await acp.cancel(receipt.provider, sessionId, receipt.turnId);
+    updateSpawnReceipt(receipt.receiptId, {
+      state: 'interrupted',
+      error: 'Cancelled after provider inspection before a safe retry.',
+    });
+    await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+    const now = Date.now();
+    const retry = {
+      ...handoff,
+      id: crypto.randomUUID(),
+      provider: contextProvider(issue.threadId!),
+      fromThreadId: issue.threadId!,
+      toThreadId: null,
+      checkpointSequence: Math.max(0, issue.checkpoint!.sequence - 1),
+      revision: issue.checkpoint!.revision,
+      offeredAt: now,
+      startedAt: null,
+      retriesBefore: issue.retryCount ?? 0,
+      lostStateFailuresBefore: issue.lostStateFailures ?? 0,
+      retriesAfter: null,
+      lostStateFailuresAfter: null,
+      outcome: 'pending' as const,
+      error: null,
+    };
+    await updateShipIssue(run, issue, {
+      contextHandoffs: [
+        ...(issue.contextHandoffs ?? []).map((item) =>
+          item.id === handoff.id
+            ? Object.assign({}, item, {
+                outcome: 'failed' as const,
+                error: 'Cancelled after provider inspection before a safe retry.',
+              })
+            : item,
+        ),
+        retry,
+      ].slice(-100),
+      handoffRecoveryRequired: false,
+      workerSettled: true,
+      workerState: 'interrupted',
+      error: null,
+    });
+    await handoffShipIssue(run, issue);
+  }
+
+  async function handoffShipIssue(run: ShipRun, issue: ShipIssue): Promise<void> {
+    if (!issue.path || !issue.threadId || !issue.checkpoint)
+      throw new Error('This task has no active worker checkpoint to hand off.');
+    const offer = issue.contextHandoffs?.findLast(
+      (item) =>
+        item.fromThreadId === issue.threadId && !item.toThreadId && item.outcome === 'pending',
+    );
+    if (!offer) {
+      const uncertain = issue.contextHandoffs?.findLast(
+        (item) =>
+          item.toThreadId === issue.threadId &&
+          item.outcome === 'pending' &&
+          issue.handoffRecoveryRequired === true,
+      );
+      if (uncertain) return retryUncertainHandoff(run, issue, uncertain);
+      throw new Error('This task has no pending context handoff.');
+    }
+    if (contextHandoffsInFlight.has(offer.id))
+      throw new Error('This context handoff is already starting.');
+    contextHandoffsInFlight.add(offer.id);
+    try {
+      if (issue.checkpoint.sequence <= offer.checkpointSequence)
+        throw new Error('The worker must update the canonical checkpoint before handoff.');
+      const revision = await invoke<string>('working_tree_revision', { path: issue.path });
+      if (issue.checkpoint.revision !== revision)
+        throw new Error('The checkpoint must be rebound to the current worktree revision first.');
+      const receiptId = crypto.randomUUID();
+      const accessKey = crypto.randomUUID();
+      const previousWorker = {
+        receiptId: issue.receiptId,
+        threadId: issue.threadId,
+        checkpointThreadIds: issue.checkpointThreadIds,
+        workerSettled: issue.workerSettled,
+        workerState: issue.workerState,
+      };
+      let cancellationCompleted = false;
+      let previousWorkerState = issue.workerState ?? 'unavailable';
+      let retiredThreadIds = new SvelteSet<string>();
+      try {
+        const previousThreadId = issue.threadId;
+        previousWorkerState = await cancelShipThread(issue, previousThreadId);
+        cancellationCompleted = true;
+        if (!shippingWorkerSettled(previousWorkerState))
+          throw new Error('The current worker did not settle, so the handoff was not started.');
+        retiredThreadIds.add(previousThreadId);
+        const settlement = await settleOwnedShipThreads(issue, retiredThreadIds);
+        retiredThreadIds = settlement.retired;
+        const currentOffer = issue.contextHandoffs?.find((item) => item.id === offer.id);
+        if (
+          !currentOffer ||
+          currentOffer.fromThreadId !== issue.threadId ||
+          currentOffer.toThreadId ||
+          currentOffer.outcome !== 'pending' ||
+          issue.checkpoint.sequence <= currentOffer.checkpointSequence
+        )
+          throw new Error('The handoff checkpoint changed while the current worker was stopping.');
+        const settledRevision = await invoke<string>('working_tree_revision', { path: issue.path });
+        if (issue.checkpoint.revision !== settledRevision)
+          throw new Error('The settled checkpoint must match the current worktree revision.');
+        const prompt = contextHandoffPrompt({
+          checkpoint: issue.checkpoint,
+          branch: issue.branch,
+          revision: settledRevision,
+          pullRequest: issue.pullRequest,
+          gates: (issue.gates ?? []).map(
+            (gate) =>
+              `${gate.gate}: ${gate.verdict ?? gate.state}${gate.reason ? ` (${gate.reason})` : ''}`,
+          ),
+        });
+        saveSpawnReceipt({
+          receiptId,
+          accessKey,
+          requestId: `handoff:${offer.id}`,
+          project: run.repository,
+          sourceId: issue.threadId,
+          sourceDirectory: issue.path,
+          targetId: null,
+          turnId: null,
+          targetDirectory: issue.path,
+          worktreeId: issue.path,
+          provider: run.provider,
+          prompt,
+          state: 'starting',
+          created: Date.now(),
+          updated: Date.now(),
+          result: null,
+          error: null,
+        });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        const started = await startCoordinatedThread(
+          { path: issue.path, branch: issue.branch },
+          run.provider === 'opencode'
+            ? { kind: 'opencode', agent: 'OpenCode', title: issue.title }
+            : { kind: 'acp', agent: run.provider, title: issue.title },
+          prompt,
+          receiptId,
+          false,
+          async () => {
+            const targetId = spawnReceipts.find((item) => item.receiptId === receiptId)?.targetId;
+            if (!targetId) throw new Error('The fresh worker did not publish its thread identity.');
+            const startedAt = Date.now();
+            await updateShipIssue(run, issue, {
+              receiptId,
+              threadId: targetId,
+              checkpointThreadIds: (issue.checkpointThreadIds ?? []).filter(
+                (threadId) => !retiredThreadIds.has(threadId),
+              ),
+              contextHandoffs: (issue.contextHandoffs ?? []).map((item) =>
+                item.id === offer.id
+                  ? Object.assign({}, item, { toThreadId: targetId, startedAt })
+                  : item.fromThreadId === offer.fromThreadId &&
+                      !item.toThreadId &&
+                      item.outcome === 'pending'
+                    ? Object.assign({}, item, {
+                        outcome: 'failed' as const,
+                        error: 'Superseded by the accepted handoff.',
+                      })
+                    : item,
+              ),
+              contextPercent: undefined,
+              handoffRecoveryRequired: false,
+              state: 'working',
+              error: null,
+              refreshError: null,
+              workerSettled: false,
+              workerState: 'working',
+            });
+          },
+          settlement.nativeGeneration,
+        );
+        if (issue.threadId !== started.threadId)
+          throw new Error('The fresh worker identity changed before handoff completed.');
+      } catch (cause) {
+        const replacementReceipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+        const replacementThreadId = replacementReceipt?.targetId;
+        if (
+          replacementReceipt &&
+          replacementThreadId &&
+          replacementThreadId !== previousWorker.threadId &&
+          (await replacementDispatchProven(replacementReceipt))
+        ) {
+          const replacementState = await directShipWorkerState({
+            ...issue,
+            threadId: replacementThreadId,
+          });
+          const reconciledState =
+            replacementState === 'unavailable' ? replacementReceipt.state : replacementState;
+          updateSpawnReceipt(receiptId, {
+            state: reconciledState,
+            error: `Replacement startup confirmation failed: ${describe(cause)}`,
+          });
+          await updateShipIssue(run, issue, {
+            receiptId,
+            threadId: replacementThreadId,
+            checkpointThreadIds: (issue.checkpointThreadIds ?? []).filter(
+              (threadId) => !retiredThreadIds.has(threadId),
+            ),
+            contextHandoffs: (issue.contextHandoffs ?? []).map((item) =>
+              item.id === offer.id
+                ? Object.assign({}, item, {
+                    toThreadId: replacementThreadId,
+                    startedAt: item.startedAt ?? Date.now(),
+                    error: describe(cause),
+                  })
+                : item,
+            ),
+            contextPercent: undefined,
+            state: 'working',
+            error: `Replacement worker started, but activity confirmation failed: ${describe(cause)}`,
+            workerSettled: shippingWorkerSettled(reconciledState),
+            workerState: replacementState,
+          });
+          throw cause;
+        }
+        updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        await updateShipIssue(run, issue, {
+          ...previousWorker,
+          ...(cancellationCompleted
+            ? {
+                workerSettled: shippingWorkerSettled(previousWorkerState),
+                workerState: previousWorkerState,
+              }
+            : {}),
+          contextHandoffs: (issue.contextHandoffs ?? []).map((item) =>
+            item.id === offer.id
+              ? Object.assign({}, item, {
+                  toThreadId: null,
+                  startedAt: null,
+                  outcome: 'pending' as const,
+                  error: describe(cause),
+                })
+              : item,
+          ),
+        });
+        throw cause;
+      }
+    } finally {
+      contextHandoffsInFlight.delete(offer.id);
     }
   }
 
@@ -2658,6 +3259,10 @@
 
   async function directShipWorkerState(issue: ShipIssue): Promise<SpawnState> {
     if (!issue.threadId || !issue.path) return 'unavailable';
+    const native = nativeChildReceipts.find(
+      (receipt) => receipt.targetId === issue.threadId && receipt.targetDirectory === issue.path,
+    );
+    if (native) return native.state;
     if (issue.threadId.startsWith('opencode:')) {
       if (!client) return 'unavailable';
       const sessionId = issue.threadId.slice('opencode:'.length);
@@ -2704,6 +3309,63 @@
     } catch {
       return 'unavailable';
     }
+  }
+
+  async function settledShipOwnershipSnapshot(
+    issue: ShipIssue,
+  ): Promise<{ generation: number; nativeGeneration: number; receipts: SpawnReceipt[] } | null> {
+    const nativeGeneration = await reconcileProviderNativeSubagents(issue);
+    const generation = nativeSubagentGeneration;
+    const receipts = [...spawnReceipts, ...nativeChildReceipts];
+    const receiptSnapshot = JSON.stringify(
+      receipts
+        .filter(
+          (receipt) =>
+            receipt.sourceDirectory === issue.path || receipt.targetDirectory === issue.path,
+        )
+        .map((receipt) => [
+          receipt.receiptId,
+          receipt.sourceId,
+          receipt.targetId,
+          receipt.sourceDirectory,
+          receipt.targetDirectory,
+          receipt.state,
+        ])
+        .toSorted(([left], [right]) => String(left).localeCompare(String(right))),
+    );
+    const threadIds = shipOwnedThreadIds(issue, receipts);
+    const states = Object.fromEntries(
+      await Promise.all(
+        threadIds.map(async (threadId) => [
+          threadId,
+          await directShipWorkerState({ ...issue, threadId }),
+        ]),
+      ),
+    );
+    const currentReceipts = [...spawnReceipts, ...nativeChildReceipts];
+    const currentSnapshot = JSON.stringify(
+      currentReceipts
+        .filter(
+          (receipt) =>
+            receipt.sourceDirectory === issue.path || receipt.targetDirectory === issue.path,
+        )
+        .map((receipt) => [
+          receipt.receiptId,
+          receipt.sourceId,
+          receipt.targetId,
+          receipt.sourceDirectory,
+          receipt.targetDirectory,
+          receipt.state,
+        ])
+        .toSorted(([left], [right]) => String(left).localeCompare(String(right))),
+    );
+    if (
+      !shipOwnershipQuietPass(generation, nativeSubagentGeneration, false).settled ||
+      receiptSnapshot !== currentSnapshot ||
+      !shipTaskThreadsSettled(issue, states, receipts)
+    )
+      return null;
+    return { generation, nativeGeneration, receipts };
   }
 
   function missingRepositoryPath(cause: unknown): boolean {
@@ -2934,21 +3596,11 @@
         if (!shippingWorkerSettled((await currentSpawnReceipt(receipt)).state)) return;
         await update({ workerSettled: true });
       }
-      const taskThreadIds = [issue.threadId, ...(issue.checkpointThreadIds ?? [])].filter(
-        (threadId): threadId is string => Boolean(threadId),
-      );
-      const taskThreadStates = Object.fromEntries(
-        await Promise.all(
-          taskThreadIds.map(async (threadId) => [
-            threadId,
-            await directShipWorkerState({ ...issue, threadId }),
-          ]),
-        ),
-      );
+      const ownership = await settledShipOwnershipSnapshot(issue);
       if (
         issue.path &&
         shipGatesSettled(issue) &&
-        shipTaskThreadsSettled(issue, taskThreadStates, spawnReceipts) &&
+        ownership &&
         shipEvidenceReadiness(issue).ready &&
         (issue.validationPolicyRequired === false ||
           requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
@@ -2962,10 +3614,20 @@
               !requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
           )
             return;
-          const archivePath = await invoke<string | null>(
-            'delete_worktree',
-            shipCleanupRequest(run.repository, issue, currentRevision),
-          );
+          if (nativeSubagentGeneration !== ownership.generation) return;
+          const confirmedOwnership = await settledShipOwnershipSnapshot(issue);
+          if (
+            !confirmedOwnership ||
+            confirmedOwnership.generation !== ownership.generation ||
+            confirmedOwnership.nativeGeneration !== ownership.nativeGeneration
+          )
+            return;
+          const archivePath = await invoke<string | null>('delete_worktree', {
+            request: {
+              ...shipCleanupRequest(run.repository, issue, currentRevision),
+              nativeGeneration: confirmedOwnership.nativeGeneration,
+            },
+          });
           saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
           await updateShipIssue(run, issue, { path: null, archivePath, error: null });
         } catch (cause) {
@@ -2993,7 +3655,46 @@
       });
       return;
     }
-    const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+    let receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
+    if (issue.state === 'working') {
+      const replacement = pendingHandoffReplacement(issue, spawnReceipts);
+      if (replacement) {
+        if (!(await replacementDispatchProven(replacement))) {
+          updateSpawnReceipt(replacement.receiptId, {
+            state: 'failed',
+            error: 'Replacement prompt was not proven dispatched; retry the pending handoff.',
+          });
+          await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+          await updateShipIssue(run, issue, {
+            error:
+              'Replacement prompt dispatch could not be proven. Inspect it, then retry the pending handoff.',
+            workerSettled: true,
+            workerState: 'interrupted',
+          });
+          return;
+        }
+        const handoffId = replacement.requestId.slice('handoff:'.length);
+        const startedAt = Date.now();
+        await updateShipIssue(run, issue, {
+          receiptId: replacement.receiptId,
+          threadId: replacement.targetId,
+          checkpointThreadIds: (issue.checkpointThreadIds ?? []).filter(
+            (threadId) => threadId !== replacement.sourceId,
+          ),
+          contextHandoffs: (issue.contextHandoffs ?? []).map((handoff) =>
+            handoff.id === handoffId
+              ? Object.assign({}, handoff, { toThreadId: replacement.targetId, startedAt })
+              : handoff,
+          ),
+          contextPercent: undefined,
+          error: null,
+          refreshError: null,
+          workerSettled: false,
+          workerState: 'starting',
+        });
+        receipt = replacement;
+      }
+    }
     if (issue.state === 'failed') {
       if (receipt && !shippingWorkerSettled(receipt.state)) await currentSpawnReceipt(receipt);
       if (
@@ -3025,7 +3726,17 @@
           error: 'Worker receipt is missing. Inspect its thread.',
         });
       else {
+        if (handoffPromptNeedsRecovery(issue, receipt)) {
+          if (receipt.provider === 'opencode') await recoverShippingOpenCodePrompt(receipt);
+          else await recoverShippingAcpPrompt(receipt);
+        }
         const current = await currentSpawnReceipt(receipt);
+        const recoveryRequired = handoffReceiptNeedsResolution(current);
+        if (recoveryRequired !== (issue.handoffRecoveryRequired === true))
+          await update({
+            handoffRecoveryRequired: recoveryRequired,
+            error: resolvedHandoffRecoveryError(recoveryRequired, issue.error),
+          });
         if (current.state === 'completed') {
           if (pr?.url) await update({ state: 'awaiting_merge', error: null });
           else if (Date.now() - current.updated > 60_000)
@@ -3105,7 +3816,12 @@
       for (const issue of run.issues)
         if (issue.path) {
           if (issue.receiptId) protectedIds.add(issue.receiptId);
-          for (const threadId of issue.checkpointThreadIds ?? []) {
+          const historicalThreadIds = (issue.contextHandoffs ?? []).flatMap((handoff) => [
+            handoff.fromThreadId,
+            handoff.toThreadId,
+          ]);
+          for (const threadId of [...(issue.checkpointThreadIds ?? []), ...historicalThreadIds]) {
+            if (!threadId) continue;
             const handoff = spawnReceipts.find((item) => item.targetId === threadId);
             if (handoff) protectedIds.add(handoff.receiptId);
           }
@@ -3122,6 +3838,28 @@
         void saveShipRuns().catch((cause) => (error = describe(cause)));
       }
     }
+    if (shippingWorkerSettled(receipt.state) && receipt.targetId)
+      for (const run of shipRuns)
+        for (const issue of run.issues) {
+          const pending = issue.contextHandoffs?.find(
+            (handoff) => handoff.toThreadId === receipt.targetId && handoff.outcome === 'pending',
+          );
+          if (!pending) continue;
+          issue.contextHandoffs = issue.contextHandoffs?.map((handoff) => {
+            if (handoff.id !== pending.id) return handoff;
+            return receipt.state === 'completed'
+              ? Object.assign(
+                  {},
+                  handoff,
+                  handoffOutcome(handoff, issue.retryCount ?? 0, issue.lostStateFailures ?? 0),
+                )
+              : Object.assign({}, handoff, {
+                  outcome: 'failed' as const,
+                  error: receipt.error ?? receipt.state,
+                });
+          });
+          void saveShipRuns().catch((cause) => (error = describe(cause)));
+        }
     const owner = shipOwner(shipRuns, receipt.sourceDirectory, receipt.sourceId);
     const gate = gateSnapshot(receipt);
     if (owner && gate) {
@@ -3202,6 +3940,7 @@
   }
 
   async function currentSpawnReceipt(receipt: SpawnReceipt): Promise<SpawnReceipt> {
+    receipt = spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
     if (!receiptNeedsRefresh(receipt)) return receipt;
     if (activeSpawnRequests.has(receipt.receiptId)) return receipt;
     if (
@@ -3292,23 +4031,11 @@
 
   async function recoverShippingAcpPrompt(receipt: SpawnReceipt): Promise<void> {
     if (!receipt.targetId || !receipt.targetDirectory || !receipt.turnId || !receipt.prompt) return;
-    const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
-    const [agentActivity, interrupted] = await Promise.all([
-      acp.activity(),
-      acp.interruptedTurns(),
-    ]);
+    const agentActivity = await acp.activity();
     const state = agentActivity[receipt.provider];
-    if (
-      state?.activeTurns[sessionId] === receipt.turnId ||
-      state?.finished[sessionId]?.turnId === receipt.turnId ||
-      interrupted.some(
-        (turn) =>
-          turn.agent === receipt.provider &&
-          turn.sessionId === sessionId &&
-          turn.turnId === receipt.turnId,
-      )
-    )
-      return;
+    if (acpPromptHasBackendEvidence(receipt, state ?? null)) return;
+    const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
+    if (await reconcileDurableAcpTurn(receipt, sessionId)) return;
     activeSpawnRequests.add(receipt.receiptId);
     try {
       const info = await acp.connect(receipt.provider);
@@ -3323,6 +4050,13 @@
         'resume' in sessionCapabilities;
       if (canResume) await acp.resume(receipt.provider, receipt.targetDirectory, sessionId);
       else await acp.load(receipt.provider, receipt.targetDirectory, sessionId);
+      const restoredActivity = (await acp.activity())[receipt.provider] ?? null;
+      if (acpPromptHasBackendEvidence(receipt, restoredActivity)) {
+        reconcileAcpSpawnReceipt(receipt, restoredActivity);
+        return;
+      }
+      if (await reconcileDurableAcpTurn(receipt, sessionId, true)) return;
+      requireSpawnPromptDispatch(receipt.receiptId);
       const turn = acp.prompt(receipt.provider, sessionId, receipt.prompt, receipt.turnId);
       activeSpawnTargets.set(receipt.targetId, receipt.receiptId);
       void turn.then(
@@ -3338,15 +4072,11 @@
           return undefined;
         },
         async (cause) => {
-          const wasInterrupted = await acpFailedPromptInterrupted(
-            receipt.provider,
-            sessionId,
-            receipt.turnId!,
-          );
-          updateSpawnReceipt(receipt.receiptId, {
-            state: wasInterrupted ? 'interrupted' : 'failed',
-            error: wasInterrupted ? null : describe(cause),
-          });
+          if (!(await reconcileDurableAcpTurn(receipt, sessionId)))
+            updateSpawnReceipt(receipt.receiptId, {
+              state: 'unavailable',
+              error: `Prompt dispatch can be retried: ${describe(cause)}`,
+            });
           spawnOutput.delete(receipt.receiptId);
           if (activeSpawnTargets.get(receipt.targetId!) === receipt.receiptId)
             activeSpawnTargets.delete(receipt.targetId!);
@@ -3357,9 +4087,32 @@
         const current = (await acp.activity())[receipt.provider];
         return current?.activeTurns[sessionId] === receipt.turnId;
       });
+      const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
+      if (current?.state === 'starting')
+        updateSpawnReceipt(receipt.receiptId, { state: 'working' });
     } finally {
       activeSpawnRequests.delete(receipt.receiptId);
     }
+  }
+
+  async function reconcileDurableAcpTurn(
+    receipt: SpawnReceipt,
+    sessionId: string,
+    providerRestored = false,
+  ): Promise<boolean> {
+    if (!receipt.turnId) return false;
+    const evidence = await acp.turnEvidence(receipt.provider, sessionId, receipt.turnId);
+    if (acpTurnPromptCanRetry(evidence)) return false;
+    if (acpTurnNeedsProviderInspection(evidence) && !providerRestored) return false;
+    const state = acpTurnEvidenceState(evidence);
+    if (!state) return false;
+    updateSpawnReceipt(receipt.receiptId, {
+      state,
+      error: acpTurnNeedsProviderInspection(evidence)
+        ? `Prompt dispatch may have completed before restart; inspect the restored provider session before cancelling and retrying.${evidence?.error ? ` ${evidence.error}` : ''}`
+        : (evidence?.error ?? null),
+    });
+    return true;
   }
 
   async function reconcileOpenCodeSpawnReceipts() {
@@ -4119,14 +4872,26 @@
           evidenceRevision: execution.revision,
           evidenceManifests,
         });
+      const reconciliation = reconcileTaskCheckpoint(saved, execution.revision, {
+        issueState: owner.issue.issueState,
+        pullRequest: owner.issue.pullRequest,
+        deliveryState: owner.issue.state,
+        refreshError: owner.issue.refreshError,
+      });
+      const incomingHandoff = owner.issue.contextHandoffs?.findLast(
+        (handoff) => handoff.toThreadId === sourceId && handoff.outcome === 'pending',
+      );
+      if (!reconciliation.revisionMatches && saved.revision && incomingHandoff) {
+        const eventId = `lost-state:${saved.sequence}:${saved.revision}:${execution.revision}`;
+        if (!owner.issue.contextEventIds?.includes(eventId))
+          await updateShipIssue(owner.run, owner.issue, {
+            contextEventIds: [...(owner.issue.contextEventIds ?? []), eventId].slice(-200),
+            lostStateFailures: (owner.issue.lostStateFailures ?? 0) + 1,
+          });
+      }
       return {
         checkpoint: saved,
-        reconciliation: reconcileTaskCheckpoint(saved, execution.revision, {
-          issueState: owner.issue.issueState,
-          pullRequest: owner.issue.pullRequest,
-          deliveryState: owner.issue.state,
-          refreshError: owner.issue.refreshError,
-        }),
+        reconciliation,
         evidence: {
           manifests: evidenceManifests,
           readiness: evidenceReadiness(
@@ -5177,6 +5942,7 @@
     receiptId?: string,
     validation = false,
     beforePrompt?: () => Promise<void>,
+    nativeGeneration?: number,
   ) {
     if (validation) {
       const model = source.kind === 'acp' ? source.model : source.model?.id;
@@ -5188,129 +5954,151 @@
     if (!validation)
       await beginShipItRun(created.path, prompt, promptSkill(skills, prompt)?.name ?? null);
     if (source.kind === 'acp') {
-      const session = await acp.create(source.agent, created.path).catch((cause) => {
-        if (!validation) throw cause;
-        throw new ValidationCandidateUnavailable(`${source.agent} is unavailable`, cause);
-      });
-      const reportedModel = session.configOptions?.find(
-        (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
-      )?.currentValue;
-      if (source.model) {
-        const modelOption = session.configOptions?.find(
-          (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
-        );
-        if (!modelOption?.options.some((option) => option.value === source.model)) {
-          const message = `Model ${source.model} is unavailable in ${source.agent}.`;
-          throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
-        }
-        const changed = await acp
-          .setConfig(source.agent, session.sessionId, modelOption.id, source.model)
-          .catch((cause) => {
-            if (!validation) throw cause;
-            throw new ValidationCandidateUnavailable(
-              `${source.agent} / ${source.model} is unavailable`,
-              cause,
-            );
-          });
-        const actual = changed.configOptions?.find((option) => option.id === modelOption.id);
-        if (actual?.currentValue !== source.model) {
-          const message = `Cannot verify ${source.agent} selected model ${source.model}.`;
-          throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
-        }
-      }
-      const thread: AgentThread = {
-        agent: source.agent,
-        model: source.model ?? reportedModel,
-        sessionId: session.sessionId,
-        directory: created.path,
-        title: prompt.slice(0, 60),
-        updated: Date.now(),
-      };
-      saveAgentThread(thread);
-      if (receiptId)
-        updateSpawnReceipt(receiptId, {
-          targetId: `acp:${source.agent}:${session.sessionId}`,
-          model: source.model ?? reportedModel,
-          targetDirectory: created.path,
-          worktreeId: created.path,
+      const session = await acp
+        .create(source.agent, created.path, nativeGeneration)
+        .catch((cause) => {
+          if (!validation) throw cause;
+          throw new ValidationCandidateUnavailable(`${source.agent} is unavailable`, cause);
         });
-      if (receiptId)
-        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
-      if (receiptId) await saveShipRuns();
-      await invoke('record_turn_snapshot', {
-        path: created.path,
-        thread: `acp:${source.agent}:${session.sessionId}`,
-      });
-      const tracking = validation
-        ? null
-        : await beginImplementationTurn(
-            created.path,
-            source.model ?? reportedModel,
-            `acp:${source.agent}:${session.sessionId}`,
+      try {
+        const reportedModel = session.configOptions?.find(
+          (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
+        )?.currentValue;
+        if (source.model) {
+          const modelOption = session.configOptions?.find(
+            (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
           );
-      updateAgentThreadStatus(thread, 'working');
-      const turnId = crypto.randomUUID();
-      if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', turnId });
-      if (receiptId)
-        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
-      if (receiptId) activeSpawnTargets.set(`acp:${source.agent}:${session.sessionId}`, receiptId);
-      await beforePrompt?.();
-      const turn = acp.prompt(source.agent, session.sessionId, prompt, turnId);
-      const finished = turn.then(
-        async (outcome) => {
-          if (tracking)
-            await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
-          updateAgentThreadStatus(thread, acpPromptInterrupted(outcome) ? 'interrupted' : 'done');
-          if (receiptId) {
-            const current = spawnReceipts.find((item) => item.receiptId === receiptId);
-            updateSpawnReceipt(receiptId, {
-              state: acpPromptInterrupted(outcome) ? 'interrupted' : 'completed',
-              result: spawnOutput.get(receiptId) ?? current?.result ?? null,
-            });
-            spawnOutput.delete(receiptId);
-            if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
-              activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
+          if (!modelOption?.options.some((option) => option.value === source.model)) {
+            const message = `Model ${source.model} is unavailable in ${source.agent}.`;
+            throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
           }
-          return undefined;
-        },
-        async (cause) => {
-          if (tracking)
-            await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
-          const interrupted = await acpFailedPromptInterrupted(
-            source.agent,
-            session.sessionId,
-            turnId,
-          );
-          updateAgentThreadStatus(thread, interrupted ? 'interrupted' : 'failed');
-          if (receiptId) {
-            updateSpawnReceipt(receiptId, {
-              state: interrupted ? 'interrupted' : 'failed',
-              error: interrupted ? null : describe(cause),
+          const changed = await acp
+            .setConfig(source.agent, session.sessionId, modelOption.id, source.model)
+            .catch((cause) => {
+              if (!validation) throw cause;
+              throw new ValidationCandidateUnavailable(
+                `${source.agent} / ${source.model} is unavailable`,
+                cause,
+              );
             });
-            spawnOutput.delete(receiptId);
-            if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
-              activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
+          const actual = changed.configOptions?.find((option) => option.id === modelOption.id);
+          if (actual?.currentValue !== source.model) {
+            const message = `Cannot verify ${source.agent} selected model ${source.model}.`;
+            throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
           }
-          if (!interrupted) error = describe(cause);
-          throw cause;
-        },
-      );
-      await awaitCoordinationStart(
-        finished.catch(async (cause) => {
-          if (await acpFailedPromptInterrupted(source.agent, session.sessionId, turnId)) return;
-          throw cause;
-        }),
-        async () => {
-          const state = (await acp.activity())[source.agent];
-          return !!state?.active.includes(session.sessionId);
-        },
-      );
-      void finished.catch(() => undefined);
-      return {
-        path: created.path,
-        branch: created.branch,
-        threadId: `acp:${source.agent}:${session.sessionId}`,
-      };
+        }
+        const thread: AgentThread = {
+          agent: source.agent,
+          model: source.model ?? reportedModel,
+          sessionId: session.sessionId,
+          directory: created.path,
+          title: prompt.slice(0, 60),
+          updated: Date.now(),
+        };
+        saveAgentThread(thread);
+        if (receiptId)
+          updateSpawnReceipt(receiptId, {
+            targetId: `acp:${source.agent}:${session.sessionId}`,
+            model: source.model ?? reportedModel,
+            targetDirectory: created.path,
+            worktreeId: created.path,
+          });
+        if (receiptId)
+          await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        if (receiptId) await saveShipRuns();
+        await invoke('record_turn_snapshot', {
+          path: created.path,
+          thread: `acp:${source.agent}:${session.sessionId}`,
+        });
+        const tracking = validation
+          ? null
+          : await beginImplementationTurn(
+              created.path,
+              source.model ?? reportedModel,
+              `acp:${source.agent}:${session.sessionId}`,
+            );
+        updateAgentThreadStatus(thread, 'working');
+        const turnId = crypto.randomUUID();
+        if (receiptId) {
+          updateSpawnReceipt(receiptId, { turnId });
+          await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        }
+        await beforePrompt?.();
+        if (receiptId) requireSpawnPromptDispatch(receiptId);
+        const turn = acp.prompt(source.agent, session.sessionId, prompt, turnId);
+        if (receiptId) updateSpawnReceipt(receiptId, { state: 'working' });
+        if (receiptId)
+          await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        if (receiptId)
+          activeSpawnTargets.set(`acp:${source.agent}:${session.sessionId}`, receiptId);
+        const finished = turn.then(
+          async (outcome) => {
+            if (tracking)
+              await recordImplementationModel(
+                created.path,
+                source.model ?? reportedModel,
+                tracking,
+              );
+            updateAgentThreadStatus(thread, acpPromptInterrupted(outcome) ? 'interrupted' : 'done');
+            if (receiptId) {
+              const current = spawnReceipts.find((item) => item.receiptId === receiptId);
+              updateSpawnReceipt(receiptId, {
+                state: acpPromptInterrupted(outcome) ? 'interrupted' : 'completed',
+                result: spawnOutput.get(receiptId) ?? current?.result ?? null,
+              });
+              spawnOutput.delete(receiptId);
+              if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
+                activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
+            }
+            return undefined;
+          },
+          async (cause) => {
+            if (tracking)
+              await recordImplementationModel(
+                created.path,
+                source.model ?? reportedModel,
+                tracking,
+              );
+            const interrupted = await acpFailedPromptInterrupted(
+              source.agent,
+              session.sessionId,
+              turnId,
+            );
+            updateAgentThreadStatus(thread, interrupted ? 'interrupted' : 'failed');
+            if (receiptId) {
+              updateSpawnReceipt(receiptId, {
+                state: interrupted ? 'interrupted' : 'failed',
+                error: interrupted ? null : describe(cause),
+              });
+              spawnOutput.delete(receiptId);
+              if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
+                activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
+            }
+            if (!interrupted) error = describe(cause);
+            throw cause;
+          },
+        );
+        await awaitCoordinationStart(
+          finished.catch(async (cause) => {
+            if (await acpFailedPromptInterrupted(source.agent, session.sessionId, turnId)) return;
+            throw cause;
+          }),
+          async () => {
+            const state = (await acp.activity())[source.agent];
+            return !!state?.active.includes(session.sessionId);
+          },
+        );
+        void finished.catch(() => undefined);
+        return {
+          path: created.path,
+          branch: created.branch,
+          threadId: `acp:${source.agent}:${session.sessionId}`,
+        };
+      } catch (cause) {
+        if (nativeGeneration !== undefined)
+          await acp.releaseSessionFence(source.agent, session.sessionId);
+        throw cause;
+      }
     }
     if (!client) {
       const message = 'OpenCode is unavailable for the new thread.';
@@ -5378,11 +6166,13 @@
       await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
     }
     await beforePrompt?.();
+    if (receiptId) requireSpawnPromptDispatch(receiptId);
     const startingPrompt = promptClient.session.prompt({
       sessionID: session.id,
       text: prompt,
       id: turnId,
     });
+    if (receiptId) updateSpawnReceipt(receiptId, { state: 'working' });
     if (receiptId)
       void startingPrompt
         .then(async (inbox) => {
@@ -5431,6 +6221,12 @@
       error = `Could not start agent thread: ${describe(cause)}`;
     });
     return { path: created.path, branch: created.branch, threadId: `opencode:${session.id}` };
+  }
+
+  function requireSpawnPromptDispatch(receiptId: string): void {
+    const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+    if (!spawnPromptDispatchAllowed(receipt))
+      throw new Error('Agent launch was cancelled before prompt dispatch.');
   }
 
   async function awaitCoordinationStart(
@@ -6028,11 +6824,13 @@
       );
       worktreeDeletions = { ...worktreeDeletions, [path]: 'Deleting files' };
       await invoke('delete_worktree', {
-        repository,
-        worktree: path,
-        force: force || !!config,
-        expectedRevision: null,
-        expectedBranch: null,
+        request: {
+          repository,
+          worktree: path,
+          force: force || !!config,
+          expectedRevision: null,
+          expectedBranch: null,
+        },
       });
       saveProjectCatalog(removeWorktree(projectCatalog, repository, path));
       const removedThreads = agentThreads.filter((thread) => thread.directory === path);
@@ -8675,6 +9473,7 @@
             (thread) => thread.agent === event.agent && thread.sessionId === eventSessionId,
           )?.directory ?? directory)
         : directory;
+    const previousNativeSubagents = nativeSubagents;
     nativeSubagents = updateNativeSubagents(
       nativeSubagents,
       event,
@@ -8684,6 +9483,26 @@
         (!!replayingAgentSessions[JSON.stringify([event.agent, eventSessionId])] ||
           !!nativeSubagents[nativeSubagentId(event.agent, eventSessionId)]?.restored),
     );
+    if (nativeSubagents !== previousNativeSubagents) nativeSubagentGeneration += 1;
+    const nativeUpdate = event.message.params?.update;
+    if (
+      event.message.method === 'session/update' &&
+      typeof eventSessionId === 'string' &&
+      nativeUpdate &&
+      typeof nativeUpdate === 'object' &&
+      'sessionUpdate' in nativeUpdate &&
+      nativeUpdate.sessionUpdate === 'subagent_spawned' &&
+      'subagentSessionId' in nativeUpdate &&
+      typeof nativeUpdate.subagentSessionId === 'string' &&
+      authorizeShipCheckpointThread(
+        shipRuns,
+        eventDirectory,
+        `acp:${event.agent}:${eventSessionId}`,
+        eventDirectory,
+        `acp:${event.agent}:${nativeUpdate.subagentSessionId}`,
+      )
+    )
+      void saveShipRuns().catch((cause) => (error = describe(cause)));
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       nativeSubagents = setNativeSubagentWaiting(
         nativeSubagents,
@@ -8738,16 +9557,40 @@
           ))
             updateSpawnReceipt(receipt.receiptId, { activity: toolTitle });
         const usage = acpUsage(params?.update);
-        if (usage?.rates && !replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
-          agentRates = { ...agentRates, [event.agent]: usage.rates };
+        const replaying = !!replayingAgentSessions[JSON.stringify([event.agent, sessionId])];
+        if (usage?.rates && !replaying) agentRates = { ...agentRates, [event.agent]: usage.rates };
         if (usage) {
           const nextUsage = { ...agentUsage };
-          for (const thread of agentThreads.filter(
+          const matchingThreads = [...agentThreads, ...nativeChildThreads].filter(
             (item) => item.agent === event.agent && item.sessionId === sessionId,
-          )) {
+          );
+          for (const thread of matchingThreads) {
             nextUsage[threadKey(thread)] = { context: usage.context };
           }
           agentUsage = nextUsage;
+          const matchingThread = matchingThreads[0];
+          if (matchingThread && !replaying)
+            void recordShipContextPressure(
+              matchingThread.directory,
+              `acp:${event.agent}:${sessionId}`,
+              usage.context,
+            ).catch((cause) => (error = describe(cause)));
+        }
+        const updateKind =
+          update && typeof update === 'object' && 'sessionUpdate' in update
+            ? String(update.sessionUpdate)
+            : '';
+        if (!replaying && /compact|retry/i.test(updateKind)) {
+          const matchingThread = [...agentThreads, ...nativeChildThreads].find(
+            (item) => item.agent === event.agent && item.sessionId === sessionId,
+          );
+          if (matchingThread)
+            void recordShipContextEvent(
+              matchingThread.directory,
+              `acp:${event.agent}:${sessionId}`,
+              `acp:${event.agent}:${sessionId}:${event.message.id ?? crypto.randomUUID()}`,
+              /compact/i.test(updateKind) ? 'compaction' : 'retry',
+            ).catch((cause) => (error = describe(cause)));
         }
       }
     }
@@ -9238,7 +10081,9 @@
     try {
       await client.session.remove({ sessionID: session.id });
       const usage = { ...openCodeUsage };
-      delete usage[`${directory}:${session.id}`];
+      const usageKey = `${directory}:${session.id}`;
+      delete usage[usageKey];
+      openCodePressureRecorder.forget(usageKey);
       openCodeUsage = usage;
       nativeThreads = nativeThreads.filter((thread) => thread.sessionId !== session.id);
       sidebarOpenCodeThreads = sidebarOpenCodeThreads.filter(
@@ -9575,6 +10420,30 @@
     liveText = {};
   }
 
+  function scheduleShipOpenCodeContextRefresh(source: OpenCodeClient, path: string, id: string) {
+    const key = `${path}:${id}`;
+    const previous = shipContextTimers.get(key);
+    if (previous) clearTimeout(previous);
+    shipContextTimers.set(
+      key,
+      setTimeout(() => {
+        shipContextTimers.delete(key);
+        if (!shipCheckpointOwner(shipRuns, path, `opencode:${id}`)) return;
+        void source.message
+          .list({ sessionID: id, limit: 50, order: 'desc' })
+          .then(async (page) => {
+            const context = openCodeContextUsage(page.data.toReversed(), setup?.models ?? []);
+            if (context === undefined) return undefined;
+            if (openCodeUsage[key] !== context)
+              openCodeUsage = { ...openCodeUsage, [key]: context };
+            await recordOpenCodeContextPressure(path, id, context);
+            return undefined;
+          })
+          .catch((cause) => (error = describe(cause)));
+      }, 100),
+    );
+  }
+
   function flushTextDeltas() {
     clearTimeout(textTimer);
     textTimer = undefined;
@@ -9632,6 +10501,46 @@
         }
         const eventSession =
           'data' in event && 'sessionID' in event.data ? event.data.sessionID : undefined;
+        if (
+          typeof eventSession === 'string' &&
+          [
+            'session.message.content.updated',
+            'session.text.ended',
+            'session.execution.succeeded',
+          ].includes(event.type)
+        ) {
+          const thread = [...sidebarOpenCodeThreads, ...nativeThreads].find(
+            (item) =>
+              item.sessionId === eventSession &&
+              (!event.location?.directory || item.directory === event.location.directory),
+          );
+          const path =
+            event.location?.directory ??
+            thread?.directory ??
+            (eventSession === sessionID ? directory : '');
+          if (path) scheduleShipOpenCodeContextRefresh(source, path, eventSession);
+        }
+        if (
+          typeof eventSession === 'string' &&
+          (event.type === 'session.compaction.started' || event.type === 'session.retry.scheduled')
+        ) {
+          const thread = [...sidebarOpenCodeThreads, ...nativeThreads].find(
+            (item) =>
+              item.sessionId === eventSession &&
+              (!event.location?.directory || item.directory === event.location.directory),
+          );
+          const path =
+            event.location?.directory ??
+            thread?.directory ??
+            (eventSession === sessionID ? directory : '');
+          if (path)
+            void recordShipContextEvent(
+              path,
+              `opencode:${eventSession}`,
+              event.id,
+              event.type === 'session.compaction.started' ? 'compaction' : 'retry',
+            ).catch((cause) => (error = describe(cause)));
+        }
         if (typeof eventSession === 'string' && event.type === 'session.execution.succeeded') {
           const thread = [...sidebarOpenCodeThreads, ...nativeThreads].find(
             (item) =>
@@ -11010,6 +11919,7 @@
         onshiprefresh={() => tickShippingRuns(true)}
         onshipopen={openShipTarget}
         onshipsettings={openSettings}
+        onshiphandoff={handoffShipIssue}
         onship={(graph, provider, limit, source) =>
           startShippingRun(graph, provider, limit, source)}
         onshipit={adoptDirectShipRun}
@@ -11054,8 +11964,14 @@
         onactivityopen={showActivitySource}
         ondecision={recordDecisionActivity}
         onusage={(id, context) => {
-          if (context !== undefined && openCodeUsage[`${directory}:${id}`] !== context)
-            openCodeUsage = { ...openCodeUsage, [`${directory}:${id}`]: context };
+          const key = `${directory}:${id}`;
+          if (context !== undefined) {
+            void recordOpenCodeContextPressure(directory, id, context).catch(
+              (cause) => (error = describe(cause)),
+            );
+            if (openCodeUsage[key] !== context)
+              openCodeUsage = { ...openCodeUsage, [key]: context };
+          }
         }}
         focusPromptPane={promptFocusPane}
         onpromptfocused={() => (promptFocusPane = null)}
@@ -11096,6 +12012,7 @@
         onclose={closeShipRuns}
         onrefresh={() => tickShippingRuns(true)}
         onopen={openShipTarget}
+        onhandoff={handoffShipIssue}
         onsettings={async () => {
           closeShipRuns();
           await openSettings();
@@ -11228,6 +12145,7 @@
             onclose={closeShipRuns}
             onrefresh={() => tickShippingRuns(true)}
             onopen={openShipTarget}
+            onhandoff={handoffShipIssue}
             onsettings={async () => {
               closeShipRuns();
               await openSettings();

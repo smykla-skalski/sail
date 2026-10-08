@@ -34,6 +34,15 @@ export interface AcpPromptOutcome {
   sailInterrupted?: boolean;
 }
 
+export interface AcpTurnEvidence {
+  agent: AgentId;
+  sessionId: string;
+  turnId: string;
+  status: 'prepared' | 'dispatch_uncertain' | 'dispatched' | 'done' | 'failed' | 'interrupted';
+  error: string | null;
+  updatedAt: number;
+}
+
 export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
   return outcome.stopReason === 'cancelled' || outcome.sailInterrupted === true;
 }
@@ -179,6 +188,19 @@ export interface AgentActivity {
       error?: string | null;
     }
   >;
+}
+
+export interface NativeSubagentSnapshot {
+  agent: AgentId;
+  sessionId: string;
+  parentSessionId: string;
+  directory: string;
+  outcome: 'working' | 'waiting' | 'completed' | 'failed' | 'interrupted' | 'unknown';
+}
+
+export interface NativeSubagentSnapshotSet {
+  generation: number;
+  subagents: NativeSubagentSnapshot[];
 }
 
 export interface AcpPendingInboxItem {
@@ -455,7 +477,7 @@ function restoreSession(
 export const acp = {
   agents: () => invoke<AgentAvailability[]>('acp_agents'),
   connect: (agent: AgentId) => invoke<Record<string, unknown>>('acp_connect', { agent }),
-  create: (agent: AgentId, cwd: string) =>
+  create: (agent: AgentId, cwd: string, nativeGeneration?: number) =>
     invoke<{
       sessionId: string;
       configOptions?: AgentConfigOption[];
@@ -463,7 +485,10 @@ export const acp = {
     }>('acp_new_session', {
       agent,
       cwd,
+      nativeGeneration,
     }),
+  releaseSessionFence: (agent: AgentId, sessionId: string) =>
+    invoke<void>('acp_release_session_fence', { agent, sessionId }),
   load: (agent: AgentId, cwd: string, sessionId: string) =>
     restoreSession('acp_load_session', agent, cwd, sessionId),
   resume: (agent: AgentId, cwd: string, sessionId: string) =>
@@ -490,6 +515,10 @@ export const acp = {
     invoke<AgentEvent['message'][]>('acp_pending_permissions', { agent, sessionId }),
   pendingInbox: () => invoke<AcpPendingInboxItem[]>('acp_pending_inbox'),
   activity: () => invoke<Record<AgentId, AgentActivity>>('acp_activity'),
+  nativeSubagents: (directory: string) =>
+    invoke<NativeSubagentSnapshotSet>('acp_native_subagents', { directory }),
+  turnEvidence: (agent: AgentId, sessionId: string, turnId: string) =>
+    invoke<AcpTurnEvidence | null>('get_acp_turn_evidence', { agent, sessionId, turnId }),
   interruptedTurns: () => invoke<InterruptedAgentTurn[]>('list_interrupted_agent_turns'),
   finishInterruptedTurn: (turn: InterruptedAgentTurn) =>
     invoke<void>('finish_interrupted_agent_turn', {

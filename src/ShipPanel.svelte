@@ -32,6 +32,7 @@
     onrefresh,
     onopen,
     onsettings,
+    onhandoff,
     nativeSubagents = [],
   }: {
     repository: string;
@@ -42,6 +43,7 @@
     onrefresh: () => Promise<void>;
     onopen: (path: string, threadId?: string | null) => Promise<void>;
     onsettings: () => Promise<void>;
+    onhandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
     nativeSubagents?: NativeSubagent[];
   } = $props();
   let error = $state('');
@@ -307,6 +309,18 @@
     />
     <div class="ship-content">
       {#if issue}
+        {@const pendingHandoff = issue.contextHandoffs?.findLast(
+          (handoff) =>
+            handoff.fromThreadId === issue.threadId &&
+            !handoff.toThreadId &&
+            handoff.outcome === 'pending',
+        )}
+        {@const recoveryHandoff = issue.contextHandoffs?.findLast(
+          (handoff) =>
+            issue.handoffRecoveryRequired === true &&
+            handoff.toThreadId === issue.threadId &&
+            handoff.outcome === 'pending',
+        )}
         {@const evidence = shipEvidenceReadiness(issue)}
         {@const manifest = (issue.evidenceManifests ?? []).find(
           (candidate) => candidate.revision === issue.evidenceRevision && !candidate.stale,
@@ -375,6 +389,47 @@
               ? ' · Attribution uncertain'
               : ''}
           </p>
+          {#if pendingHandoff}<section class="ship-handoff" aria-label="Context handoff">
+              <h4>Context handoff</h4>
+              <p>
+                Context reached {pendingHandoff.context}% after {pendingHandoff.compactions}
+                compaction{pendingHandoff.compactions === 1 ? '' : 's'}.
+              </p>
+              <button
+                disabled={(issue.checkpoint?.sequence ?? 0) <= pendingHandoff.checkpointSequence}
+                onclick={() => act(() => onhandoff(run!, issue!))}>Start fresh worker</button
+              >
+              {#if (issue.checkpoint?.sequence ?? 0) <= pendingHandoff.checkpointSequence}<p
+                  class="ship-muted"
+                >
+                  Waiting for the current worker to update the canonical checkpoint.
+                </p>{/if}
+            </section>{/if}
+          {#if recoveryHandoff}<section class="ship-handoff" aria-label="Context handoff recovery">
+              <h4>Context handoff needs inspection</h4>
+              <p>
+                Open the worker session and inspect its transcript. Retry only if its uncertain work
+                must not be adopted.
+              </p>
+              <button onclick={() => act(() => onhandoff(run!, issue!))}
+                >Cancel inspected session and retry</button
+              >
+            </section>{/if}
+          {#if issue.contextHandoffs?.length}<details>
+              <summary>Context history</summary>
+              <p>
+                Compactions: Claude {issue.contextCompactions?.claude ?? 0} · Codex
+                {issue.contextCompactions?.codex ?? 0} · OpenCode
+                {issue.contextCompactions?.opencode ?? 0}
+              </p>
+              <ol>
+                {#each issue.contextHandoffs as handoff (handoff.id)}<li>
+                    {handoff.provider} · {handoff.context}% · {handoff.outcome} · retries
+                    {handoff.retriesBefore}→{handoff.retriesAfter ?? 'pending'} · lost-state
+                    {handoff.lostStateFailuresBefore}→{handoff.lostStateFailuresAfter ?? 'pending'}
+                  </li>{/each}
+              </ol>
+            </details>{/if}
           <h4>Revision evidence</h4>
           <p class:ship-error={!evidence.ready}>
             {issue.evidenceRevision ?? 'Revision unknown'} ·

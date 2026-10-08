@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -10,6 +11,9 @@ type Deletions = BTreeMap<String, BTreeSet<String>>;
 const DELETIONS_KEY: &str = "sai-settings-deletions";
 const MODIFIED_KEY: &str = "sai-settings-modified";
 const INTERRUPTED_TURNS_KEY: &str = "sai-interrupted-agent-turns";
+const ACP_TURN_EVIDENCE_KEY: &str = "sai-acp-turn-evidence";
+const ACP_TURN_EVIDENCE_LIMIT: usize = 500;
+const ACP_UNSETTLED_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,6 +23,171 @@ pub struct InterruptedAgentTurn {
     pub directory: String,
     pub turn_id: String,
     pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpTurnEvidence {
+    pub agent: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub status: String,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+fn acp_turn_evidence(settings: &Settings) -> Vec<AcpTurnEvidence> {
+    settings
+        .get(ACP_TURN_EVIDENCE_KEY)
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
+fn write_acp_turn_evidence(
+    settings: &mut Settings,
+    evidence: &[AcpTurnEvidence],
+) -> Result<(), String> {
+    if evidence.is_empty() {
+        settings.remove(ACP_TURN_EVIDENCE_KEY);
+    } else {
+        settings.insert(
+            ACP_TURN_EVIDENCE_KEY.to_string(),
+            serde_json::to_string(evidence).map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(())
+}
+
+fn unsettled_acp_evidence(status: &str) -> bool {
+    matches!(status, "prepared" | "dispatch_uncertain" | "dispatched")
+}
+
+fn protected_acp_turns(settings: &Settings) -> HashSet<(String, String, String)> {
+    let mut protected = interrupted_turns(settings)
+        .into_iter()
+        .map(|turn| (turn.agent, turn.session_id, turn.turn_id))
+        .collect::<HashSet<_>>();
+    let receipts = settings
+        .get("sai-agent-spawn-receipts")
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    for receipt in receipts {
+        let state = receipt
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if matches!(state, "completed" | "failed" | "interrupted") {
+            continue;
+        }
+        let Some(agent) = receipt.get("provider").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(target_id) = receipt.get("targetId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(turn_id) = receipt.get("turnId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(session_id) = target_id.strip_prefix(&format!("acp:{agent}:")) else {
+            continue;
+        };
+        protected.insert((
+            agent.to_string(),
+            session_id.to_string(),
+            turn_id.to_string(),
+        ));
+    }
+    protected
+}
+
+fn merge_acp_turn_evidence_at(
+    settings: &mut Settings,
+    mut item: AcpTurnEvidence,
+    now: u64,
+) -> Result<(), String> {
+    item.updated_at = now;
+    let mut evidence = acp_turn_evidence(settings);
+    let protected = protected_acp_turns(settings);
+    if item.status == "prepared" {
+        evidence.retain(|saved| {
+            saved.agent != item.agent
+                || saved.session_id != item.session_id
+                || !unsettled_acp_evidence(&saved.status)
+                || protected.contains(&(
+                    saved.agent.clone(),
+                    saved.session_id.clone(),
+                    saved.turn_id.clone(),
+                ))
+        });
+    }
+    evidence.retain(|saved| {
+        saved.agent != item.agent
+            || saved.session_id != item.session_id
+            || saved.turn_id != item.turn_id
+    });
+    evidence.push(item);
+    evidence.retain(|saved| {
+        !unsettled_acp_evidence(&saved.status)
+            || protected.contains(&(
+                saved.agent.clone(),
+                saved.session_id.clone(),
+                saved.turn_id.clone(),
+            ))
+            || now.saturating_sub(saved.updated_at) <= ACP_UNSETTLED_RETENTION_MS
+    });
+    let completed = evidence
+        .iter()
+        .filter(|item| !unsettled_acp_evidence(&item.status))
+        .count();
+    if completed > ACP_TURN_EVIDENCE_LIMIT {
+        let mut remove = completed - ACP_TURN_EVIDENCE_LIMIT;
+        evidence.retain(|item| {
+            if remove > 0 && !unsettled_acp_evidence(&item.status) {
+                remove -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    write_acp_turn_evidence(settings, &evidence)
+}
+
+fn merge_acp_turn_evidence(settings: &mut Settings, item: AcpTurnEvidence) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    merge_acp_turn_evidence_at(settings, item, now)
+}
+
+pub fn record_acp_turn_evidence(
+    app: &tauri::AppHandle,
+    evidence: AcpTurnEvidence,
+) -> Result<(), String> {
+    let path = settings_path(app)?;
+    let _lock = lock_settings(&path)?;
+    let mut settings = read_settings(&path)?;
+    merge_acp_turn_evidence(&mut settings, evidence)?;
+    write_settings(&path, &settings)
+}
+
+#[tauri::command]
+pub fn get_acp_turn_evidence(
+    app: tauri::AppHandle,
+    agent: String,
+    session_id: String,
+    turn_id: String,
+) -> Result<Option<AcpTurnEvidence>, String> {
+    let path = settings_path(&app)?;
+    let _lock = lock_settings(&path)?;
+    Ok(acp_turn_evidence(&read_settings(&path)?)
+        .into_iter()
+        .find(|item| {
+            item.agent == agent && item.session_id == session_id && item.turn_id == turn_id
+        }))
 }
 
 fn interrupted_turns(settings: &Settings) -> Vec<InterruptedAgentTurn> {
@@ -593,10 +762,166 @@ pub fn save_setting(
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_legacy, interrupted_turns, lock_settings, merge_catalog, merge_interrupted_turns,
-        merge_threads, read_settings, remove_interrupted_turn, update_deletions, write_settings,
-        Deletions, InterruptedAgentTurn, Settings, DELETIONS_KEY,
+        acp_turn_evidence, filter_legacy, interrupted_turns, lock_settings,
+        merge_acp_turn_evidence, merge_acp_turn_evidence_at, merge_catalog,
+        merge_interrupted_turns, merge_threads, read_settings, remove_interrupted_turn,
+        update_deletions, write_settings, AcpTurnEvidence, Deletions, InterruptedAgentTurn,
+        Settings, ACP_TURN_EVIDENCE_LIMIT, ACP_UNSETTLED_RETENTION_MS, DELETIONS_KEY,
     };
+
+    #[test]
+    fn acp_turn_evidence_is_provider_correlated_replaced_and_bounded() {
+        let evidence = |agent: &str, session: &str, turn: &str, status: &str| AcpTurnEvidence {
+            agent: agent.into(),
+            session_id: session.into(),
+            turn_id: turn.into(),
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence(
+            &mut settings,
+            evidence("claude", "session", "turn", "dispatched"),
+        )
+        .unwrap();
+        merge_acp_turn_evidence(&mut settings, evidence("claude", "session", "turn", "done"))
+            .unwrap();
+        merge_acp_turn_evidence(
+            &mut settings,
+            evidence("codex", "session", "turn", "failed"),
+        )
+        .unwrap();
+        assert_eq!(
+            acp_turn_evidence(&settings)
+                .into_iter()
+                .map(|item| (item.agent, item.session_id, item.turn_id, item.status))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "claude".into(),
+                    "session".into(),
+                    "turn".into(),
+                    "done".into()
+                ),
+                (
+                    "codex".into(),
+                    "session".into(),
+                    "turn".into(),
+                    "failed".into()
+                ),
+            ]
+        );
+        for index in 0..ACP_TURN_EVIDENCE_LIMIT - 1 {
+            merge_acp_turn_evidence(
+                &mut settings,
+                evidence("claude", "other", &format!("turn-{index}"), "done"),
+            )
+            .unwrap();
+        }
+
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), ACP_TURN_EVIDENCE_LIMIT);
+        assert!(!saved
+            .iter()
+            .any(|item| item.agent == "claude" && item.session_id == "session"));
+        assert!(saved
+            .iter()
+            .any(|item| item.agent == "codex" && item.status == "failed"));
+    }
+
+    #[test]
+    fn acp_turn_evidence_never_prunes_unsettled_dispatches() {
+        let evidence = |turn: &str, status: &str| AcpTurnEvidence {
+            agent: "codex".into(),
+            session_id: "session".into(),
+            turn_id: turn.into(),
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence(&mut settings, evidence("prepared", "prepared")).unwrap();
+        merge_acp_turn_evidence(&mut settings, evidence("running", "dispatched")).unwrap();
+        for index in 0..=ACP_TURN_EVIDENCE_LIMIT {
+            merge_acp_turn_evidence(&mut settings, evidence(&format!("done-{index}"), "done"))
+                .unwrap();
+        }
+
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), ACP_TURN_EVIDENCE_LIMIT + 2);
+        assert!(saved.iter().any(|item| item.turn_id == "prepared"));
+        assert!(saved.iter().any(|item| item.turn_id == "running"));
+        assert!(!saved.iter().any(|item| item.turn_id == "done-0"));
+    }
+
+    #[test]
+    fn abandoned_dispatch_evidence_expires_but_owned_work_stays_protected() {
+        let evidence = |session: &str, turn: &str, status: &str| AcpTurnEvidence {
+            agent: "codex".into(),
+            session_id: session.into(),
+            turn_id: turn.into(),
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence_at(
+            &mut settings,
+            evidence("abandoned", "old", "dispatch_uncertain"),
+            1,
+        )
+        .unwrap();
+        merge_acp_turn_evidence_at(
+            &mut settings,
+            evidence("owned", "protected", "dispatched"),
+            1,
+        )
+        .unwrap();
+        settings.insert(
+            "sai-agent-spawn-receipts".into(),
+            serde_json::json!([{
+                "provider": "codex",
+                "targetId": "acp:codex:owned",
+                "turnId": "protected",
+                "state": "unavailable"
+            }])
+            .to_string(),
+        );
+
+        merge_acp_turn_evidence_at(
+            &mut settings,
+            evidence("recent", "fresh", "prepared"),
+            ACP_UNSETTLED_RETENTION_MS + 2,
+        )
+        .unwrap();
+
+        let saved = acp_turn_evidence(&settings);
+        assert!(!saved.iter().any(|item| item.turn_id == "old"));
+        assert!(saved.iter().any(|item| item.turn_id == "protected"));
+        assert!(saved.iter().any(|item| item.turn_id == "fresh"));
+    }
+
+    #[test]
+    fn a_new_prompt_retires_uncertain_evidence_for_the_same_session() {
+        let evidence = |turn: &str, status: &str| AcpTurnEvidence {
+            agent: "claude".into(),
+            session_id: "session".into(),
+            turn_id: turn.into(),
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "dispatch_uncertain"), 1)
+            .unwrap();
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("new", "prepared"), 2).unwrap();
+
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].turn_id, "new");
+    }
 
     #[test]
     fn interrupted_turns_replace_previous_attempt_without_losing_other_threads() {

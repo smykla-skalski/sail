@@ -1975,32 +1975,57 @@ fn add_worktree(
     })
 }
 
-#[tauri::command]
-async fn delete_worktree(
-    operation_locks: State<'_, WorktreeOperationLocks>,
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteWorktreeRequest {
     repository: String,
     worktree: String,
     force: Option<bool>,
     archive_ignored: Option<bool>,
     expected_revision: Option<String>,
     expected_branch: Option<String>,
+    native_generation: Option<u64>,
+}
+
+#[tauri::command]
+async fn delete_worktree(
+    operation_locks: State<'_, WorktreeOperationLocks>,
+    agents: State<'_, acp::AgentManager>,
+    fence: State<'_, acp::AgentWorktreeFence>,
+    request: DeleteWorktreeRequest,
 ) -> Result<Option<String>, String> {
+    let DeleteWorktreeRequest {
+        repository,
+        worktree,
+        force,
+        archive_ignored,
+        expected_revision,
+        expected_branch,
+        native_generation,
+    } = request;
     let operation_locks = operation_locks.inner().clone();
+    let agents = agents.inner().clone();
+    let fence = fence.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let checked = validate_repository(repository)?;
         let _lock = operation_locks.lock(Path::new(&checked))?;
-        if archive_ignored == Some(true) {
-            archive_ignored_and_remove(checked, worktree, expected_revision, expected_branch)
-        } else {
-            remove_worktree(
-                checked,
-                worktree,
-                force,
-                expected_revision.as_deref(),
-                expected_branch.as_deref(),
-            )?;
-            Ok(None)
-        }
+        let directory = PathBuf::from(&worktree)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&worktree));
+        fence.cleanup(&agents, &directory, native_generation, || {
+            if archive_ignored == Some(true) {
+                archive_ignored_and_remove(checked, worktree, expected_revision, expected_branch)
+            } else {
+                remove_worktree(
+                    checked,
+                    worktree,
+                    force,
+                    expected_revision.as_deref(),
+                    expected_branch.as_deref(),
+                )?;
+                Ok(None)
+            }
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2598,6 +2623,7 @@ pub fn run() {
         .manage(RuntimeManager::default())
         .manage(WorktreeOperationLocks::default())
         .manage(acp::AgentManager::default())
+        .manage(acp::AgentWorktreeFence::default())
         .manage(acp_terminal::AcpTerminalManager::default())
         .manage(terminal::TerminalManager::default())
         .manage(post_turn_checks::CheckLock::default())
@@ -2611,6 +2637,7 @@ pub fn run() {
             settings::save_setting,
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,
+            settings::get_acp_turn_evidence,
             start_runtime,
             repository_path_available,
             validate_repository,
@@ -2669,6 +2696,7 @@ pub fn run() {
             acp::acp_agents,
             acp::acp_connect,
             acp::acp_new_session,
+            acp::acp_release_session_fence,
             acp::acp_load_session,
             acp::acp_resume_session,
             acp::acp_prompt,
@@ -2678,6 +2706,7 @@ pub fn run() {
             acp::acp_pending_permissions,
             acp::acp_pending_inbox,
             acp::acp_activity,
+            acp::acp_native_subagents,
             acp::acp_prepare_restart,
             acp::acp_set_config,
             acp::acp_authenticate,

@@ -6,9 +6,32 @@ import {
   finalizeNativeSubagentRestore,
   nativeSubagentCounts,
   nativeSubagentReceipts,
+  reconcileNativeSubagents,
   setNativeSubagentWaiting,
   updateNativeSubagents,
 } from '../src/lib/native-subagents.ts';
+
+await test('backend snapshot exposes a child before its queued frontend event runs', () => {
+  const store = reconcileNativeSubagents(
+    {},
+    [
+      {
+        agent: 'codex',
+        sessionId: 'late-child',
+        parentSessionId: 'owner',
+        directory: '/worktree',
+        outcome: 'working',
+      },
+    ],
+    10,
+  );
+
+  const receipts = nativeSubagentReceipts(store);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].sourceId, 'acp:codex:owner');
+  assert.equal(receipts[0].targetId, 'acp:codex:late-child');
+  assert.equal(receipts[0].state, 'working');
+});
 
 function event(sessionId: string, update: Record<string, unknown>): AgentEvent {
   return {

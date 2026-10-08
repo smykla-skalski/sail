@@ -1,4 +1,5 @@
 import { gateMetadataSchema, type GateMetadata } from './ship-progress.ts';
+import type { AcpTurnEvidence, AgentActivity } from './acp';
 
 export type SpawnState =
   | 'queued'
@@ -136,7 +137,30 @@ export function receiptNeedsRefresh(receipt: SpawnReceipt): boolean {
   return (
     !receiptIsSettled(receipt.state) ||
     (receipt.state === 'unavailable' &&
-      (!!receipt.validation || receipt.requestId.startsWith('ship:')))
+      (!!receipt.validation ||
+        receipt.requestId.startsWith('ship:') ||
+        receipt.requestId.startsWith('handoff:')))
+  );
+}
+
+export function spawnPromptDispatchAllowed(receipt: SpawnReceipt | undefined): boolean {
+  return !!receipt && !['completed', 'failed', 'interrupted'].includes(receipt.state);
+}
+
+export function activeSpawnReceiptForThread(
+  receipts: SpawnReceipt[],
+  activeReceiptIds: ReadonlySet<string>,
+  threadId: string,
+  directory: string,
+): SpawnReceipt | null {
+  return (
+    receipts.find(
+      (receipt) =>
+        receipt.targetId === threadId &&
+        receipt.targetDirectory === directory &&
+        activeReceiptIds.has(receipt.receiptId) &&
+        !receiptIsSettled(receipt.state),
+    ) ?? null
   );
 }
 
@@ -225,4 +249,118 @@ export function acpReceiptState(receipt: SpawnReceipt, activity: AgentActivity |
   if (finished.status === 'failed') return 'failed';
   return finished.status === 'interrupted' ? 'interrupted' : 'completed';
 }
-import type { AgentActivity } from './acp';
+
+export function acpPromptHasBackendEvidence(
+  receipt: SpawnReceipt,
+  activity: AgentActivity | null,
+): boolean {
+  if (!receipt.targetId || !receipt.turnId || !activity) return false;
+  const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
+  return (
+    activity.activeTurns[sessionId] === receipt.turnId ||
+    activity.finished[sessionId]?.turnId === receipt.turnId
+  );
+}
+
+export function acpTurnEvidenceState(evidence: AcpTurnEvidence | null): SpawnState | null {
+  if (!evidence) return null;
+  if (evidence.status === 'done') return 'completed';
+  if (evidence.status === 'failed') return 'failed';
+  if (evidence.status === 'interrupted') return 'interrupted';
+  return 'unavailable';
+}
+
+export function acpTurnDispatchProven(evidence: AcpTurnEvidence | null): boolean {
+  return !!evidence && ['dispatched', 'done', 'failed', 'interrupted'].includes(evidence.status);
+}
+
+export function acpTurnPromptCanRetry(evidence: AcpTurnEvidence | null): boolean {
+  return !evidence || evidence.status === 'prepared';
+}
+
+export function acpTurnNeedsProviderInspection(evidence: AcpTurnEvidence | null): boolean {
+  return evidence?.status === 'dispatch_uncertain' || evidence?.status === 'dispatched';
+}
+
+export function handoffReceiptNeedsResolution(receipt: SpawnReceipt): boolean {
+  return (
+    receipt.requestId.startsWith('handoff:') &&
+    receipt.state === 'unavailable' &&
+    receipt.error?.startsWith('Prompt dispatch may have completed before restart;') === true
+  );
+}
+
+export function resolvedHandoffRecoveryError(
+  recoveryRequired: boolean,
+  currentError: string | null,
+): string | null {
+  if (recoveryRequired || !currentError) return currentError;
+  return currentError.startsWith('Prompt dispatch may have completed before restart;')
+    ? null
+    : currentError;
+}
+
+type HandoffRecoveryIssue = {
+  state: string;
+  path?: string | null;
+  receiptId?: string | null;
+  threadId?: string | null;
+  contextHandoffs?: Array<{
+    id: string;
+    fromThreadId: string;
+    toThreadId: string | null;
+    outcome: string;
+  }>;
+};
+
+export function pendingHandoffReplacement(
+  issue: HandoffRecoveryIssue,
+  receipts: SpawnReceipt[],
+): SpawnReceipt | null {
+  if (issue.state !== 'working' || !issue.path || !issue.threadId) return null;
+  const offer = issue.contextHandoffs?.findLast(
+    (handoff) =>
+      handoff.fromThreadId === issue.threadId &&
+      !handoff.toThreadId &&
+      handoff.outcome === 'pending',
+  );
+  if (!offer) return null;
+  return (
+    receipts.find(
+      (receipt) =>
+        receipt.requestId === `handoff:${offer.id}` &&
+        receipt.receiptId !== issue.receiptId &&
+        receipt.sourceId === offer.fromThreadId &&
+        receipt.sourceDirectory === issue.path &&
+        receipt.targetDirectory === issue.path &&
+        receipt.worktreeId === issue.path &&
+        receipt.state === 'starting' &&
+        !!receipt.targetId &&
+        !!receipt.turnId &&
+        !!receipt.prompt,
+    ) ?? null
+  );
+}
+
+export function handoffPromptNeedsRecovery(
+  issue: HandoffRecoveryIssue,
+  receipt: SpawnReceipt,
+): boolean {
+  if (
+    issue.state !== 'working' ||
+    issue.receiptId !== receipt.receiptId ||
+    issue.threadId !== receipt.targetId ||
+    !['starting', 'working', 'unavailable'].includes(receipt.state) ||
+    !receipt.targetId ||
+    !receipt.targetDirectory ||
+    !receipt.turnId ||
+    !receipt.prompt
+  )
+    return false;
+  return !!issue.contextHandoffs?.some(
+    (handoff) =>
+      receipt.requestId === `handoff:${handoff.id}` &&
+      handoff.toThreadId === receipt.targetId &&
+      handoff.outcome === 'pending',
+  );
+}

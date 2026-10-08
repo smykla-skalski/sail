@@ -1,4 +1,4 @@
-import type { AgentEntry, AgentEvent, AgentThread } from './acp.ts';
+import type { AgentEntry, AgentEvent, AgentThread, NativeSubagentSnapshot } from './acp.ts';
 import { updateEntries } from './acp.ts';
 import type { SpawnReceipt, SpawnState } from './agent-results.ts';
 
@@ -159,6 +159,61 @@ export function updateNativeSubagents(
       updated: now,
     },
   };
+}
+
+export function reconcileNativeSubagents(
+  store: NativeSubagentStore,
+  snapshots: NativeSubagentSnapshot[],
+  now = Date.now(),
+): NativeSubagentStore {
+  let next = store;
+  for (let pass = 0; pass < snapshots.length; pass += 1) {
+    let changed = false;
+    for (const snapshot of snapshots) {
+      const id = nativeSubagentId(snapshot.agent, snapshot.sessionId);
+      const previous = next[id];
+      const rootSessionId = rootSession(next, snapshot.agent, snapshot.parentSessionId);
+      if (
+        previous?.directory === snapshot.directory &&
+        previous.parentSessionId === snapshot.parentSessionId &&
+        previous.rootSessionId === rootSessionId &&
+        previous.outcome === snapshot.outcome
+      )
+        continue;
+      const activity =
+        snapshot.outcome === 'completed'
+          ? 'Completed'
+          : snapshot.outcome === 'failed'
+            ? 'Failed'
+            : snapshot.outcome === 'interrupted'
+              ? 'Interrupted'
+              : snapshot.outcome === 'waiting'
+                ? 'Needs permission'
+                : previous?.activity || 'Starting…';
+      if (next === store) next = Object.assign({}, store);
+      next[id] = {
+        id,
+        agent: snapshot.agent,
+        directory: snapshot.directory,
+        sessionId: snapshot.sessionId,
+        parentSessionId: snapshot.parentSessionId,
+        rootSessionId,
+        name: previous?.name ?? 'Subagent',
+        task: previous?.task ?? 'Delegated task',
+        ...(previous?.prompt ? { prompt: previous.prompt } : {}),
+        outcome: snapshot.outcome,
+        activity,
+        transcript: previous?.transcript ?? [],
+        created: previous?.created ?? now,
+        updated: now,
+        restored: previous?.restored ?? false,
+        ...(previous?.error ? { error: previous.error } : {}),
+      };
+      changed = true;
+    }
+    if (!changed) break;
+  }
+  return next;
 }
 
 export function setNativeSubagentWaiting(
