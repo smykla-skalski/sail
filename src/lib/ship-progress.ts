@@ -1177,7 +1177,7 @@ export function shipIssuePresentation(
       status: 'interrupted',
       label: 'Closed without merge',
       priority: 0,
-      nextAction: 'Archive the issue or reopen the pull request',
+      nextAction: 'Reopen the pull request, or Archive the run',
       updated: updated || null,
     };
   if (issue.state === 'failed')

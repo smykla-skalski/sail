@@ -114,6 +114,8 @@
     shipArchiveConfirmation,
     shipMergeAction,
     shipMergeConfirmation,
+    shipReopenAction,
+    shipReopenConfirmation,
     shipRetryAction,
     shipRetryConfirmation,
     shipStopAction,
@@ -3165,22 +3167,23 @@
     return posted;
   }
 
-  async function retryShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
-    const available = shipRetryAction(issue);
-    if (!available.enabled) throw new Error(available.reason ?? 'This issue cannot be retried.');
+  function requireShipClaimOwnership(issue: ShipIssue, action: string): void {
     if (
       issue.claim?.status === 'active' &&
       !shippingClaimOwnedByInstance(issue.claim, shippingInstanceId)
     )
       throw new Error(
-        'Another Sail instance holds the shipping claim for this issue. Retry after it releases or expires.',
+        `Another Sail instance holds the shipping claim for this issue. ${action} after it releases or expires.`,
       );
-    if (!(await confirmShipAction(shipRetryConfirmation(issue)))) return '';
-    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
-      await stopShippingWorker(issue);
-    const stillRetryable = shipRetryAction(issue);
-    if (!stillRetryable.enabled)
-      throw new Error(stillRetryable.reason ?? 'This issue changed and cannot be retried.');
+  }
+
+  /** Stops leftovers and queues a fresh worker that resumes from the saved checkpoint. */
+  async function restartShipIssue(
+    run: ShipRun,
+    issue: ShipIssue,
+    nextAction: string,
+    changes: Partial<ShipIssue> = {},
+  ): Promise<void> {
     const checkpoint = issue.checkpoint;
     const resumed =
       checkpoint && (checkpoint.status === 'cancelled' || checkpoint.status === 'failed')
@@ -3189,7 +3192,7 @@
             {
               status: 'active',
               phase: checkpoint.phase === 'complete' ? 'implement' : checkpoint.phase,
-              nextAction: 'Resume from the saved checkpoint after the retry.',
+              nextAction,
             },
             Date.now(),
           )
@@ -3210,10 +3213,61 @@
       claimHandoffPending: false,
       dispatchFencePending: false,
       retryCount: (issue.retryCount ?? 0) + 1,
+      ...changes,
       ...(resumed ? { checkpoint: resumed } : {}),
     });
     launchReadyShipIssues(run);
+  }
+
+  async function retryShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const available = shipRetryAction(issue);
+    if (!available.enabled) throw new Error(available.reason ?? 'This issue cannot be retried.');
+    requireShipClaimOwnership(issue, 'Retry');
+    if (!(await confirmShipAction(shipRetryConfirmation(issue)))) return '';
+    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+      await stopShippingWorker(issue);
+    const stillRetryable = shipRetryAction(issue);
+    if (!stillRetryable.enabled)
+      throw new Error(stillRetryable.reason ?? 'This issue changed and cannot be retried.');
+    await restartShipIssue(run, issue, 'Resume from the saved checkpoint after the retry.');
     return 'Retry queued. A fresh worker resumes from the saved checkpoint.';
+  }
+
+  async function reopenShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const available = shipReopenAction(issue);
+    if (!available.enabled)
+      throw new Error(available.reason ?? 'This pull request cannot be reopened.');
+    requireShipClaimOwnership(issue, 'Reopen');
+    if (!(await confirmShipAction(shipReopenConfirmation(issue, run.remote)))) return '';
+    const ready = shipReopenAction(issue);
+    if (!ready.enabled)
+      throw new Error(ready.reason ?? 'This issue changed and cannot be reopened.');
+    const outcome = await invoke<{ head: string; pullRequest: string; alreadyOpen: boolean }>(
+      'ship_reopen_pull_request',
+      {
+        request: {
+          repository: run.repository,
+          expectedRepository: run.remote,
+          pullRequest: issue.pullRequest,
+        },
+      },
+    );
+    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+      await stopShippingWorker(issue);
+    const key = `${run.id}:${issue.id}`;
+    // A lookup started before the reopen would report the pull request closed again.
+    beginLatestRefresh(shippingPullRequestGenerations, key);
+    const cached = shippingPullRequests.get(key);
+    if (cached) shippingPullRequests.set(key, { ...cached, state: 'OPEN' });
+    await restartShipIssue(
+      run,
+      issue,
+      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.`,
+      { pullRequestState: 'OPEN', pullRequestHead: outcome.head },
+    );
+    return outcome.alreadyOpen
+      ? 'The pull request was already open. A fresh worker resumes from the saved checkpoint.'
+      : 'Pull request reopened. A fresh worker resumes from the saved checkpoint.';
   }
 
   async function stopShipRun(run: ShipRun): Promise<string> {
@@ -3292,6 +3346,7 @@
   ): Promise<string> {
     if (id === 'merge' && issue) return mergeShipIssue(run, issue);
     if (id === 'retry' && issue) return retryShipIssue(run, issue);
+    if (id === 'reopen' && issue) return reopenShipIssue(run, issue);
     if (id === 'stop') return stopShipRun(run);
     if (id === 'archive') return archiveShipRunByUser(run);
     if (id === 'unarchive') return unarchiveShipRunByUser(run);

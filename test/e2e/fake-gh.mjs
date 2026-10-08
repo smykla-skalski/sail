@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import process from 'node:process';
 
@@ -75,6 +75,16 @@ if (fixture.pulls) {
       fields: args.filter((arg) => arg.includes('=') && !arg.startsWith('repos/')),
     });
     answer({ id: 1 });
+  }
+  if (args[0] === 'api' && method === 'PATCH' && pull) {
+    const key = `${pull[1]}#${pull[2]}`;
+    const fields = args.filter((arg) => arg.includes('=') && !arg.startsWith('repos/'));
+    log({ method, endpoint, fields });
+    if (fixture.pulls[key] && fields.includes('state=open')) {
+      fixture.pulls[key].state = 'open';
+      writeFileSync(statePath, JSON.stringify(fixture));
+    }
+    answer({ state: fixture.pulls[key]?.state ?? 'closed' });
   }
   if (args[0] === 'api' && method === 'PUT' && /\/pulls\/\d+\/merge$/.test(endpoint)) {
     log({

@@ -7,6 +7,8 @@ import {
   shipMergeConfirmation,
   shipPoolLabel,
   shipPoolUsage,
+  shipReopenAction,
+  shipReopenConfirmation,
   shipRetryAction,
   shipStopAction,
   shipStopConfirmation,
@@ -74,6 +76,41 @@ void test('retry applies to failed issues whose pull request is still usable', (
   assert.match(shipRetryAction(issue).reason!, /closed without merging/);
   issue.error = 'Issue closed before its worker launched.';
   assert.match(shipRetryAction(issue).reason!, /closed before launch/);
+});
+
+void test('reopen applies only to a stopped issue whose pull request closed unmerged', () => {
+  const issue = mergeable();
+  assert.match(shipReopenAction(issue).reason!, /closed without merging/);
+  issue.pullRequestState = 'CLOSED';
+  assert.match(shipReopenAction(issue).reason!, /worker to stop/);
+  Object.assign(issue, { state: 'failed', error: 'Pull request closed without merging.' });
+  assert.deepEqual(shipReopenAction(issue), { enabled: true, reason: null });
+  issue.claim = {
+    id: 'c',
+    holder: 'h',
+    task: 't',
+    acquiredAt: 'a',
+    heartbeatAt: 'a',
+    expiresAt: 'a',
+    status: 'active',
+    commentId: 1,
+  };
+  issue.claimFencePending = true;
+  assert.match(shipReopenAction(issue).reason!, /claim to settle/);
+  issue.claimFencePending = false;
+  issue.pullRequest = null;
+  assert.match(shipReopenAction(issue).reason!, /No pull request/);
+  issue.state = 'merged';
+  issue.pullRequest = 'https://github.com/a/b/pull/9';
+  assert.equal(shipReopenAction(issue).enabled, false);
+});
+
+void test('the reopen confirmation names the pull request, issue and repository', () => {
+  const issue = mergeable();
+  const confirmation = shipReopenConfirmation(issue, 'a/b');
+  assert.match(confirmation.title, /^Reopen pull request #9 for #\d+/);
+  assert.match(confirmation.message, /pull request #9 in a\/b/);
+  assert.equal(confirmation.confirmLabel, 'Reopen');
 });
 
 void test('stop needs live work and archive needs a stopped run', () => {
