@@ -98,14 +98,14 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 16px 20px;
     border-bottom: 1px solid var(--shell-divider);
   }
   .eyebrow {
     margin: 0 0 3px;
     color: var(--sui-primary);
-    font-size: 10px;
+    font-size: var(--type-12);
     font-weight: 700;
     letter-spacing: 0.08em;
   }
@@ -118,7 +118,7 @@
   .history-empty {
     margin: 12px 20px 0;
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
     line-height: 1.5;
   }
   .history-error[role='alert'] {
@@ -137,7 +137,7 @@
     display: grid;
     gap: 2px;
     margin: 0 4px 7px;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   h3 small {
     overflow: hidden;
@@ -161,7 +161,7 @@
     min-height: 52px;
     padding: 9px;
     border: 1px solid var(--shell-divider);
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     color: inherit;
     background: color-mix(in srgb, var(--sui-surface) 94%, var(--sui-primary));
     text-align: left;
@@ -185,7 +185,7 @@
   .event-copy small,
   time {
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
   }
   time {
     grid-column: 2;

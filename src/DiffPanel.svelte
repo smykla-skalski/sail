@@ -534,18 +534,18 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 16px 20px;
     border-bottom: 1px solid var(--shell-divider);
   }
   .diff-actions {
     display: flex;
-    gap: 4px;
+    gap: var(--space-4);
   }
   .eyebrow {
     margin: 0 0 3px;
     color: var(--sui-primary);
-    font-size: 10px;
+    font-size: var(--type-12);
     font-weight: 700;
     letter-spacing: 0.08em;
   }
@@ -556,7 +556,7 @@
   .diff-error {
     margin: 10px 16px;
     color: var(--sui-danger);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .diff-files {
     max-height: 34%;
@@ -579,13 +579,13 @@
     background: var(--shell-selected);
   }
   .diff-files strong {
-    font-size: 12px;
+    font-size: var(--type-12);
     overflow-wrap: anywhere;
   }
   .diff-files span,
   .diff-files small {
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
   }
   .diff-files .drift {
     color: var(--sui-danger);
@@ -594,7 +594,7 @@
   .diff-fallback {
     margin: 16px;
     color: var(--sui-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
     line-height: 1.5;
     overflow-wrap: anywhere;
   }
@@ -607,10 +607,10 @@
   .diff-file-heading {
     display: flex;
     justify-content: space-between;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 10px 16px;
     border-bottom: 1px solid var(--shell-divider);
-    font-size: 12px;
+    font-size: var(--type-12);
     overflow-wrap: anywhere;
   }
   .diff-file-heading span {
@@ -633,7 +633,7 @@
   }
   .diff-confirm {
     flex-wrap: wrap;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .diff-confirm span {
     flex: 1;
@@ -646,7 +646,7 @@
     flex: 1;
     min-height: 0;
     overflow: auto;
-    font-size: 11px;
+    font-size: var(--type-12);
     line-height: 1.5;
   }
   .diff-line {
@@ -655,7 +655,7 @@
     padding: 0 12px;
     white-space: pre;
     display: flex;
-    gap: 8px;
+    gap: var(--space-8);
     border: 0;
     background: transparent;
     color: inherit;
@@ -684,7 +684,7 @@
     gap: 6px;
     padding: 10px 16px;
     border-top: 1px solid var(--shell-divider);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .diff-comment-entry textarea {
     width: 100%;

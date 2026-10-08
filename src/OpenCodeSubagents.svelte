@@ -197,19 +197,19 @@
   .subagents {
     margin: 12px 0 18px 44px;
     border: 1px solid var(--shell-divider);
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     overflow: hidden;
   }
   .subagents-heading {
     padding: 9px 12px;
-    font-size: 12px;
+    font-size: var(--type-12);
     font-weight: 700;
     border-bottom: 1px solid var(--shell-divider);
   }
   .subagent-group-heading {
     padding: 6px 12px;
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -233,7 +233,7 @@
     color: var(--sui-primary);
     background: transparent;
     font: inherit;
-    font-size: 12px;
+    font-size: var(--type-12);
     cursor: pointer;
   }
   .subagent-open:disabled {
@@ -246,7 +246,7 @@
     width: 100%;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 9px 12px 3px;
     border: 0;
     background: transparent;
@@ -260,11 +260,11 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 13px;
+    font-size: var(--type-13);
   }
   .subagent-activity {
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
   }
   .subagent-activity {
     margin: 0;
@@ -285,13 +285,13 @@
   .subagent-error {
     color: var(--sui-danger-ink);
     padding: 0 12px;
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .load-older {
     margin: 8px 12px;
     padding: 6px 8px;
     border: 1px solid var(--shell-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     color: inherit;
     background: transparent;
     cursor: pointer;

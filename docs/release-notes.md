@@ -6,6 +6,14 @@ OpenCode v2.0.24 is a separate prerequisite; it is not bundled. Install the test
 
 There is no automatic updater. To update, download the next package for your platform and install it over the previous version after quitting the app. Verify the new manifest and run the first-project checks again.
 
+## Text size, reading width and theme
+
+- **Theme default changed.** Settings > General > Appearance now offers System, Light and Dark. System follows the operating system appearance and switches live when it changes. New profiles start on System; a stored Light or Dark choice is kept.
+- No interface text is smaller than 12 px. Sidebar thread titles are 13 px in the foreground color, and status badges, labels, timestamps and counts that were 9 to 11 px are now 12 px.
+- Transcript text sits in a centered column of about 72 characters with line height 1.5 in every thread view. Code blocks and tables scroll horizontally inside it.
+- Markdown headings in the transcript have their own sizes.
+- Durations, counts and timestamps use tabular digits, so numbers line up. The Ship run launch time no longer wraps.
+
 ## Keyboard, shortcuts and screen readers
 
 - The command palette also runs app actions: split, terminal, side chat, Inbox, next attention item, task overview, Ship runs, Changes, settings, theme and the shortcut sheet. Each shows its shortcut when it has one. A **⌘K** button in the top bar opens the palette.

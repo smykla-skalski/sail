@@ -226,7 +226,7 @@
   .eyebrow {
     margin: 0;
     color: var(--shell-selected-ink);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 800;
     letter-spacing: 0.12em;
   }
@@ -243,7 +243,7 @@
   .queue-pool {
     margin: 0;
     color: var(--shell-muted);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
   .queue-notice,
   .queue-error {
@@ -260,7 +260,7 @@
   table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 13px;
+    font-size: var(--type-13);
   }
   .queue-caption {
     position: absolute;
@@ -279,7 +279,7 @@
   }
   thead th {
     color: var(--shell-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
@@ -289,7 +289,7 @@
   small {
     display: block;
     color: var(--shell-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 400;
   }
   .queue-run {
@@ -318,7 +318,7 @@
     color: inherit;
     background: transparent;
     border: 1px solid var(--shell-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     padding: 5px 10px;
     cursor: pointer;
   }

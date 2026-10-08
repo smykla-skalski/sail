@@ -74,8 +74,8 @@
     min-width: 0;
     margin: 6px 0;
     border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-    font-size: 12px;
+    border-radius: var(--radius-8);
+    font-size: var(--type-12);
   }
   summary {
     display: flex;
@@ -121,7 +121,7 @@
   }
   .tool-activity-section > span {
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
     font-weight: 600;
   }
   pre {
@@ -129,7 +129,7 @@
     margin: 3px 0 0;
     overflow: auto;
     font:
-      11px/1.5 ui-monospace,
+      var(--type-12)/1.5 ui-monospace,
       monospace;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -145,7 +145,7 @@
     margin-top: 8px;
     padding: 5px 9px;
     border: 1px solid var(--shell-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-6);
     color: inherit;
     background: transparent;
     cursor: pointer;

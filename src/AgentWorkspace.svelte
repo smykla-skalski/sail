@@ -2633,7 +2633,7 @@
   }
   .agent-header div {
     display: flex;
-    gap: 12px;
+    gap: var(--space-12);
     align-items: baseline;
   }
   .agent-header .agent-heading {
@@ -2645,7 +2645,7 @@
   }
   .agent-header .agent-usage {
     flex: none;
-    font-size: 11px;
+    font-size: var(--type-12);
     white-space: nowrap;
   }
   .agent-header span {
@@ -2658,7 +2658,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 4px;
+    gap: var(--space-4);
     min-width: 0;
   }
   .agent-composer-footer {
@@ -2666,12 +2666,12 @@
     align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: var(--space-8);
     padding: 0 9px 9px 10px;
   }
   .agent-header .agent-config {
     display: flex;
-    gap: 8px;
+    gap: var(--space-8);
     flex-wrap: wrap;
     margin-left: auto;
     margin-right: 12px;
@@ -2680,7 +2680,7 @@
     flex: 1;
     min-height: 0;
     overflow: auto;
-    padding-inline: 20px;
+    padding-inline: var(--transcript-gutter);
   }
   .agent-history-status {
     display: block;
@@ -2695,7 +2695,7 @@
     margin: 0 0 8px 42px;
     padding: 9px 12px;
     border: 1px solid var(--sui-danger);
-    border-radius: 8px;
+    border-radius: var(--radius-8);
     overflow-wrap: anywhere;
   }
   .agent-tool-failure strong {
@@ -2716,7 +2716,7 @@
   .agent-busy {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: var(--space-12);
   }
   .agent-composer {
     position: relative;
@@ -2775,6 +2775,6 @@
   .agent-warning {
     margin: 0;
     color: var(--sui-warning-ink);
-    font-size: 12px;
+    font-size: var(--type-12);
   }
 </style>

@@ -42,8 +42,8 @@
     margin: 8px 0;
     padding: 8px 10px;
     border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-    font-size: 12px;
+    border-radius: var(--radius-8);
+    font-size: var(--type-12);
   }
   .shell-command-head {
     display: flex;
@@ -61,7 +61,7 @@
   .shell-command-meta {
     margin: 6px 0 0;
     color: var(--sui-muted);
-    font-size: 11px;
+    font-size: var(--type-12);
   }
   .shell-command-head .shell-command-meta {
     margin: 0;

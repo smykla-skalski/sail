@@ -1,12 +1,55 @@
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { returnToWorkspace, openSettings } from './settings-window';
 
 const read = () =>
   browser.tauri.execute(async ({ core }) => core.invoke<Record<string, string>>('load_settings'));
+
+/** Overrides the window's appearance, which WebKit reports as the OS color scheme. */
+const forceAppearance = (theme: 'light' | 'dark' | null, label = 'main') =>
+  browser.tauri.execute(
+    async ({ core }, window, value) =>
+      core.invoke('plugin:window|set_theme', { label: window, value }),
+    label,
+    theme,
+  );
+
+const shownTheme = () => browser.execute(() => document.documentElement.dataset.suiTheme);
+
+async function expectTheme(theme: 'light' | 'dark') {
+  await browser.waitUntil(async () => (await shownTheme()) === theme, {
+    timeout: 5000,
+    timeoutMsg: `Expected the ${theme} theme`,
+  });
+}
+
+/** Saves an explicit choice, flips the OS appearance the other way, and checks it survives reload. */
+async function expectStoredTheme(
+  path: string,
+  stored: 'light' | 'dark',
+  appearance: 'light' | 'dark',
+) {
+  await browser.tauri.execute(
+    async ({ core }, value) => core.invoke('save_setting', { key: 'sai-theme', value }),
+    stored,
+  );
+  await forceAppearance(appearance);
+  await browser.refresh();
+  await expect($(`.project-repository-select[title="${path}"]`)).toBeDisplayed();
+  await expectTheme(stored);
+  expect((await read())['sai-theme']).toBe(stored);
+  expect(await browser.execute(() => localStorage.getItem('sai-theme'))).toBe(stored);
+}
+
+async function capture(name: string) {
+  const output = process.env.SAIL_VISUAL_AUDIT_DIR;
+  if (!output) return;
+  mkdirSync(output, { recursive: true });
+  await browser.saveScreenshot(join(output, `${name}.png`));
+}
 
 describe('disk-backed settings', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-settings-'));
@@ -19,12 +62,40 @@ describe('disk-backed settings', () => {
   });
 
   after(async () => {
+    await forceAppearance(null);
     await browser.execute(() => {
       sessionStorage.removeItem('sail-e2e-settings');
       localStorage.clear();
     });
     rmSync(repository, { recursive: true, force: true });
     rmSync(secondRepository, { recursive: true, force: true });
+  });
+
+  it('starts new profiles on System and keeps stored Light and Dark choices', async () => {
+    const path = realpathSync(repository);
+    await forceAppearance('dark');
+    await browser.execute((selected) => {
+      localStorage.clear();
+      localStorage.setItem('sai-directory', selected);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [selected], groups: [] }),
+      );
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+    }, path);
+    await browser.refresh();
+    await expect($(`.project-repository-select[title="${path}"]`)).toBeDisplayed();
+    await browser.waitUntil(async () => (await read())['sai-theme'] === 'system', {
+      timeoutMsg: 'A new profile did not store the System theme',
+    });
+    await expectTheme('dark');
+
+    await expectStoredTheme(path, 'light', 'dark');
+    await expectStoredTheme(path, 'dark', 'light');
+    await forceAppearance(null);
+    await browser.tauri.execute(async ({ core }) =>
+      core.invoke('save_setting', { key: 'sai-theme', value: 'light' }),
+    );
   });
 
   it('migrates existing repositories and restores new preferences after reload', async () => {
@@ -60,7 +131,7 @@ describe('disk-backed settings', () => {
 
     await openSettings();
     await $('[aria-label^="Theme:"]').click();
-    await $('.option-menu [role="option"]:nth-child(2)').click();
+    await $('.option-menu [role="option"]:nth-child(3)').click();
     await returnToWorkspace();
     try {
       await browser.waitUntil(async () => (await read())['sai-theme'] === 'dark');
@@ -108,6 +179,28 @@ describe('disk-backed settings', () => {
     await expect($(`.project-repository-select[title="${path}"]`)).toBeDisplayed();
     await expect($(`.project-repository-select[title="${other}"]`)).toBeDisplayed();
     expect(await browser.execute(() => document.documentElement.dataset.suiTheme)).toBe('dark');
+  });
+
+  it('follows the OS appearance live after choosing System', async () => {
+    await forceAppearance('light');
+    await openSettings();
+    await $('[aria-label^="Theme:"]').click();
+    await $('.option-menu [role="option"]:nth-child(1)').click();
+    await expect($('[aria-label^="Theme:"]')).toHaveAttribute(
+      'aria-label',
+      expect.stringContaining('System'),
+    );
+    await capture('settings-theme-system');
+    await returnToWorkspace();
+    await browser.waitUntil(async () => (await read())['sai-theme'] === 'system');
+    await expectTheme('light');
+    await capture('desktop-system-theme-light');
+    await forceAppearance('dark');
+    await expectTheme('dark');
+    await capture('desktop-system-theme-dark');
+    await forceAppearance('light');
+    await expectTheme('light');
+    await forceAppearance(null);
   });
 
   it('opens one native settings window with the gear and Command comma', async () => {
