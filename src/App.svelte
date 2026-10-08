@@ -1951,10 +1951,10 @@
   let activeSideTab = $derived(
     sideTab === 'ship'
       ? 'ship'
-      : acpAgent && sideTab !== 'history'
-        ? 'changes'
-        : showPlanPanel && sideTab === 'plan'
-          ? 'plan'
+      : showPlanPanel && sideTab === 'plan'
+        ? 'plan'
+        : acpAgent && sideTab !== 'history'
+          ? 'changes'
           : sideTab === 'history'
             ? 'history'
             : 'changes',
