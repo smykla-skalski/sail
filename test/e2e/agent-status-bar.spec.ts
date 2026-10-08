@@ -61,7 +61,7 @@ describe('agent status bar', () => {
     });
     await $('.agent-actions button').click();
     await expect($('.agent-permission')).toBeDisplayed();
-    await expect(bar).toHaveText(expect.stringContaining('1 need input'));
+    await expect(bar).toHaveText(expect.stringContaining('1 need attention'));
     const disagreements = await browser.execute(() => {
       clearInterval(Reflect.get(window, 'sailStatusSampler'));
       const samples: unknown = Reflect.get(window, 'sailStatusDisagreements');

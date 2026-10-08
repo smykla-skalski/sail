@@ -1297,6 +1297,13 @@ button:disabled {
   margin: 0;
   padding: 0;
 }
+.settings-card .notification-pref {
+  justify-content: space-between;
+}
+.settings-card .notification-pref select {
+  width: auto;
+  max-width: 60%;
+}
 .settings-card p,
 .settings-card li {
   overflow-wrap: anywhere;

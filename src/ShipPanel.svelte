@@ -55,6 +55,7 @@
     onsettings,
     onhandoff,
     nativeSubagents = [],
+    focusRequest = null,
   }: {
     repository: string;
     active?: boolean;
@@ -67,6 +68,12 @@
     onsettings: () => Promise<void>;
     onhandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
     nativeSubagents?: NativeSubagent[];
+    focusRequest?: {
+      id: number;
+      runId: string;
+      issueId: string;
+      focus: 'issue' | 'pull-request';
+    } | null;
   } = $props();
   let error = $state('');
   let panel: HTMLDivElement;
@@ -110,6 +117,49 @@
     return item.title === `Issue #${item.number}`
       ? `#${item.number}`
       : `#${item.number} ${item.title}`;
+  }
+
+  type FocusRequest = NonNullable<typeof focusRequest>;
+  let handledFocus = 0;
+  let pendingFocus = $state<FocusRequest | null>(null);
+
+  $effect(() => {
+    const request = focusRequest;
+    if (!request || request.id === handledFocus) return;
+    handledFocus = request.id;
+    selectedRun = request.runId;
+    selectedIssue = request.issueId;
+    detailOpen = request.focus === 'pull-request';
+    view = 'list';
+    pendingFocus = request;
+  });
+
+  $effect(() => {
+    const request = pendingFocus;
+    if (
+      !request ||
+      !active ||
+      run?.id !== request.runId ||
+      !run.issues.some((item) => item.id === request.issueId)
+    )
+      return;
+    void focusPending(request);
+  });
+
+  async function focusPending(request: FocusRequest) {
+    await tick();
+    const row = panel?.querySelector<HTMLElement>(
+      `[data-ship-issue-id="${CSS.escape(request.issueId)}"]`,
+    );
+    const link =
+      request.focus === 'pull-request'
+        ? panel?.querySelector<HTMLElement>('.ship-issue-detail .ship-pull-request')
+        : null;
+    const target = link ?? row;
+    if (!target?.getClientRects().length) return;
+    target.scrollIntoView({ block: 'center' });
+    target.focus();
+    if (pendingFocus === request) pendingFocus = null;
   }
 
   $effect(() => {
@@ -510,8 +560,11 @@
               : 'Not refreshed yet'}
           </p>
           <div class="ship-actions">
-            {#if issue.pullRequest}<a href={issue.pullRequest} target="_blank" rel="noreferrer"
-                >Open PR</a
+            {#if issue.pullRequest}<a
+                class="ship-pull-request"
+                href={issue.pullRequest}
+                target="_blank"
+                rel="noreferrer">Open PR</a
               >{/if}
             <button
               disabled={!issue.path || issue.worktreeUnavailable}

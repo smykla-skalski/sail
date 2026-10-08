@@ -6,6 +6,14 @@ OpenCode v2.0.24 is a separate prerequisite; it is not bundled. Install the test
 
 There is no automatic updater. To update, download the next package for your platform and install it over the previous version after quitting the app. Verify the new manifest and run the first-project checks again.
 
+## Attention and notifications
+
+- **Notification default changed.** OS notifications now default to "Only when Sail is in the background". Before, Sail notified whenever the thread was not the one on screen, even while you were using Sail. Choose Never, Only when Sail is in the background, or Always for each type (Needs your input, Turn completed, Ship updates) in Settings. Existing profiles move to the new default, except one that had OS notifications switched off: it keeps Never for every type.
+- Notifications are batched: at most one per 10 seconds, with a count when several arrive together. Clicking one opens the thread, Ship issue or pull request it is about.
+- One attention count covers permission and question requests, Ship issues that need input, are ready to merge, were closed without merging or stalled, and waiting subagents. The Dock badge, Inbox button, status bar and Ship tab read the same list; the Ship tab shows the Ship issues that need input instead of the run count. The status bar keeps its counts below 700 px.
+- The Inbox groups items by repository. You can dismiss a Ship or subagent item until its next state change, or snooze it for an hour or until tomorrow at 08:00. Items clear when their state resolves.
+- Cmd+J (Ctrl+J elsewhere) goes to the next item needing attention. Cmd+Shift+J still opens the side chat.
+
 ## Changes in this build
 
 - The top bar keeps the project and thread path, **Inbox**, **New agent ▾**, **Changes**, and a **⋯** menu. Task overview, thread switching, commands, **Run project**, agent terminals, agent browser access, and thread actions are in **⋯**, so the top bar no longer overlaps or clips at 1280 px with panes open.

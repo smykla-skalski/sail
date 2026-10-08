@@ -76,6 +76,7 @@
     spawnReceipts: SpawnReceipt[];
     onopensubagent: (receipt: SpawnReceipt) => Promise<void>;
     shipRuns: ShipRun[];
+    shipNeedsInput: number;
     shippingBusy: boolean;
     mergeOwner?: MergeOwner;
     nativeSubagents: NativeSubagent[];
@@ -178,6 +179,7 @@
     spawnReceipts,
     onopensubagent,
     shipRuns,
+    shipNeedsInput,
     shippingBusy,
     mergeOwner = 'you',
     nativeSubagents,
@@ -603,6 +605,7 @@
       {spawnReceipts}
       {onopensubagent}
       {shipRuns}
+      {shipNeedsInput}
       {shippingBusy}
       {mergeOwner}
       {nativeSubagents}
@@ -716,6 +719,7 @@
       {spawnReceipts}
       {onopensubagent}
       {shipRuns}
+      {shipNeedsInput}
       {shippingBusy}
       {mergeOwner}
       {nativeSubagents}
@@ -978,7 +982,8 @@
                   ><button
                     data-detail-tab="ship"
                     class:active={nativeTab === 'ship'}
-                    onclick={() => (nativeTab = 'ship')}>Ship runs ({shipRuns.length})</button
+                    aria-label={`Ship runs, ${shipNeedsInput} need input`}
+                    onclick={() => (nativeTab = 'ship')}>Ship runs ({shipNeedsInput})</button
                   ><button aria-label="Close OpenCode details" onclick={closeNativeDetails}
                     >×</button
                   >
@@ -1145,7 +1150,8 @@
                   ><button
                     data-detail-tab="ship"
                     class:active={acpTab === 'ship'}
-                    onclick={() => (acpTab = 'ship')}>Ship runs ({shipRuns.length})</button
+                    aria-label={`Ship runs, ${shipNeedsInput} need input`}
+                    onclick={() => (acpTab = 'ship')}>Ship runs ({shipNeedsInput})</button
                   ><button aria-label="Close agent details" onclick={closeAcpDetails}>×</button>
                 </nav>
                 {#if acpTab === 'ship'}

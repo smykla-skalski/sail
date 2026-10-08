@@ -23,8 +23,21 @@
     type SettingsAction,
     type SettingsSnapshot,
   } from './lib/settings-window';
+  import {
+    defaultNotificationPrefs,
+    notificationPreferenceLabels,
+    notificationPreferences,
+    notificationTypeLabels,
+    notificationTypes,
+    type NotificationPreference,
+  } from './lib/notification-prefs';
 
   let snapshot = $state<SettingsSnapshot | null>(null);
+  const notificationsOn = $derived(
+    notificationTypes.some(
+      (type) => (snapshot?.notificationPrefs[type] ?? defaultNotificationPrefs[type]) !== 'never',
+    ),
+  );
   let binaryPath = $state('');
   let personalChecks = $state('');
   let personalChecksDirty = $state(false);
@@ -775,20 +788,30 @@
       </section>
       <section class="settings-card">
         <h2>Notifications</h2>
-        <label class="attention-setting">
-          <input
-            type="checkbox"
-            checked={snapshot?.notificationsEnabled ?? true}
-            onchange={(event) =>
-              send({ type: 'notifications', value: event.currentTarget.checked })}
-          />
-          OS notifications
-        </label>
+        {#each notificationTypes as type (type)}
+          <label class="attention-setting notification-pref">
+            <span>{notificationTypeLabels[type]}</span>
+            <select
+              data-notification-type={type}
+              value={snapshot?.notificationPrefs[type] ?? defaultNotificationPrefs[type]}
+              onchange={(event) =>
+                send({
+                  type: 'notification-pref',
+                  notification: type,
+                  value: event.currentTarget.value as NotificationPreference,
+                })}
+            >
+              {#each notificationPreferences as preference (preference)}
+                <option value={preference}>{notificationPreferenceLabels[preference]}</option>
+              {/each}
+            </select>
+          </label>
+        {/each}
         <label class="attention-setting">
           <input
             type="checkbox"
             checked={snapshot?.notificationSound ?? true}
-            disabled={!snapshot?.notificationsEnabled}
+            disabled={!notificationsOn}
             onchange={(event) =>
               send({ type: 'notification-sound', value: event.currentTarget.checked })}
           />

@@ -240,7 +240,7 @@ describe('native Ship run history', () => {
       ),
     );
     await expect($('#session-details')).toBeDisplayed();
-    await expect($('.side-tabs')).toHaveText(expect.stringContaining('Ship runs (2)'));
+    await expect($('.side-tabs')).toHaveText(expect.stringContaining('Ship runs (0)'));
     await expect($('.ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('Ship dashboard fixture'));
     await $('.ship-scope button:nth-child(2)').click();

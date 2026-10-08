@@ -310,6 +310,36 @@
   import PaneTree from './PaneTree.svelte';
   import InboxPanel from './InboxPanel.svelte';
   import {
+    applyAttentionLifecycle,
+    attentionRoute,
+    attentionSurfaceCounts,
+    dismissAttention,
+    isAttentionTarget,
+    loadAttentionLedger,
+    nextAttentionItem,
+    sessionRequestCandidates,
+    shipAttentionCandidates,
+    shipReceiptIds,
+    snoozeAttention,
+    snoozeUntil,
+    subagentAttentionCandidates,
+    threadRequestKeys,
+    type AttentionItem,
+    type AttentionLedger,
+    type AttentionSnooze,
+    type AttentionTarget,
+  } from './lib/attention-items';
+  import {
+    attentionNotificationType,
+    createNotificationCoalescer,
+    legacyNotificationsKey,
+    loadNotificationPrefs,
+    notificationAllowed,
+    notificationPrefsKey,
+    type NotificationPrefs,
+  } from './lib/notification-prefs';
+  import { matches as shortcutMatches } from './lib/shortcuts';
+  import {
     failedCheckOutcome,
     inboxLocations,
     inboxPermissionDecisionTitle,
@@ -992,7 +1022,13 @@
     ]),
   );
   let attentionRevision = 0;
-  let notificationsEnabled = $state(getSetting('sai-notifications-enabled') !== 'false');
+  const notificationLoad = loadNotificationPrefs(
+    getSetting(notificationPrefsKey),
+    getSetting(legacyNotificationsKey),
+  );
+  let notificationPrefs = $state<NotificationPrefs>(notificationLoad.prefs);
+  if (notificationLoad.migrated)
+    setSetting(notificationPrefsKey, JSON.stringify(notificationLoad.prefs));
   let crossValidation = $state(parseValidationSettings(getSetting(validationSettingsKey)));
   let modelRouting = $state(parseModelRoutingSettings(getSetting(modelRoutingSettingsKey)));
   let contextHandoffThreshold = $state(
@@ -1006,6 +1042,71 @@
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
   let mergeOwner = $state<MergeOwner>(parseMergeOwner(getSetting('sai-ship-merge-owner')));
   let inboxItems = $state<InboxItem[]>([]);
+  let attentionLedger = $state<AttentionLedger>(
+    loadAttentionLedger(getSetting('sai-attention-ledger')),
+  );
+  let attentionClock = $state(Date.now());
+  let lastAttentionId = $state<string | null>(null);
+  let shipFocusRequest = $state<{
+    id: number;
+    runId: string;
+    issueId: string;
+    focus: 'issue' | 'pull-request';
+  } | null>(null);
+  let sessionAttention = $derived(sessionRequestCandidates(inboxItems));
+  let attentionView = $derived(
+    applyAttentionLifecycle(
+      attentionLedger,
+      [
+        ...sessionAttention,
+        ...shipAttentionCandidates(shipRuns, {
+          mergeOwner,
+          now: attentionClock,
+          requestThreads: threadRequestKeys(sessionAttention),
+        }),
+        ...subagentAttentionCandidates(
+          visibleSpawnReceipts,
+          threadRequestKeys(sessionAttention),
+          shipReceiptIds(shipRuns),
+        ),
+      ],
+      attentionClock,
+    ),
+  );
+  let attentionItems = $derived(attentionView.items);
+  let attentionCounts = $derived(attentionSurfaceCounts(attentionItems));
+  let stateAttentionItems = $derived(attentionItems.filter((item) => item.dismissible));
+  let notifiedAttention = new Set<string>();
+  let attentionBaselined = false;
+
+  $effect(() => {
+    const view = attentionView;
+    if (view.changed) {
+      attentionLedger = view.ledger;
+      setSetting('sai-attention-ledger', JSON.stringify(view.ledger));
+    }
+  });
+
+  $effect(() => {
+    const count = attentionCounts.dock;
+    if (isTauri()) void invoke('set_attention_badge', { count }).catch(() => undefined);
+  });
+
+  $effect(() => {
+    const items = attentionItems;
+    if (attentionBaselined)
+      for (const item of items) {
+        if (!item.kind.startsWith('ship-') || notifiedAttention.has(item.id)) continue;
+        notifications.enqueue({
+          type: attentionNotificationType(item.kind),
+          target: item.target,
+          title: `Ship · ${item.title}`,
+          body: item.detail ?? 'Needs your attention',
+        });
+      }
+    attentionBaselined = true;
+    notifiedAttention = new Set(items.map((item) => item.id));
+  });
   let inboxOutcomes = $state<InboxOutcome[]>(loadInboxOutcomes(getSetting('sai-inbox-outcomes')));
   let durableActivityHistory = $state<ActivityHistoryEvent[]>(
     loadActivityHistory(getSetting('sai-activity-history')),
@@ -2051,7 +2152,7 @@
       agentsError: agentDetectionError,
       crossValidation,
       modelRouting,
-      notificationsEnabled,
+      notificationPrefs,
       notificationSound,
       personalPostTurnChecks,
       agentWorktreesEnabled,
@@ -2129,6 +2230,7 @@
     if (isTauri()) setTimeout(retryCoordinationDeliveries, 2_000);
     let unlistenAgentTerminals: (() => void) | undefined;
     let unlistenNotificationClick: (() => void) | undefined;
+    let stopEmulatedClick: (() => void) | undefined;
     setTheme(dark);
     let stopSettingsRequest: (() => void) | undefined;
     let stopSettingsAction: (() => void) | undefined;
@@ -2214,9 +2316,9 @@
         else if (action.type === 'binary') {
           binaryPath = action.value;
           void retryRuntime();
-        } else if (action.type === 'notifications') {
-          notificationsEnabled = action.value;
-          setSetting('sai-notifications-enabled', String(action.value));
+        } else if (action.type === 'notification-pref') {
+          notificationPrefs = { ...notificationPrefs, [action.notification]: action.value };
+          setSetting(notificationPrefsKey, JSON.stringify(notificationPrefs));
         } else if (action.type === 'notification-sound') {
           notificationSound = action.value;
           setSetting('sai-notification-sound', String(action.value));
@@ -2306,16 +2408,23 @@
           return undefined;
         },
       );
-      void listen<string>('sail-notification-click', ({ payload }) => {
-        void jumpToRecentThread(payload);
+      if (import.meta.env.MODE === 'e2e') {
+        const emulateClick = (event: Event) =>
+          void openNotificationTarget((event as CustomEvent<unknown>).detail);
+        window.addEventListener('sail-e2e-notification-click', emulateClick);
+        stopEmulatedClick = () =>
+          window.removeEventListener('sail-e2e-notification-click', emulateClick);
+      }
+      void listen<unknown>('sail-notification-click', ({ payload }) => {
+        void openNotificationTarget(payload);
       }).then((unlisten) => {
         if (disposed) unlisten();
         else unlistenNotificationClick = unlisten;
         return undefined;
       });
-      updateAttentionBadge();
     }
     void initialize();
+    const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
     void tickShippingRuns();
     healthTimer = setInterval(() => void checkRuntime(), 5000);
@@ -2355,6 +2464,8 @@
       clearTimeout(diffTimer);
       clearTimeout(recoveryTimer);
       clearTimeout(inboxRefreshTimer);
+      clearInterval(attentionTimer);
+      notifications.dispose();
       clearInterval(healthTimer);
       clearInterval(sidebarRefreshTimer);
       clearTimeout(sidebarInventoryTimer);
@@ -2368,6 +2479,7 @@
       unlistenTerminalExit?.();
       unlistenAgentTerminals?.();
       unlistenNotificationClick?.();
+      stopEmulatedClick?.();
       cancelAnimationFrame(followFrame);
       for (const pending of messageTimers.values()) clearTimeout(pending.timer);
     };
@@ -9922,7 +10034,6 @@
         }),
       ),
     );
-    updateAttentionBadge();
     void reconcileNativeActivity();
   }
 
@@ -10705,6 +10816,77 @@
       if (directory === item.directory) await selectSession(item.sessionId);
     }
     await focusInboxRequest(item);
+  }
+
+  function saveAttentionLedger(ledger: AttentionLedger) {
+    attentionLedger = ledger;
+    setSetting('sai-attention-ledger', JSON.stringify(ledger));
+  }
+
+  function dismissAttentionItem(item: AttentionItem) {
+    saveAttentionLedger(dismissAttention(attentionLedger, item));
+  }
+
+  function snoozeAttentionItem(item: AttentionItem, choice: AttentionSnooze) {
+    saveAttentionLedger(snoozeAttention(attentionLedger, item, snoozeUntil(choice, Date.now())));
+  }
+
+  async function openAttentionTarget(target: AttentionTarget) {
+    const route = attentionRoute(target);
+    if (route.view === 'thread') {
+      const request = inboxItems.find(
+        (item) =>
+          !isInboxOutcome(item) &&
+          (item.agentId ?? 'opencode') === route.agentId &&
+          item.directory === route.directory &&
+          item.sessionId === route.sessionId &&
+          String(item.requestId) === String(route.requestId),
+      );
+      if (request) await openInboxItem(request);
+      else
+        await jumpToRecentThread(JSON.stringify([route.agentId, route.directory, route.sessionId]));
+      return;
+    }
+    inboxDialog.close();
+    if (route.view === 'subagent') {
+      const receipt = visibleSpawnReceipts.find((item) => item.receiptId === route.receiptId);
+      if (!receipt) throw new Error('The subagent is no longer available.');
+      await openSpawnTarget(receipt);
+      return;
+    }
+    showWorkspace();
+    if (directory !== route.repository && coordinationProject(directory) !== route.repository)
+      await loadProject(route.repository, false);
+    showShipRuns();
+    shipFocusRequest = {
+      id: (shipFocusRequest?.id ?? 0) + 1,
+      runId: route.runId,
+      issueId: route.issueId,
+      focus: route.focus,
+    };
+  }
+
+  async function openAttentionItem(item: AttentionItem) {
+    try {
+      await openAttentionTarget(item.target);
+    } catch (cause) {
+      error = describe(cause);
+    }
+  }
+
+  async function openNotificationTarget(payload: unknown) {
+    if (typeof payload === 'string') {
+      await jumpToRecentThread(payload);
+      return;
+    }
+    if (isAttentionTarget(payload)) await openAttentionTarget(payload);
+  }
+
+  async function goToNextAttention() {
+    const item = nextAttentionItem(attentionItems, lastAttentionId);
+    if (!item) return;
+    lastAttentionId = item.id;
+    await openAttentionItem(item);
   }
 
   async function focusInboxOutcome(item: InboxItem, attempts = 40): Promise<void> {
@@ -11864,7 +12046,6 @@
     const nextRunning = { ...runningAgentThreads };
     delete nextRunning[key];
     runningAgentThreads = nextRunning;
-    updateAttentionBadge();
   }
 
   function threadIsViewed(key: string): boolean {
@@ -11873,15 +12054,6 @@
       (leaves(paneLayout).some((pane) => pane.thread && threadKey(pane.thread) === key) ||
         (!acpAgent && !!sessionID && focusedThreadKey() === key))
     );
-  }
-
-  function updateAttentionBadge() {
-    if (!isTauri()) return;
-    const threads = new Set([...agentThreads, ...sidebarOpenCodeThreads].map(threadKey));
-    const count = Object.entries(threadAttention).filter(
-      ([key, item]) => threads.has(key) && item.status === 'waiting',
-    ).length;
-    void invoke('set_attention_badge', { count }).catch(() => undefined);
   }
 
   async function reconcileNativeActivity() {
@@ -12109,7 +12281,6 @@
           .filter(([, item]) => item.status === 'working' || item.status === 'waiting')
           .map(([key]) => [key, true]),
       );
-      updateAttentionBadge();
       for (const thread of agentThreads) {
         const key = threadKey(thread);
         const before = previousAttention[key];
@@ -12166,19 +12337,24 @@
       delete nextRunning[key];
       runningAgentThreads = nextRunning;
     }
-    updateAttentionBadge();
     if (notify) showThreadAttentionNotification(thread, status);
   }
 
   function showThreadAttentionNotification(thread: AgentThread, status: ThreadStatus) {
-    if (!notificationsEnabled || !isTauri()) return;
+    if (!isTauri()) return;
     const children = activeSubagentsForSource(
       spawnReceipts,
       receiptSourceId(thread.agent, thread.sessionId),
       thread.directory,
     );
-    void invoke('show_attention_notification', {
-      threadKey: threadKey(thread),
+    notifications.enqueue({
+      type: status === 'waiting' ? 'input' : 'completed',
+      target: {
+        type: 'thread',
+        agentId: thread.agent,
+        directory: thread.directory,
+        sessionId: thread.sessionId,
+      },
       title: thread.title,
       body:
         status === 'waiting'
@@ -12188,9 +12364,20 @@
             : children.length
               ? 'Subagents are still active'
               : 'Completed',
-      sound: notificationSound,
-    }).catch(() => undefined);
+    });
   }
+
+  const notifications = createNotificationCoalescer({
+    allow: (notification) =>
+      notificationAllowed(notificationPrefs[notification.type], !document.hasFocus()),
+    send: (notification) =>
+      void invoke('show_attention_notification', {
+        target: notification.target,
+        title: notification.title,
+        body: notification.body,
+        sound: notificationSound,
+      }).catch(() => undefined),
+  });
 
   async function runOnePostTurnCheck(check: PostTurnCheck, retry = false) {
     const key = checkKey(check);
@@ -13985,22 +14172,13 @@
   }
 
   function keydownWorkspace(event: KeyboardEvent) {
-    if (
-      (event.metaKey || event.ctrlKey) &&
-      !event.altKey &&
-      !event.shiftKey &&
-      event.key.toLowerCase() === 'b'
-    ) {
+    if (shortcutMatches(event, 'sidebar.toggle')) {
       event.preventDefault();
       if (!event.repeat && !document.querySelector('dialog[open]')) toggleSidebar();
       return;
     }
     if (
-      event.metaKey &&
-      event.shiftKey &&
-      !event.ctrlKey &&
-      !event.altKey &&
-      event.key.toLowerCase() === 'j' &&
+      shortcutMatches(event, 'chat.side') &&
       !event.repeat &&
       !document.querySelector('dialog[open]')
     ) {
@@ -14008,18 +14186,17 @@
       openSideChat();
       return;
     }
-    if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key === ',') {
+    if (shortcutMatches(event, 'attention.next')) {
+      event.preventDefault();
+      if (!event.repeat && !document.querySelector('dialog[open]')) void goToNextAttention();
+      return;
+    }
+    if (shortcutMatches(event, 'settings.open')) {
       event.preventDefault();
       if (!event.repeat) void openSettings();
       return;
     }
-    if (
-      event.ctrlKey &&
-      !event.metaKey &&
-      !event.altKey &&
-      event.key === 'Tab' &&
-      !document.querySelector('dialog[open]')
-    ) {
+    if (shortcutMatches(event, 'threads.cycle') && !document.querySelector('dialog[open]')) {
       event.preventDefault();
       if (!recentCycleKeys) {
         recentCycleKeys = availableRecentKeys();
@@ -14039,68 +14216,37 @@
       if (key) void jumpToRecentThread(key);
       return;
     }
-    if (
-      event.metaKey &&
-      !event.ctrlKey &&
-      !event.altKey &&
-      !event.shiftKey &&
-      /^[1-9]$/.test(event.key) &&
-      !document.querySelector('dialog[open]')
-    ) {
+    if (shortcutMatches(event, 'threads.jump') && !document.querySelector('dialog[open]')) {
       event.preventDefault();
       recentCycleKeys = null;
       const key = availableRecentKeys()[Number(event.key) - 1];
       if (key) void jumpToRecentThread(key);
       return;
     }
-    if (
-      (event.metaKey || event.ctrlKey) &&
-      !event.altKey &&
-      !event.shiftKey &&
-      event.key.toLowerCase() === 'k' &&
-      !event.repeat
-    ) {
+    if (shortcutMatches(event, 'palette.open') && !event.repeat) {
       event.preventDefault();
       openCommandPalette();
       return;
     }
-    if (
-      (event.metaKey || event.ctrlKey) &&
-      !event.altKey &&
-      event.shiftKey &&
-      event.key.toLowerCase() === 'w'
-    ) {
+    if (shortcutMatches(event, 'worktree.close')) {
       event.preventDefault();
       if (!event.repeat && !document.querySelector('dialog[open]')) closeCurrentWorktree();
       return;
     }
-    if (
-      (event.metaKey || event.ctrlKey) &&
-      !event.altKey &&
-      !event.shiftKey &&
-      event.key.toLowerCase() === 'n'
-    ) {
+    if (shortcutMatches(event, 'worktree.new')) {
       event.preventDefault();
       const repository = directory ? coordinationProject(directory) : null;
       if (repository && !event.repeat && !document.querySelector('dialog[open]'))
         paletteWorktreeRequest = { id: crypto.randomUUID(), path: repository, fromPalette: false };
       return;
     }
-    if (
-      (event.metaKey || event.ctrlKey) &&
-      !event.altKey &&
-      !event.shiftKey &&
-      event.key.toLowerCase() === 'w'
-    ) {
+    if (shortcutMatches(event, 'pane.close')) {
       event.preventDefault();
       if (!event.repeat && !document.querySelector('dialog[open]')) closeCurrentPane();
       return;
     }
     if (
-      (event.metaKey || event.ctrlKey) &&
-      !event.altKey &&
-      !event.shiftKey &&
-      event.key.toLowerCase() === 't' &&
+      shortcutMatches(event, 'terminal.split') &&
       !event.repeat &&
       !document.querySelector('dialog[open]')
     ) {
@@ -14109,9 +14255,7 @@
       return;
     }
     if (
-      (event.metaKey || event.ctrlKey) &&
-      !event.altKey &&
-      event.key.toLowerCase() === 'd' &&
+      shortcutMatches(event, 'pane.split') &&
       !event.repeat &&
       !document.querySelector('dialog[open]')
     ) {
@@ -14212,10 +14356,7 @@
     }
     if (
       event.repeat ||
-      event.key.toLowerCase() !== 'l' ||
-      !(event.metaKey || event.ctrlKey) ||
-      event.altKey ||
-      event.shiftKey ||
+      !shortcutMatches(event, 'details.toggle') ||
       document.querySelector('dialog[open]')
     )
       return;
@@ -14401,7 +14542,7 @@
         !agentAvailability.some((agent) => agent.available)}
       onchooseproject={() => void chooseProject()}
       conversationTitle={focusedConversationTitle}
-      inboxCount={inboxItems.filter((item) => !isInboxOutcome(item) || !item.read).length}
+      inboxCount={attentionCounts.inbox}
       oninbox={openInbox}
       {directory}
       agents={agentAvailability}
@@ -14917,6 +15058,7 @@
         spawnReceipts={visibleSpawnReceipts}
         onopensubagent={openSpawnTarget}
         {shipRuns}
+        shipNeedsInput={attentionCounts.shipTab}
         {shippingBusy}
         {mergeOwner}
         nativeSubagents={Object.values(nativeSubagents)}
@@ -15017,6 +15159,7 @@
         {mergeOwner}
         nativeSubagents={Object.values(nativeSubagents)}
         onclose={closeShipRuns}
+        focusRequest={shipFocusRequest}
         onrefresh={() => tickShippingRuns(true)}
         onopen={openShipTarget}
         onhandoff={handoffShipIssue}
@@ -15070,7 +15213,8 @@
           >{/if}<button
           class:active={activeSideTab === 'ship'}
           aria-current={activeSideTab === 'ship' ? 'page' : undefined}
-          onclick={() => switchSideTab('ship')}>Ship runs ({shipRuns.length})</button
+          aria-label={`Ship runs, ${attentionCounts.shipTab} need input`}
+          onclick={() => switchSideTab('ship')}>Ship runs ({attentionCounts.shipTab})</button
         >
       </nav>
       <div class="side-panel-body">
@@ -15155,6 +15299,7 @@
             {mergeOwner}
             nativeSubagents={Object.values(nativeSubagents)}
             onclose={closeShipRuns}
+            focusRequest={shipFocusRequest}
             onrefresh={() => tickShippingRuns(true)}
             onopen={openShipTarget}
             onhandoff={handoffShipIssue}
@@ -15166,7 +15311,11 @@
         </div>
       </div>
     </section>{/if}
-  <AgentStatusBar items={agentStatusItems} onopen={(key) => jumpToRecentThread(key)} />
+  <AgentStatusBar
+    items={agentStatusItems}
+    attentionCount={attentionCounts.statusBar}
+    onopen={(key) => jumpToRecentThread(key)}
+  />
 </div>
 <ConfirmDialog request={confirmation} onanswer={answerConfirmation} />
 <PathPicker
@@ -15443,9 +15592,17 @@
   {#if inboxError}<p class="notice error" role="alert">{inboxError}</p>{/if}
   <InboxPanel
     items={inboxItems}
+    attention={stateAttentionItems}
+    total={attentionCounts.inbox}
     loading={inboxLoading}
     error={inboxError}
     onopen={(item) => void openInboxItem(item)}
+    onopenattention={(item) => {
+      inboxDialog.close();
+      void openAttentionItem(item);
+    }}
+    ondismiss={dismissAttentionItem}
+    onsnooze={snoozeAttentionItem}
     ondecide={decideInbox}
   />
 </dialog>

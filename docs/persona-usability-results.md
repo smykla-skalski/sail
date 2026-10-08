@@ -62,3 +62,18 @@ Priya, a lead shipping a batch, needs to find the one issue that needs her witho
 Screenshots: [grouped list](visual-audit/screenshots/ship-list-grouped.png), [grouped list, dark](visual-audit/screenshots/ship-list-grouped-dark.png), [drill-in detail](visual-audit/screenshots/ship-detail-drill-in.png), [split view](visual-audit/screenshots/ship-split-detail.png), [split view, dark](visual-audit/screenshots/ship-split-detail-dark.png).
 
 Not exercised in the GUI: a focused or selected row becoming Done while the list is open, and live frozen sorting while focus is in the list. These are covered by unit tests of the grouping and ordering logic only.
+
+# Attention walkthrough — 2026-10-08
+
+Priya, a lead who runs many Ship issues, needs one place that says what waits on her. Jordan maintains several repositories, and Sam works from the keyboard at a narrow width. This walkthrough drives a private macOS build through embedded WebDriver with seeded Ship runs. It is a scripted, simulated persona pass, not a study with real users. The Dock badge and OS notifications are native and were not observed; their counts and click routing are covered by unit tests and by an emulated click event at the app boundary.
+
+| Persona | Task                                                                               | Result                                                                                                                                                                     |
+| ------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Priya   | Open Sail with two Ship issues that need input and read the count on every surface | Inbox button, Inbox header and status bar all said 2. The Ship tab said 2 as well, because both items were Ship issues that need input.                                    |
+| Priya   | Dismiss one Ship item from the Inbox                                               | Inbox and status bar dropped to 1 together. The item came back only after its state changed (unit tested).                                                                 |
+| Priya   | Click a Ship notification for the second issue                                     | Sail opened the Ship view with that issue focused. The click was emulated at the app boundary, not through the OS.                                                         |
+| Jordan  | Read the Inbox with items from the repository                                      | Items sat under their repository name, with the same global count in the header.                                                                                           |
+| Sam     | Press Cmd+J twice from the Ship view                                               | Focus moved to the first item, then to the second, and wrapped. Cmd+Shift+J still opens the side chat. The Inbox button advertises the shortcut through aria-keyshortcuts. |
+| Sam     | Narrow the window to 640 px                                                        | The status bar kept "! 2" visible. Before, its counts were hidden below 700 px.                                                                                            |
+
+Not covered: a real OS notification, the Dock or taskbar badge, snooze expiry in the live app, and the Settings window's per-type selects (not exercised through WebDriver).
