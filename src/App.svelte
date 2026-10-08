@@ -64,6 +64,7 @@
     loadShipRuns,
     repositoryForRemote,
     shippingWorkerGone,
+    unrecoverableGraceExpired,
     unrecoverableIssuePlan,
     parseShipReport,
     requireValidatorEconomics,
@@ -5687,18 +5688,21 @@
   }
 
   const shipRepairMisses = new SvelteMap<string, string>();
+  const shipRepositoryDeadSince = new SvelteMap<string, number>();
 
   // Older runs stored a worktree path as their repository; once that worktree
   // is deleted every claim and fence call fails, so point them at the checkout.
-  // Returns the runs that stay unrecoverable.
-  async function repairShipRunRepositories(): Promise<Set<string>> {
+  // Returns when each still-unrecoverable run was first seen dead.
+  async function repairShipRunRepositories(): Promise<Map<string, number>> {
     const available = await Promise.all(
       shipRuns.map((run) =>
         invoke<boolean>('repository_path_available', { path: run.repository }).catch(() => true),
       ),
     );
     const dead = shipRuns.filter((_, index) => !available[index]);
-    if (!dead.length) return new Set();
+    for (const [index, run] of shipRuns.entries())
+      if (available[index]) shipRepositoryDeadSince.delete(run.id);
+    if (!dead.length) return new SvelteMap();
     const catalogKey = projectCatalog.repositories.join('\0');
     const lookups = dead.filter((run) => shipRepairMisses.get(run.id) !== catalogKey);
     const repaired = new SvelteSet<string>();
@@ -5726,7 +5730,17 @@
       }
       if (repaired.size) await saveShipRuns();
     }
-    return new Set(dead.filter((run) => !repaired.has(run.id)).map((run) => run.id));
+    const unrecoverable = new SvelteMap<string, number>();
+    for (const run of dead) {
+      if (repaired.has(run.id)) {
+        shipRepositoryDeadSince.delete(run.id);
+        continue;
+      }
+      const since = shipRepositoryDeadSince.get(run.id) ?? Date.now();
+      shipRepositoryDeadSince.set(run.id, since);
+      unrecoverable.set(run.id, since);
+    }
+    return unrecoverable;
   }
 
   async function settleUnrecoverableShipRun(run: ShipRun): Promise<void> {
@@ -5756,11 +5770,13 @@
     try {
       const unrecoverable = await repairShipRunRepositories();
       await persistShipRefresh(
-        shipRuns.map((run) =>
-          unrecoverable.has(run.id)
+        shipRuns.map((run) => {
+          const since = unrecoverable.get(run.id);
+          if (since === undefined) return refreshShippingRun(run, refreshCompleted);
+          return unrecoverableGraceExpired(since, Date.now())
             ? settleUnrecoverableShipRun(run)
-            : refreshShippingRun(run, refreshCompleted),
-        ),
+            : Promise.resolve();
+        }),
         saveShipRuns,
       );
       for (const run of shipRuns) if (!unrecoverable.has(run.id)) launchReadyShipIssues(run);

@@ -1636,3 +1636,11 @@ export function unrecoverableIssuePlan(
   if (issue.state === 'failed' && issue.workerSettled === true) return dirty ? 'clear' : 'none';
   return 'fail';
 }
+
+// A repository can vanish briefly (unmounted volume, permission prompt), so
+// in-flight work is only failed once it stayed gone for this long.
+const unrecoverableGraceMillis = 10 * 60_000;
+
+export function unrecoverableGraceExpired(deadSince: number, now: number): boolean {
+  return now - deadSince >= unrecoverableGraceMillis;
+}

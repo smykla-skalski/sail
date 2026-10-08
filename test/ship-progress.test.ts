@@ -30,6 +30,7 @@ import {
   shipCheckpointOwner,
   currentShipBlockedReason,
   repositoryForRemote,
+  unrecoverableGraceExpired,
   unrecoverableIssuePlan,
   shippingWorkerGone,
   authorizeShipCheckpointThread,
@@ -2430,4 +2431,9 @@ void test('reads the message of error-like objects when matching a gone worker',
   assert.equal(shippingWorkerGone({ message: 'Agent session is not connected.' }), true);
   assert.equal(shippingWorkerGone({ message: 'denied' }), false);
   assert.equal(shippingWorkerGone(null), false);
+});
+
+void test('waits ten minutes before failing work in a vanished repository', () => {
+  assert.equal(unrecoverableGraceExpired(1_000, 1_000 + 9 * 60_000), false);
+  assert.equal(unrecoverableGraceExpired(1_000, 1_000 + 10 * 60_000), true);
 });
