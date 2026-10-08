@@ -15,8 +15,6 @@ There is no automatic updater. To update, download the next package for your pla
 - **Ship runs** shows the repository name; hover it for the full path.
 - A new thread shows **Connecting** until its agent session starts, and an OpenCode thread without a model shows **Model setup needed** instead of **Needs input**, so the thread header and the status bar agree on whether an agent is running.
 
-<<<<<<< HEAD
-
 ## Ship list and detail
 
 - Ship rows take two lines and sit under **Needs input**, **Fixing & active**, **Waiting**, and **Queued**. The second line shows the newest of the checkpoint blocker, its first open question, its next action, and live activity. Placeholder checkpoint text stays hidden until the worker updates it.
@@ -25,7 +23,7 @@ There is no automatic updater. To update, download the next package for your pla
 - Below about 560 px of pane width the detail replaces the list (**← All issues** or Escape returns to the row). Wider panes show the list and detail side by side. Focus moves to the detail heading when you open an issue.
 - ↑ and ↓ move between rows and Enter opens one. A **List | Graph** switch shows the dependency map. All four Ship panel mounts show the same panel, and **Close** is now **Hide panel**.
 - The empty state offers both routes: `/ship-it <issue-url>` and an issue graph from a plan.
-  \=======
+  \
 
 ## Adapter diagnostics
 
