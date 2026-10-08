@@ -451,7 +451,7 @@ export function nativeSubagentResult(child: NativeSubagent): string | null {
   if (!['completed', 'failed', 'interrupted'].includes(child.outcome)) return null;
   if (reportsInterruption(child.transcript)) return null;
   // A failed child's error explains the failure better than whatever it said last.
-  if (child.outcome === 'failed' && child.error) return null;
+  if (child.outcome === 'failed' && child.error && child.error !== incompleteHistory) return null;
   const last = child.transcript.findLast(
     (entry): entry is AgentMessage => entry.type === 'assistant',
   );
