@@ -367,7 +367,11 @@ export function updateEntriesBatch(
 
 const replayToolIndexes = new WeakMap<AgentEntry[], Map<string, number>>();
 
-export function updateEntriesInPlace(entries: AgentEntry[], update: Record<string, unknown>): void {
+export function updateEntriesInPlace(
+  entries: AgentEntry[],
+  update: Record<string, unknown>,
+  created?: number,
+): void {
   let toolIndexes = replayToolIndexes.get(entries);
   if (
     !toolIndexes &&
@@ -376,7 +380,7 @@ export function updateEntriesInPlace(entries: AgentEntry[], update: Record<strin
     toolIndexes = indexTools(entries);
     replayToolIndexes.set(entries, toolIndexes);
   }
-  applyEntryUpdate(entries, update, toolIndexes);
+  applyEntryUpdate(entries, update, toolIndexes, created);
 }
 
 function indexTools(entries: AgentEntry[]): Map<string, number> {
@@ -492,8 +496,19 @@ export interface AgentSessionState {
 }
 
 const sessionStates = new Map<string, AgentSessionState>();
-const backgroundLimit = 2000;
-const backgroundUpdates = new Map<string, Record<string, unknown>[] | null>();
+/** Sessions whose full transcript stays in memory while they are off screen. Least recently
+ * left sessions are dropped first; deleting a thread drops its transcript. */
+export const liveTranscriptLimit = 24;
+
+export interface LiveTranscript {
+  entries: AgentEntry[];
+  /** The transcript holds the whole session from its start, not only the capped cache. */
+  complete: boolean;
+}
+
+const liveTranscripts = new Map<string, LiveTranscript>();
+/** Restores in flight per session. Their history replay must not reach a kept transcript. */
+const restoringTranscripts = new Map<string, number>();
 
 function sessionKey(agent: AgentId, sessionId: string): string {
   return JSON.stringify([agent, sessionId]);
@@ -512,74 +527,85 @@ export function sessionState(agent: AgentId, sessionId: string): AgentSessionSta
   return sessionStates.get(sessionKey(agent, sessionId));
 }
 
-/** Keeps the updates of a session that is no longer shown, so switching back to a running turn
- * needs no adapter restore. A restore replays history while the turn streams. */
-export function trackBackgroundSession(agent: AgentId, sessionId: string): void {
+/** Keeps the transcript of a session that is no longer shown and applies its updates as they
+ * arrive, so switching back to a running turn shows everything without an adapter restore.
+ * A restore would replay history while the turn streams. */
+export function trackLiveTranscript(
+  agent: AgentId,
+  sessionId: string,
+  entries: readonly AgentEntry[],
+  complete: boolean,
+): void {
   const key = sessionKey(agent, sessionId);
-  if (!backgroundUpdates.has(key)) backgroundUpdates.set(key, []);
+  liveTranscripts.delete(key);
+  if (restoringTranscripts.has(key)) return;
+  liveTranscripts.set(key, { entries: entries.slice(), complete });
+  for (const oldest of liveTranscripts.keys()) {
+    if (liveTranscripts.size <= liveTranscriptLimit) break;
+    liveTranscripts.delete(oldest);
+  }
 }
 
-export function bufferBackgroundUpdate(
+export function tracksLiveTranscript(agent: AgentId, sessionId: string): boolean {
+  return liveTranscripts.has(sessionKey(agent, sessionId));
+}
+
+export function applyLiveTranscriptUpdate(
   agent: AgentId,
   sessionId: string,
   update: Record<string, unknown>,
+  now = Date.now(),
 ): void {
   const key = sessionKey(agent, sessionId);
-  const buffer = backgroundUpdates.get(key);
-  if (!buffer) return;
-  if (buffer.length >= backgroundLimit) backgroundUpdates.set(key, null);
-  else buffer.push(update);
+  const transcript = liveTranscripts.get(key);
+  if (!transcript) return;
+  if (restoringTranscripts.has(key)) {
+    liveTranscripts.delete(key);
+    return;
+  }
+  // Matches the shown view: the local entry stands for the prompt, so an echo would duplicate it.
+  if (update.sessionUpdate === 'user_message_chunk') return;
+  updateEntriesInPlace(transcript.entries, update, now);
 }
 
-/** Drops a buffer that a history replay made unreliable; switching back then restores. */
-export function invalidateBackgroundSession(agent: AgentId, sessionId: string): void {
-  const key = sessionKey(agent, sessionId);
-  if (backgroundUpdates.has(key)) backgroundUpdates.set(key, null);
+/** Drops a transcript that a history replay made unreliable; switching back then restores. */
+export function invalidateLiveTranscript(agent: AgentId, sessionId: string): void {
+  liveTranscripts.delete(sessionKey(agent, sessionId));
 }
 
-/** Returns the buffered updates and stops tracking, or null when the buffer is incomplete. */
-export function takeBackgroundUpdates(
-  agent: AgentId,
-  sessionId: string,
-): Record<string, unknown>[] | null {
+/** Returns the kept transcript and stops tracking, or null when none is kept. */
+export function takeLiveTranscript(agent: AgentId, sessionId: string): LiveTranscript | null {
   const key = sessionKey(agent, sessionId);
-  const buffer = backgroundUpdates.get(key);
-  backgroundUpdates.delete(key);
-  return buffer ?? null;
+  const transcript = liveTranscripts.get(key) ?? null;
+  liveTranscripts.delete(key);
+  return transcript;
 }
 
 export function forgetSessionState(agent: AgentId, sessionId: string): void {
   const key = sessionKey(agent, sessionId);
   sessionStates.delete(key);
-  backgroundUpdates.delete(key);
+  liveTranscripts.delete(key);
 }
 
-/** Rebuilds the view of a running session from Sail's cache, or null when a restore is needed.
- * Without a complete buffer the cached transcript is shown until the turn ends and history
- * reloads, because restoring a running session replays history into the live stream. */
+/** Rebuilds the view of a running session without a restore. Without a kept transcript, for
+ * example after an app reload, the capped cache is shown and marked incomplete until the turn
+ * ends and history reloads, because restoring a running session replays history into the
+ * stream. */
 export function liveSessionView(
   cached: AgentEntry[],
-  buffered: Record<string, unknown>[] | null,
+  live: LiveTranscript | null,
   state: AgentSessionState | undefined,
-  now = Date.now(),
 ): {
   entries: AgentEntry[];
   complete: boolean;
   configOptions: AgentConfigOption[];
   availableCommands?: AgentCommand[];
-} | null {
-  if (!state?.configOptions) return null;
+} {
   return {
-    complete: buffered !== null,
-    entries: buffered
-      ? updateEntriesBatch(
-          cached,
-          buffered.filter((update) => update.sessionUpdate !== 'user_message_chunk'),
-          now,
-        )
-      : cached,
-    configOptions: state.configOptions,
-    ...(state.availableCommands ? { availableCommands: state.availableCommands } : {}),
+    complete: live?.complete ?? false,
+    entries: live ? live.entries.slice() : cached,
+    configOptions: state?.configOptions ?? [],
+    ...(state?.availableCommands ? { availableCommands: state.availableCommands } : {}),
   };
 }
 
@@ -629,15 +655,17 @@ function restoreSession(
   const key = JSON.stringify([agent, cwd, sessionId, profile]);
   const existing = restoringSessions.get(key);
   if (existing) return existing;
-  // A restore replays history, so this session's buffered updates can no longer be trusted.
-  invalidateBackgroundSession(agent, sessionId);
+  // A restore replays history, so this session's kept transcript can no longer be trusted.
+  invalidateLiveTranscript(agent, sessionId);
+  const live = sessionKey(agent, sessionId);
+  restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
   const request = invoke<Record<string, unknown>>(method, {
     agent,
     cwd,
     sessionId,
     profile,
   }).then((session) => {
-    invalidateBackgroundSession(agent, sessionId);
+    invalidateLiveTranscript(agent, sessionId);
     rememberRestoredState(agent, sessionId, session);
     return session;
   });
@@ -645,6 +673,9 @@ function restoreSession(
   void request
     .finally(() => {
       if (restoringSessions.get(key) === request) restoringSessions.delete(key);
+      const remaining = (restoringTranscripts.get(live) ?? 1) - 1;
+      if (remaining > 0) restoringTranscripts.set(live, remaining);
+      else restoringTranscripts.delete(live);
     })
     .catch(() => undefined);
   return request;

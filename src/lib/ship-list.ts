@@ -2,6 +2,7 @@ import type { ShipIssue, ShipRun } from './issue-shipping.ts';
 import {
   currentShipGates,
   shipActivity,
+  shipBlock,
   shipFixRounds,
   shipIssuePresentation,
   stages,
@@ -147,6 +148,22 @@ export function shipDetailFallback(
     return remembered;
   const first = rows.find((row) => row.group !== 'done')?.issue;
   return first ? { runId: run.id, issueId: first.id } : null;
+}
+
+/** What the worker waits on the user for, quoted for its composer, or null when nothing is pending. */
+export function shipWorkerRequest(issue: ShipIssue): string | null {
+  if (issue.state === 'merged' || !issue.threadId) return null;
+  const waiting = issue.reportedStatus === 'blocked' || issue.checkpoint?.status === 'blocked';
+  const lines = [
+    ...new Set(
+      [waiting ? shipBlock(issue) : null, ...(issue.checkpoint?.unresolvedQuestions ?? [])]
+        .map((line) => line?.trim())
+        .filter((line): line is string => !!line),
+    ),
+  ];
+  if (!lines.length) return null;
+  const quoted = lines.flatMap((line) => line.split('\n')).map((line) => `> ${line}`.trimEnd());
+  return `${quoted.join('\n')}\n\n`;
 }
 
 export function shipAllMerged(run: ShipRun, options: ShipPresentationOptions): boolean {

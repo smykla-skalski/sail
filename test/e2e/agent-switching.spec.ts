@@ -1,6 +1,13 @@
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -170,9 +177,37 @@ async function switchAwayAndBack(title: string, away: string, times = 3): Promis
   await switchAwayAndBack(title, away, times - 1);
 }
 
+async function conversationText(rendered = -1, attempts = 40): Promise<string> {
+  const count = await browser.execute(() => {
+    const scroll = document.querySelector<HTMLElement>('.agent-conversation');
+    if (!scroll) return 0;
+    scroll.scrollTop = 0;
+    scroll.dispatchEvent(new Event('scroll'));
+    return scroll.querySelectorAll('*').length;
+  });
+  if (count === rendered || attempts === 0) return $('.agent-conversation').getText();
+  await browser.pause(250);
+  return conversationText(count, attempts - 1);
+}
+
+function occurrences(text: string, part: string): number {
+  return text.split(part).length - 1;
+}
+
+function expectEachOnce(text: string, prefix: string, last: number) {
+  const missing: number[] = [];
+  const repeated: number[] = [];
+  for (let index = 1; index <= last; index += 1) {
+    const count = occurrences(text, `${prefix}${index} `);
+    if (count === 0) missing.push(index);
+    if (count > 1) repeated.push(index);
+  }
+  expect({ prefix, missing, repeated }).toEqual({ prefix, missing: [], repeated: [] });
+}
+
 async function sendPrompt(text: string) {
   await $('.agent-composer textarea').setValue(text);
-  await $('.agent-actions button').click();
+  await $("//*[contains(@class,'agent-actions')]//button[contains(.,'Send')]").click();
 }
 
 describe('agent sessions survive thread switches', () => {
@@ -283,6 +318,70 @@ describe('agent sessions survive thread switches', () => {
     expect(readFileSync(join(first, 'continuity-runs.txt'), 'utf8')).toBe('run\n');
   });
 
+  it('shows the whole live turn after switching back during a flood of updates', async () => {
+    await openThread('Continuity main');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const before = restarts(first);
+    const promptsBefore = occurrences(await conversationText(), 'Flood turn');
+    await sendPrompt('Flood turn');
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Flood waiting.'));
+    await openThread('Continuity sibling');
+    writeFileSync(join(first, 'flood-go.txt'), 'go\n');
+    await browser.waitUntil(() => existsSync(join(first, 'flood-sent.txt')), {
+      timeout: 20_000,
+      timeoutMsg: 'The test agent did not send the flood',
+    });
+    await browser.pause(1000);
+    await openThread('Continuity main');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await expect($('.agent-history-gap')).not.toBeExisting();
+    const live = await conversationText();
+    expect(occurrences(live, 'Flood turn')).toBe(promptsBefore + 1);
+    expect(occurrences(live, 'Flood waiting.')).toBe(1);
+    expectEachOnce(live, 'msg-', 90);
+    expectEachOnce(live, 'long-', 40);
+    expectEachOnce(live, 'f-', 2600);
+    expect(restarts(first)).toBe(before);
+    writeFileSync(join(first, 'flood-release.txt'), 'release\n');
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Flood finished.'), {
+      wait: 15_000,
+    });
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const finished = await conversationText();
+    expect(occurrences(finished, 'Flood turn')).toBe(promptsBefore + 1);
+    expectEachOnce(finished, 'f-', 2600);
+    expect(restarts(first)).toBe(before);
+  });
+
+  it('marks the capped view after an app reload until the turn ends', async () => {
+    await openThread('Continuity main');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const before = restarts(first);
+    const earlier = await conversationText();
+    await sendPrompt('Long turn');
+    await browser.waitUntil(
+      async () =>
+        occurrences(await $('.agent-conversation').getText(), 'part-3 ') >
+        occurrences(earlier, 'part-3 '),
+    );
+    await browser.refresh();
+    await openThread('Continuity main');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await expect($('.agent-history-gap')).toHaveText('Earlier messages load when this turn ends.');
+    expect(restarts(first)).toBe(before);
+    await expect($('.agent-history-gap')).not.toBeExisting({ wait: 45_000 });
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'), {
+      wait: 15_000,
+    });
+    const transcript = await conversationText();
+    expect(occurrences(transcript, 'Long turn')).toBe(occurrences(earlier, 'Long turn') + 1);
+    for (let part = 1; part <= 60; part += 1)
+      expect(occurrences(transcript, `part-${part} `)).toBe(
+        occurrences(earlier, `part-${part} `) + 1,
+      );
+    expect(restarts(first)).toBe(before);
+  });
+
   it('lets background work finish after switching away and back', async () => {
     await openThread('Continuity main');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
@@ -374,7 +473,8 @@ describe('agent sessions survive thread switches', () => {
     );
     await browser.pause(1500);
     await openThread('Continuity main');
-    const kept = await $('.agent-conversation').getText();
+    const kept = await conversationText();
+    expect(occurrences(kept, 'Second live subagent')).toBe(1);
     const streamed = [...kept.matchAll(/second-(\d+) /g)].map((match) => Number(match[1]));
     expect(streamed.length).toBeGreaterThan(1);
     expect(Math.min(...streamed)).toBe(1);

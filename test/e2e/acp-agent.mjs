@@ -755,6 +755,45 @@ for await (const line of createInterface({ input: process.stdin })) {
       const stop = trackWork(sessionId, () => clearInterval(interval));
       continue;
     }
+    if (text === 'Flood turn') {
+      const { cwd } = sessions.get(sessionId);
+      const say = (value) => recordUpdate(sessionId, sessionId, value);
+      const chunk = (value) =>
+        say({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: value } });
+      const tool = (id, title) =>
+        say({
+          sessionUpdate: 'tool_call',
+          toolCallId: `${id}-${message.id}`,
+          title,
+          status: 'completed',
+        });
+      chunk('Flood waiting.');
+      let phase = 'waiting';
+      const finish = (reason) => {
+        stop();
+        clearInterval(poll);
+        chunk(` Flood ${reason}.`);
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      };
+      const started = Date.now();
+      const poll = setInterval(() => {
+        if (Date.now() - started > 120_000) return finish('timed out');
+        if (phase === 'waiting' && existsSync(join(cwd, 'flood-go.txt'))) {
+          phase = 'sent';
+          for (let index = 1; index <= 90; index += 1) {
+            chunk(`msg-${index} `);
+            tool(`flood-step-${index}`, `Flood step ${index}`);
+          }
+          for (let index = 1; index <= 40; index += 1) chunk(`long-${index} ${'x'.repeat(990)} `);
+          tool('flood-burst', 'Flood burst');
+          for (let index = 1; index <= 2600; index += 1) chunk(`f-${index} `);
+          writeFileSync(join(cwd, 'flood-sent.txt'), 'sent\n');
+        } else if (phase === 'sent' && existsSync(join(cwd, 'flood-release.txt')))
+          finish('finished');
+      }, 100);
+      const stop = trackWork(sessionId, () => clearInterval(poll));
+      continue;
+    }
     if (text === 'Background task') {
       recordUpdate(sessionId, sessionId, {
         sessionUpdate: 'agent_message_chunk',

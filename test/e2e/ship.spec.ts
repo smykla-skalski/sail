@@ -50,6 +50,13 @@ const openIssue = async (id: string) => {
   await $(`[data-ship-issue-id="${id}"]`).click();
 };
 
+const openShip = async () => {
+  if (!(await $('.ship-panel').isDisplayed())) await toggleShip();
+  const tab = $('.side-tabs').$('button*=Ship runs');
+  if (!(await $('.ship-panel').isDisplayed()) && (await tab.isExisting())) await tab.click();
+  await expect($('.ship-panel')).toBeDisplayed();
+};
+
 const toggleShip = () =>
   browser.execute(() =>
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true })),
@@ -626,5 +633,137 @@ describe('native Ship run history', () => {
     await expect($$('.ship-now-item')).toBeElementsArrayOfSize(20);
     await $('[aria-label="Hide Ship panel"]').click();
     await expect($('.ship-panel')).not.toBeDisplayed();
+  });
+
+  it('offers a reply to a worker that is waiting on a request', async () => {
+    const run: ShipRun = {
+      id: 'ship-request',
+      source: 'plan',
+      repository,
+      remote: 'fixture/repo',
+      provider: 'claude',
+      limit: 1,
+      approvedAt: 6,
+      externalClosed: {},
+      issues: [
+        batchIssue(0, {
+          title: 'Worker with a question',
+          state: 'working',
+          path: repository,
+          threadId: 'acp:claude:request-fixture',
+          reportedStatus: 'blocked',
+          blockedReason: 'Which theme token should the badge use?',
+        }),
+        batchIssue(1, {
+          title: 'Busy worker',
+          state: 'working',
+          path: repository,
+          threadId: 'acp:claude:busy-fixture',
+        }),
+      ],
+    };
+    await browser.tauri.execute(async ({ core }, input) => {
+      await core.invoke('save_setting', { key: 'sai-details-width', value: '900' });
+      await core.invoke('save_setting', { key: 'sai-ship-runs', value: JSON.stringify([input]) });
+    }, run);
+    await browser.execute(() => {
+      localStorage.clear();
+      localStorage.setItem('sail-settings-migrated-v1', '1');
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+    });
+    await browser.setWindowSize(2560, 1440);
+    expect(await browser.execute(() => window.innerWidth)).toBe(2560);
+    await browser.refresh();
+    await expect($('.app-shell')).toBeDisplayed();
+    await openShip();
+    await openIssue('batch-0');
+    const reply = $('.ship-issue-detail .ship-actions').$('button=Reply to worker');
+    await expect(reply).toBeDisplayed();
+    await capture('ship-reply-to-worker-2560-light');
+    await setTheme('dark');
+    await capture('ship-reply-to-worker-2560-dark');
+    await browser.setWindowSize(1920, 1200);
+    expect(await browser.execute(() => window.innerWidth)).toBe(1920);
+    await capture('ship-reply-to-worker-1920-dark');
+    await setTheme('light');
+    await capture('ship-reply-to-worker-1920-light');
+    await openIssue('batch-1');
+    await expect(
+      $('.ship-issue-detail .ship-actions').$('button=Open worker thread'),
+    ).toBeDisplayed();
+    await browser.setWindowSize(390, 850);
+    expect(
+      await browser.execute(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+    ).toBe(true);
+    await browser.setWindowSize(1280, 850);
+  });
+
+  it('reply to worker quotes the request in its composer and focuses it', async () => {
+    await browser.setWindowSize(1920, 1200);
+    await browser.tauri.execute(async ({ core }, path) => {
+      await core.invoke('save_setting', { key: 'sai-ship-runs', value: '[]' });
+      await core.invoke('save_setting', { key: 'sai-directory', value: path });
+      await core.invoke('save_setting', {
+        key: 'sai-project-catalog',
+        value: JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      });
+    }, repository);
+    await browser.execute(() => {
+      localStorage.clear();
+      localStorage.setItem('sail-settings-migrated-v1', '1');
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+    });
+    await browser.refresh();
+    await $('.agent-launches button').waitForExist({ timeout: 30_000 });
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Do a small thing');
+    await $('.agent-actions button').click();
+    await $('.agent-permission button').waitForExist({ timeout: 20_000 });
+    await $('.agent-permission button').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Do a small thing'),
+    );
+    const run: ShipRun = {
+      id: 'ship-reply',
+      source: 'plan',
+      repository,
+      remote: 'fixture/repo',
+      provider: 'claude',
+      limit: 1,
+      approvedAt: 7,
+      externalClosed: {},
+      issues: [
+        batchIssue(0, {
+          title: 'Worker with a question',
+          state: 'working',
+          path: repository,
+          threadId: 'acp:claude:claude-test-1',
+          reportedStatus: 'blocked',
+          blockedReason: 'Which token?\nSecond line',
+        }),
+      ],
+    };
+    await browser.tauri.execute(async ({ core }, input) => {
+      await core.invoke('save_setting', { key: 'sai-details-width', value: '900' });
+      await core.invoke('save_setting', { key: 'sai-ship-runs', value: JSON.stringify([input]) });
+    }, run);
+    await browser.refresh();
+    await expect($('.app-shell')).toBeDisplayed();
+    await openShip();
+    await openIssue('batch-0');
+    // The isolated app has no GitHub login, so claim recovery can replace the fixture blocker.
+    const blocker = await $('.ship-issue-detail .ship-error').getText();
+    await $('.ship-issue-detail .ship-actions').$('button=Reply to worker').click();
+    const composer = $('.agent-composer textarea');
+    const quoted = blocker
+      .split('\n')
+      .map((line) => `> ${line}`.trimEnd())
+      .join('\n');
+    await browser.waitUntil(async () => (await composer.getValue()).trimEnd() === quoted);
+    await expect(composer).toBeFocused();
+    await browser.setWindowSize(1280, 850);
   });
 });

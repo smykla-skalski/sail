@@ -467,14 +467,15 @@
     acpDisconnectedSessionIds,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
-    bufferBackgroundUpdate,
+    applyLiveTranscriptUpdate,
     forgetRecentTranscript,
-    invalidateBackgroundSession,
+    invalidateLiveTranscript,
     loadAgentThreads,
     loadInterruptedAgentTurns,
     loadRecentTranscript,
     rememberSessionState,
     saveAgentThreads,
+    tracksLiveTranscript,
     updateEntriesInPlace,
     type AgentCommand,
     type AgentConfigOption,
@@ -11606,7 +11607,7 @@
     return true;
   }
 
-  async function openShipTarget(path: string, threadId?: string | null) {
+  async function openShipTarget(path: string, threadId?: string | null, prefill?: string | null) {
     try {
       await invoke('validate_repository', { path });
     } catch (cause) {
@@ -11637,8 +11638,22 @@
         throw new Error('This session’s agent is unavailable.');
       if (!(await jumpToRecentThread(threadKey(thread))))
         throw new Error('Session history is unavailable. Open the worktree to inspect it.');
+      if (prefill) prefillWorkerComposer(thread, prefill);
     } else await loadProject(path);
     closeShipRuns();
+  }
+
+  /** Puts the worker's pending request in its composer and focuses it; a busy worker queues the reply. */
+  function prefillWorkerComposer(thread: AgentThread, text: string) {
+    if (usesNativeOpenCode(thread)) {
+      draft = [draft.trim(), text].filter(Boolean).join('\n\n');
+      focusPaneForTyping('main');
+      return;
+    }
+    issuePrefills = {
+      ...issuePrefills,
+      [thread.directory]: { id: crypto.randomUUID(), text },
+    };
   }
 
   async function openSpawnTarget(receipt: SpawnReceipt) {
@@ -13472,8 +13487,11 @@
           if (plan)
             saveNativePlan({ agent: event.agent, directory: planDirectory, sessionId }, plan);
           if (replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
-            invalidateBackgroundSession(event.agent, sessionId);
-          else bufferBackgroundUpdate(event.agent, sessionId, data);
+            invalidateLiveTranscript(event.agent, sessionId);
+          else if (tracksLiveTranscript(event.agent, sessionId)) {
+            applyLiveTranscriptUpdate(event.agent, sessionId, data);
+            acpPlans().observe({ agent: event.agent, directory: planDirectory, sessionId }, data);
+          }
           if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions))
             rememberSessionState(event.agent, sessionId, {
               configOptions: data.configOptions as AgentConfigOption[],
