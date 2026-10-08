@@ -17,27 +17,48 @@ struct AgentDefinition {
     id: &'static str,
     name: &'static str,
     executable: &'static str,
-    package: &'static str,
     binary_env: Option<&'static str>,
-    min_node_major: u32,
+    launch: Launch,
 }
+
+enum Launch {
+    Npx {
+        package: &'static str,
+        min_node_major: u32,
+    },
+    // Native binary resolved by the shared OpenCode settings; started as `<binary> acp`.
+    OpenCode,
+}
+
+const OPENCODE_BINARY_SETTING: &str = "sai-opencode-bin";
 
 const AGENTS: &[AgentDefinition] = &[
     AgentDefinition {
         id: "claude",
         name: "Claude",
         executable: "claude",
-        package: "@agentclientprotocol/claude-agent-acp@0.84.0",
         binary_env: None,
-        min_node_major: 22,
+        launch: Launch::Npx {
+            package: "@agentclientprotocol/claude-agent-acp@0.84.0",
+            min_node_major: 22,
+        },
     },
     AgentDefinition {
         id: "codex",
         name: "Codex",
         executable: "codex",
-        package: "@agentclientprotocol/codex-acp@2.0.0",
         binary_env: Some("CODEX_PATH"),
-        min_node_major: 18,
+        launch: Launch::Npx {
+            package: "@agentclientprotocol/codex-acp@2.0.0",
+            min_node_major: 18,
+        },
+    },
+    AgentDefinition {
+        id: "opencode",
+        name: "OpenCode",
+        executable: "opencode",
+        binary_env: None,
+        launch: Launch::OpenCode,
     },
 ];
 
@@ -2121,7 +2142,14 @@ fn register_session(
 }
 
 #[tauri::command]
-pub fn acp_agents() -> Vec<AgentAvailability> {
+pub fn acp_agents(app: AppHandle) -> Vec<AgentAvailability> {
+    agent_availability(crate::settings::string_setting(
+        &app,
+        OPENCODE_BINARY_SETTING,
+    ))
+}
+
+fn agent_availability(opencode_binary: Option<String>) -> Vec<AgentAvailability> {
     #[cfg(feature = "e2e")]
     if let Some(path) = std::env::var_os("SAIL_ACP_TEST_AGENT") {
         return AGENTS
@@ -2140,29 +2168,47 @@ pub fn acp_agents() -> Vec<AgentAvailability> {
     let major = node.as_ref().and_then(node_major);
     AGENTS
         .iter()
-        .map(|agent| {
-            let binary = find_executable(agent.executable);
-            AgentAvailability {
-                id: agent.id.into(),
-                name: agent.name.into(),
-                binary_path: binary
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned()),
-                available: binary.is_some()
-                    && npx.is_some()
-                    && major.is_some_and(|version| version >= agent.min_node_major),
-                reason: if binary.is_none() {
-                    Some(format!("Install {} first.", agent.name))
-                } else if npx.is_none() || node.is_none() {
-                    Some("Node.js and npx are required for the ACP adapter.".into())
-                } else if major.is_none_or(|version| version < agent.min_node_major) {
-                    Some(format!(
-                        "{} requires Node.js {} or newer.",
-                        agent.name, agent.min_node_major
-                    ))
-                } else {
-                    None
+        .map(|agent| match agent.launch {
+            Launch::OpenCode => match crate::resolve_binary(opencode_binary.clone()) {
+                Ok(binary) => AgentAvailability {
+                    id: agent.id.into(),
+                    name: agent.name.into(),
+                    binary_path: Some(binary.to_string_lossy().into_owned()),
+                    available: true,
+                    reason: None,
                 },
+                Err(reason) => AgentAvailability {
+                    id: agent.id.into(),
+                    name: agent.name.into(),
+                    binary_path: None,
+                    available: false,
+                    reason: Some(reason),
+                },
+            },
+            Launch::Npx { min_node_major, .. } => {
+                let binary = find_executable(agent.executable);
+                AgentAvailability {
+                    id: agent.id.into(),
+                    name: agent.name.into(),
+                    binary_path: binary
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    available: binary.is_some()
+                        && npx.is_some()
+                        && major.is_some_and(|version| version >= min_node_major),
+                    reason: if binary.is_none() {
+                        Some(format!("Install {} first.", agent.name))
+                    } else if npx.is_none() || node.is_none() {
+                        Some("Node.js and npx are required for the ACP adapter.".into())
+                    } else if major.is_none_or(|version| version < min_node_major) {
+                        Some(format!(
+                            "{} requires Node.js {} or newer.",
+                            agent.name, min_node_major
+                        ))
+                    } else {
+                        None
+                    },
+                }
             }
         })
         .collect()
@@ -2218,41 +2264,53 @@ fn connect_blocking(
             };
         }
     }
-    let availability = acp_agents()
-        .into_iter()
-        .find(|item| item.id == agent)
-        .ok_or("Unknown agent.")?;
+    let availability = agent_availability(crate::settings::string_setting(
+        &app,
+        OPENCODE_BINARY_SETTING,
+    ))
+    .into_iter()
+    .find(|item| item.id == agent)
+    .ok_or("Unknown agent.")?;
     if !availability.available {
         return Err(availability
             .reason
             .unwrap_or_else(|| "Agent unavailable.".into()));
     }
-    let node = find_executable("node").ok_or("Node.js not found.")?;
     let original_path = std::env::var_os("PATH").unwrap_or_default();
-    let mut paths = vec![node.parent().ok_or("Invalid Node.js path.")?.to_path_buf()];
-    paths.extend(std::env::split_paths(&original_path));
     #[cfg(feature = "e2e")]
     let test_agent = std::env::var_os("SAIL_ACP_TEST_AGENT");
-    let mut command = {
-        #[cfg(feature = "e2e")]
-        if let Some(path) = test_agent {
-            let mut command = Command::new(&node);
-            command.arg(path).arg(&agent);
-            command
-        } else {
-            let npx = find_executable("npx").ok_or("npx not found.")?;
-            let mut command = Command::new(npx);
-            command.args(["--yes", definition.package]);
-            command
-        }
-        #[cfg(not(feature = "e2e"))]
-        {
-            let npx = find_executable("npx").ok_or("npx not found.")?;
-            let mut command = Command::new(npx);
-            command.args(["--yes", definition.package]);
-            command
+    #[cfg(not(feature = "e2e"))]
+    let test_agent: Option<std::ffi::OsString> = None;
+    let mut paths = Vec::new();
+    let mut command = if let Some(path) = test_agent {
+        let node = find_executable("node").ok_or("Node.js not found.")?;
+        paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
+        let mut command = Command::new(&node);
+        command.arg(path).arg(&agent);
+        command
+    } else {
+        match definition.launch {
+            Launch::Npx { package, .. } => {
+                let node = find_executable("node").ok_or("Node.js not found.")?;
+                paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
+                let npx = find_executable("npx").ok_or("npx not found.")?;
+                let mut command = Command::new(npx);
+                command.args(["--yes", package]);
+                command
+            }
+            Launch::OpenCode => {
+                let binary = availability
+                    .binary_path
+                    .clone()
+                    .ok_or("OpenCode binary not found.")?;
+                let mut command = Command::new(binary);
+                command.arg("acp");
+                command.env_remove("OPENCODE_CONFIG_DIR");
+                command
+            }
         }
     };
+    paths.extend(std::env::split_paths(&original_path));
     command.env(
         "PATH",
         std::env::join_paths(paths).map_err(|error| error.to_string())?,
@@ -4162,5 +4220,71 @@ mod capability_profile_tests {
                 .unwrap_err(),
             "Permission request is no longer pending."
         );
+    }
+}
+
+#[cfg(all(test, unix, not(feature = "e2e")))]
+mod native_agent_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fake_opencode(version: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("sail-opencode-acp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = root.join("opencode");
+        std::fs::write(&binary, format!("#!/bin/sh\necho {version}\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (root, binary)
+    }
+
+    fn opencode(binary: &Path) -> AgentAvailability {
+        agent_availability(Some(binary.to_string_lossy().into_owned()))
+            .into_iter()
+            .find(|agent| agent.id == "opencode")
+            .unwrap()
+    }
+
+    #[test]
+    fn compatible_opencode_binary_is_available_without_node() {
+        let (root, binary) = fake_opencode("2.0.24");
+        let agent = opencode(&binary);
+        assert!(agent.available);
+        assert_eq!(agent.reason, None);
+        assert_eq!(agent.binary_path.as_deref(), Some(binary.to_str().unwrap()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incompatible_opencode_binary_reports_the_version_diagnostic() {
+        let (root, binary) = fake_opencode("1.0.0");
+        let agent = opencode(&binary);
+        assert!(!agent.available);
+        assert_eq!(agent.binary_path, None);
+        assert_eq!(
+            agent.reason.as_deref(),
+            Some("OpenCode v2.0.24 is required (found 1.0.0). Upgrade or choose a compatible binary in settings.")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_opencode_binary_is_unavailable() {
+        let agent = opencode(Path::new("/nonexistent/opencode"));
+        assert!(!agent.available);
+        assert!(agent
+            .reason
+            .unwrap()
+            .starts_with("OpenCode binary not found"));
+    }
+
+    #[test]
+    fn npx_agents_keep_their_availability_entries() {
+        let (root, binary) = fake_opencode("2.0.24");
+        let ids: Vec<_> = agent_availability(Some(binary.to_string_lossy().into_owned()))
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect();
+        assert_eq!(ids, ["claude", "codex", "opencode"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
