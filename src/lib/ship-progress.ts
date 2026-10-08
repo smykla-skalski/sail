@@ -1614,3 +1614,60 @@ export function loadShipRuns(raw: string | null): ShipRun[] {
 export function serializeShipRuns(runs: ShipRun[], unparsed: readonly unknown[]): string {
   return JSON.stringify([...runs, ...unparsed]);
 }
+
+export function repositoryForRemote(
+  candidates: { path: string; remote: string | null }[],
+  remote: string,
+  preferred?: string | null,
+): string | null {
+  const wanted = remote.toLowerCase();
+  const matches = candidates.filter((item) => item.remote?.toLowerCase() === wanted);
+  return (matches.find((item) => item.path === preferred) ?? matches[0])?.path ?? null;
+}
+
+// ACP agents report a vanished session or deleted cwd with these messages.
+export function shippingWorkerGone(cause: unknown): boolean {
+  const message =
+    typeof cause === 'object' && cause && 'message' in cause
+      ? String(cause.message)
+      : String(cause);
+  return /session is not connected|location not found/i.test(message);
+}
+
+const missingRepositoryReason = /Repository path does not exist\. Choose an existing directory\.$/;
+
+// Issues stuck before the repair persisted the raw error as their block reason.
+export function currentShipBlockedReason(reason: string | undefined | null): string {
+  if (!reason) return 'Shipping claim recovery requires worker fencing.';
+  return missingRepositoryReason.test(reason)
+    ? 'Shipping worktree no longer exists. Start a new run from the project.'
+    : reason;
+}
+
+// What a run needs once its repository is gone and no checkout can replace it.
+export function unrecoverableIssuePlan(
+  issue: Pick<
+    ShipIssue,
+    | 'state'
+    | 'workerSettled'
+    | 'claim'
+    | 'claimFencePending'
+    | 'refreshError'
+    | 'worktreeUnavailable'
+  >,
+): 'none' | 'clear' | 'fail' {
+  const claimDirty = !!issue.claim || !!issue.claimFencePending || !!issue.refreshError;
+  if (issue.state === 'merged' || issue.state === 'awaiting_merge')
+    return claimDirty ? 'clear' : 'none';
+  if (issue.state === 'failed' && issue.workerSettled === true)
+    return claimDirty || issue.worktreeUnavailable !== true ? 'clear' : 'none';
+  return 'fail';
+}
+
+// A repository can vanish briefly (unmounted volume, permission prompt), so
+// in-flight work is only failed once it stayed gone for this long.
+const unrecoverableGraceMillis = 10 * 60_000;
+
+export function unrecoverableGraceExpired(deadSince: number, now: number): boolean {
+  return now - deadSince >= unrecoverableGraceMillis;
+}
