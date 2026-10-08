@@ -53,6 +53,16 @@ void test('merge is available only for a ready pull request at the checkpoint re
   assert.match(shipMergeAction(closed).reason!, /not open/);
 });
 
+void test('merge stays disabled after the bot comment until the pull request closes', () => {
+  const requested = mergeable();
+  requested.mergeRequested = { at: 1, head: 'revision-one', comment: 'squash' };
+  const state = shipMergeAction(requested);
+  assert.equal(state.enabled, false);
+  assert.match(state.reason!, /Merge already requested with “squash”/);
+  requested.pullRequestState = 'MERGED';
+  assert.match(shipMergeAction(requested).reason!, /not open/);
+});
+
 void test('retry applies to failed issues whose pull request is still usable', () => {
   const run = fixture();
   const issue = run.issues[0];
