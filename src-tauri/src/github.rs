@@ -4939,6 +4939,13 @@ mod tests {
     };
     use std::{cell::Cell, collections::HashMap, fs, process::Command, time::Duration};
 
+    #[cfg(windows)]
+    use super::{terminate_command_tree, CommandTreeHandle};
+    #[cfg(windows)]
+    use wait_timeout::ChildExt;
+    #[cfg(windows)]
+    use windows::Win32::Foundation::HANDLE;
+
     #[cfg(unix)]
     #[test]
     fn github_commands_stop_after_their_deadline() {
