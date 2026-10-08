@@ -55,6 +55,7 @@
   } from './lib/agent-queue';
   import {
     acp,
+    acpDisconnectAffectsSession,
     acpFinishedPromptStatus,
     acpPromptInterrupted,
     groupAgentEntries,
@@ -1042,7 +1043,10 @@
     void listen<AgentEvent>('acp-event', ({ payload }) => {
       if (disposed || payload.agent !== agent) return;
       const { message } = payload;
-      if (message.method === 'sail/disconnected') {
+      if (
+        message.method === 'sail/disconnected' &&
+        acpDisconnectAffectsSession(message, activeSessionId, activeCapabilityProfile)
+      ) {
         inFlightSteer?.finish();
         ready = false;
         busy = false;

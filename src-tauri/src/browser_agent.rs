@@ -1429,7 +1429,8 @@ fn economics_input_schema() -> Value {
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum CapabilityProfile {
     Explore,
     Review,

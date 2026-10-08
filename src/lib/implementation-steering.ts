@@ -1,5 +1,5 @@
 import { listen } from '@tauri-apps/api/event';
-import type { AgentEvent } from './acp.ts';
+import { acpDisconnectAffectsSession, type AgentEvent } from './acp.ts';
 import { beginImplementationTurn, recordImplementationModel } from './implementation-models.ts';
 
 type SteerResult = { outcome: 'injected' | 'startedNewTurn' | 'promptRequired' | 'failed' };
@@ -26,7 +26,10 @@ export async function trackImplementationSteer(
   });
   const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
     if (payload.agent !== agent) return;
-    if (payload.message.method === 'sail/disconnected') {
+    if (
+      payload.message.method === 'sail/disconnected' &&
+      acpDisconnectAffectsSession(payload.message, sessionId)
+    ) {
       detachedFinished = true;
       finish();
       return;

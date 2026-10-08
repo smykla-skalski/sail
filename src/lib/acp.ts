@@ -178,6 +178,26 @@ export interface AgentEvent {
   };
 }
 
+export function acpDisconnectedSessionIds(message: AgentEvent['message']): string[] | null {
+  if (message.method !== 'sail/disconnected') return null;
+  const sessionIds = message.params?.sessionIds;
+  if (!Array.isArray(sessionIds)) return null;
+  return sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string');
+}
+
+export function acpDisconnectAffectsSession(
+  message: AgentEvent['message'],
+  sessionId: string | null,
+  profile?: CapabilityProfile,
+): boolean {
+  if (message.method !== 'sail/disconnected') return false;
+  const sessionIds = acpDisconnectedSessionIds(message);
+  if (sessionId && sessionIds) return sessionIds.includes(sessionId);
+  const disconnectedProfile = message.params?.profile;
+  if (profile && typeof disconnectedProfile === 'string') return disconnectedProfile === profile;
+  return sessionIds === null;
+}
+
 export interface AgentActivity {
   alive: boolean;
   active: string[];
@@ -197,6 +217,7 @@ export interface AgentActivity {
 
 export interface NativeSubagentSnapshot {
   agent: AgentId;
+  capabilityProfile: CapabilityProfile;
   sessionId: string;
   parentSessionId: string;
   directory: string;

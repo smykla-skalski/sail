@@ -57,7 +57,7 @@ impl AcpTerminalManager {
             .unwrap_or_default()
     }
 
-    pub fn stop_agent(&self, agent: &str) {
+    pub fn stop_sessions(&self, agent: &str, session_ids: &[String]) {
         let terminals = self
             .active
             .lock()
@@ -65,7 +65,14 @@ impl AcpTerminalManager {
             .map(|active| {
                 active
                     .iter()
-                    .filter(|(_, terminal)| terminal.agent == agent)
+                    .filter(|(_, terminal)| {
+                        terminal_belongs_to_connection(
+                            &terminal.agent,
+                            &terminal.session_id,
+                            agent,
+                            session_ids,
+                        )
+                    })
                     .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
                     .collect::<Vec<_>>()
             })
@@ -116,6 +123,18 @@ impl AcpTerminalManager {
         }
         Ok(())
     }
+}
+
+fn terminal_belongs_to_connection(
+    terminal_agent: &str,
+    terminal_session_id: &str,
+    agent: &str,
+    session_ids: &[String],
+) -> bool {
+    terminal_agent == agent
+        && session_ids
+            .iter()
+            .any(|session_id| session_id == terminal_session_id)
 }
 
 impl Drop for AcpTerminalManager {
@@ -885,4 +904,33 @@ pub async fn acp_terminal_inspect_wait(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_cleanup_only_matches_its_agent_sessions() {
+        let disconnected = vec!["review-session".to_string(), "review-child".to_string()];
+
+        assert!(terminal_belongs_to_connection(
+            "codex",
+            "review-session",
+            "codex",
+            &disconnected,
+        ));
+        assert!(!terminal_belongs_to_connection(
+            "codex",
+            "build-session",
+            "codex",
+            &disconnected,
+        ));
+        assert!(!terminal_belongs_to_connection(
+            "claude",
+            "review-session",
+            "codex",
+            &disconnected,
+        ));
+    }
 }

@@ -298,6 +298,8 @@
   } from './lib/panes';
   import {
     acp,
+    acpDisconnectAffectsSession,
+    acpDisconnectedSessionIds,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
     forgetRecentTranscript,
@@ -10279,12 +10281,15 @@
 
   function handleAgentEvent(event: AgentEvent) {
     const eventSessionId = event.message.params?.sessionId;
-    const eventDirectory =
+    const eventThread =
       typeof eventSessionId === 'string'
-        ? ([...agentThreads, ...nativeChildThreads].find(
+        ? [...agentThreads, ...nativeChildThreads].find(
             (thread) => thread.agent === event.agent && thread.sessionId === eventSessionId,
-          )?.directory ?? directory)
-        : directory;
+          )
+        : undefined;
+    const eventDirectory = eventThread?.directory ?? directory;
+    const eventProfile =
+      eventThread?.capabilityProfile ?? capabilityProfileForDirectory(eventDirectory);
     const previousNativeSubagents = nativeSubagents;
     nativeSubagents = updateNativeSubagents(
       nativeSubagents,
@@ -10294,6 +10299,7 @@
       typeof eventSessionId === 'string' &&
         (!!replayingAgentSessions[JSON.stringify([event.agent, eventSessionId])] ||
           !!nativeSubagents[nativeSubagentId(event.agent, eventSessionId)]?.restored),
+      eventProfile,
     );
     if (nativeSubagents !== previousNativeSubagents) nativeSubagentGeneration += 1;
     const nativeUpdate = event.message.params?.update;
@@ -10475,16 +10481,38 @@
       ))
         updateSpawnReceipt(receipt.receiptId, { state: 'waiting' });
     } else if (event.message.method === 'sail/disconnected') {
-      nativeSubagents = disconnectNativeSubagents(nativeSubagents, event.agent);
+      const disconnectedSessionIds =
+        acpDisconnectedSessionIds(event.message) ??
+        Object.values(nativeSubagents)
+          .filter((child) => child.agent === event.agent)
+          .map((child) => child.sessionId);
+      nativeSubagents = disconnectNativeSubagents(
+        nativeSubagents,
+        event.agent,
+        disconnectedSessionIds,
+      );
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
+          acpDisconnectAffectsSession(
+            event.message,
+            item.sessionId,
+            item.capabilityProfile ?? capabilityProfileForDirectory(item.directory),
+          ) &&
           ['working', 'waiting'].includes(threadAttention[threadKey(item)]?.status ?? ''),
       ))
         updateAgentThreadStatus(thread, 'failed');
-      for (const receipt of spawnReceipts.filter(
-        (item) => item.provider === event.agent && !receiptIsSettled(item.state),
-      ))
+      for (const receipt of spawnReceipts.filter((item) => {
+        const prefix = `acp:${event.agent}:`;
+        const sessionId = item.targetId?.startsWith(prefix)
+          ? item.targetId.slice(prefix.length)
+          : null;
+        return (
+          item.provider === event.agent &&
+          acpDisconnectAffectsSession(event.message, sessionId) &&
+          !receiptIsSettled(item.state)
+        );
+      }))
         updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
     }
   }

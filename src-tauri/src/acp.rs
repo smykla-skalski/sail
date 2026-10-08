@@ -62,6 +62,7 @@ struct AgentEvent {
 #[serde(rename_all = "camelCase")]
 pub struct NativeSubagentSnapshot {
     agent: String,
+    capability_profile: CapabilityProfile,
     session_id: String,
     parent_session_id: String,
     directory: String,
@@ -126,12 +127,18 @@ impl NativeSubagentRegistry {
             .collect()
     }
 
-    fn snapshots(&self, agent: &str, directory: &Path) -> Vec<NativeSubagentSnapshot> {
+    fn snapshots(
+        &self,
+        agent: &str,
+        profile: CapabilityProfile,
+        directory: &Path,
+    ) -> Vec<NativeSubagentSnapshot> {
         self.0
             .iter()
             .filter(|(_, entry)| entry.directory == directory)
             .map(|(session_id, entry)| NativeSubagentSnapshot {
                 agent: agent.to_string(),
+                capability_profile: profile,
                 session_id: session_id.clone(),
                 parent_session_id: entry.parent_session_id.clone(),
                 directory: entry.directory.to_string_lossy().into_owned(),
@@ -913,13 +920,13 @@ impl AgentManager {
     ) -> Result<Vec<NativeSubagentSnapshot>, String> {
         let agents = self.0.lock().map_err(|error| error.to_string())?;
         let mut snapshots = Vec::new();
-        for ((agent, _profile), runtime) in agents.iter() {
+        for ((agent, profile), runtime) in agents.iter() {
             snapshots.extend(
                 runtime
                     .native_subagents
                     .lock()
                     .map_err(|error| error.to_string())?
-                    .snapshots(agent, directory),
+                    .snapshots(agent, *profile, directory),
             );
         }
         snapshots.sort_by(|left, right| {
@@ -2329,9 +2336,18 @@ fn connect_blocking(
             }
         }
         reader.alive.store(false, Ordering::Release);
-        crate::diagnostics::record("agent_disconnected", json!({"agent":agent_id}));
+        let mut session_ids = reader
+            .session_profiles
+            .lock()
+            .map(|profiles| profiles.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        session_ids.sort();
+        crate::diagnostics::record(
+            "agent_disconnected",
+            json!({"agent":agent_id,"profile":profile.as_str(),"sessionIds":session_ids}),
+        );
         app.state::<crate::acp_terminal::AcpTerminalManager>()
-            .stop_agent(&agent_id);
+            .stop_sessions(&agent_id, &session_ids);
         reader.ready.notify_all();
         if let Ok(mut state) = reader.permission_state.lock() {
             state.pending.clear();
@@ -2349,7 +2365,9 @@ fn connect_blocking(
             "acp-event",
             AgentEvent {
                 agent: agent_id,
-                message: json!({"method":"sail/disconnected"}),
+                message: json!({"method":"sail/disconnected","params":{
+                    "profile":profile.as_str(),"sessionIds":session_ids
+                }}),
             },
         );
     });
