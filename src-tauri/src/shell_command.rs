@@ -20,6 +20,15 @@ pub struct ShellResult {
     duration_ms: u64,
 }
 
+// Registers before the command starts so a Stop that arrives first still cancels it.
+fn register(
+    runs: &Mutex<HashMap<String, Arc<AtomicBool>>>,
+    id: &str,
+) -> Result<Arc<AtomicBool>, String> {
+    let mut active = runs.lock().map_err(|error| error.to_string())?;
+    Ok(active.entry(id.to_string()).or_default().clone())
+}
+
 fn run(
     runs: &Mutex<HashMap<String, Arc<AtomicBool>>>,
     id: &str,
@@ -27,28 +36,33 @@ fn run(
     command: &str,
     timeout: Duration,
 ) -> Result<ShellResult, String> {
-    if id.is_empty() || command.trim().is_empty() {
-        return Err("Shell command requires an id and a command.".into());
+    let cancel = register(runs, id)?;
+    let result = execute(directory, command, timeout, &cancel);
+    if let Ok(mut active) = runs.lock() {
+        active.remove(id);
+    }
+    result
+}
+
+fn execute(
+    directory: &str,
+    command: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<ShellResult, String> {
+    if command.trim().is_empty() {
+        return Err("Shell command is empty.".into());
     }
     if command.len() > MAX_COMMAND {
         return Err("Shell command is too long.".into());
     }
     let directory = crate::post_turn_checks::canonical_directory(directory)?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let mut active = runs.lock().map_err(|error| error.to_string())?;
-        if active.contains_key(id) {
-            return Err("Shell command is already running.".into());
-        }
-        active.insert(id.to_string(), cancel.clone());
-    }
     let started = Instant::now();
-    let result =
-        crate::post_turn_checks::execute_with_timeout(&directory, command, timeout, Some(&cancel));
-    if let Ok(mut active) = runs.lock() {
-        active.remove(id);
-    }
-    let (status, code, output) = result?;
+    let (status, code, output) = if cancel.load(Ordering::Relaxed) {
+        ("canceled".into(), None, String::new())
+    } else {
+        crate::post_turn_checks::execute_with_timeout(&directory, command, timeout, Some(cancel))?
+    };
     Ok(ShellResult {
         status,
         code,
@@ -64,6 +78,9 @@ pub async fn run_shell_command(
     directory: String,
     command: String,
 ) -> Result<ShellResult, String> {
+    if id.is_empty() {
+        return Err("Shell command requires an id.".into());
+    }
     let runs = runs.inner().0.clone();
     tauri::async_runtime::spawn_blocking(move || run(&runs, &id, &directory, &command, TIMEOUT))
         .await
@@ -71,12 +88,12 @@ pub async fn run_shell_command(
 }
 
 #[tauri::command]
-pub fn cancel_shell_command(runs: State<'_, ShellRuns>, id: String) -> Result<bool, String> {
-    let active = runs.0.lock().map_err(|error| error.to_string())?;
-    Ok(active
-        .get(&id)
-        .map(|flag| flag.store(true, Ordering::Relaxed))
-        .is_some())
+pub fn cancel_shell_command(runs: State<'_, ShellRuns>, id: String) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("Shell command requires an id.".into());
+    }
+    register(&runs.0, &id)?.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -127,6 +144,20 @@ mod tests {
         let result = worker.join().unwrap().unwrap();
         assert_eq!(result.status, "canceled");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stop_before_start_skips_the_command() {
+        let runs = Mutex::default();
+        register(&runs, "early")
+            .unwrap()
+            .store(true, Ordering::Relaxed);
+        let marker = std::env::temp_dir().join(format!("sail-shell-{}", std::process::id()));
+        let command = format!("touch '{}'", marker.display());
+        let result = run(&runs, "early", &temp(), &command, TIMEOUT).unwrap();
+        assert_eq!(result.status, "canceled");
+        assert!(!marker.exists());
+        assert!(runs.lock().unwrap().is_empty());
     }
 
     #[test]

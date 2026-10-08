@@ -51,8 +51,10 @@ function decode(value: string): string {
 
 function clip(output: string): string {
   if (output.length <= SHELL_CONTEXT_LIMIT) return output;
-  const omitted = output.length - SHELL_CONTEXT_LIMIT;
-  return `[${omitted} earlier characters omitted]\n${output.slice(-SHELL_CONTEXT_LIMIT)}`;
+  let start = output.length - SHELL_CONTEXT_LIMIT;
+  // Never start inside a surrogate pair.
+  if (/[\uDC00-\uDFFF]/.test(output[start])) start++;
+  return `[${start} earlier characters omitted]\n${output.slice(start)}`;
 }
 
 /** Formats finished runs as tagged blocks the agent reads and the transcript renders as cards. */

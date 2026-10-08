@@ -390,7 +390,7 @@ pub(crate) fn execute_with_timeout(
     output.extend(second.unwrap_or_default());
     output.truncate(MAX_OUTPUT);
     if status == "timed_out" {
-        output.extend_from_slice(b"\nCheck timed out or background process held output open.");
+        output.extend_from_slice(b"\nTimed out, or a background process held the output open.");
     }
     Ok((
         status.into(),

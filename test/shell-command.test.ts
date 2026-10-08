@@ -88,6 +88,18 @@ await test('long output keeps its tail and reports the omitted size', () => {
   );
 });
 
+await test('clipping never splits a surrogate pair', () => {
+  const output = 'a' + '😀' + 'b'.repeat(SHELL_CONTEXT_LIMIT - 1);
+  const [segment] = splitShellCommands(withShellContext([run({ output })], 'x'));
+  assert.equal(segment.type, 'shell');
+  if (segment.type !== 'shell') return;
+  assert.equal(
+    segment.shell.output,
+    `[3 earlier characters omitted]\n${'b'.repeat(SHELL_CONTEXT_LIMIT - 1)}`,
+  );
+  assert.doesNotMatch(segment.shell.output, /[\uD800-\uDFFF]/);
+});
+
 await test('text without valid blocks stays plain', () => {
   for (const text of [
     'plain message',

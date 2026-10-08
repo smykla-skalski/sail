@@ -1074,6 +1074,9 @@
       configOptions = session.configOptions ?? [];
       if (Array.isArray(session.availableCommands)) updateSkills(session.availableCommands);
       activeSessionId = session.sessionId;
+      shellRuns = shellRuns.map((run) =>
+        run.session === null ? { ...run, session: session.sessionId } : run,
+      );
       if (queued.length) saveQueuedAgentMessages(agent, directory, session.sessionId, queued);
       if (commandUpdates[session.sessionId]) updateSkills(commandUpdates[session.sessionId]);
       selectedThreadId = session.sessionId;
@@ -1261,6 +1264,7 @@
       }
       images.forEach((image) => void invoke('browser_remove_capture', { path: image.imagePath }));
       clipboardAttachments.forEach((attachment) => removeClipboardAttachment(attachment));
+      shellRuns.filter((run) => run.status === 'running').forEach(stopShell);
     };
   });
 
@@ -1340,9 +1344,10 @@
     }
     const userEntryId = crypto.randomUUID();
     const shellSession = activeSessionId;
-    const sentShell = shellRuns.filter(
-      (run) => run.session === shellSession && run.status !== 'running',
-    );
+    const sentShell =
+      external && !queuedMessage
+        ? []
+        : shellRuns.filter((run) => run.session === shellSession && run.status !== 'running');
     shellRuns = shellRuns.filter((run) => !sentShell.includes(run));
     const restoreShell = () => {
       const session = deliverySessionId ?? shellSession;
@@ -1364,7 +1369,10 @@
         activityThread = await ensureSession(text.slice(0, 60) || 'Attached files', true);
       if (activityThread?.title === 'New thread')
         activityThread = { ...activityThread, title: text.slice(0, 60) || 'Attached files' };
-      if (current !== generation && (!disposed || ephemeral)) return;
+      if (current !== generation && (!disposed || ephemeral)) {
+        restoreShell();
+        return;
+      }
       if (activityThread) onstatus(activityThread, 'working');
       phase = 'config';
       if (settingConfig) await settingConfig;
@@ -1461,6 +1469,7 @@
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
+      restoreShell();
       const backendStatus =
         phase === 'prompt' && deliverySessionId
           ? await acpFinishedPromptStatus(turnAgent, deliverySessionId, turnId)
@@ -1527,10 +1536,8 @@
         authNeeded = /auth|login|sign.?in/i.test(error);
         if (retryQueued) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
-          restoreShell();
         } else if (!external || queuedMessage) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
-          restoreShell();
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
           images = [...sentImages, ...images];
           clipboardAttachments = [...sentClipboard, ...clipboardAttachments];
