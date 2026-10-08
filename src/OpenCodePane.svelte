@@ -169,6 +169,8 @@
   let session = $state<SessionInfo | null>(null);
   const promptLocation = $derived(composerTaskLocation(taskLocation, directory, thread?.directory));
   let messages = $state<SessionMessageInfo[]>([]);
+  // Off while history (cache, first page, older pages) mounts, so its failed tools stay silent.
+  let liveTools = $state(false);
   const transcriptItems = $derived(
     buildTranscript({
       base: openCodeItems(messages, spawnReceipts),
@@ -508,6 +510,7 @@
     rememberOpenCodeTimeline(directory, id, { messages, cursor });
     onhistorychange();
     await follow();
+    if (current === generation && id === activeID) liveTools = true;
     if (scroll?.scrollHeight <= scroll?.clientHeight && cursor) void loadOlder();
   }
 
@@ -524,12 +527,15 @@
     try {
       const page = await client.message.list({ sessionID: id, limit: 50, cursor: next });
       if (current !== generation || id !== activeID) return;
+      const wasLive = liveTools;
+      liveTools = false;
       messages = mergeMessages(messages, page.data);
       cursor = page.cursor.next === next ? null : (page.cursor.next ?? null);
       rememberOpenCodeTimeline(directory, id, { messages, cursor });
       onhistorychange();
       if (!underfilled) following = false;
       await tick();
+      if (current === generation && id === activeID) liveTools = wasLive;
       scroll.scrollTop =
         underfilled && following ? scroll.scrollHeight : top + scroll.scrollHeight - height;
       loaded = true;
@@ -583,6 +589,7 @@
     lastExecutionStatus = null;
     session = null;
     const cached = id ? recallOpenCodeTimeline(directory, id) : null;
+    liveTools = false;
     messages = cached?.messages ?? [];
     cursor = cached?.cursor ?? null;
     pendingPermissions = [];
@@ -1119,6 +1126,7 @@
       <Transcript
         items={transcriptItems}
         busy={running}
+        live={liveTools}
         {coordinationMessages}
         onopen={onopensubagent}
         control={subagentControl}
