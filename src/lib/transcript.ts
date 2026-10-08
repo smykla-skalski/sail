@@ -1,6 +1,11 @@
 import type { SessionMessageInfo, PromptFileAttachment } from '@opencode/client';
 import type { AgentDisplayEntry, AgentTool } from './acp';
-import { withSpawnResponses, type SpawnReceipt } from './agent-results.ts';
+import {
+  receiptNeedsLiveActivity,
+  withSpawnResponses,
+  type SpawnReceipt,
+} from './agent-results.ts';
+import type { CoordinationMessage } from './coordination';
 import type { HookActivity } from './hook-activity';
 import type { PostTurnCheck } from './post-turn-checks';
 import type { ShellRun } from './shell-command';
@@ -105,17 +110,38 @@ export function checkItems(checks: PostTurnCheck[]): TranscriptItem[] {
   }));
 }
 
-/** One group card for all running and finished children of the turn view. */
+/**
+ * One group card per view. It sits where the first unsettled child started; with none running it
+ * trails, so its live region still announces state changes.
+ */
 export function subagentItems(receipts: SpawnReceipt[]): TranscriptItem[] {
   if (!receipts.length) return [];
+  const active = receipts.filter(receiptNeedsLiveActivity);
   return [
     {
       kind: 'subagents',
       id: 'subagents',
-      created: Math.min(...receipts.map((receipt) => receipt.created)),
+      created: active.length
+        ? Math.min(...active.map((receipt) => receipt.created))
+        : Number.MAX_SAFE_INTEGER,
       receipts,
     },
   ];
+}
+
+/** Coordination messages the agent has not echoed back yet. */
+export function pendingCoordinationItems(
+  messages: CoordinationMessage[],
+  provider: string,
+): TranscriptItem[] {
+  return messages.map((message) => ({
+    kind: 'message',
+    id: `coordination:${message.id}`,
+    role: 'user',
+    author: `From ${message.sender}${message.delivered ? '' : ' · queued'}`,
+    text: message.text,
+    provider,
+  }));
 }
 
 export function shellItems(runs: ShellRun[]): TranscriptItem[] {
@@ -157,7 +183,11 @@ export function nativeItems(
         id: entry.id,
         role: entry.type,
         author:
-          entry.type === 'user' ? 'You' : entry.type === 'thought' ? `${host.name} · thinking` : host.name,
+          entry.type === 'user'
+            ? 'You'
+            : entry.type === 'thought'
+              ? `${host.name} · thinking`
+              : host.name,
         text: entry.text,
         created: entry.created,
         provider: host.provider,
@@ -176,21 +206,19 @@ function toolFromPart(
   message: Extract<SessionMessageInfo, { type: 'assistant' }>,
   part: Extract<OpenCodeContent, { type: 'tool' }>,
 ): TranscriptTool {
-  const failed = part.state.status === 'error';
-  const settled = part.state.status === 'completed' || failed;
   return {
     id: `${message.id}:${part.id}`,
     title: part.name,
     status: part.state.status,
     input: part.state.input,
-    output: settled
-      ? (part.state.content ?? [])
-          .map((item) => (item.type === 'text' ? item.text : (item.name ?? item.uri)))
-          .join('\n')
-      : '',
+    output:
+      part.state.status === 'completed' || part.state.status === 'error'
+        ? (part.state.content ?? [])
+            .map((item) => (item.type === 'text' ? item.text : (item.name ?? item.uri)))
+            .join('\n')
+        : '',
     error: part.state.status === 'error' ? openCodeErrorDetails(part.state.error) : '',
-    source:
-      part.state.status === 'error' ? (reportedHookIdentity(part.state.metadata) ?? '') : '',
+    source: part.state.status === 'error' ? (reportedHookIdentity(part.state.metadata) ?? '') : '',
     terminalIds: [],
     raw: { messageId: message.id, partId: part.id },
   };
@@ -266,7 +294,8 @@ export function openCodeItems(
             created,
             provider: 'opencode',
           });
-      } else if (part.type === 'text') texts.push(host.liveText?.[entry.id]?.[ordinal] ?? part.text);
+      } else if (part.type === 'text')
+        texts.push(host.liveText?.[entry.id]?.[ordinal] ?? part.text);
     });
     flushText(entry.content.length);
     flushTools(entry.content.length);
@@ -338,7 +367,8 @@ export function currentToolGroup(
   busy: boolean,
 ): boolean {
   const last = items.findLast(
-    (entry) => entry.kind === 'message' || entry.kind === 'tools' || entry.kind === 'spawn-response',
+    (entry) =>
+      entry.kind === 'message' || entry.kind === 'tools' || entry.kind === 'spawn-response',
   );
   return busy && (last?.id === item.id || item.tools.some(toolRunning));
 }

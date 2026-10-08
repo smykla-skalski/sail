@@ -29,19 +29,24 @@
     type ActivityHistoryInput,
   } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
-  import SpawnActivity from './SpawnActivity.svelte';
-  import SpawnResponse from './SpawnResponse.svelte';
-  import ToolActivity from './ToolActivity.svelte';
-  import ShellCommandCard from './ShellCommandCard.svelte';
   import {
     isShellDraft,
     shellCommand,
-    splitShellCommands,
     withShellContext,
     type ShellResult,
     type ShellRun,
   } from './lib/shell-command';
-  import ChatMessage from './ChatMessage.svelte';
+  import JumpToLatest from './JumpToLatest.svelte';
+  import Transcript from './Transcript.svelte';
+  import {
+    buildTranscript,
+    checkItems,
+    openCodeItems,
+    pendingCoordinationItems,
+    shellItems,
+    streamingItems,
+    subagentItems,
+  } from './lib/transcript';
   import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import PlanPanel from './PlanPanel.svelte';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
@@ -241,7 +246,6 @@
     resolveTaskLocation,
     type TaskLocation as TaskLocationValue,
   } from './lib/task-location';
-  import PostTurnChecks from './PostTurnChecks.svelte';
   import {
     checkKey,
     personalChecks,
@@ -298,12 +302,7 @@
     type AutomaticPermissionRequest,
   } from './lib/permission-resolution';
   import { openCodePermissionRejections } from './lib/opencode-permission-resolution';
-  import {
-    prepareToolFailureDraft,
-    openCodeErrorDetails,
-    reportedHookIdentity,
-    toolFailurePrompt,
-  } from './lib/tool-failure';
+  import { prepareToolFailureDraft, toolFailurePrompt } from './lib/tool-failure';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import type { Confirmation } from './ConfirmDialog.svelte';
   import PathPicker from './PathPicker.svelte';
@@ -468,7 +467,6 @@
   import { copyCompletedSelection } from './lib/auto-copy';
   import {
     coordinationKey,
-    coordinationMessageForText,
     coordinationPrompt,
     enqueueCoordinationMessage,
     loadCoordinationMessages,
@@ -506,7 +504,6 @@
     saveBoundedReceipt,
     spawnPromptDispatchAllowed,
     spawnReceiptsForSource,
-    withSpawnResponses,
     type ReplacementDispatchAction,
     type SpawnReceipt,
     type SpawnState,
@@ -1326,7 +1323,7 @@
   let textTimer: ReturnType<typeof setTimeout> | undefined;
   let timelineSession = '';
   let timelineRefresh = 0;
-  let followChat = true;
+  let followChat = $state(true);
   let followFrame = 0;
   let messageTimers = new SvelteMap<
     string,
@@ -2080,13 +2077,6 @@
     if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
       void adoptDirectShipRun(saved, path, sourceId).catch((cause) => (error = describe(cause)));
   });
-  const displayChatMessages = $derived(
-    withSpawnResponses(
-      chatMessages,
-      spawnReceiptsForSource(spawnReceipts, sessionID ? `opencode:${sessionID}` : null, directory),
-      (message) => message.time.created,
-    ),
-  );
   $effect(() => {
     if (!sessionID || timelineSession !== sessionID || !setup) return;
     const context = openCodeContextUsage(messages, setup.models);
@@ -2099,6 +2089,42 @@
   });
   let liveOnly = $derived(
     Object.entries(liveText).filter(([id]) => !messages.some((message) => message.id === id)),
+  );
+  const mainCoordinationMessages = $derived(
+    coordinationMessages.filter(
+      (message) =>
+        !!sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`),
+    ),
+  );
+  const mainTranscript = $derived(
+    buildTranscript({
+      base: openCodeItems(
+        chatMessages,
+        spawnReceiptsForSource(
+          spawnReceipts,
+          sessionID ? `opencode:${sessionID}` : null,
+          directory,
+        ),
+        { liveText },
+      ),
+      timed: [
+        ...checkItems(mainPostTurnChecks),
+        ...subagentItems(mainSpawnActivity),
+        ...shellItems(pendingShellRuns),
+      ],
+      trailing: [
+        ...pendingCoordinationItems(
+          mainCoordinationMessages.filter(
+            (message) =>
+              !chatMessages.some(
+                (item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)),
+              ),
+          ),
+          'opencode',
+        ),
+        ...streamingItems(liveOnly, currentSession?.agent ?? 'Agent'),
+      ],
+    }),
   );
   let canSend = $derived(
     runtimeState === 'connected' &&
@@ -14564,16 +14590,6 @@
     if (typeof cause === 'object' && cause && 'message' in cause) return String(cause.message);
     return String(cause);
   }
-  function assistantText(message: SessionMessageInfo): string {
-    return message.type === 'assistant'
-      ? message.content
-          .map((part, ordinal) =>
-            part.type === 'text' ? (liveText[message.id]?.[ordinal] ?? part.text) : '',
-          )
-          .filter(Boolean)
-          .join('\n')
-      : '';
-  }
 </script>
 
 <svelte:head><title>Sail · Plan workspace</title></svelte:head>
@@ -14919,141 +14935,41 @@
                           >{/each}
                       </div>{/if}
                   </div>{/if}
-                {#each displayChatMessages as message (message.id)}
-                  {#if message.type === 'spawn-response'}
-                    <SpawnResponse receipt={message.receipt} onopen={openSpawnTarget} />
-                  {:else if message.type === 'user'}
-                    {@const attribution = coordinationMessageForText(
-                      message.text,
-                      coordinationMessages.filter(
-                        (item) =>
-                          item.target === coordinationKey(directory, `opencode:${sessionID}`),
-                      ),
-                    )}
-                    <ChatMessage
-                      kind="user"
-                      author={attribution ? `From ${attribution.sender}` : 'You'}
-                      messageId={message.id}
-                      created={message.time.created}
-                    >
-                      {#each splitShellCommands(message.text) as segment, index (index)}
-                        {#if segment.type === 'shell'}
-                          <ShellCommandCard run={segment.shell} />
-                        {:else}
-                          <Markdown
-                            source={attribution
-                              ? segment.text.replace(
-                                  coordinationPrompt(attribution),
-                                  attribution.text,
-                                )
-                              : segment.text}
-                          />
-                        {/if}
-                      {/each}
-                      {#if message.files?.length}<div class="message-files">
-                          {#each message.files as file, fileIndex (fileIndex)}<span
-                              >{file.name ??
-                                (file.source.type === 'uri' ? file.source.uri : 'Attachment')}</span
-                            >{/each}
-                        </div>{/if}
-                    </ChatMessage>
-                  {:else if message.type === 'assistant'}<ChatMessage
-                      kind="assistant"
-                      author={message.agent}
-                      messageId={message.id}
-                      created={message.time.created}
-                    >
-                      {#if assistantText(message)}<Markdown source={assistantText(message)} />{/if}
-                      {#each message.content as part, ordinal (ordinal)}
-                        {#if part.type === 'tool'}
-                          {@const reason =
-                            part.state.status === 'error'
-                              ? openCodeErrorDetails(part.state.error)
-                              : ''}
-                          {@const output =
-                            part.state.status === 'completed' || part.state.status === 'error'
-                              ? (part.state.content ?? [])
-                                  .map((item) =>
-                                    item.type === 'text' ? item.text : (item.name ?? item.uri),
-                                  )
-                                  .join('\n')
-                              : ''}
-                          <ToolActivity
-                            activityId={`${message.id}:${part.id}`}
-                            title={part.name}
-                            status={part.state.status}
-                            input={part.state.input}
-                            {output}
-                            error={reason}
-                            source={part.state.status === 'error'
-                              ? (reportedHookIdentity(part.state.metadata) ?? '')
-                              : ''}
-                            onfix={part.state.status === 'error'
-                              ? () =>
-                                  fixOpenCodeToolFailure(
-                                    `${message.id}:${part.id}`,
-                                    part.name,
-                                    part.state.input,
-                                    reason,
-                                    output,
-                                  )
-                              : undefined}
-                          />
-                        {/if}
-                      {/each}
-                      {#if message.retry}<p class="retry-state" role="status">
-                          Retry {message.retry.attempt}: {message.retry.error.message}
-                        </p>{/if}
-                      {#if message.error}<p class="message-error" role="alert">
-                          {message.error.message}
-                        </p>{/if}
-                    </ChatMessage>{/if}
-                {/each}
-                <OpenCodeSubagents
-                  {client}
-                  parentID={sessionID}
-                  {directory}
-                  onopen={openSpawnTarget}
-                  onchildren={rememberOpenCodeChildren}
-                />
-                {#each pendingShellRuns as run (run.id)}
-                  <ShellCommandCard
-                    {run}
-                    pending
-                    onstop={() =>
-                      void invoke('cancel_shell_command', { id: run.id }).catch(() => {})}
-                  />
-                {/each}
-                {#each coordinationMessages.filter((message) => sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`) && !chatMessages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
-                  <ChatMessage
-                    kind="user"
-                    author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
-                  >
-                    <Markdown source={message.text} />
-                  </ChatMessage>
-                {/each}
-                {#each liveOnly as [id, parts] (id)}
-                  <ChatMessage
-                    kind="assistant"
-                    author={`${currentSession?.agent ?? 'Agent'} · streaming`}
-                    messageId={id}
-                  >
-                    <Markdown
-                      source={Object.entries(parts)
-                        .toSorted(([a], [b]) => Number(a) - Number(b))
-                        .map(([, value]) => value)
-                        .join('\n')}
-                    />
-                  </ChatMessage>
-                {/each}
-                <PostTurnChecks
-                  checks={mainPostTurnChecks}
-                  onretry={(check) => void runOnePostTurnCheck(check, true)}
-                />
-                <SpawnActivity
-                  receipts={mainSpawnActivity}
+                <Transcript
+                  items={mainTranscript}
+                  busy={running}
+                  coordinationMessages={mainCoordinationMessages}
                   onopen={openSpawnTarget}
                   control={subagentControl}
+                  onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+                  onstopshell={(run) =>
+                    void invoke('cancel_shell_command', { id: run.id }).catch(() => {})}
+                  ontoolfix={(tool) =>
+                    fixOpenCodeToolFailure(
+                      tool.id,
+                      tool.title,
+                      tool.input,
+                      tool.error,
+                      tool.output,
+                    )}
+                >
+                  {#snippet tail()}
+                    <OpenCodeSubagents
+                      {client}
+                      parentID={sessionID}
+                      {directory}
+                      onopen={openSpawnTarget}
+                      onchildren={rememberOpenCodeChildren}
+                    />
+                  {/snippet}
+                </Transcript>
+                <JumpToLatest
+                  following={followChat}
+                  count={mainTranscript.length}
+                  onjump={() => {
+                    followChat = true;
+                    if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
+                  }}
                 />
                 {#if running && runtimeState === 'connected'}<div class="chat-working">
                     <ActivityStatus

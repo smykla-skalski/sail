@@ -1,4 +1,7 @@
-import { permissionResourceCandidates, type PermissionPolicyDecision } from './capability-profiles.ts';
+import {
+  permissionResourceCandidates,
+  type PermissionPolicyDecision,
+} from './capability-profiles.ts';
 import { toolCommand } from './tool-display.ts';
 
 export type PermissionChoice = {
@@ -60,12 +63,7 @@ function field(value: unknown, key: string): unknown {
 export function acpPermissionDetails(toolCall: unknown): PermissionDetails {
   const id = field(toolCall, 'toolCallId');
   const command =
-    [
-      field(toolCall, 'rawInput'),
-      field(toolCall, 'input'),
-      field(toolCall, 'arguments'),
-      toolCall,
-    ]
+    [field(toolCall, 'rawInput'), field(toolCall, 'input'), field(toolCall, 'arguments'), toolCall]
       .map((value) => toolCommand(value))
       .find((value) => value !== null) ?? null;
   return {

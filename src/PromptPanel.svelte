@@ -9,6 +9,12 @@
   } from '@opencode/client';
   import type { OpenCodeClient } from './lib/opencode';
   import { openExternalLink } from './lib/external-link';
+  import PermissionCard from './PermissionCard.svelte';
+  import {
+    mayAlwaysAllow,
+    openCodePermissionChoices,
+    openCodePermissionDetails,
+  } from './lib/permission-card';
   import OptionPicker from './OptionPicker.svelte';
   import {
     openCodePermissionToolCall,
@@ -301,29 +307,30 @@
     {#if status}<p class="notice" role="status">{status}</p>{/if}
     {#each pendingPermissions as request (request.id)}
       {@const policy = requestPolicy(request)}
-      <article
-        class="prompt-card"
-        data-request-id={request.id}
-        data-session-id={request.sessionID}
-        tabindex="-1"
+      {@const details = openCodePermissionDetails(request)}
+      <PermissionCard
+        title={`Allow ${request.action}?`}
+        {policy}
+        command={details.command}
+        files={details.files}
+        message={request.message}
+        toolCallId={details.toolCallId}
+        requestId={request.id}
+        sessionId={request.sessionID}
+        agentId="opencode"
+        label="OpenCode permission request"
+        extraClass="prompt-card"
+        choices={openCodePermissionChoices(policy)}
+        busy={!!busyID}
+        onchoose={(choice) => decide(request, choice.id as 'once' | 'always' | 'reject')}
       >
-        <h3>Allow {request.action}?</h3>
-        <p class="prompt-warning" data-policy-risk={policy.risk}>
-          {policy.profile} · {policy.risk} risk · policy {policy.policyRevision}: {policy.reason}
-        </p>
-        {#if request.message}<p>{request.message}</p>{/if}
-        <ul>
-          {#each request.resources as resource, index (`${resource}:${index}`)}<li>
-              <code>{resource}</code>
-            </li>{/each}
-        </ul>
-        <p class="prompt-warning">
-          Allow always saves these approvals for this project:
-          {#if request.save?.length}{#each request.save as pattern, index (`${pattern}:${index}`)}<code
-                >{request.action}: {pattern}</code
-              >{/each}
-          {:else}<span>No saved pattern proposed.</span>{/if}
-        </p>
+        {#if mayAlwaysAllow(policy)}<p class="prompt-warning">
+            Allow always saves these approvals for this project:
+            {#if request.save?.length}{#each request.save as pattern, index (`${pattern}:${index}`)}<code
+                  >{request.action}: {pattern}</code
+                >{/each}
+            {:else}<span>No saved pattern proposed.</span>{/if}
+          </p>{/if}
         <p class="prompt-warning">Reject also rejects other pending permissions in this session.</p>
         <label
           >Optional rejection feedback
@@ -331,16 +338,7 @@
             value={feedback[request.id] ?? ''}
             oninput={(event) => (feedback[request.id] = event.currentTarget.value)}></textarea>
         </label>
-        <div class="prompt-actions">
-          {#if policy.recommendation !== 'deny'}<button
-              disabled={!!busyID}
-              onclick={() => decide(request, 'once')}>Allow once</button
-            ><button disabled={!!busyID} onclick={() => decide(request, 'always')}
-              >Allow always</button
-            >{/if}
-          <button disabled={!!busyID} onclick={() => decide(request, 'reject')}>Reject</button>
-        </div>
-      </article>
+      </PermissionCard>
     {/each}
     {#each pendingForms as form (form.id)}
       <article

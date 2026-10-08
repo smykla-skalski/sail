@@ -9,13 +9,22 @@
   import TaskLocation from './TaskLocation.svelte';
   import Markdown from './Markdown.svelte';
   import ChatMessage from './ChatMessage.svelte';
-  import SpawnActivity from './SpawnActivity.svelte';
-  import PostTurnChecks from './PostTurnChecks.svelte';
-  import ShellCommandCard from './ShellCommandCard.svelte';
+  import {
+    buildTranscript,
+    checkItems,
+    hookItems,
+    nativeItems,
+    pendingCoordinationItems,
+    queuedItems,
+    shellItems,
+    subagentItems,
+    type TranscriptTool,
+  } from './lib/transcript';
+  import { acpPermissionChoices, acpPermissionDetails } from './lib/permission-card';
+  import JumpToLatest from './JumpToLatest.svelte';
+  import PermissionCard from './PermissionCard.svelte';
+  import Transcript from './Transcript.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
-  import SpawnResponse from './SpawnResponse.svelte';
-  import ToolActivity from './ToolActivity.svelte';
-  import HookActivityCard from './HookActivity.svelte';
   import { activityForSession, parseHookActivity, type HookActivity } from './lib/hook-activity';
   import { toolInput } from './lib/tool-display';
   import { agentHeaderStatus } from './lib/agent-status';
@@ -87,7 +96,7 @@
   } from './lib/acp';
   import type { ThreadStatus } from './lib/attention';
   import type { AgentUsage } from './lib/agent-usage';
-  import { withSpawnResponses, type SpawnReceipt } from './lib/agent-results';
+  import type { SpawnReceipt } from './lib/agent-results';
   import {
     parentTurnStopHint,
     permissionAlreadyAnswered,
@@ -101,29 +110,16 @@
     stageClipboardFile,
     stageClipboardImage,
   } from './lib/attachments';
-  import {
-    coordinationMessageForText,
-    coordinationPrompt,
-    type CoordinationMessage,
-  } from './lib/coordination';
-  import {
-    isFailedStatus,
-    notificationStats,
-    splitTaskNotifications,
-    type TaskSegment,
-  } from './lib/task-notification';
+  import { coordinationPrompt, type CoordinationMessage } from './lib/coordination';
   import {
     isShellDraft,
     keepShellRuns,
     shellCommand,
-    splitShellCommands,
     takeShellRuns,
     withShellContext,
     type ShellResult,
     type ShellRun,
-    type ShellSegment,
   } from './lib/shell-command';
-  import { splitKlaudiushMessage, type KlaudiushRule } from './lib/klaudiush';
   import { getSetting, removeSetting, setSetting } from './lib/settings';
   import { recordDiagnostic, type DiagnosticEvent } from './lib/diagnostics';
   import {
@@ -505,11 +501,6 @@
       visibleCount += total - seenEntryCount;
     seenEntryCount = total;
   });
-  const displayEntries = $derived(
-    withSpawnResponses(groupAgentEntries(visibleEntries), spawnReceipts, (entry) => entry.created),
-  );
-  const toolFailed = (tool: AgentTool) => /fail|error|reject/i.test(tool.status);
-  const toolRunning = (tool: AgentTool) => /^(pending|in_progress|stopping)$/i.test(tool.status);
   let replaying = false;
   function setReplaying(value: boolean) {
     if (replaying === value) return;
@@ -561,7 +552,7 @@
   let selectedThreadId: string | null = null;
   let generation = 0;
   let scroll: HTMLDivElement;
-  let autoFollow = true;
+  let autoFollow = $state(true);
   const spawnRevision = $derived(spawnReceipts.map((receipt) => receipt.updated).join(','));
   $effect(() => {
     if (spawnRevision && autoFollow) void follow();
@@ -569,6 +560,40 @@
   let prompt: HTMLTextAreaElement;
   const preparedFailures = new Map<string, string>();
   const name = $derived(agentName);
+  const transcriptItems = $derived(
+    buildTranscript({
+      base: nativeItems(groupAgentEntries(visibleEntries), spawnReceipts, {
+        name,
+        provider: agent,
+        toolOutput: (tool) => tool.content || toolInput(tool.output),
+      }),
+      timed: [
+        ...hookItems(visibleHookActivities),
+        ...checkItems(postTurnChecks),
+        ...subagentItems(spawnReceipts),
+        ...shellItems(pendingShellRuns),
+      ],
+      trailing: [
+        ...pendingCoordinationItems(
+          coordinationMessages.filter(
+            (message) =>
+              !entries.some(
+                (entry) =>
+                  entry.type === 'user' && entry.text.includes(coordinationPrompt(message)),
+              ),
+          ),
+          agent,
+        ),
+        ...queuedItems(
+          queued.map((message) => ({
+            author: `You · queued${message.attachments.length || message.images.length ? ` · ${message.attachments.length + message.images.length} attachments` : ''}`,
+            text: message.text || 'Attachments',
+          })),
+          agent,
+        ),
+      ],
+    }),
+  );
   let liveTurn = $state(false);
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
   const visibleStatus = $derived(
@@ -878,12 +903,16 @@
       toolCall: tool,
       options,
     });
+    const details = acpPermissionDetails(tool);
     const permission: AgentPermission = {
       id: message.id,
       sessionId: activeSessionId!,
       title,
       options,
       policy,
+      toolCallId: details.toolCallId,
+      command: details.command,
+      files: details.files,
       generation:
         typeof params.sailPermissionGeneration === 'number'
           ? params.sailPermissionGeneration
@@ -1760,12 +1789,6 @@
     if (!disposed) void follow();
   }
 
-  function userSegments(text: string): (TaskSegment | ShellSegment)[] {
-    return splitShellCommands(text).flatMap((part): (TaskSegment | ShellSegment)[] =>
-      part.type === 'text' ? splitTaskNotifications(part.text) : [part],
-    );
-  }
-
   function stopShell(run: ShellRun) {
     void invoke('cancel_shell_command', { id: run.id }).catch(() => {});
   }
@@ -2190,31 +2213,8 @@
       {#if historyLoading}<div class="agent-history-status" role="status">
           Loading history…
         </div>{/if}
-      {#snippet hookNotice(rules: KlaudiushRule[])}
-        <div class="agent-hook-notice">
-          <strong>Action blocked by hook</strong>
-          <ul>
-            {#each rules as rule (rule.code)}
-              <li><code>{rule.code}</code> {rule.reason}</li>
-            {/each}
-          </ul>
-        </div>
-      {/snippet}
-      {#snippet toolRow(tool: AgentTool, revealed: boolean)}
-        <ToolActivity
-          title={tool.title}
-          status={tool.status}
-          activityId={tool.id}
-          input={tool.input}
-          output={tool.content || toolInput(tool.output)}
-          expanded={revealed}
-        >
-          {#each tool.terminalIds as terminalId (terminalId)}
-            <button onclick={() => onterminal(terminalId)}>Open terminal</button>
-          {/each}
-        </ToolActivity>
-      {/snippet}
-      {#snippet failureCard(tool: AgentTool)}
+      {#snippet failureTool(item: TranscriptTool)}
+        {@const tool = item.raw as AgentTool}
         {@const failure = acpToolFailure(tool)}
         {#if failure}
           {@const label =
@@ -2240,170 +2240,51 @@
           </div>
         {/if}
       {/snippet}
-      {#each displayEntries as entry (entry.id)}
-        {#if entry.type === 'spawn-response'}
-          <SpawnResponse receipt={entry.receipt} onopen={onopensubagent} />
-        {:else if entry.type === 'tool-group'}
-          {#each entry.tools.filter(toolFailed) as tool (tool.id)}{@render failureCard(tool)}{/each}
-          {#if isBusy && (entry.id === displayEntries.at(-1)?.id || entry.tools.some(toolRunning))}
-            {#if entry.tools.length > 1}
-              <details class="agent-tool-group">
-                <summary>
-                  {entry.tools.length - 1} earlier {entry.tools.length === 2 ? 'action' : 'actions'}
-                  {#if entry.tools.slice(0, -1).some(toolRunning)}<ActivityStatus
-                      status="working"
-                      compact
-                    />{/if}
-                  {#if entry.tools.slice(0, -1).some(toolFailed)}<ActivityStatus
-                      status="failed"
-                      compact
-                    />{/if}
-                </summary>
-                <div class="agent-tool-list">
-                  {#each entry.tools.slice(0, -1) as tool (tool.id)}
-                    {@render toolRow(tool, true)}
-                  {/each}
-                </div>
-              </details>
-            {/if}
-            {@const latest = entry.tools.at(-1)}
-            {#if latest}
-              <div class="agent-tool-current" class:running={toolRunning(latest)}>
-                <span class="agent-tool-current-label">Latest action</span>
-                {@render toolRow(latest, false)}
-              </div>
-            {/if}
-          {:else}
-            <details class="agent-tool-group">
-              <summary>
-                <span>{entry.tools.length} {entry.tools.length === 1 ? 'action' : 'actions'}</span>
-                <span class="agent-tool-group-last">{entry.tools.at(-1)?.title}</span>
-                {#if entry.tools.at(-1)?.status !== 'completed' && !toolFailed(entry.tools.at(-1)!)}<ActivityStatus
-                    status={entry.tools.at(-1)?.status}
-                    compact
-                  />{/if}
-                {#if entry.tools.slice(0, -1).some(toolRunning)}<ActivityStatus
-                    status="working"
-                    compact
-                  />{/if}
-                {#if entry.tools.some(toolFailed)}<ActivityStatus status="failed" compact />{/if}
-              </summary>
-              <div class="agent-tool-list">
-                {#each entry.tools as tool (tool.id)}
-                  {@render toolRow(tool, true)}
-                {/each}
-              </div>
-            </details>
-          {/if}
-        {:else}
-          {@const segments =
-            entry.type === 'user'
-              ? userSegments(entry.text)
-              : [{ type: 'text' as const, text: entry.text }]}
-          {#each segments as segment, index (index)}
-            {#if segment.type === 'shell'}
-              <ShellCommandCard run={segment.shell} />
-            {:else if segment.type === 'notification'}
-              {@const note = segment.notification}
-              <div
-                class="agent-subagent-card"
-                class:stopped={note.status !== 'completed'}
-                aria-label={`Subagent ${note.status}`}
-                role="group"
-              >
-                <ActivityStatus
-                  status={isFailedStatus(note.status) ? 'failed' : note.status}
-                  compact
-                />
-                <span class="agent-subagent-summary">{note.summary}</span>
-                {#each notificationStats(note) as stat (stat)}<span class="agent-subagent-stat"
-                    >{stat}</span
-                  >{/each}
-              </div>
-            {:else}
-              {@const text = segment.text}
-              {@const hookMessage = entry.type === 'assistant' ? splitKlaudiushMessage(text) : null}
-              {@const attribution =
-                entry.type === 'user'
-                  ? coordinationMessageForText(text, coordinationMessages)
-                  : undefined}
-              <ChatMessage
-                kind={entry.type}
-                created={entry.created}
-                author={entry.type === 'user'
-                  ? attribution
-                    ? `From ${attribution.sender}`
-                    : 'You'
-                  : entry.type === 'thought'
-                    ? `${name} · thinking`
-                    : name}
-              >
-                {#if hookMessage}
-                  {@render hookNotice(hookMessage.rules)}
-                  <details class="agent-hook-details">
-                    <summary>Full hook notice</summary>
-                    <Markdown source={hookMessage.notice} />
-                  </details>
-                  {#if hookMessage.remainder}<Markdown source={hookMessage.remainder} />{/if}
-                {:else}
-                  <Markdown
-                    source={attribution
-                      ? text.replace(coordinationPrompt(attribution), attribution.text)
-                      : text}
-                  />
-                {/if}
-              </ChatMessage>
-            {/if}
-          {/each}
-        {/if}
-      {/each}
-      {#each pendingShellRuns as run (run.id)}
-        <ShellCommandCard {run} pending onstop={() => stopShell(run)} />
-      {/each}
-      {#each coordinationMessages.filter((message) => !entries.some((entry) => entry.type === 'user' && entry.text.includes(coordinationPrompt(message)))) as message (message.id)}
-        <ChatMessage
-          kind="user"
-          author={`From ${message.sender}${message.delivered ? '' : ' · queued'}`}
-        >
-          <Markdown source={message.text} />
-        </ChatMessage>
-      {/each}
-      {#each visibleHookActivities as activity (activity.id)}
-        <HookActivityCard {activity} />
-      {/each}
-      <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
-      {#if nativePlan}<section class="native-plan" aria-label="Native plan">
-          <h3>Plan</h3>
-          <Markdown source={nativePlan.markdown} />
-          {#if nativePlan.tasks.length}<ul>
-              {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
-                  {task.status}: {task.title}
-                </li>{/each}
-            </ul>{/if}
-        </section>{/if}
-      <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} control={subagentControl} />
-      {#if queued.length}<div class="queued-messages" role="status" aria-label="Queued messages">
-          {#each queued as message, index (index)}
-            <ChatMessage
-              kind="user"
-              author={`You · queued${message.attachments.length || message.images.length ? ` · ${message.attachments.length + message.images.length} attachments` : ''}`}
-            >
-              <Markdown source={message.text || 'Attachments'} />
-            </ChatMessage>
-          {/each}
+      <Transcript
+        items={transcriptItems}
+        busy={isBusy}
+        {coordinationMessages}
+        onopen={onopensubagent}
+        control={subagentControl}
+        {onterminal}
+        {onretrycheck}
+        onstopshell={stopShell}
+        failure={failureTool}
+      >
+        {#snippet queuedActions()}
           {#if queuePaused}<Button size="sm" variant="secondary" onclick={retryQueue}
               >Retry queue</Button
             >{/if}
-        </div>{/if}
-      {#if isBusy}<ChatMessage kind="assistant" author={name}>
-          <div class="agent-busy" role="status">
-            <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
-                size="sm"
-                variant="secondary"
-                onclick={stop}>Stop</Button
-              >{/if}
-          </div>
-        </ChatMessage>{/if}
+        {/snippet}
+        {#snippet tail()}
+          {#if nativePlan}<section class="native-plan" aria-label="Native plan">
+              <h3>Plan</h3>
+              <Markdown source={nativePlan.markdown} />
+              {#if nativePlan.tasks.length}<ul>
+                  {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
+                      {task.status}: {task.title}
+                    </li>{/each}
+                </ul>{/if}
+            </section>{/if}
+          {#if isBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
+              <div class="agent-busy" role="status">
+                <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
+                    size="sm"
+                    variant="secondary"
+                    onclick={stop}>Stop</Button
+                  >{/if}
+              </div>
+            </ChatMessage>{/if}
+        {/snippet}
+      </Transcript>
+      <JumpToLatest
+        following={autoFollow}
+        count={transcriptItems.length}
+        onjump={() => {
+          autoFollow = true;
+          void follow();
+        }}
+      />
     </div>
   </div>
   <div class="agent-composer composer-wrap">
@@ -2430,28 +2311,18 @@
         </div>
       {/if}
       {#each permissions as permission (acpPermissionIdentity(permission))}
-        <div
-          class="agent-permission"
-          role="group"
-          aria-label="Agent permission request"
-          data-request-id={permission.id}
-          data-session-id={permission.sessionId}
-          data-agent-id={agent}
-          tabindex="-1"
-        >
-          <strong>{permission.title}</strong>
-          {#if permission.policy}<small
-              >{permission.policy.profile} · {permission.policy.risk} risk · policy {permission
-                .policy.policyRevision}: {permission.policy.reason}</small
-            >{/if}
-          <div>
-            {#each permission.options as option (option.optionId)}{#if permission.policy?.recommendation !== 'deny' || !option.kind.startsWith('allow')}<Button
-                  size="sm"
-                  variant={option.kind.startsWith('allow') ? 'primary' : 'secondary'}
-                  onclick={() => answer(permission, option.optionId)}>{option.name}</Button
-                >{/if}{/each}
-          </div>
-        </div>
+        <PermissionCard
+          title={permission.title}
+          policy={permission.policy}
+          command={permission.command}
+          files={permission.files}
+          toolCallId={permission.toolCallId}
+          requestId={permission.id}
+          sessionId={permission.sessionId}
+          agentId={agent}
+          choices={acpPermissionChoices(permission.options, permission.policy)}
+          onchoose={(choice) => answer(permission, choice.id)}
+        />
       {/each}
       {#each answeredNotes as note (note.identity)}
         <p class="agent-permission-answered" role="status" data-answered-id={note.identity}>
@@ -2677,18 +2548,6 @@
     margin: 15vh auto;
     text-align: center;
   }
-  .agent-tool-group,
-  .agent-tool-current {
-    margin: 0 0 8px 42px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-  }
-  .agent-hook-notice {
-    margin: 0 0 8px 42px;
-    padding: 9px 12px;
-    border: 1px solid var(--sui-danger);
-    border-radius: 8px;
-  }
   .agent-tool-failure {
     margin: 0 0 8px 42px;
     padding: 9px 12px;
@@ -2710,89 +2569,6 @@
     max-height: 180px;
     overflow: auto;
     white-space: pre-wrap;
-  }
-  .agent-hook-notice {
-    margin-left: 0;
-  }
-  .agent-hook-notice strong {
-    color: var(--sui-danger-ink);
-  }
-  .agent-hook-notice ul {
-    margin: 5px 0 0;
-    padding-left: 20px;
-  }
-  .agent-hook-notice code {
-    margin-right: 4px;
-  }
-  .agent-hook-details {
-    margin-bottom: 8px;
-    color: var(--sui-muted);
-  }
-  .agent-tool-group > summary {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 9px 12px;
-    color: var(--sui-muted);
-  }
-  .agent-tool-group-last {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .agent-tool-group > summary {
-    cursor: pointer;
-  }
-  .agent-tool-group > summary::before {
-    content: '▸';
-    flex: 0 0 auto;
-  }
-  .agent-tool-group[open] > summary::before {
-    transform: rotate(90deg);
-  }
-  .agent-tool-list {
-    padding: 0 12px 10px;
-  }
-  .agent-tool-current-label {
-    color: var(--sui-muted);
-    font-size: 0.75rem;
-    white-space: nowrap;
-  }
-  .agent-subagent-card {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 4px 10px;
-    margin: 0 0 8px 42px;
-    padding: 8px 12px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-  }
-  .agent-subagent-card.stopped {
-    border-style: dashed;
-  }
-  .agent-subagent-summary {
-    flex: 1 1 auto;
-    min-width: 0;
-    overflow-wrap: anywhere;
-  }
-  .agent-subagent-stat {
-    color: var(--sui-muted);
-    font-size: 0.75rem;
-    white-space: nowrap;
-  }
-  .agent-tool-current {
-    padding: 7px 12px;
-  }
-  .agent-tool-current.running {
-    border-color: var(--sui-primary);
-  }
-  .agent-tool-current-label {
-    display: block;
-    margin-bottom: 2px;
-  }
-  .queued-messages :global(.agent-message) {
-    opacity: 0.6;
   }
   .agent-busy {
     display: flex;
@@ -2852,16 +2628,5 @@
   }
   .agent-error {
     color: var(--sui-danger-ink);
-  }
-  .agent-permission {
-    margin-bottom: 10px;
-    padding: 12px;
-    border: 1px solid var(--shell-divider);
-    border-radius: 8px;
-  }
-  .agent-permission div {
-    display: flex;
-    gap: 8px;
-    margin-top: 10px;
   }
 </style>

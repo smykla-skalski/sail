@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import type { SessionMessageInfo } from '@opencode/client';
 import type { AgentDisplayEntry } from '../src/lib/acp.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 import {
@@ -8,6 +9,7 @@ import {
   currentToolGroup,
   hookItems,
   nativeItems,
+  pendingCoordinationItems,
   openCodeItems,
   queuedItems,
   shellItems,
@@ -58,12 +60,19 @@ const entries: AgentDisplayEntry[] = [
   },
   { id: 'a1', type: 'assistant', text: 'done', created: 400 },
 ];
-const host = { name: 'Claude', provider: 'claude', toolOutput: (tool: { content: string }) => tool.content };
+const host = {
+  name: 'Claude',
+  provider: 'claude',
+  toolOutput: (tool: { content: string }) => tool.content,
+};
 
-test('native entries keep one entry per type with the right role and author', () => {
+await test('native entries keep one entry per type with the right role and author', () => {
   const items = nativeItems(entries, [], host);
   assert.deepEqual(
-    items.map((item) => [item.kind, item.kind === 'message' ? `${item.role}:${item.author}` : item.id]),
+    items.map((item) => [
+      item.kind,
+      item.kind === 'message' ? `${item.role}:${item.author}` : item.id,
+    ]),
     [
       ['message', 'user:You'],
       ['message', 'thought:Claude · thinking'],
@@ -73,16 +82,31 @@ test('native entries keep one entry per type with the right role and author', ()
   );
 });
 
-test('hooks, checks and subagents render in event order, one card per turn', () => {
+const check = (id: string, updated: number) => ({
+  id,
+  updated,
+  directory: '/p',
+  thread: 't',
+  turn: 'turn1',
+  source: 'repository' as const,
+  command: id,
+  status: 'passed' as const,
+  output: '',
+  code: 0,
+});
+
+await test('hooks, checks and subagents render in event order, one card per turn', () => {
   const base = nativeItems(entries, [], host);
   const hook = {
-    id: 'h1', provider: 'claude', sessionId: 's', event: 'PreToolUse', source: 'x',
-    outcome: 'blocked' as const, created: 180, diagnostics: null,
+    id: 'h1',
+    provider: 'claude',
+    sessionId: 's',
+    event: 'PreToolUse',
+    source: 'x',
+    outcome: 'blocked' as const,
+    created: 180,
+    diagnostics: null,
   };
-  const check = (id: string, updated: number) => ({
-    id, updated, directory: '/p', thread: 't', turn: 'turn1', source: 'repository' as const,
-    command: id, status: 'passed' as const, output: '', code: 0,
-  });
   const items = buildTranscript({
     base,
     timed: [
@@ -99,7 +123,7 @@ test('hooks, checks and subagents render in event order, one card per turn', () 
   assert.equal(items.filter((item) => item.kind === 'checks').length, 1);
 });
 
-test('untimed base items inherit the time before them and extras without a slot go last', () => {
+await test('untimed base items inherit the time before them and extras without a slot go last', () => {
   const base = nativeItems(
     [
       { id: 'a', type: 'user', text: 'a', created: 100 },
@@ -111,43 +135,128 @@ test('untimed base items inherit the time before them and extras without a slot 
   );
   const items = buildTranscript({
     base,
-    timed: [...subagentItems([receipt({ created: 300 })]), ...subagentItems([receipt({ created: 900 })]).map((item) => ({ ...item, id: 'late' }))],
+    timed: [
+      ...subagentItems([receipt({ created: 300 })]),
+      ...hookItems([
+        {
+          id: 'late',
+          provider: 'claude',
+          sessionId: 's',
+          event: 'Stop',
+          source: 'x',
+          outcome: 'observed',
+          created: 900,
+          diagnostics: null,
+        },
+      ]),
+    ],
   });
-  assert.deepEqual(items.map((item) => item.id), ['a', 'b', 'subagents', 'c', 'late']);
+  assert.deepEqual(
+    items.map((item) => item.id),
+    ['a', 'b', 'subagents', 'c', 'hook:late'],
+  );
 });
 
-test('settled children interleave as spawn responses', () => {
+await test('a settled-only subagent group trails and pending coordination keeps its queued label', () => {
+  const items = buildTranscript({
+    base: nativeItems(entries, [], host),
+    timed: subagentItems([receipt({ state: 'completed', created: 120, updated: 130 })]),
+    trailing: pendingCoordinationItems(
+      [{ id: 'c', target: 't', sender: 'Ship', text: 'ping', created: 1 }],
+      'claude',
+    ),
+  });
+  assert.deepEqual(items.map((item) => item.id).slice(-3), ['a1', 'subagents', 'coordination:c']);
+  const last = items.at(-1);
+  assert.equal(last?.kind === 'message' && last.author, 'From Ship · queued');
+});
+
+await test('settled children interleave as spawn responses', () => {
   const items = nativeItems(entries, [receipt({ state: 'completed', updated: 300 })], host);
-  assert.deepEqual(items.map((item) => item.kind), ['message', 'message', 'tools', 'spawn-response', 'message']);
+  assert.deepEqual(
+    items.map((item) => item.kind),
+    ['message', 'message', 'tools', 'spawn-response', 'message'],
+  );
 });
 
-test('pending shell runs and queued messages trail the transcript', () => {
+await test('pending shell runs and queued messages trail the transcript', () => {
   const items = buildTranscript({
     base: nativeItems(entries, [], host),
     timed: shellItems([
-      { id: 's', command: 'ls', status: 'running', code: null, output: '', directory: '/p', session: null, created: 220 },
+      {
+        id: 's',
+        command: 'ls',
+        status: 'running',
+        code: null,
+        output: '',
+        directory: '/p',
+        session: null,
+        created: 220,
+      },
     ]),
     trailing: queuedItems([{ author: 'You · queued', text: 'later' }], 'claude'),
   });
-  assert.deepEqual(items.map((item) => item.id), ['u1', 't1', 'tool-group:a', 'shell:s', 'a1', 'queued:0']);
+  assert.deepEqual(
+    items.map((item) => item.id),
+    ['u1', 't1', 'tool-group:a', 'shell:s', 'a1', 'queued:0'],
+  );
 });
 
-const assistant = (content: unknown[], extra: Record<string, unknown> = {}) =>
-  ({ id: 'm2', type: 'assistant', agent: 'build', time: { created: 200 }, content, ...extra }) as never;
-const tool = (id: string, status: string) => ({
-  type: 'tool', id, name: 'bash', state: { status, error: { message: 'bad' }, input: { command: 'ls' }, content: [{ type: 'text', text: 'out' }] },
+type Assistant = Extract<SessionMessageInfo, { type: 'assistant' }>;
+const assistant = (
+  content: Assistant['content'],
+  extra: Partial<Assistant> = {},
+): SessionMessageInfo => ({
+  id: 'm2',
+  type: 'assistant',
+  agent: 'build',
+  model: { id: 'm', providerID: 'p' },
+  time: { created: 200 },
+  content,
+  ...extra,
+});
+const tool = (id: string, failed: boolean): Assistant['content'][number] => ({
+  type: 'tool',
+  id,
+  name: 'bash',
+  time: { created: 200 },
+  state: failed
+    ? {
+        status: 'error',
+        error: { type: 'tool', message: 'bad' },
+        input: { command: 'ls' },
+        content: [{ type: 'text', text: 'out' }],
+      }
+    : {
+        status: 'completed',
+        input: { command: 'ls' },
+        content: [{ type: 'text', text: 'out' }],
+      },
 });
 
-test('OpenCode messages group consecutive tools and keep text, thinking and tools in order', () => {
+await test('OpenCode messages group consecutive tools and keep text, thinking and tools in order', () => {
   const items = openCodeItems(
     [
-      { id: 'm1', type: 'user', time: { created: 100 }, text: 'go', files: [{ name: 'a.txt', source: { type: 'uri', uri: 'file:///a' } }] } as never,
-      { id: 'sys', type: 'system', time: { created: 120 } } as never,
+      {
+        id: 'm1',
+        type: 'user',
+        time: { created: 100 },
+        text: 'go',
+        files: [
+          {
+            name: 'a.txt',
+            data: '',
+            mime: 'text/plain',
+            source: { type: 'uri', uri: 'file:///a' },
+          },
+        ],
+      },
+      { id: 'idle', type: 'idle', outcome: 'succeeded', time: { created: 120 } },
       assistant([
         { type: 'reasoning', text: 'plan' },
         { type: 'text', text: 'first' },
-        tool('t1', 'completed'),
-        tool('t2', 'error'),
+        tool('t1', false),
+        tool('t2', true),
         { type: 'text', text: 'second' },
       ]),
     ],
@@ -155,7 +264,11 @@ test('OpenCode messages group consecutive tools and keep text, thinking and tool
     { liveText: { m2: { 1: 'live first' } } },
   );
   assert.deepEqual(
-    items.map((item) => [item.kind, item.kind === 'message' ? item.role : '', item.kind === 'message' ? item.text : '']),
+    items.map((item) => [
+      item.kind,
+      item.kind === 'message' ? item.role : '',
+      item.kind === 'message' ? item.text : '',
+    ]),
     [
       ['message', 'user', 'go'],
       ['message', 'thought', 'plan'],
@@ -170,29 +283,47 @@ test('OpenCode messages group consecutive tools and keep text, thinking and tool
   assert.equal(group.kind === 'tools' && group.tools[0].id, 'm2:t1');
 });
 
-test('OpenCode retry and error render as a status message and streaming text is labelled', () => {
+await test('OpenCode retry and error render as a status message and streaming text is labelled', () => {
   const items = openCodeItems(
-    [assistant([], { retry: { attempt: 2, error: { message: 'slow' } }, error: { message: 'boom' } })],
+    [
+      assistant([], {
+        retry: { attempt: 2, at: 1, error: { type: 'x', message: 'slow' } },
+        error: { type: 'x', message: 'boom' },
+      }),
+    ],
     [],
   );
   assert.equal(items.length, 1);
-  assert.deepEqual(items[0].kind === 'message' && [items[0].retry, items[0].error], ['Retry 2: slow', 'boom']);
+  assert.deepEqual(items[0].kind === 'message' && [items[0].retry, items[0].error], [
+    'Retry 2: slow',
+    'boom',
+  ]);
   const live = streamingItems([['x', { 1: 'b', 0: 'a' }]], 'build');
   assert.equal(live[0].kind === 'message' && live[0].text, 'a\nb');
   assert.equal(live[0].kind === 'message' && live[0].author, 'build · streaming');
 });
 
-test('the latest action row follows the last conversation item or a running tool', () => {
+await test('the latest action row follows the last conversation item or a running tool', () => {
   const items: TranscriptItem[] = nativeItems(entries.slice(0, 3), [], host);
   const group = items[2];
   assert.ok(group.kind === 'tools');
   assert.equal(currentToolGroup(group, items, true), true);
   assert.equal(currentToolGroup(group, items, false), false);
-  assert.equal(currentToolGroup(group, [...items, ...nativeItems([entries[3]], [], host)], true), false);
+  assert.equal(
+    currentToolGroup(group, [...items, ...nativeItems([entries[3]], [], host)], true),
+    false,
+  );
 });
 
-const policy = (risk: PermissionPolicyDecision['risk'], recommendation: PermissionPolicyDecision['recommendation'] = 'interactive'): PermissionPolicyDecision => ({
-  profile: 'build', risk, recommendation, reason: 'r', policyRevision: '1',
+const policy = (
+  risk: PermissionPolicyDecision['risk'],
+  recommendation: PermissionPolicyDecision['recommendation'] = 'interactive',
+): PermissionPolicyDecision => ({
+  profile: 'build',
+  risk,
+  recommendation,
+  reason: 'r',
+  policyRevision: '1',
 });
 const options = [
   { optionId: 'o', name: 'Allow once', kind: 'allow_once' },
@@ -200,32 +331,60 @@ const options = [
   { optionId: 'r', name: 'Reject', kind: 'reject_once' },
 ];
 
-test('Always is offered only for low and medium risk actions', () => {
+await test('Always is offered only for low and medium risk actions', () => {
   for (const risk of ['low', 'medium'] as const) {
     assert.equal(mayAlwaysAllow(policy(risk)), true);
-    assert.deepEqual(acpPermissionChoices(options, policy(risk)).map((c) => c.id), ['o', 'a', 'r']);
+    assert.deepEqual(
+      acpPermissionChoices(options, policy(risk)).map((c) => c.id),
+      ['o', 'a', 'r'],
+    );
     assert.ok(openCodePermissionChoices(policy(risk)).some((c) => c.always));
   }
   for (const risk of ['unknown', 'high'] as const) {
     assert.equal(mayAlwaysAllow(policy(risk)), false);
-    assert.deepEqual(acpPermissionChoices(options, policy(risk)).map((c) => c.id), ['o', 'r']);
-    assert.deepEqual(openCodePermissionChoices(policy(risk)).map((c) => c.id), ['once', 'reject']);
+    assert.deepEqual(
+      acpPermissionChoices(options, policy(risk)).map((c) => c.id),
+      ['o', 'r'],
+    );
+    assert.deepEqual(
+      openCodePermissionChoices(policy(risk)).map((c) => c.id),
+      ['once', 'reject'],
+    );
   }
-  assert.deepEqual(acpPermissionChoices(options, undefined).map((c) => c.id), ['o', 'r']);
-  assert.deepEqual(acpPermissionChoices(options, policy('low', 'deny')).map((c) => c.id), ['r']);
-  assert.deepEqual(openCodePermissionChoices(policy('medium', 'deny')).map((c) => c.id), ['reject']);
+  assert.deepEqual(
+    acpPermissionChoices(options, undefined).map((c) => c.id),
+    ['o', 'r'],
+  );
+  assert.deepEqual(
+    acpPermissionChoices(options, policy('low', 'deny')).map((c) => c.id),
+    ['r'],
+  );
+  assert.deepEqual(
+    openCodePermissionChoices(policy('medium', 'deny')).map((c) => c.id),
+    ['reject'],
+  );
 });
 
-test('permission details show the exact command, files and tool call', () => {
+await test('permission details show the exact command, files and tool call', () => {
   assert.deepEqual(
-    acpPermissionDetails({ toolCallId: 'tc', rawInput: { command: 'git status' }, locations: [{ path: '/p/a.ts' }] }),
+    acpPermissionDetails({
+      toolCallId: 'tc',
+      rawInput: { command: 'git status' },
+      locations: [{ path: '/p/a.ts' }],
+    }),
     { toolCallId: 'tc', command: 'git status', files: ['/p/a.ts'] },
   );
   assert.deepEqual(
-    openCodePermissionDetails({ action: 'bash', resources: ['rm -rf x', 'x'], source: { type: 'tool', messageID: 'm', id: 'p' } }),
+    openCodePermissionDetails({
+      action: 'bash',
+      resources: ['rm -rf x', 'x'],
+      source: { type: 'tool', messageID: 'm', id: 'p' },
+    }),
     { toolCallId: 'm:p', command: 'rm -rf x', files: ['x'] },
   );
   assert.deepEqual(openCodePermissionDetails({ action: 'edit', resources: ['/p/a.ts'] }), {
-    toolCallId: null, command: null, files: ['/p/a.ts'],
+    toolCallId: null,
+    command: null,
+    files: ['/p/a.ts'],
   });
 });
