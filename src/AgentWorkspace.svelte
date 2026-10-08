@@ -778,9 +778,15 @@
     }
   });
 
-  async function focusPromptWhenReady() {
+  // A busy agent still accepts typing; a prefill focuses so the reply can be queued.
+  async function focusPromptWhenReady(whileBusy = false) {
     await tick();
-    if (!focusPrompt || !focused || isBusy || activeSessionId !== (thread?.sessionId ?? null))
+    if (
+      !focusPrompt ||
+      !focused ||
+      (isBusy && !whileBusy) ||
+      activeSessionId !== (thread?.sessionId ?? null)
+    )
       return;
     prompt.focus();
     onpromptfocused?.();
@@ -800,11 +806,13 @@
   });
 
   $effect(() => {
-    if (!prefill || prefill.id === lastPrefill) return;
+    // Wait for the thread switch: activating a session restores its saved draft over the prefill.
+    if (!prefill || prefill.id === lastPrefill || activeSessionId !== (thread?.sessionId ?? null))
+      return;
     lastPrefill = prefill.id;
     draft = [draft.trim(), prefill.text].filter(Boolean).join('\n\n');
     onprefillconsumed?.(prefill.id);
-    void focusPromptWhenReady();
+    void focusPromptWhenReady(true);
   });
 
   $effect(() => {
