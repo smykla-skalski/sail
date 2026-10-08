@@ -37,6 +37,7 @@ type ActiveRejection = {
   recordedIDs: Set<string>;
   replyComplete: boolean;
   inventoryRecorded: boolean;
+  inventoryRevision: number;
   record: (request: PermissionRequest) => void;
   settlement: Settlement<PermissionRequest[]>;
 };
@@ -74,13 +75,19 @@ export class OpenCodePermissionRejectionCoordinator {
   observe(request: PermissionRequest): void {
     let session = this.#observed.get(request.sessionID);
     if (!session) this.#observed.set(request.sessionID, (session = new Map()));
+    const previous = session.get(request.id);
+    const inventoryChanged =
+      !previous || JSON.stringify(previous.request) !== JSON.stringify(request);
     session.set(request.id, {
       request,
-      record: session.get(request.id)?.record,
-      recordAutomatic: session.get(request.id)?.recordAutomatic,
+      record: previous?.record,
+      recordAutomatic: previous?.recordAutomatic,
     });
     const active = this.#active.get(request.sessionID);
-    if (this.#wasNotRejected(request.sessionID, request.id)) {
+    const wasNotRejected = this.#wasNotRejected(request.sessionID, request.id);
+    if (inventoryChanged && active && !wasNotRejected && !active.settledRejectedIDs.has(request.id))
+      active.inventoryRevision++;
+    if (wasNotRejected) {
       this.#forgetObserved(request.sessionID, request.id);
       return;
     }
@@ -214,11 +221,13 @@ export class OpenCodePermissionRejectionCoordinator {
       recordedIDs: new Set(),
       replyComplete: false,
       inventoryRecorded: false,
+      inventoryRevision: 0,
       record: request.record,
       settlement: settlement<PermissionRequest[]>(),
     };
     this.#recent.delete(sessionID);
     this.#active.set(sessionID, active);
+    const inventoryRevision = active.inventoryRevision;
     try {
       const pendingRequests = await request.list();
       if (request.validate && !(await request.validate(pendingRequests))) {
@@ -231,6 +240,10 @@ export class OpenCodePermissionRejectionCoordinator {
         if (this.#inventoryAmbiguous(sessionID) && !active.rejectedIDs.has(pending.id)) continue;
         active.requests.set(pending.id, pending);
         if (!active.settledRejectedIDs.has(pending.id)) active.awaitingSettledIDs.add(pending.id);
+      }
+      if (active.inventoryRevision !== inventoryRevision) {
+        if (this.#active.get(sessionID) === active) this.#active.delete(sessionID);
+        return null;
       }
     } catch (cause) {
       if (this.#active.get(sessionID) === active) this.#active.delete(sessionID);

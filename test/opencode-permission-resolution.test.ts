@@ -72,6 +72,36 @@ await test('automatic session rejection stops when a high-risk request joins the
   assert.equal(replied, false);
 });
 
+await test('automatic session rejection stops when a permission arrives after validation', async () => {
+  const coordinator = new OpenCodePermissionRejectionCoordinator();
+  const selected = { ...permission('selected'), action: 'edit' };
+  const highRisk = { ...permission('high-risk'), action: 'npm install' };
+  const validationReached = Promise.withResolvers<void>();
+  const finishValidation = Promise.withResolvers<void>();
+  let replied = false;
+
+  coordinator.observe(selected);
+  const rejection = coordinator.reject({
+    selected,
+    list: async () => [selected],
+    validate: async () => {
+      validationReached.resolve();
+      await finishValidation.promise;
+      return true;
+    },
+    reply: async () => {
+      replied = true;
+    },
+    record: () => undefined,
+  });
+  await validationReached.promise;
+  coordinator.observe(highRisk);
+  finishValidation.resolve();
+
+  assert.equal(await rejection, null);
+  assert.equal(replied, false);
+});
+
 await test('manual allow records an authoritative event when the HTTP response is lost', async () => {
   const coordinator = new OpenCodePermissionRejectionCoordinator();
   const allowed = permission('allowed-before-response-loss');
