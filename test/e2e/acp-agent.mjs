@@ -8,6 +8,12 @@ const sessions = new Map();
 const delayedSessionDirectories = new Set();
 const permissions = new Map();
 const elicitations = new Map();
+const questionOption = (label, description, preview) => ({
+  const: label,
+  title: label,
+  ...(description ? { description } : {}),
+  ...(preview ? { _meta: { '_claude/askUserQuestionOption': { preview } } } : {}),
+});
 const activePrompts = new Map();
 const steerWaiters = new Map();
 const terminalRequests = new Map();
@@ -399,6 +405,62 @@ for await (const line of createInterface({ input: process.stdin })) {
             title: 'Delivery approach',
             properties: { approach: { type: 'string', enum: ['safe', 'fast'], default: 'safe' } },
             required: ['approach'],
+          },
+        },
+      });
+      continue;
+    }
+    if (text === 'Ask user questions') {
+      const id = ++nextPermission;
+      elicitations.set(id, { sessionId, promptId: message.id, ask: true });
+      send({
+        id,
+        method: 'elicitation/create',
+        params: {
+          sessionId,
+          mode: 'form',
+          message: 'Please answer the following questions.',
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              question_0: {
+                type: 'string',
+                title: 'Storage',
+                description: 'Which storage engine should the cache use?',
+                oneOf: [
+                  questionOption(
+                    'Postgres (Recommended)',
+                    'Durable, already deployed, and covered by backups.',
+                    'CREATE TABLE cache (\n  key text PRIMARY KEY,\n  value jsonb NOT NULL\n);',
+                  ),
+                  questionOption('Redis', 'Fastest reads, but adds a service to operate.'),
+                  questionOption('In memory', 'No setup; lost on restart.'),
+                ],
+              },
+              question_0_custom: {
+                type: 'string',
+                title: 'Other',
+                description:
+                  'Type your own answer, or add a note to the option you chose above (optional).',
+              },
+              question_1: {
+                type: 'array',
+                title: 'Rollout',
+                description: 'Which rollout steps should run?',
+                items: {
+                  anyOf: [
+                    questionOption('Feature flag', 'Ship dark, then enable per project.'),
+                    questionOption('Metrics', 'Record hit rate and latency.'),
+                    questionOption('Docs', 'Document the new setting.'),
+                  ],
+                },
+              },
+              question_1_custom: {
+                type: 'string',
+                title: 'Other',
+                description: 'Type your own answer to add to your selection above (optional).',
+              },
+            },
           },
         },
       });
@@ -1084,9 +1146,11 @@ for await (const line of createInterface({ input: process.stdin })) {
     const pending = elicitations.get(message.id);
     elicitations.delete(message.id);
     const text =
-      message.result?.action === 'accept'
-        ? `Selected: ${message.result.content?.approach}`
-        : message.result?.action;
+      message.result?.action !== 'accept'
+        ? message.result?.action
+        : pending.ask
+          ? `Answers: ${JSON.stringify(message.result.content)}`
+          : `Selected: ${message.result.content?.approach}`;
     update(pending.sessionId, {
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text },
