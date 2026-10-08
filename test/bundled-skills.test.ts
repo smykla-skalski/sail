@@ -175,12 +175,29 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   );
 });
 
-void test('Sail mode names only ship_progress stages and statuses the tool accepts', () => {
+void test('Sail mode names only Ship tool fields and values the tools accept', () => {
+  const bridge = readFileSync(
+    new URL('../src-tauri/src/browser_agent.rs', import.meta.url),
+    'utf8',
+  );
   const schema =
     /"stage":\{"type":"string","enum":\[([^\]]+)\]\},\s*"status":\{"type":"string","enum":\[([^\]]+)\]\}/.exec(
-      readFileSync(new URL('../src-tauri/src/browser_agent.rs', import.meta.url), 'utf8'),
+      bridge,
     );
   assert.ok(schema, 'ship_progress schema not found');
+  const evidenceFields = /"task_evidence_record",\s*"[^"]*",\s*"([^"]+)"/.exec(bridge);
+  assert.ok(evidenceFields, 'task_evidence_record fields not found');
+  const evidence = sailModeRule('Evidence');
+  for (const field of evidenceFields[1].split(',').filter((name) => name.startsWith('expected')))
+    assert.match(evidence, new RegExp(`\`${field}\``), field);
+  assert.match(
+    bridge,
+    /"validation_policy",\s*"[^"]*",\s*"risk"/,
+    'validation_policy tool missing',
+  );
+  const risk = sailModeRule('Risk and Sail gates');
+  assert.match(risk, /call `validation_policy` with that level before validation/);
+  assert.match(risk, /do not set `requiredGates` yourself/);
   const progress = sailModeRule('Progress');
   const stages = /using stages (.*?) and `([a-z_]+)`\./.exec(progress);
   assert.ok(stages, 'stage list not found');
