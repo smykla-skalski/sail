@@ -280,6 +280,7 @@ export interface ShipIssue {
   setupStarted?: boolean;
   setupCompleted?: boolean;
   archivePath?: string | null;
+  cancelledAt?: number;
   error: string | null;
   stage?: string;
   reportedStatus?: 'running' | 'blocked';
@@ -346,6 +347,9 @@ export interface ShipRun {
   dependencyErrors?: Record<string, string>;
   issues: ShipIssue[];
   umbrella?: { number: number; title: string; url: string };
+  archivedAt?: number;
+  archivedBy?: 'auto' | 'user';
+  unarchivedAt?: number;
 }
 
 export type DirectShipRunInput = {
@@ -808,6 +812,11 @@ export function claimHeartbeatDue(
   force = false,
 ): boolean {
   return force || monotonicDeadline === undefined || monotonicNow >= monotonicDeadline;
+}
+
+/** A run the user stopped releases as cancelled; every other terminal issue releases as its state. */
+export function terminalClaimReleaseReason(issue: ShipIssue): string {
+  return issue.cancelledAt === undefined ? issue.state : 'cancelled';
 }
 
 export function terminalClaimReleaseReady(

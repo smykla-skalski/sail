@@ -213,9 +213,11 @@ mod diagnostics;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
+mod opencode_config;
 mod post_turn_checks;
 mod settings;
 mod shell_command;
+mod ship_actions;
 mod stderr_log;
 mod terminal;
 mod worktree_config;
@@ -2861,6 +2863,7 @@ pub fn run() {
             settings::get_acp_turn_evidence,
             start_runtime,
             repository_path_available,
+            opencode_config::opencode_plan_review_plugin,
             validate_repository,
             list_picker_directory,
             working_tree_diff,
@@ -2909,6 +2912,8 @@ pub fn run() {
             github::complete_predecessor_shipping_claim_fence,
             github::heartbeat_shipping_claim,
             github::release_shipping_claim,
+            ship_actions::ship_merge_pull_request,
+            ship_actions::ship_issue_title,
             github::pull_request_checks,
             github::failed_check_log,
             github::open_pull_request,

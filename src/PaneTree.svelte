@@ -11,6 +11,7 @@
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import WorkspaceActivity from './WorkspaceActivity.svelte';
   import ShipPanel from './ShipPanel.svelte';
+  import type { ShipActionId } from './lib/ship-actions';
   import EmptyPanePicker from './EmptyPanePicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
   import TerminalPane from './TerminalPane.svelte';
@@ -48,7 +49,14 @@
   } from './lib/capability-profiles';
   import type { NativeSubagent } from './lib/native-subagents';
   import { threadKey } from './lib/recent-threads';
-  import { getPlan, getHistory, type PlanSnapshot, type HistoryEntry } from './lib/plan';
+  import {
+    getPlan,
+    getHistory,
+    openCodePlanBackend,
+    type PlanSnapshot,
+    type HistoryEntry,
+  } from './lib/plan';
+  import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
   import { annotateDiffs } from './lib/diff';
   import {
     clampPaneRatio,
@@ -86,6 +94,9 @@
     onshipopen: (path: string, threadId?: string | null) => Promise<void>;
     onshipsettings: () => Promise<void>;
     onshiphandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
+    onshipaction: (id: ShipActionId, run: ShipRun, issue: ShipIssue | null) => Promise<string>;
+    ondismissshipnotice: () => void;
+    shipArchiveNotice?: number;
     onship: (
       graph: PublishedGraph,
       provider: ShipRun['provider'],
@@ -130,7 +141,9 @@
     ondiffcomments: (scope: string, comments: DiffComment[]) => void;
     ondiffcommentssent: (scope: string, ids: string[]) => void;
     onsenddiffcomments: (id: string, scope: string, text: string) => Promise<void>;
-    pendingAgentBatches: Record<string, { id: string; text: string }>;
+    pendingAgentBatches: Record<string, { id: string; text: string; leavePlanMode?: boolean }>;
+    onsendplan: (id: string, text: string, options: { leavePlanMode: boolean }) => Promise<void>;
+    onrevealplan: (id: string) => void;
     onbatchcomplete: (id: string, failure: string | null) => void;
     onshortcut: (event: KeyboardEvent) => void;
     onactivity: (thread: AgentThread) => void;
@@ -190,6 +203,9 @@
     onshipopen,
     onshipsettings,
     onshiphandoff,
+    onshipaction,
+    ondismissshipnotice,
+    shipArchiveNotice = 0,
     onship,
     onshipit,
     postTurnChecks,
@@ -219,6 +235,8 @@
     ondiffcommentssent,
     onsenddiffcomments,
     pendingAgentBatches,
+    onsendplan,
+    onrevealplan,
     onbatchcomplete,
     onshortcut,
     onactivity,
@@ -275,7 +293,30 @@
   let nativeHistoryError = $state('');
   let nativeDetailsOpen = $state(false);
   let nativeTab = $state<'plan' | 'changes' | 'history' | 'activity' | 'ship'>('changes');
-  let acpTab = $state<'changes' | 'activity' | 'ship'>('changes');
+  let acpTab = $state<'plan' | 'history' | 'changes' | 'activity' | 'ship'>('changes');
+  let acpPlanTick = $state(0);
+  let planRevealed = false;
+  const emptySnapshot: PlanSnapshot = { plan: null, questions: null };
+  const acpScope = $derived.by((): PlanScope | null => {
+    if ('direction' in pane || !pane.agent || pane.agent === 'opencode' || !pane.thread)
+      return null;
+    return { agent: pane.agent, directory, sessionId: pane.thread.sessionId };
+  });
+  const acpSnapshot = $derived.by(() => {
+    void acpPlanTick;
+    return acpScope ? acpPlans().snapshot(acpScope) : emptySnapshot;
+  });
+  const acpPlanHistory = $derived.by(() => {
+    void acpPlanTick;
+    return acpScope ? acpPlans().history(acpScope) : [];
+  });
+  const acpBackend = $derived(
+    acpScope && 'id' in pane
+      ? acpPlanBackend(acpPlans(), acpScope, {
+          send: (text, options) => onsendplan(pane.id, text, options),
+        })
+      : null,
+  );
   let paneActivityItems = $state<WorkspaceActivityItem[]>([]);
   let selectPaneActivity = $state<(item: WorkspaceActivityItem) => Promise<void>>(async () => {
     throw new Error('The activity source is unavailable.');
@@ -493,8 +534,24 @@
   $effect(() => {
     if ('direction' in pane || !pane.agent || pane.agent === 'opencode') return;
     const open = changesPanes.includes(pane.id);
-    if (open && !previousAcpOpen) acpTab = 'changes';
+    if (open && !previousAcpOpen) acpTab = planRevealed ? 'plan' : 'changes';
+    planRevealed = false;
     previousAcpOpen = open;
+  });
+
+  $effect(() => {
+    const scope = acpScope;
+    if (!scope || !('id' in pane)) return;
+    const paneId = pane.id;
+    const revealing = new Set(['proposed', 'questions', 'amended', 'checkpoint', 'done']);
+    return acpPlans().subscribe((change) => {
+      if (planKey(change.scope) !== planKey(scope)) return;
+      acpPlanTick += 1;
+      if (!revealing.has(change.reason)) return;
+      planRevealed = true;
+      acpTab = 'plan';
+      onrevealplan(paneId);
+    });
   });
 
   $effect(() => {
@@ -617,6 +674,9 @@
       {onshipopen}
       {onshipsettings}
       {onshiphandoff}
+      {onshipaction}
+      {ondismissshipnotice}
+      {shipArchiveNotice}
       {onship}
       {onshipit}
       {postTurnChecks}
@@ -657,6 +717,8 @@
       {ondiffcommentssent}
       {onsenddiffcomments}
       {pendingAgentBatches}
+      {onsendplan}
+      {onrevealplan}
       {onbatchcomplete}
       {onshortcut}
       {onactivity}
@@ -732,6 +794,9 @@
       {onshipopen}
       {onshipsettings}
       {onshiphandoff}
+      {onshipaction}
+      {ondismissshipnotice}
+      {shipArchiveNotice}
       {onship}
       {onshipit}
       {postTurnChecks}
@@ -772,6 +837,8 @@
       {ondiffcommentssent}
       {onsenddiffcomments}
       {pendingAgentBatches}
+      {onsendplan}
+      {onrevealplan}
       {onbatchcomplete}
       {onshortcut}
       {onactivity}
@@ -1012,7 +1079,7 @@
                 {#if nativeTab === 'plan'}
                   <PlanPanel
                     snapshot={nativeSnapshot}
-                    {client}
+                    backend={client ? openCodePlanBackend(client, directory) : null}
                     {directory}
                     sessionID={pane.thread?.sessionId ?? null}
                     {dark}
@@ -1043,6 +1110,9 @@
                     }}
                     onsettings={onshipsettings}
                     onhandoff={onshiphandoff}
+                    onaction={onshipaction}
+                    ondismissnotice={ondismissshipnotice}
+                    archiveNotice={shipArchiveNotice}
                   />
                 {:else if nativeTab === 'history'}
                   <PlanHistoryPanel
@@ -1165,12 +1235,22 @@
               <section class="native-details side-area" aria-label="Agent details">
                 <nav class="side-tabs" aria-label="Agent detail tabs">
                   <div class="side-tabs-list" role="tablist" aria-label="Agent details">
-                    <button
+                    {#if acpSnapshot.plan || acpSnapshot.questions}<button
+                        class:active={acpTab === 'plan'}
+                        role="tab"
+                        aria-selected={acpTab === 'plan'}
+                        onclick={() => (acpTab = 'plan')}>Plan</button
+                      >{/if}<button
                       class:active={acpTab === 'changes'}
                       role="tab"
                       aria-selected={acpTab === 'changes'}
                       onclick={() => (acpTab = 'changes')}>Changes ({diffs.length})</button
-                    ><button
+                    >{#if acpPlanHistory.length}<button
+                        class:active={acpTab === 'history'}
+                        role="tab"
+                        aria-selected={acpTab === 'history'}
+                        onclick={() => (acpTab = 'history')}>Plan history</button
+                      >{/if}<button
                       class:active={acpTab === 'activity'}
                       role="tab"
                       aria-selected={acpTab === 'activity'}
@@ -1190,7 +1270,36 @@
                     onclick={closeAcpDetails}>×</button
                   >
                 </nav>
-                {#if acpTab === 'ship'}
+                {#if acpTab === 'plan' && (acpSnapshot.plan || acpSnapshot.questions)}
+                  <PlanPanel
+                    snapshot={acpSnapshot}
+                    backend={acpBackend}
+                    {directory}
+                    sessionID={pane.thread?.sessionId ?? null}
+                    {dark}
+                    onchanged={async () => {
+                      acpPlanTick += 1;
+                    }}
+                    shipRun={shipRuns.find(
+                      (run) =>
+                        run.source === acpSnapshot.plan?.sessionID && run.repository === project,
+                    ) ?? null}
+                    onship={(graph, provider, limit) =>
+                      onship(graph, provider, limit, acpSnapshot.plan?.sessionID ?? '')}
+                    onselectfile={(file) => {
+                      selectedFile = file;
+                      acpTab = 'changes';
+                    }}
+                  />
+                {:else if acpTab === 'history'}
+                  <PlanHistoryPanel
+                    events={acpPlanHistory}
+                    session={undefined}
+                    loading={false}
+                    error=""
+                    onrefresh={() => (acpPlanTick += 1)}
+                  />
+                {:else if acpTab === 'ship'}
                   <ShipPanel
                     repository={project}
                     runs={shipRuns}
@@ -1205,6 +1314,9 @@
                     }}
                     onsettings={onshipsettings}
                     onhandoff={onshiphandoff}
+                    onaction={onshipaction}
+                    ondismissnotice={ondismissshipnotice}
+                    archiveNotice={shipArchiveNotice}
                   />
                 {:else if acpTab === 'activity'}
                   <WorkspaceActivity
@@ -1222,7 +1334,7 @@
                   <DiffPanel
                     {directory}
                     files={diffs}
-                    annotations={{}}
+                    annotations={annotateDiffs(diffs, acpSnapshot.plan, directory)}
                     selected={selectedFile}
                     loading={diffLoading}
                     error={diffError}

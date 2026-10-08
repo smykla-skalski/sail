@@ -27,6 +27,8 @@
     onmobileview,
     overview,
     onoverview,
+    shipQueue,
+    onshipqueue,
     projectName,
     projectDisabled,
     onchooseproject,
@@ -67,6 +69,8 @@
     onmobileview: (view: MobileView) => void;
     overview: boolean;
     onoverview: () => void;
+    shipQueue: boolean;
+    onshipqueue: () => void;
     projectName: string;
     projectDisabled: boolean;
     onchooseproject: () => void;
@@ -137,6 +141,8 @@
   <div class="breadcrumb">
     {#if overview}<strong>All worktrees</strong><span class="slash">/</span><strong
         >Task overview</strong
+      >{:else if shipQueue}<strong>All repositories</strong><span class="slash">/</span><strong
+        >Ship queue</strong
       >{:else}<button
         class="breadcrumb-project"
         title={directory || undefined}
@@ -254,6 +260,9 @@
       {#snippet trigger()}<span aria-hidden="true">⋯</span>{/snippet}
       <button role="menuitem" onclick={onoverview}
         >{overview ? 'Back to workspace' : 'Task overview'}</button
+      >
+      <button role="menuitem" onclick={onshipqueue}
+        >{shipQueue ? 'Back to workspace' : 'Ship queue'}</button
       >
       {#if directory}<button role="menuitem" class="agent-menu-launch" onclick={onswitchthread}
           >Switch thread…</button

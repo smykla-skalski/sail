@@ -4029,6 +4029,21 @@ pub async fn github_issue_repository(repository: String) -> Result<String, Strin
         .map_err(|error| error.to_string())?
 }
 
+pub(crate) fn gh_output(directory: &Path, args: &[&str]) -> Result<String, String> {
+    gh_command(directory, args)
+}
+
+pub(crate) fn require_target_repository(
+    worktree: &Path,
+    expected_repository: &str,
+) -> Result<String, String> {
+    expected_target_repository(worktree, expected_repository)
+}
+
+pub(crate) fn target_repository_of(worktree: &Path) -> Result<String, String> {
+    target_repository(worktree)
+}
+
 fn gh_command(directory: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new(gh_binary());
     command

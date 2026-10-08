@@ -12,7 +12,15 @@ export const checkpointPhases = [
   'complete',
 ] as const;
 
-export const checkpointStatuses = ['active', 'blocked', 'completed'] as const;
+export const checkpointStatuses = [
+  'active',
+  'blocked',
+  'completed',
+  'cancelled',
+  'failed',
+] as const;
+
+const terminalCheckpointStatuses = new Set<string>(['completed', 'cancelled', 'failed']);
 
 const taskCheckpointObjectSchema = z.object({
   schemaVersion: z.literal(1),
@@ -36,7 +44,11 @@ export const taskCheckpointSchema = taskCheckpointObjectSchema.superRefine(
   (checkpoint, context) => {
     if ((checkpoint.status === 'blocked') !== (checkpoint.blocker !== null))
       context.addIssue({ code: 'custom', message: 'Only blocked checkpoints have a blocker.' });
-    if ((checkpoint.status === 'completed') !== (checkpoint.phase === 'complete'))
+    const complete = checkpoint.phase === 'complete';
+    if (
+      (complete && !terminalCheckpointStatuses.has(checkpoint.status)) ||
+      (checkpoint.status === 'completed' && !complete)
+    )
       context.addIssue({
         code: 'custom',
         message: 'Completed status and complete phase must occur together.',
@@ -143,7 +155,13 @@ export function reconcileTaskCheckpoint(
     issueState: external.issueState ?? 'UNKNOWN',
     pullRequest: external.pullRequest ?? null,
     deliveryState: external.deliveryState,
-    resumable: revisionMatches && githubKnown && deliveryMatches && checkpoint.status !== 'blocked',
+    resumable:
+      revisionMatches &&
+      githubKnown &&
+      deliveryMatches &&
+      checkpoint.status !== 'blocked' &&
+      checkpoint.status !== 'cancelled' &&
+      checkpoint.status !== 'failed',
     reason:
       checkpoint.revision === null
         ? 'The checkpoint has no revision baseline. Inspect the worktree and bind an update before resuming.'
@@ -157,6 +175,8 @@ export function reconcileTaskCheckpoint(
                 ? 'The checkpoint no longer matches GitHub delivery state.'
                 : checkpoint.status === 'blocked'
                   ? checkpoint.blocker
-                  : null,
+                  : checkpoint.status === 'cancelled' || checkpoint.status === 'failed'
+                    ? `The checkpoint was ${checkpoint.status}. Retry the issue to resume it.`
+                    : null,
   };
 }

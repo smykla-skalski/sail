@@ -31,3 +31,25 @@ await test('replays the latest native plan', () => {
   ]);
   assert.equal(plan?.markdown, '# Latest');
 });
+
+await test('maps OpenCode ACP plan entries and ignores Codex-only updates', () => {
+  const plan = nativePlanUpdate('opencode', {
+    sessionUpdate: 'plan',
+    entries: [
+      { content: 'Inspect', priority: 'high', status: 'completed' },
+      { content: 'Edit', priority: 'medium', status: 'pending' },
+    ],
+  });
+  assert.equal(plan?.provider, 'opencode');
+  assert.equal(plan?.markdown, '- [x] Inspect\n- [ ] Edit');
+  assert.deepEqual(plan?.tasks, [
+    { title: 'Inspect', status: 'completed' },
+    { title: 'Edit', status: 'pending' },
+  ]);
+  assert.equal(nativePlanUpdate('opencode', { sessionUpdate: 'plan', entries: [] }, plan), plan);
+  assert.equal(nativePlanUpdate('opencode', { sessionUpdate: 'plan_update', plan: '# x' }), null);
+  assert.equal(
+    nativePlanUpdate('codex', { sessionUpdate: 'plan', entries: [{ content: 'x' }] }),
+    null,
+  );
+});

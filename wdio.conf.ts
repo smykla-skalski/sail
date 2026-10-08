@@ -1,6 +1,6 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { isolatedPaths, privatePort, PrivateEndpointGuard } from './test/e2e-isolation.ts';
 
 const port = privatePort(process.env.TAURI_WEBDRIVER_PORT);
@@ -14,6 +14,21 @@ process.env.SAIL_E2E_OPEN_URL_LOG = attach
   ? (process.env.SAIL_E2E_OPEN_URL_LOG ?? join(state, 'external-link.log'))
   : join(state, 'external-link.log');
 process.env.SAIL_ACP_TEST_AGENT = resolve('test/e2e/acp-agent.mjs');
+
+const fakeGhDirectory = join(state, 'fake-gh');
+if (!attach && process.platform !== 'win32' && !process.env.SAIL_E2E_FAKE_GH_DIR) {
+  mkdirSync(join(state, 'bin'), { recursive: true });
+  mkdirSync(fakeGhDirectory, { recursive: true });
+  const shim = join(state, 'bin', 'gh');
+  writeFileSync(
+    shim,
+    `#!/bin/sh\nexec "${process.execPath}" "${resolve('test/e2e/fake-gh.mjs')}" "$@"\n`,
+  );
+  chmodSync(shim, 0o755);
+  process.env.SAIL_E2E_FAKE_GH_DIR = fakeGhDirectory;
+  process.env.SAIL_E2E_FAKE_GH_BIN = join(state, 'bin');
+  process.env.PATH = `${join(state, 'bin')}${delimiter}${process.env.PATH ?? ''}`;
+}
 
 const binary = resolve(
   process.env.SAIL_E2E_BINARY ??
