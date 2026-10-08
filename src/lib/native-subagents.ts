@@ -80,18 +80,35 @@ function messageTail(text: string): string {
   return `…${text.slice(code >= 0xdc00 && code <= 0xdfff ? start + 1 : start)}`;
 }
 
+/** The oldest text that fits the message limit before an ellipsis, never ending inside a
+ * surrogate pair. */
+function messageHead(text: string): string {
+  const end = nativeMessageLimit - 1;
+  const code = text.charCodeAt(end - 1);
+  return `${text.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end)}…`;
+}
+
+/** Caps a raw tool value. Structured values over the limit become their capped JSON text, so a
+ * tool's input keeps its leading fields and its output keeps the newest text. */
+function boundValue(value: unknown, cut: (text: string) => string): unknown {
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  return typeof text === 'string' && text.length > nativeMessageLimit ? cut(text) : value;
+}
+
 function boundEntry(entry: AgentEntry): AgentEntry {
   if (entry.type !== 'tool')
     return entry.text.length > nativeMessageLimit && !entry.id.endsWith(':prompt')
       ? { ...entry, text: messageTail(entry.text) }
       : entry;
-  const long = (value: unknown): value is string =>
-    typeof value === 'string' && value.length > nativeMessageLimit;
-  if (!long(entry.content) && !long(entry.output)) return entry;
+  const content = boundValue(entry.content, messageTail) as string;
+  const input = boundValue(entry.input, messageHead);
+  const output = boundValue(entry.output, messageTail);
+  if (content === entry.content && input === entry.input && output === entry.output) return entry;
   return {
     ...entry,
-    ...(long(entry.content) ? { content: messageTail(entry.content) } : {}),
-    ...(long(entry.output) ? { output: messageTail(entry.output) } : {}),
+    content,
+    ...(input === undefined ? {} : { input }),
+    ...(output === undefined ? {} : { output }),
   };
 }
 

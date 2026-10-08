@@ -669,3 +669,46 @@ await test('a chunk appended to a long spawn prompt keeps the prompt start', () 
   assert.ok(first.text.startsWith('START'));
   assert.ok(first.text.endsWith('more'));
 });
+
+await test('structured tool input and output are capped as text', () => {
+  const big = 'Y'.repeat(100_000);
+  const store = updateNativeSubagents(
+    spawnedChild(),
+    event('child', {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'write',
+      title: 'Write',
+      rawInput: { command: 'write', content: big },
+      rawOutput: { stdout: big, done: true },
+    }),
+    '/repo',
+    2,
+  );
+
+  const tool = store['codex:child'].transcript.find((entry) => entry.id === 'write');
+  assert.ok(tool?.type === 'tool');
+  assert.ok(typeof tool.input === 'string' && tool.input.length === nativeMessageLimit);
+  assert.ok(tool.input.startsWith('{"command":"write"'));
+  assert.ok(typeof tool.output === 'string' && tool.output.length === nativeMessageLimit);
+  assert.ok(tool.output.endsWith('"done":true}'));
+});
+
+await test('small structured tool values stay structured', () => {
+  const store = updateNativeSubagents(
+    spawnedChild(),
+    event('child', {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'read',
+      title: 'Read',
+      rawInput: { path: '/repo/a.ts' },
+      rawOutput: { lines: 3 },
+    }),
+    '/repo',
+    2,
+  );
+
+  const tool = store['codex:child'].transcript.find((entry) => entry.id === 'read');
+  assert.ok(tool?.type === 'tool');
+  assert.deepEqual(tool.input, { path: '/repo/a.ts' });
+  assert.deepEqual(tool.output, { lines: 3 });
+});
