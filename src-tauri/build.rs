@@ -90,6 +90,8 @@ fn main() {
             "acp_permission",
             "acp_permission_resources_trusted",
             "acp_pending_permissions",
+            "acp_pending_elicitations",
+            "acp_elicitation",
             "acp_pending_inbox",
             "acp_activity",
             "acp_native_subagents",

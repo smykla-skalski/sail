@@ -1,6 +1,6 @@
 <script lang="ts">
   import { checkState } from './lib/pull-request-checks';
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import PathPicker from './PathPicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
@@ -9,7 +9,15 @@
   import type { AttentionMap, ThreadStatus } from './lib/attention';
   import { activityState } from './lib/activity-state';
   import { threadKey } from './lib/recent-threads';
-  import { sidebarThreadRows, sidebarThreadStatus } from './lib/sidebar-agents';
+  import {
+    advanceFailedChildNotices,
+    failedChildCount,
+    failedChildLabel,
+    openedFailedChildren,
+    sidebarThreadRows,
+    sidebarThreadStatus,
+    type FailedChildNotices,
+  } from './lib/sidebar-agents';
   import {
     isSubagentThread,
     receiptSourceId,
@@ -206,6 +214,7 @@
   const collapsedAgentPathsSetting = 'sai-collapsed-agent-worktrees';
   let collapsedAgentPaths = $state<string[]>(loadCollapsedAgentPaths());
   let expandedHistoricalParents = $state<string[]>([]);
+  let failedChildNotices = $state<FailedChildNotices>({});
 
   function loadCollapsedAgentPaths(): string[] {
     try {
@@ -258,6 +267,37 @@
       nativeActivityReady,
       nativeUnavailableDirectories,
       spawnReceipts,
+    );
+  }
+
+  $effect(() => {
+    const parents = Object.values(threads).flat();
+    const busy = (sourceId: string, parentDirectory: string) => {
+      const parent = parents.find(
+        (thread) =>
+          thread.directory === parentDirectory &&
+          receiptSourceId(thread.agent, thread.sessionId) === sourceId,
+      );
+      const status = parent ? threadStatus(parent) : null;
+      return status === 'working' || status === 'waiting';
+    };
+    const selected = parents.find((thread) => threadKey(thread) === selectedThread) ?? null;
+    const previous = untrack(() => failedChildNotices);
+    const next = advanceFailedChildNotices(
+      previous,
+      spawnReceipts,
+      busy,
+      openedFailedChildren(spawnReceipts, selected),
+    );
+    if (next !== previous) failedChildNotices = next;
+  });
+
+  function failedChildren(thread: AgentThread): number {
+    return failedChildCount(
+      failedChildNotices,
+      spawnReceipts,
+      receiptSourceId(thread.agent, thread.sessionId),
+      thread.directory,
     );
   }
 
@@ -752,9 +792,11 @@
         {@const status = threadStatus(thread)}
         {@const child = subagentThread(thread)}
         {@const childCounts = subagentCounts(thread)}
+        {@const failed = failedChildren(thread)}
         {@const childSummary = [
           childCounts.active ? `${childCounts.active} active` : '',
           childCounts.waiting ? `${childCounts.waiting} waiting` : '',
+          failed ? failedChildLabel(failed) : '',
         ]
           .filter(Boolean)
           .join(', ')}

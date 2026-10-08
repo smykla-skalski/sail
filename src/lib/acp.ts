@@ -711,6 +711,14 @@ export const acp = {
     }),
   pendingPermissions: (agent: AgentId, sessionId: string) =>
     invoke<AgentEvent['message'][]>('acp_pending_permissions', { agent, sessionId }),
+  pendingElicitations: (agent: AgentId, sessionId: string) =>
+    invoke<AgentEvent['message'][]>('acp_pending_elicitations', { agent, sessionId }),
+  elicitation: (
+    agent: AgentId,
+    requestId: string | number,
+    action: 'accept' | 'decline' | 'cancel',
+    content?: Record<string, unknown>,
+  ) => invoke<void>('acp_elicitation', { params: { agent, requestId, action, content } }),
   pendingInbox: () => invoke<AcpPendingInboxItem[]>('acp_pending_inbox'),
   activity: () => invoke<Record<AgentId, AgentActivity>>('acp_activity'),
   nativeSubagents: (directory: string) =>

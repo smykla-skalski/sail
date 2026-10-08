@@ -128,6 +128,14 @@ describe('ACP agent threads', () => {
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Done: Do a small thing'),
     );
+    await $('.agent-composer textarea').setValue('Ask structured question');
+    await $('.agent-actions button').click();
+    await expect($('[aria-label="Agent question"]')).toHaveText(
+      expect.stringContaining('Choose the delivery approach'),
+    );
+    await $('[aria-label="Agent question"] select').selectByAttribute('value', 'fast');
+    await $('[aria-label="Agent question"] button').click();
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Selected: fast'));
     await expect($('.option-trigger[aria-label^="Model:"]')).toHaveText(
       expect.stringContaining('Fast model'),
     );

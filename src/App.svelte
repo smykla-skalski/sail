@@ -1629,9 +1629,11 @@
   let chatMessages = $derived(
     messages.filter((message) => message.type === 'user' || message.type === 'assistant'),
   );
+  let openCodeChildReceipts = $state.raw<SpawnReceipt[]>([]);
   const mainSpawnActivity = $derived(
     spawnReceiptsForSource(spawnReceipts, sessionID ? `opencode:${sessionID}` : null, directory),
   );
+  const mainActivityChildren = $derived([...mainSpawnActivity, ...openCodeChildReceipts]);
   const mainPostTurnChecks = $derived(
     postTurnResults.filter(
       (check) => check.directory === directory && check.thread === `opencode:${sessionID}`,
@@ -1655,7 +1657,7 @@
             )
           : [],
       ),
-      children: mainSpawnActivity,
+      children: mainActivityChildren,
       decisions: [
         ...pendingPermissions.map((request) => ({
           id: request.id,
@@ -8632,6 +8634,21 @@
         const location = byDirectory.get(thread.directory);
         if (!location) continue;
         const nativeChild = nativeSubagents[nativeSubagentId(pending.agent, sessionId)];
+        if (pending.message.method === 'elicitation/create') {
+          const message = pending.message.params?.message;
+          items.push({
+            ...location,
+            key: `elicitation:${pending.agent}:${sessionId}:${requestId}`,
+            kind: 'question',
+            agent: `${agentAvailability.find((item) => item.id === pending.agent)?.name ?? pending.agent}${nativeChild ? ` · ${nativeChild.name}` : ''}`,
+            agentId: pending.agent,
+            sessionId,
+            requestId,
+            text: typeof message === 'string' ? message : 'Agent question',
+            receivedAt: pending.receivedAt,
+          });
+          continue;
+        }
         const tool = pending.message.params?.toolCall;
         const title =
           tool && typeof tool === 'object' && 'title' in tool && typeof tool.title === 'string'
@@ -10655,7 +10672,7 @@
       }
       return;
     }
-    if (item.kind === 'acp-permission') {
+    if (item.kind === 'acp-permission' || item.kind === 'question') {
       const thread = [...agentThreads, ...nativeChildThreads].find(
         (entry) =>
           entry.agent === item.agentId &&
@@ -11335,7 +11352,7 @@
 
   async function selectMainWorkspaceActivity(item: WorkspaceActivityItem) {
     if (item.kind === 'child') {
-      const receipt = mainSpawnActivity.find((entry) => entry.receiptId === item.sourceId);
+      const receipt = mainActivityChildren.find((entry) => entry.receiptId === item.sourceId);
       if (receipt?.targetId && receipt.targetDirectory) {
         await openSpawnTarget(receipt);
         return;
@@ -12388,6 +12405,8 @@
     }
     if (
       event.message.method === 'session/request_permission' ||
+      event.message.method === 'elicitation/create' ||
+      event.message.method === '$/cancel_request' ||
       event.message.method === 'sail/permission_resolved' ||
       event.message.method === 'sail/disconnected'
     )
@@ -14559,7 +14578,7 @@
                   </div>{/if}
                 {#each displayChatMessages as message (message.id)}
                   {#if message.type === 'spawn-response'}
-                    <SpawnResponse receipt={message.receipt} />
+                    <SpawnResponse receipt={message.receipt} onopen={openSpawnTarget} />
                   {:else if message.type === 'user'}
                     {@const attribution = coordinationMessageForText(
                       message.text,
@@ -14647,7 +14666,13 @@
                         </p>{/if}
                     </ChatMessage>{/if}
                 {/each}
-                <OpenCodeSubagents {client} parentID={sessionID} />
+                <OpenCodeSubagents
+                  {client}
+                  parentID={sessionID}
+                  {directory}
+                  onopen={openSpawnTarget}
+                  onchildren={(receipts) => (openCodeChildReceipts = receipts)}
+                />
                 {#each pendingShellRuns as run (run.id)}
                   <ShellCommandCard
                     {run}
@@ -14869,6 +14894,7 @@
         onentries={(id, entries, sessionId, ready) =>
           (agentEntrySnapshots = { ...agentEntrySnapshots, [id]: { entries, sessionId, ready } })}
         {changesPanes}
+        dockDetails={!mainDetailsVisible && !shipFallbackVisible && !mobileLayout}
         main={mainPaneContent}
         mainPicker={showMainPicker}
         canClose={leaves(paneLayout).length > 1 ||

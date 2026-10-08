@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   createOpenCodeChildStore,
+  openCodeChildActivity,
+  openCodeChildReceipts,
+  openCodeChildStatusLabel,
   type OpenCodeChildClient,
   type OpenCodeChildren,
 } from '../src/lib/opencode-children.ts';
@@ -186,4 +189,38 @@ await test('closing the last view stops the poll and drops late results', async 
     reopened.at(-1)?.children.map((child) => child.id),
     ['child-a'],
   );
+});
+
+await test('a finished child reads Finished, never Queued', () => {
+  const finished = { ...session('done', 'parent'), outcome: undefined };
+  const failed = { ...session('bad', 'parent'), outcome: 'failed' as const };
+  const live = session('live', 'parent');
+  const receipts = openCodeChildReceipts('parent', '/repo', {
+    children: [live, finished, failed],
+    active: ['live'],
+    summaries: {},
+  });
+  const byId = Object.fromEntries(receipts.map((receipt) => [receipt.receiptId, receipt]));
+  assert.equal(byId['opencode-child:live'].state, 'working');
+  assert.equal(byId['opencode-child:done'].state, 'completed');
+  assert.equal(byId['opencode-child:done'].activity, 'Finished');
+  assert.equal(byId['opencode-child:bad'].state, 'failed');
+  assert.equal(openCodeChildStatusLabel('completed'), 'Finished');
+  assert.equal(openCodeChildStatusLabel('working'), undefined);
+  assert.equal(openCodeChildStatusLabel('failed'), undefined);
+  assert.equal(openCodeChildActivity('queued', undefined), 'Queued');
+});
+
+await test('child receipts point at the child thread and its parent', () => {
+  const [receipt] = openCodeChildReceipts('parent', '/repo', {
+    children: [session('child', 'parent')],
+    active: [],
+    summaries: { child: message('child') },
+  });
+  assert.equal(receipt.sourceId, 'opencode:parent');
+  assert.equal(receipt.targetId, 'opencode:child');
+  assert.equal(receipt.targetDirectory, '/repo');
+  assert.equal(receipt.provider, 'opencode');
+  assert.equal(receipt.prompt, 'Child child');
+  assert.equal(receipt.activity, 'Output of child');
 });

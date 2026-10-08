@@ -102,6 +102,11 @@ export function recordSidebarOpenCodeOutcome(
   return { ...outcomes, [threadKey(thread)]: status };
 }
 
+/** A failed child stays listed, because its failure is a result the user has to read. */
+function retained(receipt: SpawnReceipt | undefined): boolean {
+  return !receipt || !receiptIsSettled(receipt.state) || receipt.state === 'failed';
+}
+
 export function sidebarThreadRows(
   threads: AgentThread[],
   receipts: SpawnReceipt[],
@@ -141,7 +146,7 @@ export function sidebarThreadRows(
     const nextTrail = new Set(trail).add(key);
     return (children.get(key) ?? []).some((child) => {
       const receipt = receiptByChild.get(sidebarThreadIdentity(child));
-      return !receipt || !receiptIsSettled(receipt.state) || hasLiveDescendant(child, nextTrail);
+      return retained(receipt) || hasLiveDescendant(child, nextTrail);
     });
   };
   const visit = (thread: AgentThread, depth: number): void => {
@@ -152,16 +157,11 @@ export function sidebarThreadRows(
     const historicalExpanded = expanded.includes(threadKey(thread));
     const historicalChildren = nested.filter((child) => {
       const receipt = receiptByChild.get(sidebarThreadIdentity(child));
-      return !!receipt && receiptIsSettled(receipt.state) && !hasLiveDescendant(child);
+      return !retained(receipt) && !hasLiveDescendant(child);
     }).length;
     const visible = nested.filter((child) => {
       const receipt = receiptByChild.get(sidebarThreadIdentity(child));
-      return (
-        !receipt ||
-        !receiptIsSettled(receipt.state) ||
-        hasLiveDescendant(child) ||
-        historicalExpanded
-      );
+      return retained(receipt) || hasLiveDescendant(child) || historicalExpanded;
     });
     rows.push({
       thread,
@@ -238,4 +238,80 @@ export function sidebarThreadStatus(
     }
   }
   return status;
+}
+
+/** Where a failed child is in the lifecycle of its "failed child" notice on the parent. The notice
+ * shows until the parent completes a turn that started after the failure, or the user opens the
+ * child. `during-turn`: failed while the parent's turn ran. `idle`: waiting for the next turn.
+ * `armed`: that turn is running. `cleared`: no notice. */
+export type FailedChildPhase = 'during-turn' | 'idle' | 'armed' | 'cleared';
+export type FailedChildNotices = Record<string, FailedChildPhase>;
+
+function nativeFailedChildren(receipts: readonly SpawnReceipt[]): SpawnReceipt[] {
+  return receipts.filter(
+    (receipt) => receipt.receiptId.startsWith('native:') && receipt.state === 'failed',
+  );
+}
+
+/** Moves each failed child's notice forward. `parentBusy` says whether the parent has a turn
+ * running, and `opened` lists children the user opened. Returns `notices` itself when nothing
+ * changed. */
+export function advanceFailedChildNotices(
+  notices: FailedChildNotices,
+  receipts: readonly SpawnReceipt[],
+  parentBusy: (sourceId: string, directory: string) => boolean,
+  opened: ReadonlySet<string> = new Set(),
+): FailedChildNotices {
+  const next: FailedChildNotices = {};
+  for (const receipt of nativeFailedChildren(receipts)) {
+    const busy = parentBusy(receipt.sourceId, receipt.sourceDirectory);
+    const previous = notices[receipt.receiptId];
+    let phase: FailedChildPhase;
+    if (previous === undefined) phase = busy ? 'during-turn' : 'idle';
+    else if (previous === 'during-turn') phase = busy ? 'during-turn' : 'idle';
+    else if (previous === 'idle') phase = busy ? 'armed' : 'idle';
+    else if (previous === 'armed') phase = busy ? 'armed' : 'cleared';
+    else phase = 'cleared';
+    next[receipt.receiptId] = opened.has(receipt.receiptId) ? 'cleared' : phase;
+  }
+  // A cleared notice outlives its receipt, so a child that reappears does not notify again.
+  for (const [id, phase] of Object.entries(notices)) if (phase === 'cleared') next[id] ??= phase;
+  const same =
+    Object.keys(next).length === Object.keys(notices).length &&
+    Object.entries(next).every(([id, phase]) => notices[id] === phase);
+  return same ? notices : next;
+}
+
+export function failedChildCount(
+  notices: FailedChildNotices,
+  receipts: readonly SpawnReceipt[],
+  sourceId: string,
+  directory: string,
+): number {
+  return nativeFailedChildren(receipts).filter(
+    (receipt) =>
+      receipt.sourceId === sourceId &&
+      receipt.sourceDirectory === directory &&
+      (notices[receipt.receiptId] ?? 'idle') !== 'cleared',
+  ).length;
+}
+
+export function failedChildLabel(count: number): string {
+  return `${count} failed ${count === 1 ? 'child' : 'children'}`;
+}
+
+/** Failed children whose thread is the one the user has open. */
+export function openedFailedChildren(
+  receipts: readonly SpawnReceipt[],
+  selected: { agent: string; sessionId: string; directory: string } | null,
+): Set<string> {
+  if (!selected) return new Set();
+  const target = receiptSourceId(selected.agent, selected.sessionId);
+  return new Set(
+    nativeFailedChildren(receipts)
+      .filter(
+        (receipt) => receipt.targetId === target && receipt.targetDirectory === selected.directory,
+      )
+      .map((receipt) => receipt.receiptId),
+  );
 }
