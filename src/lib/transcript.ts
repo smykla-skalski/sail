@@ -34,6 +34,8 @@ export type TranscriptMessage = {
   text: string;
   created?: number;
   provider: string;
+  /** The host's own message id, for scroll anchors; item ids may carry a part suffix. */
+  sourceId?: string;
   files?: string[];
   streaming?: boolean;
   queued?: boolean;
@@ -248,6 +250,7 @@ export function openCodeItems(
         text: entry.text,
         created: entry.time.created,
         provider: 'opencode',
+        sourceId: entry.id,
         files: entry.files?.map(fileLabel),
       });
       continue;
@@ -268,6 +271,7 @@ export function openCodeItems(
           text,
           created,
           provider: 'opencode',
+          sourceId: entry.id,
         });
     };
     const flushTools = (ordinal: number) => {
@@ -293,6 +297,7 @@ export function openCodeItems(
             text: part.text,
             created,
             provider: 'opencode',
+            sourceId: entry.id,
           });
       } else if (part.type === 'text')
         texts.push(host.liveText?.[entry.id]?.[ordinal] ?? part.text);
@@ -311,6 +316,7 @@ export function openCodeItems(
         text: '',
         created,
         provider: 'opencode',
+        sourceId: entry.id,
         retry: note[0],
         error: entry.error?.message,
       });
@@ -333,6 +339,7 @@ export function streamingItems(
       .map(([, value]) => value)
       .join('\n'),
     provider: 'opencode',
+    sourceId: id,
     streaming: true,
   }));
 }

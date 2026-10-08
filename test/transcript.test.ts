@@ -281,6 +281,10 @@ await test('OpenCode messages group consecutive tools and keep text, thinking an
   assert.equal(group.kind === 'tools' && group.tools.length, 2);
   assert.deepEqual(items[0].kind === 'message' && items[0].files, ['a.txt']);
   assert.equal(group.kind === 'tools' && group.tools[0].id, 'm2:t1');
+  assert.deepEqual(
+    items.flatMap((item) => (item.kind === 'message' ? [item.sourceId] : [])).slice(1),
+    ['m2', 'm2', 'm2'],
+  );
 });
 
 await test('OpenCode retry and error render as a status message and streaming text is labelled', () => {

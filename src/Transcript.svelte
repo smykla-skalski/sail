@@ -186,7 +186,7 @@
         </div>
       {/if}
     {:else}
-      <details class="agent-tool-group">
+      <details class="agent-tool-group" open={!failure && item.tools.some(toolFailed)}>
         <summary>
           <span>{item.tools.length} {item.tools.length === 1 ? 'action' : 'actions'}</span>
           <span class="agent-tool-group-last">{item.tools.at(-1)?.title}</span>
@@ -216,7 +216,7 @@
       <ChatMessage
         kind={item.role}
         created={item.created}
-        messageId={item.id}
+        messageId={item.sourceId ?? item.id}
         provider={item.provider}
         author={attribution ? `From ${attribution.sender}` : item.author}
       >
