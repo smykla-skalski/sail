@@ -143,6 +143,32 @@ fn reuse_session_config(
     Ok(next)
 }
 
+/// Returns the parameters to send for a restored session. Reuse keeps the adapter's live session;
+/// `per_load` is the documented rollback switch and mints a fresh config for every load.
+fn restore_params(
+    per_load: bool,
+    configs: &mut HashMap<String, SessionConfig>,
+    session_id: &str,
+    cwd: &str,
+    mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
+    release: impl FnMut(&str),
+) -> Result<Value, String> {
+    if per_load {
+        let config = mint()?;
+        return Ok(session_request_params(
+            cwd,
+            Some(session_id),
+            &mcp_server(&config),
+        ));
+    }
+    let config = reuse_session_config(configs, session_id, cwd, mint, release)?;
+    Ok(session_request_params(
+        &config.cwd,
+        Some(session_id),
+        &config.server,
+    ))
+}
+
 struct PendingPermission {
     message: Value,
     received_at: u64,
@@ -1195,22 +1221,24 @@ async fn restore_session(
     let runtime = connection(&manager, &agent)?;
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let params = if per_load_mcp() {
-            let config = browser.config(&cwd, Some(&session_id), Some(&agent))?;
-            session_request_params(&cwd, Some(&session_id), &mcp_server(&config))
-        } else {
+        let params = {
             let mut configs = runtime
                 .session_configs
                 .lock()
                 .map_err(|error| error.to_string())?;
-            let config = reuse_session_config(
+            // The reader drains this map when it exits, so minting for a stopped agent would
+            // leak the token.
+            if !runtime.alive.load(Ordering::Acquire) {
+                return Err("Agent process stopped. Reopen the thread to reconnect.".to_string());
+            }
+            restore_params(
+                per_load_mcp(),
                 &mut configs,
                 &session_id,
                 &cwd,
                 || browser.config(&cwd, Some(&session_id), Some(&agent)),
                 |token| browser.release(token),
-            )?;
-            session_request_params(&config.cwd, Some(&session_id), &config.server)
+            )?
         };
         runtime
             .session_directories
@@ -1714,6 +1742,76 @@ mod session_config_tests {
             session_request_params(&first.cwd, Some("session"), &first.server),
             session_request_params(&second.cwd, Some("session"), &second.server)
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_per_load_switch_mints_parameters_for_every_load() {
+        let mut configs = HashMap::new();
+        let mut minted = 0;
+        let mut released = 0;
+        let first = restore_params(
+            true,
+            &mut configs,
+            "session",
+            "/work/repo",
+            || {
+                minted += 1;
+                Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
+            },
+            |_| released += 1,
+        )
+        .unwrap();
+        let second = restore_params(
+            true,
+            &mut configs,
+            "session",
+            "/work/repo",
+            || {
+                minted += 1;
+                Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
+            },
+            |_| released += 1,
+        )
+        .unwrap();
+        assert_eq!(minted, 2);
+        assert_eq!(released, 0);
+        assert!(configs.is_empty());
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn reuse_keeps_the_parameters_the_adapter_already_saw() {
+        let directory = scratch("restore");
+        let cwd = directory.to_string_lossy().into_owned();
+        let mut configs = HashMap::new();
+        let mut minted = 0;
+        let first = restore_params(
+            false,
+            &mut configs,
+            "session",
+            &cwd,
+            || {
+                minted += 1;
+                Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
+            },
+            |_| unreachable!("a reused config releases no token"),
+        )
+        .unwrap();
+        let second = restore_params(
+            false,
+            &mut configs,
+            "session",
+            &cwd,
+            || {
+                minted += 1;
+                Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
+            },
+            |_| unreachable!("a reused config releases no token"),
+        )
+        .unwrap();
+        assert_eq!(minted, 1);
+        assert_eq!(first, second);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

@@ -8257,8 +8257,7 @@
       if (
         status === 'done' &&
         typeof turnId === 'string' &&
-        event.message.params?.notify !== false &&
-        !replayingAgentSessions[JSON.stringify([event.agent, sessionId])]
+        event.message.params?.notify !== false
       ) {
         const thread = agentThreads.find(
           (item) => item.agent === event.agent && item.sessionId === sessionId,

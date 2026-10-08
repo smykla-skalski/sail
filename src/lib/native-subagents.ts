@@ -98,8 +98,11 @@ export function updateNativeSubagents(
     const id = nativeSubagentId(event.agent, sessionId);
     const previous = store[id];
     const prompt = typeof update.prompt === 'string' ? update.prompt : previous?.prompt;
+    // Only the adapter's replayed children carry the replay marker, so a child announced while a
+    // live session replays stays live.
+    const replayed = restored && isReplaySubagent(sessionId);
     const malformed =
-      restored &&
+      replayed &&
       (!(typeof update.name === 'string' && update.name.trim()) ||
         !(typeof update.task === 'string' && update.task.trim()));
     const transcript = previous?.transcript ?? [];
@@ -134,7 +137,7 @@ export function updateNativeSubagents(
         transcript: nextTranscript,
         created: previous?.created ?? now,
         updated: now,
-        restored: previous?.restored || restored,
+        restored: previous?.restored || replayed,
         ...(malformed ? { error: 'Incomplete subagent history' } : {}),
       },
     };

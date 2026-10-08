@@ -509,11 +509,13 @@ export function liveSessionView(
   now = Date.now(),
 ): {
   entries: AgentEntry[];
+  complete: boolean;
   configOptions: AgentConfigOption[];
   availableCommands?: AgentCommand[];
 } | null {
   if (!state?.configOptions) return null;
   return {
+    complete: buffered !== null,
     entries: buffered
       ? updateEntriesBatch(
           cached,
@@ -571,8 +573,10 @@ function restoreSession(
   const key = JSON.stringify([agent, cwd, sessionId]);
   const existing = restoringSessions.get(key);
   if (existing) return existing;
+  invalidateBackgroundSession(agent, sessionId);
   const request = invoke<Record<string, unknown>>(method, { agent, cwd, sessionId }).then(
     (session) => {
+      invalidateBackgroundSession(agent, sessionId);
       rememberRestoredState(agent, sessionId, session);
       return session;
     },

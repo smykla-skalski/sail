@@ -214,6 +214,9 @@ describe('agent sessions survive thread switches', () => {
       (saved, personalCheck, directories) => {
         sessionStorage.removeItem('sai-e2e-continuity-threads');
         sessionStorage.setItem('sail-e2e-settings', 'enabled');
+        // A shared webview keeps the migration marker between runs, and a migrated start wipes
+        // these keys before the app reads them.
+        localStorage.removeItem('sail-settings-migrated-v1');
         localStorage.setItem('sai-directory', directories[0]);
         localStorage.removeItem('sai-pane-layouts');
         localStorage.setItem('sai-post-turn-personal', JSON.stringify([personalCheck]));
@@ -254,6 +257,7 @@ describe('agent sessions survive thread switches', () => {
     await sendPrompt('Long turn');
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-1 '));
     await switchAwayAndBack('Continuity main', 'Continuity sibling');
+    await expect($('.agent-picker-controls')).toHaveText(expect.stringContaining('Test model'));
     await switchAwayAndBack('Continuity main', 'Continuity elsewhere');
     await browser.pause(500);
     const live = await $('.agent-conversation').getText();
@@ -286,11 +290,14 @@ describe('agent sessions survive thread switches', () => {
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Background task started.'),
     );
+    await switchAwayAndBack('Continuity main', 'Continuity sibling');
     await switchAwayAndBack('Continuity main', 'Continuity elsewhere');
     await expect($('.agent-conversation')).toHaveText(
-      expect.stringContaining('Background task finished.'),
+      expect.stringContaining('Background task started. Background task finished.'),
       { wait: 15_000 },
     );
+    const background = await $('.agent-conversation').getText();
+    expect(background.split('Background task finished.').length - 1).toBe(1);
     expect(restarts(first)).toBe(0);
   });
 

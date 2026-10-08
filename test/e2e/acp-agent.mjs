@@ -295,8 +295,14 @@ for await (const line of createInterface({ input: process.stdin })) {
     if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
     else {
-      for (const item of session.history)
-        update(item.sessionId ?? message.params.sessionId, item.update ?? item);
+      await session.history.reduce(
+        (previous, item) =>
+          previous.then(() => {
+            update(item.sessionId ?? message.params.sessionId, item.update ?? item);
+            return new Promise((resolve) => setTimeout(resolve, 0));
+          }),
+        Promise.resolve(),
+      );
       send({
         id: message.id,
         result: {

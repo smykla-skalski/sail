@@ -65,7 +65,7 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
 await test('replayed lifecycle deduplicates and unfinished history disconnects', () => {
   const spawn = event('parent', {
     sessionUpdate: 'subagent_spawned',
-    subagentSessionId: 'child',
+    subagentSessionId: 'parent:replay-subagent:child',
     name: 'worker',
     task: 'Task',
     capabilities: {},
@@ -73,10 +73,10 @@ await test('replayed lifecycle deduplicates and unfinished history disconnects',
   let store = updateNativeSubagents({}, spawn, '/repo', 1, true);
   store = updateNativeSubagents(store, spawn, '/repo', 2, true);
   assert.equal(Object.keys(store).length, 1);
-  assert.equal(store['codex:child'].created, 1);
+  assert.equal(store['codex:parent:replay-subagent:child'].created, 1);
 
   store = finalizeNativeSubagentRestore(store, 'codex', 'parent', 3);
-  assert.equal(store['codex:child'].outcome, 'unknown');
+  assert.equal(store['codex:parent:replay-subagent:child'].outcome, 'unknown');
   assert.equal(nativeSubagentReceipts(store)[0].state, 'unavailable');
 });
 
@@ -237,7 +237,7 @@ await test('malformed and self-referential lifecycle events leave parents intact
     {},
     event('parent', {
       sessionUpdate: 'subagent_spawned',
-      subagentSessionId: 'broken-child',
+      subagentSessionId: 'parent:replay-subagent:broken',
       name: 42,
       capabilities: {},
     }),
@@ -245,7 +245,10 @@ await test('malformed and self-referential lifecycle events leave parents intact
     1,
     true,
   );
-  assert.equal(restored['codex:broken-child'].error, 'Incomplete subagent history');
+  assert.equal(
+    restored['codex:parent:replay-subagent:broken'].error,
+    'Incomplete subagent history',
+  );
 });
 
 function spawnEvent(parent: string, child: string): AgentEvent {
@@ -281,6 +284,14 @@ await test('a replay of a live session does not duplicate its live children', ()
     Object.values(finalized).map((child) => [child.sessionId, child.outcome]),
     [['task-1', 'working']],
   );
+});
+
+await test('a child spawned while its session replays stays live', () => {
+  const store = updateNativeSubagents({}, spawnEvent('root', 'root:live-child'), '/repo', 1, true);
+  const child = store['codex:root:live-child'];
+  assert.equal(child?.restored, false);
+  assert.equal(child?.outcome, 'working');
+  assert.equal(finalizeNativeSubagentRestore(store, 'codex', 'root', 2), store);
 });
 
 await test('a first replay still restores historical children', () => {

@@ -349,6 +349,7 @@ void test('switching back to a running session rebuilds it from the buffered upd
     ['Working on it', 'Read file'],
   );
   assert.equal(view.configOptions, configOptions);
+  assert.equal(view.complete, true);
   assert.equal(takeBackgroundUpdates('claude', 'live'), null);
   assert.equal(takeBackgroundUpdates('claude', 'untracked'), null);
 });
@@ -364,10 +365,9 @@ void test('a running session without a complete buffer keeps its cached transcri
     });
   const overflowed = takeBackgroundUpdates('claude', 'busy');
   assert.equal(overflowed, null);
-  assert.equal(
-    liveSessionView(cached, overflowed, sessionState('claude', 'busy'))?.entries,
-    cached,
-  );
+  const incomplete = liveSessionView(cached, overflowed, sessionState('claude', 'busy'));
+  assert.equal(incomplete?.entries, cached);
+  assert.equal(incomplete?.complete, false);
   trackBackgroundSession('claude', 'replayed');
   invalidateBackgroundSession('claude', 'replayed');
   assert.equal(takeBackgroundUpdates('claude', 'replayed'), null);
