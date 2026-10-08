@@ -855,6 +855,19 @@ function stableIdentity(value: string): string {
     .padStart(8, '0')}`;
 }
 
+function normalizedCiRunUrl(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  try {
+    const url = new URL(trimmed);
+    url.hash = '';
+    if (url.pathname.length > 1) url.pathname = url.pathname.replace(/\/+$/, '');
+    return url.toString();
+  } catch {
+    return trimmed;
+  }
+}
+
 export type CiEvidenceIdentityInput = {
   name: string;
   url: string;
@@ -876,15 +889,17 @@ export function ciEvidenceIdentity(
 } {
   const stableRun = check.runId ?? check.databaseId;
   const stableStatus = check.statusContextId;
+  const stableStatusRun = stableStatus === undefined ? undefined : normalizedCiRunUrl(check.url);
   const uncertain =
-    check.identityUncertain === true || (stableRun === undefined && stableStatus === undefined);
+    check.identityUncertain === true ||
+    (stableRun === undefined && (stableStatus === undefined || stableStatusRun === undefined));
   const execution =
     stableRun !== undefined
       ? `${revision}\u0000${check.name}\u0000${check.runId ?? 'no-run'}\u0000${
           check.databaseId ?? 'no-check'
         }\u0000${check.attempt ?? 1}`
       : stableStatus !== undefined
-        ? `${revision}\u0000${check.name}\u0000status\u0000${stableStatus}`
+        ? `${revision}\u0000${check.name}\u0000status\u0000${stableStatusRun ?? 'no-run-url'}`
         : `${revision}\u0000${check.name}\u0000legacy\u0000${check.url}`;
   return {
     id: `ci:${stableIdentity(execution)}`,

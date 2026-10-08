@@ -1248,25 +1248,109 @@ void test('counts each CI execution once across polling and status changes', () 
   assert.equal(summarizeTaskEconomics(manifests, { ready: false }, 'revision').totals.checks, 2);
 });
 
-void test('uses a stable status context identity across polls', () => {
-  const context = {
-    name: 'external/build',
-    url: 'https://ci.test/build/1',
-    statusContextId: 'SC_kwDOStatusContext1',
-  };
-  const pending = ciEvidence(context, 'pending', 10);
-  const passed = ciEvidence({ ...context, url: 'https://ci.test/build/1/result' }, 'passed', 20);
-  assert.equal(pending.id, passed.id);
-  assert.equal(passed.identityUncertain, false);
-
+void test('counts a Buildkite execution once when GitHub replaces its status context', () => {
+  const pending = ciEvidence(
+    {
+      name: 'buildkite/test',
+      url: 'https://buildkite.com/acme/widgets/builds/101/#job-1',
+      statusContextId: 'SC_pending',
+    },
+    'pending',
+    10,
+  );
+  const passed = ciEvidence(
+    {
+      name: 'buildkite/test',
+      url: 'https://buildkite.com/acme/widgets/builds/101',
+      statusContextId: 'SC_success',
+    },
+    'passed',
+    20,
+  );
   let manifests = recordCiEvidenceObservation([], 'revision', criteria, pending);
+
+  manifests = reconcileCiEvidenceSnapshot(manifests, 'revision', [passed]);
   manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, passed);
   const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
 
+  assert.equal(pending.id, passed.id);
   assert.equal(manifests[0].evidence.length, 1);
   assert.equal(manifests[0].evidence[0].result, 'passed');
+  assert.equal(summary.totals.checks, 1);
   assert.equal(summary.identityCoverageComplete, true);
   assert.equal(summary.accepted, true);
+});
+
+void test('counts independent Buildkite executions with the same context separately', () => {
+  const first = ciEvidence(
+    {
+      name: 'buildkite/test',
+      url: 'https://buildkite.com/acme/widgets/builds/101',
+      statusContextId: 'SC_first',
+    },
+    'passed',
+    10,
+  );
+  const second = ciEvidence(
+    {
+      name: 'buildkite/test',
+      url: 'https://buildkite.com/acme/widgets/builds/102',
+      statusContextId: 'SC_second',
+    },
+    'passed',
+    20,
+  );
+  let manifests = recordCiEvidenceObservation([], 'revision', criteria, first);
+
+  manifests = reconcileCiEvidenceSnapshot(manifests, 'revision', [second]);
+  manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, second);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+
+  assert.notEqual(first.id, second.id);
+  assert.equal(summary.totals.checks, 2);
+  assert.equal(summary.identityCoverageComplete, true);
+  assert.equal(summary.accepted, true);
+});
+
+void test('recovers Buildkite economics when a persisted status gains stable identity', () => {
+  const url = 'https://buildkite.com/acme/widgets/builds/101';
+  const pending = ciEvidence(
+    { name: 'buildkite/test', url, identityUncertain: true },
+    'pending',
+    10,
+  );
+  const passed = ciEvidence(
+    { name: 'buildkite/test', url, statusContextId: 'SC_success' },
+    'passed',
+    20,
+  );
+  let manifests = recordCiEvidenceObservation([], 'revision', criteria, pending);
+
+  manifests = reconcileCiEvidenceSnapshot(manifests, 'revision', [passed]);
+  manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, passed);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+
+  assert.equal(summary.totals.checks, 1);
+  assert.equal(summary.identityCoverageComplete, true);
+  assert.equal(summary.accepted, true);
+});
+
+void test('marks status contexts without a run URL as identity-incomplete', () => {
+  const status = ciEvidence(
+    {
+      name: 'external/build',
+      url: '',
+      statusContextId: 'SC_kwDOStatusContext1',
+    },
+    'passed',
+    20,
+  );
+  const manifests = recordCiEvidenceObservation([], 'revision', criteria, status);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+
+  assert.equal(status.identityUncertain, true);
+  assert.equal(summary.identityCoverageComplete, false);
+  assert.equal(summary.accepted, false);
 });
 
 void test('keeps a newer live CI state when the same execution is archived', () => {
