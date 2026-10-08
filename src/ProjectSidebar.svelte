@@ -61,6 +61,7 @@
     acpActivityReady: boolean;
     nativeActivityReady: boolean;
     nativeUnavailableDirectories: string[];
+    compact?: boolean;
     selectedThread: string | null;
     openCodeAvailable: boolean;
     worktreeDialogRequest: { id: string; path: string; fromPalette: boolean } | null;
@@ -113,6 +114,7 @@
 
   let {
     catalog,
+    compact = false,
     directory,
     disabled,
     agents,
@@ -882,7 +884,62 @@
   {/if}
 {/snippet}
 
-<section class="projects" aria-label="Projects and repositories">
+{#snippet railRepository(path: string)}
+  <button
+    class="rail-repository"
+    aria-label={`Open default worktree for ${repositoryName(path)}`}
+    aria-current={path === directory ? 'page' : undefined}
+    title={repositoryName(path)}
+    {disabled}
+    onclick={() => onselectdefault(path)}>{repositoryName(path).charAt(0).toUpperCase()}</button
+  >
+  {#each catalog.worktrees[path] ?? [] as worktree (worktree.path)}
+    <button
+      aria-label={`Open worktree ${worktree.branch}`}
+      aria-current={worktree.path === directory ? 'page' : undefined}
+      title={worktree.branch}
+      disabled={disabled || !!worktreeDeletions[worktree.path]}
+      onclick={() => onselect(worktree.path)}><span aria-hidden="true">⑂</span></button
+    >
+  {/each}
+  {#each [path, ...(catalog.worktrees[path] ?? []).map((worktree) => worktree.path)] as location (location)}
+    {#each threads[location] ?? [] as thread (threadKey(thread))}
+      {@const status = threadStatus(thread)}
+      {@const key = threadKey(thread)}
+      <button
+        class="rail-thread"
+        class:active={selectedThread === key}
+        aria-current={selectedThread === key ? 'page' : undefined}
+        aria-label={`${providerName(thread)}: ${thread.title}, ${statusLabel(status)}`}
+        title={`${providerName(thread)} · ${thread.title} · ${statusLabel(status)}`}
+        onclick={() => onselectthread(key)}
+      >
+        <HarnessIcon agent={thread.agent} size={16} />
+        <ActivityStatus {status} label={statusLabel(status)} compact />
+      </button>
+    {/each}
+  {/each}
+{/snippet}
+
+{#if compact}
+  <nav class="sidebar-rail" aria-label="Repositories">
+    <button
+      aria-label="Add repository"
+      title="Add repository"
+      {disabled}
+      onclick={() => onaddrepository(null)}>+</button
+    >
+    {#each catalog.groups as group (group.id)}
+      {#each group.repositories as path (path)}
+        <div class="sidebar-rail-group">{@render railRepository(path)}</div>
+      {/each}
+    {/each}
+    {#each ungrouped as path (path)}
+      <div class="sidebar-rail-group">{@render railRepository(path)}</div>
+    {/each}
+  </nav>
+{/if}
+<section class="projects" aria-label="Projects and repositories" hidden={compact}>
   <div class="projects-heading">
     <span class="label">PROJECTS</span>
     <button
