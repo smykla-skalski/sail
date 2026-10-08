@@ -11,6 +11,12 @@ Use them when the user asks you to coordinate agents, inspect or create
 worktrees, operate Sail terminals, message another thread, or use Sail's embedded
 browser. Read the tool schemas before calling them.
 
+Sail assigns this session an `explore`, `review`, `build`, or `release`
+capability profile. The MCP catalog contains only tools enabled by that profile,
+and disabled tools are rejected even if called from stale schema context. Do not
+work around a missing tool. Permission prompts include Sail's risk classification,
+reason, and policy revision; unknown and high-risk actions require a person.
+
 ## Workflow references
 
 - Bundled workflow prompts contain the core contract only. When that contract

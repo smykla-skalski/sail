@@ -1,0 +1,59 @@
+import type { PermissionPolicyDecision } from './capability-profiles.ts';
+
+type PermissionRequestBase = {
+  key: string;
+  generation: string | number;
+  policy: PermissionPolicyDecision;
+};
+
+export type AutomaticPermissionRequest = PermissionRequestBase & {
+  respond: (optionId: string) => Promise<void>;
+  record: (optionId: string) => void;
+};
+
+export type ManualPermissionRequest = PermissionRequestBase & {
+  optionId: string | null;
+  respond: (optionId: string | null) => Promise<void>;
+  record: (optionId: string | null) => void;
+};
+
+export class AutomaticPermissionResolver {
+  readonly #inFlight = new Map<string, Promise<boolean>>();
+  readonly #completed = new Set<string>();
+
+  resolve(request: AutomaticPermissionRequest | ManualPermissionRequest): Promise<boolean> {
+    if ('optionId' in request) return this.#resolve(request, request.optionId);
+    if (request.policy.recommendation === 'interactive' || !request.policy.optionId)
+      return Promise.resolve(false);
+    return this.#resolve(request, request.policy.optionId);
+  }
+
+  #resolve<Option extends string | null>(
+    request: PermissionRequestBase & {
+      respond: (optionId: Option) => Promise<void>;
+      record: (optionId: Option) => void;
+    },
+    optionId: Option,
+  ): Promise<boolean> {
+    const identity = JSON.stringify([request.key, request.generation]);
+    if (this.#completed.has(identity)) return Promise.resolve(true);
+    const existing = this.#inFlight.get(identity);
+    if (existing) return existing;
+    const resolution = request
+      .respond(optionId)
+      .then(() => {
+        request.record(optionId);
+        this.#completed.add(identity);
+        if (this.#completed.size > 512) {
+          const oldest = this.#completed.values().next().value;
+          if (oldest !== undefined) this.#completed.delete(oldest);
+        }
+        return true;
+      })
+      .finally(() => this.#inFlight.delete(identity));
+    this.#inFlight.set(identity, resolution);
+    return resolution;
+  }
+}
+
+export const permissionResolver = new AutomaticPermissionResolver();

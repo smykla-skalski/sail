@@ -333,6 +333,7 @@ struct Connection {
     pending: Mutex<HashMap<u64, mpsc::Sender<PendingResponse>>>,
     reader_progress: ReaderProgress,
     permission_state: Mutex<PermissionState>,
+    next_permission_generation: AtomicU64,
     prompt_state: Mutex<PromptState>,
     cancelled_prompts: Mutex<HashSet<String>>,
     next_id: AtomicU64,
@@ -345,9 +346,55 @@ struct Connection {
     ready: Condvar,
 }
 
+#[derive(Clone, Debug)]
 struct PendingPermission {
     message: Value,
     received_at: u64,
+    generation: u64,
+    fingerprint: String,
+}
+
+#[cfg(test)]
+fn claim_pending_permission(
+    permissions: &Mutex<HashMap<String, PendingPermission>>,
+    key: &str,
+    expected_session_id: &str,
+    expected_generation: u64,
+    expected_fingerprint: &str,
+) -> Result<PendingPermission, String> {
+    let mut permissions = permissions.lock().map_err(|error| error.to_string())?;
+    claim_pending_permission_map(
+        &mut permissions,
+        key,
+        expected_session_id,
+        expected_generation,
+        expected_fingerprint,
+    )
+}
+
+fn claim_pending_permission_map(
+    permissions: &mut HashMap<String, PendingPermission>,
+    key: &str,
+    expected_session_id: &str,
+    expected_generation: u64,
+    expected_fingerprint: &str,
+) -> Result<PendingPermission, String> {
+    let pending = permissions
+        .get(key)
+        .ok_or_else(|| "Permission request is no longer pending.".to_string())?;
+    let session_id = pending
+        .message
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str);
+    if session_id != Some(expected_session_id)
+        || pending.generation != expected_generation
+        || pending.fingerprint != expected_fingerprint
+    {
+        return Err("Permission request identity no longer matches.".to_string());
+    }
+    permissions
+        .remove(key)
+        .ok_or_else(|| "Permission request is no longer pending.".to_string())
 }
 
 struct PendingResponse {
@@ -421,11 +468,22 @@ impl PermissionState {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let generation = message
+            .pointer("/params/sailPermissionGeneration")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let fingerprint = message
+            .pointer("/params/sailPermissionFingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         self.pending.insert(
             request_id.to_string(),
             PendingPermission {
                 message,
                 received_at,
+                generation,
+                fingerprint,
             },
         );
         let cancel_late_request =
@@ -524,6 +582,102 @@ pub struct PendingPermissionInfo {
     agent: String,
     message: Value,
     received_at: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionResourceTrust {
+    trusted: bool,
+    canonical_resources: Vec<String>,
+}
+
+fn inspect_permission_resources(
+    workspace: &Path,
+    resources: &[String],
+) -> Result<PermissionResourceTrust, String> {
+    let root = workspace
+        .canonicalize()
+        .map_err(|error| format!("Cannot inspect workspace resources: {error}"))?;
+    let mut canonical_resources = Vec::new();
+    for resource in resources {
+        let local_file_url = resource
+            .strip_prefix("file://localhost/")
+            .map(|path| format!("/{path}"))
+            .or_else(|| {
+                resource
+                    .strip_prefix("file:///")
+                    .map(|path| format!("/{path}"))
+            });
+        #[cfg(windows)]
+        let local_file_url = local_file_url.map(|path| {
+            if path.as_bytes().get(2) == Some(&b':') {
+                path[1..].to_string()
+            } else {
+                path
+            }
+        });
+        if resource.is_empty()
+            || resource.starts_with('~')
+            || (resource.contains("://") && local_file_url.is_none())
+            || resource.contains('$')
+            || resource.contains('%')
+        {
+            return Ok(PermissionResourceTrust {
+                trusted: false,
+                canonical_resources,
+            });
+        }
+        let resource_path = PathBuf::from(local_file_url.as_deref().unwrap_or(resource));
+        let target = if resource_path.is_absolute() {
+            resource_path
+        } else {
+            workspace.join(resource_path)
+        };
+        if !target.exists() {
+            return Ok(PermissionResourceTrust {
+                trusted: false,
+                canonical_resources,
+            });
+        }
+        let canonical = target
+            .canonicalize()
+            .map_err(|error| format!("Cannot inspect permission resource: {error}"))?;
+        if !canonical.starts_with(&root) {
+            return Ok(PermissionResourceTrust {
+                trusted: false,
+                canonical_resources,
+            });
+        }
+        let mut component = target.as_path();
+        while component.starts_with(workspace) && component != workspace {
+            if std::fs::symlink_metadata(component)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Ok(PermissionResourceTrust {
+                    trusted: false,
+                    canonical_resources,
+                });
+            }
+            let Some(parent) = component.parent() else {
+                break;
+            };
+            component = parent;
+        }
+        canonical_resources.push(canonical.to_string_lossy().into_owned());
+    }
+    Ok(PermissionResourceTrust {
+        trusted: true,
+        canonical_resources,
+    })
+}
+
+#[tauri::command]
+pub fn acp_permission_resources_trusted(
+    workspace: String,
+    resources: Vec<String>,
+) -> Result<PermissionResourceTrust, String> {
+    inspect_permission_resources(Path::new(&workspace), &resources)
 }
 
 impl Drop for Connection {
@@ -659,16 +813,31 @@ impl Connection {
         self.write(&json!({"jsonrpc":"2.0","method":method,"params":params}))
     }
 
-    fn respond(&self, id: Value, result: Value) -> Result<Option<PendingPermission>, String> {
-        let mut permissions = self
+    fn respond(
+        &self,
+        id: Value,
+        expected_session_id: &str,
+        expected_generation: u64,
+        expected_fingerprint: &str,
+        result: Value,
+    ) -> Result<PendingPermission, String> {
+        let key = id.to_string();
+        let mut state = self
             .permission_state
             .lock()
             .map_err(|error| error.to_string())?;
-        if !permissions.pending.contains_key(&id.to_string()) {
-            return Ok(None);
+        let pending = claim_pending_permission_map(
+            &mut state.pending,
+            &key,
+            expected_session_id,
+            expected_generation,
+            expected_fingerprint,
+        )?;
+        if let Err(error) = self.write(&json!({"jsonrpc":"2.0","id":id,"result":result})) {
+            state.pending.entry(key).or_insert_with(|| pending.clone());
+            return Err(error);
         }
-        self.write(&json!({"jsonrpc":"2.0","id":id,"result":result}))?;
-        Ok(permissions.pending.remove(&id.to_string()))
+        Ok(pending)
     }
 }
 
@@ -1099,6 +1268,8 @@ mod interruption_report_tests {
                 PendingPermission {
                     message: json!({"id":1,"params":{"sessionId":"target"}}),
                     received_at: 1,
+                    generation: 0,
+                    fingerprint: String::new(),
                 },
             ),
             (
@@ -1106,6 +1277,8 @@ mod interruption_report_tests {
                 PendingPermission {
                     message: json!({"id":"two","params":{"sessionId":"other"}}),
                     received_at: 2,
+                    generation: 0,
+                    fingerprint: String::new(),
                 },
             ),
             (
@@ -1113,6 +1286,8 @@ mod interruption_report_tests {
                 PendingPermission {
                     message: json!({"id":3,"params":{"sessionId":"target"}}),
                     received_at: 3,
+                    generation: 0,
+                    fingerprint: String::new(),
                 },
             ),
         ]);
@@ -1138,6 +1313,8 @@ mod interruption_report_tests {
                 PendingPermission {
                     message: json!({"id":1,"params":{"sessionId":"target"}}),
                     received_at: 1,
+                    generation: 0,
+                    fingerprint: String::new(),
                 },
             ),
             (
@@ -1145,6 +1322,8 @@ mod interruption_report_tests {
                 PendingPermission {
                     message: json!({"id":2,"params":{"sessionId":"target"}}),
                     received_at: 2,
+                    generation: 0,
+                    fingerprint: String::new(),
                 },
             ),
         ]);
@@ -1839,6 +2018,7 @@ fn connect_blocking(
         pending: Mutex::new(HashMap::new()),
         reader_progress: ReaderProgress::default(),
         permission_state: Mutex::new(PermissionState::default()),
+        next_permission_generation: AtomicU64::new(1),
         prompt_state: Mutex::new(PromptState::default()),
         cancelled_prompts: Mutex::new(HashSet::new()),
         next_id: AtomicU64::new(1),
@@ -1856,7 +2036,7 @@ fn connect_blocking(
     std::thread::spawn(move || {
         for line in BufReader::new(output).lines() {
             let Ok(line) = line else { break };
-            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            let Ok(mut message) = serde_json::from_str::<Value>(&line) else {
                 crate::diagnostics::record(
                     "acp_invalid_json",
                     json!({"agent":agent_id,"bytes":line.len()}),
@@ -1984,6 +2164,17 @@ fn connect_blocking(
                 if message.get("method").and_then(Value::as_str)
                     == Some("session/request_permission")
                 {
+                    let generation = reader
+                        .next_permission_generation
+                        .fetch_add(1, Ordering::Relaxed);
+                    let fingerprint = uuid::Uuid::new_v4().to_string();
+                    if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
+                        params.insert("sailPermissionGeneration".into(), generation.into());
+                        params.insert(
+                            "sailPermissionFingerprint".into(),
+                            fingerprint.clone().into(),
+                        );
+                    }
                     let turn_id = reader
                         .prompt_state
                         .lock()
@@ -1999,6 +2190,7 @@ fn connect_blocking(
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
+                        let event_fingerprint = fingerprint.clone();
                         let _ = state.record(message.clone(), received_at, turn_id, |request_id| {
                             reader.write(&json!({
                                 "jsonrpc":"2.0",
@@ -2010,7 +2202,9 @@ fn connect_blocking(
                                 AgentEvent {
                                     agent: agent_id.clone(),
                                     message: json!({"method":"sail/permission_resolved","params":{
-                                        "sessionId":session_id,"requestId":request_id
+                                        "sessionId":session_id,"requestId":request_id,
+                                        "sailPermissionGeneration":generation,
+                                        "sailPermissionFingerprint":event_fingerprint
                                     }}),
                                 },
                             );
@@ -2130,6 +2324,7 @@ pub async fn acp_new_session(
     agent: String,
     cwd: String,
     native_generation: Option<u64>,
+    profile: Option<String>,
 ) -> Result<Value, String> {
     if !PathBuf::from(&cwd).is_dir() {
         return Err("Repository directory does not exist.".into());
@@ -2138,7 +2333,7 @@ pub async fn acp_new_session(
     let browser = browser.inner().clone();
     let fence = fence.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let config = browser.config(&cwd, None, Some(&agent))?;
+        let config = browser.config_for_profile(&cwd, None, Some(&agent), profile.as_deref())?;
         let mcp_server = json!({"name":"sail-browser","command":config.command,"args":config.args,
             "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()});
         let _serial = runtime
@@ -2210,8 +2405,18 @@ pub async fn acp_load_session(
     agent: String,
     cwd: String,
     session_id: String,
+    profile: Option<String>,
 ) -> Result<Value, String> {
-    restore_session(manager, browser, agent, cwd, session_id, "session/load").await
+    restore_session(
+        manager,
+        browser,
+        agent,
+        cwd,
+        session_id,
+        profile,
+        "session/load",
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2221,8 +2426,18 @@ pub async fn acp_resume_session(
     agent: String,
     cwd: String,
     session_id: String,
+    profile: Option<String>,
 ) -> Result<Value, String> {
-    restore_session(manager, browser, agent, cwd, session_id, "session/resume").await
+    restore_session(
+        manager,
+        browser,
+        agent,
+        cwd,
+        session_id,
+        profile,
+        "session/resume",
+    )
+    .await
 }
 
 async fn restore_session(
@@ -2231,12 +2446,18 @@ async fn restore_session(
     agent: String,
     cwd: String,
     session_id: String,
+    profile: Option<String>,
     method: &'static str,
 ) -> Result<Value, String> {
     let runtime = connection(&manager, &agent)?;
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let config = browser.config(&cwd, Some(&session_id), Some(&agent))?;
+        let config = browser.config_for_profile(
+            &cwd,
+            Some(&session_id),
+            Some(&agent),
+            profile.as_deref(),
+        )?;
         let mcp_server = json!({"name":"sail-browser","command":config.command,"args":config.args,
             "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()});
         runtime
@@ -2734,37 +2955,53 @@ pub fn acp_cancel(
     })
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpPermissionParams {
+    agent: String,
+    request_id: Value,
+    option_id: Option<String>,
+    session_id: String,
+    request_generation: u64,
+    request_fingerprint: String,
+}
+
 #[tauri::command]
 pub fn acp_permission(
     app: AppHandle,
     manager: State<'_, AgentManager>,
-    agent: String,
-    request_id: Value,
-    option_id: Option<String>,
+    params: AcpPermissionParams,
 ) -> Result<(), String> {
+    let AcpPermissionParams {
+        agent,
+        request_id,
+        option_id,
+        session_id,
+        request_generation,
+        request_fingerprint,
+    } = params;
     let outcome = option_id
         .map(|id| json!({"outcome":"selected","optionId":id}))
         .unwrap_or_else(|| json!({"outcome":"cancelled"}));
     let runtime = connection(&manager, &agent)?;
-    let pending = runtime.respond(request_id.clone(), json!({"outcome":outcome}))?;
-    let session_id = pending.as_ref().and_then(|pending| {
-        pending
-            .message
-            .pointer("/params/sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    });
-    if let Some(session_id) = session_id {
-        let _ = app.emit(
-            "acp-event",
-            AgentEvent {
-                agent,
-                message: json!({"method":"sail/permission_resolved","params":{
-                    "sessionId":session_id,"requestId":request_id
-                }}),
-            },
-        );
-    }
+    let pending = runtime.respond(
+        request_id.clone(),
+        &session_id,
+        request_generation,
+        &request_fingerprint,
+        json!({"outcome":outcome}),
+    )?;
+    let _ = app.emit(
+        "acp-event",
+        AgentEvent {
+            agent,
+            message: json!({"method":"sail/permission_resolved","params":{
+                "sessionId":session_id,"requestId":request_id,
+                "sailPermissionGeneration":pending.generation,
+                "sailPermissionFingerprint":pending.fingerprint
+            }}),
+        },
+    );
     Ok(())
 }
 
@@ -2932,5 +3169,126 @@ mod native_subagent_fence_tests {
         );
         assert!(!dispatched);
         std::fs::remove_dir(&directory).expect("test worktree should be removable");
+    }
+}
+
+#[cfg(test)]
+mod capability_profile_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_resource_inspection_rejects_symlinks_that_leave_workspace() {
+        let root = std::env::temp_dir().join(format!("sail-acp-resource-{}", uuid::Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("sail-acp-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("secret"), root.join("readme")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(outside.join("secret"), root.join("readme")).unwrap();
+
+        let result = inspect_permission_resources(&root, &["readme".into()]).unwrap();
+
+        assert!(!result.trusted);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn workspace_resource_inspection_accepts_regular_workspace_files() {
+        let root = std::env::temp_dir().join(format!("sail-acp-resource-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn main() {}").unwrap();
+
+        let result = inspect_permission_resources(&root, &["src/lib.rs".into()]).unwrap();
+        #[cfg(unix)]
+        let file_url = format!("file://{}", root.join("src/lib.rs").display());
+        #[cfg(windows)]
+        let file_url = format!(
+            "file:///{}",
+            root.join("src/lib.rs")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        );
+        let file_url_result = inspect_permission_resources(&root, &[file_url]).unwrap();
+
+        assert!(result.trusted);
+        assert!(file_url_result.trusted);
+        assert_eq!(
+            result.canonical_resources,
+            vec![root
+                .join("src/lib.rs")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn workspace_resource_inspection_rejects_a_path_swapped_to_a_symlink() {
+        let root = std::env::temp_dir().join(format!("sail-acp-resource-{}", uuid::Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("sail-acp-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("target"), "workspace").unwrap();
+        std::fs::write(outside.join("secret"), "secret").unwrap();
+
+        assert!(
+            inspect_permission_resources(&root, &["target".into()])
+                .unwrap()
+                .trusted
+        );
+        std::fs::remove_file(root.join("target")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("secret"), root.join("target")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(outside.join("secret"), root.join("target")).unwrap();
+
+        assert!(
+            !inspect_permission_resources(&root, &["target".into()])
+                .unwrap()
+                .trusted
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn permission_response_claim_is_available_only_once() {
+        let permissions = Mutex::new(HashMap::from([(
+            "7".into(),
+            PendingPermission {
+                message: json!({"id":7,"params":{"sessionId":"new-session"}}),
+                received_at: 1,
+                generation: 2,
+                fingerprint: "new-fingerprint".into(),
+            },
+        )]));
+
+        assert_eq!(
+            claim_pending_permission(&permissions, "7", "old-session", 1, "old-fingerprint")
+                .unwrap_err(),
+            "Permission request identity no longer matches."
+        );
+        assert_eq!(
+            claim_pending_permission(&permissions, "7", "new-session", 2, "old-fingerprint")
+                .unwrap_err(),
+            "Permission request identity no longer matches."
+        );
+        assert!(
+            claim_pending_permission(&permissions, "7", "new-session", 2, "new-fingerprint")
+                .is_ok()
+        );
+        assert_eq!(
+            claim_pending_permission(&permissions, "7", "new-session", 2, "new-fingerprint")
+                .unwrap_err(),
+            "Permission request is no longer pending."
+        );
     }
 }

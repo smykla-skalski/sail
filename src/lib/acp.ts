@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getSetting, setSetting } from './settings.ts';
 import { toolCommand } from './tool-display.ts';
+import type { CapabilityProfile, PermissionPolicyDecision } from './capability-profiles.ts';
 
 export type AgentId = string;
 
@@ -19,6 +20,7 @@ export interface AgentThread {
   directory: string;
   title: string;
   updated: number;
+  capabilityProfile?: CapabilityProfile;
 }
 
 export interface InterruptedAgentTurn {
@@ -143,6 +145,9 @@ export interface AgentPermission {
   sessionId: string;
   title: string;
   options: { optionId: string; name: string; kind: string }[];
+  policy?: PermissionPolicyDecision;
+  generation?: number;
+  fingerprint?: string;
 }
 
 export interface AgentConfigOption {
@@ -296,7 +301,9 @@ export function loadAgentThreads(): AgentThread[] {
         typeof item.sessionId === 'string' &&
         typeof item.directory === 'string' &&
         typeof item.title === 'string' &&
-        typeof item.updated === 'number',
+        typeof item.updated === 'number' &&
+        (item.capabilityProfile === undefined ||
+          ['explore', 'review', 'build', 'release'].includes(item.capabilityProfile)),
     );
   } catch {
     return [];
@@ -460,11 +467,12 @@ function restoreSession(
   agent: AgentId,
   cwd: string,
   sessionId: string,
+  profile: CapabilityProfile,
 ) {
-  const key = JSON.stringify([agent, cwd, sessionId]);
+  const key = JSON.stringify([agent, cwd, sessionId, profile]);
   const existing = restoringSessions.get(key);
   if (existing) return existing;
-  const request = invoke<Record<string, unknown>>(method, { agent, cwd, sessionId });
+  const request = invoke<Record<string, unknown>>(method, { agent, cwd, sessionId, profile });
   restoringSessions.set(key, request);
   void request
     .finally(() => {
@@ -477,7 +485,7 @@ function restoreSession(
 export const acp = {
   agents: () => invoke<AgentAvailability[]>('acp_agents'),
   connect: (agent: AgentId) => invoke<Record<string, unknown>>('acp_connect', { agent }),
-  create: (agent: AgentId, cwd: string, nativeGeneration?: number) =>
+  create: (agent: AgentId, cwd: string, profile?: CapabilityProfile, nativeGeneration?: number) =>
     invoke<{
       sessionId: string;
       configOptions?: AgentConfigOption[];
@@ -485,14 +493,15 @@ export const acp = {
     }>('acp_new_session', {
       agent,
       cwd,
+      profile,
       nativeGeneration,
     }),
   releaseSessionFence: (agent: AgentId, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, sessionId }),
-  load: (agent: AgentId, cwd: string, sessionId: string) =>
-    restoreSession('acp_load_session', agent, cwd, sessionId),
-  resume: (agent: AgentId, cwd: string, sessionId: string) =>
-    restoreSession('acp_resume_session', agent, cwd, sessionId),
+  load: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
+    restoreSession('acp_load_session', agent, cwd, sessionId, profile),
+  resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
+    restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
   prompt: (
     agent: AgentId,
     sessionId: string,
@@ -509,8 +518,29 @@ export const acp = {
     }),
   cancel: (agent: AgentId, sessionId: string, turnId: string | null) =>
     invoke<void>('acp_cancel', { agent, sessionId, turnId }),
-  permission: (agent: AgentId, requestId: string | number, optionId: string | null) =>
-    invoke<void>('acp_permission', { agent, requestId, optionId }),
+  permission: (
+    agent: AgentId,
+    requestId: string | number,
+    optionId: string | null,
+    sessionId: string,
+    requestGeneration: number | undefined,
+    requestFingerprint: string | undefined,
+  ) =>
+    invoke<void>('acp_permission', {
+      params: {
+        agent,
+        requestId,
+        optionId,
+        sessionId,
+        requestGeneration,
+        requestFingerprint,
+      },
+    }),
+  permissionResourcesTrusted: (workspace: string, resources: string[]) =>
+    invoke<{ trusted: boolean; canonicalResources: string[] }>('acp_permission_resources_trusted', {
+      workspace,
+      resources,
+    }),
   pendingPermissions: (agent: AgentId, sessionId: string) =>
     invoke<AgentEvent['message'][]>('acp_pending_permissions', { agent, sessionId }),
   pendingInbox: () => invoke<AcpPendingInboxItem[]>('acp_pending_inbox'),

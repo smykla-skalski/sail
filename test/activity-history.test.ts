@@ -6,6 +6,7 @@ import {
   recentActivityEvents,
   saveActivityHistory,
 } from '../src/lib/activity-history.ts';
+import { permissionDecisionTitle } from '../src/lib/capability-profiles.ts';
 
 await test('activity history deduplicates provider updates with latest scoped outcome', () => {
   const events = recentActivityEvents([
@@ -101,6 +102,54 @@ await test('activity history bounds display text without storing output', () => 
   assert.equal(event.title.length, 240);
   assert.equal(event.title.endsWith('…'), true);
   assert.equal('output' in event, false);
+});
+
+await test('permission history retains policy context when the provider title is oversized', () => {
+  const title = permissionDecisionTitle('x'.repeat(240), {
+    profile: 'explore',
+    risk: 'low',
+    recommendation: 'allow',
+    optionId: 'allow',
+    reason: 'Low-risk action is enabled for exploration.',
+    policyRevision: '2026-10-07.1',
+  });
+
+  const [event] = recentActivityEvents([
+    {
+      workspace: '/repo/a',
+      kind: 'decision',
+      source: 'Codex',
+      sourceId: 'permission',
+      title,
+      outcome: 'completed',
+      at: 10,
+    },
+  ]);
+
+  assert.match(
+    event.title,
+    /^explore · low risk · policy 2026-10-07\.1 — Allowed by policy: Low-risk action is enabled for exploration\./,
+  );
+  assert.equal(event.title.length, 240);
+  assert.equal(event.title.endsWith('…'), true);
+});
+
+await test('permission history describes the actual rejected settlement', () => {
+  const title = permissionDecisionTitle(
+    'Read README.md',
+    {
+      profile: 'explore',
+      risk: 'low',
+      recommendation: 'allow',
+      optionId: 'allow',
+      reason: 'Low-risk action is enabled for exploration.',
+      policyRevision: '2026-10-07.1',
+    },
+    'rejected',
+  );
+
+  assert.match(title, /— Rejected:/);
+  assert.doesNotMatch(title, /Allowed by policy/);
 });
 
 await test('activity history reloads only valid bounded durable events', () => {

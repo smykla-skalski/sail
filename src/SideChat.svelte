@@ -1,11 +1,17 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { isSessionNotFoundError } from '@opencode/client';
   import AgentWorkspace from './AgentWorkspace.svelte';
   import TaskLocation from './TaskLocation.svelte';
   import Markdown from './Markdown.svelte';
   import type { OpenCodeClient, SessionMessageInfo } from './lib/opencode';
   import { runOpenCodePromptStart } from './lib/opencode-turns';
   import type { AgentId } from './lib/acp';
+  import {
+    withCapabilityProfileReservation,
+    exploreSessionMetadata,
+    type CapabilityProfile,
+  } from './lib/capability-profiles';
   import {
     composerTaskLocation,
     type TaskLocation as TaskLocationValue,
@@ -17,6 +23,10 @@
     removeClipboardFile,
     stageClipboardFile,
   } from './lib/attachments';
+  import {
+    openCodeInboxSettled,
+    waitForAuthoritativeOpenCodeSettlement,
+  } from './lib/opencode-turns';
 
   type Source =
     { kind: 'opencode'; sessionID: string } | { kind: 'acp'; agent: AgentId; context: string };
@@ -29,6 +39,7 @@
     focused,
     focusPrompt,
     onpromptfocused,
+    onensureprofile,
   }: {
     source: Source;
     client: OpenCodeClient | null;
@@ -37,6 +48,7 @@
     focused: boolean;
     focusPrompt: boolean;
     onpromptfocused: () => void;
+    onensureprofile: (directory: string, profile: CapabilityProfile) => Promise<() => void>;
   } = $props();
   const promptLocation = $derived(composerTaskLocation(taskLocation, directory));
 
@@ -123,23 +135,33 @@
       void (async () => {
         let createdID: string | null = null;
         try {
-          const fork = await forkClient.session.fork({ sessionID: source.sessionID });
-          createdID = fork.id;
-          if (disposed) {
-            await forkClient.session.remove({ sessionID: fork.id });
-            return;
-          }
-          const page = await forkClient.message.list({
-            sessionID: fork.id,
-            limit: 100,
-            order: 'desc',
-          });
-          if (disposed) {
-            await forkClient.session.remove({ sessionID: fork.id });
-            return;
-          }
-          baseline = new Set(page.data.map((message) => message.id));
-          forkID = fork.id;
+          await withCapabilityProfileReservation(
+            () => onensureprofile(directory, 'explore'),
+            async () => {
+              if (disposed) return;
+              const fork = await forkClient.session.fork({ sessionID: source.sessionID });
+              createdID = fork.id;
+              await forkClient.session.update({
+                sessionID: fork.id,
+                metadata: exploreSessionMetadata(fork.metadata),
+              });
+              if (disposed) {
+                await forkClient.session.remove({ sessionID: fork.id });
+                return;
+              }
+              const page = await forkClient.message.list({
+                sessionID: fork.id,
+                limit: 100,
+                order: 'desc',
+              });
+              if (disposed) {
+                await forkClient.session.remove({ sessionID: fork.id });
+                return;
+              }
+              baseline = new Set(page.data.map((message) => message.id));
+              forkID = fork.id;
+            },
+          );
         } catch (cause) {
           if (createdID) await forkClient.session.remove({ sessionID: createdID }).catch(() => {});
           if (!disposed) error = String(cause);
@@ -177,7 +199,8 @@
     await pendingPaste;
     const text = draft.trim();
     if ((!text && !attachments.length) || !client || !forkID || busy) return;
-    const sessionID = forkID;
+    const promptClient = client;
+    const sideSessionID = forkID;
     const files = [...attachments];
     busy = true;
     error = '';
@@ -185,20 +208,42 @@
     attachments = [];
     let accepted = false;
     try {
-      const inbox = await runOpenCodePromptStart(directory, () =>
-        client.session.prompt({
-          sessionID,
-          text,
-          files: files.map((item) => ({ uri: fileUri(item.path), name: item.name })),
-        }),
+      await withCapabilityProfileReservation(
+        () => onensureprofile(directory, 'explore'),
+        async () => {
+          const inbox = await runOpenCodePromptStart(directory, () =>
+            promptClient.session.prompt({
+              sessionID: sideSessionID,
+              text,
+              files: files.map((item) => ({ uri: fileUri(item.path), name: item.name })),
+            }),
+          );
+          accepted = true;
+          if (disposed) {
+            await promptClient.session.inbox
+              .cancel({ sessionID: sideSessionID, inboxID: inbox.id })
+              .catch(() => {});
+            return;
+          }
+          inboxID = inbox.id;
+          await waitForAuthoritativeOpenCodeSettlement(
+            () => (client ?? promptClient).session.wait({ sessionID: sideSessionID }),
+            async () => {
+              const currentClient = client;
+              if (!currentClient) return false;
+              return openCodeInboxSettled(inbox.id, (cursor) =>
+                currentClient.message.list({
+                  sessionID: sideSessionID,
+                  limit: 100,
+                  order: 'desc',
+                  cursor,
+                }),
+              );
+            },
+            { terminal: isSessionNotFoundError },
+          );
+        },
       );
-      accepted = true;
-      if (disposed) {
-        await client.session.inbox.cancel({ sessionID: forkID, inboxID: inbox.id }).catch(() => {});
-        return;
-      }
-      inboxID = inbox.id;
-      await client.session.wait({ sessionID: forkID });
       inboxID = null;
       await refresh();
     } catch (cause) {
@@ -227,6 +272,7 @@
     {focused}
     {focusPrompt}
     {onpromptfocused}
+    capabilityProfile="explore"
     ephemeral
     seedContext={source.context}
     oncreated={() => {}}

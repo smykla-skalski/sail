@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
+const CAPABILITY_POLICY_REVISION: &str = env!("SAIL_CAPABILITY_POLICY_REVISION");
+
 #[derive(Clone)]
 struct Page {
     directory: PathBuf,
@@ -29,6 +31,7 @@ struct Client {
     directory: PathBuf,
     session: Option<String>,
     agent: Option<String>,
+    profile: CapabilityProfile,
 }
 
 #[derive(Default)]
@@ -105,6 +108,34 @@ pub struct McpConfig {
 }
 
 impl BrowserManager {
+    pub fn config_for_profile(
+        &self,
+        directory: &str,
+        session: Option<&str>,
+        agent: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<McpConfig, String> {
+        let profile = profile
+            .map(|value| {
+                CapabilityProfile::parse(value).ok_or(
+                    "Unknown capability profile. Expected explore, review, build, or release.",
+                )
+            })
+            .transpose()?;
+        let mut config = self.config(directory, session, agent)?;
+        if let Some(profile) = profile {
+            config
+                .env
+                .insert("SAIL_CAPABILITY_PROFILE".into(), profile.as_str().into());
+            if let Ok(mut clients) = self.0.clients.lock() {
+                if let Some(client) = clients.get_mut(&config.token) {
+                    client.profile = profile;
+                }
+            }
+        }
+        Ok(config)
+    }
+
     pub fn config(
         &self,
         directory: &str,
@@ -125,6 +156,7 @@ impl BrowserManager {
                     directory,
                     session: session.map(str::to_string),
                     agent: agent.map(str::to_string),
+                    profile: CapabilityProfile::Build,
                 },
             );
         let port = *self.0.port.lock().map_err(|error| error.to_string())?;
@@ -140,6 +172,7 @@ impl BrowserManager {
             env: HashMap::from([
                 ("SAIL_BROWSER_PORT".into(), port.to_string()),
                 ("SAIL_BROWSER_TOKEN".into(), token.clone()),
+                ("SAIL_CAPABILITY_PROFILE".into(), "build".into()),
             ]),
             token,
         })
@@ -552,6 +585,7 @@ impl BrowserManager {
         }
         let directory = client.directory.clone();
         let source_agent = client.agent.clone();
+        let profile = client.profile;
         let session = request.session_id.as_deref();
         let session = client
             .session
@@ -560,6 +594,14 @@ impl BrowserManager {
             .unwrap_or(&request.token)
             .to_string();
         drop(clients);
+        if !profile.enables(&request.name) {
+            return Err(format!(
+                "Tool {} is disabled by the {} capability profile (policy {}).",
+                request.name,
+                profile.as_str(),
+                CAPABILITY_POLICY_REVISION
+            ));
+        }
         if matches!(
             request.name.as_str(),
             "worktree_create"
@@ -1084,8 +1126,14 @@ pub fn browser_mcp_config(
     directory: String,
     session: Option<String>,
     agent: Option<String>,
+    profile: Option<String>,
 ) -> Result<McpConfig, String> {
-    manager.config(&directory, session.as_deref(), agent.as_deref())
+    manager.config_for_profile(
+        &directory,
+        session.as_deref(),
+        agent.as_deref(),
+        profile.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -1381,6 +1429,84 @@ fn economics_input_schema() -> Value {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapabilityProfile {
+    Explore,
+    Review,
+    Build,
+    Release,
+}
+
+impl CapabilityProfile {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "explore" => Some(Self::Explore),
+            "review" => Some(Self::Review),
+            "build" => Some(Self::Build),
+            "release" => Some(Self::Release),
+            _ => None,
+        }
+    }
+
+    fn active() -> Self {
+        std::env::var("SAIL_CAPABILITY_PROFILE")
+            .ok()
+            .as_deref()
+            .and_then(Self::parse)
+            .unwrap_or(Self::Build)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explore => "explore",
+            Self::Review => "review",
+            Self::Build => "build",
+            Self::Release => "release",
+        }
+    }
+
+    fn enables(self, tool: &str) -> bool {
+        const CORE: &[&str] = &[
+            "sail_skill",
+            "skill_reference",
+            "worktree_list",
+            "worktree_info",
+            "agent_status",
+            "agent_wait",
+            "agent_result",
+            "terminal_list",
+            "terminal_read",
+            "terminal_wait",
+            "worktree_status",
+            "project_threads",
+            "read_page",
+            "screenshot",
+            "task_checkpoint_read",
+            "task_checkpoint_update",
+            "ship_progress",
+        ];
+        if CORE.contains(&tool) {
+            return true;
+        }
+        match self {
+            Self::Explore => false,
+            Self::Review => tool == "validation_gate",
+            Self::Build => true,
+            Self::Release => matches!(
+                tool,
+                "terminal_create"
+                    | "terminal_write"
+                    | "terminal_stop"
+                    | "thread_message"
+                    | "navigate"
+                    | "click"
+                    | "type"
+                    | "run_script"
+            ),
+        }
+    }
+}
+
 pub fn run_mcp_stdio() {
     let input = std::io::stdin();
     let mut output = std::io::stdout().lock();
@@ -1392,10 +1518,12 @@ pub fn run_mcp_stdio() {
             continue;
         };
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+        let profile = CapabilityProfile::active();
         let result = match method {
             "initialize" => mcp_initialize(),
             "ping" => json!({}),
-            "tools/list" => json!({"tools": TOOLS.iter().map(|(name, description, fields)| {
+            "tools/list" => {
+                json!({"tools": TOOLS.iter().filter(|(name, _, _)| profile.enables(name)).map(|(name, description, fields)| {
                 if *name == "skill_reference" {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object",
@@ -1515,8 +1643,20 @@ pub fn run_mcp_stdio() {
                 }
                 let properties: serde_json::Map<String, Value> = fields.split(',').filter(|field| !field.is_empty()).map(|field| (field.to_string(), json!({"type":"string"}))).collect();
                 json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":properties.keys().collect::<Vec<_>>()}})
-            }).collect::<Vec<_>>() }),
-            "tools/call" => call_bridge(message.get("params").unwrap_or(&Value::Null)),
+            }).collect::<Vec<_>>() })
+            }
+            "tools/call" => {
+                let params = message.get("params").unwrap_or(&Value::Null);
+                match params.get("name").and_then(Value::as_str) {
+                    Some(name) if profile.enables(name) => call_bridge(params),
+                    Some(name) => json!({"content":[{"type":"text","text":format!(
+                        "Tool {name} is disabled by the {} capability profile (policy {}).",
+                        profile.as_str(),
+                        CAPABILITY_POLICY_REVISION
+                    )}],"isError":true}),
+                    None => call_bridge(params),
+                }
+            }
             _ => json!({"error":"Unknown MCP method."}),
         };
         let response = json!({"jsonrpc":"2.0","id":id,"result":result});
@@ -1607,7 +1747,43 @@ mod picker_tests {
 
 #[cfg(test)]
 mod skill_tests {
-    use super::{call_bridge, mcp_initialize, SAIL_SKILL, TOOLS};
+    use super::{
+        call_bridge, mcp_initialize, BrowserManager, CapabilityProfile, CAPABILITY_POLICY_REVISION,
+        SAIL_SKILL, TOOLS,
+    };
+
+    #[test]
+    fn capability_profiles_expose_only_role_tools() {
+        assert!(CapabilityProfile::Explore.enables("read_page"));
+        assert!(!CapabilityProfile::Explore.enables("terminal_create"));
+        assert!(CapabilityProfile::Review.enables("validation_gate"));
+        assert!(!CapabilityProfile::Review.enables("agent_spawn"));
+        assert!(CapabilityProfile::Build.enables("terminal_create"));
+        assert!(CapabilityProfile::Release.enables("thread_message"));
+        assert!(!CapabilityProfile::Release.enables("agent_spawn"));
+        assert_eq!(CapabilityProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn capability_policy_revision_comes_from_the_shared_manifest() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/capability-policy.json")).unwrap();
+        assert_eq!(manifest["revision"], CAPABILITY_POLICY_REVISION);
+    }
+
+    #[test]
+    fn invalid_profile_is_rejected_before_registering_a_client() {
+        let manager = BrowserManager::default();
+        let error = match manager.config_for_profile("/not-used", None, None, Some("admin")) {
+            Ok(_) => panic!("invalid profile was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "Unknown capability profile. Expected explore, review, build, or release."
+        );
+        assert!(manager.0.clients.lock().unwrap().is_empty());
+    }
     use serde_json::json;
 
     #[test]
