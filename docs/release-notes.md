@@ -14,6 +14,15 @@ There is no automatic updater. To update, download the next package for your pla
 - The Inbox groups items by repository. You can dismiss a Ship or subagent item until its next state change, or snooze it for an hour or until tomorrow at 08:00. Items clear when their state resolves.
 - Cmd+J (Ctrl+J elsewhere) goes to the next item needing attention. Cmd+Shift+J still opens the side chat.
 
+## One transcript view
+
+- Claude, Codex and OpenCode threads now render through one transcript view, so the main thread, the OpenCode pane and the agent workspace look and behave the same.
+- OpenCode tool calls are grouped like Claude and Codex tool calls, and OpenCode thinking shows as a collapsed "Show thinking" row. Thinking is collapsed for every agent.
+- Hooks, post-turn checks and the subagent group card appear in event order between the messages, with one card per turn, instead of after the last message.
+- Messages show their time. The assistant avatar is the provider's mark instead of "S.".
+- Code blocks have a **Copy** button. **Jump to latest (N new)** appears when you scroll away from the end of a live transcript.
+- Permission requests use one card. It shows the exact command and files, links back to the tool call, and never offers "Allow always" for unknown or high-risk actions.
+
 ## Subagent navigation and control
 
 - A subagent's breadcrumb shows its parent thread, with **Parent** and previous/next sibling buttons. The keys are Cmd+[ (Ctrl+[ elsewhere) for the parent and Cmd+Shift+[ and Cmd+Shift+] for the previous and next sibling. Cmd+Alt+Arrows still moves pane focus.
