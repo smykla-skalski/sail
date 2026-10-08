@@ -35,6 +35,7 @@
   import ChatMessage from './ChatMessage.svelte';
   import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import type { NativePlan } from './lib/native-plan';
   import ShipPanel from './ShipPanel.svelte';
   import {
     appendShipEvent,
@@ -1196,6 +1197,7 @@
   >();
   let messageGeneration = new SvelteMap<string, number>();
   let snapshot = $state<PlanSnapshot>({ plan: null, questions: null });
+  let nativePlan = $state<NativePlan | null>(null);
   let diffs = $state<WorkingDiffInfo[]>([]);
   let diffLoading = $state(false);
   let diffError = $state('');
@@ -1945,14 +1947,14 @@
   let effortChoices = $derived(
     (chosenModel?.variants ?? []).map((variant) => ({ value: variant.id, name: variant.id })),
   );
-  let showPlanPanel = $derived(!!snapshot.plan || !!snapshot.questions);
+  let showPlanPanel = $derived(!!snapshot.plan || !!snapshot.questions || !!nativePlan);
   let activeSideTab = $derived(
     sideTab === 'ship'
       ? 'ship'
-      : acpAgent && sideTab !== 'history'
-        ? 'changes'
-        : showPlanPanel && sideTab === 'plan'
-          ? 'plan'
+      : showPlanPanel && sideTab === 'plan'
+        ? 'plan'
+        : acpAgent && sideTab !== 'history'
+          ? 'changes'
           : sideTab === 'history'
             ? 'history'
             : 'changes',
@@ -14404,6 +14406,7 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
+                onnativeplan={(plan) => (nativePlan = plan)}
                 onworkspaceactivity={updateMainAgentWorkspaceActivity}
                 ondecision={(thread, permission, optionId) =>
                   recordDecisionActivity(
@@ -14907,7 +14910,7 @@
       onpointerdown={() => focusPane('main')}
     >
       <nav class="side-tabs" aria-label="Session detail tabs">
-        {#if !acpAgent && showPlanPanel && sessionID}<button
+        {#if showPlanPanel && (sessionID || acpAgent)}<button
             class:active={activeSideTab === 'plan'}
             aria-current={activeSideTab === 'plan' ? 'page' : undefined}
             onclick={() => switchSideTab('plan')}>Plan</button
@@ -14926,26 +14929,30 @@
         >
       </nav>
       <div class="side-panel-body">
-        {#if !acpAgent && showPlanPanel}<div
-            class:inactive={activeSideTab !== 'plan'}
-            class="side-view"
-          >
-            <PlanPanel
-              {snapshot}
-              client={connecting ? null : client}
-              {directory}
-              {sessionID}
-              {dark}
-              onchanged={() => refreshSession()}
-              onselectfile={selectDiffPath}
-              shipRun={shipRuns.find(
-                (run) =>
-                  run.repository === (coordinationProject(directory) ?? directory) &&
-                  run.source === snapshot.plan?.sessionID,
-              ) ?? null}
-              onship={(graph, provider, limit) =>
-                startShippingRun(graph, provider, limit, snapshot.plan?.sessionID ?? '')}
-            />
+        {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
+            {#if acpAgent && nativePlan}<section class="native-plan-panel" aria-label="Native plan">
+                <Markdown source={nativePlan.markdown} />
+                {#if nativePlan.tasks.length}<ul>
+                    {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
+                        {task.status}: {task.title}
+                      </li>{/each}
+                  </ul>{/if}
+              </section>{:else}<PlanPanel
+                {snapshot}
+                client={connecting ? null : client}
+                {directory}
+                {sessionID}
+                {dark}
+                onchanged={() => refreshSession()}
+                onselectfile={selectDiffPath}
+                shipRun={shipRuns.find(
+                  (run) =>
+                    run.repository === (coordinationProject(directory) ?? directory) &&
+                    run.source === snapshot.plan?.sessionID,
+                ) ?? null}
+                onship={(graph, provider, limit) =>
+                  startShippingRun(graph, provider, limit, snapshot.plan?.sessionID ?? '')}
+              />{/if}
           </div>{/if}
         {#if sessionID || acpAgent}<div
             class:inactive={activeSideTab !== 'changes'}
