@@ -1,5 +1,6 @@
 <script lang="ts">
   import { keyboardScrollable } from './lib/scroll-focus';
+  import { OPEN_IN_SPLIT_EVENT } from './lib/external-link';
   class ValidationCandidateUnavailable extends Error {
     constructor(message: string, cause?: unknown) {
       super(cause === undefined ? message : `${message}: ${describe(cause)}`, { cause });
@@ -2536,7 +2537,13 @@
     }
   }
 
+  function openLinkInSplit(event: Event) {
+    if (event instanceof CustomEvent && typeof event.detail?.url === 'string')
+      splitFocusedPane('row', 'browser', undefined, undefined, event.detail.url);
+  }
+
   onMount(() => {
+    window.addEventListener(OPEN_IN_SPLIT_EVENT, openLinkInSplit);
     let unlistenAgentEvents: (() => void) | undefined;
     let unlistenBrowserAccess: (() => void) | undefined;
     let unlistenCoordination: (() => void) | undefined;
@@ -2777,6 +2784,7 @@
         void refreshDiff(sessionID, selection, true);
     }, 3000);
     return () => {
+      window.removeEventListener(OPEN_IN_SPLIT_EVENT, openLinkInSplit);
       stopSettingsRequest?.();
       stopSettingsAction?.();
       stopCloseRequest?.();
@@ -12047,6 +12055,7 @@
     kind?: 'terminal' | 'browser' | 'agent-terminal',
     command?: string,
     agentTerminalId?: string,
+    browserUrl?: string,
   ) {
     if (!directory) return;
     let target = focusedPane;
@@ -12085,6 +12094,10 @@
     if (!created) return;
     if (command) pendingCommands = { ...pendingCommands, [created.id]: command };
     const browserTab = kind === 'browser' ? newBrowserTab() : null;
+    if (browserTab && browserUrl) {
+      browserTab.history = [browserUrl];
+      browserTab.index = 0;
+    }
     savePaneLayout(
       browserTab
         ? updatePane(layout, created.id, {
