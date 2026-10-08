@@ -1136,11 +1136,14 @@ pub async fn acp_new_session(
         if let Some(id) = result.get("sessionId").and_then(Value::as_str) {
             browser.identify(&config.token, id);
             if !per_load_mcp() {
-                let previous = runtime
+                let mut configs = runtime
                     .session_configs
                     .lock()
-                    .map_err(|error| error.to_string())?
-                    .insert(
+                    .map_err(|error| error.to_string())?;
+                // The reader drains this map when it exits, so a config stored for a stopped
+                // agent would keep its token for the life of the process.
+                if runtime.alive.load(Ordering::Acquire) {
+                    let previous = configs.insert(
                         id.to_string(),
                         SessionConfig {
                             cwd: cwd.clone(),
@@ -1149,8 +1152,11 @@ pub async fn acp_new_session(
                             token: config.token.clone(),
                         },
                     );
-                if let Some(previous) = previous {
-                    browser.release(&previous.token);
+                    if let Some(previous) = previous {
+                        browser.release(&previous.token);
+                    }
+                } else {
+                    browser.release(&config.token);
                 }
             }
             runtime

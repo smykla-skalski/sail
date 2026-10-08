@@ -286,12 +286,21 @@ await test('a replay of a live session does not duplicate its live children', ()
   );
 });
 
-await test('a child spawned while its session replays stays live', () => {
-  const store = updateNativeSubagents({}, spawnEvent('root', 'root:live-child'), '/repo', 1, true);
-  const child = store['codex:root:live-child'];
+await test('a claude child spawned while its session replays stays live', () => {
+  const live = { ...spawnEvent('root', 'root:live-child'), agent: 'claude' as const };
+  const store = updateNativeSubagents({}, live, '/repo', 1, true);
+  const child = store['claude:root:live-child'];
   assert.equal(child?.restored, false);
   assert.equal(child?.outcome, 'working');
-  assert.equal(finalizeNativeSubagentRestore(store, 'codex', 'root', 2), store);
+  assert.equal(finalizeNativeSubagentRestore(store, 'claude', 'root', 2), store);
+});
+
+await test('an adapter without replay markers still restores its children', () => {
+  const store = updateNativeSubagents({}, spawnEvent('root', 'thread-7'), '/repo', 1, true);
+  assert.equal(store['codex:thread-7']?.restored, true);
+  const finalized = finalizeNativeSubagentRestore(store, 'codex', 'root', 2);
+  assert.equal(finalized['codex:thread-7']?.outcome, 'unknown');
+  assert.equal(finalized['codex:thread-7']?.activity, 'Disconnected');
 });
 
 await test('a first replay still restores historical children', () => {

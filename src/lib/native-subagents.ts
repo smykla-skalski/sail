@@ -98,9 +98,9 @@ export function updateNativeSubagents(
     const id = nativeSubagentId(event.agent, sessionId);
     const previous = store[id];
     const prompt = typeof update.prompt === 'string' ? update.prompt : previous?.prompt;
-    // Only the adapter's replayed children carry the replay marker, so a child announced while a
-    // live session replays stays live.
-    const replayed = restored && isReplaySubagent(sessionId);
+    // Only claude-agent-acp marks replayed children, so its live children stay live while a
+    // session replays. Other adapters replay under plain ids, where the replay itself decides.
+    const replayed = restored && (event.agent !== 'claude' || isReplaySubagent(sessionId));
     const malformed =
       replayed &&
       (!(typeof update.name === 'string' && update.name.trim()) ||

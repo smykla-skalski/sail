@@ -257,7 +257,9 @@ describe('agent sessions survive thread switches', () => {
     await sendPrompt('Long turn');
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-1 '));
     await switchAwayAndBack('Continuity main', 'Continuity sibling');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
     await expect($('.agent-picker-controls')).toHaveText(expect.stringContaining('Test model'));
+    expect(restarts(first)).toBe(0);
     await switchAwayAndBack('Continuity main', 'Continuity elsewhere');
     await browser.pause(500);
     const live = await $('.agent-conversation').getText();
