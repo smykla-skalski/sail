@@ -3896,7 +3896,10 @@ mod capability_profile_tests {
 
     #[test]
     fn client_advertises_plan_capability() {
-        assert_eq!(client_capabilities(CapabilityProfile::Build).get("plan"), Some(&json!({})));
+        assert_eq!(
+            client_capabilities(CapabilityProfile::Build).get("plan"),
+            Some(&json!({}))
+        );
     }
 
     #[test]

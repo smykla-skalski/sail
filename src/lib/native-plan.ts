@@ -9,9 +9,8 @@ export type NativePlan = {
 type RecordValue = Record<string, unknown>;
 
 function record(value: unknown): RecordValue | null {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as RecordValue)
-    : null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return Object.fromEntries(Object.entries(value));
 }
 
 function text(value: unknown): string | null {
