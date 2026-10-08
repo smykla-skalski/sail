@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { Button } from '@smykla-skalski/sui';
   import type { StructuredQuestion } from './lib/planning-state';
   import {
@@ -28,7 +29,7 @@
     fields.filter((field) => field.kind === 'single' || field.kind === 'multi').length,
   );
   const formId = $derived(`elicitation-${String(elicitation.id).replace(/[^\w-]/g, '_')}`);
-  let values = $derived(elicitationDefaults(elicitation.schema));
+  let values = $state(untrack(() => elicitationDefaults(elicitation.schema)));
   let focused = $state<Record<string, string>>({});
   let error = $state('');
 
@@ -180,6 +181,7 @@
           <select
             {id}
             value={String(values[field.key] ?? '')}
+            oninput={(event) => set(field.key, event.currentTarget.value)}
             onchange={(event) => set(field.key, event.currentTarget.value)}
           >
             <option value="">Choose…</option>{#each field.options as option (option)}<option

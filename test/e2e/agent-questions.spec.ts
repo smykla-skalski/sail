@@ -4,6 +4,8 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+const sendButton = "//*[contains(@class,'agent-actions')]//button[contains(.,'Send')]";
+
 describe('agent questions', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-questions-e2e-'));
 
@@ -29,12 +31,24 @@ describe('agent questions', () => {
     await browser.refresh();
     await expect($('.agent-launches button')).toBeEnabled();
     await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer textarea').waitForEnabled();
     await $('.agent-composer textarea').setValue('Ask user questions');
-    await $('.agent-actions button').click();
+    await expect($(sendButton)).toBeEnabled();
+    await $(sendButton).click();
 
     const form = $('[aria-label="Agent question"]');
-    await expect(form).toBeDisplayed();
+    try {
+      await expect(form).toBeDisplayed();
+    } catch (cause) {
+      console.error('Agent question diagnostic', {
+        header: await $('.agent-header').getText(),
+        composer: await $('.agent-composer').getText(),
+        draft: await $('.agent-composer textarea').getValue(),
+        conversation: await $('.agent-conversation').getText(),
+      });
+      throw cause;
+    }
     await expect(form.$('.elicitation-message')).toHaveText(
       'Please answer the following questions.',
     );
@@ -67,7 +81,11 @@ describe('agent questions', () => {
 
     const redis = storage.$('[data-option="Redis"] input');
     await redis.click();
-    await browser.execute((input) => input.focus(), redis);
+    await browser.execute(() =>
+      document
+        .querySelector<HTMLInputElement>('[data-question="question_0"] [data-option="Redis"] input')
+        ?.focus(),
+    );
     await browser.keys('ArrowUp');
     await expect(storage.$('[data-option="Postgres (Recommended)"] input')).toBeSelected();
     await expect(storage.$('.elicitation-preview textarea')).toHaveValue(
@@ -84,5 +102,33 @@ describe('agent questions', () => {
       ),
     );
     await expect(form).not.toBeExisting();
+
+    await $('.agent-composer textarea').setValue('Ask structured question');
+    await expect($(sendButton)).toBeEnabled();
+    await $(sendButton).click();
+    try {
+      await $('[aria-label="Agent question"]').waitForDisplayed();
+    } catch (cause) {
+      console.error('Enum question diagnostic', {
+        header: await $('.agent-header').getText(),
+        actions: await $('.agent-actions').getText(),
+        draft: await $('.agent-composer textarea').getValue(),
+        conversation: await $('.agent-conversation').getText(),
+      });
+      throw cause;
+    }
+    await expect($('[aria-label="Agent question"] .elicitation-message')).toHaveText(
+      'Choose the delivery approach',
+    );
+    await browser.execute(() => {
+      const select = document.querySelector<HTMLSelectElement>(
+        '[aria-label="Agent question"] select',
+      );
+      if (!select) throw new Error('Missing enum select');
+      select.value = 'fast';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await $('[aria-label="Agent question"] .elicitation-actions button').click();
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Selected: fast'));
   });
 });
