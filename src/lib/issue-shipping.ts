@@ -7,6 +7,7 @@ import { initialTaskCheckpoint, type TaskCheckpoint } from './task-checkpoint.ts
 import type { ContextHandoff, ContextProvider } from './context-handoff.ts';
 import type { EvidenceManifest } from './task-evidence.ts';
 import type { ShipValidationPolicy } from './ship-risk-policy.ts';
+import type { CiFailureTriage } from './ci-failure-triage.ts';
 
 export type ShipIssueState =
   'pending' | 'starting' | 'working' | 'awaiting_merge' | 'failed' | 'merged';
@@ -251,6 +252,7 @@ export interface ShipIssue {
   events?: ShipEvent[];
   issueState?: 'OPEN' | 'CLOSED';
   checks?: ShipCheck[];
+  ciTriages?: CiFailureTriage[];
   refreshedAt?: number;
   refreshError?: string | null;
   claimFencePending?: boolean;

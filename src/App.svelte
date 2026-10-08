@@ -131,6 +131,14 @@
   import type { ShipItIssue } from './lib/implementation-models';
   import { checkState } from './lib/pull-request-checks.ts';
   import {
+    ciFailurePrompt,
+    ciTriageEconomics,
+    recordCiFailureTriage,
+    resolveCiFailureTriages,
+    triageCiFailure,
+    type CiRerunPolicy,
+  } from './lib/ci-failure-triage.ts';
+  import {
     initialTaskCheckpoint,
     prepareTaskCheckpointUpdate,
     reconcileTaskCheckpoint,
@@ -591,6 +599,10 @@
   const shippingInstanceId = crypto.randomUUID();
   let shippingClockWall = Date.now();
   let shippingClockMonotonic = performance.now();
+  const ciRerunPolicy: CiRerunPolicy = {
+    allowed: ['flaky', 'infrastructure'],
+    maxAttempts: 2,
+  };
   let acpRecoveryReady = false;
   let worktreeCreations = $state<WorktreeCreation[]>([]);
   let worktreeDeletions = $state<Record<string, string>>({});
@@ -4550,6 +4562,20 @@
         issue,
         {
           ...refreshedPullRequest(currentIssue, pr),
+          ...(pr && currentIssue.ciTriages
+            ? {
+                ciTriages: resolveCiFailureTriages(
+                  currentIssue.ciTriages,
+                  pr.headRefOid,
+                  new Set(
+                    pr.checks
+                      .filter((check) => checkState(check) === 'passing')
+                      .map((check) => check.name),
+                  ),
+                  Date.now(),
+                ),
+              }
+            : {}),
           ...(refreshedRevision
             ? {
                 evidenceRevision: refreshedRevision,
@@ -9344,32 +9370,90 @@
           url: check.url,
         })
       : 'This check has no GitHub Actions job log. Open the check link for details.';
-    const text = `Please investigate failed check “${check.name}” for ${worktree.branch}.\n${check.url}\n\n${log}`;
     const target = await invoke<string>('validate_repository', { path: worktree.path });
     if (directory !== target) await loadProject(target);
     if (directory !== target) throw new Error('Worktree changed before sending the logs.');
-    const pane = leaves(paneLayout).find((leaf) => leaf.agent && leaf.thread);
+    const owner = shipRuns
+      .flatMap((run) => run.issues.map((issue) => ({ run, issue })))
+      .find(({ issue }) => issue.path === target);
+    const revision =
+      check.revision ?? (await invoke<string>('working_tree_revision', { path: worktree.path }));
+    const recorded = recordCiFailureTriage(
+      owner?.issue.ciTriages ?? [],
+      triageCiFailure(
+        {
+          revision,
+          workflow: check.workflow ?? 'GitHub Actions',
+          job: check.name,
+          attempt: check.attempt ?? 1,
+          log,
+          url: check.url,
+        },
+        ciRerunPolicy,
+        Date.now(),
+      ),
+    );
+    if (recorded.duplicate) return;
+    const triage = recorded.triage;
+    const text = ciFailurePrompt(triage);
+    const pane = leaves(paneLayout).find(
+      (leaf) =>
+        leaf.agent &&
+        leaf.thread &&
+        (!owner?.issue.threadId ||
+          leaf.thread.sessionId === owner.issue.threadId ||
+          `${leaf.thread.agent}:${leaf.thread.sessionId}` === owner.issue.threadId),
+    );
     if (pane?.agent) {
       await sendDiffComments(pane.id, diffCommentKey(pane.id), text);
-      return;
+    } else {
+      const thread = agentThreads.find(
+        (item) =>
+          item.directory === target &&
+          (!owner?.issue.threadId ||
+            item.sessionId === owner.issue.threadId ||
+            `${item.agent}:${item.sessionId}` === owner.issue.threadId),
+      );
+      if (thread) {
+        focusMainPane();
+        openAgent(thread.agent, thread);
+        await tick();
+        await sendDiffComments('main', diffCommentKey('main'), text);
+      } else if (acpAgent) await sendDiffComments('main', diffCommentKey('main'), text);
+      else if (client && sessionID) await sendDiffComments('main', diffCommentKey('main'), text);
+      else
+        throw new Error(
+          'Open the owning agent thread in this worktree before sending CI evidence.',
+        );
     }
-    const thread = agentThreads.find((item) => item.directory === target);
-    if (thread) {
-      focusMainPane();
-      openAgent(thread.agent, thread);
-      await tick();
-      await sendDiffComments('main', diffCommentKey('main'), text);
-      return;
+    if (owner) {
+      let evidenceManifests = owner.issue.evidenceManifests ?? [];
+      if (owner.issue.checkpoint)
+        evidenceManifests = recordTaskEvidence(
+          evidenceManifests,
+          revision,
+          owner.issue.checkpoint.acceptanceCriteria,
+          {
+            id: triage.id,
+            kind: 'command',
+            name: `ci-triage:${triage.workflow}/${triage.job}`,
+            provider: 'github',
+            model: null,
+            result: 'failed',
+            timestamp: triage.routedAt,
+            outputReference: triage.url,
+            criteria: [],
+            economics: ciTriageEconomics(triage),
+            executionOrder: [check.runId ?? check.databaseId ?? triage.routedAt, triage.attempt],
+          },
+          owner.issue.shippingTarget?.baseRevision,
+        );
+      await updateShipIssue(owner.run, owner.issue, {
+        ciTriages: recorded.records,
+        evidenceRevision: revision,
+        evidenceManifests,
+      });
     }
-    if (acpAgent) {
-      await sendDiffComments('main', diffCommentKey('main'), text);
-      return;
-    }
-    if (client && sessionID) {
-      await sendDiffComments('main', diffCommentKey('main'), text);
-      return;
-    }
-    throw new Error('Open an agent thread in this worktree before sending check logs.');
   }
 
   async function chooseProject(groupID: string | null = null) {
