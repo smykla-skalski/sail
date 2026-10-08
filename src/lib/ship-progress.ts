@@ -888,7 +888,7 @@ export function refreshedIssueState(issue: ShipIssue, closed: boolean): Partial<
 
 const fixVerdicts = new Set<string>(['NEEDS_FIXES', 'FAIL']);
 
-function currentShipGates(issue: ShipIssue): ShipGate[] {
+export function currentShipGates(issue: ShipIssue): ShipGate[] {
   const gates = issue.gates ?? [];
   return gateNames.flatMap((name) => {
     const gate = gates
@@ -1373,6 +1373,13 @@ const shipGateSchema = gateMetadataSchema.extend({
   updated: z.number(),
   error: nullableString,
 });
+const checkpointReconciliationSchema = z.object({
+  revisionMatches: z.boolean(),
+  resumable: z.boolean(),
+  deliveryState: z.string(),
+  issueState: z.string(),
+  reason: nullableString,
+});
 const shipIssueSchema = z.object({
   id: z.string(),
   number: z.number().int().positive(),
@@ -1462,6 +1469,7 @@ const shipIssueSchema = z.object({
   dispatchFencePending: z.boolean().optional(),
   claim: shippingClaimSchema.optional(),
   checkpoint: taskCheckpointSchema.optional(),
+  checkpointReconciliation: checkpointReconciliationSchema.optional(),
   checkpointThreadIds: z.array(z.string()).optional(),
   contextCompactions: z
     .object({

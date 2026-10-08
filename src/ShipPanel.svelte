@@ -15,15 +15,27 @@
     dependencyIssue,
     dependencyUrl,
     gateNames,
-    shipActivity,
     shipBlock,
     shipClosedBeforeLaunch,
     shipEvidenceReadiness,
-    shipIssuePresentation,
-    shipMergeClaim,
     shipStatus,
-    sortShipIssues,
   } from './lib/ship-progress';
+  import {
+    adjacentRowId,
+    shipAllMerged,
+    shipDeliveryMismatch,
+    shipGroups,
+    shipOrderSnapshot,
+    shipRowLine,
+    shipRowName,
+    shipRows,
+    shipSplitWidth,
+    shipStageIndicator,
+    shipTaskCriteria,
+    shipTaskObjective,
+    type ShipOrderSnapshot,
+    type ShipRow,
+  } from './lib/ship-list';
   import {
     exportTaskEconomics,
     summarizeTaskEconomics,
@@ -65,11 +77,21 @@
   } = $props();
   let error = $state('');
   let panel: HTMLDivElement;
+  let listElement = $state<HTMLElement>();
+  let heading = $state<HTMLElement>();
+  let panelWidth = $state(0);
   let scope = $state<'current' | 'all'>('current');
   let selectedRun = $state('');
   let selectedIssue = $state('');
+  let detailOpen = $state(false);
+  let view = $state<'list' | 'graph'>('list');
+  let showDone = $state(false);
+  let focusedId = $state('');
+  let frozen = $state<ShipOrderSnapshot | null>(null);
   const detailId = `ship-selected-issue-${crypto.randomUUID()}`;
+  const headingId = `${detailId}-heading`;
   let wasActive = false;
+  const wide = $derived(panelWidth >= shipSplitWidth);
   const visible = $derived(
     runs.filter((run) => scope === 'all' || !repository || run.repository === repository),
   );
@@ -77,12 +99,19 @@
     visible.toSorted((left, right) => right.approvedAt - left.approvedAt),
   );
   const run = $derived(orderedRuns.find((item) => item.id === selectedRun) ?? orderedRuns[0]);
+  const rows = $derived(run ? shipRows(run, { mergeOwner }, frozen) : []);
+  const pinned = $derived(new Set([selectedIssue, focusedId].filter(Boolean)));
+  const groups = $derived(shipGroups(rows, { showDone, pinned }));
+  const visibleIds = $derived(groups.flatMap((group) => group.rows.map((row) => row.issue.id)));
   const issue = $derived(
     run?.issues.find((item) => item.id === selectedIssue) ??
-      (run ? sortShipIssues(run, { mergeOwner })[0] : undefined),
+      (wide ? rows.find((row) => row.group !== 'done')?.issue : undefined),
   );
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
-  const issues = $derived(run ? sortShipIssues(run, { mergeOwner }) : []);
+  const allDone = $derived(!!run && shipAllMerged(run, { mergeOwner }));
+  const doneCount = $derived(rows.filter((row) => row.group === 'done').length);
+  const showDetail = $derived(!!issue && view === 'list' && (wide || detailOpen));
+  const showList = $derived(view === 'graph' || wide || !detailOpen);
 
   function issueLabel(item: ShipIssue): string {
     return item.title === `Issue #${item.number}`
@@ -100,6 +129,8 @@
     handledFocus = request.id;
     selectedRun = request.runId;
     selectedIssue = request.issueId;
+    detailOpen = request.focus === 'pull-request';
+    view = 'list';
     pendingFocus = request;
   });
 
@@ -109,7 +140,7 @@
       !request ||
       !active ||
       run?.id !== request.runId ||
-      !issues.some((item) => item.id === request.issueId)
+      !run.issues.some((item) => item.id === request.issueId)
     )
       return;
     void focusPending(request);
@@ -117,15 +148,15 @@
 
   async function focusPending(request: FocusRequest) {
     await tick();
-    const button = panel?.querySelector<HTMLElement>(
+    const row = panel?.querySelector<HTMLElement>(
       `[data-ship-issue-id="${CSS.escape(request.issueId)}"]`,
     );
-    if (!button?.getClientRects().length) return;
     const link =
       request.focus === 'pull-request'
-        ? panel.querySelector<HTMLElement>('.ship-issue-detail .ship-pull-request')
+        ? panel?.querySelector<HTMLElement>('.ship-issue-detail .ship-pull-request')
         : null;
-    const target = link ?? button;
+    const target = link ?? row;
+    if (!target?.getClientRects().length) return;
     target.scrollIntoView({ block: 'center' });
     target.focus();
     if (pendingFocus === request) pendingFocus = null;
@@ -134,6 +165,30 @@
   $effect(() => {
     if (active && !wasActive) error = '';
     wasActive = active;
+  });
+
+  $effect(() => {
+    const measure = () => (panelWidth = panel.clientWidth);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(panel);
+    return () => observer.disconnect();
+  });
+
+  function keydown(event: KeyboardEvent) {
+    panelKeydown(event);
+    listKeydown(event);
+  }
+
+  $effect(() => {
+    panel.addEventListener('keydown', keydown);
+    panel.addEventListener('focusin', listFocusIn);
+    panel.addEventListener('focusout', listFocusOut);
+    return () => {
+      panel.removeEventListener('keydown', keydown);
+      panel.removeEventListener('focusin', listFocusIn);
+      panel.removeEventListener('focusout', listFocusOut);
+    };
   });
 
   async function act(action: () => Promise<void>) {
@@ -146,16 +201,76 @@
   }
 
   async function selectIssue(id: string) {
-    const scrollTop = panel.scrollTop;
     selectedIssue = id;
+    detailOpen = true;
     await tick();
-    panel.scrollTop = scrollTop;
+    heading?.focus();
+  }
+
+  async function returnToRow() {
+    const id = issue?.id;
+    detailOpen = false;
+    await tick();
+    if (id) panel.querySelector<HTMLElement>(`[data-ship-issue-id="${CSS.escape(id)}"]`)?.focus();
+  }
+
+  function panelKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
+    const target = event.target;
+    if (!(target instanceof Node) || !panel.querySelector(`#${detailId}`)?.contains(target)) return;
+    event.preventDefault();
+    void returnToRow();
+  }
+
+  function rowId(target: EventTarget | null): string {
+    return target instanceof Element
+      ? (target.closest<HTMLElement>('[data-ship-issue-id]')?.dataset.shipIssueId ?? '')
+      : '';
+  }
+
+  function listFocusIn(event: FocusEvent) {
+    const id = rowId(event.target);
+    if (!id || !run || !listElement?.contains(event.target as Node)) return;
+    focusedId = id;
+    frozen ??= shipOrderSnapshot(shipRows(run, { mergeOwner }));
+  }
+
+  function listFocusOut(event: FocusEvent) {
+    const next = event.relatedTarget;
+    if (next instanceof Node && listElement?.contains(next)) return;
+    if (!(event.target instanceof Node && listElement?.contains(event.target))) return;
+    focusedId = '';
+    frozen = null;
+  }
+
+  function listKeydown(event: KeyboardEvent) {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp' && event.key !== 'Enter') return;
+    const id = rowId(event.target);
+    if (!id || !listElement?.contains(event.target as Node)) return;
+    event.preventDefault();
+    if (event.key === 'Enter') {
+      void selectIssue(id);
+      return;
+    }
+    const next = adjacentRowId(visibleIds, id, event.key === 'ArrowDown' ? 1 : -1);
+    if (next)
+      listElement
+        ?.querySelector<HTMLElement>(`[data-ship-issue-id="${CSS.escape(next)}"]`)
+        ?.focus();
+  }
+
+  function chooseRun(id: string) {
+    selectedRun = id;
+    selectedIssue = '';
+    detailOpen = false;
+    showDone = false;
+    frozen = null;
   }
 
   function runPresentation(item: ShipRun) {
-    const first = sortShipIssues(item, { mergeOwner })[0];
+    const first = shipRows(item, { mergeOwner })[0];
     return first
-      ? shipIssuePresentation(item, first, { mergeOwner })
+      ? first.presentation
       : {
           status: 'completed',
           label: 'Empty',
@@ -165,22 +280,6 @@
         };
   }
 
-  function workerClaim(item: ShipIssue): string {
-    if (item.state === 'merged') return 'Complete';
-    if (!item.workerState) {
-      if (item.workerSettled) return 'Complete';
-      return item.threadId ? 'Unknown' : 'Not started';
-    }
-    const label = item.workerState.replaceAll('_', ' ');
-    return label.charAt(0).toUpperCase() + label.slice(1);
-  }
-
-  function gateClaim(item: ShipIssue): string {
-    const gates = item.gates ?? [];
-    if (!gates.length) return 'Not started';
-    const latest = gates.toSorted((left, right) => right.updated - left.updated)[0];
-    return `${latest.gate.replaceAll('-', ' ')} · ${latest.verdict ?? latest.state}`;
-  }
   function exportEconomics(owner: ShipRun) {
     const exported = exportTaskEconomics(
       owner.issues.map((item) => ({
@@ -242,7 +341,30 @@
     </div>{:else}<small>Independent issue</small>{/if}
 {/snippet}
 
-<div class="ship-panel" bind:this={panel} aria-label="Ship runs">
+{#snippet row(entry: ShipRow)}
+  {@const line = shipRowLine(run!, entry.issue)}
+  <button
+    class="ship-now-item"
+    data-state={entry.presentation.status}
+    data-ship-issue-id={entry.issue.id}
+    aria-pressed={entry.issue.id === issue?.id}
+    aria-controls={detailId}
+    aria-label={shipRowName(entry)}
+    title={issueLabel(entry.issue)}
+    onclick={() => selectIssue(entry.issue.id)}
+  >
+    <span class="ship-issue-heading"
+      ><strong>{issueLabel(entry.issue)}</strong><ActivityStatus
+        status={entry.presentation.status}
+        label={entry.presentation.label}
+        compact
+      /></span
+    >
+    <span class="ship-line" data-kind={line.kind}>{line.text}</span>
+  </button>
+{/snippet}
+
+<div class="ship-panel" class:wide bind:this={panel} aria-label="Ship runs" role="group">
   <header>
     <div>
       <h2>Ship runs</h2>
@@ -259,7 +381,7 @@
       >
       {#if run}<button onclick={() => exportEconomics(run)}>Export task economics</button>{/if}
       <button onclick={() => act(onsettings)}>Validation settings</button>
-      <button aria-label="Close Ship runs" onclick={onclose}>Close</button>
+      <button aria-label="Hide Ship panel" onclick={onclose}>Hide panel</button>
     </div>
   </header>
   {#if error}<p class="ship-error" role="alert">{error}</p>{/if}
@@ -273,112 +395,114 @@
   {#if !run}
     <section class="ship-empty">
       <h3>No Ship runs yet</h3>
-      <p>Publish an issue graph from an approved plan, then choose Ship issue graph.</p>
+      <p>Start one of two ways:</p>
+      <ul>
+        <li>Ask an agent to run <code>/ship-it &lt;issue-url&gt;</code> for one issue.</li>
+        <li>Publish an issue graph from an approved plan, then choose Ship issue graph.</li>
+      </ul>
     </section>
   {:else}
-    <section class="ship-run-chooser" aria-label="Choose Ship run">
-      <h3>Runs</h3>
-      <div class="ship-run-list">
-        {#each orderedRuns as item (item.id)}
-          {@const presentation = runPresentation(item)}
-          <button
-            class="ship-run-option"
-            aria-pressed={item.id === run.id}
-            onclick={() => {
-              selectedRun = item.id;
-              selectedIssue = '';
-            }}
-          >
-            <span class="ship-run-task"
-              ><strong>{item.umbrella?.title ?? item.issues[0]?.title ?? 'Ship run'}</strong>
-              <ActivityStatus
-                status={presentation.status}
-                label={presentation.label}
-                compact
-              /></span
+    {#if orderedRuns.length > 1}<section class="ship-run-chooser" aria-label="Choose Ship run">
+        <h3>Runs</h3>
+        <div class="ship-run-list">
+          {#each orderedRuns as item (item.id)}
+            {@const presentation = runPresentation(item)}
+            <button
+              class="ship-run-option"
+              aria-pressed={item.id === run.id}
+              onclick={() => chooseRun(item.id)}
             >
-            <span class="ship-run-meta"
-              ><span>{item.remote}</span><time datetime={new Date(item.approvedAt).toISOString()}
-                >Launched {new Date(item.approvedAt).toLocaleString()}</time
-              ></span
-            >
-          </button>
-        {/each}
-      </div>
-    </section>
+              <span class="ship-run-task"
+                ><strong>{item.umbrella?.title ?? item.issues[0]?.title ?? 'Ship run'}</strong>
+                <ActivityStatus
+                  status={presentation.status}
+                  label={presentation.label}
+                  compact
+                /></span
+              >
+              <span class="ship-run-meta"
+                ><span>{item.remote}</span><time datetime={new Date(item.approvedAt).toISOString()}
+                  >Launched {new Date(item.approvedAt).toLocaleString()}</time
+                ></span
+              >
+            </button>
+          {/each}
+        </div>
+      </section>{/if}
     <section class="ship-summary" aria-label="Run progress">
       <div>
         <h3>{run.umbrella?.title ?? run.issues[0]?.title ?? 'Ship run'}</h3>
-        {#if run.umbrella}<a href={run.umbrella.url} target="_blank" rel="noreferrer"
-            >Umbrella #{run.umbrella.number}</a
-          >{/if}
-        <p>{run.remote} · {run.provider} · up to {run.limit} workers</p>
+        <p>
+          {#if run.umbrella}<a href={run.umbrella.url} target="_blank" rel="noreferrer"
+              >Umbrella #{run.umbrella.number}</a
+            >
+            ·
+          {/if}{run.remote} · {run.provider} · up to {run.limit} workers
+        </p>
       </div>
-      <div>
+      <div class="ship-progress">
         <strong>{merged} / {run.issues.length} merged</strong><progress
           value={merged}
           max={run.issues.length || 1}
           aria-label="Merged issues"
         ></progress>
-        <p>
-          {run.issues.filter((item) => ['starting', 'working'].includes(item.state)).length} active ·
-          {run.issues.filter((item) =>
-            ['Blocked', 'Failed', 'Closed without merge'].includes(shipStatus(run, item)),
-          ).length} need attention
-        </p>
       </div>
+      {#if wide || !showDetail}<div class="view-toggle" role="group" aria-label="Issue view">
+          <button aria-pressed={view === 'list'} onclick={() => (view = 'list')}>List</button>
+          <button aria-pressed={view === 'graph'} onclick={() => (view = 'graph')}>Graph</button>
+        </div>{/if}
     </section>
-    <section class="ship-now" aria-label="Shipping issues">
-      <div>
-        <h3>Issues</h3>
-        <p>Needs attention first. Each claim comes from its recorded source.</p>
-      </div>
-      <div class="ship-now-list">
-        {#each issues as item (item.id)}
-          {@const activity = shipActivity(run, item)}
-          {@const presentation = shipIssuePresentation(run, item, { mergeOwner })}
-          <button
-            class="ship-now-item"
-            data-state={presentation.status}
-            data-ship-issue-id={item.id}
-            aria-pressed={item.id === issue?.id}
-            aria-controls={detailId}
-            onclick={() => selectIssue(item.id)}
-          >
-            <span class="ship-issue-heading"
-              ><strong>{issueLabel(item)}</strong><ActivityStatus
-                status={presentation.status}
-                label={presentation.label}
-                compact
-              /></span
-            >
-            <span class="ship-latest"><b>Latest</b> {activity.title} · {activity.detail}</span>
-            <span class="ship-next"><b>Next</b> {presentation.nextAction}</span>
-            <span class="ship-claims" aria-label={`Issue ${item.number} recorded states`}>
-              <span><b>Claim</b>{coordinationClaim(item)}</span>
-              <span><b>Worker</b>{workerClaim(item)}</span>
-              <span><b>Review</b>{gateClaim(item)}</span>
-              <span><b>CI</b>{ciStatus(item.checks)}</span>
-              <span><b>Merge</b>{shipMergeClaim(item)}</span>
-            </span>
-            <time datetime={new Date(presentation.updated ?? run.approvedAt).toISOString()}
-              >{presentation.updated
-                ? `Updated ${new Date(presentation.updated).toLocaleString()}`
-                : 'No confirmed update'}</time
-            >
-          </button>
-        {:else}<p class="ship-muted">No shipping work is active.</p>{/each}
-      </div>
-    </section>
-    <WorkerDependencyMap
-      {run}
-      {nativeSubagents}
-      selected={issue?.id}
-      onselect={selectIssue}
-      {onopen}
-    />
-    <div class="ship-content">
-      {#if issue}
+    <div class="ship-content" class:split={wide && view === 'list'}>
+      {#if showList}
+        {#if view === 'graph'}
+          <WorkerDependencyMap
+            {run}
+            {nativeSubagents}
+            selected={issue?.id}
+            onselect={async (id) => {
+              view = 'list';
+              await selectIssue(id);
+            }}
+            {onopen}
+          />
+        {:else}
+          <section class="ship-now" aria-label="Shipping issues">
+            {#if allDone && !showDone && !pinned.size}
+              <p class="ship-all-done">
+                All {run.issues.length} issues {merged === run.issues.length ? 'merged' : 'done'} ·
+                <button class="ship-link" onclick={() => (showDone = true)}>Show done</button>
+              </p>
+            {:else}
+              <div
+                class="ship-now-list"
+                role="group"
+                aria-label="Issues by state"
+                bind:this={listElement}
+              >
+                {#each groups as group (group.id)}
+                  <section
+                    class="ship-group"
+                    data-group={group.id}
+                    aria-labelledby={`${detailId}-${group.id}`}
+                  >
+                    <h4 id={`${detailId}-${group.id}`}>
+                      {group.label} <span>{group.rows.length + group.hidden}</span>
+                    </h4>
+                    {#each group.rows as entry (entry.issue.id)}{@render row(entry)}{/each}
+                  </section>
+                {:else}<p class="ship-muted">No shipping work is active.</p>{/each}
+                {#if doneCount}<button
+                    class="ship-link ship-done-toggle"
+                    aria-pressed={showDone}
+                    onclick={() => (showDone = !showDone)}
+                    >{showDone ? 'Hide done' : `Show done (${doneCount})`}</button
+                  >{/if}
+              </div>
+            {/if}
+          </section>
+        {/if}
+      {/if}
+      {#if showDetail && issue}
         {@const pendingHandoff = issue.contextHandoffs?.findLast(
           (handoff) =>
             handoff.fromThreadId === issue.threadId &&
@@ -400,27 +524,33 @@
           evidence,
           issue.evidenceRevision,
         )}
-        <section
-          id={detailId}
-          class="ship-issue-detail"
-          tabindex="-1"
-          aria-label={`Issue ${issue.number} details`}
-        >
-          <h3>{issueLabel(issue)}</h3>
+        {@const stage = shipStageIndicator(issue)}
+        {@const objective = shipTaskObjective(issue)}
+        {@const criteria = shipTaskCriteria(issue)}
+        {@const mismatch = shipDeliveryMismatch(issue)}
+        <section id={detailId} class="ship-issue-detail" aria-labelledby={headingId}>
+          {#if !wide}<button class="ship-back" onclick={returnToRow}>← All issues</button>{/if}
+          <h3 id={headingId} tabindex="-1" bind:this={heading}>{issueLabel(issue)}</h3>
+          <ol class="ship-stage" role="img" aria-label={stage.label}>
+            {#each stage.steps as step (step.id)}
+              <li data-state={step.state}>
+                {step.label}{#if step.state === 'not-required'}
+                  · not required{:else if step.state === 'current' && stage.round > 0}
+                  · round {stage.round}{/if}
+              </li>
+            {/each}
+          </ol>
           {#if !shipClosedBeforeLaunch(issue) && (shipBlock(issue) || issue.error)}<p
               class="ship-error"
               role="status"
             >
               {shipBlock(issue) || issue.error}
             </p>{/if}
-          {#if issue.state === 'pending' && issue.dependsOn.some((ref) => dependencyIssue(run, ref)?.state === 'failed')}{@const blocker =
-              shipIssuePresentation(run, issue, { mergeOwner })}
+          {#if issue.state === 'pending' && issue.dependsOn.some((ref) => dependencyIssue(run, ref)?.state === 'failed')}
             <p class="ship-error">
               Waiting for failed dependencies to recover. Independent issues continue.
-              {#if blocker.link}<a href={blocker.link.url} target="_blank" rel="noreferrer"
-                  >Open {blocker.link.label}</a
-                >{/if}
             </p>{/if}
+          {#if mismatch}<p class="ship-error" role="status">{mismatch}</p>{/if}
           {#if issue.refreshError}<p class="ship-error" role="status">
               Refresh failed: {issue.refreshError}. Showing last known state.
             </p>{/if}
@@ -430,7 +560,12 @@
               : 'Not refreshed yet'}
           </p>
           <div class="ship-actions">
-            <a href={issue.url} target="_blank" rel="noreferrer">Open GitHub issue</a>
+            {#if issue.pullRequest}<a
+                class="ship-pull-request"
+                href={issue.pullRequest}
+                target="_blank"
+                rel="noreferrer">Open PR</a
+              >{/if}
             <button
               disabled={!issue.path || issue.worktreeUnavailable}
               onclick={() => act(() => onopen(issue!.path!))}>Open worktree</button
@@ -438,14 +573,9 @@
             <button
               disabled={!issue.path || !issue.threadId || issue.worktreeUnavailable}
               onclick={() => act(() => onopen(issue!.path!, issue!.threadId))}
-              >Open worker session</button
+              >Open worker thread</button
             >
-            {#if issue.pullRequest}<a
-                class="ship-pull-request"
-                href={issue.pullRequest}
-                target="_blank"
-                rel="noreferrer">Open PR</a
-              >{/if}
+            <a href={issue.url} target="_blank" rel="noreferrer">Open GitHub issue</a>
           </div>
           <p class="ship-path">
             {issue.worktreeUnavailable
@@ -458,120 +588,138 @@
           </p>
           {#if issue.archivePath}<p class="ship-path">Archived files: {issue.archivePath}</p>{/if}
           {@render dependencies(run, issue)}
-          <h4>Coordination claim</h4>
-          {#if issue.claim}
-            <p>{issue.claim.holder} · {issue.claim.task} · {coordinationClaim(issue)}</p>
-            <p>
-              Acquired {new Date(issue.claim.acquiredAt).toLocaleString()} · heartbeat {new Date(
-                issue.claim.heartbeatAt,
-              ).toLocaleString()} · expires {new Date(issue.claim.expiresAt).toLocaleString()}
-            </p>
-            {#if issue.claim.takeoverOf}<p>Audited takeover of {issue.claim.takeoverOf}</p>{/if}
-            {#if issue.claim.releasedAt}<p>
-                Released {new Date(issue.claim.releasedAt).toLocaleString()} ·
-                {issue.claim.releaseReason}
+          <section class="ship-contract" aria-labelledby={`${detailId}-contract`}>
+            <h4 id={`${detailId}-contract`}>Task contract</h4>
+            {#if objective}<p class="ship-objective">{objective}</p>{:else}<p class="ship-muted">
+                The worker has not recorded the task contract yet.
               </p>{/if}
-          {:else}<p class="ship-muted">No visible claim recorded.</p>{/if}
-          <h4>Implementation</h4>
-          <p>Worker: {run.provider} / {resolvedWorkerModel(issue) ?? 'Unknown model'}</p>
-          <p>
-            Models that changed files: {issue.models?.join(', ') ||
-              (resolvedWorkerModel(issue)
-                ? `Awaiting file-change attribution from ${resolvedWorkerModel(issue)}`
-                : 'Awaiting worker model attribution')}{issue.modelUncertain
-              ? ' · Attribution uncertain'
-              : ''}
-          </p>
-          {#if pendingHandoff}<section class="ship-handoff" aria-label="Context handoff">
-              <h4>Context handoff</h4>
+            {#if criteria.length}<ol class="ship-gates">
+                {#each criteria as criterion, index (`${index}:${criterion}`)}
+                  <li>
+                    <strong
+                      >{evidence.unverifiedCriteria.includes(criterion)
+                        ? 'Unverified'
+                        : 'Verified'}</strong
+                    >
+                    <span>{criterion}</span>
+                  </li>
+                {/each}
+              </ol>{/if}
+            <h5>Risk and gates</h5>
+            {#if issue.validationPolicy}
+              <dl class="ship-policy">
+                <div>
+                  <dt>Selected risk</dt>
+                  <dd>{issue.validationPolicy.risk}</dd>
+                </div>
+                <div>
+                  <dt>Required gates</dt>
+                  <dd>{issue.validationPolicy.requiredGates.join(', ') || 'None'}</dd>
+                </div>
+                <div>
+                  <dt>Revision</dt>
+                  <dd>{issue.validationPolicy.revision}</dd>
+                </div>
+                <div>
+                  <dt>Policy source</dt>
+                  <dd>{issue.validationPolicy.sources.join(' · ')}</dd>
+                </div>
+              </dl>
+            {:else}<p class="ship-muted">Risk not selected. Validation cannot start.</p>{/if}
+            <h5>Evidence</h5>
+            <p class:ship-error={!evidence.ready}>
+              {issue.evidenceRevision ?? 'Revision unknown'} ·
+              {evidence.ready ? 'Merge evidence ready' : evidence.reason}
+            </p>
+            <details>
+              <summary>Evidence manifest ({manifest?.evidence.length ?? 0})</summary>
+              {#each manifest?.evidence ?? [] as item (item.id)}
+                <p>
+                  {item.kind}: {item.name} · {item.result} · {item.provider} / {item.model ??
+                    'No model'}
+                  · {new Date(item.timestamp).toLocaleString()} · {item.outputReference}
+                </p>
+              {:else}<p>No evidence recorded for this revision.</p>{/each}
+            </details>
+            <h5>Claim</h5>
+            {#if issue.claim}
+              <p>{issue.claim.holder} · {issue.claim.task} · {coordinationClaim(issue)}</p>
               <p>
-                Context reached {pendingHandoff.context}% after {pendingHandoff.compactions}
-                compaction{pendingHandoff.compactions === 1 ? '' : 's'}.
+                Acquired {new Date(issue.claim.acquiredAt).toLocaleString()} · heartbeat {new Date(
+                  issue.claim.heartbeatAt,
+                ).toLocaleString()} · expires {new Date(issue.claim.expiresAt).toLocaleString()}
               </p>
-              <button
-                disabled={(issue.checkpoint?.sequence ?? 0) <= pendingHandoff.checkpointSequence}
-                onclick={() => act(() => onhandoff(run!, issue!))}>Start fresh worker</button
-              >
-              {#if (issue.checkpoint?.sequence ?? 0) <= pendingHandoff.checkpointSequence}<p
-                  class="ship-muted"
-                >
-                  Waiting for the current worker to update the canonical checkpoint.
+              {#if issue.claim.takeoverOf}<p>Audited takeover of {issue.claim.takeoverOf}</p>{/if}
+              {#if issue.claim.releasedAt}<p>
+                  Released {new Date(issue.claim.releasedAt).toLocaleString()} ·
+                  {issue.claim.releaseReason}
                 </p>{/if}
-            </section>{/if}
-          {#if recoveryHandoff}<section class="ship-handoff" aria-label="Context handoff recovery">
-              <h4>Context handoff needs inspection</h4>
-              <p>
-                Open the worker session and inspect its transcript. Retry only if its uncertain work
-                must not be adopted.
-              </p>
-              <button onclick={() => act(() => onhandoff(run!, issue!))}
-                >Cancel inspected session and retry</button
+            {:else}<p class="ship-muted">No visible claim recorded.</p>{/if}
+            <h5>Handoff</h5>
+            {#if !pendingHandoff && !recoveryHandoff && !issue.contextHandoffs?.length}<p
+                class="ship-muted"
               >
-            </section>{/if}
-          {#if issue.contextHandoffs?.length}<details>
-              <summary>Context history</summary>
-              <p>
-                Compactions: Claude {issue.contextCompactions?.claude ?? 0} · Codex
-                {issue.contextCompactions?.codex ?? 0} · OpenCode
-                {issue.contextCompactions?.opencode ?? 0}
-              </p>
-              <ol>
-                {#each issue.contextHandoffs as handoff (handoff.id)}<li>
-                    {handoff.provider} · {handoff.context}% · {handoff.outcome.replaceAll('_', ' ')} ·
-                    retries
-                    {handoff.retriesBefore}→{handoff.retriesAfter ?? 'pending'} · lost-state
-                    {handoff.lostStateFailuresBefore}→{handoff.lostStateFailuresAfter ?? 'pending'}
-                  </li>{/each}
-              </ol>
-            </details>{/if}
-          <h4>Revision evidence</h4>
-          <p class:ship-error={!evidence.ready}>
-            {issue.evidenceRevision ?? 'Revision unknown'} ·
-            {evidence.ready ? 'Merge evidence ready' : evidence.reason}
-          </p>
-          <ol class="ship-gates">
-            {#each issue.checkpoint?.acceptanceCriteria ?? [] as criterion (criterion)}
-              <li>
-                <strong
-                  >{evidence.unverifiedCriteria.includes(criterion)
-                    ? 'Unverified'
-                    : 'Verified'}</strong
+                No context handoff.
+              </p>{/if}
+            <h4>Implementation</h4>
+            <p>Worker: {run.provider} / {resolvedWorkerModel(issue) ?? 'Unknown model'}</p>
+            <p>
+              Models that changed files: {issue.models?.join(', ') ||
+                (resolvedWorkerModel(issue)
+                  ? `Awaiting file-change attribution from ${resolvedWorkerModel(issue)}`
+                  : 'Awaiting worker model attribution')}{issue.modelUncertain
+                ? ' · Attribution uncertain'
+                : ''}
+            </p>
+            {#if pendingHandoff}<section class="ship-handoff" aria-label="Context handoff">
+                <h4>Context handoff</h4>
+                <p>
+                  Context reached {pendingHandoff.context}% after {pendingHandoff.compactions}
+                  compaction{pendingHandoff.compactions === 1 ? '' : 's'}.
+                </p>
+                <button
+                  disabled={(issue.checkpoint?.sequence ?? 0) <= pendingHandoff.checkpointSequence}
+                  onclick={() => act(() => onhandoff(run!, issue!))}>Start fresh worker</button
                 >
-                <span>{criterion}</span>
-              </li>
-            {:else}<li>Acceptance criteria not recorded.</li>{/each}
-          </ol>
-          <details>
-            <summary>Evidence manifest ({manifest?.evidence.length ?? 0})</summary>
-            {#each manifest?.evidence ?? [] as item (item.id)}
-              <p>
-                {item.kind}: {item.name} · {item.result} · {item.provider} / {item.model ??
-                  'No model'}
-                · {new Date(item.timestamp).toLocaleString()} · {item.outputReference}
-              </p>
-            {:else}<p>No evidence recorded for this revision.</p>{/each}
-          </details>
-          <h4>Validation policy</h4>
-          {#if issue.validationPolicy}
-            <dl class="ship-policy">
-              <div>
-                <dt>Selected risk</dt>
-                <dd>{issue.validationPolicy.risk}</dd>
-              </div>
-              <div>
-                <dt>Required gates</dt>
-                <dd>{issue.validationPolicy.requiredGates.join(', ') || 'None'}</dd>
-              </div>
-              <div>
-                <dt>Revision</dt>
-                <dd>{issue.validationPolicy.revision}</dd>
-              </div>
-              <div>
-                <dt>Policy source</dt>
-                <dd>{issue.validationPolicy.sources.join(' · ')}</dd>
-              </div>
-            </dl>
-          {:else}<p class="ship-muted">Risk not selected. Validation cannot start.</p>{/if}
+                {#if (issue.checkpoint?.sequence ?? 0) <= pendingHandoff.checkpointSequence}<p
+                    class="ship-muted"
+                  >
+                    Waiting for the current worker to update the canonical checkpoint.
+                  </p>{/if}
+              </section>{/if}
+            {#if recoveryHandoff}<section
+                class="ship-handoff"
+                aria-label="Context handoff recovery"
+              >
+                <h4>Context handoff needs inspection</h4>
+                <p>
+                  Open the worker session and inspect its transcript. Retry only if its uncertain
+                  work must not be adopted.
+                </p>
+                <button onclick={() => act(() => onhandoff(run!, issue!))}
+                  >Cancel inspected session and retry</button
+                >
+              </section>{/if}
+            {#if issue.contextHandoffs?.length}<details>
+                <summary>Context history</summary>
+                <p>
+                  Compactions: Claude {issue.contextCompactions?.claude ?? 0} · Codex
+                  {issue.contextCompactions?.codex ?? 0} · OpenCode
+                  {issue.contextCompactions?.opencode ?? 0}
+                </p>
+                <ol>
+                  {#each issue.contextHandoffs as handoff (handoff.id)}<li>
+                      {handoff.provider} · {handoff.context}% · {handoff.outcome.replaceAll(
+                        '_',
+                        ' ',
+                      )} · retries
+                      {handoff.retriesBefore}→{handoff.retriesAfter ?? 'pending'} · lost-state
+                      {handoff.lostStateFailuresBefore}→{handoff.lostStateFailuresAfter ??
+                        'pending'}
+                    </li>{/each}
+                </ol>
+              </details>{/if}
+          </section>
           <h4>Accepted-task economics</h4>
           <p class:ship-error={!economics.accepted}>
             {economics.accepted
@@ -704,31 +852,100 @@
     min-height: 0;
     height: auto;
   }
-  header,
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    align-items: start;
+    justify-content: space-between;
+  }
+  header h2,
+  header p {
+    margin: 0;
+  }
   .ship-summary {
     display: flex;
-    flex-direction: column;
-    gap: 20px;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 12px;
+    padding: 10px 0;
+    border-block: 1px solid var(--shell-divider);
+  }
+  .ship-summary h3,
+  .ship-summary p {
+    margin: 0;
+  }
+  .ship-summary p {
+    color: var(--sui-muted);
+    font-size: 12px;
+  }
+  .ship-progress {
+    display: grid;
+    min-width: 120px;
+    gap: 4px;
+  }
+  progress {
+    display: block;
+    width: 100%;
+  }
+  .view-toggle {
+    display: flex;
+  }
+  .view-toggle button:first-child {
+    border-radius: 6px 0 0 6px;
+  }
+  .view-toggle button:last-child {
+    border-radius: 0 6px 6px 0;
+    border-left-width: 0;
+  }
+  .view-toggle button[aria-pressed='true'] {
+    border-color: var(--sui-primary);
+    color: var(--sui-primary);
+  }
+  .ship-content {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+    margin-top: 12px;
+  }
+  .ship-content.split {
+    grid-template-columns: minmax(240px, 2fr) minmax(0, 3fr);
     align-items: start;
   }
   .ship-now {
-    display: grid;
-    gap: 12px;
-    margin-top: 20px;
-  }
-  .ship-now h3,
-  .ship-now p {
-    margin: 0;
+    min-width: 0;
   }
   .ship-now-list {
     display: grid;
-    gap: 8px;
+    gap: 12px;
+  }
+  .ship-group {
+    display: grid;
+    gap: 4px;
+  }
+  .ship-group h4 {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    margin: 0;
+    color: var(--sui-muted);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .ship-group h4 span {
+    font-weight: 400;
+  }
+  .ship-group[data-group='needs-input'] h4 {
+    color: var(--activity-waiting);
   }
   .ship-now-item {
     display: grid;
     min-width: 0;
-    gap: 7px;
-    padding: 12px;
+    gap: 3px;
+    padding: 6px 10px;
     text-align: left;
     border-left: 3px solid var(--sui-primary);
     overflow-wrap: anywhere;
@@ -739,11 +956,20 @@
     background: color-mix(in srgb, var(--sui-primary) 7%, transparent);
   }
   .ship-now-item[data-state='failed'],
-  .ship-now-item[data-state='offline'] {
+  .ship-now-item[data-state='offline'],
+  .ship-now-item[data-state='interrupted'] {
     border-left-color: var(--sui-danger);
   }
-  .ship-now-item[data-state='waiting'] {
+  .ship-now-item[data-state='waiting'],
+  .ship-now-item[data-state='ready'],
+  .ship-now-item[data-state='queued'] {
     border-left-color: var(--activity-waiting);
+  }
+  .ship-now-item[data-state='fixing'] {
+    border-left-color: var(--activity-fixing);
+  }
+  .ship-now-item[data-state='completed'] {
+    border-left-color: var(--activity-completed);
   }
   .ship-issue-heading,
   .ship-run-task,
@@ -751,53 +977,33 @@
     display: flex;
     min-width: 0;
     gap: 8px;
-    align-items: start;
+    align-items: center;
     justify-content: space-between;
   }
-  .ship-issue-heading strong,
+  .ship-issue-heading strong {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .ship-run-task strong,
   .ship-run-meta span,
   .ship-run-meta time {
     min-width: 0;
     overflow-wrap: anywhere;
   }
-  .ship-latest,
-  .ship-next {
-    line-height: 1.4;
-  }
-  .ship-latest b,
-  .ship-next b {
-    display: inline-block;
-    min-width: 42px;
+  .ship-line {
+    overflow: hidden;
     color: var(--sui-muted);
-    font-size: 10px;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-  }
-  .ship-claims {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 6px;
-  }
-  .ship-claims > span {
-    display: grid;
-    min-width: 0;
-    gap: 2px;
-    padding: 6px 8px;
-    border-radius: 6px;
-    background: color-mix(in srgb, var(--sui-foreground) 4%, transparent);
-    overflow-wrap: anywhere;
-    font-size: 11px;
-  }
-  .ship-claims b {
-    color: var(--sui-muted);
-    font-size: 9px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-  }
-  .ship-now-item time {
-    opacity: 0.7;
     font-size: 12px;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ship-line[data-kind='blocker'] {
+    color: var(--sui-danger);
   }
   h2,
   h3 {
@@ -816,13 +1022,30 @@
     border: 1px solid var(--shell-divider);
     border-radius: 6px;
     padding: 7px 10px;
-  }
-  button {
     cursor: pointer;
   }
   button:disabled {
     opacity: 0.45;
     cursor: default;
+  }
+  button:focus-visible,
+  a:focus-visible,
+  h3:focus-visible {
+    outline: 2px solid var(--sui-primary);
+    outline-offset: 2px;
+  }
+  .ship-link {
+    border: 0;
+    padding: 2px 4px;
+    color: var(--sui-primary);
+    text-decoration: underline;
+  }
+  .ship-done-toggle {
+    justify-self: start;
+  }
+  .ship-all-done {
+    margin: 0;
+    padding: 16px 0;
   }
   .ship-actions {
     display: flex;
@@ -833,7 +1056,10 @@
   .ship-run-chooser {
     display: grid;
     gap: 8px;
-    margin: 20px 0;
+    margin: 12px 0 0;
+  }
+  .ship-run-chooser h3 {
+    margin: 0;
   }
   .ship-run-list {
     display: grid;
@@ -855,30 +1081,47 @@
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
-    margin-top: 16px;
+    margin-top: 12px;
   }
   .ship-scope button[aria-pressed='true'] {
     border-color: var(--sui-primary);
     color: var(--sui-primary);
   }
-  .ship-summary {
-    padding: 16px 0;
-    border-block: 1px solid var(--shell-divider);
-  }
-  progress {
-    display: block;
-    width: 100%;
-    margin-top: 8px;
-  }
-  .ship-content {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 24px;
-    margin-top: 20px;
-  }
   .ship-issue-detail {
     min-width: 0;
     overflow-wrap: anywhere;
+  }
+  .ship-back {
+    margin-bottom: 8px;
+  }
+  .ship-stage {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin: 0 0 8px;
+    padding: 0;
+    list-style: none;
+    font-size: 12px;
+  }
+  .ship-stage li {
+    color: var(--sui-muted);
+  }
+  .ship-stage li[data-state='done'] {
+    color: var(--activity-completed);
+  }
+  .ship-stage li[data-state='current'] {
+    color: var(--sui-foreground);
+    font-weight: 700;
+  }
+  .ship-stage li[data-state='not-required'] {
+    opacity: 0.7;
+  }
+  .ship-contract h4,
+  .ship-contract h5 {
+    margin: 12px 0 4px;
+  }
+  .ship-objective {
+    font-weight: 600;
   }
   .ship-dependencies {
     display: grid;
@@ -945,19 +1188,16 @@
     cursor: pointer;
   }
   .ship-empty {
-    padding: 40px 0;
+    padding: 24px 0;
   }
   @media (max-width: 520px) {
     .ship-panel {
       padding: 12px;
     }
-    .ship-claims {
-      grid-template-columns: minmax(0, 1fr);
-    }
-    .ship-issue-heading,
     .ship-run-task,
     .ship-run-meta {
       flex-direction: column;
+      align-items: start;
       gap: 5px;
     }
   }

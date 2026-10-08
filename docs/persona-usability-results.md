@@ -46,6 +46,23 @@ Maya, the AI power user, runs several agents and moves between them while they w
 
 With the previous per-load MCP settings restored (`SAIL_ACP_PER_LOAD_MCP=1`), four of these tasks fail because switching restarts the session. A real Codex turn kept running through a mid-turn load, but restarted its MCP server; the result is recorded on the tracking issue.
 
+# Ship batch walkthrough — 2026-10-08
+
+Priya, a lead shipping a batch, needs to find the one issue that needs her without scanning every row. This walkthrough runs her path against a private macOS build through embedded WebDriver with a stored 20-issue run: 3 issues that need input, 12 waiting on one of them, and 5 merged. It is a scripted, simulated persona pass, not a study with real users. The worker, GitHub, and checkpoint data are fixtures, so the result covers the layout and navigation, not live shipping.
+
+| Task                                                                 | Result                                                                                                                                                                               |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Open Ship (Cmd+L) with 20 issues and find the issue that needs input | **Needs input** is the first group. Its first row is visible without scrolling at 1280×850 (one action: opening Ship). One more action, a click or Enter, opens that issue's detail. |
+| Count the screens the whole batch needs                              | With Done shown, the 20 rows fit within two window heights (1700 px) at 850 px window height.                                                                                        |
+| Hide finished work                                                   | The 5 merged issues are hidden behind **Show done (5)**. When all 20 are merged, the list says "All 20 issues merged" with **Show done**.                                            |
+| Open an issue in a narrow pane, then go back                         | Below 560 px the detail replaces the list, focus lands on the detail heading, and Escape returns focus to the same row.                                                              |
+| Move through the list with the keyboard                              | ↓ and ↑ move between rows, stop at the ends, and Enter opens the focused row.                                                                                                        |
+| Read an issue's task contract                                        | The detail shows the objective and criteria, risk and gates, evidence, claim, and handoff, or says the worker has not recorded the contract yet.                                     |
+
+Screenshots: [grouped list](visual-audit/screenshots/ship-list-grouped.png), [grouped list, dark](visual-audit/screenshots/ship-list-grouped-dark.png), [drill-in detail](visual-audit/screenshots/ship-detail-drill-in.png), [split view](visual-audit/screenshots/ship-split-detail.png), [split view, dark](visual-audit/screenshots/ship-split-detail-dark.png).
+
+Not exercised in the GUI: a focused or selected row becoming Done while the list is open, and live frozen sorting while focus is in the list. These are covered by unit tests of the grouping and ordering logic only.
+
 # Attention walkthrough — 2026-10-08
 
 Priya, a lead who runs many Ship issues, needs one place that says what waits on her. Jordan maintains several repositories, and Sam works from the keyboard at a narrow width. This walkthrough drives a private macOS build through embedded WebDriver with seeded Ship runs. It is a scripted, simulated persona pass, not a study with real users. The Dock badge and OS notifications are native and were not observed; their counts and click routing are covered by unit tests and by an emulated click event at the app boundary.
@@ -60,3 +77,18 @@ Priya, a lead who runs many Ship issues, needs one place that says what waits on
 | Sam     | Narrow the window to 640 px                                                        | The status bar kept "! 2" visible. Before, its counts were hidden below 700 px.                                                                                            |
 
 Not covered: a real OS notification, the Dock or taskbar badge, snooze expiry in the live app, and the Settings window's per-type selects (not exercised through WebDriver).
+
+# Subagent navigation walkthrough — 2026-10-08
+
+Maya delegates work to subagents and has to answer them, find them and stop them. Sam does it from the keyboard. This walkthrough drives a private macOS build through embedded WebDriver, with the repository's ACP test agent emulating a Claude parent whose native child asks for permission, and seeded receipts for a child spawned in another worktree. It is a scripted, simulated persona pass, not a study with real users. Light and dark screenshots of the parent card and the child view were checked by eye.
+
+| Persona | Task                                                                            | Result                                                                                                                                                                          |
+| ------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Maya    | Spot a child that waits for permission and answer it without leaving the parent | The child's card in the parent showed the request with its options. Allow once resolved it and the card said "Answered".                                                        |
+| Maya    | Open the child while its request is pending                                     | The request replayed in the child's view. The composer was disabled, the banner said the agent does not accept messages for subagents yet, and there was no Stop button.        |
+| Sam     | Press Cmd+[ in the child view                                                   | Focus went to the parent thread. The breadcrumb showed Parent, the child's name and a "1 of 1" position with previous and next buttons.                                         |
+| Maya    | Answer one request from two places                                              | The first answer resolved it. A repeat of the same answer succeeded without a second event, a different answer failed with "no longer pending", and both views showed Answered. |
+| Maya    | Stop one subagent                                                               | Native Claude cards explained "Stop the parent turn to stop Claude subagents" and offered no button. MCP and OpenCode cards offer Stop (unit tested, not driven in the app).    |
+| Jordan  | Find a reviewer the planner spawned in another worktree                         | The planner showed a "(+1)" count and a reference row "Reviewer · in worktree …" under it. The reviewer's own row said "spawned by Planner".                                    |
+
+Not covered: a real Claude adapter (it advertises no child prompt capability, so the enabled composer is covered by unit tests only), Stop and Stop all against live OpenCode and MCP children, OpenCode children nested in the sidebar, and the Ship dependency map's Open button (unit tested). The narrow sidebar clips the "(+N)" count when a long status label shows next to it.

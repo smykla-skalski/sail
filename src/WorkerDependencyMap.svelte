@@ -87,10 +87,10 @@
                     <dt>Owner</dt>
                     <dd>{node.owner}</dd>
                   </div>
-                  <div>
-                    <dt>Checks</dt>
-                    <dd>{node.checkState}</dd>
-                  </div>
+                  {#if node.checkState !== null}<div>
+                      <dt>Checks</dt>
+                      <dd>{node.checkState}</dd>
+                    </div>{/if}
                   <div>
                     <dt>Blocked by</dt>
                     <dd>{dependencies(node.id).join(', ') || 'Nothing'}</dd>
@@ -102,6 +102,13 @@
                   {#if node.issue?.path && node.issue.threadId && !node.issue.worktreeUnavailable}
                     <button onclick={() => openWorker(node.issue!.path!, node.issue!.threadId!)}
                       >Worker</button
+                    >
+                  {/if}
+                  {#if node.thread}
+                    <button
+                      aria-label={`Open ${node.label} subagent`}
+                      onclick={() => openWorker(node.thread!.path, node.thread!.threadId)}
+                      >Open</button
                     >
                   {/if}
                   {#each node.issue?.checks?.filter((check) => check.url) ?? [] as check (`${check.name}:${check.url}`)}
@@ -131,9 +138,14 @@
                 <td>{node.owner}</td>
                 <td>{node.state}{node.blockingReason ? ` — ${node.blockingReason}` : ''}</td>
                 <td>{dependencies(node.id).join(', ') || 'Nothing'}</td>
-                <td>{node.checkState}</td>
+                <td>{node.checkState ?? '—'}</td>
                 <td class="table-actions">
                   {#if node.issue}<button onclick={() => onselect(node.id)}>Details</button>{/if}
+                  {#if node.thread}<button
+                      aria-label={`Open ${node.label} subagent`}
+                      onclick={() => openWorker(node.thread!.path, node.thread!.threadId)}
+                      >Open</button
+                    >{/if}
                   {#if node.url}<a href={node.url} target="_blank" rel="noreferrer">Issue</a>{/if}
                   {#if node.issue?.path && node.issue.threadId && !node.issue.worktreeUnavailable}
                     <button onclick={() => openWorker(node.issue!.path!, node.issue!.threadId!)}
@@ -246,11 +258,14 @@
     background: var(--sui-surface);
   }
   .map-node[data-state='blocked'],
+  .map-node[data-state='closed without merge'],
   .map-node[data-state='failed'],
   .map-node.error {
     border-left-color: var(--sui-danger);
   }
   .map-node[data-state='waiting'],
+  .map-node[data-state='waiting for input'],
+  .map-node[data-state='awaiting merge'],
   .map-node[data-state='queued'] {
     border-left-color: var(--activity-waiting);
   }

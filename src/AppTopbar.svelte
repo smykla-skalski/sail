@@ -3,12 +3,14 @@
   import HarnessIcon from './HarnessIcon.svelte';
   import MenuButton from './MenuButton.svelte';
   import type { AgentAvailability, AgentId } from './lib/acp';
-  import {
-    ariaKeyShortcutsFor,
-    detectShortcutPlatform,
-    shortcutFor,
-    shortcutLabel,
-  } from './lib/shortcuts';
+  import { ariaKeyShortcutsFor, shortcutFor, shortcutLabel } from './lib/shortcuts';
+
+  export type TopbarSubagentNav = {
+    parentTitle: string;
+    position: string;
+    hasPrevious: boolean;
+    hasNext: boolean;
+  };
 
   export type TopbarThreadActions =
     | { kind: 'agent'; title: string; ondelete: () => void }
@@ -53,6 +55,9 @@
     changesTitle,
     changesExpanded,
     ontogglechanges,
+    subagentNav = null,
+    onsubagentparent,
+    onsubagentsibling,
   }: {
     element?: HTMLElement;
     sidebarToggle?: HTMLButtonElement;
@@ -90,9 +95,15 @@
     changesTitle: string;
     changesExpanded: boolean;
     ontogglechanges: () => void;
+    subagentNav?: TopbarSubagentNav | null;
+    onsubagentparent?: () => void;
+    onsubagentsibling?: (direction: -1 | 1) => void;
   } = $props();
 
-  const paletteShortcut = shortcutLabel(shortcutFor('palette.open'), detectShortcutPlatform());
+  const platform = /Mac|iPhone|iPad/.test(globalThis.navigator?.platform ?? '') ? 'mac' : 'other';
+  const keyLabel = (id: 'subagent.parent' | 'subagent.previous' | 'subagent.next') =>
+    shortcutLabel(shortcutFor(id), platform);
+  const paletteShortcut = shortcutLabel(shortcutFor('palette.open'), platform);
 
   const threadLabel = $derived(
     [
@@ -131,9 +142,46 @@
         title={directory || undefined}
         onclick={onchooseproject}
         disabled={projectDisabled}>{projectName} ⌄</button
-      ><span class="slash">/</span><strong title={conversationTitle}>{conversationTitle}</strong
+      ><span class="slash">/</span>{#if subagentNav}<button
+          class="breadcrumb-project breadcrumb-parent"
+          title={`Parent thread: ${subagentNav.parentTitle}`}
+          aria-label={`Go to parent thread ${subagentNav.parentTitle}`}
+          onclick={onsubagentparent}>{subagentNav.parentTitle}</button
+        ><span class="slash">/</span>{/if}<strong title={conversationTitle}
+        >{conversationTitle}</strong
       >{/if}
   </div>
+  {#if subagentNav && !overview}
+    <div class="subagent-nav" role="group" aria-label="Subagent navigation">
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-label="Go to parent thread"
+        aria-keyshortcuts={ariaKeyShortcutsFor('subagent.parent')}
+        title={`Parent thread (${keyLabel('subagent.parent')})`}
+        onclick={onsubagentparent}>↑ Parent</Button
+      >
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-label="Previous sibling subagent"
+        aria-keyshortcuts={ariaKeyShortcutsFor('subagent.previous')}
+        title={`Previous sibling (${keyLabel('subagent.previous')})`}
+        disabled={!subagentNav.hasPrevious}
+        onclick={() => onsubagentsibling?.(-1)}>‹</Button
+      >
+      <span class="subagent-nav-position" aria-live="polite">{subagentNav.position}</span>
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-label="Next sibling subagent"
+        aria-keyshortcuts={ariaKeyShortcutsFor('subagent.next')}
+        title={`Next sibling (${keyLabel('subagent.next')})`}
+        disabled={!subagentNav.hasNext}
+        onclick={() => onsubagentsibling?.(1)}>›</Button
+      >
+    </div>
+  {/if}
   <div class="topbar-actions">
     <div class="topbar-primary">
       <Button

@@ -56,6 +56,7 @@
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
   import { withSpawnResponses, type SpawnReceipt } from './lib/agent-results';
+  import type { SubagentControl } from './lib/subagent-control';
   import type { BrowserAttachment } from './lib/browser-pick';
   import {
     coordinationMessageForText,
@@ -107,6 +108,7 @@
     coordinationMessages = [],
     spawnReceipts = [],
     onopensubagent,
+    subagentControl,
     postTurnChecks = [],
     onretrycheck,
     focused,
@@ -137,6 +139,7 @@
     coordinationMessages?: CoordinationMessage[];
     spawnReceipts?: SpawnReceipt[];
     onopensubagent?: (receipt: SpawnReceipt) => Promise<void>;
+    subagentControl?: SubagentControl;
     postTurnChecks?: PostTurnCheck[];
     onretrycheck: (check: PostTurnCheck) => void;
     focused: boolean;
@@ -1190,7 +1193,7 @@
         </ChatMessage>
       {/each}
       <PostTurnChecks checks={postTurnChecks} onretry={onretrycheck} />
-      <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
+      <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} control={subagentControl} />
       {#if running}<div class="agent-busy" role="status">
           <ActivityStatus status={visibleStatus} /><Button
             size="sm"

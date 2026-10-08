@@ -25,12 +25,18 @@
   import type { DiffComment } from './lib/diff-comments';
   import { coordinationKey, type CoordinationMessage } from './lib/coordination';
   import { spawnReceiptsForSource, type SpawnReceipt } from './lib/agent-results';
+  import type { SubagentControl } from './lib/subagent-control';
   import type { ThreadStatus } from './lib/attention';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import type { ReviewCapture, ReviewPreview } from './lib/review-evidence';
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import type { PublishedGraph } from './lib/issue-graph';
-  import type { DirectShipAuthorization, ShipIssue, ShipRun } from './lib/issue-shipping';
+  import type {
+    DirectShipAuthorization,
+    MergeOwner,
+    ShipIssue,
+    ShipRun,
+  } from './lib/issue-shipping';
   import type { ActivityHistoryEvent } from './lib/activity-history';
   import type { WorkspaceActivityItem } from './lib/workspace-activity';
   import type { ShipItIssue } from './lib/implementation-models';
@@ -70,9 +76,11 @@
     coordinationMessages: CoordinationMessage[];
     spawnReceipts: SpawnReceipt[];
     onopensubagent: (receipt: SpawnReceipt) => Promise<void>;
+    subagentControl?: SubagentControl;
     shipRuns: ShipRun[];
     shipNeedsInput: number;
     shippingBusy: boolean;
+    mergeOwner?: MergeOwner;
     nativeSubagents: NativeSubagent[];
     onshiprefresh: () => Promise<void>;
     onshipopen: (path: string, threadId?: string | null) => Promise<void>;
@@ -172,9 +180,11 @@
     coordinationMessages,
     spawnReceipts,
     onopensubagent,
+    subagentControl,
     shipRuns,
     shipNeedsInput,
     shippingBusy,
+    mergeOwner = 'you',
     nativeSubagents,
     onshiprefresh,
     onshipopen,
@@ -597,9 +607,11 @@
       {coordinationMessages}
       {spawnReceipts}
       {onopensubagent}
+      {subagentControl}
       {shipRuns}
       {shipNeedsInput}
       {shippingBusy}
+      {mergeOwner}
       {nativeSubagents}
       {onshiprefresh}
       {onshipopen}
@@ -710,9 +722,11 @@
       {coordinationMessages}
       {spawnReceipts}
       {onopensubagent}
+      {subagentControl}
       {shipRuns}
       {shipNeedsInput}
       {shippingBusy}
+      {mergeOwner}
       {nativeSubagents}
       {onshiprefresh}
       {onshipopen}
@@ -929,6 +943,7 @@
                 directory,
               )}
               {onopensubagent}
+              {subagentControl}
               focused={focused === pane.id}
               focusPrompt={focusPromptPane === pane.id}
               picked={pickedAttachments[pane.id]}
@@ -1018,6 +1033,7 @@
                     repository={project}
                     runs={shipRuns}
                     busy={shippingBusy}
+                    {mergeOwner}
                     {nativeSubagents}
                     onclose={closeNativeDetails}
                     onrefresh={onshiprefresh}
@@ -1099,6 +1115,7 @@
                 directory,
               )}
               {onopensubagent}
+              {subagentControl}
               postTurnChecks={postTurnChecks.filter(
                 (check) =>
                   pane.thread &&
@@ -1178,6 +1195,7 @@
                     repository={project}
                     runs={shipRuns}
                     busy={shippingBusy}
+                    {mergeOwner}
                     {nativeSubagents}
                     onclose={closeAcpDetails}
                     onrefresh={onshiprefresh}
