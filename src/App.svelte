@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyboardScrollable } from './lib/scroll-focus';
   class ValidationCandidateUnavailable extends Error {
     constructor(message: string, cause?: unknown) {
       super(cause === undefined ? message : `${message}: ${describe(cause)}`, { cause });
@@ -15473,6 +15474,7 @@
               <div
                 class="conversation"
                 bind:this={chatScroll}
+                {@attach keyboardScrollable}
                 onscroll={() => {
                   followChat = chatScroll ? nearBottom(chatScroll) : true;
                   if (chatScroll && chatScroll.scrollTop <= 80) void loadOlderMessages();

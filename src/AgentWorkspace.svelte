@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyboardScrollable } from './lib/scroll-focus';
   import { onMount, tick, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
@@ -2331,6 +2332,7 @@
       class="agent-conversation conversation"
       role="region"
       bind:this={scroll}
+      {@attach keyboardScrollable}
       onscroll={() => {
         autoFollow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80;
         if (scroll.scrollTop <= 80 && !historyLoading) void showEarlier();
