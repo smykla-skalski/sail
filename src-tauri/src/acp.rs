@@ -1617,3 +1617,160 @@ pub async fn acp_authenticate(
     .await
     .map_err(|error| error.to_string())?
 }
+
+#[cfg(test)]
+mod session_config_tests {
+    use super::*;
+    use crate::browser_agent::McpConfig;
+    use std::collections::BTreeMap;
+
+    fn config(token: &str, env: &[(&str, &str)]) -> McpConfig {
+        McpConfig {
+            command: "/Applications/Sail.app/Contents/MacOS/sail".into(),
+            args: vec!["--browser-mcp".into()],
+            env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            token: token.into(),
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "sail-session-config-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn request_params_are_identical_whatever_the_env_insertion_order() {
+        let first = config(
+            "token",
+            &[
+                ("SAIL_BROWSER_PORT", "4100"),
+                ("SAIL_BROWSER_TOKEN", "token"),
+            ],
+        );
+        let second = config(
+            "token",
+            &[
+                ("SAIL_BROWSER_TOKEN", "token"),
+                ("SAIL_BROWSER_PORT", "4100"),
+            ],
+        );
+        let params = |config: &McpConfig| {
+            serde_json::to_string(&session_request_params(
+                "/work/repo",
+                Some("session"),
+                &mcp_server(config),
+            ))
+            .unwrap()
+        };
+        assert_eq!(params(&first), params(&second));
+        assert_eq!(params(&first), params(&first));
+        let request = session_request_params("/work/repo", None, &mcp_server(&first));
+        let env = &request["mcpServers"][0]["env"];
+        assert_eq!(env[0]["name"], "SAIL_BROWSER_PORT");
+        assert_eq!(env[1]["name"], "SAIL_BROWSER_TOKEN");
+        assert!(request.get("sessionId").is_none());
+    }
+
+    #[test]
+    fn restoring_a_session_reuses_its_first_parameters() {
+        let directory = scratch("reuse");
+        let cwd = directory.to_string_lossy().into_owned();
+        let mut configs = HashMap::new();
+        let mut minted = 0;
+        let mut released = Vec::new();
+        let first = reuse_session_config(
+            &mut configs,
+            "session",
+            &cwd,
+            || {
+                minted += 1;
+                Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
+            },
+            |token| released.push(token.to_string()),
+        )
+        .unwrap();
+        let second = reuse_session_config(
+            &mut configs,
+            "session",
+            &cwd,
+            || {
+                minted += 1;
+                Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
+            },
+            |token| released.push(token.to_string()),
+        )
+        .unwrap();
+        assert_eq!(minted, 1);
+        assert!(released.is_empty());
+        assert_eq!(first.token, "first");
+        assert_eq!(
+            session_request_params(&first.cwd, Some("session"), &first.server),
+            session_request_params(&second.cwd, Some("session"), &second.server)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_to_the_same_directory_keeps_the_original_cwd() {
+        let directory = scratch("symlink");
+        let link = directory.with_extension("link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        let mut configs = HashMap::new();
+        let original = directory.to_string_lossy().into_owned();
+        reuse_session_config(
+            &mut configs,
+            "session",
+            &original,
+            || Ok(config("first", &[])),
+            |_| {},
+        )
+        .unwrap();
+        let through_link = reuse_session_config(
+            &mut configs,
+            "session",
+            &link.to_string_lossy(),
+            || Err("a symlinked path must not mint a new config".into()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(through_link.cwd, original);
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn moving_a_session_to_another_directory_mints_and_releases() {
+        let first_directory = scratch("before");
+        let second_directory = scratch("after");
+        let mut configs = HashMap::new();
+        let mut released = Vec::new();
+        reuse_session_config(
+            &mut configs,
+            "session",
+            &first_directory.to_string_lossy(),
+            || Ok(config("first", &[])),
+            |token| released.push(token.to_string()),
+        )
+        .unwrap();
+        let moved = reuse_session_config(
+            &mut configs,
+            "session",
+            &second_directory.to_string_lossy(),
+            || Ok(config("second", &[])),
+            |token| released.push(token.to_string()),
+        )
+        .unwrap();
+        assert_eq!(moved.token, "second");
+        assert_eq!(released, vec!["first".to_string()]);
+        std::fs::remove_dir_all(first_directory).unwrap();
+        std::fs::remove_dir_all(second_directory).unwrap();
+    }
+}
