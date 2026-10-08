@@ -213,6 +213,7 @@ mod diagnostics;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
+mod opencode_config;
 mod post_turn_checks;
 mod settings;
 mod shell_command;
@@ -2862,6 +2863,7 @@ pub fn run() {
             settings::get_acp_turn_evidence,
             start_runtime,
             repository_path_available,
+            opencode_config::opencode_plan_review_plugin,
             validate_repository,
             list_picker_directory,
             working_tree_diff,

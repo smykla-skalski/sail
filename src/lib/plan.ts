@@ -34,7 +34,7 @@ const PlanStepSchema = z.object({
     .optional(),
 });
 
-const PlanSchema = z.object({
+export const PlanSchema = z.object({
   title: z.string(),
   summary: z.string(),
   diagram: z.string().optional(),
@@ -69,7 +69,7 @@ const PlanQuestionSchema = z.object({
   recommended: z.array(z.string()).optional(),
 });
 
-const PlanQuestionsSchema = z.object({
+export const PlanQuestionsSchema = z.object({
   id: z.string(),
   sessionID: z.string(),
   questions: z.array(PlanQuestionSchema),
@@ -80,7 +80,7 @@ const PlanSnapshotSchema = z.object({
   questions: PlanQuestionsSchema.nullable(),
 });
 
-const HistoryEntrySchema = z.object({
+export const HistoryEntrySchema = z.object({
   id: z.number().int().positive(),
   at: z.number(),
   reason: z.enum(['proposed', 'reviewed', 'amended', 'step', 'checkpoint', 'done', 'touch']),
@@ -279,6 +279,27 @@ export async function answerQuestions(
     await call(client, directory, 'answer', { sessionID, id, answers }),
   );
   if (!result.ok) throw new Error(result.error ?? 'The answers were not accepted.');
+}
+
+/** How a plan panel reaches whichever agent owns the session. */
+export interface PlanBackend {
+  latest(sessionID: string): Promise<PlanSnapshot>;
+  review(
+    plan: Plan,
+    action: 'revise' | 'execute',
+    decisions: PlanDecision[],
+    note?: string,
+  ): Promise<void>;
+  answer(sessionID: string, id: string, answers: Record<string, string[]>): Promise<void>;
+}
+
+export function openCodePlanBackend(client: OpenCodeClient, directory: string): PlanBackend {
+  return {
+    latest: (sessionID) => getPlan(client, directory, sessionID),
+    review: (plan, action, decisions, note) =>
+      reviewPlan(client, directory, plan, action, decisions, note),
+    answer: (sessionID, id, answers) => answerQuestions(client, directory, sessionID, id, answers),
+  };
 }
 
 export function reviewInput(

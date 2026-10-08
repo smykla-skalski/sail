@@ -21,7 +21,7 @@ A desktop workspace for coding-agent work. Sail hosts OpenCode planning sessions
 - In **Changes**, click a diff line or Shift-click a range, write a comment, and add it to the draft list. Press ⌘Enter to send all pending comments to that agent in one message. Comments follow matching lines after a refresh; removed lines appear as outdated.
 - Switch a changed file between **All**, **Staged**, and **Unstaged** to stage or unstage a file or hunk. Revert unstaged changes after confirming; Sail rejects actions when the diff has changed since it loaded.
 - Sail runs pinned ACP adapters on demand. The first launch downloads the adapter through `npx`; later launches use npm's cache. Each agent uses its own authentication and configuration. Codex can open its ChatGPT sign-in flow inside Sail when needed.
-- Threads are saved per repository and agent. Reopening a thread replays its history from the agent. The Architect plan and review workflow remains on OpenCode.
+- Threads are saved per repository and agent. Reopening a thread replays its history from the agent. Claude and Codex threads propose structured plans through Sail's `sail_plan_*` tools and use the same Plan view; see [plan review for ACP agents](docs/plan-review.md). The Architect workflow remains on OpenCode.
 
 ## Development
 
