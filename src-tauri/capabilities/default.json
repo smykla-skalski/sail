@@ -58,6 +58,8 @@
     "allow-complete-predecessor-shipping-claim-fence",
     "allow-heartbeat-shipping-claim",
     "allow-release-shipping-claim",
+    "allow-ship-merge-pull-request",
+    "allow-ship-issue-title",
     "allow-pull-request-checks",
     "allow-failed-check-log",
     "allow-open-pull-request",

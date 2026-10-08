@@ -1689,7 +1689,7 @@ pub fn run_mcp_stdio() {
                                     "objective":{"type":"string","minLength":1},
                                     "acceptanceCriteria":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},
                                     "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","review","test","pr","complete"]},
-                                    "status":{"type":"string","enum":["active","blocked","completed"]},
+                                    "status":{"type":"string","enum":["active","blocked","completed","cancelled","failed"]},
                                     "requiredGates":{"type":"array","items":{"type":"string","minLength":1}},
                                     "blocker":{"type":["string","null"]},
                                     "unresolvedQuestions":{"type":"array","items":{"type":"string","minLength":1}},

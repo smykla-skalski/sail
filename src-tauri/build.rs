@@ -68,6 +68,8 @@ fn main() {
             "complete_predecessor_shipping_claim_fence",
             "heartbeat_shipping_claim",
             "release_shipping_claim",
+            "ship_merge_pull_request",
+            "ship_issue_title",
             "pull_request_checks",
             "failed_check_log",
             "open_pull_request",

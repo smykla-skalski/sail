@@ -11,6 +11,7 @@
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import WorkspaceActivity from './WorkspaceActivity.svelte';
   import ShipPanel from './ShipPanel.svelte';
+  import type { ShipActionId } from './lib/ship-actions';
   import EmptyPanePicker from './EmptyPanePicker.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
   import TerminalPane from './TerminalPane.svelte';
@@ -86,6 +87,9 @@
     onshipopen: (path: string, threadId?: string | null) => Promise<void>;
     onshipsettings: () => Promise<void>;
     onshiphandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
+    onshipaction: (id: ShipActionId, run: ShipRun, issue: ShipIssue | null) => Promise<string>;
+    ondismissshipnotice: () => void;
+    shipArchiveNotice?: number;
     onship: (
       graph: PublishedGraph,
       provider: ShipRun['provider'],
@@ -190,6 +194,9 @@
     onshipopen,
     onshipsettings,
     onshiphandoff,
+    onshipaction,
+    ondismissshipnotice,
+    shipArchiveNotice = 0,
     onship,
     onshipit,
     postTurnChecks,
@@ -617,6 +624,9 @@
       {onshipopen}
       {onshipsettings}
       {onshiphandoff}
+      {onshipaction}
+      {ondismissshipnotice}
+      {shipArchiveNotice}
       {onship}
       {onshipit}
       {postTurnChecks}
@@ -732,6 +742,9 @@
       {onshipopen}
       {onshipsettings}
       {onshiphandoff}
+      {onshipaction}
+      {ondismissshipnotice}
+      {shipArchiveNotice}
       {onship}
       {onshipit}
       {postTurnChecks}
@@ -1043,6 +1056,9 @@
                     }}
                     onsettings={onshipsettings}
                     onhandoff={onshiphandoff}
+                    onaction={onshipaction}
+                    ondismissnotice={ondismissshipnotice}
+                    archiveNotice={shipArchiveNotice}
                   />
                 {:else if nativeTab === 'history'}
                   <PlanHistoryPanel
@@ -1205,6 +1221,9 @@
                     }}
                     onsettings={onshipsettings}
                     onhandoff={onshiphandoff}
+                    onaction={onshipaction}
+                    ondismissnotice={ondismissshipnotice}
+                    archiveNotice={shipArchiveNotice}
                   />
                 {:else if acpTab === 'activity'}
                   <WorkspaceActivity

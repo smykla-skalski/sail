@@ -1399,6 +1399,7 @@ const shipIssueSchema = z.object({
   setupStarted: z.boolean().optional(),
   setupCompleted: z.boolean().optional(),
   archivePath: nullableString.optional(),
+  cancelledAt: z.number().int().nonnegative().optional(),
   stage: z.string().optional(),
   reportedStatus: z.enum(['running', 'blocked']).optional(),
   pullRequestState: z.string().optional(),
@@ -1561,6 +1562,9 @@ const shipRunSchema = z.object({
   dependencyErrors: z.record(z.string(), z.string()).default({}),
   issues: z.array(shipIssueSchema),
   umbrella: z.object({ number: z.number(), title: z.string(), url: z.string() }).optional(),
+  archivedAt: z.number().int().nonnegative().optional(),
+  archivedBy: z.enum(['auto', 'user']).optional(),
+  unarchivedAt: z.number().int().nonnegative().optional(),
 });
 
 export function loadShipRuns(raw: string | null): ShipRun[] {

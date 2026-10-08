@@ -3,6 +3,7 @@ import type { SetupReport } from './onboarding';
 import type { ValidationSettings } from './cross-validation';
 import type { ModelRoutingSettings } from './model-routing';
 import type { MergeOwner } from './issue-shipping';
+import type { ShipArchiveDelay } from './ship-archive';
 import type {
   NotificationPreference,
   NotificationPrefs,
@@ -38,6 +39,7 @@ export type SettingsSnapshot = {
   agentThreadListEnabled: boolean;
   agentMessagesEnabled: boolean;
   mergeOwner: MergeOwner;
+  shipArchiveDelay: ShipArchiveDelay;
   contextHandoffThreshold: number;
 };
 
@@ -54,6 +56,7 @@ export type SettingsAction =
   | { type: 'agent-thread-list'; value: boolean }
   | { type: 'agent-messages'; value: boolean }
   | { type: 'merge-owner'; value: MergeOwner }
+  | { type: 'ship-archive-delay'; value: ShipArchiveDelay }
   | { type: 'context-handoff-threshold'; value: number }
   | { type: 'detect-agents' }
   | { type: 'cross-validation'; value: ValidationSettings }

@@ -17,6 +17,11 @@
   } from './lib/model-routing';
   import { shipRiskLevels, type ShipRisk } from './lib/ship-risk-policy';
   import {
+    defaultShipArchiveDelay,
+    parseShipArchiveDelay,
+    shipArchiveDelays,
+  } from './lib/ship-archive';
+  import {
     settingsAction,
     settingsRequest,
     settingsState,
@@ -596,6 +601,28 @@
         >
           <option value="you">You</option>
           <option value="agent">Agent, per repository release policy</option>
+        </select>
+      </section>
+      <section class="settings-card">
+        <h2>Ship archive</h2>
+        <p>
+          Archive a Ship run after all its issues are merged or closed and its claims are released.
+          Archiving only hides the run: checkpoints, evidence, branches and worktrees stay, and the
+          Archived filter brings it back.
+        </p>
+        <label for="ship-archive-delay">Archive finished runs</label>
+        <select
+          id="ship-archive-delay"
+          value={snapshot?.shipArchiveDelay ?? defaultShipArchiveDelay}
+          onchange={(event) =>
+            send({
+              type: 'ship-archive-delay',
+              value: parseShipArchiveDelay(event.currentTarget.value),
+            })}
+        >
+          {#each shipArchiveDelays as option (option.value)}
+            <option value={option.value}>{option.label}</option>
+          {/each}
         </select>
       </section>
       <section class="settings-card">
