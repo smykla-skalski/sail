@@ -2929,6 +2929,8 @@ pub fn run() {
             acp::acp_permission,
             acp::acp_permission_resources_trusted,
             acp::acp_pending_permissions,
+            acp::acp_pending_elicitations,
+            acp::acp_elicitation,
             acp::acp_pending_inbox,
             acp::acp_activity,
             acp::acp_native_subagents,

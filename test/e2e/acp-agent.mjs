@@ -7,6 +7,7 @@ import { join } from 'node:path';
 const sessions = new Map();
 const delayedSessionDirectories = new Set();
 const permissions = new Map();
+const elicitations = new Map();
 const activePrompts = new Map();
 const steerWaiters = new Map();
 const terminalRequests = new Map();
@@ -378,6 +379,26 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    if (text === 'Ask structured question') {
+      const id = ++nextPermission;
+      elicitations.set(id, { sessionId, promptId: message.id });
+      send({
+        id,
+        method: 'elicitation/create',
+        params: {
+          sessionId,
+          mode: 'form',
+          message: 'Choose the delivery approach',
+          requestedSchema: {
+            type: 'object',
+            title: 'Delivery approach',
+            properties: { approach: { type: 'string', enum: ['safe', 'fast'], default: 'safe' } },
+            required: ['approach'],
+          },
+        },
+      });
+      continue;
+    }
     if (text === 'Agent interrupted') {
       send({ id: message.id, result: { stopReason: 'cancelled' } });
       continue;
@@ -976,6 +997,18 @@ for await (const line of createInterface({ input: process.stdin })) {
         else finish();
       }
     }
+  } else if (message.id != null && elicitations.has(message.id)) {
+    const pending = elicitations.get(message.id);
+    elicitations.delete(message.id);
+    const text =
+      message.result?.action === 'accept'
+        ? `Selected: ${message.result.content?.approach}`
+        : message.result?.action;
+    update(pending.sessionId, {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text },
+    });
+    send({ id: pending.promptId, result: { stopReason: 'end_turn' } });
   } else if (message.id != null && permissions.has(message.id)) {
     const pending = permissions.get(message.id);
     permissions.delete(message.id);

@@ -8618,6 +8618,21 @@
         const location = byDirectory.get(thread.directory);
         if (!location) continue;
         const nativeChild = nativeSubagents[nativeSubagentId(pending.agent, sessionId)];
+        if (pending.message.method === 'elicitation/create') {
+          const message = pending.message.params?.message;
+          items.push({
+            ...location,
+            key: `elicitation:${pending.agent}:${sessionId}:${requestId}`,
+            kind: 'question',
+            agent: `${agentAvailability.find((item) => item.id === pending.agent)?.name ?? pending.agent}${nativeChild ? ` · ${nativeChild.name}` : ''}`,
+            agentId: pending.agent,
+            sessionId,
+            requestId,
+            text: typeof message === 'string' ? message : 'Agent question',
+            receivedAt: pending.receivedAt,
+          });
+          continue;
+        }
         const tool = pending.message.params?.toolCall;
         const title =
           tool && typeof tool === 'object' && 'title' in tool && typeof tool.title === 'string'
@@ -10641,7 +10656,7 @@
       }
       return;
     }
-    if (item.kind === 'acp-permission') {
+    if (item.kind === 'acp-permission' || item.kind === 'question') {
       const thread = [...agentThreads, ...nativeChildThreads].find(
         (entry) =>
           entry.agent === item.agentId &&
@@ -12374,6 +12389,8 @@
     }
     if (
       event.message.method === 'session/request_permission' ||
+      event.message.method === 'elicitation/create' ||
+      event.message.method === '$/cancel_request' ||
       event.message.method === 'sail/permission_resolved' ||
       event.message.method === 'sail/disconnected'
     )
