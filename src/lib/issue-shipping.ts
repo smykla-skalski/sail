@@ -490,6 +490,19 @@ export function claimMonotonicLeaseDeadline(monotonicStart: number, claim: Shipp
   return monotonicStart + Math.max(0, remaining);
 }
 
+export function recoveredClaimLeaseDeadlines(
+  monotonicNow: number,
+  wallNow: number,
+  claim: ShippingClaim,
+): { monotonic: number; wall: number } {
+  const remaining = Date.parse(claim.expiresAt) - wallNow;
+  const boundedRemaining = Number.isFinite(remaining) ? Math.max(0, remaining) : 0;
+  return {
+    monotonic: monotonicNow + boundedRemaining,
+    wall: wallNow + boundedRemaining,
+  };
+}
+
 export function shippingClockWasSuspended(
   previousWall: number,
   previousMonotonic: number,
@@ -542,21 +555,26 @@ export async function fencePredecessorWorkerBeforeTakeover(
   return { observation, fenced: !observation.active };
 }
 
-export function predecessorTakeoverChanges(): Partial<ShipIssue> {
+export function predecessorTakeoverChanges(issue: ShipIssue): Partial<ShipIssue> {
+  const terminal = issue.state === 'merged' || issue.state === 'failed';
   return {
-    state: 'pending',
+    ...(terminal ? {} : { state: 'pending' as const }),
     claim: undefined,
-    receiptId: null,
-    threadId: null,
-    workerSettled: false,
-    workerState: undefined,
+    ...(terminal
+      ? {}
+      : {
+          receiptId: null,
+          threadId: null,
+          workerSettled: false,
+          workerState: undefined,
+          error: null,
+        }),
     claimFencePending: false,
     claimRevalidationPending: false,
     claimHandoffPending: false,
     dispatchFencePending: false,
     blockedReason: null,
     refreshError: null,
-    error: null,
   };
 }
 

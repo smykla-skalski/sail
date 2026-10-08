@@ -105,6 +105,7 @@
     predecessorTakeoverChanges,
     promptDispatchAdmissionVisible,
     recoverOpenCodePromptAdmission,
+    recoveredClaimLeaseDeadlines,
     readyShipIssues,
     registeredShipBranch,
     refreshShippingIssueAfterClaim,
@@ -3667,6 +3668,8 @@
   async function reconcileForeignShippingClaim(run: ShipRun, issue: ShipIssue): Promise<void> {
     const claim = issue.claim;
     if (!claim || claim.status !== 'active') return;
+    const validationKey = `${run.id}:${issue.id}:${claim.id}:${claim.commentId}`;
+    scheduleRecoveredShippingClaimLeaseFence(run, issue, validationKey, claim);
     try {
       const { observation, fenced } = await fencePredecessorWorkerBeforeTakeover(
         () =>
@@ -3697,16 +3700,33 @@
           }),
       );
       if (!fenced) {
+        if (issue.claim?.id !== claim.id || issue.claim.commentId !== claim.commentId) return;
         await updateShipIssue(run, issue, { claim: observation.claim, refreshError: null });
+        scheduleRecoveredShippingClaimLeaseFence(run, issue, validationKey, observation.claim);
         return;
       }
       if (!issue.workerSettled) return;
-      await updateShipIssue(run, issue, predecessorTakeoverChanges());
+      shipClaimLeaseDeadlines.delete(validationKey);
+      shipClaimLeaseWallDeadlines.delete(validationKey);
+      clearShippingClaimLeaseFence(validationKey);
+      await updateShipIssue(run, issue, predecessorTakeoverChanges(issue));
     } catch (cause) {
       await updateShipIssue(run, issue, {
         refreshError: `Foreign claim reconciliation failed: ${describe(cause)}`,
       });
     }
+  }
+
+  function scheduleRecoveredShippingClaimLeaseFence(
+    run: ShipRun,
+    issue: ShipIssue,
+    validationKey: string,
+    claim: ShippingClaim,
+  ): void {
+    const deadlines = recoveredClaimLeaseDeadlines(performance.now(), Date.now(), claim);
+    shipClaimLeaseDeadlines.set(validationKey, deadlines.monotonic);
+    shipClaimLeaseWallDeadlines.set(validationKey, deadlines.wall);
+    scheduleShippingClaimLeaseFence(run, issue, validationKey, deadlines.monotonic);
   }
 
   async function fenceRecoveredShippingWorker(
