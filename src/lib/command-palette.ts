@@ -331,9 +331,16 @@ export function searchCommandPalette({
     label: 'New session',
     detail: `Start with ${agents.find((agent) => agent.id === step.agent)?.name ?? step.agent}`,
   };
+  const seen = new Set<string>();
   const existing: PaletteEntry[] = threads
     .filter((thread) => thread.directory === step.directory && thread.agent === step.agent)
     .toSorted((a, b) => b.updated - a.updated)
+    .filter((thread) => {
+      // A saved thread and its session/list entry name one session.
+      if (seen.has(thread.sessionId)) return false;
+      seen.add(thread.sessionId);
+      return true;
+    })
     .map((thread) => ({
       id: `thread:${thread.agent}:${thread.directory}:${thread.sessionId}`,
       kind: 'thread',

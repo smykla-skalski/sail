@@ -518,6 +518,25 @@ await test('ACP listing pages through the cursor and keeps only the asked direct
   );
 });
 
+await test('ACP listing skips entries without a session id', async () => {
+  const threads = await listSidebarAcpThreads(
+    'opencode',
+    () =>
+      Promise.resolve({
+        sessions: [
+          { sessionId: '', cwd: '/repo/a', title: 'Empty id' },
+          { sessionId: '  ', cwd: '/repo/a', title: 'Blank id' },
+          { sessionId: 'ses_ok', cwd: '/repo/a', title: 'Real' },
+        ],
+      }),
+    '/repo/a',
+  );
+  assert.deepEqual(
+    threads.map((thread) => thread.sessionId),
+    ['ses_ok'],
+  );
+});
+
 await test('ACP listing failure reaches the caller instead of an empty list', async () => {
   await assert.rejects(
     listSidebarAcpThreads('opencode', () => Promise.reject(new Error('agent exited')), '/repo/a'),

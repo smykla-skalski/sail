@@ -150,10 +150,11 @@ function migratePane(
   return value;
 }
 
-function migrateLayouts(port: SettingsPort, threads: Json[]): void {
+/** False when the saved layouts are unreadable, so the legacy session pointers must stay. */
+function migrateLayouts(port: SettingsPort, threads: Json[]): boolean {
   const raw = port.get('sai-pane-layouts');
   const layouts = record(raw === null ? {} : parse(port, 'sai-pane-layouts'));
-  if (!layouts) return;
+  if (!layouts) return false;
   const next: Json = { ...layouts };
   const sessions = new Map<string, string>();
   for (const key of port.keys().filter((item) => item.startsWith(sessionPrefix))) {
@@ -168,6 +169,7 @@ function migrateLayouts(port: SettingsPort, threads: Json[]): void {
     next[directory] = migratePane(layout, directory, sessionId, threads);
   }
   if (raw !== null || Object.keys(next).length) write(port, 'sai-pane-layouts', raw, next);
+  return true;
 }
 
 function migrateReceipts(port: SettingsPort): void {
@@ -242,8 +244,11 @@ function migrateImplementationOwners(port: SettingsPort): void {
  */
 export function migrateOpenCodeSettings(port: SettingsPort): boolean {
   if (port.get(openCodeMigrationKey) === '1') return false;
+  let layoutsMigrated = false;
   const steps: ((target: SettingsPort) => void)[] = [
-    (target) => migrateLayouts(target, migrateThreads(target)),
+    (target) => {
+      layoutsMigrated = migrateLayouts(target, migrateThreads(target));
+    },
     migrateReceipts,
     migrateShipRuns,
     migrateCoordination,
@@ -257,7 +262,9 @@ export function migrateOpenCodeSettings(port: SettingsPort): boolean {
       continue;
     }
   }
-  for (const key of port.keys().filter((item) => item.startsWith(sessionPrefix))) port.remove(key);
+  if (layoutsMigrated)
+    for (const key of port.keys().filter((item) => item.startsWith(sessionPrefix)))
+      port.remove(key);
   port.set(openCodeMigrationKey, '1');
   return true;
 }

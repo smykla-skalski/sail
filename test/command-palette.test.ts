@@ -145,6 +145,28 @@ void test('session step offers new first, then only matching worktree sessions',
   assert.equal(search(step, 'newest')[0]?.thread?.sessionId, 'new');
 });
 
+void test('a session saved in Sail and listed by the agent appears once', () => {
+  const step: PaletteStep = {
+    kind: 'sessions',
+    repository: '/work/alpha',
+    directory: '/work/alpha-feature',
+    agent: 'opencode',
+  };
+  const saved: AgentThread = {
+    agent: 'opencode',
+    directory: '/work/alpha-feature',
+    sessionId: 'ses_both',
+    title: 'Saved title',
+    updated: 5,
+  };
+  const entries = search(step, '', { threads: [saved, { ...saved, title: 'Listed title' }] });
+  assert.deepEqual(
+    entries.map((entry) => entry.thread?.sessionId ?? entry.kind),
+    ['new-session', 'ses_both'],
+  );
+  assert.equal(new Set(entries.map((entry) => entry.id)).size, entries.length);
+});
+
 void test('OpenCode sessions list like every other ACP agent', () => {
   const step: PaletteStep = {
     kind: 'sessions',

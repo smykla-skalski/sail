@@ -89,7 +89,7 @@ export async function listSidebarAcpThreads(
 ): Promise<AgentThread[]> {
   const listing = await list(cursor);
   for (const session of listing.sessions) {
-    if (trimmedPath(session.cwd) !== trimmedPath(path)) continue;
+    if (trimmedPath(session.cwd) !== trimmedPath(path) || !session.sessionId?.trim()) continue;
     threads.push({
       agent,
       directory: path,

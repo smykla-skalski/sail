@@ -125,6 +125,23 @@ describe('OpenCode in the ACP pane', () => {
     await expect($('.project-agent-row[aria-label*="Third outside"]')).not.toExist();
   });
 
+  it('lists each OpenCode session once in the Switch thread palette after opening it', async () => {
+    await $('.project-agent-row[aria-label*="Second outside"]').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Second outside'));
+    await chooseTopbarAction('More actions', 'Switch thread');
+    const search = $('[aria-label="Search command palette"]');
+    await search.setValue('OpenCode');
+    await browser.keys('Enter');
+    await expect($('.palette-entry[data-kind="thread"]')).toBeDisplayed();
+    const labels = await browser.execute(() =>
+      [...document.querySelectorAll('.palette-entry[data-kind="thread"]')].map(
+        (entry) => entry.textContent ?? '',
+      ),
+    );
+    expect(labels.filter((label) => label.includes('Second outside'))).toHaveLength(1);
+    await browser.keys('Escape');
+  });
+
   it('renders OpenCode in a split pane through the same workspace', async () => {
     await browser.execute((directory) => {
       localStorage.setItem(

@@ -214,6 +214,13 @@ void test('survives corrupt and partial data', () => {
   assert.equal(port.get(openCodeMigrationKey), '1');
 });
 
+void test('keeps the saved session pointer when the layouts cannot be read', () => {
+  const port = store({ 'sai-pane-layouts': '{nope', [`sai-session:${dir}`]: 'ses_keep' });
+  migrateOpenCodeSettings(port);
+  assert.equal(port.get(`sai-session:${dir}`), 'ses_keep');
+  assert.equal(port.get('sai-pane-layouts'), '{nope');
+});
+
 void test('does not overwrite corrupt agent threads or drop native ones', () => {
   const port = store({
     'sail-agent-threads': '{broken',
