@@ -121,6 +121,7 @@
   import { permissionPolicy, type CapabilityProfile } from './lib/capability-profiles';
   import { permissionResolver } from './lib/permission-resolution';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
+  import { loadNativePlan, saveNativePlan } from './lib/planning-state';
   import {
     acpPermissionIdentity,
     enqueueAcpPermission,
@@ -703,6 +704,8 @@
 
   function applyUpdate(update: Record<string, unknown>) {
     nativePlan = nativePlanUpdate(agent, update, nativePlan);
+    if (activeSessionId && nativePlan)
+      saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
     onnativeplan?.(nativePlan);
     if (replaying) {
       updateEntriesInPlace(replayEntries, update);
@@ -922,15 +925,22 @@
     setReplaying(false);
     replayEntries = [];
     permissions = [];
-    nativePlan = null;
-    onnativeplan?.(null);
     selectedThreadId = id;
     activeSessionId = id;
+    nativePlan = id ? loadNativePlan({ agent, directory, sessionId: id }) : null;
+    onnativeplan?.(nativePlan);
     entries = id && thread ? loadRecentTranscript(thread) : [];
+    const backgroundUpdates = id && !nativeEntries ? takeBackgroundUpdates(agent, id) : null;
     const liveView =
       id && !nativeEntries
-        ? liveSessionView(entries, takeBackgroundUpdates(agent, id), sessionState(agent, id))
+        ? liveSessionView(entries, backgroundUpdates, sessionState(agent, id))
         : null;
+    if (backgroundUpdates && id) {
+      for (const update of backgroundUpdates)
+        nativePlan = nativePlanUpdate(agent, update, nativePlan);
+      if (nativePlan) saveNativePlan({ agent, directory, sessionId: id }, nativePlan);
+      onnativeplan?.(nativePlan);
+    }
     if (liveView) entries = liveView.entries;
     visibleCount = 50;
     historyLoaded = !id;

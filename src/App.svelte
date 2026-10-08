@@ -9233,7 +9233,7 @@
       forgetThreadAttention(thread);
       if (thread.agent !== 'opencode') {
         forgetRecentTranscript(thread);
-        void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+        void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
       }
     }
     delete paneLayouts[path];
@@ -9337,7 +9337,7 @@
         forgetThreadAttention(thread);
         if (thread.agent !== 'opencode') {
           forgetRecentTranscript(thread);
-          void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+          void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
         }
       }
       delete paneLayouts[path];
@@ -11708,7 +11708,7 @@
     }
     void tick().then(() => forgetRecentTranscript(thread));
     if (thread.agent !== 'opencode')
-      void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+      void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
   }
 
   function agentThreadKey(thread: AgentThread): string {
