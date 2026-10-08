@@ -5,6 +5,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { Button } from '@smykla-skalski/sui';
   import ActivityStatus from './ActivityStatus.svelte';
+  import ElicitationForm, { type Elicitation } from './ElicitationForm.svelte';
   import TaskLocation from './TaskLocation.svelte';
   import Markdown from './Markdown.svelte';
   import ChatMessage from './ChatMessage.svelte';
@@ -473,6 +474,8 @@
     untrack(() => onentrieschange?.(snapshot, activeSessionId, available));
   });
   let permissions = $state<AgentPermission[]>([]);
+  let elicitations = $state<Elicitation[]>([]);
+  let elicitationDrafts = $state<Record<string, Record<string, unknown>>>({});
   let configOptions = $state<AgentConfigOption[]>([]);
   let pickerOpen = $state<'model' | 'effort' | null>(null);
   let configPickerOpen = $state<string | null>(null);
@@ -829,6 +832,62 @@
     if (thread) onstatus(thread, 'waiting');
   }
 
+  function queueElicitation(message: AgentEvent['message']) {
+    const params = message.params;
+    const sessionId = activeSessionId;
+    if (
+      !params ||
+      !sessionId ||
+      params.sessionId !== sessionId ||
+      message.id == null ||
+      params.mode !== 'form' ||
+      !params.requestedSchema ||
+      typeof params.requestedSchema !== 'object' ||
+      Array.isArray(params.requestedSchema)
+    )
+      return;
+    const schema = params.requestedSchema as Record<string, unknown>;
+    const id = String(message.id);
+    if (elicitations.some((item) => String(item.id) === id)) return;
+    const properties =
+      schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
+        ? (schema.properties as Record<string, Record<string, unknown>>)
+        : {};
+    elicitationDrafts[id] = Object.fromEntries(
+      Object.entries(properties).flatMap(([key, property]) =>
+        property.default === undefined ? [] : [[key, property.default]],
+      ),
+    );
+    elicitations = [
+      ...elicitations,
+      { id: message.id, sessionId, message: String(params.message ?? ''), schema },
+    ];
+    if (thread) onstatus(thread, 'waiting');
+  }
+
+  async function answerElicitation(elicitation: Elicitation, action: 'accept' | 'decline' | 'cancel') {
+    const id = String(elicitation.id);
+    const schema = elicitation.schema;
+    const required = Array.isArray(schema.required)
+      ? schema.required.filter((key): key is string => typeof key === 'string')
+      : [];
+    const content = elicitationDrafts[id] ?? {};
+    if (action === 'accept')
+      for (const key of required)
+        if (content[key] === undefined || content[key] === '') {
+          error = `${key} is required.`;
+          return;
+        }
+    try {
+      await acp.elicitation(agent, elicitation.id, action, action === 'accept' ? content : undefined);
+      elicitations = elicitations.filter((item) => String(item.id) !== id);
+      delete elicitationDrafts[id];
+      if (thread && !elicitations.length && !permissions.length) onstatus(thread, 'working');
+    } catch (cause) {
+      error = describe(cause);
+    }
+  }
+
   async function activate(id: string | null) {
     rememberTranscript();
     const previousSessionId = activeSessionId;
@@ -972,6 +1031,9 @@
           () => current === generation && activeSessionId === id,
         );
         if (waiting) for (const request of waiting) queuePermission(request);
+        const pendingElicitations = await acp.pendingElicitations(agent, id).catch(() => []);
+        if (current === generation && activeSessionId === id)
+          for (const request of pendingElicitations) queueElicitation(request);
       }
       if (current === generation) ready = true;
     } catch (cause) {
@@ -1187,6 +1249,12 @@
           void steerQueued();
       } else if (message.method === 'session/request_permission' && message.id != null) {
         queuePermission(message);
+      } else if (message.method === 'elicitation/create' && message.id != null) {
+        queueElicitation(message);
+      } else if (message.method === '$/cancel_request') {
+        const id = message.params?.id;
+        if (typeof id === 'string' || typeof id === 'number')
+          elicitations = elicitations.filter((item) => item.id !== id);
       }
     })
       .then((unsubscribe) => {
@@ -2170,6 +2238,12 @@
                 >{/if}{/each}
           </div>
         </div>
+      {/each}
+      {#each elicitations as elicitation (elicitation.id)}
+        <ElicitationForm {elicitation} {agent} onanswer={(request, action, content) => {
+          if (content) elicitationDrafts[String(request.id)] = content;
+          return answerElicitation(request, action);
+        }} />
       {/each}
       <textarea
         bind:this={prompt}
