@@ -1,5 +1,21 @@
 import { gateMetadataSchema, type GateMetadata } from './ship-progress.ts';
 import type { AcpTurnEvidence, AgentActivity, InterruptedAgentTurn } from './acp';
+import type { ModelRouteRole } from './model-routing.ts';
+import type { ShipRisk } from './ship-risk-policy.ts';
+
+export type SpawnRouteIdentity = {
+  provider: 'claude' | 'codex' | 'opencode';
+  model: string | null;
+  variant: string | null;
+};
+
+export type SpawnRouting = {
+  role: ModelRouteRole;
+  risk: ShipRisk;
+  independentReviewRequired: boolean;
+  requested: SpawnRouteIdentity;
+  actual: SpawnRouteIdentity | null;
+};
 
 export type SpawnState =
   | 'queued'
@@ -32,6 +48,7 @@ export type SpawnReceipt = {
   dispatchPending?: boolean;
   activity?: string;
   model?: string;
+  routing?: SpawnRouting;
   validation?: GateMetadata;
 };
 
@@ -76,6 +93,25 @@ export function loadSpawnReceipts(raw: string | null): SpawnReceipt[] {
     );
     for (const receipt of receipts) {
       if (typeof receipt.model !== 'string') delete receipt.model;
+      if (
+        receipt.routing &&
+        (!['exploration', 'implementation', 'debugging', 'review', 'ci-triage'].includes(
+          receipt.routing.role,
+        ) ||
+          !['low', 'medium', 'high'].includes(receipt.routing.risk) ||
+          typeof receipt.routing.independentReviewRequired !== 'boolean' ||
+          !receipt.routing.requested ||
+          !['claude', 'codex', 'opencode'].includes(receipt.routing.requested.provider) ||
+          typeof receipt.routing.requested.model !== 'string' ||
+          (receipt.routing.requested.variant !== null &&
+            typeof receipt.routing.requested.variant !== 'string') ||
+          (receipt.routing.actual !== null &&
+            (!['claude', 'codex', 'opencode'].includes(receipt.routing.actual.provider) ||
+              typeof receipt.routing.actual.model !== 'string' ||
+              (receipt.routing.actual.variant !== null &&
+                typeof receipt.routing.actual.variant !== 'string'))))
+      )
+        delete receipt.routing;
       if (!gateMetadataSchema.safeParse(receipt.validation).success) delete receipt.validation;
     }
     return receipts;

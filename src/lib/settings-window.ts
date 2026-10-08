@@ -1,6 +1,7 @@
 import type { AgentAvailability } from './acp';
 import type { SetupReport } from './onboarding';
 import type { ValidationSettings } from './cross-validation';
+import type { ModelRoutingSettings } from './model-routing';
 
 export const settingsRequest = 'sail:settings-request';
 export const settingsState = 'sail:settings-state';
@@ -20,6 +21,7 @@ export type SettingsSnapshot = {
   agents: AgentAvailability[];
   agentsError: string;
   crossValidation: ValidationSettings;
+  modelRouting: ModelRoutingSettings;
   notificationsEnabled: boolean;
   notificationSound: boolean;
   personalPostTurnChecks: string[];
@@ -45,4 +47,5 @@ export type SettingsAction =
   | { type: 'context-handoff-threshold'; value: number }
   | { type: 'detect-agents' }
   | { type: 'cross-validation'; value: ValidationSettings }
+  | { type: 'model-routing'; value: ModelRoutingSettings }
   | { type: 'restart-setup' };

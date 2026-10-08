@@ -50,6 +50,20 @@ describe('agent coordination bridge', () => {
         }),
       }),
     );
+    expect(tools.result.tools).toContainEqual(
+      expect.objectContaining({
+        name: 'agent_spawn',
+        inputSchema: expect.objectContaining({
+          properties: expect.objectContaining({
+            role: expect.objectContaining({
+              enum: ['exploration', 'implementation', 'debugging', 'review', 'ci-triage'],
+            }),
+            risk: expect.objectContaining({ enum: ['low', 'medium', 'high'] }),
+          }),
+          required: ['prompt'],
+        }),
+      }),
+    );
     expect(skill.result.content[0].text).toBe(initialization.result.instructions);
   });
 

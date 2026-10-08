@@ -25,6 +25,21 @@
       {name} <span>subagent</span>
       <ActivityStatus status={receipt.state} compact />
     </div>
+    {#if receipt.routing}
+      <p class="spawn-route">
+        {receipt.routing.role} · {receipt.routing.risk} · requested {receipt.routing.requested
+          .provider}
+        / {receipt.routing.requested.model}{receipt.routing.requested.variant
+          ? ` / ${receipt.routing.requested.variant}`
+          : ''}{#if receipt.routing.actual}
+          · actual {receipt.routing.actual.provider} / {receipt.routing.actual.model}{receipt
+            .routing.actual.variant
+            ? ` / ${receipt.routing.actual.variant}`
+            : ''}{/if}
+        {#if receipt.routing.independentReviewRequired}
+          · independent review required{/if}
+      </p>
+    {/if}
     {#if receipt.result}<Markdown source={receipt.result} />{/if}
     {#if receipt.error}<p class="spawn-error">{receipt.error}</p>{/if}
     {#if !receipt.result && !receipt.error}<p>{receipt.state}</p>{/if}
@@ -56,5 +71,9 @@
   }
   .spawn-error {
     color: var(--sui-danger);
+  }
+  .spawn-route {
+    color: var(--sui-muted);
+    font-size: 0.78rem;
   }
 </style>
