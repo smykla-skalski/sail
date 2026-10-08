@@ -1,11 +1,13 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import { Button } from '@smykla-skalski/sui';
 
   export type Confirmation = {
     id: string;
     title: string;
     message: string;
     confirmLabel: string;
+    destructive?: boolean;
   };
 
   let {
@@ -40,9 +42,11 @@
     <h2 id="confirmation-title">{request.title}</h2>
     <p>{request.message}</p>
     <div class="confirmation-actions">
-      <button type="button" onclick={() => onanswer(false)}>Cancel</button>
-      <button class="confirmation-primary" type="button" onclick={() => onanswer(true)}
-        >{request.confirmLabel}</button
+      <Button variant="secondary" onclick={() => onanswer(false)}>Cancel</Button>
+      <Button
+        class="confirmation-primary"
+        variant={request.destructive ? 'danger' : 'primary'}
+        onclick={() => onanswer(true)}>{request.confirmLabel}</Button
       >
     </div>
   {/if}

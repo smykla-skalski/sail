@@ -32,7 +32,7 @@
   .post-turn-check {
     margin: 12px 20px;
     padding: 12px;
-    border: 1px solid var(--border-color, #7775);
+    border: 1px solid var(--shell-divider);
     border-radius: 8px;
   }
   .post-turn-check-head {

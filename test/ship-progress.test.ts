@@ -1591,9 +1591,12 @@ void test('merge readiness rejects missing, failed, and stale revision evidence'
     state: 'awaiting_merge',
     pullRequest: 'https://example.test/pull/2',
     pullRequestHead: 'commit-one',
+    pullRequestState: 'OPEN',
+    pullRequestMergeable: true,
     evidenceCommit: 'commit-one',
     checks: [{ name: 'build', state: 'SUCCESS', url: 'https://example.test/build' }],
   });
+  issue.checkpoint = { ...issue.checkpoint!, revision: 'commit-one' };
   assert.match(shipIssuePresentation(run, issue).nextAction, /Revision unknown/);
   assert.equal(shipMergeClaim(issue), 'PR open');
 
@@ -1618,8 +1621,9 @@ void test('merge readiness rejects missing, failed, and stale revision evidence'
   );
   assert.equal(economics.accepted, true);
   assert.equal(economics.economicsComplete, true);
-  assert.equal(economics.totals.checks, issue.checkpoint!.requiredGates.length + 1);
-  assert.equal(shipIssuePresentation(run, issue).nextAction, 'Merge the pull request');
+  assert.equal(economics.totals.checks, issue.checkpoint.requiredGates.length + 1);
+  assert.equal(shipIssuePresentation(run, issue).nextAction, 'Merge #2 to unblock 1 issue');
+  assert.equal(shipIssuePresentation(run, issue).label, 'Ready to merge');
   assert.equal(shipMergeClaim(issue), 'Ready for merge');
 
   issue.refreshError = 'GitHub unavailable';
@@ -2121,4 +2125,376 @@ void test('restart reconciles settled and newly recorded receipts before decidin
     { ...receipt, receiptId: 'foreign', sourceId: 'other' },
   ]);
   assert.equal(issue.gates.length, 1);
+});
+
+type FixtureIssue = ReturnType<typeof fixture>['issues'][number];
+
+function stateGate(
+  gate: 'code-adversary' | 'findings-adversary' | 'test-adversary',
+  verdict: 'CLEAN' | 'NEEDS_FIXES' | 'PASS' | 'FAIL' | 'BLOCKED',
+  updated: number,
+  reason?: string,
+) {
+  return {
+    id: `${gate}-${updated}`,
+    gate,
+    requestedModel: 'test',
+    provider: 'codex',
+    model: 'test',
+    threadId: `thread-${updated}`,
+    directory: '/repo',
+    state: 'completed' as const,
+    created: updated,
+    updated,
+    error: null,
+    verdict,
+    ...(reason ? { reason } : {}),
+  };
+}
+
+function runningIssue(overrides: Partial<FixtureIssue> = {}) {
+  const run = fixture();
+  const issue = Object.assign(run.issues[0], {
+    state: 'working' as const,
+    workerState: 'working' as const,
+    stage: 'reviewing',
+    ...overrides,
+  });
+  return { run, issue };
+}
+
+function readyIssue(overrides: Partial<FixtureIssue> = {}) {
+  const run = fixture();
+  const evidence = withMergeEvidence(run.issues[0]);
+  const issue = Object.assign(run.issues[0], evidence, {
+    state: 'awaiting_merge' as const,
+    pullRequest: 'https://example.test/pull/2',
+    pullRequestHead: 'commit-one',
+    pullRequestState: 'OPEN',
+    pullRequestMergeable: true,
+    evidenceCommit: 'commit-one',
+    checks: [{ name: 'build', state: 'SUCCESS', url: 'https://example.test/build' }],
+    ...overrides,
+  });
+  issue.checkpoint = { ...issue.checkpoint!, revision: 'commit-one' };
+  run.issues[1].dependsOn = [];
+  return { run, issue };
+}
+
+void test('NEEDS_FIXES and FAIL verdicts show the running worker as fixing', () => {
+  const { run, issue } = runningIssue({
+    gates: [stateGate('code-adversary', 'NEEDS_FIXES', 10, 'Handle the empty list')],
+  });
+  const presentation = shipIssuePresentation(run, issue);
+  assert.equal(presentation.label, 'Fixing · round 1');
+  assert.equal(presentation.status, 'fixing');
+  assert.equal(presentation.priority, 1);
+  assert.equal(shipStatus(run, issue), 'Fixing');
+  assert.equal(shipActivity(run, issue).title, 'Fixing · round 1');
+  assert.equal(shipActivity(run, issue).state, 'active');
+
+  issue.gates = [
+    stateGate('code-adversary', 'NEEDS_FIXES', 10, 'First'),
+    stateGate('code-adversary', 'CLEAN', 20),
+    stateGate('test-adversary', 'FAIL', 30, 'Second'),
+  ];
+  assert.equal(shipIssuePresentation(run, issue).label, 'Fixing · round 2');
+
+  issue.gates = [
+    stateGate('code-adversary', 'NEEDS_FIXES', 10, 'First'),
+    stateGate('code-adversary', 'CLEAN', 20),
+  ];
+  assert.equal(shipIssuePresentation(run, issue).label, 'Working');
+});
+
+void test('a failed gate does not show fixing once the worker stopped running', () => {
+  const { run, issue } = runningIssue({
+    gates: [stateGate('code-adversary', 'NEEDS_FIXES', 10, 'Handle the empty list')],
+    workerState: 'waiting',
+  });
+  assert.equal(shipIssuePresentation(run, issue).label, 'Needs input');
+});
+
+void test('a worker blocked report shows needs input with the checkpoint blocker', () => {
+  const { run, issue } = runningIssue({
+    reportedStatus: 'blocked',
+    blockedReason: 'Progress message',
+  });
+  assert.deepEqual(
+    {
+      label: shipIssuePresentation(run, issue).label,
+      reason: shipIssuePresentation(run, issue).reason,
+      priority: shipIssuePresentation(run, issue).priority,
+    },
+    { label: 'Needs input', reason: 'Progress message', priority: 0 },
+  );
+  issue.checkpoint = {
+    ...issue.checkpoint!,
+    status: 'blocked',
+    blocker: 'Convergence budget exhausted',
+    nextAction: 'Decide how to continue',
+  };
+  const presentation = shipIssuePresentation(run, issue);
+  assert.equal(presentation.reason, 'Convergence budget exhausted');
+  assert.equal(presentation.nextAction, 'Convergence budget exhausted');
+  assert.equal(shipStatus(run, issue), 'Blocked');
+  assert.equal(shipActivity(run, issue).detail, 'Convergence budget exhausted');
+
+  issue.reportedStatus = 'running';
+  issue.blockedReason = null;
+  issue.checkpoint = { ...issue.checkpoint, status: 'active', blocker: null };
+  assert.equal(shipIssuePresentation(run, issue).label, 'Working');
+});
+
+void test('a BLOCKED gate verdict needs input even while the worker runs', () => {
+  const { run, issue } = runningIssue({
+    gates: [stateGate('test-adversary', 'BLOCKED', 10, 'No sandbox available')],
+  });
+  const presentation = shipIssuePresentation(run, issue);
+  assert.equal(presentation.label, 'Needs input');
+  assert.equal(presentation.reason, 'No sandbox available');
+});
+
+void test('a persisted legacy blockedReason with a NEEDS_FIXES verdict shows fixing', () => {
+  const { run, issue } = runningIssue({
+    blockedReason: 'Handle the empty list',
+    gates: [stateGate('code-adversary', 'NEEDS_FIXES', 10, 'Handle the empty list')],
+  });
+  assert.equal(shipIssuePresentation(run, issue).label, 'Fixing · round 1');
+  assert.equal(shipStatus(run, issue), 'Fixing');
+  assert.equal(shipActivity(run, issue).state, 'active');
+
+  issue.gates = [stateGate('test-adversary', 'FAIL', 10, 'Handle the empty list')];
+  assert.equal(shipIssuePresentation(run, issue).label, 'Fixing · round 1');
+
+  issue.gates = [];
+  assert.equal(shipIssuePresentation(run, issue).label, 'Needs input');
+});
+
+void test('a real Sail block stays a block next to a failing verdict', () => {
+  const { run, issue } = runningIssue({
+    blockedReason: 'Shipping claim lost: heartbeat verification failed',
+    gates: [stateGate('code-adversary', 'NEEDS_FIXES', 10, 'Handle the empty list')],
+  });
+  const presentation = shipIssuePresentation(run, issue);
+  assert.equal(presentation.label, 'Needs input');
+  assert.equal(presentation.reason, 'Shipping claim lost: heartbeat verification failed');
+  assert.equal(shipStatus(run, issue), 'Blocked');
+});
+
+void test('status, activity and presentation agree on fixing CI after awaiting merge was reported', () => {
+  const { run, issue } = readyIssue({
+    state: 'working',
+    workerState: 'working',
+    stage: 'awaiting_merge',
+    checks: [{ name: 'build', state: 'FAILURE', url: 'https://example.test/build' }],
+  });
+  assert.equal(shipIssuePresentation(run, issue).label, 'Fixing (CI)');
+  assert.equal(shipStatus(run, issue), 'Fixing');
+  assert.equal(shipActivity(run, issue).title, 'Fixing (CI)');
+});
+
+void test('a worker block stays a block next to a failing verdict', () => {
+  const { run, issue } = runningIssue({
+    reportedStatus: 'blocked',
+    blockedReason: 'Needs a decision',
+    gates: [stateGate('code-adversary', 'NEEDS_FIXES', 10, 'Handle the empty list')],
+  });
+  assert.equal(shipIssuePresentation(run, issue).label, 'Needs input');
+  assert.equal(shipIssuePresentation(run, issue).reason, 'Needs a decision');
+});
+
+void test('failing CI shows fixing only while the worker runs', () => {
+  const failing = [{ name: 'build', state: 'FAILURE', url: 'https://example.test/build' }];
+  const { run, issue } = runningIssue({ checks: failing, stage: 'ci' });
+  assert.equal(shipIssuePresentation(run, issue).label, 'Fixing (CI)');
+  assert.equal(shipStatus(run, issue), 'Fixing');
+
+  const finished = readyIssue({ checks: failing });
+  assert.equal(shipIssuePresentation(finished.run, finished.issue).label, 'Recovery needed');
+});
+
+void test('a pull request without required checks reaches ready to merge', () => {
+  const { run, issue } = readyIssue({ checks: [] });
+  assert.equal(ciStatus(issue.checks), 'No checks');
+  const presentation = shipIssuePresentation(run, issue);
+  assert.deepEqual(
+    [presentation.status, presentation.label, presentation.priority, presentation.nextAction],
+    ['ready', 'Ready to merge', 0, 'Merge the pull request'],
+  );
+  assert.equal(shipMergeClaim(issue), 'Ready for merge');
+});
+
+void test('ready to merge needs an open mergeable pull request at the checkpoint revision', () => {
+  const cases: Array<[string, Partial<FixtureIssue>]> = [
+    ['closed', { pullRequestState: 'CLOSED' }],
+    ['not mergeable', { pullRequestMergeable: false }],
+    ['mergeability unknown', { pullRequestMergeable: null }],
+    ['pending checks', { checks: [{ name: 'build', state: 'PENDING', url: 'https://x.test' }] }],
+    ['head moved', { pullRequestHead: 'commit-two' }],
+  ];
+  for (const [name, overrides] of cases) {
+    const { run, issue } = readyIssue(overrides);
+    assert.notEqual(shipIssuePresentation(run, issue).label, 'Ready to merge', name);
+  }
+  const { run, issue } = readyIssue();
+  issue.checkpoint = { ...issue.checkpoint!, revision: 'commit-two' };
+  assert.notEqual(shipIssuePresentation(run, issue).label, 'Ready to merge');
+});
+
+void test('ready to merge is a user item only when the user merges', () => {
+  const { run, issue } = readyIssue();
+  assert.equal(shipIssuePresentation(run, issue, { mergeOwner: 'you' }).label, 'Ready to merge');
+  assert.equal(shipIssuePresentation(run, issue).label, 'Ready to merge');
+  const agent = shipIssuePresentation(run, issue, { mergeOwner: 'agent' });
+  assert.equal(agent.label, 'Awaiting merge');
+});
+
+void test('a reported awaiting_merge stage is accepted and presented before the worker exits', () => {
+  assert.deepEqual(parseShipReport({ stage: 'awaiting_merge', status: 'running' }), {
+    stage: 'awaiting_merge',
+    status: 'running',
+  });
+  const { run, issue } = readyIssue({ state: 'working', stage: 'awaiting_merge' });
+  assert.equal(shipIssuePresentation(run, issue).label, 'Ready to merge');
+});
+
+void test('a ready dependency names the issues its merge unblocks', () => {
+  const { run, issue } = readyIssue();
+  assert.equal(shipIssuePresentation(run, issue).nextAction, 'Merge the pull request');
+  run.issues[1].dependsOn = ['first'];
+  assert.equal(
+    shipIssuePresentation(run, issue).nextAction,
+    `Merge #${issue.number} to unblock 1 issue`,
+  );
+  run.issues.push({ ...run.issues[1], id: 'third', number: 4 });
+  assert.equal(
+    shipIssuePresentation(run, issue).nextAction,
+    `Merge #${issue.number} to unblock 2 issues`,
+  );
+});
+
+void test('a pull request closed without merging is its own state', () => {
+  const { run, issue } = readyIssue();
+  Object.assign(
+    issue,
+    refreshedPullRequest(issue, {
+      url: 'https://example.test/pull/2',
+      state: 'CLOSED',
+      mergedAt: null,
+      headRefOid: 'commit-one',
+      mergeable: null,
+      checks: [],
+    }),
+  );
+  assert.equal(issue.pullRequestState, 'CLOSED');
+  const presentation = shipIssuePresentation(run, issue);
+  assert.deepEqual(
+    [presentation.status, presentation.label, presentation.priority],
+    ['interrupted', 'Closed without merge', 0],
+  );
+  assert.match(presentation.nextAction, /Archive/);
+  assert.match(presentation.nextAction, /reopen/i);
+  assert.equal(shipStatus(run, issue), 'Closed without merge');
+
+  Object.assign(issue, { state: 'failed', error: 'Pull request closed without merging.' });
+  assert.equal(shipIssuePresentation(run, issue).label, 'Closed without merge');
+  assert.equal(shipActivity(run, issue).title, 'Closed without merge');
+});
+
+void test('a merged pull request is never shown as closed without merge', () => {
+  const { run, issue } = readyIssue();
+  Object.assign(
+    issue,
+    refreshedPullRequest(issue, {
+      url: 'https://example.test/pull/2',
+      state: 'MERGED',
+      mergedAt: '2026-01-01T00:00:00Z',
+      headRefOid: 'commit-one',
+      checks: [],
+    }),
+  );
+  assert.equal(shipIssuePresentation(run, issue).label, 'Completed');
+});
+
+void test('refreshing a pull request records its state and mergeability', () => {
+  const { issue } = readyIssue();
+  const changes = refreshedPullRequest(issue, {
+    url: 'https://example.test/pull/2',
+    state: 'OPEN',
+    mergedAt: null,
+    headRefOid: 'commit-one',
+    mergeable: true,
+    checks: [],
+  });
+  assert.equal(changes.pullRequestState, 'OPEN');
+  assert.equal(changes.pullRequestMergeable, true);
+  assert.equal(
+    refreshedPullRequest(issue, {
+      url: 'https://example.test/pull/2',
+      state: 'OPEN',
+      mergedAt: null,
+      headRefOid: 'commit-one',
+      checks: [],
+    }).pullRequestMergeable,
+    null,
+  );
+});
+
+void test('an issue closed before launch is closed, not failed', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, refreshedIssueState(issue, true));
+  const presentation = shipIssuePresentation(run, issue);
+  assert.deepEqual(
+    [presentation.status, presentation.label, presentation.priority],
+    ['completed', 'Closed', 4],
+  );
+  assert.equal(shipStatus(run, issue), 'Closed');
+  assert.equal(shipActivity(run, issue).state, 'complete');
+
+  issue.error = 'Worker failed';
+  assert.equal(shipIssuePresentation(run, issue).label, 'Recovery needed');
+});
+
+void test('waiting and failed dependencies show different labels', () => {
+  const run = fixture();
+  const [first, second] = run.issues;
+  const waiting = shipIssuePresentation(run, second);
+  assert.deepEqual(
+    [waiting.status, waiting.label, waiting.priority, waiting.link],
+    ['queued', 'Waiting on #2', 3, { label: '#2', url: 'https://github.com/a/b/issues/2' }],
+  );
+
+  first.state = 'failed';
+  first.error = 'Worker failed';
+  const failed = shipIssuePresentation(run, second);
+  assert.deepEqual(
+    [failed.status, failed.label, failed.priority, failed.link],
+    [
+      'waiting',
+      'Waiting on #2 (needs input)',
+      0,
+      { label: '#2', url: 'https://github.com/a/b/issues/2' },
+    ],
+  );
+  assert.equal(shipStatus(run, second), 'Blocked');
+
+  first.state = 'merged';
+  assert.equal(shipIssuePresentation(run, second).label, 'Queued');
+});
+
+void test('a failed dependency wins over an unmerged one', () => {
+  const run = fixture();
+  const [first, second] = run.issues;
+  run.issues.push({
+    ...second,
+    id: 'third',
+    number: 4,
+    dependsOn: ['first', 'second'],
+  });
+  first.state = 'working';
+  second.state = 'failed';
+  second.error = 'Worker failed';
+  assert.equal(shipIssuePresentation(run, run.issues[2]).label, 'Waiting on #3 (needs input)');
 });

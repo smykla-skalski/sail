@@ -135,6 +135,7 @@
     focusPromptPane: string | null;
     onpromptfocused: () => void;
     running: (thread: AgentThread | null) => boolean;
+    activityReady: boolean;
     onstatus: (thread: AgentThread, status: ThreadStatus, notifyOnDone?: boolean) => void;
     onreplaychange: (agent: string, sessionId: string | null, replaying: boolean) => void;
     onchanges: (id: string) => void;
@@ -218,6 +219,7 @@
     focusPromptPane,
     onpromptfocused,
     running,
+    activityReady,
     onstatus,
     onreplaychange,
     onchanges,
@@ -620,6 +622,7 @@
       {focusPromptPane}
       {onpromptfocused}
       {running}
+      {activityReady}
       {onstatus}
       {onreplaychange}
       {onchanges}
@@ -730,6 +733,7 @@
       {focusPromptPane}
       {onpromptfocused}
       {running}
+      {activityReady}
       {onstatus}
       {onreplaychange}
       {onchanges}
@@ -1040,6 +1044,7 @@
               )}
               {onretrycheck}
               running={running(pane.thread)}
+              {activityReady}
               focused={focused === pane.id}
               focusPrompt={focusPromptPane === pane.id}
               picked={pickedAttachments[pane.id]}

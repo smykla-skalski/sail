@@ -339,7 +339,7 @@
   }
   .side-chat-hint {
     margin: 0;
-    color: var(--text-muted, #888);
+    color: var(--sui-muted);
     font-size: 0.8rem;
   }
   .side-chat-messages {

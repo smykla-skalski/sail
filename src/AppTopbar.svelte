@@ -1,0 +1,224 @@
+<script lang="ts">
+  import { Button } from '@smykla-skalski/sui';
+  import HarnessIcon from './HarnessIcon.svelte';
+  import MenuButton from './MenuButton.svelte';
+  import type { AgentAvailability, AgentId } from './lib/acp';
+
+  export type TopbarThreadActions =
+    | { kind: 'agent'; title: string; ondelete: () => void }
+    | { kind: 'opencode'; title: string; onrename: () => void; ondelete: () => void };
+
+  type MobileView = 'sessions' | 'chat' | 'details';
+
+  let {
+    element = $bindable(),
+    sidebarToggle = $bindable(),
+    sidebarExpanded,
+    ontogglesidebar,
+    mobileView,
+    onmobileview,
+    overview,
+    onoverview,
+    projectName,
+    projectDisabled,
+    onchooseproject,
+    conversationTitle,
+    inboxCount,
+    oninbox,
+    directory,
+    agents,
+    onopenagent,
+    newWorkDisabled,
+    onnewwork,
+    planDisabled,
+    onnewplan,
+    onswitchthread,
+    threadActions,
+    contextUsage,
+    browserAccess,
+    ontogglebrowser,
+    onrunproject,
+    agentTerminalCount,
+    onagentterminals,
+    onrestore,
+    oncommands,
+    changesLabel,
+    changesTitle,
+    changesExpanded,
+    ontogglechanges,
+  }: {
+    element?: HTMLElement;
+    sidebarToggle?: HTMLButtonElement;
+    sidebarExpanded: boolean;
+    ontogglesidebar: () => void;
+    mobileView: MobileView;
+    onmobileview: (view: MobileView) => void;
+    overview: boolean;
+    onoverview: () => void;
+    projectName: string;
+    projectDisabled: boolean;
+    onchooseproject: () => void;
+    conversationTitle: string;
+    inboxCount: number;
+    oninbox: () => void;
+    directory: string;
+    agents: AgentAvailability[];
+    onopenagent: (agent: AgentId) => void;
+    newWorkDisabled: boolean;
+    onnewwork: () => void;
+    planDisabled: boolean;
+    onnewplan: () => void;
+    onswitchthread: () => void;
+    threadActions: TopbarThreadActions | null;
+    contextUsage?: number;
+    browserAccess: boolean;
+    ontogglebrowser: () => void;
+    onrunproject: (() => void) | null;
+    agentTerminalCount: number;
+    onagentterminals: () => void;
+    onrestore: (() => void) | null;
+    oncommands: () => void;
+    changesLabel: string;
+    changesTitle: string;
+    changesExpanded: boolean;
+    ontogglechanges: () => void;
+  } = $props();
+
+  const threadLabel = $derived(
+    [
+      threadActions ? `Thread ${threadActions.title}` : 'Thread',
+      contextUsage === undefined ? '' : `context ${contextUsage}% used`,
+    ]
+      .filter(Boolean)
+      .join(', '),
+  );
+</script>
+
+<header class="topbar" bind:this={element}>
+  <button
+    class="sidebar-toggle"
+    bind:this={sidebarToggle}
+    aria-label="Toggle project sidebar"
+    aria-controls="project-sidebar"
+    aria-expanded={sidebarExpanded}
+    title="Toggle project sidebar (⌘B / Ctrl+B)"
+    onclick={ontogglesidebar}>☰</button
+  >
+  <nav class="mobile-switcher" aria-label="Workspace panels">
+    <button aria-pressed={mobileView === 'sessions'} onclick={() => onmobileview('sessions')}
+      >Projects</button
+    >
+    <button aria-pressed={mobileView === 'chat'} onclick={() => onmobileview('chat')}>Chat</button>
+    <button aria-pressed={mobileView === 'details'} onclick={() => onmobileview('details')}
+      >Details</button
+    >
+  </nav>
+  <div class="breadcrumb">
+    {#if overview}<strong>All worktrees</strong><span class="slash">/</span><strong
+        >Task overview</strong
+      >{:else}<button
+        class="breadcrumb-project"
+        title={directory || undefined}
+        onclick={onchooseproject}
+        disabled={projectDisabled}>{projectName} ⌄</button
+      ><span class="slash">/</span><strong title={conversationTitle}>{conversationTitle}</strong
+      >{/if}
+  </div>
+  <div class="topbar-actions">
+    <div class="topbar-primary">
+      <Button variant="ghost" size="sm" aria-label="Pending requests" onclick={oninbox}
+        >Inbox ({inboxCount})</Button
+      >
+      {#if directory}<MenuButton
+          class="new-agent-menu"
+          label="New agent ▾"
+          ariaLabel="New agent"
+          menuLabel="New agent"
+        >
+          {#snippet trigger()}New<span class="menu-trigger-extra">&nbsp;agent</span
+            >&nbsp;▾{/snippet}
+          <div class="agent-launches" role="group" aria-label="Agents">
+            {#each agents as agent (agent.id)}
+              <button
+                role="menuitem"
+                disabled={!agent.available}
+                title={agent.reason ?? `New ${agent.name} thread`}
+                onclick={() => onopenagent(agent.id)}
+                ><HarnessIcon agent={agent.id} /> {agent.name}</button
+              >
+            {/each}
+            <button
+              role="menuitem"
+              disabled={newWorkDisabled}
+              title="New OpenCode thread"
+              onclick={onnewwork}><HarnessIcon agent="opencode" /> OpenCode</button
+            >
+          </div>
+          <div class="menu-separator" role="separator"></div>
+          <button
+            role="menuitem"
+            aria-label="New plan"
+            title="Start an Architect plan"
+            disabled={planDisabled}
+            onclick={onnewplan}>New plan</button
+          >
+        </MenuButton>{/if}
+      <Button
+        variant="ghost"
+        size="sm"
+        onclick={ontogglechanges}
+        aria-controls="session-details"
+        aria-expanded={changesExpanded}
+        title={changesTitle}>{changesLabel}</Button
+      >
+    </div>
+    <MenuButton
+      class="more-actions-menu"
+      label="More actions"
+      ariaLabel="More actions"
+      title="More actions"
+      menuLabel="More actions"
+    >
+      {#snippet trigger()}<span aria-hidden="true">⋯</span>{/snippet}
+      <button role="menuitem" onclick={onoverview}
+        >{overview ? 'Back to workspace' : 'Task overview'}</button
+      >
+      {#if directory}<button role="menuitem" class="agent-menu-launch" onclick={onswitchthread}
+          >Switch thread…</button
+        >{/if}
+      <button role="menuitem" onclick={oncommands}>Commands…</button>
+      {#if onrunproject}<button role="menuitem" onclick={onrunproject}>Run project</button>{/if}
+      {#if agentTerminalCount}<button role="menuitem" onclick={onagentterminals}
+          >Agent terminals ({agentTerminalCount})</button
+        >{/if}
+      {#if directory}<button
+          role="menuitemcheckbox"
+          aria-checked={browserAccess}
+          title="Toggle agent browser access for this project"
+          onclick={ontogglebrowser}>Agent browser {browserAccess ? 'on' : 'off'}</button
+        >{/if}
+      {#if threadActions || onrestore}
+        <div class="menu-separator" role="separator"></div>
+        <div role="group" aria-label={threadLabel}>
+          {#if threadActions}<span class="menu-label" aria-hidden="true" title={threadActions.title}
+              >{threadActions.title}</span
+            >{/if}
+          {#if contextUsage !== undefined}<span class="menu-label session-usage" aria-hidden="true"
+              >Context {contextUsage}%</span
+            >{/if}
+          {#if onrestore}<button role="menuitem" onclick={onrestore}>Restore…</button>{/if}
+          {#if threadActions?.kind === 'opencode'}<button
+              role="menuitem"
+              onclick={threadActions.onrename}>Rename…</button
+            ><button role="menuitem" class="danger" onclick={threadActions.ondelete}
+              >Delete session…</button
+            >{:else if threadActions}<button
+              role="menuitem"
+              class="danger"
+              onclick={threadActions.ondelete}>Delete thread…</button
+            >{/if}
+        </div>
+      {/if}
+    </MenuButton>
+  </div>
+</header>

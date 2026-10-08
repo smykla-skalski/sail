@@ -37,6 +37,7 @@
   import PlanPanel from './PlanPanel.svelte';
   import type { NativePlan } from './lib/native-plan';
   import ShipPanel from './ShipPanel.svelte';
+  import AppTopbar from './AppTopbar.svelte';
   import {
     appendShipEvent,
     beginLatestRefresh,
@@ -49,6 +50,7 @@
     requireValidatorEconomics,
     refreshedIssueState,
     refreshedPullRequest,
+    closedWithoutMerge,
     shipGatesSettled,
     shipCleanupRequest,
     shipEvidenceReadiness,
@@ -118,6 +120,9 @@
     shippingClockWasSuspended,
     shippingClaimOwnedByInstance,
     shippingWorkerSettled,
+    shipWorkerPrompt,
+    parseMergeOwner,
+    type MergeOwner,
     shippingSetupAction,
     settledLostClaimFence,
     terminalClaimReleaseReady,
@@ -788,12 +793,17 @@
     directory: string;
   } | null>(null);
 
-  function confirmInApp(title: string, message: string, confirmLabel: string): Promise<boolean> {
+  function confirmInApp(
+    title: string,
+    message: string,
+    confirmLabel: string,
+    { destructive = false }: { destructive?: boolean } = {},
+  ): Promise<boolean> {
     const pending = confirmationQueue.then(
       () =>
         new Promise<boolean>((resolve) => {
           confirmationResolver = resolve;
-          confirmation = { id: crypto.randomUUID(), title, message, confirmLabel };
+          confirmation = { id: crypto.randomUUID(), title, message, confirmLabel, destructive };
         }),
     );
     confirmationQueue = pending.then(() => undefined);
@@ -979,6 +989,7 @@
   let agentStatusEnabled = $state(getSetting('sai-agent-status-enabled') !== 'false');
   let agentThreadListEnabled = $state(getSetting('sai-agent-thread-list-enabled') !== 'false');
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
+  let mergeOwner = $state<MergeOwner>(parseMergeOwner(getSetting('sai-ship-merge-owner')));
   let inboxItems = $state<InboxItem[]>([]);
   let inboxOutcomes = $state<InboxOutcome[]>(loadInboxOutcomes(getSetting('sai-inbox-outcomes')));
   let durableActivityHistory = $state<ActivityHistoryEvent[]>(
@@ -1291,7 +1302,7 @@
   let error = $state('');
   let chatScroll = $state<HTMLDivElement>();
   let sidebarElement: HTMLElement;
-  let sidebarToggleElement: HTMLButtonElement;
+  let sidebarToggleElement = $state<HTMLButtonElement>();
   let topbarElement = $state<HTMLElement>();
   let topbarHeight = $state(80);
   let chatArea: HTMLElement;
@@ -2028,6 +2039,7 @@
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
+      mergeOwner,
       contextHandoffThreshold,
     };
   }
@@ -2206,6 +2218,9 @@
         } else if (action.type === 'agent-messages') {
           agentMessagesEnabled = action.value;
           setSetting('sai-agent-messages-enabled', String(action.value));
+        } else if (action.type === 'merge-owner') {
+          mergeOwner = parseMergeOwner(action.value);
+          setSetting('sai-ship-merge-owner', mergeOwner);
         } else if (action.type === 'context-handoff-threshold') {
           const previousThreshold = contextHandoffThreshold;
           contextHandoffThreshold = parseContextHandoffThreshold(String(action.value));
@@ -3892,7 +3907,7 @@
     issue: ShipIssue,
     workerState: SpawnState,
   ): Promise<void> {
-    const reason = 'Pull request closed without merging.';
+    const reason = closedWithoutMerge;
     await settleClosedPullRequest(
       workerState,
       async () => {
@@ -3989,7 +4004,17 @@
         ? 'Before every adversary pass, read the checkpoint revision. After the pass, use ship_progress with that revision, its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, validator economics counters, and reason when blocked or failed.'
         : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
       const target = shippingTarget;
-      const prompt = `/ship-it ${issue.url}\n\nSail holds visible claim ${claim.id} for task ${claim.task} on behalf of this worker. Sail already created this issue worktree from ${target.repository}:${target.baseBranch} at ${target.baseRevision}. Use that exact repository and base branch for the pull request. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. Before each quality command, read the checkpoint execution boundary; record the result with task_evidence_record and its expectedRevision, expectedMutationGeneration, and expectedBaseRevision, mapping exact acceptance criterion strings and a bounded output reference. Include the economics counters attributable to that activity (role, phase, turns, tools, permissions, compactions, token categories, elapsed time, retries, findings, checks, human interventions, failed commands, approval latency, and repeated work). Classify activity as primary, subagent, validator, guardian, synthetic, or probe. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
+      const prompt = shipWorkerPrompt({
+        issueUrl: issue.url,
+        claimId: claim.id,
+        claimTask: claim.task,
+        repository: target.repository,
+        baseBranch: target.baseBranch,
+        baseRevision: target.baseRevision,
+        gateExecution,
+        gateReporting,
+        mergeOwner,
+      });
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -7194,9 +7219,8 @@
               {
                 ...issueEvidenceChanges,
                 stage: report.gate === 'test-adversary' ? 'testing' : 'reviewing',
-                blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
-                  ? report.reason
-                  : null,
+                reportedStatus: 'running',
+                blockedReason: report.verdict === 'BLOCKED' ? report.reason : null,
                 gates: [
                   ...(owner.issue.gates ?? []),
                   completedInlineShipGate(
@@ -7368,9 +7392,7 @@
               owner.issue,
               {
                 ...issueEvidenceChanges,
-                blockedReason: ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict)
-                  ? report.reason
-                  : null,
+                blockedReason: report.verdict === 'BLOCKED' ? report.reason : null,
                 events: appendShipEvent(
                   owner.issue.events,
                   `${validation.gate}: ${report.verdict}`,
@@ -7389,6 +7411,7 @@
       if (!owner) throw new Error('Only the assigned Ship worker can report issue progress.');
       await updateShipIssue(owner.run, owner.issue, {
         stage: report.stage,
+        reportedStatus: report.status,
         blockedReason: report.status === 'blocked' ? report.reason : null,
         events: appendShipEvent(owner.issue.events, report.stage, report.reason),
       });
@@ -9242,6 +9265,7 @@
                 ? `Delete worktree “${branch}” at ${path}? This permanently removes uncommitted and ignored files, including copied files. The branch will remain.`
                 : `Delete worktree “${branch}” at ${path}? Uncommitted and ignored files block deletion. The branch will remain.`,
               force ? 'Force delete' : 'Delete worktree',
+              { destructive: true },
             );
     if (!confirmed) return;
     const wasSelected = directory === path;
@@ -9263,6 +9287,7 @@
             'Archive failed',
             `Archive script exited with code ${code}. Delete “${branch}” anyway?`,
             'Delete anyway',
+            { destructive: true },
           );
           if (!deleteAnyway) return;
         }
@@ -9763,6 +9788,16 @@
       return true;
     } catch (cause) {
       if (current !== selection) return false;
+      if (missingRepositoryPath(cause)) {
+        const fallback = await availableFallbackDirectory(path);
+        if (current !== selection) return false;
+        if (fallback) {
+          void loadProject(fallback, false).catch((loadCause) => {
+            if (directory === fallback) error = describe(loadCause);
+          });
+          return false;
+        }
+      }
       setupError = describe(cause);
       workReady = false;
       planReady = false;
@@ -9770,6 +9805,20 @@
     } finally {
       if (current === selection) setupLoading = false;
     }
+  }
+
+  async function availableFallbackDirectory(missing: string): Promise<string | null> {
+    const parent = worktreeAt(projectCatalog, missing)?.repository;
+    const candidates = [parent, ...projectCatalog.repositories].filter(
+      (path): path is string => !!path && path !== missing,
+    );
+    const unique = [...new Set(candidates)];
+    const available = await Promise.all(
+      unique.map((path) =>
+        invoke<boolean>('repository_path_available', { path }).catch(() => false),
+      ),
+    );
+    return unique.find((_, index) => available[index]) ?? null;
   }
 
   async function restartSetup() {
@@ -11595,6 +11644,19 @@
     focusedPane = 'main';
   }
 
+  async function deleteAgentThread(thread: AgentThread) {
+    const stillRunning = !!runningAgentThreads[agentThreadKey(thread)];
+    const confirmed = await confirmInApp(
+      'Delete thread',
+      `Delete “${thread.title}” from Sail? Its transcript and status are removed from Sail.${
+        stillRunning ? ' The agent is still working, and deleting the thread does not stop it.' : ''
+      }`,
+      'Delete thread',
+      { destructive: true },
+    );
+    if (confirmed) removeAgentThread(thread);
+  }
+
   function removeAgentThread(thread: AgentThread) {
     const usage = { ...agentUsage };
     delete usage[threadKey(thread)];
@@ -12821,6 +12883,7 @@
               'Delete plan session',
               `Delete “${session.title ?? 'Untitled plan'}”? This cannot be undone.`,
               'Delete session',
+              { destructive: true },
             );
     if (!confirmed) return;
     try {
@@ -14054,7 +14117,7 @@
     }
     sidebarVisible = !sidebarVisible;
     if (!sidebarVisible && sidebarElement.contains(document.activeElement))
-      void tick().then(() => sidebarToggleElement.focus());
+      void tick().then(() => sidebarToggleElement?.focus());
   }
 
   function showTaskOverview() {
@@ -14207,148 +14270,70 @@
     </div>
   </aside>
   <div class="main-area">
-    <header class="topbar" bind:this={topbarElement}>
-      <button
-        class="sidebar-toggle"
-        bind:this={sidebarToggleElement}
-        aria-label="Toggle project sidebar"
-        aria-controls="project-sidebar"
-        aria-expanded={sidebarVisible && (!mobileLayout || mobileView === 'sessions')}
-        title="Toggle project sidebar (⌘B / Ctrl+B)"
-        onclick={toggleSidebar}>☰</button
-      >
-      <nav class="mobile-switcher" aria-label="Workspace panels">
-        <button aria-pressed={mobileView === 'sessions'} onclick={() => showMobileView('sessions')}
-          >Projects</button
-        >
-        <button aria-pressed={mobileView === 'chat'} onclick={() => showMobileView('chat')}
-          >Chat</button
-        >
-        <button aria-pressed={mobileView === 'details'} onclick={() => showMobileView('details')}
-          >Details</button
-        >
-      </nav>
-      <div class="breadcrumb">
-        {#if workspaceView === 'overview'}<strong>All worktrees</strong><span class="slash">/</span
-          ><strong>Task overview</strong>{:else}<button
-            class="breadcrumb-project"
-            onclick={() => chooseProject()}
-            disabled={runtimeState !== 'connected' &&
-              !agentAvailability.some((agent) => agent.available)}
-            >{directory ? directory.split('/').filter(Boolean).at(-1) : 'Workspace'} ⌄</button
-          ><span class="slash">/</span><strong>{focusedConversationTitle}</strong>{/if}
-      </div>
-      <div class="topbar-actions">
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-pressed={workspaceView === 'overview'}
-          onclick={() => (workspaceView === 'overview' ? showWorkspace() : showTaskOverview())}
-          >{workspaceView === 'overview' ? 'Workspace' : 'Overview'}</Button
-        >
-        <Button variant="ghost" size="sm" aria-label="Pending requests" onclick={openInbox}
-          >Inbox ({inboxItems.filter((item) => !isInboxOutcome(item) || !item.read).length})</Button
-        >
-        {#if directory}<Button
-            variant="ghost"
-            size="sm"
-            onclick={newPlan}
-            disabled={!planReady || switching || sending}
-            aria-label="New plan"
-            title="Start an Architect plan">New plan</Button
-          >{/if}
-        {#if directory}<div class="agent-launches">
-            {#each agentAvailability as agent (agent.id)}
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={!agent.available}
-                title={agent.reason ?? `New ${agent.name} thread`}
-                onclick={() => openAgent(agent.id)}
-                >+ <HarnessIcon agent={agent.id} /> {agent.name}</Button
-              >
-            {/each}
-            <Button
-              size="sm"
-              variant="ghost"
-              onclick={newWork}
-              disabled={!workReady || switching || sending}
-              title="New OpenCode thread">+ <HarnessIcon agent="opencode" /> OpenCode</Button
-            >
-          </div>{/if}
-        {#if directory}<button
-            class="agent-menu-launch"
-            onclick={() =>
-              reopenCommandPalette({
-                kind: 'agents',
-                repository: selectedRepository(projectCatalog, directory) ?? directory,
-                directory,
-              })}>Agents</button
-          >{/if}
-        {#if actionAgentThread}<Button
-            variant="ghost"
-            size="sm"
-            aria-label="Remove thread"
-            onclick={() => {
-              if (actionAgentThread) removeAgentThread(actionAgentThread);
-            }}>Remove thread</Button
-          >{:else if actionOpenCodeSession}<Button
-            variant="ghost"
-            size="sm"
-            onclick={() => actionOpenCodeSession && startRename(actionOpenCodeSession)}
-            >Rename</Button
-          ><Button
-            variant="ghost"
-            size="sm"
-            onclick={() => actionOpenCodeSession && void removeSession(actionOpenCodeSession)}
-            >Delete</Button
-          >{/if}
-        {#if !acpAgent && sessionID && openCodeUsage[`${directory}:${sessionID}`] !== undefined}<span
-            class="session-usage">Context {openCodeUsage[`${directory}:${sessionID}`]}%</span
-          >{/if}
-        {#if directory}<Button
-            variant="ghost"
-            size="sm"
-            aria-pressed={!browserAccessDisabled}
-            onclick={toggleAgentBrowserAccess}
-            title="Toggle agent browser access for this project"
-            >Agent browser {browserAccessDisabled ? 'off' : 'on'}</Button
-          >{/if}
-        {#if selectedWorktreeConfig?.run}<Button
-            variant="ghost"
-            size="sm"
-            onclick={() => splitFocusedPane('row', 'terminal', selectedWorktreeConfig?.run)}
-            >Run project</Button
-          >{/if}
-        {#if agentTerminals.length}<Button
-            variant="ghost"
-            size="sm"
-            onclick={() => agentTerminalsDialog.showModal()}
-            >Agent terminals ({agentTerminals.length})</Button
-          >{/if}
-        {#if directory && focusedSnapshotThread()}<Button
-            variant="ghost"
-            size="sm"
-            onclick={() => void openSnapshots()}>Restore</Button
-          >{/if}
-        <Button variant="ghost" size="sm" onclick={openCommandsDialog}>Commands</Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          onclick={toggleChanges}
-          aria-controls="session-details"
-          aria-expanded={focusedPane !== 'main'
-            ? changesPanes.includes(focusedPane)
-            : acpAgent
-              ? agentChangesOpen
-              : detailsOpen &&
-                (mainShipFallback ||
-                  (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship'))}
-          title={sessionID || acpAgent ? 'Toggle Changes (⌘L)' : 'Toggle details (⌘L)'}
-          >{sessionID || acpAgent ? 'Changes' : 'Details'}</Button
-        >
-      </div>
-    </header>
+    <AppTopbar
+      bind:element={topbarElement}
+      bind:sidebarToggle={sidebarToggleElement}
+      sidebarExpanded={sidebarVisible && (!mobileLayout || mobileView === 'sessions')}
+      ontogglesidebar={toggleSidebar}
+      {mobileView}
+      onmobileview={(view) => void showMobileView(view)}
+      overview={workspaceView === 'overview'}
+      onoverview={() => (workspaceView === 'overview' ? showWorkspace() : showTaskOverview())}
+      projectName={directory ? locationName(directory) : 'Workspace'}
+      projectDisabled={runtimeState !== 'connected' &&
+        !agentAvailability.some((agent) => agent.available)}
+      onchooseproject={() => void chooseProject()}
+      conversationTitle={focusedConversationTitle}
+      inboxCount={inboxItems.filter((item) => !isInboxOutcome(item) || !item.read).length}
+      oninbox={openInbox}
+      {directory}
+      agents={agentAvailability}
+      onopenagent={(agent) => openAgent(agent)}
+      newWorkDisabled={!workReady || switching || sending}
+      onnewwork={newWork}
+      planDisabled={!planReady || switching || sending}
+      onnewplan={() => void newPlan()}
+      onswitchthread={() =>
+        reopenCommandPalette({
+          kind: 'agents',
+          repository: selectedRepository(projectCatalog, directory) ?? directory,
+          directory,
+        })}
+      threadActions={actionAgentThread
+        ? {
+            kind: 'agent',
+            title: actionAgentThread.title,
+            ondelete: () => actionAgentThread && void deleteAgentThread(actionAgentThread),
+          }
+        : actionOpenCodeSession
+          ? {
+              kind: 'opencode',
+              title: actionOpenCodeSession.title ?? 'Untitled plan',
+              onrename: () => actionOpenCodeSession && startRename(actionOpenCodeSession),
+              ondelete: () => actionOpenCodeSession && void removeSession(actionOpenCodeSession),
+            }
+          : null}
+      contextUsage={!acpAgent && sessionID ? openCodeUsage[`${directory}:${sessionID}`] : undefined}
+      browserAccess={!browserAccessDisabled}
+      ontogglebrowser={toggleAgentBrowserAccess}
+      onrunproject={selectedWorktreeConfig?.run
+        ? () => splitFocusedPane('row', 'terminal', selectedWorktreeConfig?.run)
+        : null}
+      agentTerminalCount={agentTerminals.length}
+      onagentterminals={() => agentTerminalsDialog.showModal()}
+      onrestore={directory && focusedSnapshotThread() ? () => void openSnapshots() : null}
+      oncommands={openCommandsDialog}
+      changesLabel={sessionID || acpAgent ? 'Changes' : 'Details'}
+      changesTitle={sessionID || acpAgent ? 'Toggle Changes (⌘L)' : 'Toggle details (⌘L)'}
+      changesExpanded={focusedPane !== 'main'
+        ? changesPanes.includes(focusedPane)
+        : acpAgent
+          ? agentChangesOpen
+          : detailsOpen &&
+            (mainShipFallback ||
+              (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship'))}
+      ontogglechanges={() => void toggleChanges()}
+    />
     {#if $settingsError}<p class="notice error" role="alert">{$settingsError}</p>{/if}
     {#if setupError}<p class="notice error" role="alert">{setupError}</p>{/if}
     {#if error}<div class="notice error" role="alert">{error}</div>{/if}
@@ -14429,6 +14414,7 @@
                   )}
                 capabilityProfile={capabilityProfileForDirectory(directory)}
                 running={!!(acpThread && runningAgentThreads[agentThreadKey(acpThread)])}
+                activityReady={acpActivityReady}
                 focused={focusedPane === 'main'}
                 oncreated={createAgentThread}
                 onactivity={saveAgentThread}
@@ -14458,9 +14444,7 @@
                   ? 'connecting'
                   : runtimeState !== 'connected'
                     ? 'offline'
-                    : pendingPermissions.length ||
-                        pendingForms.length ||
-                        setup?.model.state === 'action'
+                    : pendingPermissions.length || pendingForms.length
                       ? 'waiting'
                       : running
                         ? 'working'
@@ -14469,6 +14453,15 @@
                           : setupLoading
                             ? 'connecting'
                             : 'offline'}
+                label={runtimeState === 'connected' &&
+                !pendingPermissions.length &&
+                !pendingForms.length &&
+                !running &&
+                !workReady &&
+                !setupLoading &&
+                setup?.model.state === 'action'
+                  ? 'Model setup needed'
+                  : undefined}
               />
             </div>
             <div class="chat-body">
@@ -14846,6 +14839,7 @@
         focusPromptPane={promptFocusPane}
         onpromptfocused={() => (promptFocusPane = null)}
         running={(thread) => !!(thread && runningAgentThreads[agentThreadKey(thread)])}
+        activityReady={acpActivityReady}
         onstatus={updateAgentThreadStatus}
         onreplaychange={setAgentReplay}
         onchanges={(id) => {
@@ -14878,6 +14872,7 @@
         repository={coordinationProject(directory) ?? directory}
         runs={shipRuns}
         busy={shippingBusy}
+        {mergeOwner}
         nativeSubagents={Object.values(nativeSubagents)}
         onclose={closeShipRuns}
         onrefresh={() => tickShippingRuns(true)}
@@ -15015,6 +15010,7 @@
             active={activeSideTab === 'ship' && detailsOpen && (acpAgent ? agentChangesOpen : true)}
             runs={shipRuns}
             busy={shippingBusy}
+            {mergeOwner}
             nativeSubagents={Object.values(nativeSubagents)}
             onclose={closeShipRuns}
             onrefresh={() => tickShippingRuns(true)}

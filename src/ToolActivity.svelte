@@ -67,7 +67,7 @@
   .tool-activity {
     min-width: 0;
     margin: 6px 0;
-    border: 1px solid var(--shell-divider, var(--border));
+    border: 1px solid var(--shell-divider);
     border-radius: 8px;
     font-size: 12px;
   }
@@ -83,11 +83,11 @@
     font-weight: 600;
   }
   .tool-activity-error {
-    color: var(--danger, #d66);
+    color: var(--sui-danger-ink);
   }
   .tool-activity-summary-error {
     flex-basis: 100%;
-    color: var(--danger, #d66);
+    color: var(--sui-danger-ink);
     max-height: 3em;
     overflow: hidden;
     overflow-wrap: anywhere;
@@ -96,7 +96,7 @@
     flex-basis: 100%;
     min-width: 0;
     overflow: hidden;
-    color: var(--text, inherit);
+    color: inherit;
     font:
       12px/1.5 ui-monospace,
       monospace;
@@ -105,7 +105,7 @@
   }
   .tool-activity-command::before {
     content: '$ ';
-    color: var(--text-muted, var(--sui-muted));
+    color: var(--sui-muted);
   }
   .tool-activity-details {
     padding: 0 10px 9px;
@@ -114,7 +114,7 @@
     margin-top: 8px;
   }
   .tool-activity-section > span {
-    color: var(--text-muted, var(--sui-muted));
+    color: var(--sui-muted);
     font-size: 11px;
     font-weight: 600;
   }
@@ -133,15 +133,15 @@
   }
   .tool-activity-source {
     margin: 8px 0 0;
-    color: var(--text-muted, var(--sui-muted));
+    color: var(--sui-muted);
   }
   .tool-activity-fix {
     margin-top: 8px;
     padding: 5px 9px;
-    border: 1px solid var(--shell-divider, var(--border));
+    border: 1px solid var(--shell-divider);
     border-radius: 6px;
-    color: var(--text, inherit);
-    background: var(--surface, transparent);
+    color: inherit;
+    background: transparent;
     cursor: pointer;
   }
 </style>

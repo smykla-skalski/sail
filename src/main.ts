@@ -4,9 +4,11 @@ import { mount } from 'svelte';
 import { initializeSettings } from './lib/settings';
 import { installFrontendDiagnostics, recordDiagnostic } from './lib/diagnostics';
 import { installScrollbarVisibility } from './lib/scrollbars';
+import { installThemeTransitionGuard } from './lib/theme-transitions';
 
 installFrontendDiagnostics();
 installScrollbarVisibility();
+installThemeTransitionGuard();
 
 async function start() {
   if (import.meta.env.MODE === 'e2e') await import('@wdio/tauri-plugin');
