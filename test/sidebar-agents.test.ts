@@ -519,17 +519,20 @@ await test('ACP listing pages through the cursor and keeps only the asked direct
 });
 
 await test('ACP listing skips entries without a session id', async () => {
+  // Parsed JSON stands in for what an agent sends, including values the types forbid.
+  const listing: AgentSessionListing = JSON.parse(
+    JSON.stringify({
+      sessions: [
+        { sessionId: '', cwd: '/repo/a', title: 'Empty id' },
+        { sessionId: '  ', cwd: '/repo/a', title: 'Blank id' },
+        { sessionId: 42, cwd: '/repo/a', title: 'Numeric id' },
+        { sessionId: 'ses_ok', cwd: '/repo/a', title: 'Real' },
+      ],
+    }),
+  );
   const threads = await listSidebarAcpThreads(
     'opencode',
-    () =>
-      Promise.resolve({
-        sessions: [
-          { sessionId: '', cwd: '/repo/a', title: 'Empty id' },
-          { sessionId: '  ', cwd: '/repo/a', title: 'Blank id' },
-          { sessionId: 42 as unknown as string, cwd: '/repo/a', title: 'Numeric id' },
-          { sessionId: 'ses_ok', cwd: '/repo/a', title: 'Real' },
-        ],
-      }),
+    () => Promise.resolve(listing),
     '/repo/a',
   );
   assert.deepEqual(
