@@ -146,6 +146,7 @@ function manifestIdentity(revision: string, baseRevision: string | null | undefi
 function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
   const sorted = evidence.toSorted(compareEvidence);
   if (sorted.length <= evidenceLimit) return sorted;
+  const latest = latestOutcomeEvidence(sorted);
   const latestGates = new Map<string, TaskEvidence>();
   for (const entry of sorted) {
     if (entry.kind !== 'gate') continue;
@@ -153,14 +154,22 @@ function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
     if (!previous || evidenceIsNewer(entry, previous)) latestGates.set(entry.name, entry);
   }
   const latestCriteria = new Map<string, TaskEvidence>();
-  for (const entry of latestOutcomeEvidence(sorted)) {
+  for (const entry of latest) {
     if (entry.result !== 'passed') continue;
     for (const criterion of entry.criteria) {
       const previous = latestCriteria.get(criterion);
       if (!previous || evidenceIsNewer(entry, previous)) latestCriteria.set(criterion, entry);
     }
   }
-  const protectedIds = new Set([...latestGates.values()].map((entry) => entry.id));
+  const protectedIds = new Set<string>();
+  for (const entry of latest.filter(isCiObservation).toSorted(compareEvidence).toReversed()) {
+    if (protectedIds.size >= evidenceLimit) break;
+    protectedIds.add(entry.id);
+  }
+  for (const entry of [...latestGates.values()].toSorted(compareEvidence).toReversed()) {
+    if (protectedIds.size >= evidenceLimit) break;
+    protectedIds.add(entry.id);
+  }
   for (const entry of [...latestCriteria.values()].toSorted(compareEvidence).toReversed()) {
     if (protectedIds.size >= evidenceLimit) break;
     protectedIds.add(entry.id);
@@ -953,12 +962,36 @@ export function recordCiEvidenceObservation(
       });
     }
     if (rollup) {
-      const reconciled = reconcileArchivedEconomicsEvidence(
-        rollup,
-        parsedEntry.reconciliationKey!,
-        parsedEntry,
-      );
-      if (reconciled !== rollup) return moveRollup(synced, reconciled, index);
+      const exact = manifest?.evidence.find((candidate) => candidate.id === parsedEntry.id);
+      if (exact) {
+        if (ciObservationContent(exact) !== ciObservationContent(parsedEntry))
+          throw new Error(`Evidence identity ${parsedEntry.id} was reused with different content.`);
+      } else {
+        const reconciled = reconcileArchivedEconomicsEvidence(
+          rollup,
+          parsedEntry.reconciliationKey!,
+          parsedEntry,
+        );
+        if (reconciled !== rollup) {
+          const moved = moveRollup(synced, reconciled, index);
+          const highWater = Math.max(
+            archivedSequenceHighWater(moved),
+            ...moved.flatMap((candidate) => candidate.evidence.map((entry) => entry.sequence ?? 0)),
+          );
+          if (highWater >= maxEconomicsCounter) throw new Error('Evidence sequence limit reached.');
+          const restored = { ...parsedEntry, sequence: highWater + 1 };
+          return moved.with(
+            index,
+            withBoundedEvidence(
+              {
+                ...moved[index],
+                updatedAt: Math.max(moved[index].updatedAt, parsedEntry.timestamp),
+              },
+              [...moved[index].evidence, restored],
+            ),
+          );
+        }
+      }
     }
   }
   if (parsedEntry.identityUncertain !== true && parsedEntry.reconciliationKey) {

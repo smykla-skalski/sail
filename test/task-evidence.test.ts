@@ -342,6 +342,54 @@ void test('rejects unknown criteria and bounds manifests and entries', () => {
   assert.equal(manifests.at(-1)?.evidence.length, 100);
 });
 
+void test('keeps current CI live when gates and criterion proofs fill the evidence bound', () => {
+  const boundedCriteria = Array.from({ length: 97 }, (_, index) => `criterion-${index}`);
+  let manifests = boundedCriteria.reduce(
+    (current, criterion, index) =>
+      recordTaskEvidence(
+        current,
+        'revision',
+        boundedCriteria,
+        evidence({
+          id: `criterion-proof-${index}`,
+          kind: 'command',
+          name: `criterion-proof-${index}`,
+          timestamp: index + 1,
+          criteria: [criterion],
+        }),
+      ),
+    [] as EvidenceManifest[],
+  );
+  manifests = ['code-adversary', 'findings-adversary', 'test-adversary'].reduce(
+    (current, name, index) =>
+      recordTaskEvidence(
+        current,
+        'revision',
+        boundedCriteria,
+        evidence({ id: `required-gate-${index}`, name, timestamp: 98 + index, criteria: [] }),
+      ),
+    manifests,
+  );
+  const currentCi = ciEvidence(
+    {
+      name: 'build',
+      url: 'https://github.test/actions/runs/bounded',
+      databaseId: 50,
+      runId: 10,
+    },
+    'passed',
+    101,
+  );
+
+  manifests = recordCiEvidenceObservation(manifests, 'revision', boundedCriteria, currentCi);
+
+  assert.equal(manifests[0].evidence.length, 100);
+  assert.equal(
+    manifests[0].evidence.some((entry) => entry.id === currentCi.id),
+    true,
+  );
+});
+
 void test('the evidence bound retains each latest gate above a full command history', () => {
   let manifests: EvidenceManifest[] = [];
   for (let index = 1; index <= 100; index += 1)
@@ -1175,25 +1223,18 @@ void test('persists archived CI transition economics through later compaction', 
     databaseId: 70,
     runId: 20,
   };
-  let manifests = recordCiEvidenceObservation(
-    [],
-    'revision',
-    criteria,
-    ciEvidence(check, 'pending', 1),
-  );
-  for (let index = 0; index < 100; index += 1)
-    manifests = recordTaskEvidence(
-      manifests,
-      'revision',
-      criteria,
-      evidence({
-        id: `transition-filler-${index}`,
-        kind: 'command',
-        name: `transition-filler-${index}`,
-        criteria: [],
-        timestamp: index + 2,
-      }),
-    );
+  const pending = { ...ciEvidence(check, 'pending', 1), sequence: 1 };
+  let manifests: EvidenceManifest[] = [
+    {
+      revision: 'revision',
+      acceptanceCriteria: criteria,
+      evidence: [],
+      stale: false,
+      createdAt: 1,
+      updatedAt: 1,
+      economicsRollup: rollUpEconomics(undefined, [pending]),
+    },
+  ];
   manifests = recordCiEvidenceObservation(
     manifests,
     'revision',
@@ -1607,31 +1648,24 @@ void test('temporary CI identity loss keeps the enriched execution counted once'
   assert.equal(summary.accepted, true);
 });
 
-void test('temporary CI identity loss keeps an archived enriched execution counted once', () => {
+void test('temporary CI identity loss restores archived enriched execution to live evidence', () => {
   const url = 'https://github.test/actions/runs/archived-identity-refresh';
   const stable = ciEvidence(
     { name: 'build', url, databaseId: 50, runId: 10, attempt: 1 },
     'passed',
     1,
   );
-  let manifests = recordCiEvidenceObservation([], 'revision', criteria, stable);
-  manifests = Array.from({ length: 100 }, (_, index) => index).reduce(
-    (current, index) =>
-      recordTaskEvidence(
-        current,
-        'revision',
-        criteria,
-        evidence({
-          id: `archived-refresh-filler-${index}`,
-          kind: 'command',
-          name: `archived-refresh-filler-${index}`,
-          timestamp: index + 2,
-          criteria: [],
-          economics: { ...emptyTaskEconomics('primary', 'implement'), turns: 1 },
-        }),
-      ),
-    manifests,
-  );
+  let manifests: EvidenceManifest[] = [
+    {
+      revision: 'revision',
+      acceptanceCriteria: criteria,
+      evidence: [],
+      stale: false,
+      createdAt: 1,
+      updatedAt: 1,
+      economicsRollup: rollUpEconomics(undefined, [{ ...stable, sequence: 1 }]),
+    },
+  ];
   const fallback = ciEvidence({ name: 'build', url, identityUncertain: true }, 'passed', 200);
 
   manifests = reconcileCiEvidenceSnapshot(manifests, 'revision', [fallback]);
@@ -1643,7 +1677,7 @@ void test('temporary CI identity loss keeps an archived enriched execution count
 
   assert.equal(
     manifests[0].evidence.some((entry) => entry.id === fallback.id),
-    false,
+    true,
   );
   assert.equal(
     archived?.identityAliases.some(
@@ -1658,25 +1692,21 @@ void test('temporary CI identity loss keeps an archived enriched execution count
 
 void test('rekeys a compacted legacy CI failure with monotonic economics', () => {
   const url = 'https://github.test/actions/runs/1';
-  let manifests = recordCiEvidenceObservation(
-    [],
-    'revision',
-    criteria,
-    ciEvidence({ name: 'build', url, identityUncertain: true }, 'pending', 10),
-  );
-  for (let index = 0; index < 100; index += 1)
-    manifests = recordTaskEvidence(
-      manifests,
-      'revision',
-      criteria,
-      evidence({
-        id: `filler-${index}`,
-        kind: 'command',
-        name: `filler-${index}`,
-        timestamp: 20 + index,
-        criteria: [],
-      }),
-    );
+  const provisional = {
+    ...ciEvidence({ name: 'build', url, identityUncertain: true }, 'pending', 10),
+    sequence: 1,
+  };
+  let manifests: EvidenceManifest[] = [
+    {
+      revision: 'revision',
+      acceptanceCriteria: criteria,
+      evidence: [],
+      stale: false,
+      createdAt: 1,
+      updatedAt: 10,
+      economicsRollup: rollUpEconomics(undefined, [provisional]),
+    },
+  ];
   const stable = ciEvidence(
     { name: 'build', url, databaseId: 50, runId: 10, attempt: 1 },
     'failed',
