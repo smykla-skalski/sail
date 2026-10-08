@@ -97,6 +97,7 @@
     contextPressureStage,
     parseContextHandoffThreshold,
     reconcileHandoffOutcomes,
+    transferHandoffOwnership,
     updateThreadContextPressure,
     type ContextProvider,
   } from './lib/context-handoff.ts';
@@ -327,6 +328,7 @@
     handoffReceiptNeedsResolution,
     handoffPromptNeedsRecovery,
     loadSpawnReceipts,
+    openCodePromptHasBackendEvidence,
     receiptForSource,
     receiptNeedsRefresh,
     receiptIsSettled,
@@ -2656,19 +2658,13 @@
     if (!client) return false;
     const sessionId = receipt.targetId.slice('opencode:'.length);
     try {
-      const [session, page, inbox, active] = await Promise.all([
+      const [session, page, inbox] = await Promise.all([
         client.session.get({ sessionID: sessionId }),
         client.message.list({ sessionID: sessionId, limit: 50, order: 'desc' }),
         client.session.inbox.list({ sessionID: sessionId }),
-        client.session.active(),
       ]);
       if (session.location.directory !== receipt.targetDirectory) return false;
-      return (
-        page.data.some((message) => message.type === 'user' && message.text === receipt.prompt) ||
-        inbox.some((item) => item.id === receipt.turnId) ||
-        active[sessionId]?.type === 'running' ||
-        Boolean(session.outcome)
-      );
+      return openCodePromptHasBackendEvidence(receipt, page.data, inbox);
     } catch {
       return false;
     }
@@ -2848,7 +2844,13 @@
               ),
               contextHandoffs: (issue.contextHandoffs ?? []).map((item) =>
                 item.id === offer.id
-                  ? Object.assign({}, item, { toThreadId: targetId, startedAt })
+                  ? transferHandoffOwnership(
+                      item,
+                      targetId,
+                      startedAt,
+                      issue.retryCount ?? 0,
+                      issue.lostStateFailures ?? 0,
+                    )
                   : item.fromThreadId === offer.fromThreadId &&
                       !item.toThreadId &&
                       item.outcome === 'pending'
@@ -2898,11 +2900,16 @@
             ),
             contextHandoffs: (issue.contextHandoffs ?? []).map((item) =>
               item.id === offer.id
-                ? Object.assign({}, item, {
-                    toThreadId: replacementThreadId,
-                    startedAt: item.startedAt ?? Date.now(),
-                    error: describe(cause),
-                  })
+                ? Object.assign(
+                    transferHandoffOwnership(
+                      item,
+                      replacementThreadId,
+                      item.startedAt ?? Date.now(),
+                      issue.retryCount ?? 0,
+                      issue.lostStateFailures ?? 0,
+                    ),
+                    { error: describe(cause) },
+                  )
                 : item,
             ),
             contextPercent: undefined,
@@ -3691,7 +3698,13 @@
           ),
           contextHandoffs: (issue.contextHandoffs ?? []).map((handoff) =>
             handoff.id === handoffId
-              ? Object.assign({}, handoff, { toThreadId: replacement.targetId, startedAt })
+              ? transferHandoffOwnership(
+                  handoff,
+                  replacement.targetId!,
+                  startedAt,
+                  issue.retryCount ?? 0,
+                  issue.lostStateFailures ?? 0,
+                )
               : handoff,
           ),
           contextPercent: undefined,
@@ -3998,19 +4011,14 @@
     const sessionId = receipt.targetId.slice('opencode:'.length);
     activeSpawnRequests.add(receipt.receiptId);
     try {
-      const [session, page, inbox, active] = await Promise.all([
+      const [session, page, inbox] = await Promise.all([
         source.session.get({ sessionID: sessionId }),
         source.message.list({ sessionID: sessionId, limit: 50, order: 'desc' }),
         source.session.inbox.list({ sessionID: sessionId }),
-        source.session.active(),
       ]);
       if (session.location.directory !== receipt.targetDirectory)
         throw new Error('Target session moved to another worktree.');
-      const promptSeen = page.data.some(
-        (message) => message.type === 'user' && message.text === receipt.prompt,
-      );
-      if (promptSeen || inbox.length || active[sessionId]?.type === 'running' || session.outcome)
-        return;
+      if (openCodePromptHasBackendEvidence(receipt, page.data, inbox)) return;
       const turnId = receipt.turnId ?? crypto.randomUUID();
       if (!receipt.turnId) {
         updateSpawnReceipt(receipt.receiptId, { turnId });

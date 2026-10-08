@@ -14,6 +14,7 @@ import {
   handoffPromptNeedsRecovery,
   isSubagentThread,
   loadSpawnReceipts,
+  openCodePromptHasBackendEvidence,
   receiptForSource,
   receiptNeedsRefresh,
   receiptIsSettled,
@@ -424,6 +425,31 @@ await test('OpenCode handoff prompt recovery requires replacement ownership', ()
     handoffPromptNeedsRecovery({ ...issue, receiptId: 'old-receipt' }, recoverable),
     false,
   );
+});
+
+await test('OpenCode handoff dispatch ignores unrelated session activity', () => {
+  const handoff = {
+    prompt: 'Continue from the canonical checkpoint',
+    turnId: 'handoff-turn',
+  };
+
+  assert.equal(
+    openCodePromptHasBackendEvidence(
+      handoff,
+      [{ type: 'user', text: 'Unrelated prompt' }],
+      [{ id: 'unrelated-turn' }],
+    ),
+    false,
+  );
+  assert.equal(
+    openCodePromptHasBackendEvidence(
+      handoff,
+      [{ type: 'user', text: 'Continue from the canonical checkpoint' }],
+      [],
+    ),
+    true,
+  );
+  assert.equal(openCodePromptHasBackendEvidence(handoff, [], [{ id: 'handoff-turn' }]), true);
 });
 
 await test('owned handoff prompts recover across every unsettled restart window', () => {

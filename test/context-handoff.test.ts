@@ -7,6 +7,7 @@ import {
   handoffOutcome,
   parseContextHandoffThreshold,
   reconcileHandoffOutcomes,
+  transferHandoffOwnership,
   updateThreadContextPressure,
 } from '../src/lib/context-handoff.ts';
 import { initialTaskCheckpoint } from '../src/lib/task-checkpoint.ts';
@@ -67,6 +68,33 @@ void test('records whether retries or lost-state failures regressed', () => {
   };
   assert.equal(handoffOutcome(handoff, 1, 0).outcome, 'no_regression');
   assert.equal(handoffOutcome(handoff, 2, 0).outcome, 'regressed');
+});
+
+void test('handoff ownership transfer excludes retries recorded by the previous worker', () => {
+  const offered = {
+    id: 'handoff-one',
+    provider: 'codex' as const,
+    fromThreadId: 'old',
+    toThreadId: null,
+    context: 90,
+    compactions: 0,
+    checkpointSequence: 1,
+    revision: 'abc',
+    offeredAt: 10,
+    startedAt: null,
+    retriesBefore: 0,
+    lostStateFailuresBefore: 0,
+    retriesAfter: null,
+    lostStateFailuresAfter: null,
+    outcome: 'pending' as const,
+    error: null,
+  };
+
+  const transferred = transferHandoffOwnership(offered, 'new', 20, 1, 0);
+
+  assert.equal(handoffOutcome(transferred, 1, 0).outcome, 'no_regression');
+  assert.equal(transferred.retriesBefore, 1);
+  assert.equal(transferred.toThreadId, 'new');
 });
 
 void test('recovers a pending handoff from its persisted completed receipt', () => {

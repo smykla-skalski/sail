@@ -104,6 +104,22 @@ export function handoffOutcome(
   };
 }
 
+export function transferHandoffOwnership(
+  handoff: ContextHandoff,
+  toThreadId: string,
+  startedAt: number,
+  retries: number,
+  lostStateFailures: number,
+): ContextHandoff {
+  return {
+    ...handoff,
+    toThreadId,
+    startedAt,
+    retriesBefore: retries,
+    lostStateFailuresBefore: lostStateFailures,
+  };
+}
+
 export function reconcileHandoffOutcomes(
   handoffs: ContextHandoff[] | undefined,
   receipts: Pick<SpawnReceipt, 'requestId' | 'targetId' | 'state' | 'error'>[],

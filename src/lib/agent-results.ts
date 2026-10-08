@@ -262,6 +262,18 @@ export function acpPromptHasBackendEvidence(
   );
 }
 
+export function openCodePromptHasBackendEvidence(
+  receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
+  messages: Array<{ type: string; text?: string }>,
+  inbox: Array<{ id: string }>,
+): boolean {
+  if (!receipt.prompt || !receipt.turnId) return false;
+  return (
+    messages.some((message) => message.type === 'user' && message.text === receipt.prompt) ||
+    inbox.some((item) => item.id === receipt.turnId)
+  );
+}
+
 export function acpTurnEvidenceState(evidence: AcpTurnEvidence | null): SpawnState | null {
   if (!evidence) return null;
   if (evidence.status === 'done') return 'completed';
