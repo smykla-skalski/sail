@@ -69,19 +69,28 @@ function normalizedModel(value: string): string {
 }
 
 export function parseModelRoutingSettings(raw: string | null): ModelRoutingSettings {
+  if (raw === null) return { routes: [], independentReviewRisks: [] };
   try {
     const value: unknown = JSON.parse(raw ?? 'null');
     if (!value || typeof value !== 'object') throw new Error('Invalid settings');
     if (!('routes' in value) || !Array.isArray(value.routes)) throw new Error('Invalid routes');
-    const routes = value.routes.filter(isModelRoute);
+    if (!value.routes.every(isModelRoute)) throw new Error('Invalid route');
+    const routes = value.routes;
+    if (
+      'independentReviewRisks' in value &&
+      (!Array.isArray(value.independentReviewRisks) || !value.independentReviewRisks.every(isRisk))
+    )
+      throw new Error('Invalid review risks');
     const deduplicated = new Map(routes.map((route) => [`${route.role}\0${route.risk}`, route]));
     const independentReviewRisks: ShipRisk[] =
       'independentReviewRisks' in value && Array.isArray(value.independentReviewRisks)
         ? [...new Set(value.independentReviewRisks.filter(isRisk))]
-        : ['medium', 'high'];
+        : routes.length > 0
+          ? ['medium', 'high']
+          : [];
     return { routes: [...deduplicated.values()], independentReviewRisks };
   } catch {
-    return { routes: [], independentReviewRisks: ['medium', 'high'] };
+    return { routes: [], independentReviewRisks: [...shipRiskLevels] };
   }
 }
 
@@ -97,7 +106,10 @@ export function selectModelRoute(
     return {
       route: null,
       independentReviewRequired,
-      reason: `No ${request.risk}-risk ${request.role} model route is configured.`,
+      reason:
+        settings.routes.length === 0 && !independentReviewRequired
+          ? null
+          : `No ${request.risk}-risk ${request.role} model route is configured.`,
     };
   if (hasUnresolvedModelAlias(route.model))
     return {

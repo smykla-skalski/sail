@@ -96,6 +96,10 @@ describe('provider selected agent spawn', () => {
       );
       localStorage.removeItem('sail-agent-threads');
       localStorage.removeItem('sai-agent-spawn-receipts');
+      localStorage.setItem(
+        'sai-model-routing',
+        JSON.stringify({ routes: [], independentReviewRisks: [] }),
+      );
       localStorage.setItem('sai-notifications-enabled', 'false');
     }, path);
     await browser.tauri.execute(async ({ core }, directory) => {
@@ -106,6 +110,10 @@ describe('provider selected agent spawn', () => {
       });
       await core.invoke('save_setting', { key: 'sail-agent-threads', value: null });
       await core.invoke('save_setting', { key: 'sai-agent-spawn-receipts', value: null });
+      await core.invoke('save_setting', {
+        key: 'sai-model-routing',
+        value: JSON.stringify({ routes: [], independentReviewRisks: [] }),
+      });
       await core.invoke('save_setting', { key: 'sai-notifications-enabled', value: 'false' });
     }, path);
     await browser.refresh();
@@ -120,23 +128,33 @@ describe('provider selected agent spawn', () => {
     );
     await $('.agent-composer textarea').setValue('Clipboard fixture source');
     await $('.agent-actions button').click();
-    await browser.waitUntil(
-      () =>
-        browser.execute(() => {
-          const saved: unknown = JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]');
-          return (
-            Array.isArray(saved) &&
-            saved.some(
-              (thread) =>
-                typeof thread === 'object' &&
-                thread !== null &&
-                'title' in thread &&
-                thread.title === 'Clipboard fixture source',
-            )
-          );
-        }),
-      { timeout: 15_000 },
-    );
+    try {
+      await browser.waitUntil(
+        () =>
+          browser.execute(() => {
+            const saved: unknown = JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]');
+            return (
+              Array.isArray(saved) &&
+              saved.some(
+                (thread) =>
+                  typeof thread === 'object' &&
+                  thread !== null &&
+                  'title' in thread &&
+                  thread.title === 'Clipboard fixture source',
+              )
+            );
+          }),
+        { timeout: 15_000 },
+      );
+    } catch (error) {
+      const diagnostic = await browser.execute(() => ({
+        header: document.querySelector('.agent-header')?.textContent,
+        conversation: document.querySelector('.agent-conversation')?.textContent?.slice(-3000),
+        threads: localStorage.getItem('sail-agent-threads'),
+      }));
+      console.error('Source agent setup failed:', diagnostic);
+      throw error;
+    }
     const saved = await browser.execute(() => localStorage.getItem('sail-agent-threads'));
     const sourceThread = z
       .array(agentThread)
@@ -253,6 +271,31 @@ describe('provider selected agent spawn', () => {
       'agent_result',
     );
     expect(wrongKey.isError).toBe(true);
+
+    const routedResult = await callMcp(config, sessionId, {
+      role: 'implementation',
+      risk: 'high',
+      prompt: 'Clipboard fixture default-model worker',
+      target: { kind: 'existing', path },
+    });
+    expect(routedResult.isError).not.toBe(true);
+    const routedWorker = z
+      .object({ threadId: z.string(), receiptId: z.string() })
+      .parse(JSON.parse(routedResult.content[0].text));
+    expect(routedWorker.threadId).toMatch(new RegExp(`^acp:${sourceThread.agent}:`));
+    const routedReceipt = await browser.execute((id) => {
+      const savedReceipts: Array<{ receiptId: string; routing?: unknown }> = JSON.parse(
+        localStorage.getItem('sai-agent-spawn-receipts') ?? '[]',
+      );
+      return savedReceipts.find((item) => item.receiptId === id);
+    }, routedWorker.receiptId);
+    expect(routedReceipt?.routing).toMatchObject({
+      role: 'implementation',
+      risk: 'high',
+      independentReviewRequired: false,
+      requested: { provider: sourceThread.agent, model: null },
+      actual: { provider: sourceThread.agent },
+    });
 
     const spawnShared = callMcp(config, sessionId, {
       provider: 'claude',

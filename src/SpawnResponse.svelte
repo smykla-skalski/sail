@@ -103,11 +103,11 @@
       <p class="spawn-route">
         {receipt.routing.role} · {receipt.routing.risk} · requested {receipt.routing.requested
           .provider}
-        / {receipt.routing.requested.model}{receipt.routing.requested.variant
+        / {receipt.routing.requested.model ?? 'default'}{receipt.routing.requested.variant
           ? ` / ${receipt.routing.requested.variant}`
           : ''}{#if receipt.routing.actual}
-          · actual {receipt.routing.actual.provider} / {receipt.routing.actual.model}{receipt
-            .routing.actual.variant
+          · actual {receipt.routing.actual.provider} / {receipt.routing.actual.model ??
+            'unreported'}{receipt.routing.actual.variant
             ? ` / ${receipt.routing.actual.variant}`
             : ''}{/if}
         {#if receipt.routing.independentReviewRequired}

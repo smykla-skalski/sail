@@ -8669,11 +8669,10 @@
         !shipRiskLevels.includes(risk as ShipRisk))
     )
       throw new Error('Choose both a routing role and low, medium, or high task risk.');
-    if (
-      !routed &&
-      (typeof provider !== 'string' || !['claude', 'codex', 'opencode'].includes(provider))
-    )
+    if (!routed && provider === undefined)
       throw new Error('Choose a routing role and task risk, or a legacy provider.');
+    if (!routed && !['claude', 'codex', 'opencode'].includes(String(provider)))
+      throw new Error('Choose Claude, Codex, or OpenCode.');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Starting prompt must be 1–8000 characters.');
     if (target !== undefined && (typeof target !== 'object' || target === null))
@@ -8703,16 +8702,14 @@
             role === 'review' ? implementationModels(request.directory) : undefined,
         })
       : null;
-    if (routeSelection && !routeSelection.route)
+    if (routeSelection?.reason)
       throw new Error(routeSelection.reason ?? 'No eligible model route.');
     const route = routeSelection?.route;
-    const selectedProvider = route?.provider ?? provider;
-    const chosenProvider: SpawnReceipt['provider'] =
-      selectedProvider === 'claude'
-        ? 'claude'
-        : selectedProvider === 'codex'
-          ? 'codex'
-          : 'opencode';
+    const selectedProvider =
+      route?.provider ?? provider ?? (source.kind === 'opencode' ? 'opencode' : source.agent);
+    if (!['claude', 'codex', 'opencode'].includes(String(selectedProvider)))
+      throw new Error('Choose Claude, Codex, or OpenCode.');
+    const chosenProvider = selectedProvider as SpawnReceipt['provider'];
     if (chosenProvider === 'opencode') {
       if (!client || runtimeState !== 'connected') throw new Error('OpenCode is unavailable.');
     } else {
@@ -8770,16 +8767,16 @@
       updated: Date.now(),
       result: null,
       error: null,
-      ...(route && routeSelection
+      ...(routed && routeSelection
         ? {
             routing: {
-              role: route.role,
-              risk: route.risk,
+              role: role as ModelRouteRole,
+              risk: risk as ShipRisk,
               independentReviewRequired: routeSelection.independentReviewRequired,
               requested: {
-                provider: route.provider,
-                model: route.model,
-                variant: route.variant ?? null,
+                provider: chosenProvider,
+                model: route?.model ?? null,
+                variant: route?.variant ?? null,
               },
               actual: null,
             },

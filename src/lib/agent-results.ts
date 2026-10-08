@@ -109,12 +109,14 @@ export function loadSpawnReceipts(raw: string | null): SpawnReceipt[] {
           typeof receipt.routing.independentReviewRequired !== 'boolean' ||
           !receipt.routing.requested ||
           !['claude', 'codex', 'opencode'].includes(receipt.routing.requested.provider) ||
-          typeof receipt.routing.requested.model !== 'string' ||
+          (receipt.routing.requested.model !== null &&
+            typeof receipt.routing.requested.model !== 'string') ||
           (receipt.routing.requested.variant !== null &&
             typeof receipt.routing.requested.variant !== 'string') ||
           (receipt.routing.actual !== null &&
             (!['claude', 'codex', 'opencode'].includes(receipt.routing.actual.provider) ||
-              typeof receipt.routing.actual.model !== 'string' ||
+              (receipt.routing.actual.model !== null &&
+                typeof receipt.routing.actual.model !== 'string') ||
               (receipt.routing.actual.variant !== null &&
                 typeof receipt.routing.actual.variant !== 'string'))))
       )
