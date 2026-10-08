@@ -87,8 +87,14 @@ function styleChunks(source: Source): Chunk[] {
       css: match[1],
       line: lineAt(source.text, match.index + match[0].indexOf('>') + 1),
     });
+  // Svelte `{expr}` holes become a placeholder, so a dynamic value still parses and a dynamic
+  // font size is reported as unresolved instead of being skipped.
   const markup = (css: string, index: number) =>
-    chunks.push({ file: source.file, css: `${css};`, line: lineAt(source.text, index) });
+    chunks.push({
+      file: source.file,
+      css: `${css.replaceAll(/\{[^{}]*\}/g, 'dynamic-value')};`,
+      line: lineAt(source.text, index),
+    });
   for (const match of source.text.matchAll(/\sstyle=(?:"([^"]*)"|\{(['"`])([\s\S]*?)\2\})/g))
     markup(inlineExpressions(match[1] ?? match[3]), match.index);
   for (const match of source.text.matchAll(
@@ -99,6 +105,8 @@ function styleChunks(source: Source): Chunk[] {
     /\s(fill|stroke|stop-color|flood-color|lighting-color|font-size)="([^"]*)"/g,
   ))
     markup(`${match[1]}: ${match[2]}`, match.index);
+  for (const match of source.text.matchAll(/\s(?:style:)?(font-size|font)=\{(?!['"`])/g))
+    markup(`${match[1]}: dynamic-value`, match.index);
   return chunks;
 }
 
@@ -209,7 +217,7 @@ function resolveVar(value: string, tokens: Theme): string | null {
 
 function fontSize(property: string, raw: string, tokens: Theme, depth = 0): FontSize {
   if (property !== 'font-size' && property !== 'font') return null;
-  const value = raw.replace(/\s*!important\s*$/i, '').trim();
+  const value = raw.replace(/\s*!\s*important\s*$/i, '').trim();
   if (inheritedSize.has(value.toLowerCase())) return null;
   const size =
     property === 'font-size'
@@ -219,14 +227,14 @@ function fontSize(property: string, raw: string, tokens: Theme, depth = 0): Font
   const resolved = resolveVar(size, tokens);
   if (resolved === null || depth > 4) return { unresolved: value };
   // clamp() never renders below its first argument, so that minimum is the size to check.
-  const clamp = /^clamp\(\s*([^,]+?)\s*,/.exec(resolved);
+  const clamp = /^clamp\(\s*([^,]+?)\s*,/i.exec(resolved);
   if (resolved !== size || clamp) {
     const inner = fontSize('font-size', clamp ? clamp[1] : resolved, tokens, depth + 1);
     return inner && 'unresolved' in inner ? { unresolved: value } : inner;
   }
-  const length = /^(\d*\.?\d+)(px|rem)?$/.exec(size);
+  const length = /^(\d*\.?\d+)(px|rem)?$/i.exec(size);
   if (!length || (!length[2] && Number(length[1]) !== 0)) return { unresolved: value };
-  return { px: Number(length[1]) * (length[2] === 'rem' ? 16 : 1) };
+  return { px: Number(length[1]) * (length[2]?.toLowerCase() === 'rem' ? 16 : 1) };
 }
 
 void test('font sizes resolve to px, or fail unless reviewed', () => {
@@ -236,6 +244,8 @@ void test('font sizes resolve to px, or fail unless reviewed', () => {
     ['font', '600 0.8125rem/1.125rem var(--sui-font)', { px: 13 }],
     ['font', 'var(--type-12)/1.5 ui-monospace, monospace', { px: 12 }],
     ['font-size', '11px !important', { px: 11 }],
+    ['font-size', '11PX ! important', { px: 11 }],
+    ['font-size', 'dynamic-valuepx', { unresolved: 'dynamic-valuepx' }],
     ['font-size', 'var(--undefined-size, 12px)', { px: 12 }],
     ['font-size', 'var(--undefined-size, 10px) !important', { px: 10 }],
     ['font-size', 'var(--undefined-size)', { unresolved: 'var(--undefined-size)' }],
