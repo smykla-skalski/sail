@@ -6956,6 +6956,7 @@
                 return (
                   (await openCodePermissionRejections.reject({
                     selected: request,
+                    automatic: true,
                     list: () => openCodeSource.permission.list({ sessionID: request.sessionID }),
                     validate: async (pendingRequests) => {
                       const decisions = await Promise.all(

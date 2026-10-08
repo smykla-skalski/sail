@@ -4,6 +4,7 @@ type RejectionRequest = {
   selected: PermissionRequest;
   list: () => Promise<PermissionRequest[]>;
   validate?: (requests: PermissionRequest[]) => Promise<boolean>;
+  automatic?: boolean;
   reply: () => Promise<void>;
   record: (request: PermissionRequest) => void;
 };
@@ -55,12 +56,18 @@ type ObservedPermission = {
   recordAutomatic?: (request: PermissionRequest, reply: PermissionReply) => void;
 };
 
+type InFlightRejection = {
+  requestID: string;
+  validated: boolean;
+  promise: Promise<PermissionRequest[] | null>;
+};
+
 export class OpenCodePermissionRejectionCoordinator {
   readonly #observed = new Map<string, Map<string, ObservedPermission>>();
   readonly #active = new Map<string, ActiveRejection>();
   readonly #recent = new Map<string, RecentRejection>();
   readonly #nonRejected = new Map<string, Set<string>>();
-  readonly #inFlight = new Map<string, Promise<PermissionRequest[] | null>>();
+  readonly #inFlight = new Map<string, InFlightRejection>();
   readonly #ambiguousReplies = new Map<string, Map<string, AmbiguousReply>>();
   readonly #maxSessions: number;
   readonly #maxRequests: number;
@@ -200,13 +207,33 @@ export class OpenCodePermissionRejectionCoordinator {
   }
 
   reject(request: RejectionRequest): Promise<PermissionRequest[] | null> {
+    if (request.automatic) return Promise.resolve(null);
     const sessionID = request.selected.sessionID;
     const existing = this.#inFlight.get(sessionID);
-    if (existing) return existing;
+    if (existing) {
+      if (
+        existing.requestID === request.selected.id &&
+        existing.validated === Boolean(request.validate)
+      )
+        return existing.promise;
+      return existing.promise.then(
+        (settled) =>
+          settled?.some((candidate) => candidate.id === request.selected.id)
+            ? settled
+            : this.reject(request),
+        () => this.reject(request),
+      );
+    }
+    const inFlight: InFlightRejection = {
+      requestID: request.selected.id,
+      validated: Boolean(request.validate),
+      promise: Promise.resolve(null),
+    };
     const resolution = this.#reject(request).finally(() => {
-      this.#inFlight.delete(sessionID);
+      if (this.#inFlight.get(sessionID) === inFlight) this.#inFlight.delete(sessionID);
     });
-    this.#inFlight.set(sessionID, resolution);
+    inFlight.promise = resolution;
+    this.#inFlight.set(sessionID, inFlight);
     return resolution;
   }
 

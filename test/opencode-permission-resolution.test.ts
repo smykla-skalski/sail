@@ -72,6 +72,31 @@ await test('automatic session rejection stops when a high-risk request joins the
   assert.equal(replied, false);
 });
 
+await test('automatic rejection never invokes the session-wide provider reply', async () => {
+  const coordinator = new OpenCodePermissionRejectionCoordinator();
+  const selected = { ...permission('selected'), action: 'edit' };
+  let listed = false;
+  let replied = false;
+
+  const settled = await coordinator.reject({
+    selected,
+    automatic: true,
+    list: async () => {
+      listed = true;
+      return [selected];
+    },
+    validate: async () => true,
+    reply: async () => {
+      replied = true;
+    },
+    record: () => undefined,
+  });
+
+  assert.equal(settled, null);
+  assert.equal(listed, false);
+  assert.equal(replied, false);
+});
+
 await test('automatic session rejection stops when a permission arrives after validation', async () => {
   const coordinator = new OpenCodePermissionRejectionCoordinator();
   const selected = { ...permission('selected'), action: 'edit' };
@@ -100,6 +125,52 @@ await test('automatic session rejection stops when a permission arrives after va
 
   assert.equal(await rejection, null);
   assert.equal(replied, false);
+});
+
+await test('a distinct rejection retries after an in-flight validation is invalidated', async () => {
+  const coordinator = new OpenCodePermissionRejectionCoordinator();
+  const automatic = { ...permission('automatic'), action: 'edit' };
+  const manual = { ...permission('manual'), action: 'npm install' };
+  const validationReached = Promise.withResolvers<void>();
+  const finishValidation = Promise.withResolvers<void>();
+  let automaticReplies = 0;
+  let manualReplies = 0;
+
+  coordinator.observe(automatic);
+  const automaticRejection = coordinator.reject({
+    selected: automatic,
+    list: async () => [automatic],
+    validate: async () => {
+      validationReached.resolve();
+      await finishValidation.promise;
+      return true;
+    },
+    reply: async () => {
+      automaticReplies++;
+    },
+    record: () => undefined,
+  });
+  await validationReached.promise;
+  coordinator.observe(manual);
+  const manualRejection = coordinator.reject({
+    selected: manual,
+    list: async () => [automatic, manual],
+    reply: async () => {
+      manualReplies++;
+      coordinator.settle(manual.sessionID, automatic.id, 'reject');
+      coordinator.settle(manual.sessionID, manual.id, 'reject');
+    },
+    record: () => undefined,
+  });
+  finishValidation.resolve();
+
+  assert.equal(await automaticRejection, null);
+  assert.deepEqual(
+    (await manualRejection)?.map((request) => request.id),
+    ['manual', 'automatic'],
+  );
+  assert.equal(automaticReplies, 0);
+  assert.equal(manualReplies, 1);
 });
 
 await test('manual allow records an authoritative event when the HTTP response is lost', async () => {
