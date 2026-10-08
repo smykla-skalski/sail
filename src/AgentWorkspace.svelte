@@ -483,7 +483,15 @@
   let planRequested = $state(false);
   let completedTurn = Promise.resolve();
   let lastPlanRevisionId = '';
-  let activePlanRevision: { id: string; feedback: string; reported: boolean } | null = null;
+  let activePlanRevision: {
+    id: string;
+    feedback: string;
+    sessionId: string | null;
+    generation: number;
+    acceptingUpdates: boolean;
+    revisedPlanSeen: boolean;
+    reported: boolean;
+  } | null = null;
   $effect(() => {
     if (nativeEntries) entries = nativeEntries;
   });
@@ -744,7 +752,15 @@
   }
 
   function applyUpdate(update: Record<string, unknown>) {
+    const previousPlan = nativePlan;
     nativePlan = nativePlanUpdate(agent, update, nativePlan);
+    if (
+      !replaying &&
+      nativePlan !== previousPlan &&
+      activePlanRevision?.acceptingUpdates &&
+      activePlanRevision.sessionId === activeSessionId
+    )
+      activePlanRevision.revisedPlanSeen = true;
     if (activeSessionId && nativePlan)
       saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
     onnativeplan?.(nativePlan);
@@ -1409,6 +1425,7 @@
     externalText?: string,
     queuedMessage?: QueuedAgentMessage,
     forcePlan = false,
+    onPromptDispatch?: () => void,
   ) {
     if (externalText === undefined) await pendingPaste;
     const external = externalText !== undefined;
@@ -1579,6 +1596,7 @@
       );
       if (stopRequested) throw new Error('Agent turn was cancelled.');
       phase = 'prompt';
+      onPromptDispatch?.();
       if (id && sentImages.length)
         onattachmentsent?.(
           sentImages.map((image) => image.id),
@@ -1669,6 +1687,8 @@
         }
       }
       if (current === generation) {
+        if (external && !queuedMessage && phase !== 'prompt')
+          entries = entries.filter((entry) => entry.id !== userEntryId);
         recordDiagnostic('turn_failed', {
           agent: turnAgent,
           sessionId: deliverySessionId,
@@ -1717,14 +1737,33 @@
   }
 
   async function sendPlanRevision(revision: { id: string; feedback: string }) {
-    activePlanRevision = { ...revision, reported: false };
+    const request = {
+      ...revision,
+      sessionId: activeSessionId,
+      generation,
+      acceptingUpdates: false,
+      revisedPlanSeen: false,
+      reported: false,
+    };
+    activePlanRevision = request;
     try {
       // A native plan is emitted before its prompt settles. A revision is a
       // new ACP prompt, never a steering request into the planning turn.
       await completedTurn;
-      if (disposed || !nativePlan) throw new Error('The native plan is no longer available.');
-      const status = await send(revision.feedback, undefined, true);
+      if (request.reported) return;
+      if (
+        disposed ||
+        !request.sessionId ||
+        activeSessionId !== request.sessionId ||
+        generation !== request.generation ||
+        !nativePlan
+      )
+        throw new Error('The native plan is no longer available in this session.');
+      const status = await send(revision.feedback, undefined, true, () => {
+        request.acceptingUpdates = true;
+      });
       if (status !== 'done' || stopRequested) throw new Error('Plan revision was cancelled.');
+      if (!request.revisedPlanSeen) throw new Error('The agent did not provide a revised plan.');
       reportPlanRevision(revision.id, null);
     } catch (cause) {
       reportPlanRevision(revision.id, describe(cause));

@@ -308,7 +308,9 @@ describe('ACP agent threads', () => {
     ).toBe(0);
 
     await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await expect($('.agent-composer textarea')).toBeEnabled();
     await $('.agent-composer textarea').setValue('Cancel creation');
     await $('.agent-actions button').click();
     await browser.keys('Escape');
@@ -342,6 +344,7 @@ describe('ACP agent threads', () => {
     }, realpathSync(repository));
     await browser.refresh();
 
+    await expect($('.agent-launches')).toHaveText(expect.stringContaining('Claude'));
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer textarea').setValue('Plan revision fixture');
@@ -364,6 +367,13 @@ describe('ACP agent threads', () => {
     await expect($('#native-plan-feedback')).toHaveValue('Fail native revision');
     const retryRevision = $('.native-plan-revision button');
     await expect(retryRevision).toBeEnabled();
+
+    await $('#native-plan-feedback').setValue('No revised plan');
+    await retryRevision.click();
+    await expect($('.native-plan-revision [role="alert"]')).toHaveText(
+      'The agent did not provide a revised plan.',
+    );
+    await expect($('#native-plan-feedback')).toHaveValue('No revised plan');
 
     await $('#native-plan-feedback').setValue('Cancel native revision');
     await retryRevision.click();
@@ -390,6 +400,80 @@ describe('ACP agent threads', () => {
     await expect($('[aria-label="Native plan"]')).toHaveText(
       expect.stringContaining('Revised plan'),
     );
+  });
+
+  it('does not send revision feedback after stopping the original plan turn', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+
+    await expect($('.agent-launches')).toHaveText(expect.stringContaining('Claude'));
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await expect($('.agent-composer textarea')).toBeEnabled();
+    await $('.agent-composer textarea').setValue('Slow plan revision fixture');
+    await $('.agent-actions button:last-child').click();
+    await expect($('[aria-label="Native plan"]')).toHaveText(
+      expect.stringContaining('Initial plan'),
+    );
+    await $('#native-plan-feedback').setValue('Add retries');
+    await $('button=Request revision').click();
+    await expect($('.agent-busy')).toBeDisplayed();
+    expect(await $('.agent-conversation').getText()).not.toContain('Add retries');
+    await $('.agent-busy button').click();
+    await expect($('.native-plan-revision [role="alert"]')).toHaveText(
+      'Plan revision was cancelled.',
+    );
+    await expect($('#native-plan-feedback')).toHaveValue('Add retries');
+    await expect($('.agent-busy')).not.toBeDisplayed();
+    expect(await $('.agent-conversation').getText()).not.toContain('Add retries');
+  });
+
+  it('does not send a pending plan revision to a different session', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Slow plan revision fixture');
+    await $('.agent-actions button:last-child').click();
+    await expect($('[aria-label="Native plan"]')).toHaveText(
+      expect.stringContaining('Initial plan'),
+    );
+    await $('#native-plan-feedback').setValue('Add retries');
+    await $('button=Request revision').click();
+    await expect($('.agent-busy')).toBeDisplayed();
+    const [originalSession] = await activeClaudeSessions();
+    expect(typeof originalSession).toBe('string');
+
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Plan revision fixture');
+    await $('.agent-actions button:last-child').click();
+    await expect($('[aria-label="Native plan"]')).toHaveText(
+      expect.stringContaining('Initial plan'),
+    );
+    await browser.waitUntil(async () => !(await activeClaudeSessions()).includes(originalSession), {
+      timeout: 20_000,
+    });
+    await expect($('[aria-label="Native plan"]')).toHaveText(
+      expect.stringContaining('Initial plan'),
+    );
+    expect(await $('.agent-conversation').getText()).not.toContain('Add retries');
   });
 
   it('shows nested native ACP children and restores their separate history', async () => {

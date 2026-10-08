@@ -614,7 +614,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     const user = { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } };
     sessions.get(sessionId).history.push(user);
     update(sessionId, user);
-    if (text === 'Plan revision fixture') {
+    if (text === 'Plan revision fixture' || text === 'Slow plan revision fixture') {
       const plan =
         agent === 'codex'
           ? {
@@ -629,12 +629,26 @@ for await (const line of createInterface({ input: process.stdin })) {
               input: { plan: '# Initial plan\n\n- inspect the current flow' },
             };
       recordUpdate(sessionId, sessionId, plan);
-      setTimeout(() => send({ id: message.id, result: { stopReason: 'end_turn' } }), 750);
+      setTimeout(
+        () => {
+          if (activePrompts.get(sessionId) === message.id)
+            send({ id: message.id, result: { stopReason: 'end_turn' } });
+        },
+        text === 'Slow plan revision fixture' ? 15_000 : 750,
+      );
       continue;
     }
-    if (['Add retries', 'Fail native revision', 'Cancel native revision'].includes(text)) {
+    if (
+      ['Add retries', 'Fail native revision', 'Cancel native revision', 'No revised plan'].includes(
+        text,
+      )
+    ) {
       if (text === 'Fail native revision') {
         send({ id: message.id, error: { code: -1, message: 'Fixture revision failed' } });
+        continue;
+      }
+      if (text === 'No revised plan') {
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
         continue;
       }
       if (text === 'Cancel native revision') {
