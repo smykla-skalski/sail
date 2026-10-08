@@ -6,6 +6,7 @@ import {
   disconnectNativeSubagents,
   finalizeNativeSubagentRestore,
   nativeMessageLimit,
+  nativeSubagentAcceptsPrompts,
   nativeSubagentCounts,
   nativeSubagentReceipts,
   nativeSubagentThreads,
@@ -808,4 +809,26 @@ await test('tool calls are counted once, even after the transcript evicts them',
   );
   assert.equal(nativeSubagentReceipts(store)[0].toolCount, calls.length);
   assert.equal(nativeSubagentReceipts(childUpdates([]))[0].toolCount, undefined);
+});
+
+await test('a child accepts prompts only when its adapter advertises the capability', () => {
+  const spawn = (capabilities: Record<string, unknown>) =>
+    updateNativeSubagents(
+      {},
+      event('parent', {
+        sessionUpdate: 'subagent_spawned',
+        subagentSessionId: 'child',
+        name: 'worker',
+        task: 'Task',
+        capabilities,
+      }),
+      '/repo',
+      1,
+      false,
+      'build',
+    )['codex:child'];
+
+  assert.equal(nativeSubagentAcceptsPrompts(spawn({})), false);
+  assert.equal(nativeSubagentAcceptsPrompts(spawn({ prompt: {} })), true);
+  assert.equal(nativeSubagentAcceptsPrompts(undefined), false);
 });

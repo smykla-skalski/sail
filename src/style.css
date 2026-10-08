@@ -96,6 +96,7 @@ button:disabled {
   .project-worktree-select,
   .project-agent-row,
   .breadcrumb-project,
+  .breadcrumb-parent,
   .menu-trigger,
   .menu-popup [role^='menuitem'],
   .mobile-switcher button,
@@ -404,6 +405,47 @@ button:disabled {
 }
 .project-agent-history:hover {
   color: var(--sui-foreground);
+}
+.project-agent-row.nested {
+  position: relative;
+}
+.project-agent-row.nested::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  bottom: 0;
+  left: -6px;
+  width: 1px;
+  background: var(--shell-divider);
+  pointer-events: none;
+}
+.project-agent-row.reference .project-agent-title {
+  color: var(--sui-muted);
+  font-style: italic;
+}
+.project-agent-origin {
+  display: block;
+  color: var(--sui-muted);
+  font-size: 10px;
+  font-style: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-agent-title:has(.project-agent-descendants) {
+  display: flex;
+  gap: 4px;
+}
+.project-agent-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-agent-descendants {
+  flex: none;
+  font-weight: 400;
+  color: var(--sui-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 .project-agent-row.subagent:hover {
   background: var(--shell-hover);
@@ -2403,6 +2445,23 @@ button:disabled {
   background: transparent;
   font-size: inherit;
   white-space: nowrap;
+}
+.breadcrumb-parent {
+  max-width: 30%;
+}
+.subagent-nav {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+  color: var(--sui-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+@container topbar (max-width: 760px) {
+  .subagent-nav-position {
+    display: none;
+  }
 }
 @media (max-width: 850px) {
   .breadcrumb-project {

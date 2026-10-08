@@ -88,6 +88,11 @@
   import type { ThreadStatus } from './lib/attention';
   import type { AgentUsage } from './lib/agent-usage';
   import { withSpawnResponses, type SpawnReceipt } from './lib/agent-results';
+  import {
+    parentTurnStopHint,
+    permissionAlreadyAnswered,
+    type SubagentControl,
+  } from './lib/subagent-control';
   import type { BrowserAttachment } from './lib/browser-pick';
   import {
     clipboardFiles,
@@ -194,6 +199,9 @@
       requireClaim?: boolean,
     ) => Promise<DirectShipAuthorization | undefined>;
     nativeEntries?: AgentEntry[];
+    /** The child's adapter advertised a prompt capability, so its composer is enabled. */
+    childPrompts?: boolean;
+    subagentControl?: SubagentControl;
     capabilityProfile?: CapabilityProfile;
   }
   let {
@@ -233,8 +241,11 @@
     onworkspaceactivity,
     onshipit,
     nativeEntries,
+    childPrompts = false,
+    subagentControl,
     capabilityProfile = 'build',
   }: Props = $props();
+  const readOnlyChild = $derived(!!nativeEntries && !childPrompts);
   let mounted = $state(false);
   let permissionInventoryRevision = 0;
   const activeCapabilityProfile = $derived(thread?.capabilityProfile ?? capabilityProfile);
@@ -506,6 +517,13 @@
     untrack(() => onentrieschange?.(snapshot, activeSessionId, available));
   });
   let permissions = $state<AgentPermission[]>([]);
+  let answeredNotes = $state<{ identity: string; title: string }[]>([]);
+
+  function noteAnswered(permission: AgentPermission) {
+    const identity = acpPermissionIdentity(permission);
+    if (answeredNotes.some((note) => note.identity === identity)) return;
+    answeredNotes = [...answeredNotes, { identity, title: permission.title }];
+  }
   let elicitations = $state<Elicitation[]>([]);
   let elicitationDrafts = $state<Record<string, Record<string, unknown>>>({});
   let configOptions = $state<AgentConfigOption[]>([]);
@@ -956,6 +974,7 @@
     setReplaying(false);
     replayEntries = [];
     permissions = [];
+    answeredNotes = [];
     selectedThreadId = id;
     activeSessionId = id;
     nativePlan = id ? loadNativePlan({ agent, directory, sessionId: id }) : null;
@@ -1011,6 +1030,16 @@
       historyLoaded = true;
       ready = true;
       connecting = false;
+      if (id) {
+        // A child has no connection of its own to open, but its pending requests still replay here.
+        const waiting = await fencedAcpPermissionInventory(
+          () => acp.pendingPermissions(agent, id),
+          () => permissionInventoryRevision,
+          () => current === generation && activeSessionId === id,
+        ).catch(() => null);
+        if (waiting && current === generation)
+          for (const request of waiting) queuePermission(request);
+      }
       return;
     }
     try {
@@ -1300,6 +1329,7 @@
         )
           return;
         permissionInventoryRevision++;
+        const shown = permissions;
         permissions = removeResolvedAcpPermission(permissions, {
           id: params.requestId,
           sessionId: params.sessionId,
@@ -1312,6 +1342,7 @@
               ? params.sailPermissionFingerprint
               : undefined,
         });
+        for (const gone of shown) if (!permissions.includes(gone)) noteAnswered(gone);
         if (thread && running && permissions.length === 0) onstatus(thread, 'working');
       } else if (message.method === 'session/update') {
         const update = params.update;
@@ -1944,7 +1975,14 @@
         },
       });
       permissions = permissions.filter((item) => acpPermissionIdentity(item) !== identity);
+      noteAnswered(permission);
     } catch (cause) {
+      if (permissionAlreadyAnswered(cause)) {
+        permissions = permissions.filter((item) => acpPermissionIdentity(item) !== identity);
+        noteAnswered(permission);
+        if (thread && lastRequest) onstatus(thread, 'working');
+        return;
+      }
       error = describe(cause);
       const pending = await acp.pendingPermissions(agent, permission.sessionId).catch(() => null);
       const pendingIdentities = pending?.flatMap((message) => {
@@ -2329,7 +2367,7 @@
                 </li>{/each}
             </ul>{/if}
         </section>{/if}
-      <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} />
+      <SpawnActivity receipts={spawnReceipts} onopen={onopensubagent} control={subagentControl} />
       {#if queued.length}<div class="queued-messages" role="status" aria-label="Queued messages">
           {#each queued as message, index (index)}
             <ChatMessage
@@ -2345,11 +2383,11 @@
         </div>{/if}
       {#if isBusy}<ChatMessage kind="assistant" author={name}>
           <div class="agent-busy" role="status">
-            <ActivityStatus status={visibleStatus} /><Button
-              size="sm"
-              variant="secondary"
-              onclick={stop}>Stop</Button
-            >
+            <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
+                size="sm"
+                variant="secondary"
+                onclick={stop}>Stop</Button
+              >{/if}
           </div>
         </ChatMessage>{/if}
     </div>
@@ -2401,6 +2439,17 @@
           </div>
         </div>
       {/each}
+      {#each answeredNotes as note (note.identity)}
+        <p class="agent-permission-answered" role="status" data-answered-id={note.identity}>
+          Answered · {note.title}
+        </p>
+      {/each}
+      {#if nativeEntries}
+        <p class="agent-readonly" role="status">
+          {#if readOnlyChild}Read-only: the agent doesn't accept messages for subagents yet.
+            {parentTurnStopHint}.{:else}This subagent accepts messages.{/if}
+        </p>
+      {/if}
       {#each elicitations as elicitation (elicitation.id)}
         <ElicitationForm
           {elicitation}
@@ -2432,7 +2481,7 @@
         onkeydown={keydown}
         rows="3"
         placeholder={`Message ${name}… (start with ! to run a shell command)`}
-        disabled={!directory || !!nativeEntries}></textarea>
+        disabled={!directory || readOnlyChild}></textarea>
       {#each clipboardImagePreviews as preview (preview.path)}
         <figure
           class="clipboard-image-preview"
@@ -2478,7 +2527,7 @@
             value={modelOption?.currentValue}
             options={modelOption?.options ?? []}
             open={pickerOpen === 'model'}
-            disabled={!ready || isBusy || !directory || !!nativeEntries}
+            disabled={!ready || isBusy || !directory || readOnlyChild}
             loading={!!creatingSession}
             onopen={() => void openPicker('model')}
             onclose={() => (pickerOpen = null)}
@@ -2491,7 +2540,7 @@
             value={effortOption?.currentValue}
             options={effortOption?.options ?? []}
             open={pickerOpen === 'effort'}
-            disabled={!ready || isBusy || !directory || !!nativeEntries}
+            disabled={!ready || isBusy || !directory || readOnlyChild}
             loading={!!creatingSession}
             onopen={() => void openPicker('effort')}
             onclose={() => (pickerOpen = null)}
@@ -2505,13 +2554,13 @@
               size="sm"
               variant={planRequested ? 'primary' : 'secondary'}
               onclick={() => (planRequested = !planRequested)}
-              disabled={!ready || isBusy || !!nativeEntries}>Plan</Button
+              disabled={!ready || isBusy || readOnlyChild}>Plan</Button
             >{/if}
           <Button
             onclick={() => void send()}
             disabled={shellMode
-              ? !shellCommand(draft) || !directory || !!nativeEntries
-              : !ready || !!nativeEntries || (!draft.trim() && !clipboardAttachments.length)}
+              ? !shellCommand(draft) || !directory || readOnlyChild
+              : !ready || readOnlyChild || (!draft.trim() && !clipboardAttachments.length)}
             >{shellMode ? 'Run ↵' : isBusy ? 'Queue ↗' : 'Send ↗'}</Button
           >
         </div>
@@ -2521,6 +2570,12 @@
 </div>
 
 <style>
+  .agent-permission-answered,
+  .agent-readonly {
+    margin: 0;
+    color: var(--sui-muted);
+    font-size: 0.8rem;
+  }
   .native-plan {
     margin: 0.75rem;
     padding: 0.75rem;

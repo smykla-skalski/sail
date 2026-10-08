@@ -60,3 +60,18 @@ Priya, a lead who runs many Ship issues, needs one place that says what waits on
 | Sam     | Narrow the window to 640 px                                                        | The status bar kept "! 2" visible. Before, its counts were hidden below 700 px.                                                                                            |
 
 Not covered: a real OS notification, the Dock or taskbar badge, snooze expiry in the live app, and the Settings window's per-type selects (not exercised through WebDriver).
+
+# Subagent navigation walkthrough — 2026-10-08
+
+Maya delegates work to subagents and has to answer them, find them and stop them. Sam does it from the keyboard. This walkthrough drives a private macOS build through embedded WebDriver, with the repository's ACP test agent emulating a Claude parent whose native child asks for permission, and seeded receipts for a child spawned in another worktree. It is a scripted, simulated persona pass, not a study with real users. Light and dark screenshots of the parent card and the child view were checked by eye.
+
+| Persona | Task                                                                            | Result                                                                                                                                                                          |
+| ------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Maya    | Spot a child that waits for permission and answer it without leaving the parent | The child's card in the parent showed the request with its options. Allow once resolved it and the card said "Answered".                                                        |
+| Maya    | Open the child while its request is pending                                     | The request replayed in the child's view. The composer was disabled, the banner said the agent does not accept messages for subagents yet, and there was no Stop button.        |
+| Sam     | Press Cmd+[ in the child view                                                   | Focus went to the parent thread. The breadcrumb showed Parent, the child's name and a "1 of 1" position with previous and next buttons.                                         |
+| Maya    | Answer one request from two places                                              | The first answer resolved it. A repeat of the same answer succeeded without a second event, a different answer failed with "no longer pending", and both views showed Answered. |
+| Maya    | Stop one subagent                                                               | Native Claude cards explained "Stop the parent turn to stop Claude subagents" and offered no button. MCP and OpenCode cards offer Stop (unit tested, not driven in the app).    |
+| Jordan  | Find a reviewer the planner spawned in another worktree                         | The planner showed a "(+1)" count and a reference row "Reviewer · in worktree …" under it. The reviewer's own row said "spawned by Planner".                                    |
+
+Not covered: a real Claude adapter (it advertises no child prompt capability, so the enabled composer is covered by unit tests only), Stop and Stop all against live OpenCode and MCP children, OpenCode children nested in the sidebar, and the Ship dependency map's Open button (unit tested). The narrow sidebar clips the "(+N)" count when a long status label shows next to it.

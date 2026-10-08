@@ -556,6 +556,64 @@ struct PermissionState {
     pending: HashMap<String, PendingPermission>,
     canceling_sessions: HashMap<String, CancelingSession>,
     settled_prompts: HashMap<String, (String, u64)>,
+    /// Requests answered already, so a repeat of the same answer from another surface succeeds
+    /// instead of failing. Bounded; the oldest entries go first.
+    answered: HashMap<String, AnsweredPermission>,
+    answered_order: VecDeque<String>,
+}
+
+#[derive(Clone)]
+struct AnsweredPermission {
+    session_id: String,
+    generation: u64,
+    fingerprint: String,
+    result: Value,
+}
+
+const ANSWERED_PERMISSION_LIMIT: usize = 256;
+
+impl PermissionState {
+    fn remember_answer(
+        &mut self,
+        key: &str,
+        pending: &PendingPermission,
+        session_id: &str,
+        result: &Value,
+    ) {
+        if self.answered.len() >= ANSWERED_PERMISSION_LIMIT {
+            if let Some(oldest) = self.answered_order.pop_front() {
+                self.answered.remove(&oldest);
+            }
+        }
+        self.answered_order.retain(|item| item != key);
+        self.answered_order.push_back(key.to_string());
+        self.answered.insert(
+            key.to_string(),
+            AnsweredPermission {
+                session_id: session_id.to_string(),
+                generation: pending.generation,
+                fingerprint: pending.fingerprint.clone(),
+                result: result.clone(),
+            },
+        );
+    }
+
+    /// True when this exact answer already resolved the request.
+    fn repeats_answer(
+        &self,
+        key: &str,
+        session_id: &str,
+        generation: u64,
+        fingerprint: &str,
+        result: &Value,
+    ) -> bool {
+        self.answered.get(key).is_some_and(|answered| {
+            answered.session_id == session_id
+                && answered.generation == generation
+                && answered.fingerprint == fingerprint
+                && &answered.result == result
+        })
+    }
 }
 
 struct CancelingSession {
@@ -931,24 +989,41 @@ impl Connection {
         expected_generation: u64,
         expected_fingerprint: &str,
         result: Value,
-    ) -> Result<PendingPermission, String> {
+    ) -> Result<Option<PendingPermission>, String> {
         let key = id.to_string();
         let mut state = self
             .permission_state
             .lock()
             .map_err(|error| error.to_string())?;
-        let pending = claim_pending_permission_map(
+        let pending = match claim_pending_permission_map(
             &mut state.pending,
             &key,
             expected_session_id,
             expected_generation,
             expected_fingerprint,
-        )?;
+        ) {
+            Ok(pending) => pending,
+            Err(error) => {
+                // A second surface repeating the first answer is a success with no new event.
+                return if state.repeats_answer(
+                    &key,
+                    expected_session_id,
+                    expected_generation,
+                    expected_fingerprint,
+                    &result,
+                ) {
+                    Ok(None)
+                } else {
+                    Err(error)
+                };
+            }
+        };
         if let Err(error) = self.write(&json!({"jsonrpc":"2.0","id":id,"result":result})) {
             state.pending.entry(key).or_insert_with(|| pending.clone());
             return Err(error);
         }
-        Ok(pending)
+        state.remember_answer(&key, &pending, expected_session_id, &result);
+        Ok(Some(pending))
     }
 }
 
@@ -3533,6 +3608,9 @@ pub fn acp_permission(
         &request_fingerprint,
         json!({"outcome":outcome}),
     )?;
+    let Some(pending) = pending else {
+        return Ok(());
+    };
     let _ = app.emit(
         "acp-event",
         AgentEvent {
@@ -4129,6 +4207,49 @@ mod capability_profile_tests {
         );
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn repeating_an_answer_succeeds_but_a_different_answer_does_not() {
+        let mut state = PermissionState::default();
+        let pending = PendingPermission {
+            message: json!({"id":7,"params":{"sessionId":"child"}}),
+            received_at: 1,
+            generation: 2,
+            fingerprint: "fp".into(),
+        };
+        let allow = json!({"outcome":{"outcome":"selected","optionId":"allow"}});
+        let reject = json!({"outcome":{"outcome":"selected","optionId":"reject"}});
+        assert!(!state.repeats_answer("7", "child", 2, "fp", &allow));
+        state.remember_answer("7", &pending, "child", &allow);
+        assert!(state.repeats_answer("7", "child", 2, "fp", &allow));
+        assert!(!state.repeats_answer("7", "child", 2, "fp", &reject));
+        assert!(!state.repeats_answer("7", "other", 2, "fp", &allow));
+        assert!(!state.repeats_answer("7", "child", 3, "fp", &allow));
+    }
+
+    #[test]
+    fn answered_permissions_stay_bounded() {
+        let mut state = PermissionState::default();
+        let pending = PendingPermission {
+            message: json!({}),
+            received_at: 1,
+            generation: 1,
+            fingerprint: "fp".into(),
+        };
+        let result = json!({"outcome":{"outcome":"cancelled"}});
+        for id in 0..(ANSWERED_PERMISSION_LIMIT + 10) {
+            state.remember_answer(&id.to_string(), &pending, "s", &result);
+        }
+        assert_eq!(state.answered.len(), ANSWERED_PERMISSION_LIMIT);
+        assert!(!state.repeats_answer("0", "s", 1, "fp", &result));
+        assert!(state.repeats_answer(
+            &(ANSWERED_PERMISSION_LIMIT + 9).to_string(),
+            "s",
+            1,
+            "fp",
+            &result
+        ));
     }
 
     #[test]

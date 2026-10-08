@@ -9,8 +9,11 @@ export type DependencyMapNode = {
   owner: string;
   state: string;
   blockingReason: string | null;
-  checkState: string;
+  /** Null for a subagent, which has no checks of its own. */
+  checkState: string | null;
   issue?: ShipIssue;
+  /** The thread a subagent node opens. */
+  thread?: { path: string; threadId: string };
   url?: string;
   depth: number;
   errors: string[];
@@ -200,7 +203,8 @@ export function buildWorkerDependencyMap(
       owner: `${child.agent} / ${child.name}`,
       state: child.outcome === 'unknown' ? 'Unknown' : child.outcome,
       blockingReason: child.error ?? null,
-      checkState: 'Unavailable',
+      checkState: null,
+      thread: { path: child.directory, threadId: `acp:${child.agent}:${child.sessionId}` },
       depth: nativeDepth(child),
       errors: child.error ? [child.error] : [],
     });

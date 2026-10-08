@@ -12,13 +12,53 @@
     toolCountLabel,
   } from './lib/subagent-display';
   import { formatDuration } from './lib/task-notification';
+  import {
+    childPermissions,
+    parentTurnStopHint,
+    permissionAlreadyAnswered,
+    stoppableSubagents,
+    subagentStop,
+    type SubagentControl,
+  } from './lib/subagent-control';
+  import type { InboxItem } from './lib/inbox';
   import { onMount } from 'svelte';
 
   let {
     receipts,
     onopen,
-  }: { receipts: SpawnReceipt[]; onopen?: (receipt: SpawnReceipt) => Promise<void> } = $props();
+    control,
+  }: {
+    receipts: SpawnReceipt[];
+    onopen?: (receipt: SpawnReceipt) => Promise<void>;
+    control?: SubagentControl;
+  } = $props();
   const active = $derived(receipts.filter(receiptNeedsLiveActivity));
+  const stoppable = $derived(control ? stoppableSubagents(active, control.shipOwned) : []);
+  let busy = $state<string[]>([]);
+  let actionErrors = $state<Record<string, string>>({});
+
+  async function act(id: string, run: () => Promise<void>) {
+    if (busy.includes(id)) return;
+    busy = [...busy, id];
+    const next = { ...actionErrors };
+    delete next[id];
+    actionErrors = next;
+    try {
+      await run();
+    } catch (cause) {
+      if (!permissionAlreadyAnswered(cause))
+        actionErrors = {
+          ...actionErrors,
+          [id]: cause instanceof Error ? cause.message : String(cause),
+        };
+    } finally {
+      busy = busy.filter((item) => item !== id);
+    }
+  }
+
+  function decide(item: InboxItem, optionId: string) {
+    return act(item.key, () => control!.ondecide(item, optionId));
+  }
   let expanded = $state<string[]>([]);
   let opening = $state<string[]>([]);
   let openErrors = $state<Record<string, string>>({});
@@ -112,7 +152,20 @@
 </div>
 {#if active.length}
   <section class="spawn-activity" aria-label="Subagent activity">
-    <h2>Subagents ({active.length})</h2>
+    <div class="spawn-activity-heading">
+      <h2>Subagents ({active.length})</h2>
+      {#if control && stoppable.length > 1}<button
+          class="spawn-stop"
+          aria-label="Stop all subagents"
+          disabled={busy.includes('stop-all')}
+          onpointerdown={keepComposerSelection}
+          onclick={() => void act('stop-all', () => control.onstopall(stoppable))}
+          >{busy.includes('stop-all') ? 'Stopping…' : 'Stop all'}</button
+        >{/if}
+    </div>
+    {#if actionErrors['stop-all']}<p class="spawn-error" role="alert">
+        {actionErrors['stop-all']}
+      </p>{/if}
     {#each active as receipt (receipt.receiptId)}
       <article
         class="spawn-active state-{receipt.state}"
@@ -163,6 +216,57 @@
             >
           </span>
         </div>
+        {#if control}
+          {@const stop = subagentStop(receipt, control.shipOwned)}
+          {@const permissions = childPermissions(control, receipt)}
+          {#each permissions.pending as item (item.key)}
+            <div
+              class="spawn-permission"
+              role="group"
+              aria-label="Subagent permission request"
+              data-request-id={item.requestId}
+              data-session-id={item.sessionId}
+              data-agent-id={item.agentId}
+              tabindex="-1"
+            >
+              <strong>{item.permissionTitle ?? item.text}</strong>
+              <div class="spawn-permission-options">
+                {#each item.options ?? [] as option (option.optionId)}{#if item.policy?.recommendation !== 'deny' || !option.kind.startsWith('allow')}<button
+                      class="spawn-permission-option"
+                      class:allow={option.kind.startsWith('allow')}
+                      disabled={busy.includes(item.key)}
+                      onpointerdown={keepComposerSelection}
+                      onclick={() => void decide(item, option.optionId)}>{option.name}</button
+                    >{/if}{/each}
+              </div>
+              {#if actionErrors[item.key]}<p class="spawn-error" role="alert">
+                  {actionErrors[item.key]}
+                </p>{/if}
+            </div>
+          {/each}
+          {#each permissions.answered as note (note.key)}
+            <p class="spawn-permission-answered" role="status" data-answered-key={note.key}>
+              Answered · {note.title}
+            </p>
+          {/each}
+          {#if stop === 'stop'}
+            <div class="spawn-controls">
+              <button
+                class="spawn-stop"
+                aria-label={`Stop ${label(receipt)} subagent`}
+                disabled={busy.includes(receipt.receiptId)}
+                onpointerdown={keepComposerSelection}
+                onclick={() => void act(receipt.receiptId, () => control.onstop(receipt))}
+                >{busy.includes(receipt.receiptId) ? 'Stopping…' : 'Stop'}</button
+              >
+            </div>
+          {:else if stop === 'parent-turn'}
+            <p class="spawn-stop-hint">{parentTurnStopHint}</p>
+          {/if}
+          {#if actionErrors[receipt.receiptId]}<p class="spawn-error" role="alert">
+              {actionErrors[receipt.receiptId]}
+            </p>{/if}
+        {/if}
         {#if !receipt.targetId || !receipt.targetDirectory}<p class="spawn-unavailable">
             Thread unavailable — the child has not confirmed a target yet.
           </p>{/if}
@@ -190,6 +294,57 @@
   .spawn-activity h2 {
     margin: 0 0 8px;
     font-size: 0.85rem;
+  }
+  .spawn-activity-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    width: min(100%, 720px);
+  }
+  .spawn-controls,
+  .spawn-permission {
+    margin: 8px 0 0 42px;
+  }
+  .spawn-permission {
+    display: grid;
+    gap: 6px;
+    padding: 8px 10px;
+    border: 1px solid var(--activity-waiting);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--activity-waiting) 8%, var(--sui-surface));
+    font-size: 0.83rem;
+  }
+  .spawn-permission-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .spawn-permission-option,
+  .spawn-stop {
+    min-height: 28px;
+    padding: 3px 10px;
+    border: 1px solid var(--shell-divider);
+    border-radius: 6px;
+    color: var(--sui-foreground);
+    background: transparent;
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+  .spawn-permission-option.allow {
+    border-color: var(--sui-primary);
+    color: var(--sui-primary);
+  }
+  .spawn-permission-option:disabled,
+  .spawn-stop:disabled {
+    cursor: wait;
+    opacity: 0.6;
+  }
+  .spawn-permission-answered,
+  .spawn-stop-hint {
+    margin: 8px 0 0 42px;
+    color: var(--sui-muted);
+    font-size: 0.76rem;
   }
   .spawn-active {
     --spawn-color: var(--activity-working);
