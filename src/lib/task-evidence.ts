@@ -162,15 +162,15 @@ function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
     }
   }
   const protectedIds = new Set<string>();
-  for (const entry of latest.filter(isCiObservation).toSorted(compareEvidence).toReversed()) {
-    if (protectedIds.size >= evidenceLimit) break;
-    protectedIds.add(entry.id);
-  }
   for (const entry of [...latestGates.values()].toSorted(compareEvidence).toReversed()) {
     if (protectedIds.size >= evidenceLimit) break;
     protectedIds.add(entry.id);
   }
   for (const entry of [...latestCriteria.values()].toSorted(compareEvidence).toReversed()) {
+    if (protectedIds.size >= evidenceLimit) break;
+    protectedIds.add(entry.id);
+  }
+  for (const entry of latest.filter(isCiObservation).toSorted(compareEvidence).toReversed()) {
     if (protectedIds.size >= evidenceLimit) break;
     protectedIds.add(entry.id);
   }

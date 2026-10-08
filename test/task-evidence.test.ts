@@ -342,7 +342,7 @@ void test('rejects unknown criteria and bounds manifests and entries', () => {
   assert.equal(manifests.at(-1)?.evidence.length, 100);
 });
 
-void test('keeps current CI live when gates and criterion proofs fill the evidence bound', () => {
+void test('archives CI when gates and criterion proofs fill the evidence bound', () => {
   const boundedCriteria = Array.from({ length: 97 }, (_, index) => `criterion-${index}`);
   let manifests = boundedCriteria.reduce(
     (current, criterion, index) =>
@@ -386,8 +386,95 @@ void test('keeps current CI live when gates and criterion proofs fill the eviden
   assert.equal(manifests[0].evidence.length, 100);
   assert.equal(
     manifests[0].evidence.some((entry) => entry.id === currentCi.id),
+    false,
+  );
+  assert.equal(manifests[0].economicsRollup?.archivedEntries, 1);
+  assert.equal(summarizeTaskEconomics(manifests, { ready: true }, 'revision').totals.checks, 1);
+});
+
+void test('reserves gate and criterion proof capacity ahead of 100 live CI executions', () => {
+  const requiredCriteria = ['The accepted outcome is verified.'];
+  const executions = Array.from({ length: 100 }, (_, index) =>
+    ciEvidence(
+      {
+        name: `build-${index + 1}`,
+        url: `https://github.test/actions/runs/${index + 1}`,
+        databaseId: index + 1,
+        runId: index + 1,
+      },
+      'passed',
+      index + 1,
+    ),
+  );
+  let manifests = executions.reduce(
+    (current, execution) =>
+      recordCiEvidenceObservation(current, 'revision', requiredCriteria, execution),
+    [] as EvidenceManifest[],
+  );
+
+  assert.equal(manifests[0].evidence.length, 100);
+  assert.equal(
+    manifests[0].evidence.every((entry) => entry.id.startsWith('ci:')),
     true,
   );
+
+  manifests = recordTaskEvidence(
+    manifests,
+    'revision',
+    requiredCriteria,
+    evidence({ id: 'required-gate', timestamp: 101, criteria: [] }),
+  );
+  manifests = recordTaskEvidence(
+    manifests,
+    'revision',
+    requiredCriteria,
+    evidence({
+      id: 'criterion-proof',
+      kind: 'command',
+      name: 'task contract',
+      timestamp: 102,
+      criteria: requiredCriteria,
+    }),
+  );
+
+  const readiness = evidenceReadiness(manifests, 'revision', ['code-adversary'], requiredCriteria);
+  assert.equal(manifests[0].evidence.length, 100);
+  assert.equal(manifests[0].evidence.filter((entry) => entry.id.startsWith('ci:')).length, 98);
+  assert.equal(
+    manifests[0].evidence.some((entry) => entry.id === 'required-gate'),
+    true,
+  );
+  assert.equal(
+    manifests[0].evidence.some((entry) => entry.id === 'criterion-proof'),
+    true,
+  );
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.missingGates, []);
+  assert.deepEqual(readiness.unverifiedCriteria, []);
+  assert.equal(manifests[0].economicsRollup?.archivedEntries, 2);
+  assert.equal(summarizeTaskEconomics(manifests, readiness, 'revision').totals.checks, 100);
+
+  manifests = recordCiEvidenceObservation(manifests, 'revision', requiredCriteria, {
+    ...executions[0],
+    timestamp: 200,
+  });
+  const repolledReadiness = evidenceReadiness(
+    manifests,
+    'revision',
+    ['code-adversary'],
+    requiredCriteria,
+  );
+  assert.equal(
+    manifests[0].evidence.some((entry) => entry.id === 'required-gate'),
+    true,
+  );
+  assert.equal(
+    manifests[0].evidence.some((entry) => entry.id === 'criterion-proof'),
+    true,
+  );
+  assert.equal(repolledReadiness.ready, true);
+  assert.equal(summarizeTaskEconomics(manifests, repolledReadiness, 'revision').totals.checks, 100);
+  assert.equal(manifests[0].economicsRollup?.archivedEntries, 3);
 });
 
 void test('the evidence bound retains each latest gate above a full command history', () => {
