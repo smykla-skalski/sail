@@ -182,6 +182,11 @@ export function elicitationContent(
   return content;
 }
 
+/** An optional single choice with a pick can be cleared back to no answer. */
+export function canClearChoice(entry: ElicitationField, value: unknown): boolean {
+  return entry.kind === 'single' && !entry.required && !blank(value);
+}
+
 export function missingRequired(
   fields: ElicitationField[],
   content: Record<string, unknown>,
