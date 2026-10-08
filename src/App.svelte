@@ -13625,7 +13625,8 @@
     } catch (cause) {
       result = { status: 'failed', output: describe(cause) };
     }
-    shellRuns = shellRuns.map((item) => (item.id === run.id ? { ...item, ...result } : item));
+    const finished = shellRuns.find((item) => item.id === run.id);
+    if (finished) Object.assign(finished, result);
   }
 
   async function send() {
@@ -13860,8 +13861,10 @@
       }
       if (current === selection && path === directory) await refreshSession(id);
     } catch (cause) {
-      if (!accepted)
-        shellRuns = [...sentShell.map((run) => ({ ...run, session: id })), ...shellRuns];
+      if (!accepted) {
+        for (const run of sentShell) run.session = id;
+        shellRuns = [...sentShell, ...shellRuns];
+      }
       if (current === selection && path === directory) {
         if (!accepted) {
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');

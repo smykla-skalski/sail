@@ -89,7 +89,7 @@ await test('long output keeps its tail and reports the omitted size', () => {
 });
 
 await test('clipping never splits a surrogate pair', () => {
-  const output = 'a' + '😀' + 'b'.repeat(SHELL_CONTEXT_LIMIT - 1);
+  const output = 'a😀' + 'b'.repeat(SHELL_CONTEXT_LIMIT - 1);
   const [segment] = splitShellCommands(withShellContext([run({ output })], 'x'));
   assert.equal(segment.type, 'shell');
   if (segment.type !== 'shell') return;

@@ -1074,9 +1074,7 @@
       configOptions = session.configOptions ?? [];
       if (Array.isArray(session.availableCommands)) updateSkills(session.availableCommands);
       activeSessionId = session.sessionId;
-      shellRuns = shellRuns.map((run) =>
-        run.session === null ? { ...run, session: session.sessionId } : run,
-      );
+      for (const run of shellRuns) if (run.session === null) run.session = session.sessionId;
       if (queued.length) saveQueuedAgentMessages(agent, directory, session.sessionId, queued);
       if (commandUpdates[session.sessionId]) updateSkills(commandUpdates[session.sessionId]);
       selectedThreadId = session.sessionId;
@@ -1351,7 +1349,8 @@
     shellRuns = shellRuns.filter((run) => !sentShell.includes(run));
     const restoreShell = () => {
       const session = deliverySessionId ?? shellSession;
-      shellRuns = [...sentShell.map((run) => ({ ...run, session })), ...shellRuns];
+      for (const run of sentShell) run.session = session;
+      shellRuns = [...sentShell, ...shellRuns];
     };
     flushUpdates();
     entries = [
@@ -1588,7 +1587,8 @@
     } catch (cause) {
       result = { status: 'failed', output: describe(cause) };
     }
-    shellRuns = shellRuns.map((item) => (item.id === run.id ? { ...item, ...result } : item));
+    const finished = shellRuns.find((item) => item.id === run.id);
+    if (finished) Object.assign(finished, result);
     void follow();
   }
 

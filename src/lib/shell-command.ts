@@ -29,7 +29,7 @@ export const SHELL_CONTEXT_LIMIT = 16 * 1024;
 
 const TAG = 'user-shell-command';
 const BLOCK = new RegExp(`<${TAG}>([\\s\\S]*?)</${TAG}>`, 'g');
-const STATUSES: ShellStatus[] = ['running', 'passed', 'failed', 'timed_out', 'canceled'];
+const STATUSES = new Set<string>(['running', 'passed', 'failed', 'timed_out', 'canceled']);
 
 /** Returns the command for a `!` composer line, '' for a bare `!`, or null for a normal message. */
 export function shellCommand(draft: string): string | null {
@@ -85,10 +85,14 @@ function field(body: string, name: string): string | undefined {
   return value === undefined ? undefined : decode(value);
 }
 
+function isShellStatus(value: string | undefined): value is ShellStatus {
+  return value !== undefined && STATUSES.has(value);
+}
+
 function parse(body: string): ShellOutcome | undefined {
   const command = field(body, 'command');
-  const status = field(body, 'status') as ShellStatus | undefined;
-  if (!command || !status || !STATUSES.includes(status)) return undefined;
+  const status = field(body, 'status');
+  if (!command || !isShellStatus(status)) return undefined;
   const code = field(body, 'exit-code');
   const duration = field(body, 'duration-ms');
   return {
