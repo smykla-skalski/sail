@@ -6,6 +6,7 @@ import {
   checkpointTouched,
   shipAllMerged,
   shipDeliveryMismatch,
+  shipDetailFallback,
   shipGroupOf,
   shipGroups,
   shipOrderSnapshot,
@@ -106,6 +107,33 @@ void test('issues land in the group that tells the user what to do', () => {
     i4: 'waiting',
     i5: 'queued',
   });
+});
+
+void test('the default detail issue stays put when another row re-sorts above it', () => {
+  const run = fixture(3);
+  const [first, , later] = run.issues;
+  Object.assign(first, { state: 'merged' as const });
+  const shown = shipDetailFallback(run, shipRows(run, {}), null);
+  assert.deepEqual(shown, { runId: 'run', issueId: 'i1' });
+
+  working(later, 'testing', { reportedStatus: 'blocked', blockedReason: 'Need a decision' });
+  const resorted = shipRows(run, {});
+  assert.equal(resorted.find((row) => row.group !== 'done')?.issue.id, 'i2');
+  assert.deepEqual(shipDetailFallback(run, resorted, shown), shown);
+
+  const other = { ...run, id: 'other' };
+  assert.deepEqual(shipDetailFallback(other, shipRows(other, {}), shown), {
+    runId: 'other',
+    issueId: 'i2',
+  });
+  const removed = { ...run, issues: run.issues.filter((issue) => issue.id !== 'i1') };
+  assert.deepEqual(shipDetailFallback(removed, shipRows(removed, {}), shown), {
+    runId: 'run',
+    issueId: 'i2',
+  });
+  assert.equal(shipDetailFallback(undefined, [], shown), null);
+  for (const issue of run.issues) issue.state = 'merged';
+  assert.equal(shipDetailFallback(run, shipRows(run, {}), null), null);
 });
 
 void test('group mapping covers every presentation status', () => {

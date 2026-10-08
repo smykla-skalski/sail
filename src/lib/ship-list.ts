@@ -131,6 +131,21 @@ export function shipGroups(
   });
 }
 
+export type ShipDetailFallback = { runId: string; issueId: string };
+
+/** The issue a split view shows with nothing selected: the remembered one while it exists, else the first unfinished row. */
+export function shipDetailFallback(
+  run: ShipRun | undefined,
+  rows: ShipRow[],
+  remembered: ShipDetailFallback | null,
+): ShipDetailFallback | null {
+  if (!run) return null;
+  if (remembered?.runId === run.id && run.issues.some((issue) => issue.id === remembered.issueId))
+    return remembered;
+  const first = rows.find((row) => row.group !== 'done')?.issue;
+  return first ? { runId: run.id, issueId: first.id } : null;
+}
+
 export function shipAllMerged(run: ShipRun, options: ShipPresentationOptions): boolean {
   return run.issues.length > 0 && shipRows(run, options).every((row) => row.group === 'done');
 }
