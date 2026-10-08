@@ -227,7 +227,7 @@ void test('root search offers app actions with their shortcut hints', () => {
     if (entry.shortcut) assert.equal(entry.label, shortcutFor(entry.shortcut).label);
 });
 
-void test('action entries are searchable by label and detail, and outrank projects', () => {
+void test('action entries are searchable by label', () => {
   const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
 
   assert.equal(search({ kind: 'projects' }, 'split pane', { actions })[0]?.actionId, 'pane.split');
@@ -279,4 +279,21 @@ void test('worktree, agent and session steps show no app actions', () => {
     },
   ] as PaletteStep[])
     assert.equal(search(step, '', { actions }).filter((e) => e.kind === 'action').length, 0);
+});
+
+void test('an exact thread title outranks actions whose detail mentions it', () => {
+  const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
+  const first = search({ kind: 'projects' }, 'Newest', { actions })[0];
+  assert.equal(first?.thread?.sessionId, 'new');
+  assert.equal(search({ kind: 'projects' }, 'thread', { actions })[0]?.kind !== 'action', true);
+});
+
+void test('a query that only matches a disabled action activates no other action', () => {
+  const actions = paletteActions({ dark: false, overview: false, hasDirectory: false });
+  const entries = search({ kind: 'projects' }, 'side chat', { actions });
+  assert.deepEqual(
+    entries.map((entry) => entry.actionId),
+    ['chat.side'],
+  );
+  assert.equal(entries[0]?.disabled, true);
 });

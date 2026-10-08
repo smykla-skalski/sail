@@ -236,6 +236,11 @@ export function searchCommandPalette({
       shortcut: action.shortcut,
     }));
     if (query.trim()) {
+      // Fuzzy gaps let unrelated actions match; require every term as a whole substring.
+      const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+      const matchingActions = actionEntries.filter((entry) =>
+        terms.every((term) => entry.label.toLowerCase().includes(term)),
+      );
       const worktrees: PaletteEntry[] = catalog.repositories.flatMap((repository) =>
         (catalog.worktrees[repository] ?? []).map((worktree) => ({
           id: `worktree:${worktree.path}`,
@@ -274,14 +279,17 @@ export function searchCommandPalette({
         },
       );
       return rank(
-        [...repositories, ...worktrees, ...sessionEntries, ...commandEntries, ...actionEntries],
+        [...repositories, ...worktrees, ...sessionEntries, ...commandEntries, ...matchingActions],
         query,
+        // Action details are prose; matching them would outrank exact thread and project names.
         (entry) =>
-          `${entry.label} ${entry.detail} ${entry.directory ?? ''} ${entry.command?.command ?? ''}`,
+          entry.kind === 'action'
+            ? entry.label
+            : `${entry.label} ${entry.detail} ${entry.directory ?? ''} ${entry.command?.command ?? ''}`,
         (entry) =>
           entry.thread && running.has(threadKey(entry.thread))
             ? 2
-            : entry.kind === 'command' || entry.kind === 'action'
+            : entry.kind === 'command'
               ? 1
               : 0,
       );
