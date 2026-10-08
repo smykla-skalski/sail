@@ -31,6 +31,11 @@ import {
   refreshedIssueState,
   shipOwner,
   shipCheckpointOwner,
+  currentShipBlockedReason,
+  repositoryForRemote,
+  unrecoverableGraceExpired,
+  unrecoverableIssuePlan,
+  shippingWorkerGone,
   authorizeShipCheckpointThread,
   commitRevisionBoundValidation,
   shipIssuePresentation,
@@ -2437,4 +2442,65 @@ void test('a failed dependency wins over an unmerged one', () => {
   second.state = 'failed';
   second.error = 'Worker failed';
   assert.equal(shipIssuePresentation(run, run.issues[2]).label, 'Waiting on #3 (needs input)');
+});
+
+void test('repairs a dead run repository from the catalog checkout with the same remote', () => {
+  const candidates = [
+    { path: '/other', remote: 'kumahq/other' },
+    { path: '/broken', remote: null },
+    { path: '/kuma', remote: 'Kumahq/Kuma' },
+  ];
+  assert.equal(repositoryForRemote(candidates, 'kumahq/kuma'), '/kuma');
+  assert.equal(repositoryForRemote(candidates, 'kong/kong-mesh'), null);
+  assert.equal(repositoryForRemote([], 'kumahq/kuma'), null);
+  const clones = [
+    { path: '/a/kuma', remote: 'kumahq/kuma' },
+    { path: '/b/kuma', remote: 'kumahq/kuma' },
+  ];
+  assert.equal(repositoryForRemote(clones, 'kumahq/kuma', '/b/kuma'), '/b/kuma');
+  assert.equal(repositoryForRemote(clones, 'kumahq/kuma', '/c/other'), '/a/kuma');
+});
+
+void test('treats a vanished agent session or deleted worktree as a gone worker', () => {
+  assert.equal(shippingWorkerGone(new Error('Agent session is not connected.')), true);
+  assert.equal(shippingWorkerGone('Location not found: /sail/worktrees/gone'), true);
+  assert.equal(shippingWorkerGone(new Error('permission denied')), false);
+});
+
+void test('replaces the persisted missing-repository block reason', () => {
+  assert.equal(
+    currentShipBlockedReason(
+      'Shipping claim recovery failed: Repository path does not exist. Choose an existing directory.',
+    ),
+    'Shipping worktree no longer exists. Start a new run from the project.',
+  );
+  assert.equal(currentShipBlockedReason('Worker paused.'), 'Worker paused.');
+  assert.equal(currentShipBlockedReason(null), 'Shipping claim recovery requires worker fencing.');
+});
+
+void test('plans how to settle issues of a run whose repository is gone', () => {
+  const settled = { state: 'failed' as const, workerSettled: true, worktreeUnavailable: true };
+  assert.equal(unrecoverableIssuePlan(settled), 'none');
+  assert.equal(unrecoverableIssuePlan({ ...settled, refreshError: 'Claim: boom' }), 'clear');
+  assert.equal(unrecoverableIssuePlan({ ...settled, worktreeUnavailable: false }), 'clear');
+  assert.equal(
+    unrecoverableIssuePlan({ ...settled, state: 'merged', claimFencePending: true }),
+    'clear',
+  );
+  assert.equal(unrecoverableIssuePlan({ state: 'merged' }), 'none');
+  assert.equal(unrecoverableIssuePlan({ state: 'awaiting_merge', workerSettled: true }), 'none');
+  assert.equal(unrecoverableIssuePlan({ state: 'awaiting_merge', workerSettled: false }), 'none');
+  assert.equal(unrecoverableIssuePlan({ state: 'working', workerSettled: false }), 'fail');
+  assert.equal(unrecoverableIssuePlan({ state: 'failed', workerSettled: false }), 'fail');
+});
+
+void test('reads the message of error-like objects when matching a gone worker', () => {
+  assert.equal(shippingWorkerGone({ message: 'Agent session is not connected.' }), true);
+  assert.equal(shippingWorkerGone({ message: 'denied' }), false);
+  assert.equal(shippingWorkerGone(null), false);
+});
+
+void test('waits ten minutes before failing work in a vanished repository', () => {
+  assert.equal(unrecoverableGraceExpired(1_000, 1_000 + 9 * 60_000), false);
+  assert.equal(unrecoverableGraceExpired(1_000, 1_000 + 10 * 60_000), true);
 });

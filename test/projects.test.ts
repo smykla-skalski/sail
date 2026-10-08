@@ -4,6 +4,7 @@ import {
   addWorktree,
   assignRepository,
   loadProjectCatalog,
+  owningRepository,
   removeRepository,
   replaceRepositoryPath,
   setWorktreePullRequest,
@@ -187,4 +188,17 @@ await test('finds the worktree for a directory and skips main checkouts', () => 
   });
   assert.equal(worktreeAt(catalog, '/repo'), null);
   assert.equal(worktreeAt(catalog, '/missing'), null);
+});
+
+await test('resolves the owning repository of a project or catalogued worktree only', () => {
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/repo'],
+      worktrees: { '/repo': [{ path: '/wt/one', branch: 'one' }] },
+    }),
+    '/repo',
+  );
+  assert.equal(owningRepository(catalog, '/repo'), '/repo');
+  assert.equal(owningRepository(catalog, '/wt/one'), '/repo');
+  assert.equal(owningRepository(catalog, '/wt/uncatalogued'), null);
 });
