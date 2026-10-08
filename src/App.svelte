@@ -3235,8 +3235,6 @@
     const ready = shipReopenAction(issue);
     if (!ready.enabled)
       throw new Error(ready.reason ?? 'This issue changed and cannot be reopened.');
-    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
-      await stopShippingWorker(issue);
     const outcome = await invoke<{ head: string; pullRequest: string; alreadyOpen: boolean }>(
       'ship_reopen_pull_request',
       {
@@ -3247,6 +3245,8 @@
         },
       },
     );
+    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+      await stopShippingWorker(issue);
     const key = `${run.id}:${issue.id}`;
     // A lookup started before the reopen would report the pull request closed again.
     beginLatestRefresh(shippingPullRequestGenerations, key);
