@@ -486,6 +486,14 @@
   let historyAttempted = $state(false);
   let showingEarlier = false;
   const visibleEntries = $derived(entries.slice(-visibleCount));
+  let seenEntryCount = 0;
+  $effect(() => {
+    const total = entries.length;
+    // Growing the tail window keeps older entries from sliding out while the user reads back.
+    if (total > seenEntryCount && seenEntryCount > 0 && !autoFollow)
+      visibleCount += total - seenEntryCount;
+    seenEntryCount = total;
+  });
   const displayEntries = $derived(
     withSpawnResponses(groupAgentEntries(visibleEntries), spawnReceipts, (entry) => entry.created),
   );
@@ -772,7 +780,10 @@
     }
     scroll.scrollTop = top + scroll.scrollHeight - height;
     showingEarlier = false;
-    if (scroll.scrollHeight <= scroll.clientHeight && entries.length > visibleCount)
+    if (
+      (scroll.scrollHeight <= scroll.clientHeight || scroll.scrollTop <= 80) &&
+      entries.length > visibleCount
+    )
       void showEarlier();
   }
 
@@ -2126,6 +2137,9 @@
       onscroll={() => {
         autoFollow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80;
         if (scroll.scrollTop <= 80 && !historyLoading) void showEarlier();
+      }}
+      onwheel={(event) => {
+        if (event.deltaY < 0 && scroll.scrollTop <= 80 && !historyLoading) void showEarlier();
       }}
       aria-label={`${name} conversation`}
     >
