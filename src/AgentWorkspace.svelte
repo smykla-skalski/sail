@@ -135,6 +135,12 @@
   import { permissionResolver } from './lib/permission-resolution';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
   import {
+    loadNativePlan,
+    loadStructuredQuestions,
+    saveNativePlan,
+    saveStructuredQuestions,
+  } from './lib/planning-state';
+  import {
     acpPermissionIdentity,
     enqueueAcpPermission,
     fencedAcpPermissionInventory,
@@ -726,6 +732,8 @@
 
   function applyUpdate(update: Record<string, unknown>) {
     nativePlan = nativePlanUpdate(agent, update, nativePlan);
+    if (activeSessionId && nativePlan)
+      saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
     onnativeplan?.(nativePlan);
     if (replaying) {
       updateEntriesInPlace(replayEntries, update);
@@ -883,7 +891,7 @@
       !Array.isArray(schema.properties)
         ? (schema.properties as Record<string, Record<string, unknown>>)
         : {};
-    elicitationDrafts[id] = Object.fromEntries(
+    elicitationDrafts[id] ??= Object.fromEntries(
       Object.entries(properties).flatMap(([key, property]) =>
         property.default === undefined ? [] : [[key, property.default]],
       ),
@@ -892,6 +900,7 @@
       ...elicitations,
       { id: message.id, sessionId, message: String(params.message ?? ''), schema },
     ];
+    saveStructuredQuestions({ agent, directory, sessionId }, elicitations);
     if (thread) onstatus(thread, 'waiting');
   }
 
@@ -920,6 +929,8 @@
       );
       elicitations = elicitations.filter((item) => String(item.id) !== id);
       delete elicitationDrafts[id];
+      if (activeSessionId)
+        saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
       if (thread && !elicitations.length && !permissions.length) onstatus(thread, 'working');
     } catch (cause) {
       error = describe(cause);
@@ -945,15 +956,24 @@
     setReplaying(false);
     replayEntries = [];
     permissions = [];
-    nativePlan = null;
-    onnativeplan?.(null);
     selectedThreadId = id;
     activeSessionId = id;
+    nativePlan = id ? loadNativePlan({ agent, directory, sessionId: id }) : null;
+    elicitations = id ? loadStructuredQuestions({ agent, directory, sessionId: id }) : [];
+    elicitationDrafts = {};
+    onnativeplan?.(nativePlan);
     entries = id && thread ? loadRecentTranscript(thread) : [];
+    const backgroundUpdates = id && !nativeEntries ? takeBackgroundUpdates(agent, id) : null;
     const liveView =
       id && !nativeEntries
-        ? liveSessionView(entries, takeBackgroundUpdates(agent, id), sessionState(agent, id))
+        ? liveSessionView(entries, backgroundUpdates, sessionState(agent, id))
         : null;
+    if (backgroundUpdates && id) {
+      for (const update of backgroundUpdates)
+        nativePlan = nativePlanUpdate(agent, update, nativePlan);
+      if (nativePlan) saveNativePlan({ agent, directory, sessionId: id }, nativePlan);
+      onnativeplan?.(nativePlan);
+    }
     if (liveView) entries = liveView.entries;
     visibleCount = 50;
     historyLoaded = !id;
@@ -1069,9 +1089,22 @@
           () => current === generation && activeSessionId === id,
         );
         if (waiting) for (const request of waiting) queuePermission(request);
-        const pendingElicitations = await acp.pendingElicitations(agent, id).catch(() => []);
-        if (current === generation && activeSessionId === id)
-          for (const request of pendingElicitations) queueElicitation(request);
+        const pendingElicitations = await acp.pendingElicitations(agent, id).then(
+          (requests) => ({ requests, available: true }),
+          () => ({ requests: [], available: false }),
+        );
+        if (current === generation && activeSessionId === id && pendingElicitations.available) {
+          const pendingIDs = new Set(
+            pendingElicitations.requests.flatMap((request) =>
+              request.method === 'elicitation/create' && request.id != null
+                ? [String(request.id)]
+                : [],
+            ),
+          );
+          elicitations = elicitations.filter((item) => pendingIDs.has(String(item.id)));
+          for (const request of pendingElicitations.requests) queueElicitation(request);
+          saveStructuredQuestions({ agent, directory, sessionId: id }, elicitations);
+        }
       }
       if (current === generation) ready = true;
     } catch (cause) {
@@ -1208,6 +1241,11 @@
         acpDisconnectAffectsSession(message, activeSessionId, activeCapabilityProfile)
       ) {
         inFlightSteer?.finish();
+        if (activeSessionId) {
+          elicitations = [];
+          elicitationDrafts = {};
+          saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, []);
+        }
         ready = false;
         busy = false;
         if (thread) onstatus(thread, 'failed');
@@ -1243,6 +1281,16 @@
           (!steer.turnId || steer.turnId === params.turnId)
         )
           steer.finish();
+      }
+      if (message.method === '$/cancel_request') {
+        const id = params?.id;
+        if (typeof id === 'string' || typeof id === 'number') {
+          elicitations = elicitations.filter((item) => String(item.id) !== String(id));
+          delete elicitationDrafts[String(id)];
+          if (activeSessionId)
+            saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
+        }
+        return;
       }
       if (!params || params.sessionId !== activeSessionId) return;
       if (message.method === 'sail/permission_resolved') {
@@ -1291,10 +1339,6 @@
         queuePermission(message);
       } else if (message.method === 'elicitation/create' && message.id != null) {
         queueElicitation(message);
-      } else if (message.method === '$/cancel_request') {
-        const id = message.params?.id;
-        if (typeof id === 'string' || typeof id === 'number')
-          elicitations = elicitations.filter((item) => item.id !== id);
       }
     })
       .then((unsubscribe) => {

@@ -44,7 +44,13 @@
   import ChatMessage from './ChatMessage.svelte';
   import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import PlanPanel from './PlanPanel.svelte';
-  import type { NativePlan } from './lib/native-plan';
+  import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
+  import {
+    loadNativePlan,
+    clearStructuredQuestions,
+    removeStructuredQuestion,
+    saveNativePlan,
+  } from './lib/planning-state';
   import ShipPanel from './ShipPanel.svelte';
   import AppTopbar from './AppTopbar.svelte';
   import {
@@ -9249,7 +9255,7 @@
       forgetThreadAttention(thread);
       if (thread.agent !== 'opencode') {
         forgetRecentTranscript(thread);
-        void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+        void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
       }
     }
     delete paneLayouts[path];
@@ -9353,7 +9359,7 @@
         forgetThreadAttention(thread);
         if (thread.agent !== 'opencode') {
           forgetRecentTranscript(thread);
-          void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+          void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
         }
       }
       delete paneLayouts[path];
@@ -11724,7 +11730,7 @@
     }
     void tick().then(() => forgetRecentTranscript(thread));
     if (thread.agent !== 'opencode')
-      void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+      void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
   }
 
   function agentThreadKey(thread: AgentThread): string {
@@ -12309,6 +12315,18 @@
         const update = params?.update;
         if (update && typeof update === 'object') {
           const data = update as Record<string, unknown>;
+          const thread = [...agentThreads, ...nativeChildThreads].find(
+            (item) => item.agent === event.agent && item.sessionId === sessionId,
+          );
+          const planDirectory = thread?.directory ?? eventDirectory;
+          const priorPlan = loadNativePlan({
+            agent: event.agent,
+            directory: planDirectory,
+            sessionId,
+          });
+          const plan = nativePlanUpdate(event.agent, data, priorPlan);
+          if (plan)
+            saveNativePlan({ agent: event.agent, directory: planDirectory, sessionId }, plan);
           if (replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
             invalidateBackgroundSession(event.agent, sessionId);
           else bufferBackgroundUpdate(event.agent, sessionId, data);
@@ -12411,6 +12429,11 @@
       event.message.method === 'sail/disconnected'
     )
       scheduleInboxRefresh();
+    if (event.message.method === '$/cancel_request') {
+      const requestID = event.message.params?.id;
+      if (typeof requestID === 'string' || typeof requestID === 'number')
+        removeStructuredQuestion(event.agent, requestID);
+    }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
@@ -12478,6 +12501,8 @@
         Object.values(nativeSubagents)
           .filter((child) => child.agent === event.agent)
           .map((child) => child.sessionId);
+      for (const sessionId of disconnectedSessionIds)
+        clearStructuredQuestions(event.agent, sessionId);
       nativeSubagents = disconnectNativeSubagents(
         nativeSubagents,
         event.agent,
