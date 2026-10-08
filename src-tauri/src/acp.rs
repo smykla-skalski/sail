@@ -2142,18 +2142,26 @@ fn register_session(
 }
 
 #[tauri::command]
-pub fn acp_agents(app: AppHandle) -> Vec<AgentAvailability> {
-    agent_availability(crate::settings::string_setting(
-        &app,
-        OPENCODE_BINARY_SETTING,
-    ))
+pub async fn acp_agents(app: AppHandle) -> Result<Vec<AgentAvailability>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        agent_availability(
+            crate::settings::string_setting(&app, OPENCODE_BINARY_SETTING),
+            None,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
-fn agent_availability(opencode_binary: Option<String>) -> Vec<AgentAvailability> {
+fn agent_availability(
+    opencode_binary: Result<Option<String>, String>,
+    only: Option<&str>,
+) -> Vec<AgentAvailability> {
     #[cfg(feature = "e2e")]
     if let Some(path) = std::env::var_os("SAIL_ACP_TEST_AGENT") {
         return AGENTS
             .iter()
+            .filter(|agent| only.is_none_or(|id| id == agent.id))
             .map(|agent| AgentAvailability {
                 id: agent.id.into(),
                 name: agent.name.into(),
@@ -2168,8 +2176,9 @@ fn agent_availability(opencode_binary: Option<String>) -> Vec<AgentAvailability>
     let major = node.as_ref().and_then(node_major);
     AGENTS
         .iter()
+        .filter(|agent| only.is_none_or(|id| id == agent.id))
         .map(|agent| match agent.launch {
-            Launch::OpenCode => match crate::resolve_binary(opencode_binary.clone()) {
+            Launch::OpenCode => match opencode_binary.clone().and_then(crate::resolve_binary) {
                 Ok(binary) => AgentAvailability {
                     id: agent.id.into(),
                     name: agent.name.into(),
@@ -2235,6 +2244,18 @@ fn connect_blocking(
     profile: CapabilityProfile,
 ) -> Result<Value, String> {
     let definition = definition(&agent)?;
+    let availability = agent_availability(
+        crate::settings::string_setting(&app, OPENCODE_BINARY_SETTING),
+        Some(&agent),
+    )
+    .into_iter()
+    .next()
+    .ok_or("Unknown agent.")?;
+    if !availability.available {
+        return Err(availability
+            .reason
+            .unwrap_or_else(|| "Agent unavailable.".into()));
+    }
     let mut agents = manager.0.lock().map_err(|error| error.to_string())?;
     let key = (agent.clone(), profile);
     if let Some(existing) = agents.get(&key) {
@@ -2263,18 +2284,6 @@ fn connect_blocking(
                 Ok(capabilities.clone())
             };
         }
-    }
-    let availability = agent_availability(crate::settings::string_setting(
-        &app,
-        OPENCODE_BINARY_SETTING,
-    ))
-    .into_iter()
-    .find(|item| item.id == agent)
-    .ok_or("Unknown agent.")?;
-    if !availability.available {
-        return Err(availability
-            .reason
-            .unwrap_or_else(|| "Agent unavailable.".into()));
     }
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     #[cfg(feature = "e2e")]
@@ -4238,7 +4247,7 @@ mod native_agent_tests {
     }
 
     fn opencode(binary: &Path) -> AgentAvailability {
-        agent_availability(Some(binary.to_string_lossy().into_owned()))
+        agent_availability(Ok(Some(binary.to_string_lossy().into_owned())), None)
             .into_iter()
             .find(|agent| agent.id == "opencode")
             .unwrap()
@@ -4278,9 +4287,27 @@ mod native_agent_tests {
     }
 
     #[test]
+    fn settings_error_makes_opencode_unavailable_with_the_cause() {
+        let agent = agent_availability(Err("Cannot parse settings: bad".into()), Some("opencode"))
+            .pop()
+            .unwrap();
+        assert!(!agent.available);
+        assert_eq!(agent.reason.as_deref(), Some("Cannot parse settings: bad"));
+    }
+
+    #[test]
+    fn availability_can_target_one_agent() {
+        let ids: Vec<_> = agent_availability(Ok(None), Some("claude"))
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect();
+        assert_eq!(ids, ["claude"]);
+    }
+
+    #[test]
     fn npx_agents_keep_their_availability_entries() {
         let (root, binary) = fake_opencode("2.0.24");
-        let ids: Vec<_> = agent_availability(Some(binary.to_string_lossy().into_owned()))
+        let ids: Vec<_> = agent_availability(Ok(Some(binary.to_string_lossy().into_owned())), None)
             .into_iter()
             .map(|agent| agent.id)
             .collect();
