@@ -13,6 +13,58 @@ function secondaryColors() {
   );
 }
 
+const sendButton = "//*[contains(@class,'agent-actions')]//button[contains(.,'Send')]";
+
+/** Samples the painted thread header and status bar on every animation frame and every 10 ms,
+ * and records any frame where they disagree about the one running thread. */
+function startStatusSampler() {
+  return browser.execute(() => {
+    const previous: unknown = Reflect.get(window, 'sailStatusStop');
+    if (typeof previous === 'function') previous();
+    const mismatches: string[] = [];
+    const sample = () => {
+      const header = document.querySelector('.agent-header .activity-status')?.textContent ?? '';
+      const summary = document.querySelector('.agent-status-summary')?.textContent ?? '';
+      const headerState = header.includes('Needs input')
+        ? 'waiting'
+        : header.includes('Working')
+          ? 'working'
+          : header.includes('Ready')
+            ? 'ready'
+            : null;
+      const summaryState = summary.includes('need attention')
+        ? 'waiting'
+        : summary.includes('working')
+          ? 'working'
+          : 'ready';
+      if (headerState && headerState !== summaryState)
+        mismatches.push(`${header.trim()} || ${summary.replace(/\s+/g, ' ').trim()}`);
+    };
+    let stopped = false;
+    const frame = () => {
+      if (stopped) return;
+      sample();
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+    const timer = setInterval(() => requestAnimationFrame(sample), 10);
+    Reflect.set(window, 'sailStatusMismatches', mismatches);
+    Reflect.set(window, 'sailStatusStop', () => {
+      stopped = true;
+      clearInterval(timer);
+    });
+  });
+}
+
+function statusMismatches(): Promise<string[]> {
+  return browser.execute(() => {
+    const stop: unknown = Reflect.get(window, 'sailStatusStop');
+    if (typeof stop === 'function') stop();
+    const mismatches: unknown = Reflect.get(window, 'sailStatusMismatches');
+    return Array.isArray(mismatches) ? mismatches.map(String) : ['sampler missing'];
+  });
+}
+
 describe('agent status bar', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-agent-status-'));
 
@@ -48,26 +100,11 @@ describe('agent status bar', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-composer textarea')).toBeEnabled();
     await $('.agent-composer textarea').setValue('Delayed approval');
-    await browser.execute(() => {
-      const disagreements: string[] = [];
-      const sample = () => {
-        const header = document.querySelector('.agent-header .activity-status')?.textContent ?? '';
-        const summary = document.querySelector('.agent-status-summary')?.textContent ?? '';
-        if (header.includes('Working') && summary.includes('No agents running'))
-          disagreements.push(header.trim());
-      };
-      Reflect.set(window, 'sailStatusDisagreements', disagreements);
-      Reflect.set(window, 'sailStatusSampler', setInterval(sample, 20));
-    });
-    await $('.agent-actions button').click();
+    await startStatusSampler();
+    await $(sendButton).click();
     await expect($('.agent-permission')).toBeDisplayed();
     await expect(bar).toHaveText(expect.stringContaining('1 need attention'));
-    const disagreements = await browser.execute(() => {
-      clearInterval(Reflect.get(window, 'sailStatusSampler'));
-      const samples: unknown = Reflect.get(window, 'sailStatusDisagreements');
-      return Array.isArray(samples) ? samples.map(String) : ['sampler missing'];
-    });
-    expect(disagreements).toEqual([]);
+    expect(await statusMismatches()).toEqual([]);
 
     await $('.agent-status-summary').click();
     const details = $('.agent-status-popover');
@@ -104,6 +141,27 @@ describe('agent status bar', () => {
     await $('.agent-status-row').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await expect(details).not.toExist();
+
+    await startStatusSampler();
+    await $('.agent-permission button').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Delayed approval'),
+    );
+    await expect($('.agent-header .activity-status')).toHaveText(expect.stringContaining('Ready'));
+    await browser.pause(300);
+    expect(await statusMismatches()).toEqual([]);
+
+    await startStatusSampler();
+    await $('.agent-composer textarea').setValue('Delayed approval');
+    await $(sendButton).click();
+    await expect($('.agent-header .activity-status')).toHaveText(
+      expect.stringContaining('Working'),
+    );
+    await expect($('.agent-permission')).toBeDisplayed();
+    await $('.agent-permission button').click();
+    await expect($('.agent-header .activity-status')).toHaveText(expect.stringContaining('Ready'));
+    await browser.pause(300);
+    expect(await statusMismatches()).toEqual([]);
 
     await browser.setWindowSize(700, 700);
     await $('.sidebar-toggle').click();
