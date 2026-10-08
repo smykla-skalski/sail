@@ -92,3 +92,16 @@ Maya delegates work to subagents and has to answer them, find them and stop them
 | Jordan  | Find a reviewer the planner spawned in another worktree                         | The planner showed a "(+1)" count and a reference row "Reviewer · in worktree …" under it. The reviewer's own row said "spawned by Planner".                                    |
 
 Not covered: a real Claude adapter (it advertises no child prompt capability, so the enabled composer is covered by unit tests only), Stop and Stop all against live OpenCode and MCP children, OpenCode children nested in the sidebar, and the Ship dependency map's Open button (unit tested). The narrow sidebar clips the "(+N)" count when a long status label shows next to it.
+
+# One transcript view walkthrough — 2026-10-08
+
+Maya reads long agent runs and answers approvals. Sam works from the keyboard. This walkthrough drives a private macOS build through embedded WebDriver with the repository's ACP test agent standing in for Claude. It is a scripted, simulated persona pass, not a study with real users. Light and dark screenshots were checked by eye: [transcript](visual-audit/screenshots/desktop-transcript-light.png), [permission, light](visual-audit/screenshots/desktop-permission-light.png), [permission, dark](visual-audit/screenshots/desktop-permission-dark.png).
+
+| Persona | Task                                       | Result                                                                                                                                                      |
+| ------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Maya    | Scan a finished run for what the agent did | Tool calls sit in one collapsed group per stretch, between the messages that explain them. Each message shows the provider mark and its time.               |
+| Maya    | Read a permission request                  | The card shows the policy line, the exact command and files when the request carries them, and Allow once and Reject. It offers no Always for unknown risk. |
+| Sam     | Answer the request with the keyboard       | The first button in the card is Allow once; Show action follows the choices and scrolls to the tool call.                                                   |
+| Maya    | Send a follow-up while the agent works     | The queued message appears under the running turn and clears when the turn finishes.                                                                        |
+
+Not covered in the GUI: OpenCode threads (unit tested through the shared model only), the Jump to latest button, the code Copy button, thinking rows, and hook and post-turn check cards in event order (unit tested). The post-turn-checks and conversation-links specs fail on unmodified main in this environment, so they could not confirm those cards.

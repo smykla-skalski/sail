@@ -42,4 +42,22 @@ describe('shared transcript view', () => {
     await expect($('.user-message .message-time')).toBeDisplayed();
     expect((await $$('.agent-conversation .message')).length).toBeGreaterThan(1);
   });
+
+  it('keeps a queued message under the running turn and places the permission card', async () => {
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Delayed approval');
+    await $('.agent-actions button:last-of-type').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await $('.agent-composer textarea').setValue('Queued follow-up');
+    await $('.agent-actions button:last-of-type').click();
+    await expect($('.agent-conversation .queued-messages')).toHaveText(
+      expect.stringContaining('Queued follow-up'),
+    );
+    await expect($('.permission-card')).toBeDisplayed();
+    await $('.permission-card .permission-actions button').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Delayed approval'),
+    );
+  });
 });
