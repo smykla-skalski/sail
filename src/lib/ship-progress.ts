@@ -715,7 +715,9 @@ export function shipTaskThreadsSettled(
   states: Partial<Record<string, SpawnState>>,
   receipts: Array<
     Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'> &
-      Partial<Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetDirectory'>>
+      Partial<
+        Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetDirectory' | 'dispatchPending'>
+      >
   >,
   discoveredThreadIds: Iterable<string> = [],
 ): boolean {
@@ -731,12 +733,25 @@ export function shipTaskThreadsSettled(
   ].filter((threadId): threadId is string => Boolean(threadId));
   return threadIds.every((threadId) => {
     const live = states[threadId] ?? 'unavailable';
-    const receipt = receipts.find((item) =>
-      threadId === issue.threadId ? item.receiptId === issue.receiptId : item.targetId === threadId,
+    const matchingReceipts = receipts.filter(
+      (item) =>
+        (threadId === issue.threadId && item.receiptId === issue.receiptId) ||
+        (item.targetId === threadId &&
+          (item.targetDirectory === undefined || item.targetDirectory === issue.path)),
     );
-    if (receipt && !shippingWorkerSettled(receipt.state)) return false;
+    if (
+      matchingReceipts.some(
+        (receipt) => receipt.dispatchPending || !shippingWorkerSettled(receipt.state),
+      )
+    )
+      return false;
     if (live !== 'unavailable') return shippingWorkerSettled(live);
-    return receipt !== undefined && shippingWorkerSettled(receipt.state);
+    return (
+      matchingReceipts.length > 0 &&
+      matchingReceipts.every(
+        (receipt) => !receipt.dispatchPending && shippingWorkerSettled(receipt.state),
+      )
+    );
   });
 }
 
@@ -762,6 +777,27 @@ export function shipOwnershipQuietPass(
     settled: previousGeneration === currentGeneration,
     nextGeneration: currentGeneration,
   };
+}
+
+export function shipTaskReceiptIdsToProtect(
+  issue: ShipIssue,
+  receipts: Pick<
+    SpawnReceipt,
+    'receiptId' | 'targetId' | 'targetDirectory' | 'state' | 'dispatchPending'
+  >[],
+): string[] {
+  const ownedThreadIds = new Set([issue.threadId, ...(issue.checkpointThreadIds ?? [])]);
+  return receipts
+    .filter(
+      (receipt) =>
+        (receipt.receiptId === issue.receiptId &&
+          (issue.workerSettled !== true || issue.claim?.status === 'active')) ||
+        (!!issue.path &&
+          ownedThreadIds.has(receipt.targetId) &&
+          receipt.targetDirectory === issue.path &&
+          (receipt.dispatchPending === true || !shippingWorkerSettled(receipt.state))),
+    )
+    .map((receipt) => receipt.receiptId);
 }
 
 export function reconciledShipGates(issue: ShipIssue, receipts: SpawnReceipt[]): ShipGate[] {
@@ -1093,6 +1129,24 @@ export function appendShipEvent(
 }
 
 const nullableString = z.string().nullable();
+const shippingClaimSchema = z.object({
+  id: z.string(),
+  instanceId: z.string().min(1).optional(),
+  holder: z.string(),
+  task: z.string(),
+  acquiredAt: z.string(),
+  heartbeatAt: z.string(),
+  expiresAt: z.string(),
+  status: z.enum(['active', 'released']),
+  releasedAt: z.string().optional(),
+  releaseReason: z.string().optional(),
+  takeoverOf: z.string().optional(),
+  releasedHeartbeatAt: z.string().optional(),
+  releasedExpiresAt: z.string().optional(),
+  releasedCommentUpdatedAtMillis: z.number().int().nonnegative().optional(),
+  commentId: z.number().int().positive(),
+  commentUpdatedAtMillis: z.number().int().nonnegative().optional(),
+});
 const shipGateSchema = gateMetadataSchema.extend({
   id: z.string(),
   provider: z.string(),
@@ -1171,6 +1225,11 @@ const shipIssueSchema = z.object({
     .optional(),
   refreshedAt: z.number().optional(),
   refreshError: nullableString.optional(),
+  claimFencePending: z.boolean().optional(),
+  claimRevalidationPending: z.boolean().optional(),
+  claimHandoffPending: z.boolean().optional(),
+  dispatchFencePending: z.boolean().optional(),
+  claim: shippingClaimSchema.optional(),
   checkpoint: taskCheckpointSchema.optional(),
   checkpointThreadIds: z.array(z.string()).optional(),
   contextCompactions: z

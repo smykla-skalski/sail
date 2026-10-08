@@ -123,7 +123,6 @@
     const latest = gates.toSorted((left, right) => right.updated - left.updated)[0];
     return `${latest.gate.replaceAll('-', ' ')} · ${latest.verdict ?? latest.state}`;
   }
-
   function exportEconomics(owner: ShipRun) {
     const exported = exportTaskEconomics(
       owner.issues.map((item) => ({
@@ -159,6 +158,12 @@
       reasons.push('provider/model attribution was compacted into overflow buckets');
     if (economics.overflowed) reasons.push('one or more totals exceeded the safe integer limit');
     return `Lifetime economics are incomplete: ${reasons.join('; ')}.`;
+  }
+
+  function coordinationClaim(item: ShipIssue): string {
+    if (!item.claim) return item.state === 'pending' ? 'Not acquired' : 'Unavailable';
+    if (item.claim.status === 'released') return 'Released';
+    return Date.parse(item.claim.expiresAt) > Date.now() ? 'Active' : 'Expired';
   }
 </script>
 
@@ -286,6 +291,7 @@
             <span class="ship-latest"><b>Latest</b> {activity.title} · {activity.detail}</span>
             <span class="ship-next"><b>Next</b> {presentation.nextAction}</span>
             <span class="ship-claims" aria-label={`Issue ${item.number} recorded states`}>
+              <span><b>Claim</b>{coordinationClaim(item)}</span>
               <span><b>Worker</b>{workerClaim(item)}</span>
               <span><b>Review</b>{gateClaim(item)}</span>
               <span><b>CI</b>{ciStatus(item.checks)}</span>
@@ -379,6 +385,20 @@
           </p>
           {#if issue.archivePath}<p class="ship-path">Archived files: {issue.archivePath}</p>{/if}
           {@render dependencies(run, issue)}
+          <h4>Coordination claim</h4>
+          {#if issue.claim}
+            <p>{issue.claim.holder} · {issue.claim.task} · {coordinationClaim(issue)}</p>
+            <p>
+              Acquired {new Date(issue.claim.acquiredAt).toLocaleString()} · heartbeat {new Date(
+                issue.claim.heartbeatAt,
+              ).toLocaleString()} · expires {new Date(issue.claim.expiresAt).toLocaleString()}
+            </p>
+            {#if issue.claim.takeoverOf}<p>Audited takeover of {issue.claim.takeoverOf}</p>{/if}
+            {#if issue.claim.releasedAt}<p>
+                Released {new Date(issue.claim.releasedAt).toLocaleString()} ·
+                {issue.claim.releaseReason}
+              </p>{/if}
+          {:else}<p class="ship-muted">No visible claim recorded.</p>{/if}
           <h4>Implementation</h4>
           <p>Worker: {run.provider} / {resolvedWorkerModel(issue) ?? 'Unknown model'}</p>
           <p>

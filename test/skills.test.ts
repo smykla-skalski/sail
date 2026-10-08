@@ -11,6 +11,7 @@ import {
   skillQuery,
 } from '../src/lib/skills.ts';
 import { validationSettingsKey } from '../src/lib/cross-validation.ts';
+import { slashCommands } from '../src/lib/slash-commands.ts';
 
 const shipItCore = readFileSync(new URL('../skills/ship-it/SKILL.md', import.meta.url), 'utf8');
 const convergence = readFileSync(
@@ -106,6 +107,43 @@ void test('a selected skill resolves from a prompt with arguments', () => {
   assert.equal(promptSkill(skills, 'Example:\n> /review'), undefined);
   assert.equal(promptSkill(skills, '> Example\n/review'), undefined);
   assert.equal(promptSkill(skills, '> Example\n\n/review')?.id, 'two');
+});
+
+void test('nested list fences hide code until a valid indented closing fence', () => {
+  const prompt = [
+    '- Outer item',
+    '  - ```text',
+    '    /review',
+    '    - ```',
+    '    /review',
+    '    ```js',
+    '    /review',
+    '    ```   ',
+    '  /ship-issue #42',
+  ].join('\n');
+  assert.deepEqual(
+    slashCommands(prompt).map((command) => command.name),
+    ['ship-issue'],
+  );
+  assert.equal(promptSkill(skills, prompt)?.id, 'one');
+
+  const continuation = '- Item\n  ```\n  /review\n  ```\n/review';
+  assert.deepEqual(
+    slashCommands(continuation).map((command) => command.name),
+    ['review'],
+  );
+
+  const deepList = '- Outer\n    - ```\n      /review\n      ```\n      /ship-issue';
+  assert.deepEqual(
+    slashCommands(deepList).map((command) => command.name),
+    ['ship-issue'],
+  );
+
+  const outdented = '- Item\n  ```\n  /review\n/review';
+  assert.deepEqual(
+    slashCommands(outdented).map((command) => command.name),
+    ['review'],
+  );
 });
 
 void test('bundled skills fill missing names without replacing installed skills', () => {

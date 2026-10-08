@@ -29,7 +29,7 @@
   import type { ReviewCapture, ReviewPreview } from './lib/review-evidence';
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import type { PublishedGraph } from './lib/issue-graph';
-  import type { ShipIssue, ShipRun } from './lib/issue-shipping';
+  import type { DirectShipAuthorization, ShipIssue, ShipRun } from './lib/issue-shipping';
   import type { ActivityHistoryEvent } from './lib/activity-history';
   import type { WorkspaceActivityItem } from './lib/workspace-activity';
   import type { ShipItIssue } from './lib/implementation-models';
@@ -87,7 +87,8 @@
       directory: string,
       threadId: string,
       workerModel?: string,
-    ) => Promise<void>;
+      requireClaim?: boolean,
+    ) => Promise<DirectShipAuthorization | undefined>;
     postTurnChecks: PostTurnCheck[];
     onretrycheck: (check: PostTurnCheck) => void;
     agentUsage: Record<string, AgentUsage>;

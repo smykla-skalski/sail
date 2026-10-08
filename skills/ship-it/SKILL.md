@@ -30,6 +30,8 @@ Invocation: `/ship-it [--issue] <task description | github-issue-url | jira-url>
 
 Read [references/inputs.md](references/inputs.md) before Phase 1. Classify the input, create the issue for `--issue`, read the GitHub issue or Jira ticket, and write the task context file outside the repository. No branch, edit or commit until this phase succeeds.
 
+For a GitHub issue, inspect visible `sail-claim:v1` comments, open pull requests, and recently merged pull requests for equivalent work before claiming. Treat an active marker as released only when a release marker by the same eligible author matches its claim ID, holder, task, acquisition time, released heartbeat and expiry, and recorded comment revision. A non-expired active claim is a hard stop unless the prompt identifies that exact claim ID and task as held by Sail on behalf of this worker; in that case use Sail's claim and do not publish another. Otherwise publish a visible claim before implementation with a machine-readable `sail-claim:v1` marker and readable holder, task, acquisition, heartbeat, expiry, status, and takeover fields. Preserve expired claims as the takeover audit trail. Sail-managed runs renew and release their claim in Sail's existing monitor loop; standalone runs refresh the same comment at phase boundaries without creating a scheduler.
+
 ## Phase 2 — Explore
 
 Read root `CLAUDE.md`, `AGENTS.md` and `CONTRIBUTING.md` when present, including the merge convention. Identify the stack, the lint, format, type-check, test and build commands, the affected code and its tests.
@@ -41,6 +43,8 @@ Fetch origin, resolve the default branch with `gh repo view`, fast-forward it, b
 ## Phase 4 — Implement
 
 Small focused commits following repository patterns; add behavior-focused tests. Run focused formatting, linting and tests while implementing and fixing. Run the repository's full quality gate once on the final delivery tip, repeating it only when a later source change makes that evidence stale. Never use suppressions or `--no-verify`; fix the root cause.
+
+Refresh a standalone GitHub claim before implementation and every later phase. If it expired or another active claim superseded it, stop.
 
 In a Sail-managed task, bind the checkpoint to the current revision before recording results. Read its revision before each quality command, then pass that value as `expectedRevision` to `task_evidence_record`, map the exact acceptance criteria it verifies, and reference bounded terminal or log output. After any source change, rebind and rerun required evidence; never reuse a stale result.
 
@@ -74,6 +78,8 @@ Read [references/pr-loop.md](references/pr-loop.md) before Phase 7. In short:
 ## Phase 11 — Close, report, clean up
 
 GitHub issue: confirm `Closes` closed it, else close it with a completion comment. Jira: leave it untouched; say it is ready to transition. Report source (`created` if Phase 1 made the issue; Jira key; or description), PR link, commits, CI and required-approval status, merged/closed status, follow-up issues, and any explicitly authorized exhaustive-review overrun. Then switch to the default branch, fast-forward, and delete the local branch (or worktree) when safe.
+
+Release the GitHub claim in the same visible comment after merge or abandonment, recording the release time and reason.
 
 ## Hard stops
 

@@ -47,6 +47,11 @@
     type ShipItIssue,
   } from './lib/implementation-models';
   import {
+    dispatchAuthorizedDirectShipPrompt,
+    directShipClaimPrompt,
+    type DirectShipAuthorization,
+  } from './lib/issue-shipping';
+  import {
     agentQueuePaused,
     queuedAgentMessages,
     saveQueuedAgentMessages,
@@ -158,7 +163,8 @@
       directory: string,
       threadId: string,
       workerModel?: string,
-    ) => Promise<void>;
+      requireClaim?: boolean,
+    ) => Promise<DirectShipAuthorization | undefined>;
     nativeEntries?: AgentEntry[];
     capabilityProfile?: CapabilityProfile;
   }
@@ -269,7 +275,7 @@
       claimLegacyPendingImplementationTurn(path, sourceId);
     if (claimedLegacy) recordShipItOwner(path, sourceId);
     if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
-      void callback(saved, path, sourceId, model);
+      void callback(saved, path, sourceId, model).catch((cause) => (error = describe(cause)));
   });
 
   function isShipItPrompt(text: string): boolean {
@@ -1223,6 +1229,8 @@
     let notifyOnDone = true;
     let keepImages = false;
     let phase: 'session' | 'config' | 'snapshot' | 'prompt' = 'session';
+    let directClaim = '';
+    let directAuthorization: DirectShipAuthorization | undefined;
     let deliverySessionId = activeSessionId;
     busy = true;
     if (activityThread) onstatus(activityThread, 'working');
@@ -1254,12 +1262,15 @@
       deliverySessionId = id;
       if (shipIssue && id && !ephemeral) {
         recordShipItOwner(turnDirectory, `acp:${turnAgent}:${id}`);
-        await onshipit?.(
+        directAuthorization = await onshipit?.(
           shipIssue,
           turnDirectory,
           `acp:${turnAgent}:${id}`,
           modelOption?.currentValue,
+          true,
         );
+        if (!directAuthorization) throw new Error('Direct shipping claim was not acquired.');
+        directClaim = directShipClaimPrompt(directAuthorization.claim);
       }
       if (stopRequested) {
         finalStatus = 'interrupted';
@@ -1291,7 +1302,7 @@
       const promptText =
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
-          : skillText;
+          : skillText + directClaim;
       phase = 'prompt';
       if (id && sentImages.length)
         onattachmentsent?.(
@@ -1301,12 +1312,14 @@
         );
       let result;
       try {
-        result = await acp.prompt(
-          turnAgent,
-          id!,
-          withAttachedFiles(promptText, sentClipboard),
-          turnId,
-          promptImagePaths(sentImages, sentClipboard),
+        result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
+          acp.prompt(
+            turnAgent,
+            id!,
+            withAttachedFiles(promptText, sentClipboard),
+            turnId,
+            promptImagePaths(sentImages, sentClipboard),
+          ),
         );
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
       } catch (cause) {

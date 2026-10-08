@@ -41,6 +41,11 @@
     type ShipItIssue,
   } from './lib/implementation-models';
   import {
+    dispatchAuthorizedDirectShipPrompt,
+    directShipClaimPrompt,
+    type DirectShipAuthorization,
+  } from './lib/issue-shipping';
+  import {
     openCodeInboxSettled,
     runOpenCodePromptStart,
     runSerialOpenCodeTurn,
@@ -154,7 +159,8 @@
       directory: string,
       threadId: string,
       workerModel?: string,
-    ) => Promise<void>;
+      requireClaim?: boolean,
+    ) => Promise<DirectShipAuthorization | undefined>;
     capabilityProfile?: CapabilityProfile;
     onensureprofile?: (directory: string, profile: CapabilityProfile) => Promise<() => void>;
     ondecision?: (thread: AgentThread, id: string, title: string, outcome: string) => void;
@@ -198,7 +204,7 @@
         path,
         sourceId,
         session?.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-      );
+      ).catch((cause) => (error = describe(cause)));
   });
 
   function isShipItPrompt(text: string): boolean {
@@ -821,6 +827,8 @@
       running = true;
       if (session) onstatus(summary(session), 'working');
       const promptRequest = runSerialOpenCodeTurn(id, async () => {
+        let directClaim = '';
+        let directAuthorization: DirectShipAuthorization | undefined;
         const target = await source.session.get({ sessionID: id });
         if (target.location.directory !== turnDirectory)
           throw new Error('Target session moved to another worktree.');
@@ -829,7 +837,15 @@
           : undefined;
         if (shipIssue) {
           recordShipItOwner(turnDirectory, `opencode:${id}`);
-          await onshipit?.(shipIssue, turnDirectory, `opencode:${id}`, implementingModel);
+          directAuthorization = await onshipit?.(
+            shipIssue,
+            turnDirectory,
+            `opencode:${id}`,
+            implementingModel,
+            true,
+          );
+          if (!directAuthorization) throw new Error('Direct shipping claim was not acquired.');
+          directClaim = directShipClaimPrompt(directAuthorization.claim);
         }
         await invoke('record_turn_snapshot', { path: turnDirectory, thread: `opencode:${id}` });
         const tracking = await beginImplementationTurn(
@@ -839,19 +855,21 @@
         );
         let response: Awaited<ReturnType<OpenCodeClient['session']['prompt']>>;
         try {
-          response = await runOpenCodePromptStart(turnDirectory, () =>
-            source.session.prompt({
-              sessionID: id,
-              text: resolveSkillPrompt(skills, text, implementingModel),
-              skills: promptSkill(skills, text)?.id
-                ? [{ id: promptSkill(skills, text)!.id! }]
-                : undefined,
-              delivery: queued ? 'steer' : undefined,
-              files: paths.map((path) => ({
-                uri: fileUri(path),
-                name: clipboardNames.get(path) ?? path.split(/[\\/]/).at(-1),
-              })),
-            }),
+          response = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
+            runOpenCodePromptStart(turnDirectory, () =>
+              source.session.prompt({
+                sessionID: id,
+                text: resolveSkillPrompt(skills, text, implementingModel) + directClaim,
+                skills: promptSkill(skills, text)?.id
+                  ? [{ id: promptSkill(skills, text)!.id! }]
+                  : undefined,
+                delivery: queued ? 'steer' : undefined,
+                files: paths.map((path) => ({
+                  uri: fileUri(path),
+                  name: clipboardNames.get(path) ?? path.split(/[\\/]/).at(-1),
+                })),
+              }),
+            ),
           );
           const heldRelease = releaseProfile;
           releaseProfile = undefined;
