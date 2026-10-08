@@ -89,6 +89,7 @@ fn main() {
             "acp_release_session_fence",
             "acp_load_session",
             "acp_resume_session",
+            "acp_list_sessions",
             "acp_prompt",
             "acp_steer",
             "acp_cancel",

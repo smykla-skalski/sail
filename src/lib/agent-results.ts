@@ -1,3 +1,4 @@
+import { sameThreadId } from './thread-id.ts';
 import { gateMetadataSchema, type GateMetadata } from './ship-progress.ts';
 import type { AcpTurnEvidence, AgentActivity, InterruptedAgentTurn } from './acp';
 import type { ModelRouteRole } from './model-routing.ts';
@@ -253,7 +254,7 @@ export function activeSpawnReceiptForThread(
   return (
     receipts.find(
       (receipt) =>
-        receipt.targetId === threadId &&
+        sameThreadId(receipt.targetId, threadId) &&
         receipt.targetDirectory === directory &&
         activeReceiptIds.has(receipt.receiptId) &&
         !receiptIsSettled(receipt.state),
@@ -268,12 +269,12 @@ export function spawnReceiptsForSource(
 ): SpawnReceipt[] {
   if (!sourceId) return [];
   return receipts.filter(
-    (receipt) => receipt.sourceId === sourceId && receipt.sourceDirectory === directory,
+    (receipt) => sameThreadId(receipt.sourceId, sourceId) && receipt.sourceDirectory === directory,
   );
 }
 
 export function receiptSourceId(agent: string, sessionId: string): string {
-  return agent === 'opencode' ? `opencode:${sessionId}` : `acp:${agent}:${sessionId}`;
+  return `acp:${agent}:${sessionId}`;
 }
 
 export function activeSubagentsForSource(
@@ -302,7 +303,7 @@ export function isSubagentThread(
   directory: string,
 ): boolean {
   return receipts.some(
-    (receipt) => receipt.targetId === targetId && receipt.targetDirectory === directory,
+    (receipt) => sameThreadId(receipt.targetId, targetId) && receipt.targetDirectory === directory,
   );
 }
 
