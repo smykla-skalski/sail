@@ -10,6 +10,7 @@ import {
   activeSpawnReceiptForThread,
   activeSubagentsForSource,
   boundedSpawnOutput,
+  handoffReceiptForInterruptedTurn,
   handoffReceiptNeedsResolution,
   handoffPromptNeedsRecovery,
   isSubagentThread,
@@ -173,6 +174,25 @@ await test('durable ACP evidence distinguishes completion from uncertain dispatc
   assert.equal(acpTurnDispatchProven(evidence), true);
   assert.equal(acpTurnDispatchProven(null), false);
   assert.equal(acpTurnEvidenceState(null), null);
+});
+
+await test('restart routes a dispatched ACP handoff away from generic continuation recovery', () => {
+  const handoff = {
+    ...receipt,
+    requestId: 'handoff:handoff-one',
+    state: 'working' as const,
+  };
+  const interrupted = {
+    agent: 'codex',
+    sessionId: 'target',
+    directory: '/repo/task',
+    turnId: 'turn-one',
+    text: 'Continue from the canonical checkpoint',
+  };
+
+  const recovered = handoffReceiptForInterruptedTurn(interrupted, [handoff]);
+
+  assert.equal(recovered, handoff);
 });
 
 await test('uncertain handoff receipts require explicit provider resolution', () => {

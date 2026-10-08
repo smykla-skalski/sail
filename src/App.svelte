@@ -325,6 +325,7 @@
     acpTurnPromptCanRetry,
     activeSpawnReceiptForThread,
     activeSubagentsForSource,
+    handoffReceiptForInterruptedTurn,
     handoffReceiptNeedsResolution,
     handoffPromptNeedsRecovery,
     loadSpawnReceipts,
@@ -9189,11 +9190,17 @@
           saveAgentThread(thread);
         }
         const recoveredThread = thread;
+        const handoffReceipt = handoffReceiptForInterruptedTurn(turn, spawnReceipts);
         const alreadyActive = async () => {
           const current = (await acp.activity())[turn.agent];
           return current?.activeTurns[turn.sessionId] === turn.turnId;
         };
         try {
+          if (handoffReceipt) {
+            const reconciled = await reconcileDurableAcpTurn(handoffReceipt, turn.sessionId);
+            if (reconciled) await acp.finishInterruptedTurn(turn);
+            return;
+          }
           if (await alreadyActive()) {
             updateAgentThreadStatus(recoveredThread, 'working');
             return;

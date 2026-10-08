@@ -1,5 +1,5 @@
 import { gateMetadataSchema, type GateMetadata } from './ship-progress.ts';
-import type { AcpTurnEvidence, AgentActivity } from './acp';
+import type { AcpTurnEvidence, AgentActivity, InterruptedAgentTurn } from './acp';
 
 export type SpawnState =
   | 'queued'
@@ -259,6 +259,22 @@ export function acpPromptHasBackendEvidence(
   return (
     activity.activeTurns[sessionId] === receipt.turnId ||
     activity.finished[sessionId]?.turnId === receipt.turnId
+  );
+}
+
+export function handoffReceiptForInterruptedTurn(
+  turn: InterruptedAgentTurn,
+  receipts: SpawnReceipt[],
+): SpawnReceipt | null {
+  return (
+    receipts.find(
+      (receipt) =>
+        receipt.requestId.startsWith('handoff:') &&
+        receipt.provider === turn.agent &&
+        receipt.targetId === `acp:${turn.agent}:${turn.sessionId}` &&
+        receipt.targetDirectory === turn.directory &&
+        receipt.turnId === turn.turnId,
+    ) ?? null
   );
 }
 
