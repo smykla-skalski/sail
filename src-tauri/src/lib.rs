@@ -851,6 +851,7 @@ fn git_patches(
     let run = |names: bool| -> Result<Vec<u8>, String> {
         let mut command = Command::new("git");
         command.args([
+            "--no-optional-locks",
             "-C",
             root,
             "diff",
@@ -908,8 +909,11 @@ fn git_patches(
 async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = validate_repository(path)?;
+        // Status refreshes stat data and writes it back to the index unless optional
+        // locks are off, which rewrites the user's index on every diff refresh.
         let output = Command::new("git")
             .args([
+                "--no-optional-locks",
                 "-C",
                 &root,
                 "status",
@@ -4246,12 +4250,12 @@ mod tests {
             path,
             &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
         );
-        fs::write(root.join("*.txt"), "changed literal\n").unwrap();
+        fs::write(root.join(magic), "changed literal\n").unwrap();
         fs::write(root.join("other.txt"), "changed other\n").unwrap();
         let changes = tauri::async_runtime::block_on(working_tree_diff(path.into())).unwrap();
         assert!(changes
             .iter()
-            .find(|change| change.file == "*.txt")
+            .find(|change| change.file == magic)
             .unwrap()
             .patch
             .contains("changed literal"));
@@ -4261,19 +4265,19 @@ mod tests {
             .unwrap()
             .patch
             .contains("changed other"));
-        let patch = git_patch(path, "*.txt", "unstaged", false).unwrap();
+        let patch = git_patch(path, magic, "unstaged", false).unwrap();
         assert!(patch.contains("changed literal"));
         assert!(!patch.contains("changed other"));
         tauri::async_runtime::block_on(git_change_action(
             path.into(),
-            "*.txt".into(),
+            magic.into(),
             "unstaged".into(),
             "stage".into(),
             patch,
             None,
         ))
         .unwrap();
-        assert!(git_patch(path, "*.txt", "staged", false)
+        assert!(git_patch(path, magic, "staged", false)
             .unwrap()
             .contains("changed literal"));
         assert!(git_patch(path, "other.txt", "staged", false)
