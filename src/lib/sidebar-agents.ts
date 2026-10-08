@@ -10,8 +10,16 @@ import {
 } from './agent-results.ts';
 
 export type SidebarThreadRow = {
+  /** Unique within a list: a reference row repeats the thread it points at. */
+  key: string;
   thread: AgentThread;
   depth: number;
+  /** Children and deeper descendants, shown on the parent as (+N). */
+  descendants: number;
+  /** A pointer to a child that lives in another worktree. */
+  reference: boolean;
+  /** Title of the parent thread, for a child whose parent lives in another worktree. */
+  spawnedBy: string | null;
   hiddenHistoricalChildren: number;
   historicalChildren: number;
   historicalExpanded: boolean;
@@ -107,13 +115,46 @@ function retained(receipt: SpawnReceipt | undefined): boolean {
   return !receipt || !receiptIsSettled(receipt.state) || receipt.state === 'failed';
 }
 
+function childThread(receipt: SpawnReceipt): AgentThread | null {
+  if (!receipt.targetId || !receipt.targetDirectory) return null;
+  const opencode = receipt.targetId.startsWith('opencode:');
+  const match = /^acp:([^:]+):(.+)$/.exec(receipt.targetId);
+  if (!opencode && !match) return null;
+  return {
+    agent: opencode ? 'opencode' : (match?.[1] ?? ''),
+    directory: receipt.targetDirectory,
+    sessionId: opencode ? receipt.targetId.slice('opencode:'.length) : (match?.[2] ?? ''),
+    title: receipt.prompt ?? receipt.name ?? 'Subagent',
+    updated: receipt.updated,
+  };
+}
+
+const nestedReceipt = (receipt: SpawnReceipt) =>
+  receipt.receiptId.startsWith('native:') || receipt.receiptId.startsWith('opencode-child:');
+
 export function sidebarThreadRows(
-  threads: AgentThread[],
+  allListed: AgentThread[],
   receipts: SpawnReceipt[],
   expanded: string[] = [],
+  everyThread: AgentThread[] = allListed,
 ): SidebarThreadRow[] {
-  const native = receipts.filter((receipt) => receipt.receiptId.startsWith('native:'));
+  const native = receipts.filter(nestedReceipt);
+  const listed = new Set(allListed.map(sidebarThreadIdentity));
+  // OpenCode lists only top-level sessions, so its children come from their receipts.
+  const threads = [
+    ...allListed,
+    ...native.flatMap((receipt) => {
+      const thread = receipt.receiptId.startsWith('opencode-child:') ? childThread(receipt) : null;
+      return thread &&
+        thread.directory === receipt.sourceDirectory &&
+        listed.has(`${receipt.sourceDirectory}\0${receipt.sourceId}`) &&
+        !listed.has(sidebarThreadIdentity(thread))
+        ? [thread]
+        : [];
+    }),
+  ];
   const byIdentity = new Map(threads.map((thread) => [sidebarThreadIdentity(thread), thread]));
+  const anywhere = new Map(everyThread.map((thread) => [sidebarThreadIdentity(thread), thread]));
   const receiptByChild = new Map<string, SpawnReceipt>(
     native.flatMap((receipt) =>
       receipt.targetId && receipt.targetDirectory
@@ -121,6 +162,23 @@ export function sidebarThreadRows(
         : [],
     ),
   );
+  const references = new Map<string, { thread: AgentThread; receipt: SpawnReceipt }[]>();
+  const spawnedBy = new Map<string, string>();
+  for (const receipt of receipts) {
+    if (nestedReceipt(receipt) || receipt.sourceDirectory === receipt.targetDirectory) continue;
+    const thread = childThread(receipt);
+    if (!thread) continue;
+    const parentKey = `${receipt.sourceDirectory}\0${receipt.sourceId}`;
+    const parent = byIdentity.get(parentKey);
+    if (parent && retained(receipt)) {
+      const real = anywhere.get(sidebarThreadIdentity(thread));
+      const list = references.get(parentKey) ?? [];
+      list.push({ thread: real ?? thread, receipt });
+      references.set(parentKey, list);
+    }
+    const sourceThread = anywhere.get(parentKey);
+    spawnedBy.set(sidebarThreadIdentity(thread), sourceThread?.title ?? 'another thread');
+  }
   const children = new Map<string, AgentThread[]>();
   const roots: AgentThread[] = [];
   for (const thread of threads) {
@@ -140,6 +198,16 @@ export function sidebarThreadRows(
   for (const nested of children.values()) nested.sort(recentThreadFirst);
   const rows: SidebarThreadRow[] = [];
   const visited = new Set<string>();
+  const countDescendants = (thread: AgentThread, trail = new Set<string>()): number => {
+    const key = sidebarThreadIdentity(thread);
+    if (trail.has(key)) return 0;
+    const nextTrail = new Set(trail).add(key);
+    const nested = children.get(key) ?? [];
+    return (
+      (references.get(key)?.length ?? 0) +
+      nested.reduce((total, child) => total + 1 + countDescendants(child, nextTrail), 0)
+    );
+  };
   const hasLiveDescendant = (thread: AgentThread, trail = new Set<string>()): boolean => {
     const key = sidebarThreadIdentity(thread);
     if (trail.has(key)) return false;
@@ -164,12 +232,28 @@ export function sidebarThreadRows(
       return retained(receipt) || hasLiveDescendant(child) || historicalExpanded;
     });
     rows.push({
+      key: threadKey(thread),
       thread,
       depth,
+      descendants: countDescendants(thread),
+      reference: false,
+      spawnedBy: spawnedBy.get(key) ?? null,
       hiddenHistoricalChildren: nested.length - visible.length,
       historicalChildren,
       historicalExpanded,
     });
+    for (const link of references.get(key) ?? [])
+      rows.push({
+        key: `ref:${threadKey(thread)}:${threadKey(link.thread)}`,
+        thread: link.thread,
+        depth: depth + 1,
+        descendants: 0,
+        reference: true,
+        spawnedBy: null,
+        hiddenHistoricalChildren: 0,
+        historicalChildren: 0,
+        historicalExpanded: false,
+      });
     for (const child of visible) visit(child, depth + 1);
   };
   for (const root of roots) visit(root, 0);

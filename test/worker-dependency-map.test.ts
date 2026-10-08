@@ -145,3 +145,12 @@ await test('dependency map excludes native children owned by another run', () =>
   ]);
   assert.deepEqual(graph, { nodes: [], edges: [], errors: [] });
 });
+
+await test('subagent nodes open their thread and carry no check state', () => {
+  const parent = { ...issue(1), threadId: 'acp:codex:root', path: '/repo' };
+  const graph = buildWorkerDependencyMap(run([parent]), [nativeChild('child', 'root', 'working')]);
+  const node = graph.nodes.find((item) => item.id === 'native:codex:child');
+
+  assert.equal(node?.checkState, null);
+  assert.deepEqual(node?.thread, { path: '/repo', threadId: 'acp:codex:child' });
+});
