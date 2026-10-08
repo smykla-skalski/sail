@@ -3670,11 +3670,8 @@
     const claim = issue.claim;
     if (!claim || claim.status !== 'active') return;
     const validationKey = `${run.id}:${issue.id}:${claim.id}:${claim.commentId}`;
-    shipClaimLeaseDeadlines.delete(validationKey);
-    shipClaimLeaseWallDeadlines.delete(validationKey);
-    clearShippingClaimLeaseFence(validationKey);
     try {
-      const { observation, fenced } = await fencePredecessorWorkerBeforeTakeover(
+      await fencePredecessorWorkerBeforeTakeover(
         () =>
           invoke<ShippingClaimObservation>('observe_shipping_claim', {
             repository: run.repository,
@@ -3683,7 +3680,9 @@
             recoveryId: shippingInstanceId,
           }),
         async () => {
-          if (!recoveredClaimWorkerFenceRequired(issue)) return;
+          const taskWorkersSettled =
+            issue.workerSettled === true && (await shippingTaskWorkersSettled(issue));
+          if (!recoveredClaimWorkerFenceRequired(issue, taskWorkersSettled)) return;
           const blockedReason = 'The predecessor shipping claim expired; fencing its worker.';
           await updateShipIssue(run, issue, {
             claimFencePending: true,
@@ -3702,23 +3701,25 @@
             claim,
             recoveryId: shippingInstanceId,
           }),
+        async ({ observation, fenced }) => {
+          if (!fenced) {
+            if (issue.claim?.id !== claim.id || issue.claim.commentId !== claim.commentId) return;
+            await updateShipIssue(run, issue, { claim: observation.claim, refreshError: null });
+            scheduleRecoveredShippingClaimLeaseFence(
+              run,
+              issue,
+              validationKey,
+              observation.remainingLeaseMillis,
+            );
+            return;
+          }
+          if (!issue.workerSettled) return;
+          shipClaimLeaseDeadlines.delete(validationKey);
+          shipClaimLeaseWallDeadlines.delete(validationKey);
+          clearShippingClaimLeaseFence(validationKey);
+          await updateShipIssue(run, issue, predecessorTakeoverChanges(issue));
+        },
       );
-      if (!fenced) {
-        if (issue.claim?.id !== claim.id || issue.claim.commentId !== claim.commentId) return;
-        await updateShipIssue(run, issue, { claim: observation.claim, refreshError: null });
-        scheduleRecoveredShippingClaimLeaseFence(
-          run,
-          issue,
-          validationKey,
-          observation.remainingLeaseMillis,
-        );
-        return;
-      }
-      if (!issue.workerSettled) return;
-      shipClaimLeaseDeadlines.delete(validationKey);
-      shipClaimLeaseWallDeadlines.delete(validationKey);
-      clearShippingClaimLeaseFence(validationKey);
-      await updateShipIssue(run, issue, predecessorTakeoverChanges(issue));
     } catch (cause) {
       await updateShipIssue(run, issue, {
         refreshError: `Foreign claim reconciliation failed: ${describe(cause)}`,

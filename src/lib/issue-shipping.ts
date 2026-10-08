@@ -548,13 +548,19 @@ export async function fencePredecessorWorkerBeforeTakeover(
   observe: () => Promise<ShippingClaimObservation>,
   fence: () => Promise<void>,
   releaseFence: () => Promise<void>,
+  settleLease: (result: {
+    observation: ShippingClaimObservation;
+    fenced: boolean;
+  }) => Promise<void> = async () => undefined,
 ): Promise<{ observation: ShippingClaimObservation; fenced: boolean }> {
   const observation = await observe();
   if (!observation.active) {
     await fence();
     await releaseFence();
   }
-  return { observation, fenced: !observation.active };
+  const result = { observation, fenced: !observation.active };
+  await settleLease(result);
+  return result;
 }
 
 export function predecessorTakeoverChanges(issue: ShipIssue): Partial<ShipIssue> {
@@ -580,9 +586,12 @@ export function predecessorTakeoverChanges(issue: ShipIssue): Partial<ShipIssue>
   };
 }
 
-export function recoveredClaimWorkerFenceRequired(issue: ShipIssue): boolean {
+export function recoveredClaimWorkerFenceRequired(
+  issue: ShipIssue,
+  taskWorkersSettled: boolean,
+): boolean {
   const terminal = issue.state === 'merged' || issue.state === 'failed';
-  return !terminal || issue.workerSettled !== true;
+  return !terminal || issue.workerSettled !== true || !taskWorkersSettled;
 }
 
 export function resumedShippingIssueChanges(issue: ShipIssue): Partial<ShipIssue> {

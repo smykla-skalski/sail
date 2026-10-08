@@ -52,6 +52,7 @@ import {
   shippingSetupAction,
   terminalClaimReleaseReady,
   type DirectShipAuthorization,
+  type ShippingClaimObservation,
   workerStateSettled,
 } from '../src/lib/issue-shipping.ts';
 import { shipOwner } from '../src/lib/ship-progress.ts';
@@ -1070,7 +1071,7 @@ void test('a released predecessor claim preserves settled terminal cleanup state
   const result = await fencePredecessorWorkerBeforeTakeover(
     async () => ({ claim: issue.claim!, active: false, remainingLeaseMillis: 0 }),
     async () => {
-      if (!recoveredClaimWorkerFenceRequired(issue)) return;
+      if (!recoveredClaimWorkerFenceRequired(issue, true)) return;
       throw new Error('OpenCode is unavailable; stop the worker manually.');
     },
     async () => undefined,
@@ -1082,19 +1083,76 @@ void test('a released predecessor claim preserves settled terminal cleanup state
   assert.equal(issue.claim, undefined);
   assert.equal(issue.receiptId, 'settled-receipt');
   assert.equal(issue.threadId, 'settled-thread');
-  assert.equal(recoveredClaimWorkerFenceRequired(issue), false);
+  assert.equal(recoveredClaimWorkerFenceRequired(issue, true), false);
   assert.deepEqual(
     readyShipIssues(shipping).map((candidate) => candidate.id),
     ['second', 'dependent'],
   );
 });
 
-void test('an unsettled terminal issue still fences its recovered worker', () => {
+void test('a terminal issue with a live checkpoint still fences its recovered worker', () => {
   const issue = run().issues[0];
   issue.state = 'merged';
-  issue.workerSettled = false;
+  issue.workerSettled = true;
+  issue.checkpointThreadIds = ['checkpoint'];
 
-  assert.equal(recoveredClaimWorkerFenceRequired(issue), true);
+  assert.equal(recoveredClaimWorkerFenceRequired(issue, false), true);
+});
+
+void test('a recovered claim keeps its lease fence until observation replaces it', async () => {
+  let resolveObservation!: (observation: ShippingClaimObservation) => void;
+  const observation = new Promise<ShippingClaimObservation>((resolve) => {
+    resolveObservation = resolve;
+  });
+  let leaseMillis = 45_000;
+
+  const reconciliation = fencePredecessorWorkerBeforeTakeover(
+    () => observation,
+    async () => undefined,
+    async () => undefined,
+    async ({ observation: current }) => {
+      leaseMillis = current.remainingLeaseMillis;
+    },
+  );
+
+  assert.equal(leaseMillis, 45_000);
+  resolveObservation({
+    claim: {
+      id: 'claim-1',
+      holder: 'Sail A',
+      task: 'issue-11',
+      acquiredAt: '2026-10-07T10:00:00.000Z',
+      heartbeatAt: '2026-10-07T10:01:00.000Z',
+      expiresAt: '2026-10-07T10:03:00.000Z',
+      status: 'active',
+      commentId: 1,
+    },
+    active: true,
+    remainingLeaseMillis: 30_000,
+  });
+  await reconciliation;
+  assert.equal(leaseMillis, 30_000);
+});
+
+void test('a failed recovered claim observation leaves its lease fence armed', async () => {
+  let rejectObservation!: (cause: Error) => void;
+  const observation = new Promise<ShippingClaimObservation>((_resolve, reject) => {
+    rejectObservation = reject;
+  });
+  let leaseFenceArmed = true;
+
+  const reconciliation = fencePredecessorWorkerBeforeTakeover(
+    () => observation,
+    async () => undefined,
+    async () => undefined,
+    async () => {
+      leaseFenceArmed = false;
+    },
+  );
+
+  rejectObservation(new Error('observation timed out'));
+  await assert.rejects(reconciliation, /observation timed out/);
+  assert.equal(leaseFenceArmed, true);
 });
 
 void test('an orphan stop failure retains the predecessor takeover fence', async () => {
