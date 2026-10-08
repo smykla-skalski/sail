@@ -12,6 +12,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::browser_agent::CapabilityProfile;
+
 static NEXT_TERMINAL: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
@@ -57,7 +59,7 @@ impl AcpTerminalManager {
             .unwrap_or_default()
     }
 
-    pub fn stop_agent(&self, agent: &str) {
+    pub fn stop_sessions(&self, agent: &str, profile: CapabilityProfile, session_ids: &[String]) {
         let terminals = self
             .active
             .lock()
@@ -65,7 +67,16 @@ impl AcpTerminalManager {
             .map(|active| {
                 active
                     .iter()
-                    .filter(|(_, terminal)| terminal.agent == agent)
+                    .filter(|(_, terminal)| {
+                        terminal_belongs_to_connection(
+                            &terminal.agent,
+                            terminal.profile,
+                            &terminal.session_id,
+                            agent,
+                            profile,
+                            session_ids,
+                        )
+                    })
                     .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
                     .collect::<Vec<_>>()
             })
@@ -118,6 +129,21 @@ impl AcpTerminalManager {
     }
 }
 
+fn terminal_belongs_to_connection(
+    terminal_agent: &str,
+    terminal_profile: CapabilityProfile,
+    terminal_session_id: &str,
+    agent: &str,
+    profile: CapabilityProfile,
+    session_ids: &[String],
+) -> bool {
+    terminal_agent == agent
+        && terminal_profile == profile
+        && session_ids
+            .iter()
+            .any(|session_id| session_id == terminal_session_id)
+}
+
 impl Drop for AcpTerminalManager {
     fn drop(&mut self) {
         self.shutdown();
@@ -126,6 +152,7 @@ impl Drop for AcpTerminalManager {
 
 struct AcpTerminal {
     agent: String,
+    profile: CapabilityProfile,
     session_id: String,
     directory: PathBuf,
     child: Mutex<Child>,
@@ -263,6 +290,7 @@ fn snapshot(session: &AcpTerminal) -> Result<TerminalSnapshot, String> {
 fn session(
     manager: &AcpTerminalManager,
     agent: &str,
+    profile: CapabilityProfile,
     params: Value,
 ) -> Result<Arc<AcpTerminal>, String> {
     let params: TerminalParams =
@@ -274,7 +302,10 @@ fn session(
         .get(&params.terminal_id)
         .cloned()
         .ok_or("Unknown terminal ID.")?;
-    if terminal.agent != agent || terminal.session_id != params.session_id {
+    if terminal.agent != agent
+        || terminal.profile != profile
+        || terminal.session_id != params.session_id
+    {
         return Err("Unknown terminal ID.".to_string());
     }
     if terminal
@@ -321,6 +352,7 @@ pub fn handle(
     app: &AppHandle,
     manager: &AcpTerminalManager,
     agent: &str,
+    profile: CapabilityProfile,
     method: &str,
     params: Value,
     session_directory: Option<PathBuf>,
@@ -389,6 +421,7 @@ pub fn handle(
         );
         let terminal = Arc::new(AcpTerminal {
             agent: agent.to_string(),
+            profile,
             session_id: params.session_id.clone(),
             directory: fallback.clone(),
             child: Mutex::new(child),
@@ -484,7 +517,7 @@ pub fn handle(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let terminal = session(manager, agent, params)?;
+    let terminal = session(manager, agent, profile, params)?;
     match method {
         "terminal/output" => {
             let snapshot = snapshot(&terminal)?;
@@ -885,4 +918,47 @@ pub async fn acp_terminal_inspect_wait(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_cleanup_only_matches_its_agent_sessions() {
+        let disconnected = vec!["review-session".to_string(), "review-child".to_string()];
+
+        assert!(terminal_belongs_to_connection(
+            "codex",
+            CapabilityProfile::Review,
+            "review-session",
+            "codex",
+            CapabilityProfile::Review,
+            &disconnected,
+        ));
+        assert!(!terminal_belongs_to_connection(
+            "codex",
+            CapabilityProfile::Build,
+            "review-session",
+            "codex",
+            CapabilityProfile::Review,
+            &disconnected,
+        ));
+        assert!(!terminal_belongs_to_connection(
+            "codex",
+            CapabilityProfile::Review,
+            "build-session",
+            "codex",
+            CapabilityProfile::Review,
+            &disconnected,
+        ));
+        assert!(!terminal_belongs_to_connection(
+            "claude",
+            CapabilityProfile::Review,
+            "review-session",
+            "codex",
+            CapabilityProfile::Review,
+            &disconnected,
+        ));
+    }
 }

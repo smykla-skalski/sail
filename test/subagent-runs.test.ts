@@ -130,7 +130,12 @@ await test('one child reported natively and by an MCP receipt yields one run', (
 });
 
 await test('the higher-precedence source sets the state and others fill missing fields', () => {
-  const disconnected = disconnectNativeSubagents(nativeStore(spawned('task-1')), 'claude', 9);
+  const disconnected = disconnectNativeSubagents(
+    nativeStore(spawned('task-1')),
+    'claude',
+    ['task-1'],
+    9,
+  );
   const cases = [
     {
       name: 'live native beats an MCP receipt',

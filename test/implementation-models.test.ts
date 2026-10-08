@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   activeImplementationModels,
   abandonImplementationTurn,
+  assertShipItIssueRepository,
   beginImplementationTurn,
   beginShipItRun,
   claimLegacyPendingImplementationTurn,
@@ -176,11 +177,11 @@ void test('model history survives equivalent references and rejects a second iss
   assert.equal(values.get(`sai-implementation-run:${directory}`), 'example/repo#1');
   await assert.rejects(
     () => beginShipItRun(directory, '/ship-it other/repo#1'),
-    /This worktree tracks example\/repo#1\. Start other\/repo#1 in a new worktree/,
+    /This checkout ships example\/repo, not other\/repo/,
   );
   await assert.rejects(
     () => beginShipItRun(directory, '/ship-it https://github.com/example/other/issues/1'),
-    /Start example\/other#1 in a new worktree/,
+    /This checkout ships example\/repo, not example\/other/,
   );
   await assert.rejects(
     () => beginShipItRun(directory, '/ship-it #2'),
@@ -218,7 +219,7 @@ void test('legacy run identities resolve against the worktree before comparison'
   });
   await assert.rejects(
     () => beginShipItRun('/test/legacy-run', '/ship-it other/repo#210'),
-    /This worktree tracks owner\/repo#210/,
+    /This checkout ships owner\/repo, not other\/repo/,
   );
   await beginShipItRun('/test/legacy-run', '/ship-it #210');
   assert.equal(values.get('sai-implementation-run:/test/legacy-run'), 'owner/repo#210');
@@ -245,8 +246,58 @@ void test('unresolved bare references require qualification', async () => {
   });
   await assert.rejects(() => beginShipItRun('/test/no-remote', '/ship-it #210'), /Use owner/);
   assert.equal(values.get('sai-implementation-run:/test/no-remote'), undefined);
-  await beginShipItRun('/test/no-remote', '/ship-it owner/repo#210');
-  assert.equal(values.get('sai-implementation-run:/test/no-remote'), 'owner/repo#210');
+  await assert.rejects(
+    () => beginShipItRun('/test/no-remote', '/ship-it owner/repo#210'),
+    /Use owner/,
+  );
+  assert.equal(values.get('sai-implementation-run:/test/no-remote'), undefined);
+});
+
+void test('cross-repository shipping is rejected before the run identity is saved', async () => {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => 'owner/repo' } },
+  });
+
+  await assert.rejects(
+    () => beginShipItRun('/test/owner-repo', '/ship-it other/repo#271'),
+    /This checkout ships owner\/repo, not other\/repo/,
+  );
+
+  assert.equal(values.get('sai-implementation-run:/test/owner-repo'), undefined);
+});
+
+void test('persisted cross-repository shipping is rejected during recovery', async () => {
+  const directory = '/test/recovered-owner-repo';
+  const values = new Map<string, string>([
+    [`sai-implementation-run:${directory}`, 'other/repo#271'],
+  ]);
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    },
+  });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { __TAURI_INTERNALS__: { invoke: async () => 'owner/repo' } },
+  });
+
+  const saved = savedShipItIssue(directory);
+  assert.deepEqual(saved, { repository: 'other/repo', number: 271 });
+  await assert.rejects(
+    () => assertShipItIssueRepository(directory, saved),
+    /This checkout ships owner\/repo, not other\/repo/,
+  );
 });
 
 void test('overlapping known turns reserve both models for validation', async () => {

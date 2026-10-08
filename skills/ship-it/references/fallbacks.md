@@ -23,6 +23,8 @@ On agents with a command sandbox (Codex), the user's request to ship the change 
 
 Use these when the `adversarial-review` or `adversarial-test` skill is not installed. With Sail cross-validation, give every subagent the repository path, the diff command (`git diff origin/<default>...HEAD`), the changed files, and the task context file. Without cross-validation, execute the same mandates directly in the Ship It session.
 
+The budget and re-review exceptions in [convergence.md](convergence.md) apply unchanged to these fallback mandates. A missing specialized skill does not authorize extra review or test cycles.
+
 ### Code review (two passes, in order)
 
 1. Code Adversary: with cross-validation, spawn `adversarial-review:code-adversary`, or a generic subagent told to assume the change is broken, hunt concrete failures including unmet acceptance criteria, and prove each finding with a failing input, `file:line`, and a fix. Without it, perform this mandate directly. Findings are labeled `blocking:`, `issue:` or `question:`.

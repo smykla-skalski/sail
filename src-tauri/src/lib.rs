@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -7,14 +7,88 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", windows))]
 use tauri::Emitter;
 use tauri::{Manager, State};
 
-static SHIPPING_WORKTREE_LOCK: Mutex<()> = Mutex::new(());
 const OPENCODE_VERSION: &str = "2.0.24";
+
+#[derive(Clone, Default)]
+struct WorktreeOperationLocks(Arc<WorktreeOperationLockState>);
+
+#[derive(Default)]
+struct WorktreeOperationLockState {
+    active: Mutex<HashSet<PathBuf>>,
+    available: Condvar,
+}
+
+struct WorktreeOperationGuard {
+    state: Arc<WorktreeOperationLockState>,
+    repository: PathBuf,
+}
+
+impl WorktreeOperationLocks {
+    fn lock(&self, repository: &Path) -> Result<WorktreeOperationGuard, String> {
+        let repository = git_common_directory(repository)?;
+        let mut active = self
+            .0
+            .active
+            .lock()
+            .map_err(|_| "Worktree operations are unavailable.".to_string())?;
+        while active.contains(&repository) {
+            active = self
+                .0
+                .available
+                .wait(active)
+                .map_err(|_| "Worktree operations are unavailable.".to_string())?;
+        }
+        active.insert(repository.clone());
+        Ok(WorktreeOperationGuard {
+            state: Arc::clone(&self.0),
+            repository,
+        })
+    }
+}
+
+/// Canonicalization git can consume. On Windows `std::fs::canonicalize` returns an
+/// extended-length `\\?\` path, which git rejects when it creates worktrees and refs.
+pub(crate) trait GitCanonical {
+    fn git_canonical(&self) -> std::io::Result<PathBuf>;
+}
+
+impl GitCanonical for Path {
+    fn git_canonical(&self) -> std::io::Result<PathBuf> {
+        dunce::canonicalize(self)
+    }
+}
+
+fn git_common_directory(repository: &Path) -> Result<PathBuf, String> {
+    let repository = repository
+        .git_canonical()
+        .map_err(|_| "Repository folder no longer exists.".to_string())?;
+    let common = git_reference(&repository, &["rev-parse", "--git-common-dir"])
+        .ok_or("Cannot locate the repository Git directory.")?;
+    let common = PathBuf::from(common);
+    let common = if common.is_absolute() {
+        common
+    } else {
+        repository.join(common)
+    };
+    common
+        .git_canonical()
+        .map_err(|_| "Repository Git directory no longer exists.".to_string())
+}
+
+impl Drop for WorktreeOperationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.state.active.lock() {
+            active.remove(&self.repository);
+            self.state.available.notify_all();
+        }
+    }
+}
 
 fn existing_shipping_worktree(
     repository: &Path,
@@ -29,16 +103,21 @@ fn existing_shipping_worktree(
         return Ok(None);
     };
     let path = PathBuf::from(existing.path)
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Shipping worktree is missing.")?;
     let setup = worktree_config::read(&path)?
         .map(|config| config.setup)
         .unwrap_or_default();
+    let shipping_target = shipping_target(repository, &path, name).ok();
     Ok(Some(CreatedWorktree {
         path: path.to_string_lossy().into_owned(),
         branch: name.to_string(),
-        base: worktree_base(repository),
+        base: shipping_target
+            .as_ref()
+            .map(|target| target.base_ref.clone())
+            .unwrap_or_else(|| worktree_base(repository)),
         setup,
+        shipping_target,
     }))
 }
 
@@ -193,7 +272,7 @@ fn list_picker_directory(path: Option<String>) -> Result<PickerDirectory, String
                 .ok_or("Cannot find the home folder")?,
         ),
     };
-    let chosen = chosen.canonicalize().map_err(|error| error.to_string())?;
+    let chosen = chosen.git_canonical().map_err(|error| error.to_string())?;
     if !chosen.is_dir() {
         return Err("Choose a folder to browse".to_string());
     }
@@ -645,7 +724,7 @@ fn repository_path_available(path: String) -> bool {
 #[tauri::command]
 fn validate_repository(path: String) -> Result<String, String> {
     let directory = Path::new(&path)
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Repository path does not exist. Choose an existing directory.".to_string())?;
     if !directory.is_dir() {
         return Err("Repository path is not a directory.".to_string());
@@ -724,11 +803,10 @@ impl Drop for TemporaryIndex {
     }
 }
 
-fn index_with_intent(
-    root: &str,
-    files: &[String],
-    copy_current: bool,
-) -> Result<TemporaryIndex, String> {
+/// A private index for read-only commands. Git refreshes stat data and writes it back to the
+/// index it reads, and only some commands honour `--no-optional-locks`, so a read that must not
+/// touch the user's index runs against a copy.
+fn index_copy(root: &str, copy_current: bool) -> Result<TemporaryIndex, String> {
     let output = Command::new("git")
         .args(["-C", root, "rev-parse", "--git-path", "index"])
         .output()
@@ -748,6 +826,15 @@ fn index_with_intent(
     if copy_current && index.exists() {
         std::fs::copy(&index, &temporary.0).map_err(|error| error.to_string())?;
     }
+    Ok(temporary)
+}
+
+fn index_with_intent(
+    root: &str,
+    files: &[String],
+    copy_current: bool,
+) -> Result<TemporaryIndex, String> {
+    let temporary = index_copy(root, copy_current)?;
     let pathspecs = files
         .iter()
         .map(|file| format!(":(literal){file}"))
@@ -772,6 +859,7 @@ fn git_patches(
     let run = |names: bool| -> Result<Vec<u8>, String> {
         let mut command = Command::new("git");
         command.args([
+            "--no-optional-locks",
             "-C",
             root,
             "diff",
@@ -829,8 +917,10 @@ fn git_patches(
 async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = validate_repository(path)?;
+        let snapshot = index_copy(&root, true)?;
         let output = Command::new("git")
             .args([
+                "--no-optional-locks",
                 "-C",
                 &root,
                 "status",
@@ -839,6 +929,7 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
                 "--no-renames",
                 "--untracked-files=all",
             ])
+            .env("GIT_INDEX_FILE", &snapshot.0)
             .output()
             .map_err(|error| error.to_string())?;
         if !output.status.success() {
@@ -879,14 +970,14 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
         } else {
             Some(index_with_intent(&root, &untracked, true)?)
         };
-        let staged = git_patches(&root, "staged", None)?;
+        let staged = git_patches(&root, "staged", Some(&snapshot.0))?;
         let unstaged = git_patches(
             &root,
             "unstaged",
-            temporary.as_ref().map(|index| index.0.as_path()),
+            Some(temporary.as_ref().unwrap_or(&snapshot).0.as_path()),
         )?;
         let all = if has_head {
-            git_patches(&root, "all", None)?
+            git_patches(&root, "all", Some(&snapshot.0))?
         } else {
             let existing = records
                 .iter()
@@ -984,6 +1075,96 @@ async fn working_tree_commit(path: String) -> Result<Option<String>, String> {
         Ok(Some(
             String::from_utf8_lossy(&head.stdout).trim().to_string(),
         ))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn shipping_base_revision(path: String, base_ref: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = validate_repository(path)?;
+        let base = match base_ref {
+            Some(value) if value.starts_with("refs/") && !value.contains(char::is_whitespace) => {
+                value
+            }
+            Some(_) => return Err("Invalid shipping base reference.".to_string()),
+            None => worktree_base(Path::new(&root)),
+        };
+        git_reference(
+            Path::new(&root),
+            &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+        )
+        .ok_or("Cannot resolve the shipping base commit.".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn shipping_changed_paths(
+    path: String,
+    base_revision: Option<String>,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = validate_repository(path)?;
+        let base = match base_revision {
+            Some(base) => git_reference(
+                Path::new(&root),
+                &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+            )
+            .ok_or("The selected shipping base commit no longer exists.")?,
+            None => {
+                let reference = worktree_base(Path::new(&root));
+                git_reference(
+                    Path::new(&root),
+                    &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+                )
+                .ok_or("Cannot resolve the shipping base commit.")?
+            }
+        };
+        let merge_base = git_reference(Path::new(&root), &["merge-base", "HEAD", &base])
+            .ok_or("Cannot find the merge base for validation.")?;
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &root,
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                &merge_base,
+                "--",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        let untracked = Command::new("git")
+            .args([
+                "-C",
+                &root,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+            ])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !untracked.status.success() {
+            return Err(String::from_utf8_lossy(&untracked.stderr).into_owned());
+        }
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .chain(untracked.stdout.split(|byte| *byte == 0))
+            .filter(|name| !name.is_empty())
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1348,7 +1529,7 @@ fn diff_file_contents(path: String, file: String, side: String) -> Result<Option
     if !target.exists() {
         return Ok(None);
     }
-    let canonical = target.canonicalize().map_err(|error| error.to_string())?;
+    let canonical = target.git_canonical().map_err(|error| error.to_string())?;
     if !canonical.starts_with(&root) || !canonical.is_file() {
         return Err("Diff file is outside the repository.".into());
     }
@@ -1364,6 +1545,68 @@ struct CreatedWorktree {
     branch: String,
     base: String,
     setup: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shipping_target: Option<ShippingTarget>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShippingTarget {
+    repository: String,
+    remote: String,
+    base_branch: String,
+    base_ref: String,
+    base_revision: String,
+}
+
+fn shipping_target(
+    repository: &Path,
+    worktree: &Path,
+    branch: &str,
+) -> Result<ShippingTarget, String> {
+    let target = github::target_repository(repository)?;
+    let (remote, configured_remote) = shipping_fetch_source(repository, &target)?;
+    let base_branch = shipping_default_branch(repository, &remote)?;
+    let base_ref = if configured_remote {
+        format!("refs/remotes/{remote}/{base_branch}")
+    } else {
+        "refs/sail-shipping/default".to_string()
+    };
+    let base_revision = git_reference(worktree, &["merge-base", branch, &base_ref])
+        .or_else(|| {
+            git_reference(
+                repository,
+                &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+            )
+        })
+        .ok_or("Cannot resolve the shipping base commit.".to_string())?;
+    Ok(ShippingTarget {
+        repository: target,
+        remote,
+        base_branch,
+        base_ref,
+        base_revision,
+    })
+}
+
+#[tauri::command]
+async fn shipping_worktree_target(
+    repository: String,
+    worktree: String,
+    branch: String,
+) -> Result<ShippingTarget, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = validate_repository(repository)?;
+        let worktree = validate_repository(worktree)?;
+        let actual_branch = git_reference(Path::new(&worktree), &["branch", "--show-current"])
+            .ok_or("Shipping worktree is detached.".to_string())?;
+        if actual_branch != branch {
+            return Err("Shipping worktree branch changed.".to_string());
+        }
+        shipping_target(Path::new(&repository), Path::new(&worktree), &branch)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Serialize)]
@@ -1390,7 +1633,7 @@ fn registered_worktrees(
         .filter(|entry| entry.present)
         .filter_map(|entry| {
             Path::new(&entry.path)
-                .canonicalize()
+                .git_canonical()
                 .ok()
                 .map(|path| (path, entry.branch))
         })
@@ -1398,7 +1641,7 @@ fn registered_worktrees(
     Ok(paths
         .into_iter()
         .filter_map(|path| {
-            let branch = registered.get(&Path::new(&path).canonicalize().ok()?)?;
+            let branch = registered.get(&Path::new(&path).git_canonical().ok()?)?;
             Some(RegisteredWorktree {
                 path,
                 branch: branch.clone(),
@@ -1487,12 +1730,16 @@ fn repository_namespace(repository: &Path) -> String {
 
 #[tauri::command]
 async fn create_worktree(
+    operation_locks: State<'_, WorktreeOperationLocks>,
     repository: String,
     name: String,
     destination_parent: Option<String>,
     base_ref: Option<String>,
 ) -> Result<CreatedWorktree, String> {
+    let operation_locks = operation_locks.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let repository = validate_repository(repository)?;
+        let _lock = operation_locks.lock(Path::new(&repository))?;
         add_worktree(repository, name, destination_parent, base_ref)
     })
     .await
@@ -1501,14 +1748,14 @@ async fn create_worktree(
 
 #[tauri::command]
 async fn create_shipping_worktree(
+    operation_locks: State<'_, WorktreeOperationLocks>,
     repository: String,
     name: String,
 ) -> Result<CreatedWorktree, String> {
+    let operation_locks = operation_locks.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _lock = SHIPPING_WORKTREE_LOCK
-            .lock()
-            .map_err(|_| "Shipping worktree creation is unavailable.")?;
-        let checked = validate_repository(repository.clone())?;
+        let checked = validate_repository(repository)?;
+        let _lock = operation_locks.lock(Path::new(&checked))?;
         if let Some(existing) = existing_shipping_worktree(Path::new(&checked), &name)? {
             return Ok(existing);
         }
@@ -1536,7 +1783,24 @@ async fn create_shipping_worktree(
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        add_worktree(repository, name, None, Some(default_ref))
+        let base_revision = git_reference(
+            Path::new(&checked),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{default_ref}^{{commit}}"),
+            ],
+        )
+        .ok_or("Cannot resolve the fetched shipping base commit.".to_string())?;
+        let mut created = add_worktree(checked, name, None, Some(default_ref.clone()))?;
+        created.shipping_target = Some(ShippingTarget {
+            repository: target,
+            remote: source,
+            base_branch: branch,
+            base_ref: default_ref,
+            base_revision,
+        });
+        Ok(created)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1643,7 +1907,7 @@ fn add_worktree(
     let parent = match destination_parent {
         Some(path) => {
             let parent = Path::new(&path)
-                .canonicalize()
+                .git_canonical()
                 .map_err(|_| "Worktree destination does not exist.".to_string())?;
             if !parent.is_dir() {
                 return Err("Worktree destination is not a directory.".to_string());
@@ -1698,7 +1962,7 @@ fn add_worktree(
         ));
     }
     let path = path
-        .canonicalize()
+        .git_canonical()
         .map_err(|error| format!("Cannot resolve new worktree: {error}"))?;
     let config = (|| -> Result<Option<worktree_config::WorktreeConfig>, String> {
         let config = worktree_config::read(&path)?;
@@ -1731,23 +1995,255 @@ fn add_worktree(
         branch: name.to_string(),
         base,
         setup: config.map(|config| config.setup).unwrap_or_default(),
+        shipping_target: None,
     })
 }
 
-#[tauri::command]
-async fn delete_worktree(
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteWorktreeRequest {
     repository: String,
     worktree: String,
     force: Option<bool>,
     archive_ignored: Option<bool>,
-) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if archive_ignored == Some(true) {
-            archive_ignored_and_remove(repository, worktree)
-        } else {
-            remove_worktree(repository, worktree, force)?;
-            Ok(None)
+    expected_revision: Option<String>,
+    expected_branch: Option<String>,
+    native_generation: Option<u64>,
+    open_code_session_ids: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenCodeCleanupSession {
+    id: String,
+    #[serde(rename = "parentID")]
+    parent_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenCodeCleanupCursor {
+    next: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenCodeCleanupPage {
+    data: Vec<OpenCodeCleanupSession>,
+    cursor: OpenCodeCleanupCursor,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenCodeCleanupActive {
+    data: HashMap<String, serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenCodeCleanupInbox {
+    data: Vec<serde_json::Value>,
+}
+
+fn verify_open_code_cleanup_state(
+    expected: &HashSet<String>,
+    sessions: &[OpenCodeCleanupSession],
+    active: &HashSet<String>,
+    queued: &HashSet<String>,
+) -> Result<HashSet<String>, String> {
+    let mut owned = expected.clone();
+    loop {
+        let previous = owned.len();
+        for session in sessions {
+            if session
+                .parent_id
+                .as_ref()
+                .is_some_and(|parent_id| owned.contains(parent_id))
+            {
+                owned.insert(session.id.clone());
+            }
         }
+        if owned.len() == previous {
+            break;
+        }
+    }
+    if owned.iter().any(|id| !expected.contains(id)) {
+        return Err("OpenCode task sessions changed before worktree cleanup.".into());
+    }
+    if owned
+        .iter()
+        .any(|id| active.contains(id) || queued.contains(id))
+    {
+        return Err("An OpenCode task session is active in this worktree.".into());
+    }
+    Ok(owned)
+}
+
+fn load_open_code_cleanup_sessions(
+    client: &reqwest::blocking::Client,
+    info: &RuntimeInfo,
+    directory: &str,
+) -> Result<Vec<OpenCodeCleanupSession>, String> {
+    let diagnostic = "Cannot verify OpenCode task sessions before worktree cleanup.";
+    let base = info.url.trim_end_matches('/');
+    let mut sessions = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen = HashSet::new();
+    loop {
+        let mut url = reqwest::Url::parse(&format!("{base}/api/session"))
+            .map_err(|_| diagnostic.to_string())?;
+        match cursor.as_ref() {
+            Some(cursor) => {
+                url.query_pairs_mut().append_pair("cursor", cursor);
+            }
+            None => {
+                url.query_pairs_mut()
+                    .append_pair("directory", directory)
+                    .append_pair("limit", "50")
+                    .append_pair("order", "asc");
+            }
+        }
+        let response = client
+            .get(url)
+            .basic_auth("opencode", Some(&info.password))
+            .send()
+            .map_err(|_| diagnostic.to_string())?;
+        if !response.status().is_success() {
+            return Err(diagnostic.into());
+        }
+        let page: OpenCodeCleanupPage = response.json().map_err(|_| diagnostic.to_string())?;
+        sessions.extend(page.data);
+        let Some(next) = page.cursor.next else {
+            break;
+        };
+        if !seen.insert(next.clone()) {
+            return Err(diagnostic.into());
+        }
+        cursor = Some(next);
+    }
+    Ok(sessions)
+}
+
+fn load_open_code_cleanup_activity<Inbox, Active>(
+    owned: &HashSet<String>,
+    sessions: &[OpenCodeCleanupSession],
+    mut load_inbox: Inbox,
+    load_active: Active,
+) -> Result<(HashSet<String>, HashSet<String>), String>
+where
+    Inbox: FnMut(&str) -> Result<bool, String>,
+    Active: FnOnce() -> Result<HashSet<String>, String>,
+{
+    let mut queued = HashSet::new();
+    for id in owned {
+        if sessions.iter().any(|session| session.id == *id) && load_inbox(id)? {
+            queued.insert(id.clone());
+        }
+    }
+    Ok((load_active()?, queued))
+}
+
+fn verify_open_code_cleanup(
+    info: &RuntimeInfo,
+    directory: &Path,
+    expected_ids: Vec<String>,
+) -> Result<(), String> {
+    let diagnostic = "Cannot verify OpenCode task sessions before worktree cleanup.";
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .no_proxy()
+        .build()
+        .map_err(|_| diagnostic.to_string())?;
+    let base = info.url.trim_end_matches('/');
+    let authorize = |request: reqwest::blocking::RequestBuilder| {
+        request.basic_auth("opencode", Some(&info.password))
+    };
+    let directory = directory.to_string_lossy().into_owned();
+    let sessions = load_open_code_cleanup_sessions(&client, info, &directory)?;
+    let expected = expected_ids.into_iter().collect::<HashSet<_>>();
+    verify_open_code_cleanup_state(&expected, &sessions, &HashSet::new(), &HashSet::new())?;
+    let sessions = load_open_code_cleanup_sessions(&client, info, &directory)?;
+    let owned =
+        verify_open_code_cleanup_state(&expected, &sessions, &HashSet::new(), &HashSet::new())?;
+    let (active, queued) = load_open_code_cleanup_activity(
+        &owned,
+        &sessions,
+        |id| {
+            let response = authorize(client.get(format!("{base}/api/session/{id}/inbox")))
+                .send()
+                .map_err(|_| diagnostic.to_string())?;
+            if !response.status().is_success() {
+                return Err(diagnostic.into());
+            }
+            let inbox: OpenCodeCleanupInbox =
+                response.json().map_err(|_| diagnostic.to_string())?;
+            Ok(!inbox.data.is_empty())
+        },
+        || {
+            let response = authorize(client.get(format!("{base}/api/session/active")))
+                .send()
+                .map_err(|_| diagnostic.to_string())?;
+            if !response.status().is_success() {
+                return Err(diagnostic.into());
+            }
+            let active: OpenCodeCleanupActive =
+                response.json().map_err(|_| diagnostic.to_string())?;
+            Ok(active.data.into_keys().collect())
+        },
+    )?;
+    let sessions = load_open_code_cleanup_sessions(&client, info, &directory)?;
+    verify_open_code_cleanup_state(&expected, &sessions, &active, &queued)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_worktree(
+    operation_locks: State<'_, WorktreeOperationLocks>,
+    agents: State<'_, acp::AgentManager>,
+    fence: State<'_, acp::AgentWorktreeFence>,
+    runtime: State<'_, RuntimeManager>,
+    request: DeleteWorktreeRequest,
+) -> Result<Option<String>, String> {
+    let DeleteWorktreeRequest {
+        repository,
+        worktree,
+        force,
+        archive_ignored,
+        expected_revision,
+        expected_branch,
+        native_generation,
+        open_code_session_ids,
+    } = request;
+    let operation_locks = operation_locks.inner().clone();
+    let agents = agents.inner().clone();
+    let fence = fence.inner().clone();
+    let runtime_info = runtime
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .as_ref()
+        .map(|runtime| runtime.info.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let checked = validate_repository(repository)?;
+        let _lock = operation_locks.lock(Path::new(&checked))?;
+        let directory = PathBuf::from(&worktree)
+            .git_canonical()
+            .unwrap_or_else(|_| PathBuf::from(&worktree));
+        fence.cleanup(&agents, &directory, native_generation, || {
+            if let Some(session_ids) = open_code_session_ids {
+                let info = runtime_info
+                    .as_ref()
+                    .ok_or("Cannot verify OpenCode task sessions before worktree cleanup.")?;
+                verify_open_code_cleanup(info, &directory, session_ids)?;
+            }
+            if archive_ignored == Some(true) {
+                archive_ignored_and_remove(checked, worktree, expected_revision, expected_branch)
+            } else {
+                remove_worktree(
+                    checked,
+                    worktree,
+                    force,
+                    expected_revision.as_deref(),
+                    expected_branch.as_deref(),
+                )?;
+                Ok(None)
+            }
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1756,13 +2252,128 @@ async fn delete_worktree(
 fn archive_ignored_and_remove(
     repository: String,
     worktree: String,
+    expected_revision: Option<String>,
+    expected_branch: Option<String>,
 ) -> Result<Option<String>, String> {
+    archive_ignored_and_remove_with_hook(
+        repository,
+        worktree,
+        expected_revision,
+        expected_branch,
+        |_| Ok(()),
+    )
+}
+
+#[cfg(unix)]
+fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        nix::libc::renamex_np(
+            source.as_ptr(),
+            destination.as_ptr(),
+            nix::libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        nix::libc::renameat2(
+            nix::libc::AT_FDCWD,
+            source.as_ptr(),
+            nix::libc::AT_FDCWD,
+            destination.as_ptr(),
+            nix::libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // Omitting MOVEFILE_REPLACE_EXISTING makes the native rename fail atomically
+    // when another process has recreated the destination.
+    let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn rollback_staged_archive(
+    staging: &Path,
+    worktree: &Path,
+    moved: &[PathBuf],
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for relative in moved.iter().rev() {
+        let source = staging.join(relative);
+        let destination = worktree.join(relative);
+        if let Some(parent) = destination.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                failures.push(format!("{}: {error}", relative.display()));
+                continue;
+            }
+        }
+        if let Err(error) = rename_without_replace(&source, &destination) {
+            failures.push(format!(
+                "{}: {error}; original remains staged at {}",
+                relative.display(),
+                source.display()
+            ));
+        }
+    }
+    if failures.is_empty() {
+        let _ = std::fs::remove_dir_all(staging);
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not restore archived worktree files: {}. Recovery staging: {}",
+            failures.join(", "),
+            staging.display()
+        ))
+    }
+}
+
+fn archive_ignored_and_remove_with_hook<F>(
+    repository: String,
+    worktree: String,
+    expected_revision: Option<String>,
+    expected_branch: Option<String>,
+    mut after_move: F,
+) -> Result<Option<String>, String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+{
     const IGNORED: &str = "Worktree has ignored files. Move or remove them before deleting.";
     let worktree = PathBuf::from(worktree);
     let parent = worktree.parent().ok_or("Worktree parent is missing.")?;
-    let archive = parent
-        .join(".sail-shipping-archive")
-        .join(worktree.file_name().ok_or("Worktree name is missing.")?);
+    let archive_root = parent.join(".sail-shipping-archive");
+    let worktree_name = worktree.file_name().ok_or("Worktree name is missing.")?;
+    let archive = archive_root.join(worktree_name);
     let saved_archive = || {
         archive
             .exists()
@@ -1776,6 +2387,8 @@ fn archive_ignored_and_remove(
         repository.clone(),
         worktree.to_string_lossy().into_owned(),
         None,
+        expected_revision.as_deref(),
+        expected_branch.as_deref(),
     ) {
         Ok(()) => return Ok(saved_archive()),
         Err(error) if error == IGNORED => {}
@@ -1823,38 +2436,215 @@ fn archive_ignored_and_remove(
     if ignored.is_empty() {
         return Err("Ignored worktree files changed during cleanup. Retry.".to_string());
     }
-    for relative in ignored {
-        let destination = archive.join(&relative);
-        if destination.exists() {
-            return Err(format!(
-                "Ignored file archive already contains {}. Inspect {} before retrying.",
-                relative.display(),
-                archive.display()
-            ));
-        }
-        std::fs::create_dir_all(destination.parent().ok_or("Invalid archive path.")?)
-            .map_err(|error| format!("Cannot prepare ignored file archive: {error}"))?;
-        std::fs::rename(worktree.join(relative), destination).map_err(|error| {
-            format!(
-                "Cannot archive ignored worktree files to {}: {error}",
-                archive.display()
-            )
-        })?;
+    if archive.exists() {
+        return Err(format!(
+            "Ignored file archive already exists. Inspect {} before retrying.",
+            archive.display()
+        ));
     }
-    remove_worktree(repository, worktree.to_string_lossy().into_owned(), None)?;
+    std::fs::create_dir_all(&archive_root)
+        .map_err(|error| format!("Cannot prepare ignored file archive: {error}"))?;
+    let staging = archive_root.join(format!(
+        ".staging-{}-{}",
+        worktree_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&staging)
+        .map_err(|error| format!("Cannot prepare ignored file archive: {error}"))?;
+    let mut moved = Vec::new();
+    for relative in ignored {
+        let destination = staging.join(&relative);
+        std::fs::create_dir_all(destination.parent().ok_or("Invalid archive path.")?).map_err(
+            |error| {
+                let rollback = rollback_staged_archive(&staging, &worktree, &moved);
+                format!(
+                    "Cannot prepare ignored file archive: {error}{}",
+                    rollback
+                        .err()
+                        .map(|failure| format!("; {failure}"))
+                        .unwrap_or_default()
+                )
+            },
+        )?;
+        if let Err(error) = std::fs::rename(worktree.join(&relative), &destination) {
+            let rollback = rollback_staged_archive(&staging, &worktree, &moved);
+            return Err(format!(
+                "Cannot archive ignored worktree files to {}: {error}",
+                archive.display(),
+            ) + &rollback
+                .err()
+                .map(|failure| format!("; {failure}"))
+                .unwrap_or_default());
+        }
+        moved.push(relative.clone());
+        if let Err(error) = after_move(&relative) {
+            let rollback = rollback_staged_archive(&staging, &worktree, &moved);
+            return Err(error
+                + &rollback
+                    .err()
+                    .map(|failure| format!("; {failure}"))
+                    .unwrap_or_default());
+        }
+    }
+    if let Err(error) = remove_worktree(
+        repository,
+        worktree.to_string_lossy().into_owned(),
+        None,
+        expected_revision.as_deref(),
+        expected_branch.as_deref(),
+    ) {
+        let rollback = rollback_staged_archive(&staging, &worktree, &moved);
+        return Err(error
+            + &rollback
+                .err()
+                .map(|failure| format!("; {failure}"))
+                .unwrap_or_default());
+    }
+    std::fs::rename(&staging, &archive).map_err(|error| {
+        format!(
+            "Worktree was removed, but its ignored files remain preserved at {}: {error}",
+            staging.display()
+        )
+    })?;
     Ok(saved_archive())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct GuardedRemovalState {
+    reference: Option<String>,
+    head: String,
+}
+
+struct WorktreeHeadLock(PathBuf);
+
+impl Drop for WorktreeHeadLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn lock_worktree_head(worktree: &Path) -> Result<WorktreeHeadLock, String> {
+    use std::ffi::OsString;
+    use std::fs::OpenOptions;
+
+    let head = git_reference(worktree, &["rev-parse", "--git-path", "HEAD"])
+        .ok_or("Cannot locate the worktree HEAD before deletion.")?;
+    let head = PathBuf::from(head);
+    let head = if head.is_absolute() {
+        head
+    } else {
+        worktree.join(head)
+    };
+    let mut lock_name = OsString::from(head.as_os_str());
+    lock_name.push(".lock");
+    let lock = PathBuf::from(lock_name);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .map_err(|error| format!("Cannot lock the worktree checkout before deletion: {error}"))?;
+    Ok(WorktreeHeadLock(lock))
+}
+
+fn guarded_removal_state(
+    worktree: &Path,
+    guarded: bool,
+) -> Result<Option<GuardedRemovalState>, String> {
+    if !guarded {
+        return Ok(None);
+    }
+    let reference = git_reference(worktree, &["symbolic-ref", "-q", "HEAD"]);
+    let head = git_reference(worktree, &["rev-parse", "HEAD"])
+        .ok_or("Cannot capture the worktree commit before deletion.")?;
+    Ok(Some(GuardedRemovalState { reference, head }))
+}
+
+fn restore_changed_worktree(
+    repository: &Path,
+    worktree: &Path,
+    state: &GuardedRemovalState,
+) -> Result<(), String> {
+    let branch = state
+        .reference
+        .as_deref()
+        .ok_or("Cannot restore a detached worktree after it changed during deletion.")?
+        .strip_prefix("refs/heads/")
+        .ok_or("Cannot restore a non-local worktree branch.")?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["worktree", "add"])
+        .arg(worktree)
+        .arg(branch)
+        .output()
+        .map_err(|error| format!("Cannot restore the changed worktree: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Cannot restore the changed worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 fn remove_worktree(
     repository: String,
     worktree: String,
     force: Option<bool>,
+    expected_revision: Option<&str>,
+    expected_branch: Option<&str>,
 ) -> Result<(), String> {
+    remove_worktree_with_hook(
+        repository,
+        worktree,
+        force,
+        expected_revision,
+        expected_branch,
+        || Ok(()),
+    )
+}
+
+fn remove_worktree_with_hook<F>(
+    repository: String,
+    worktree: String,
+    force: Option<bool>,
+    expected_revision: Option<&str>,
+    expected_branch: Option<&str>,
+    before_remove: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    remove_worktree_with_hooks(
+        repository,
+        worktree,
+        force,
+        expected_revision,
+        expected_branch,
+        (before_remove, || Ok(()), || Ok(())),
+    )
+}
+
+fn remove_worktree_with_hooks<F, G, H>(
+    repository: String,
+    worktree: String,
+    force: Option<bool>,
+    expected_revision: Option<&str>,
+    expected_branch: Option<&str>,
+    hooks: (F, G, H),
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+    G: FnOnce() -> Result<(), String>,
+    H: FnOnce() -> Result<(), String>,
+{
+    let (before_final_identity_check, after_final_identity_check, after_remove) = hooks;
     let repository = PathBuf::from(validate_repository(repository)?)
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
     let worktree = Path::new(&worktree)
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Worktree folder no longer exists.".to_string())?;
     if worktree == repository {
         return Err("Cannot delete the main repository.".to_string());
@@ -1866,11 +2656,39 @@ fn remove_worktree(
         .filter_map(|line| line.strip_prefix("worktree "));
     if !registered.into_iter().any(|path| {
         Path::new(path)
-            .canonicalize()
+            .git_canonical()
             .is_ok_and(|registered| registered == worktree)
     }) {
         return Err("This folder is not a worktree of the selected repository.".to_string());
     }
+    let ensure_expected_revision = || -> Result<(), String> {
+        let Some(expected) = expected_revision else {
+            return Ok(());
+        };
+        let actual = git_directory_revision(&worktree)?;
+        if actual != expected {
+            return Err(
+                "Worktree changed after validation. Revalidate before deleting it.".to_string(),
+            );
+        }
+        Ok(())
+    };
+    let ensure_expected_branch = || -> Result<(), String> {
+        let Some(expected) = expected_branch else {
+            return Ok(());
+        };
+        let expected = expected.strip_prefix("refs/heads/").unwrap_or(expected);
+        let actual = git_reference(&worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .ok_or("Cannot read the worktree branch before deletion.")?;
+        if actual != expected {
+            return Err(format!(
+                "Worktree branch changed from {expected} to {actual}. Revalidate before deleting it."
+            ));
+        }
+        Ok(())
+    };
+    ensure_expected_revision()?;
+    ensure_expected_branch()?;
     let force = force == Some(true);
     if !force {
         let status = Command::new("git")
@@ -1896,6 +2714,36 @@ fn remove_worktree(
             );
         }
     }
+    ensure_expected_revision()?;
+    ensure_expected_branch()?;
+    let guarded = guarded_removal_state(
+        &worktree,
+        expected_revision.is_some() || expected_branch.is_some(),
+    )?;
+    if guarded
+        .as_ref()
+        .is_some_and(|state| state.reference.is_none())
+    {
+        return Err(
+            "Guarded cleanup requires a branch checkout; the worktree is detached.".to_string(),
+        );
+    }
+    before_final_identity_check()?;
+    let _head_lock = guarded
+        .as_ref()
+        .map(|_| lock_worktree_head(&worktree))
+        .transpose()?;
+    if let Some(state) = guarded.as_ref() {
+        let actual = guarded_removal_state(&worktree, true)?
+            .ok_or("Cannot capture the worktree identity before deletion.")?;
+        if actual != *state {
+            return Err(
+                "Worktree checkout changed during deletion. Revalidate before deleting it."
+                    .to_string(),
+            );
+        }
+    }
+    after_final_identity_check()?;
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -1913,6 +2761,42 @@ fn remove_worktree(
             "Cannot delete worktree: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
+    }
+    after_remove()?;
+    let listed = git_reference(&repository, &["worktree", "list", "--porcelain", "-z"])
+        .ok_or("Cannot verify repository worktrees after deletion.")?;
+    let re_registered = parse_registered_worktrees(&listed)
+        .into_iter()
+        .any(|entry| {
+            let registered = Path::new(&entry.path);
+            registered == worktree
+                || registered
+                    .git_canonical()
+                    .is_ok_and(|registered| registered == worktree)
+        });
+    if re_registered {
+        return Err(
+            "The worktree path was registered again during deletion. Refresh before continuing."
+                .to_string(),
+        );
+    }
+    if let Some(state) = guarded {
+        let reference = state
+            .reference
+            .as_deref()
+            .ok_or("Cannot verify the removed detached worktree.")?;
+        let current = git_reference(&repository, &["rev-parse", "--verify", reference]);
+        if current.as_deref() != Some(state.head.as_str()) {
+            let restore = restore_changed_worktree(&repository, &worktree, &state);
+            return Err(format!(
+                "Worktree changed during deletion. Its branch {} preserves the new commit.{}",
+                reference,
+                restore
+                    .err()
+                    .map(|error| format!(" {error}"))
+                    .unwrap_or_else(|| " The checkout was restored.".to_string())
+            ));
+        }
     }
     Ok(())
 }
@@ -1955,7 +2839,9 @@ pub fn run() {
             Ok(())
         })
         .manage(RuntimeManager::default())
+        .manage(WorktreeOperationLocks::default())
         .manage(acp::AgentManager::default())
+        .manage(acp::AgentWorktreeFence::default())
         .manage(acp_terminal::AcpTerminalManager::default())
         .manage(terminal::TerminalManager::default())
         .manage(post_turn_checks::CheckLock::default())
@@ -1969,6 +2855,7 @@ pub fn run() {
             settings::save_setting,
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,
+            settings::get_acp_turn_evidence,
             start_runtime,
             repository_path_available,
             validate_repository,
@@ -1977,6 +2864,9 @@ pub fn run() {
             working_tree_revision,
             working_tree_generation,
             working_tree_commit,
+            shipping_base_revision,
+            shipping_worktree_target,
+            shipping_changed_paths,
             worktree_overviews,
             worktree_snapshots::record_turn_snapshot,
             worktree_snapshots::list_turn_snapshots,
@@ -2009,6 +2899,11 @@ pub fn run() {
             github::shipping_target_repository,
             github::shipping_pull_request,
             github::shipping_dependency_closed,
+            github::acquire_shipping_claim,
+            github::observe_shipping_claim,
+            github::complete_predecessor_shipping_claim_fence,
+            github::heartbeat_shipping_claim,
+            github::release_shipping_claim,
             github::pull_request_checks,
             github::failed_check_log,
             github::open_pull_request,
@@ -2024,15 +2919,19 @@ pub fn run() {
             acp::acp_agents,
             acp::acp_connect,
             acp::acp_new_session,
+            acp::acp_forget_session,
+            acp::acp_release_session_fence,
             acp::acp_load_session,
             acp::acp_resume_session,
             acp::acp_prompt,
             acp::acp_steer,
             acp::acp_cancel,
             acp::acp_permission,
+            acp::acp_permission_resources_trusted,
             acp::acp_pending_permissions,
             acp::acp_pending_inbox,
             acp::acp_activity,
+            acp::acp_native_subagents,
             acp::acp_prepare_restart,
             acp::acp_set_config,
             acp::acp_authenticate,
@@ -2112,17 +3011,22 @@ mod tests {
     #[cfg(any(unix, windows))]
     use super::working_tree_generation;
     use super::{
-        add_worktree, archive_ignored_and_remove, existing_shipping_worktree, git_change_action,
-        git_patch, normalize_picker_path, parse_registered_worktrees, registered_worktrees,
-        remove_worktree, repository_namespace, server_args, shipping_default_branch,
-        shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
-        worktree_overviews,
+        add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
+        existing_shipping_worktree, git_change_action, git_patch, git_reference,
+        load_open_code_cleanup_activity, normalize_picker_path, parse_registered_worktrees,
+        registered_worktrees, remove_worktree, remove_worktree_with_hook,
+        remove_worktree_with_hooks, repository_namespace, server_args, shipping_base_revision,
+        shipping_changed_paths, shipping_default_branch, shipping_fetch_source,
+        verify_open_code_cleanup_state, version_is_compatible, version_number, working_tree_diff,
+        worktree_overviews, OpenCodeCleanupSession, WorktreeOperationLocks,
     };
     use super::{working_tree_commit, working_tree_revision};
+    use crate::GitCanonical;
+    use std::collections::HashSet;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     #[cfg(unix)]
@@ -2177,7 +3081,7 @@ mod tests {
         let repository = root.join("repository");
         let child = root.join("child");
         fs::create_dir_all(&repository).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let repository_path = repository.to_str().unwrap();
         git(repository_path, &["init", "-q"]);
         git(
@@ -2216,7 +3120,7 @@ mod tests {
         let repository = root.join("repository");
         let child = root.join("child");
         fs::create_dir_all(&repository).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let repository_path = repository.to_str().unwrap();
         git(repository_path, &["init", "-q"]);
         git(
@@ -2252,7 +3156,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             recovered.path,
-            child.canonicalize().unwrap().to_str().unwrap()
+            child.git_canonical().unwrap().to_str().unwrap()
         );
         assert_eq!(recovered.branch, "ship-issue-7-test");
         fs::remove_dir_all(root).unwrap();
@@ -2327,7 +3231,7 @@ mod tests {
         let parent = root.join("worktrees");
         fs::create_dir_all(&repository).unwrap();
         fs::create_dir_all(&parent).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let repository_path = repository.to_str().unwrap();
         git(repository_path, &["init", "-q"]);
         fs::write(repository.join(".gitignore"), "node_modules/\n").unwrap();
@@ -2356,28 +3260,39 @@ mod tests {
         let ignored = Path::new(&created.path).join("node_modules/package/file.js");
         fs::create_dir_all(ignored.parent().unwrap()).unwrap();
         fs::write(&ignored, "content").unwrap();
-        let result = remove_worktree(repository_path.into(), created.path.clone(), None);
+        let result = remove_worktree(
+            repository_path.into(),
+            created.path.clone(),
+            None,
+            None,
+            None,
+        );
         assert!(result.unwrap_err().contains("ignored files"));
         assert!(ignored.exists());
         let untracked = Path::new(&created.path).join("notes.txt");
         fs::write(&untracked, "keep").unwrap();
-        assert!(
-            archive_ignored_and_remove(repository_path.into(), created.path.clone())
-                .unwrap_err()
-                .contains("changes outside ignored")
-        );
+        assert!(archive_ignored_and_remove(
+            repository_path.into(),
+            created.path.clone(),
+            None,
+            None
+        )
+        .unwrap_err()
+        .contains("changes outside ignored"));
         assert!(ignored.exists());
         fs::remove_file(untracked).unwrap();
-        let archive = archive_ignored_and_remove(repository_path.into(), created.path.clone())
-            .unwrap()
-            .unwrap();
+        let archive =
+            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None, None)
+                .unwrap()
+                .unwrap();
         assert_eq!(
             fs::read_to_string(Path::new(&archive).join("node_modules/package/file.js")).unwrap(),
             "content"
         );
         assert!(!Path::new(&created.path).exists());
         assert_eq!(
-            archive_ignored_and_remove(repository_path.into(), created.path.clone()).unwrap(),
+            archive_ignored_and_remove(repository_path.into(), created.path.clone(), None, None)
+                .unwrap(),
             Some(archive)
         );
         let forced = add_worktree(
@@ -2389,8 +3304,428 @@ mod tests {
         .unwrap();
         fs::create_dir_all(Path::new(&forced.path).join("node_modules")).unwrap();
         fs::write(Path::new(&forced.path).join("node_modules/file"), "content").unwrap();
-        remove_worktree(repository_path.into(), forced.path.clone(), Some(true)).unwrap();
+        remove_worktree(
+            repository_path.into(),
+            forced.path.clone(),
+            Some(true),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!Path::new(&forced.path).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_removal_rejects_a_new_clean_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-delete-revision-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = root.join("repository");
+        let parent = root.join("worktrees");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&parent).unwrap();
+        let repository = repository.git_canonical().unwrap();
+        let repository_path = repository.to_str().unwrap();
+        git(repository_path, &["init", "-q"]);
+        fs::write(repository.join("tracked.txt"), "before\n").unwrap();
+        git(repository_path, &["add", "tracked.txt"]);
+        git(
+            repository_path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        );
+        let created = add_worktree(
+            repository_path.into(),
+            "child".into(),
+            Some(parent.to_string_lossy().into_owned()),
+            Some("HEAD".into()),
+        )
+        .unwrap();
+        let expected =
+            tauri::async_runtime::block_on(working_tree_revision(created.path.clone())).unwrap();
+        fs::write(Path::new(&created.path).join("tracked.txt"), "after\n").unwrap();
+        git(&created.path, &["add", "tracked.txt"]);
+        git(
+            &created.path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "new clean commit",
+            ],
+        );
+
+        let error = remove_worktree(
+            repository_path.into(),
+            created.path.clone(),
+            None,
+            Some(&expected),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed after validation"));
+        assert!(Path::new(&created.path).exists());
+        remove_worktree(
+            repository_path.into(),
+            created.path.clone(),
+            Some(true),
+            None,
+            None,
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_removal_rejects_a_same_commit_branch_switch() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-delete-branch-test");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        git(&worktree, &["switch", "-q", "-c", "other"]);
+        let switched =
+            tauri::async_runtime::block_on(working_tree_revision(worktree.clone())).unwrap();
+
+        let error = remove_worktree(
+            repository.clone(),
+            worktree.clone(),
+            None,
+            Some(&expected),
+            Some("child"),
+        )
+        .unwrap_err();
+
+        assert_eq!(switched, expected);
+        assert!(error.contains("branch changed from child to other"));
+        assert!(Path::new(&worktree).exists());
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn ignored_archive_fixture(prefix: &str) -> (PathBuf, String, String, String) {
+        let root = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        let repository = root.join("repository");
+        let parent = root.join("worktrees");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&parent).unwrap();
+        let repository = repository.git_canonical().unwrap();
+        let repository_path = repository.to_string_lossy().into_owned();
+        git(&repository_path, &["init", "-q"]);
+        fs::write(repository.join(".gitignore"), "*.tmp\n").unwrap();
+        fs::write(repository.join("tracked.txt"), "before\n").unwrap();
+        git(&repository_path, &["add", ".gitignore", "tracked.txt"]);
+        git(
+            &repository_path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        );
+        let created = add_worktree(
+            repository_path.clone(),
+            "child".into(),
+            Some(parent.to_string_lossy().into_owned()),
+            Some("HEAD".into()),
+        )
+        .unwrap();
+        fs::write(Path::new(&created.path).join("one.tmp"), "one").unwrap();
+        fs::write(Path::new(&created.path).join("two.tmp"), "two").unwrap();
+        let expected =
+            tauri::async_runtime::block_on(working_tree_revision(created.path.clone())).unwrap();
+        (root, repository_path, created.path, expected)
+    }
+
+    #[test]
+    fn archive_failure_restores_every_moved_ignored_file() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-archive-rollback-test");
+        let mut moved = 0;
+
+        let error = archive_ignored_and_remove_with_hook(
+            repository.clone(),
+            worktree.clone(),
+            Some(expected),
+            None,
+            |_| {
+                moved += 1;
+                if moved == 1 {
+                    Err("injected archive failure".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected archive failure"));
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("one.tmp")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("two.tmp")).unwrap(),
+            "two"
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_rollback_never_clobbers_a_recreated_path() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-archive-no-clobber-test");
+        let mut recreated = None;
+
+        let error = archive_ignored_and_remove_with_hook(
+            repository.clone(),
+            worktree.clone(),
+            Some(expected),
+            None,
+            |relative| {
+                fs::write(Path::new(&worktree).join(relative), "recreated").unwrap();
+                recreated = Some(relative.to_path_buf());
+                Err("injected archive failure".to_string())
+            },
+        )
+        .unwrap_err();
+
+        let recreated = recreated.unwrap();
+        assert!(error.contains("Recovery staging:"));
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join(&recreated)).unwrap(),
+            "recreated"
+        );
+        let archive_root = root.join("worktrees/.sail-shipping-archive");
+        let staging = fs::read_dir(&archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".staging-")
+            })
+            .unwrap();
+        assert!(staging.join(recreated).exists());
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_revision_drift_restores_every_moved_ignored_file() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-archive-drift-test");
+        let mut changed = false;
+
+        let error = archive_ignored_and_remove_with_hook(
+            repository.clone(),
+            worktree.clone(),
+            Some(expected),
+            None,
+            |_| {
+                if !changed {
+                    fs::write(Path::new(&worktree).join("tracked.txt"), "after\n").unwrap();
+                    git(&worktree, &["add", "tracked.txt"]);
+                    git(
+                        &worktree,
+                        &[
+                            "-c",
+                            "user.name=Sail Test",
+                            "-c",
+                            "user.email=sail@example.test",
+                            "-c",
+                            "commit.gpgsign=false",
+                            "commit",
+                            "-qm",
+                            "race commit",
+                        ],
+                    );
+                    changed = true;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed after validation"));
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("one.tmp")).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("two.tmp")).unwrap(),
+            "two"
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removal_race_restores_checkout_at_the_new_commit() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-delete-race-test");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        fs::write(Path::new(&repository).join("tracked.txt"), "after\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "racing commit",
+            ],
+        );
+
+        let error = remove_worktree_with_hooks(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&expected),
+            None,
+            (
+                || Ok(()),
+                || {
+                    git(&repository, &["update-ref", "refs/heads/child", "HEAD"]);
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed during deletion"), "{error}");
+        assert!(error.contains("checkout was restored"));
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
+            "after\n"
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removal_rejects_a_same_commit_branch_switch_before_removal() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-delete-branch-race-test");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        git(&repository, &["branch", "replacement", "HEAD"]);
+
+        let error = remove_worktree_with_hook(
+            repository.clone(),
+            worktree.clone(),
+            None,
+            Some(&expected),
+            Some("child"),
+            || {
+                git(&worktree, &["switch", "replacement"]);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("checkout changed during deletion"));
+        assert!(Path::new(&worktree).is_dir());
+        assert_eq!(
+            git_reference(Path::new(&worktree), &["symbolic-ref", "--short", "HEAD"]).as_deref(),
+            Some("replacement")
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removal_reports_a_worktree_recreated_at_the_same_path() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-delete-reregister-test");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+
+        let error = remove_worktree_with_hooks(
+            repository.clone(),
+            worktree.clone(),
+            None,
+            Some(&expected),
+            Some("child"),
+            (
+                || Ok(()),
+                || Ok(()),
+                || {
+                    git(&repository, &["worktree", "add", &worktree, "child"]);
+                    Ok(())
+                },
+            ),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("registered again during deletion"));
+        assert!(Path::new(&worktree).is_dir());
+        assert_eq!(
+            git_reference(Path::new(&worktree), &["symbolic-ref", "--short", "HEAD"]).as_deref(),
+            Some("child")
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_operations_share_a_common_git_directory_lock() {
+        let (root, repository, worktree, _) = ignored_archive_fixture("sail-common-dir-lock-test");
+        let locks = WorktreeOperationLocks::default();
+        let main_guard = locks.lock(Path::new(&repository)).unwrap();
+        let linked_locks = locks.clone();
+        let linked = worktree.clone();
+        let (ready, started) = std::sync::mpsc::channel();
+        let (acquired, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            let _guard = linked_locks.lock(Path::new(&linked)).unwrap();
+            acquired.send(()).unwrap();
+        });
+
+        started.recv().unwrap();
+        assert!(matches!(
+            received.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(main_guard);
+        received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        waiter.join().unwrap();
+
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2417,6 +3752,13 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        // Git checks out CRLF by default on Windows, and these fixtures compare exact bytes.
+        // Best effort: `init` with a path argument creates the repository elsewhere.
+        if args.first() == Some(&"init") {
+            let _ = Command::new("git")
+                .args(["-C", root, "config", "core.autocrlf", "false"])
+                .output();
+        }
     }
 
     #[cfg(unix)]
@@ -2427,7 +3769,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("sail-revision-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -2453,7 +3795,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("sail-revision-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -2478,7 +3820,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("sail-generation-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -2504,7 +3846,7 @@ mod tests {
     fn working_tree_commit_requires_a_clean_checkout() {
         let root = std::env::temp_dir().join(format!("sail-commit-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -2564,13 +3906,81 @@ mod tests {
     }
 
     #[test]
+    fn shipping_paths_include_commits_and_uncommitted_files_since_base() {
+        let root =
+            std::env::temp_dir().join(format!("sail-shipping-paths-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let root = root.git_canonical().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q", "-b", "main"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(path, &["add", "base.txt"]);
+        git(path, &["commit", "-qm", "seed"]);
+        git(path, &["checkout", "-qb", "feature"]);
+        fs::write(root.join("committed.txt"), "commit\n").unwrap();
+        git(path, &["add", "committed.txt"]);
+        git(path, &["commit", "-qm", "feature"]);
+        fs::write(root.join("base.txt"), "changed\n").unwrap();
+        fs::write(root.join("untracked.txt"), "new\n").unwrap();
+
+        let paths =
+            tauri::async_runtime::block_on(shipping_changed_paths(path.into(), None)).unwrap();
+        assert_eq!(paths, ["base.txt", "committed.txt", "untracked.txt"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shipping_paths_use_the_captured_base_commit_after_the_ref_moves() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-shipping-base-race-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = root.git_canonical().unwrap();
+        let path = root.to_str().unwrap();
+        git(path, &["init", "-q", "-b", "main"]);
+        git(path, &["config", "user.name", "Sail Test"]);
+        git(path, &["config", "user.email", "sail@example.test"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(path, &["add", "base.txt"]);
+        git(path, &["commit", "-qm", "seed"]);
+        git(path, &["checkout", "-qb", "feature"]);
+        let captured =
+            tauri::async_runtime::block_on(shipping_base_revision(path.into(), None)).unwrap();
+        fs::write(root.join("feature.txt"), "feature\n").unwrap();
+        git(path, &["add", "feature.txt"]);
+        git(path, &["commit", "-qm", "feature"]);
+        git(path, &["branch", "-f", "main", "HEAD"]);
+
+        let captured_paths = tauri::async_runtime::block_on(shipping_changed_paths(
+            path.into(),
+            Some(captured.clone()),
+        ))
+        .unwrap();
+        let moved =
+            tauri::async_runtime::block_on(shipping_base_revision(path.into(), None)).unwrap();
+        let current_paths = tauri::async_runtime::block_on(shipping_changed_paths(
+            path.into(),
+            Some(moved.clone()),
+        ))
+        .unwrap();
+
+        assert_ne!(captured, moved);
+        assert_eq!(captured_paths, ["feature.txt"]);
+        assert!(current_paths.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn overview_reports_branch_changes_and_missing_repositories() {
         let root =
             std::env::temp_dir().join(format!("sail-overview-test-{}", uuid::Uuid::new_v4()));
         let repository = root.join("repository");
         let missing = root.join("missing");
         fs::create_dir_all(&repository).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let path = repository.to_str().unwrap();
         git(path, &["init", "-q", "-b", "overview-test"]);
         fs::write(repository.join("changed.txt"), "change\n").unwrap();
@@ -2606,7 +4016,7 @@ mod tests {
     fn git_change_actions_handle_hunks_stale_patches_and_untracked_files() {
         let root = std::env::temp_dir().join(format!("sail-change-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -2781,7 +4191,7 @@ mod tests {
     fn unstage_file_before_first_commit_preserves_worktree() {
         let root = std::env::temp_dir().join(format!("sail-unborn-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         fs::write(root.join("new.txt"), "new line\n").unwrap();
@@ -2831,24 +4241,29 @@ mod tests {
     fn file_actions_use_literal_pathspecs() {
         let root = std::env::temp_dir().join(format!("sail-literal-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
         git(path, &["config", "user.email", "sail@example.test"]);
-        fs::write(root.join("*.txt"), "literal\n").unwrap();
+        // `*` is not a legal Windows filename, and `[` is magic to git on both platforms.
+        let magic = if cfg!(windows) { "a[1].txt" } else { "*.txt" };
+        fs::write(root.join(magic), "literal\n").unwrap();
         fs::write(root.join("other.txt"), "other\n").unwrap();
-        git(path, &["add", "--", ":(literal)*.txt", "other.txt"]);
+        git(
+            path,
+            &["add", "--", &format!(":(literal){magic}"), "other.txt"],
+        );
         git(
             path,
             &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
         );
-        fs::write(root.join("*.txt"), "changed literal\n").unwrap();
+        fs::write(root.join(magic), "changed literal\n").unwrap();
         fs::write(root.join("other.txt"), "changed other\n").unwrap();
         let changes = tauri::async_runtime::block_on(working_tree_diff(path.into())).unwrap();
         assert!(changes
             .iter()
-            .find(|change| change.file == "*.txt")
+            .find(|change| change.file == magic)
             .unwrap()
             .patch
             .contains("changed literal"));
@@ -2858,19 +4273,19 @@ mod tests {
             .unwrap()
             .patch
             .contains("changed other"));
-        let patch = git_patch(path, "*.txt", "unstaged", false).unwrap();
+        let patch = git_patch(path, magic, "unstaged", false).unwrap();
         assert!(patch.contains("changed literal"));
         assert!(!patch.contains("changed other"));
         tauri::async_runtime::block_on(git_change_action(
             path.into(),
-            "*.txt".into(),
+            magic.into(),
             "unstaged".into(),
             "stage".into(),
             patch,
             None,
         ))
         .unwrap();
-        assert!(git_patch(path, "*.txt", "staged", false)
+        assert!(git_patch(path, magic, "staged", false)
             .unwrap()
             .contains("changed literal"));
         assert!(git_patch(path, "other.txt", "staged", false)
@@ -2886,7 +4301,7 @@ mod tests {
     fn binary_file_actions_apply_complete_patches() {
         let root = std::env::temp_dir().join(format!("sail-binary-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -2969,6 +4384,71 @@ mod tests {
         assert!(version_is_compatible(Some("2.0.24")));
         assert!(!version_is_compatible(Some("2.0.22")));
         assert!(!version_is_compatible(Some("2.1.0")));
+    }
+
+    #[test]
+    fn late_opencode_child_after_confirmation_blocks_cleanup() {
+        let expected = HashSet::from(["root".to_string()]);
+        let sessions = vec![
+            OpenCodeCleanupSession {
+                id: "root".into(),
+                parent_id: None,
+            },
+            OpenCodeCleanupSession {
+                id: "late-child".into(),
+                parent_id: Some("root".into()),
+            },
+        ];
+
+        let error =
+            verify_open_code_cleanup_state(&expected, &sessions, &HashSet::new(), &HashSet::new())
+                .expect_err("a provider child created after confirmation must block cleanup");
+
+        assert_eq!(
+            error,
+            "OpenCode task sessions changed before worktree cleanup."
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_dequeue_during_cleanup_blocks_removal() {
+        use std::cell::Cell;
+
+        let owned = HashSet::from(["root".to_string()]);
+        let sessions = vec![OpenCodeCleanupSession {
+            id: "root".into(),
+            parent_id: None,
+        }];
+        let state = Cell::new(0);
+        let advance = || state.set(state.get() + 1);
+
+        let (active, queued) = load_open_code_cleanup_activity(
+            &owned,
+            &sessions,
+            |_| {
+                let is_queued = state.get() == 0;
+                advance();
+                Ok(is_queued)
+            },
+            || {
+                let is_active = state.get() == 1;
+                advance();
+                Ok(if is_active {
+                    HashSet::from(["root".to_string()])
+                } else {
+                    HashSet::new()
+                })
+            },
+        )
+        .unwrap();
+
+        let error = verify_open_code_cleanup_state(&owned, &sessions, &active, &queued)
+            .expect_err("a prompt transitioning from queued to active must block cleanup");
+
+        assert_eq!(
+            error,
+            "An OpenCode task session is active in this worktree."
+        );
     }
 
     #[test]

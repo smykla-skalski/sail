@@ -4,9 +4,14 @@ import type { SpawnReceipt, SpawnState } from './agent-results';
 import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
 import { taskCheckpointSchema } from './task-checkpoint.ts';
+import { taskEconomicsSchema, type TaskEconomics } from './task-economics.ts';
+import type { ContextHandoff } from './context-handoff.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
+  nextTaskEvidenceSequence,
+  recordTaskEvidence,
+  type EvidenceManifest,
   type EvidenceReadiness,
   type TaskEvidence,
 } from './task-evidence.ts';
@@ -23,7 +28,18 @@ export const stages = [
 ] as const;
 export const verdicts = ['CLEAN', 'NEEDS_FIXES', 'PASS', 'FAIL', 'BLOCKED'] as const;
 export type GateVerdict = (typeof verdicts)[number];
-export type ShipCheck = { name: string; state: string; url: string };
+export type ShipCheck = {
+  name: string;
+  state: string;
+  url: string;
+  databaseId?: number;
+  runId?: number;
+  attempt?: number;
+  statusContextId?: string;
+  revision?: string;
+  workflow?: string;
+  identityUncertain?: boolean;
+};
 export type ShippingPullRequest = {
   url: string;
   state: string;
@@ -48,12 +64,53 @@ export type ShipIssuePresentation = {
 export type GateMetadata = {
   gate: GateName;
   requestedModel: string;
+  sequence?: number;
   revision?: string;
   mutationGeneration?: string;
+  baseRevision?: string;
   revisionDrifted?: boolean;
   verdict?: GateVerdict;
   reason?: string;
+  evidenceCriteria?: string[];
+  evidenceOutputReference?: string;
+  evidenceTimestamp?: number;
+  evidenceSequence?: number;
+  evidenceEconomics?: TaskEconomics;
+  protocolVersion?: 2;
 };
+
+export function nextGateSequence(gates: Pick<ShipGate, 'sequence'>[]): number {
+  return Math.max(0, ...gates.map((gate, index) => (gate.sequence ?? index) + 1));
+}
+
+export function nextValidationReservation(
+  gates: Pick<ShipGate, 'sequence' | 'evidenceSequence'>[],
+  manifests: EvidenceManifest[],
+): { sequence: number; evidenceSequence: number } {
+  return {
+    sequence: nextGateSequence(gates),
+    evidenceSequence: Math.max(
+      nextTaskEvidenceSequence(manifests),
+      ...gates.map((gate) => (gate.evidenceSequence ?? 0) + 1),
+    ),
+  };
+}
+
+export function reserveInlineValidation(
+  reservations: Map<string, { sequence: number; evidenceSequence: number }>,
+  key: string,
+  gates: Pick<ShipGate, 'sequence' | 'evidenceSequence'>[],
+  manifests: EvidenceManifest[],
+): { sequence: number; evidenceSequence: number } {
+  const recorded = nextValidationReservation(gates, manifests);
+  const previous = reservations.get(key);
+  const reserved = {
+    sequence: Math.max(recorded.sequence, (previous?.sequence ?? -1) + 1),
+    evidenceSequence: Math.max(recorded.evidenceSequence, (previous?.evidenceSequence ?? 0) + 1),
+  };
+  reservations.set(key, reserved);
+  return reserved;
+}
 export type ShipGate = GateMetadata & {
   id: string;
   provider: string;
@@ -66,14 +123,59 @@ export type ShipGate = GateMetadata & {
   error: string | null;
 };
 
+export function completedInlineShipGate(
+  gate: Omit<ShipGate, 'state' | 'created' | 'updated' | 'revision'> & { revision: string },
+  now: number,
+): ShipGate {
+  return { ...gate, revision: gate.revision, state: 'completed', created: now, updated: now };
+}
+
+export function requiredValidationGatesSatisfied(
+  policy:
+    | Pick<
+        NonNullable<ShipIssue['validationPolicy']>,
+        'requiredGates' | 'revision' | 'baseRevision'
+      >
+    | undefined,
+  gates: ShipGate[],
+): boolean {
+  if (!policy) return false;
+  return policy.requiredGates.every((name) => {
+    const gate = gates
+      .map((item, index) => ({ item, index }))
+      .filter(
+        ({ item }) =>
+          item.gate === name &&
+          item.revision === policy.revision &&
+          (policy.baseRevision === undefined || item.baseRevision === policy.baseRevision),
+      )
+      .toSorted(
+        (left, right) =>
+          (right.item.sequence ?? right.index) - (left.item.sequence ?? left.index) ||
+          right.item.updated - left.item.updated ||
+          right.item.created - left.item.created,
+      )[0]?.item;
+    if (!gate || gate.state !== 'completed') return false;
+    return name === 'test-adversary' ? gate.verdict === 'PASS' : gate.verdict === 'CLEAN';
+  });
+}
+
 export const gateMetadataSchema = z.object({
   gate: z.enum(gateNames),
   requestedModel: z.string(),
+  sequence: z.number().int().nonnegative().optional(),
   revision: z.string().min(1).optional(),
   mutationGeneration: z.string().min(1).optional(),
+  baseRevision: z.string().min(1).optional(),
   revisionDrifted: z.boolean().optional(),
   verdict: z.enum(verdicts).optional(),
   reason: z.string().optional(),
+  evidenceCriteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
+  evidenceOutputReference: z.string().min(1).max(2000).optional(),
+  evidenceTimestamp: z.number().int().nonnegative().optional(),
+  evidenceSequence: z.number().int().positive().optional(),
+  evidenceEconomics: taskEconomicsSchema.optional(),
+  protocolVersion: z.literal(2).optional(),
 });
 
 const reportSchema = z.union([
@@ -91,6 +193,7 @@ const reportSchema = z.union([
       reason: z.string().max(2000).optional(),
       criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
       outputReference: z.string().min(1).max(2000).optional(),
+      economics: taskEconomicsSchema.optional(),
       revision: z.string().min(1).optional(),
     })
     .strict(),
@@ -100,12 +203,23 @@ const reportSchema = z.union([
       reason: z.string().max(2000).optional(),
       criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
       outputReference: z.string().min(1).max(2000).optional(),
+      economics: taskEconomicsSchema.optional(),
     })
     .strict(),
 ]);
 
 export function parseShipReport(value: unknown) {
   const report = reportSchema.parse(value);
+  if ('verdict' in report && report.economics) {
+    if (report.economics.role !== 'validator')
+      throw new Error('Validation verdict economics must use the validator role.');
+    if ('gate' in report) {
+      const phase = report.gate === 'test-adversary' ? 'test' : 'review';
+      if (report.economics.phase !== phase)
+        throw new Error(`Validation verdict economics must use the ${phase} phase.`);
+    } else if (!['review', 'test'].includes(report.economics.phase))
+      throw new Error('Validation verdict economics must use a validation phase.');
+  }
   if (
     ('status' in report && report.status === 'blocked') ||
     ('verdict' in report && ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict))
@@ -113,6 +227,14 @@ export function parseShipReport(value: unknown) {
     if (!report.reason?.trim()) throw new Error('A blocked or failed report needs a reason.');
   }
   return report;
+}
+
+export function requireValidatorEconomics(
+  report: ReturnType<typeof parseShipReport>,
+  allowLegacyMissing: boolean,
+): void {
+  if ('verdict' in report && !report.economics && !allowLegacyMissing)
+    throw new Error('Validation verdicts require validator economics.');
 }
 
 export function validateGateVerdict(gate: GateName, verdict: GateVerdict): void {
@@ -129,6 +251,198 @@ export function validationRevisionDrifted(
     validation.revisionDrifted === true ||
     (validation.revision !== undefined && validation.revision !== currentRevision)
   );
+}
+
+export async function commitRevisionBoundValidation<T>({
+  expectedRevision,
+  expectedMutationGeneration,
+  expectedBaseRevision,
+  readRevision,
+  readMutationGeneration,
+  readBaseRevision,
+  prepare,
+  commit,
+}: {
+  expectedRevision: string | undefined;
+  expectedMutationGeneration: string | undefined;
+  expectedBaseRevision?: string;
+  readRevision: () => Promise<string>;
+  readMutationGeneration: () => Promise<string>;
+  readBaseRevision?: () => Promise<string>;
+  prepare: () => Promise<T>;
+  commit: (prepared: T, registerRollback: (rollback: () => Promise<void>) => void) => Promise<void>;
+}): Promise<void> {
+  if (!expectedRevision)
+    throw new Error('Validation needs the revision captured before execution.');
+  const verifyBoundary = async () => {
+    if ((await readRevision()) !== expectedRevision)
+      throw new Error('The worktree changed during validation. Rerun the gate.');
+    if (
+      expectedMutationGeneration !== undefined &&
+      (await readMutationGeneration()) !== expectedMutationGeneration
+    )
+      throw new Error('The worktree was modified during validation. Rerun the gate.');
+    if (expectedBaseRevision !== undefined && (await readBaseRevision?.()) !== expectedBaseRevision)
+      throw new Error('The shipping base changed during validation. Rerun the gate.');
+  };
+  await verifyBoundary();
+  const prepared = await prepare();
+  await verifyBoundary();
+  let rollback: (() => Promise<void>) | undefined;
+  try {
+    await commit(prepared, (candidate) => (rollback = candidate));
+    await verifyBoundary();
+  } catch (cause) {
+    try {
+      await rollback?.();
+    } catch (rollbackCause) {
+      throw new Error(`Validation commit failed (${String(cause)}) and rollback failed.`, {
+        cause: rollbackCause,
+      });
+    }
+    throw cause;
+  }
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function restoreIfUnchanged<T>(value: T, previousValue: T, committedValue: T): T {
+  return sameValue(value, committedValue) ? previousValue : value;
+}
+
+export function rollbackValidationReceipt(
+  current: SpawnReceipt,
+  previous: SpawnReceipt,
+  committed: SpawnReceipt,
+): SpawnReceipt {
+  if (!current.validation || !previous.validation || !committed.validation) return current;
+  const validation = {
+    ...current.validation,
+    verdict: restoreIfUnchanged(
+      current.validation.verdict,
+      previous.validation.verdict,
+      committed.validation.verdict,
+    ),
+    reason: restoreIfUnchanged(
+      current.validation.reason,
+      previous.validation.reason,
+      committed.validation.reason,
+    ),
+    evidenceCriteria: restoreIfUnchanged(
+      current.validation.evidenceCriteria,
+      previous.validation.evidenceCriteria,
+      committed.validation.evidenceCriteria,
+    ),
+    evidenceOutputReference: restoreIfUnchanged(
+      current.validation.evidenceOutputReference,
+      previous.validation.evidenceOutputReference,
+      committed.validation.evidenceOutputReference,
+    ),
+    evidenceTimestamp: restoreIfUnchanged(
+      current.validation.evidenceTimestamp,
+      previous.validation.evidenceTimestamp,
+      committed.validation.evidenceTimestamp,
+    ),
+    evidenceSequence: restoreIfUnchanged(
+      current.validation.evidenceSequence,
+      previous.validation.evidenceSequence,
+      committed.validation.evidenceSequence,
+    ),
+    evidenceEconomics: restoreIfUnchanged(
+      current.validation.evidenceEconomics,
+      previous.validation.evidenceEconomics,
+      committed.validation.evidenceEconomics,
+    ),
+  };
+  return { ...current, validation };
+}
+
+function rollbackEvidenceEntry(
+  current: EvidenceManifest[],
+  previous: EvidenceManifest[],
+  committed: EvidenceManifest[],
+  evidenceId: string,
+): EvidenceManifest[] {
+  return current.map((manifest) => {
+    const matches = (candidate: EvidenceManifest) =>
+      candidate.revision === manifest.revision && candidate.baseRevision === manifest.baseRevision;
+    const previousEntry = previous.find(matches)?.evidence.find((entry) => entry.id === evidenceId);
+    const committedEntry = committed
+      .find(matches)
+      ?.evidence.find((entry) => entry.id === evidenceId);
+    const currentIndex = manifest.evidence.findIndex((entry) => entry.id === evidenceId);
+    if (currentIndex < 0 || !sameValue(manifest.evidence[currentIndex], committedEntry))
+      return manifest;
+    return {
+      ...manifest,
+      evidence: previousEntry
+        ? manifest.evidence.with(currentIndex, previousEntry)
+        : manifest.evidence.toSpliced(currentIndex, 1),
+    };
+  });
+}
+
+function removeCommittedEvents(
+  current: ShipEvent[] | undefined,
+  previous: ShipEvent[] | undefined,
+  committed: ShipEvent[] | undefined,
+): ShipEvent[] | undefined {
+  const removed = [...(current ?? [])];
+  const previousCounts = new Map<string, number>();
+  for (const event of previous ?? []) {
+    const key = JSON.stringify(event);
+    previousCounts.set(key, (previousCounts.get(key) ?? 0) + 1);
+  }
+  const added = (committed ?? []).filter((event) => {
+    const key = JSON.stringify(event);
+    const count = previousCounts.get(key) ?? 0;
+    if (!count) return true;
+    previousCounts.set(key, count - 1);
+    return false;
+  });
+  for (const event of added) {
+    const index = removed.findIndex((candidate) => sameValue(candidate, event));
+    if (index >= 0) removed.splice(index, 1);
+  }
+  return removed;
+}
+
+type ValidationIssueSnapshot = Pick<
+  ShipIssue,
+  'evidenceRevision' | 'evidenceManifests' | 'stage' | 'blockedReason' | 'gates' | 'events'
+>;
+
+export function rollbackValidationIssue(
+  current: ShipIssue,
+  previous: ValidationIssueSnapshot,
+  committed: ValidationIssueSnapshot,
+  evidenceId: string,
+  gateId?: string,
+): ValidationIssueSnapshot {
+  const restore = <K extends keyof ValidationIssueSnapshot>(key: K) =>
+    sameValue(current[key], committed[key]) ? previous[key] : current[key];
+  const gates = gateId
+    ? (current.gates ?? []).filter((gate) => {
+        if (gate.id !== gateId) return true;
+        const committedGate = committed.gates?.find((candidate) => candidate.id === gateId);
+        return !sameValue(gate, committedGate);
+      })
+    : current.gates;
+  return {
+    evidenceRevision: restore('evidenceRevision'),
+    evidenceManifests: rollbackEvidenceEntry(
+      current.evidenceManifests ?? [],
+      previous.evidenceManifests ?? [],
+      committed.evidenceManifests ?? [],
+      evidenceId,
+    ),
+    stage: restore('stage'),
+    blockedReason: restore('blockedReason'),
+    gates,
+    events: removeCommittedEvents(current.events, previous.events, committed.events),
+  };
 }
 
 export function gateSnapshot(receipt: SpawnReceipt): ShipGate | null {
@@ -197,6 +511,27 @@ export function shipGatesSettled(issue: ShipIssue): boolean {
   return (issue.gates ?? []).every((gate) => shippingWorkerSettled(gate.state));
 }
 
+export function shipCleanupRequest(
+  repository: string,
+  issue: ShipIssue,
+  currentRevision: string | undefined,
+) {
+  if (!issue.path) throw new Error('Ship cleanup requires a worktree.');
+  if (!shipEvidenceReadiness(issue).ready)
+    throw new Error('Ship cleanup requires complete revision-bound evidence.');
+  const expectedRevision =
+    issue.validationPolicy?.revision ?? issue.checkpoint?.revision ?? currentRevision;
+  if (!expectedRevision) throw new Error('Ship cleanup requires a verified worktree revision.');
+  return {
+    repository,
+    worktree: issue.path,
+    force: false,
+    archiveIgnored: true,
+    expectedRevision,
+    expectedBranch: issue.branch,
+  };
+}
+
 export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
   if (!issue.checkpoint)
     return {
@@ -215,7 +550,19 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     issue.evidenceRevision,
     issue.checkpoint.requiredGates,
     issue.checkpoint.acceptanceCriteria,
+    issue.validationPolicy?.baseRevision,
   );
+  if (
+    issue.validationPolicyRequired !== false &&
+    !requiredValidationGatesSatisfied(issue.validationPolicy, issue.gates ?? [])
+  )
+    return {
+      ...readiness,
+      ready: false,
+      reason:
+        readiness.reason ??
+        'Required validation gates are not completed for the selected revision.',
+    };
   if (issue.refreshError)
     return {
       ...readiness,
@@ -230,7 +577,10 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
     };
   if (!issue.pullRequest || !issue.checks?.length || !issue.evidenceRevision) return readiness;
   const manifest = (issue.evidenceManifests ?? []).find(
-    (candidate) => candidate.revision === issue.evidenceRevision && !candidate.stale,
+    (candidate) =>
+      candidate.revision === issue.evidenceRevision &&
+      candidate.baseRevision === (issue.validationPolicy?.baseRevision ?? null) &&
+      !candidate.stale,
   );
   const latestCommands = new Map<string, TaskEvidence>();
   for (const entry of manifest?.evidence ?? [])
@@ -249,6 +599,71 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
   };
 }
 
+export function recoverValidationEvidence(
+  issue: ShipIssue,
+  observedBaseRevision: string | undefined,
+): Pick<ShipIssue, 'evidenceRevision' | 'evidenceManifests'> | null {
+  const checkpoint = issue.checkpoint;
+  if (!checkpoint?.revision) return null;
+  const revision = checkpoint.revision;
+  const baseRevision = issue.validationPolicy?.baseRevision;
+  if (baseRevision !== observedBaseRevision) return null;
+  let manifests = issue.evidenceManifests ?? [];
+  const gates = (issue.gates ?? []).toSorted(
+    (left, right) =>
+      (left.sequence ?? Number.MAX_SAFE_INTEGER) - (right.sequence ?? Number.MAX_SAFE_INTEGER) ||
+      left.created - right.created ||
+      left.id.localeCompare(right.id),
+  );
+  const recoverable = gates.filter(
+    (gate) =>
+      gate.revision === revision &&
+      gate.baseRevision === baseRevision &&
+      gate.verdict &&
+      gate.evidenceTimestamp !== undefined &&
+      gate.evidenceOutputReference,
+  );
+  const evidenceIds = new Set(recoverable.map((gate) => `gate:${gate.id}`));
+  const missing = recoverable.some((gate) =>
+    manifests.every((manifest) =>
+      manifest.evidence.every((entry) => entry.id !== `gate:${gate.id}`),
+    ),
+  );
+  if (!missing && issue.evidenceRevision === revision) return null;
+  if (missing)
+    manifests = manifests.map((manifest) => ({
+      ...manifest,
+      evidence: manifest.evidence.filter((entry) => !evidenceIds.has(entry.id)),
+    }));
+  for (const gate of recoverable) {
+    const evidenceId = `gate:${gate.id}`;
+    const criteria = (gate.evidenceCriteria ?? []).filter((criterion) =>
+      checkpoint.acceptanceCriteria.includes(criterion),
+    );
+    const next = recordTaskEvidence(
+      manifests,
+      revision,
+      checkpoint.acceptanceCriteria,
+      {
+        id: evidenceId,
+        kind: 'gate',
+        name: gate.gate,
+        provider: gate.provider,
+        model: gate.model,
+        result: ['CLEAN', 'PASS'].includes(gate.verdict!) ? 'passed' : 'failed',
+        timestamp: gate.evidenceTimestamp!,
+        outputReference: gate.evidenceOutputReference!,
+        criteria,
+        economics: gate.evidenceEconomics,
+        ...(gate.evidenceSequence !== undefined ? { sequence: gate.evidenceSequence } : {}),
+      },
+      baseRevision,
+    );
+    manifests = next;
+  }
+  return { evidenceRevision: revision, evidenceManifests: manifests };
+}
+
 export function shipMergeClaim(issue: ShipIssue): string {
   if (issue.state === 'merged') return 'Merged';
   if (!issue.pullRequest) return 'PR not opened';
@@ -261,23 +676,130 @@ export function shipMergeClaim(issue: ShipIssue): string {
   return 'PR open';
 }
 
+export function shipOwnedThreadIds(
+  issue: ShipIssue,
+  receipts: Array<
+    Partial<Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetId' | 'targetDirectory'>>
+  > = [],
+): string[] {
+  const lineage = new Set(
+    [
+      issue.threadId,
+      ...(issue.checkpointThreadIds ?? []),
+      ...(issue.contextHandoffs ?? []).flatMap((handoff) => [
+        handoff.fromThreadId,
+        handoff.toThreadId,
+      ]),
+    ].filter(Boolean),
+  );
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const receipt of receipts) {
+      if (
+        receipt.sourceDirectory !== issue.path ||
+        receipt.targetDirectory !== issue.path ||
+        !receipt.sourceId ||
+        !lineage.has(receipt.sourceId) ||
+        !receipt.targetId ||
+        lineage.has(receipt.targetId)
+      )
+        continue;
+      lineage.add(receipt.targetId);
+      expanded = true;
+    }
+  }
+  return [...lineage].filter((threadId): threadId is string => Boolean(threadId));
+}
+
 export function shipTaskThreadsSettled(
   issue: ShipIssue,
   states: Partial<Record<string, SpawnState>>,
-  receipts: Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'>[],
+  receipts: Array<
+    Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'> &
+      Partial<
+        Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetDirectory' | 'dispatchPending'>
+      >
+  >,
+  discoveredThreadIds: Iterable<string> = [],
 ): boolean {
-  const threadIds = [...new Set([issue.threadId, ...(issue.checkpointThreadIds ?? [])])].filter(
-    (threadId): threadId is string => Boolean(threadId),
-  );
+  const threadIds = [
+    ...new Set([
+      ...shipOwnedThreadIds(issue, receipts),
+      ...discoveredThreadIds,
+      ...(issue.contextHandoffs ?? []).flatMap((handoff) => [
+        handoff.fromThreadId,
+        handoff.toThreadId,
+      ]),
+    ]),
+  ].filter((threadId): threadId is string => Boolean(threadId));
   return threadIds.every((threadId) => {
     const live = states[threadId] ?? 'unavailable';
-    const receipt = receipts.find((item) =>
-      threadId === issue.threadId ? item.receiptId === issue.receiptId : item.targetId === threadId,
+    const matchingReceipts = receipts.filter(
+      (item) =>
+        (threadId === issue.threadId && item.receiptId === issue.receiptId) ||
+        (item.targetId === threadId &&
+          (item.targetDirectory === undefined || item.targetDirectory === issue.path)),
     );
-    if (receipt && !shippingWorkerSettled(receipt.state)) return false;
+    if (
+      matchingReceipts.some(
+        (receipt) => receipt.dispatchPending || !shippingWorkerSettled(receipt.state),
+      )
+    )
+      return false;
     if (live !== 'unavailable') return shippingWorkerSettled(live);
-    return receipt !== undefined && shippingWorkerSettled(receipt.state);
+    return (
+      matchingReceipts.length > 0 &&
+      matchingReceipts.every(
+        (receipt) => !receipt.dispatchPending && shippingWorkerSettled(receipt.state),
+      )
+    );
   });
+}
+
+export function shipOwnershipQuietGeneration(
+  nativeSubagentGeneration: number,
+  nativeGeneration: number,
+  openCodeDescendants: Iterable<string>,
+): string {
+  return JSON.stringify([
+    nativeSubagentGeneration,
+    nativeGeneration,
+    ...[...new Set(openCodeDescendants)].toSorted(),
+  ]);
+}
+
+export function shipOwnershipQuietPass(
+  previousGeneration: number | null,
+  currentGeneration: number,
+  hasUnsettledOwnership: boolean,
+): { settled: boolean; nextGeneration: number | null } {
+  if (hasUnsettledOwnership) return { settled: false, nextGeneration: null };
+  return {
+    settled: previousGeneration === currentGeneration,
+    nextGeneration: currentGeneration,
+  };
+}
+
+export function shipTaskReceiptIdsToProtect(
+  issue: ShipIssue,
+  receipts: Pick<
+    SpawnReceipt,
+    'receiptId' | 'targetId' | 'targetDirectory' | 'state' | 'dispatchPending'
+  >[],
+): string[] {
+  const ownedThreadIds = new Set([issue.threadId, ...(issue.checkpointThreadIds ?? [])]);
+  return receipts
+    .filter(
+      (receipt) =>
+        (receipt.receiptId === issue.receiptId &&
+          (issue.workerSettled !== true || issue.claim?.status === 'active')) ||
+        (!!issue.path &&
+          ownedThreadIds.has(receipt.targetId) &&
+          receipt.targetDirectory === issue.path &&
+          (receipt.dispatchPending === true || !shippingWorkerSettled(receipt.state))),
+    )
+    .map((receipt) => receipt.receiptId);
 }
 
 export function reconciledShipGates(issue: ShipIssue, receipts: SpawnReceipt[]): ShipGate[] {
@@ -609,6 +1131,24 @@ export function appendShipEvent(
 }
 
 const nullableString = z.string().nullable();
+const shippingClaimSchema = z.object({
+  id: z.string(),
+  instanceId: z.string().min(1).optional(),
+  holder: z.string(),
+  task: z.string(),
+  acquiredAt: z.string(),
+  heartbeatAt: z.string(),
+  expiresAt: z.string(),
+  status: z.enum(['active', 'released']),
+  releasedAt: z.string().optional(),
+  releaseReason: z.string().optional(),
+  takeoverOf: z.string().optional(),
+  releasedHeartbeatAt: z.string().optional(),
+  releasedExpiresAt: z.string().optional(),
+  releasedCommentUpdatedAtMillis: z.number().int().nonnegative().optional(),
+  commentId: z.number().int().positive(),
+  commentUpdatedAtMillis: z.number().int().nonnegative().optional(),
+});
 const shipGateSchema = gateMetadataSchema.extend({
   id: z.string(),
   provider: z.string(),
@@ -671,14 +1211,128 @@ const shipIssueSchema = z.object({
     .array(z.object({ at: z.number(), stage: z.string(), reason: z.string().optional() }))
     .optional(),
   issueState: z.enum(['OPEN', 'CLOSED']).optional(),
-  checks: z.array(z.object({ name: z.string(), state: z.string(), url: z.string() })).optional(),
+  checks: z
+    .array(
+      z.object({
+        name: z.string(),
+        state: z.string(),
+        url: z.string(),
+        databaseId: z.number().int().positive().optional(),
+        runId: z.number().int().positive().optional(),
+        attempt: z.number().int().positive().optional(),
+        statusContextId: z.string().min(1).optional(),
+        revision: z.string().min(1).optional(),
+        workflow: z.string().min(1).optional(),
+        identityUncertain: z.boolean().optional(),
+      }),
+    )
+    .optional(),
+  ciTriages: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        revision: z.string().min(1),
+        workflow: z.string().min(1),
+        job: z.string().min(1),
+        attempt: z.number().int().positive(),
+        classification: z.enum(['code', 'flaky', 'infrastructure', 'unknown']),
+        excerpt: z.string(),
+        url: z.string(),
+        routedAt: z.number().int().nonnegative(),
+        resolvedAt: z.number().int().nonnegative().nullable(),
+        recurrence: z.number().int().positive(),
+        rerunAllowed: z.boolean(),
+        rerunReason: z.string().min(1),
+      }),
+    )
+    .max(200)
+    .optional(),
   refreshedAt: z.number().optional(),
   refreshError: nullableString.optional(),
+  claimFencePending: z.boolean().optional(),
+  claimRevalidationPending: z.boolean().optional(),
+  claimHandoffPending: z.boolean().optional(),
+  dispatchFencePending: z.boolean().optional(),
+  claim: shippingClaimSchema.optional(),
   checkpoint: taskCheckpointSchema.optional(),
   checkpointThreadIds: z.array(z.string()).optional(),
+  contextCompactions: z
+    .object({
+      claude: z.number().int().nonnegative().optional(),
+      codex: z.number().int().nonnegative().optional(),
+      opencode: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
+  contextEventIds: z.array(z.string().min(1)).max(200).optional(),
+  contextHandoffs: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        provider: z.enum(['claude', 'codex', 'opencode']),
+        fromThreadId: z.string().min(1),
+        toThreadId: z.string().nullable(),
+        context: z.number().min(0).max(100),
+        compactions: z.number().int().nonnegative(),
+        checkpointSequence: z.number().int().nonnegative(),
+        revision: z.string().nullable(),
+        offeredAt: z.number().int().nonnegative(),
+        startedAt: z.number().int().nonnegative().nullable(),
+        retriesBefore: z.number().int().nonnegative(),
+        lostStateFailuresBefore: z.number().int().nonnegative(),
+        retriesAfter: z.number().int().nonnegative().nullable(),
+        lostStateFailuresAfter: z.number().int().nonnegative().nullable(),
+        outcome: z
+          .enum(['pending', 'reduced', 'unchanged', 'no_regression', 'regressed', 'failed'])
+          .transform((outcome): ContextHandoff['outcome'] =>
+            outcome === 'reduced' || outcome === 'unchanged' ? 'no_regression' : outcome,
+          ),
+        error: z.string().nullable(),
+      }),
+    )
+    .max(100)
+    .optional(),
+  contextCheckpointRequestedAt: z.number().int().nonnegative().optional(),
+  contextCheckpointRequestedSequence: z.number().int().nonnegative().optional(),
+  contextHandoffOfferedAt: z.number().int().nonnegative().optional(),
+  contextHandoffOfferedSequence: z.number().int().nonnegative().optional(),
+  contextPercent: z.number().min(0).max(100).optional(),
+  contextPercentByThread: z.record(z.string().min(1), z.number().min(0).max(100)).optional(),
+  handoffRecoveryRequired: z.boolean().optional(),
+  retryCount: z.number().int().nonnegative().optional(),
+  lostStateFailures: z.number().int().nonnegative().optional(),
   evidenceManifests: evidenceManifestsSchema.optional(),
   evidenceRevision: z.string().min(1).optional(),
   evidenceCommit: z.string().min(1).optional(),
+  validationPolicyRequired: z.boolean().default(true),
+  validationPolicy: z
+    .object({
+      risk: z.enum(['low', 'medium', 'high']),
+      requiredGates: z.array(z.enum(gateNames)),
+      sources: z.array(z.string().min(1)).min(1),
+      revision: z.string().min(1),
+      mutationGeneration: z.string().min(1).optional(),
+      baseRevision: z.string().min(1).optional(),
+      changedPaths: z.array(z.string()),
+      selectedAt: z.number().int().nonnegative(),
+      history: z.array(
+        z.object({
+          requestedRisk: z.enum(['low', 'medium', 'high']).nullable(),
+          selectedRisk: z.enum(['low', 'medium', 'high']),
+          sources: z.array(z.string().min(1)).min(1),
+          at: z.number().int().nonnegative(),
+        }),
+      ),
+    })
+    .optional(),
+  shippingTarget: z
+    .object({
+      repository: z.string().min(1),
+      remote: z.string().min(1),
+      baseBranch: z.string().min(1),
+      baseRef: z.string().min(1),
+      baseRevision: z.string().min(1),
+    })
+    .optional(),
 });
 const shipRunSchema = z.object({
   id: z.string(),
@@ -700,7 +1354,19 @@ export function loadShipRuns(raw: string | null): ShipRun[] {
     if (!Array.isArray(value)) return [];
     return value.flatMap((item) => {
       const parsed = shipRunSchema.safeParse(item);
-      return parsed.success ? [parsed.data] : [];
+      if (!parsed.success) return [];
+      for (const issue of parsed.data.issues)
+        issue.contextHandoffs = issue.contextHandoffs?.map((handoff) =>
+          handoff.outcome === 'pending' &&
+          !handoff.toThreadId &&
+          handoff.fromThreadId !== issue.threadId
+            ? Object.assign({}, handoff, {
+                outcome: 'failed' as const,
+                error: 'Retired stale handoff offer during recovery.',
+              })
+            : handoff,
+        );
+      return [parsed.data];
     });
   } catch {
     return [];

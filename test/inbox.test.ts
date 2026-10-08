@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   failedCheckOutcome,
+  inboxPermissionDecisionTitle,
+  inboxPermissionProfile,
+  inboxRejectedPermissionPolicy,
   inboxLocations,
   inboxTurnMessageIndex,
   loadInboxOutcomes,
@@ -136,6 +139,94 @@ void test('failed check results stay informational and point at their thread', (
   });
   assert.equal(failedCheckOutcome({ ...check, status: 'passed' }), null);
   assert.equal(failedCheckOutcome({ ...check, thread: 'broken' }), null);
+});
+
+void test('permission settlements retain the session profile stored by the inbox', () => {
+  const permission: InboxItem = {
+    ...item('permission', 123),
+    kind: 'opencode-permission',
+    policy: {
+      profile: 'explore',
+      risk: 'low',
+      recommendation: 'allow',
+      optionId: 'once',
+      reason: 'Low-risk action is enabled for exploration.',
+      policyRevision: '2026-10-07.1',
+    },
+  };
+
+  assert.equal(inboxPermissionProfile(permission, 'build'), 'explore');
+});
+
+void test('inbox rejections retain the displayed canonical resource policy', () => {
+  const displayedPolicy = {
+    profile: 'explore' as const,
+    risk: 'low' as const,
+    recommendation: 'interactive' as const,
+    reason: 'Path-based reads require approval because the provider opens the path later.',
+    policyRevision: '2026-10-07.1',
+  };
+  const permission: InboxItem = {
+    ...item('selected', 123),
+    kind: 'opencode-permission',
+    policy: displayedPolicy,
+    permissionPolicies: {
+      selected: displayedPolicy,
+      collateral: { ...displayedPolicy, profile: 'review' },
+    },
+  };
+  let fallbacks = 0;
+  const fallback = () => {
+    fallbacks++;
+    return { ...displayedPolicy, risk: 'unknown' as const };
+  };
+
+  assert.equal(inboxRejectedPermissionPolicy(permission, 'selected', fallback), displayedPolicy);
+  assert.equal(
+    inboxRejectedPermissionPolicy(permission, 'collateral', fallback),
+    permission.permissionPolicies?.collateral,
+  );
+  assert.equal(inboxRejectedPermissionPolicy(permission, 'unseen', fallback).risk, 'unknown');
+  assert.equal(fallbacks, 1);
+});
+
+void test('rejected inbox permissions record the actual outcome', () => {
+  const permission: InboxItem = {
+    ...item('permission-rejected', 123),
+    kind: 'acp-permission',
+    permissionTitle: 'Read README.md',
+    text: 'explore · low risk · policy 2026-10-07.1 — Allowed by policy',
+    policy: {
+      profile: 'explore',
+      risk: 'low',
+      recommendation: 'allow',
+      optionId: 'once',
+      reason: 'low-risk action is enabled for the explore profile.',
+      policyRevision: '2026-10-07.1',
+    },
+  };
+
+  assert.match(inboxPermissionDecisionTitle(permission, 'rejected'), /— Rejected:/);
+  assert.doesNotMatch(inboxPermissionDecisionTitle(permission, 'rejected'), /Allowed by policy/);
+});
+
+void test('allowed inbox permissions record the actual outcome', () => {
+  const permission: InboxItem = {
+    ...item('permission-allowed', 123),
+    kind: 'opencode-permission',
+    permissionTitle: 'Inspect repository',
+    text: 'review · unknown risk · policy 2026-10-07.1 — Awaiting approval',
+    policy: {
+      profile: 'review',
+      risk: 'unknown',
+      recommendation: 'interactive',
+      reason: 'The action does not match a reviewed policy rule.',
+      policyRevision: '2026-10-07.1',
+    },
+  };
+
+  assert.match(inboxPermissionDecisionTitle(permission, 'completed'), /— Allowed:/);
+  assert.doesNotMatch(inboxPermissionDecisionTitle(permission, 'completed'), /Awaiting approval/);
 });
 
 void test('completed turn navigation stays between its user message and the next turn', () => {

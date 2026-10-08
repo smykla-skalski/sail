@@ -58,15 +58,18 @@
         </button>
         {#if item.kind === 'opencode-permission'}
           <div class="inbox-actions">
-            <button disabled={!!busyKey} onclick={() => decide(item, 'once')}>Allow once</button>
+            {#if item.allow !== false}<button
+                disabled={!!busyKey}
+                onclick={() => decide(item, 'once')}>Allow once</button
+              >{/if}
             <button disabled={!!busyKey} onclick={() => decide(item, 'reject')}>Reject</button>
           </div>
         {:else if item.kind === 'acp-permission'}
           <div class="inbox-actions">
-            {#each item.options ?? [] as option (option.optionId)}<button
-                disabled={!!busyKey}
-                onclick={() => decide(item, option.optionId)}>{option.name}</button
-              >{/each}
+            {#each item.options ?? [] as option (option.optionId)}{#if item.allow !== false || !option.kind.startsWith('allow')}<button
+                  disabled={!!busyKey}
+                  onclick={() => decide(item, option.optionId)}>{option.name}</button
+                >{/if}{/each}
             {#if !(item.options ?? []).some((option) => option.kind.startsWith('reject'))}<button
                 disabled={!!busyKey}
                 onclick={() => decide(item, null)}>Deny</button
