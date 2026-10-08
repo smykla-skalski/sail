@@ -2913,6 +2913,7 @@ pub fn run() {
             github::heartbeat_shipping_claim,
             github::release_shipping_claim,
             ship_actions::ship_merge_pull_request,
+            ship_actions::ship_reopen_pull_request,
             ship_actions::ship_issue_title,
             github::pull_request_checks,
             github::failed_check_log,

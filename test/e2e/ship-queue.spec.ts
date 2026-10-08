@@ -24,6 +24,15 @@ const setTheme = (theme: 'light' | 'dark') =>
     document.documentElement.dataset.suiTheme = value;
   }, theme);
 
+const captureThemes = async (width: number, height: number, name: string) => {
+  await browser.setWindowSize(width, height);
+  expect(await browser.execute(() => window.innerWidth)).toBe(width);
+  await setTheme('light');
+  await capture(`${name}-${width}-light`);
+  await setTheme('dark');
+  await capture(`${name}-${width}-dark`);
+};
+
 const calls = (): { method: string; endpoint: string; fields: string[] }[] => {
   try {
     return readFileSync(join(fakeGh, 'calls.jsonl'), 'utf8')
@@ -165,11 +174,18 @@ describe('Ship queue, archive and actions', () => {
         pulls: {
           'fixture/repo#7': { state: 'open', merged: false, draft: false, head, branch: 'ready' },
           'fixture/repo#8': { state: 'open', merged: false, draft: false, head, branch: 'moved' },
+          'fixture/repo#9': {
+            state: 'closed',
+            merged: false,
+            draft: false,
+            head,
+            branch: 'closed',
+          },
         },
       }),
     );
     const now = Date.now();
-    const checkpoint = (issue: ShipIssue, status: 'active' | 'failed') => ({
+    const checkpoint = (issue: ShipIssue, status: 'active' | 'failed' | 'cancelled') => ({
       ...fixture().issues[0].checkpoint!,
       taskId: issue.id,
       sequence: 3,
@@ -191,6 +207,16 @@ describe('Ship queue, archive and actions', () => {
       workerSettled: true,
     };
     failed.checkpoint = checkpoint(failed, 'failed');
+    const closed: ShipIssue = {
+      ...readyIssue('closed', 15, 9),
+      title: 'Closed fixture',
+      dependsOn: ['fixture/other#900'],
+      state: 'failed',
+      error: 'Pull request closed without merging.',
+      pullRequestState: 'CLOSED',
+      pullRequestMergeable: null,
+    };
+    closed.checkpoint = checkpoint(closed, 'cancelled');
     const pending: ShipIssue = {
       ...fixture().issues[1],
       id: 'queued',
@@ -217,7 +243,7 @@ describe('Ship queue, archive and actions', () => {
         title: 'Queue fixture',
         url: 'https://github.com/fixture/repo/issues/10',
       },
-      issues: [readyIssue('ready', 11, 7), readyIssue('moved', 14, 8), failed, pending],
+      issues: [readyIssue('ready', 11, 7), readyIssue('moved', 14, 8), failed, closed, pending],
     };
     const stoppable: ShipRun = {
       ...active,
@@ -373,6 +399,44 @@ describe('Ship queue, archive and actions', () => {
     expect(issue.checkpoint?.status).toBe('active');
     expect(issue.checkpoint?.sequence).toBe(4);
     await expect(row('failed').$('[data-ship-action="retry"]')).not.toExist();
+  });
+
+  it('reopen restores a pull request closed without merging after confirmation', async () => {
+    const reopen = row('closed').$('[data-ship-action="reopen"]');
+    await expect(reopen).toBeEnabled();
+    await expect(row('closed').$('[data-ship-action="retry"]')).not.toExist();
+    await captureThemes(2560, 1440, 'ship-queue-reopen');
+    await captureThemes(1920, 1200, 'ship-queue-reopen');
+    await setTheme('light');
+    await browser.setWindowSize(390, 850);
+    expect(
+      await browser.execute(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+    ).toBe(true);
+    await browser.setWindowSize(1280, 850);
+    const before = calls().length;
+    await reopen.click();
+    await confirm(/Reopen pull request #9 for #15 Closed fixture\?/);
+    await expect($('[data-ship-result]')).toHaveText(
+      expect.stringContaining('Pull request reopened'),
+    );
+    expect(calls().slice(before)).toEqual([
+      { method: 'PATCH', endpoint: 'repos/fixture/repo/pulls/9', fields: ['state=open'] },
+    ]);
+    await browser.waitUntil(async () => {
+      const issue = (await storedRuns())
+        .find((run) => run.id === 'active-run')
+        ?.issues.find((item) => item.id === 'closed');
+      return issue?.state === 'pending' && issue.pullRequestState === 'OPEN';
+    });
+    const issue = (await storedRuns())
+      .find((run) => run.id === 'active-run')!
+      .issues.find((item) => item.id === 'closed')!;
+    expect(issue.error).toBeNull();
+    expect(issue.checkpoint?.status).toBe('active');
+    expect(issue.checkpoint?.nextAction).toContain('was reopened');
+    await expect(row('closed').$('[data-ship-action="reopen"]')).not.toExist();
   });
 
   it('stop run cancels every unfinished issue, then archive hides the run', async () => {

@@ -297,6 +297,84 @@ pub async fn ship_merge_pull_request(
     .map_err(|error| error.to_string())?
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShipReopenRequest {
+    repository: String,
+    expected_repository: String,
+    pull_request: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShipReopenOutcome {
+    head: String,
+    pull_request: String,
+    already_open: bool,
+}
+
+/// Reopens a pull request closed without merging. A merged pull request is never touched.
+pub(crate) fn reopen_pull_request(
+    request: &ShipReopenRequest,
+    github: &mut dyn FnMut(Vec<String>) -> Result<String, String>,
+) -> Result<ShipReopenOutcome, String> {
+    let (target, number) = parse_pull_request_url(&request.pull_request)?;
+    if !target.eq_ignore_ascii_case(&request.expected_repository) {
+        return Err(format!(
+            "The pull request belongs to {target}, not {}.",
+            request.expected_repository
+        ));
+    }
+    let endpoint = format!("repos/{target}/pulls/{number}");
+    let details = github(vec!["api".to_string(), endpoint.clone()])?;
+    let details: serde_json::Value = serde_json::from_str(&details)
+        .map_err(|_| "GitHub returned invalid pull request details.".to_string())?;
+    if details["merged"] == true {
+        return Err("The pull request is already merged.".to_string());
+    }
+    let head = details["head"]["sha"]
+        .as_str()
+        .ok_or("GitHub returned a pull request without a head revision.")?
+        .to_string();
+    let already_open = details["state"] == "open";
+    if !already_open {
+        github(vec![
+            "api".to_string(),
+            "--method".to_string(),
+            "PATCH".to_string(),
+            endpoint,
+            "-f".to_string(),
+            "state=open".to_string(),
+        ])
+        .map_err(|error| {
+            format!(
+                "GitHub could not reopen the pull request. Its branch may have been deleted or force-pushed. {error}"
+            )
+        })?;
+    }
+    Ok(ShipReopenOutcome {
+        head,
+        pull_request: request.pull_request.clone(),
+        already_open,
+    })
+}
+
+#[tauri::command]
+pub async fn ship_reopen_pull_request(
+    request: ShipReopenRequest,
+) -> Result<ShipReopenOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = PathBuf::from(crate::validate_repository(request.repository.clone())?);
+        crate::github::require_target_repository(&repository, &request.expected_repository)?;
+        reopen_pull_request(&request, &mut |arguments| {
+            let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+            crate::github::gh_output(&repository, &arguments)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 pub async fn ship_issue_title(repository: String, reference: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -369,6 +447,95 @@ mod tests {
 
     fn open_pull_request(head: &str) -> String {
         format!(r#"{{"state":"open","merged":false,"draft":false,"head":{{"sha":"{head}"}}}}"#)
+    }
+
+    fn reopen_request(pull_request: &str) -> ShipReopenRequest {
+        ShipReopenRequest {
+            repository: "repo".to_string(),
+            expected_repository: "Owner/Repo".to_string(),
+            pull_request: pull_request.to_string(),
+        }
+    }
+
+    #[test]
+    fn reopen_patches_only_a_closed_unmerged_pull_request() {
+        let closed = format!(r#"{{"state":"closed","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
+        let mut calls = Vec::new();
+        let outcome = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |arguments| {
+                calls.push(arguments.join(" "));
+                Ok(if calls.len() == 1 {
+                    closed.clone()
+                } else {
+                    "{}".to_string()
+                })
+            },
+        )
+        .unwrap();
+        assert!(!outcome.already_open);
+        assert_eq!(outcome.head, HEAD);
+        assert_eq!(
+            calls,
+            [
+                "api repos/owner/repo/pulls/7",
+                "api --method PATCH repos/owner/repo/pulls/7 -f state=open",
+            ]
+        );
+    }
+
+    #[test]
+    fn reopen_refuses_merged_foreign_and_unreopenable_pull_requests() {
+        let merged = format!(r#"{{"state":"closed","merged":true,"head":{{"sha":"{HEAD}"}}}}"#);
+        let mut calls = 0;
+        let error = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                Ok(merged.clone())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("already merged"));
+        assert_eq!(calls, 1);
+
+        let error = reopen_pull_request(
+            &reopen_request("https://github.com/other/repo/pull/7"),
+            &mut |_| panic!("no GitHub call for another repository"),
+        )
+        .unwrap_err();
+        assert!(error.contains("belongs to other/repo"));
+
+        let closed = format!(r#"{{"state":"closed","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
+        let error = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |arguments| {
+                if arguments.contains(&"PATCH".to_string()) {
+                    Err("HTTP 422".to_string())
+                } else {
+                    Ok(closed.clone())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("could not reopen"));
+        assert!(error.contains("HTTP 422"));
+    }
+
+    #[test]
+    fn reopen_leaves_an_open_pull_request_alone() {
+        let open = format!(r#"{{"state":"open","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
+        let mut calls = 0;
+        let outcome = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                Ok(open.clone())
+            },
+        )
+        .unwrap();
+        assert!(outcome.already_open);
+        assert_eq!(calls, 1);
     }
 
     #[test]

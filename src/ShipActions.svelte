@@ -4,12 +4,14 @@
     shipArchiveAction,
     shipIssueTarget,
     shipMergeAction,
+    shipReopenAction,
     shipRetryAction,
     shipRunTarget,
     shipStopAction,
     type ShipActionId,
   } from './lib/ship-actions';
   import { shipRunArchived } from './lib/ship-archive';
+  import { shipClosedWithoutMerge } from './lib/ship-progress';
 
   let {
     run,
@@ -38,6 +40,7 @@
 
   const merge = $derived(issue ? shipMergeAction(issue) : null);
   const retry = $derived(issue ? shipRetryAction(issue) : null);
+  const reopen = $derived(issue && shipClosedWithoutMerge(issue) ? shipReopenAction(issue) : null);
   const stop = $derived(shipStopAction(run));
   const archive = $derived(shipArchiveAction(run));
 </script>
@@ -67,7 +70,12 @@
         shipIssueTarget(issue),
         merge,
       )}{/if}
-    {#if issue.state === 'failed' && retry}{@render action(
+    {#if reopen}{@render action(
+        'reopen',
+        'Reopen',
+        shipIssueTarget(issue),
+        reopen,
+      )}{:else if issue.state === 'failed' && retry}{@render action(
         'retry',
         'Retry',
         shipIssueTarget(issue),
