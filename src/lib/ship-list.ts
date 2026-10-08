@@ -160,15 +160,17 @@ const stageLabels: Record<(typeof stages)[number], string> = {
 };
 
 const gateSelectors: Partial<Record<(typeof stages)[number], string[]>> = {
-  reviewing: ['code-adversary', 'findings-adversary', 'adversarial-review'],
-  testing: ['test-adversary', 'adversarial-test'],
-  ci: ['ci'],
+  reviewing: ['code-adversary', 'findings-adversary'],
+  testing: ['test-adversary'],
 };
+
+const placeholderGates = ['code-adversary', 'findings-adversary', 'test-adversary'];
 
 function requiredGateNames(issue: ShipIssue): string[] | null {
   if (issue.validationPolicy) return issue.validationPolicy.requiredGates;
-  if (checkpointTouched(issue) && issue.checkpoint) return issue.checkpoint.requiredGates;
-  return null;
+  const gates = checkpointTouched(issue) ? issue.checkpoint?.requiredGates : undefined;
+  if (!gates || gates.join() === placeholderGates.join()) return null;
+  return gates;
 }
 
 function stageRequired(stage: (typeof stages)[number], required: string[] | null): boolean {
@@ -228,18 +230,22 @@ export function shipStageIndicator(issue: ShipIssue): ShipStageIndicator {
 /** The checkpoint's reconciliation result is the only source of a delivery mismatch. */
 export function shipDeliveryMismatch(issue: ShipIssue): string | null {
   const result = issue.checkpointReconciliation;
-  if (!result || result.resumable || !result.reason) return null;
+  if (!result || result.resumable || !result.reason || issue.state === 'merged') return null;
   if (issue.checkpoint?.status === 'blocked' && result.reason === issue.checkpoint.blocker)
     return null;
   return result.reason;
 }
 
 export function shipTaskObjective(issue: ShipIssue): string | null {
-  return checkpointTouched(issue) ? (issue.checkpoint?.objective ?? null) : null;
+  const objective = checkpointTouched(issue) ? issue.checkpoint?.objective : undefined;
+  return objective && objective !== issue.title ? objective : null;
 }
 
 export function shipTaskCriteria(issue: ShipIssue): string[] {
-  return checkpointTouched(issue) ? (issue.checkpoint?.acceptanceCriteria ?? []) : [];
+  const placeholder = `Satisfy the acceptance criteria in ${issue.url}.`;
+  return checkpointTouched(issue)
+    ? (issue.checkpoint?.acceptanceCriteria ?? []).filter((criterion) => criterion !== placeholder)
+    : [];
 }
 
 export function adjacentRowId(ids: string[], current: string | null, step: 1 | -1): string | null {

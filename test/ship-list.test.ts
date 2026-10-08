@@ -272,7 +272,7 @@ void test('gates a risk policy did not select show as not required', () => {
   });
   const states = Object.fromEntries(shipStageIndicator(issue).steps.map((s) => [s.id, s.state]));
   assert.equal(states.reviewing, 'not-required');
-  assert.equal(states.ci, 'not-required');
+  assert.equal(states.ci, 'upcoming', 'CI is not a validation gate');
   assert.equal(states.testing, 'upcoming');
   assert.equal(states.implementing, 'current');
 });
@@ -280,7 +280,7 @@ void test('gates a risk policy did not select show as not required', () => {
 void test('requiredGates from a touched checkpoint also select stages', () => {
   const run = fixture(1);
   const issue = working(run.issues[0], 'reviewing');
-  touched(issue, { requiredGates: ['adversarial-review', 'ci'] }, 5);
+  touched(issue, { requiredGates: ['code-adversary', 'findings-adversary'] }, 5);
   const states = Object.fromEntries(shipStageIndicator(issue).steps.map((s) => [s.id, s.state]));
   assert.equal(states.reviewing, 'current');
   assert.equal(states.testing, 'not-required');
@@ -360,4 +360,29 @@ void test('reconciliation survives a save and load', async () => {
     restored.issues[0].checkpointReconciliation,
     run.issues[0].checkpointReconciliation,
   );
+});
+
+void test('placeholder fields stay hidden even after a partial worker update', () => {
+  const run = fixture(1);
+  const issue = run.issues[0];
+  touched(issue, { nextAction: 'Explore the code' }, 5);
+  assert.equal(shipTaskObjective(issue), null);
+  assert.deepEqual(shipTaskCriteria(issue), []);
+  assert.ok(shipStageIndicator(issue).steps.every((step) => step.state !== 'not-required'));
+});
+
+void test('duplicate criteria and merged issues are handled', () => {
+  const run = fixture(1);
+  const issue = run.issues[0];
+  touched(issue, { acceptanceCriteria: ['Tests pass', 'Tests pass'] }, 5);
+  assert.deepEqual(shipTaskCriteria(issue), ['Tests pass', 'Tests pass']);
+  issue.checkpointReconciliation = {
+    revisionMatches: true,
+    resumable: false,
+    deliveryState: 'merged',
+    issueState: 'OPEN',
+    reason: 'stale',
+  };
+  Object.assign(issue, { state: 'merged' as const });
+  assert.equal(shipDeliveryMismatch(issue), null);
 });

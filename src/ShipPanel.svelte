@@ -541,7 +541,7 @@
                 The worker has not recorded the task contract yet.
               </p>{/if}
             {#if criteria.length}<ol class="ship-gates">
-                {#each criteria as criterion (criterion)}
+                {#each criteria as criterion, index (`${index}:${criterion}`)}
                   <li>
                     <strong
                       >{evidence.unverifiedCriteria.includes(criterion)
