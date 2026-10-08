@@ -17,6 +17,8 @@ import {
   loadSpawnReceipts,
   openCodePromptHasBackendEvidence,
   openCodePromptHasHistoryEvidence,
+  openCodePromptRecoveryAction,
+  openCodePromptSettlement,
   receiptForSource,
   receiptNeedsRefresh,
   receiptIsSettled,
@@ -498,6 +500,46 @@ await test('OpenCode handoff recovery finds a durable prompt beyond the newest 5
   );
 
   assert.equal(dispatched, true);
+});
+
+await test('completed OpenCode handoff settlement finds its prompt beyond the newest 50 messages', async () => {
+  const handoff = {
+    prompt: 'Continue from the canonical checkpoint',
+    turnId: 'handoff-turn',
+  };
+  const pages = new Map([
+    [
+      undefined,
+      {
+        data: Array.from({ length: 50 }, (_, index) => ({
+          type: 'assistant',
+          text: `Completed output ${index}`,
+        })),
+        cursor: { next: 'older' },
+      },
+    ],
+    [
+      'older',
+      {
+        data: [{ type: 'user', text: 'Continue from the canonical checkpoint' }],
+        cursor: { next: null },
+      },
+    ],
+  ]);
+
+  const settled = await openCodePromptSettlement(handoff, 'succeeded', async (cursor) =>
+    pages.get(cursor)!,
+  );
+
+  assert.deepEqual(settled, { state: 'completed', result: null });
+});
+
+await test('unrelated OpenCode activity after a pre-dispatch crash requires inspection', () => {
+  assert.equal(openCodePromptRecoveryAction(false, true, undefined), 'inspect');
+});
+
+await test('unrelated OpenCode outcome after a pre-dispatch crash requires inspection', () => {
+  assert.equal(openCodePromptRecoveryAction(false, false, 'succeeded'), 'inspect');
 });
 
 await test('owned handoff prompts recover across every unsettled restart window', () => {

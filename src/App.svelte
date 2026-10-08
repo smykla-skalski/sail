@@ -331,6 +331,8 @@
     loadSpawnReceipts,
     openCodePromptHasBackendEvidence,
     openCodePromptHasHistoryEvidence,
+    openCodePromptRecoveryAction,
+    openCodePromptSettlement,
     receiptForSource,
     receiptNeedsRefresh,
     receiptIsSettled,
@@ -2678,13 +2680,7 @@
     handoff: NonNullable<ShipIssue['contextHandoffs']>[number],
   ): Promise<void> {
     const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
-    if (
-      !receipt ||
-      receipt.provider === 'opencode' ||
-      !receipt.targetId ||
-      !receipt.turnId ||
-      !handoffReceiptNeedsResolution(receipt)
-    )
+    if (!receipt || !receipt.targetId || !receipt.turnId || !handoffReceiptNeedsResolution(receipt))
       throw new Error('This handoff no longer needs provider inspection.');
     const confirmed = await confirmInApp(
       'Cancel and retry context handoff?',
@@ -2692,8 +2688,16 @@
       'Cancel and retry',
     );
     if (!confirmed) return;
-    const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
-    await acp.cancel(receipt.provider, sessionId, receipt.turnId);
+    if (receipt.provider === 'opencode') {
+      if (!client) throw new Error('OpenCode is unavailable, so this handoff cannot be retried.');
+      const sessionId = receipt.targetId.slice('opencode:'.length);
+      const active = await client.session.active();
+      if (active[sessionId]?.type === 'running')
+        await client.session.interrupt({ sessionID: sessionId });
+    } else {
+      const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
+      await acp.cancel(receipt.provider, sessionId, receipt.turnId);
+    }
     updateSpawnReceipt(receipt.receiptId, {
       state: 'interrupted',
       error: 'Cancelled after provider inspection before a safe retry.',
@@ -3925,37 +3929,20 @@
       updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
       return;
     }
-    const page = await source.message.list({ sessionID: sessionId, limit: 50, order: 'desc' });
-    const users = page.data.filter((message) => message.type === 'user');
-    if (users.length !== 1 || users[0].text !== receipt.prompt) {
-      updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
-      return;
-    }
-    const idle = page.data.find((message) => message.type === 'idle');
-    const finished = idle?.outcome ?? outcome;
-    if (!finished) {
-      updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
-      return;
-    }
-    const result =
-      page.data
-        .flatMap((message) =>
-          message.type === 'assistant' && message.time.completed
-            ? message.content.flatMap((part) => (part.type === 'text' ? [part.text] : []))
-            : [],
-        )
-        .join('\n')
-        .slice(-16_000) || null;
-    updateSpawnReceipt(receipt.receiptId, {
-      state:
-        finished === 'succeeded' ? 'completed' : finished === 'failed' ? 'failed' : 'interrupted',
-      result,
-    });
+    const settled = await openCodePromptSettlement(receipt, outcome, (cursor) =>
+      source.message.list({
+        sessionID: sessionId,
+        limit: 50,
+        ...(cursor ? { cursor } : { order: 'desc' }),
+      }),
+    );
+    updateSpawnReceipt(receipt.receiptId, settled);
   }
 
   async function currentSpawnReceipt(receipt: SpawnReceipt): Promise<SpawnReceipt> {
     receipt = spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
     if (!receiptNeedsRefresh(receipt)) return receipt;
+    if (handoffReceiptNeedsResolution(receipt)) return receipt;
     if (activeSpawnRequests.has(receipt.receiptId)) return receipt;
     if (
       !receipt.targetId ||
@@ -4020,18 +4007,28 @@
       ]);
       if (session.location.directory !== receipt.targetDirectory)
         throw new Error('Target session moved to another worktree.');
-      if (
-        active[sessionId]?.type === 'running' ||
-        session.outcome ||
-        (await openCodePromptHasHistoryEvidence(receipt, inbox, (cursor) =>
-          source.message.list({
-            sessionID: sessionId,
-            limit: 50,
-            ...(cursor ? { cursor } : { order: 'desc' }),
-          }),
-        ))
-      )
+      const hasPromptEvidence = await openCodePromptHasHistoryEvidence(receipt, inbox, (cursor) =>
+        source.message.list({
+          sessionID: sessionId,
+          limit: 50,
+          ...(cursor ? { cursor } : { order: 'desc' }),
+        }),
+      );
+      const recovery = openCodePromptRecoveryAction(
+        hasPromptEvidence,
+        active[sessionId]?.type === 'running',
+        session.outcome,
+      );
+      if (recovery === 'adopt') return;
+      if (recovery === 'inspect') {
+        updateSpawnReceipt(receipt.receiptId, {
+          state: 'unavailable',
+          error:
+            'Prompt dispatch may have completed before restart; inspect the restored provider session before cancelling and retrying.',
+        });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
         return;
+      }
       const turnId = receipt.turnId ?? crypto.randomUUID();
       if (!receipt.turnId) {
         updateSpawnReceipt(receipt.receiptId, { turnId });

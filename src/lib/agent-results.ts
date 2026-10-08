@@ -290,25 +290,88 @@ export function openCodePromptHasBackendEvidence(
   );
 }
 
+export type OpenCodePromptRecoveryAction = 'adopt' | 'inspect' | 'dispatch';
+
+type OpenCodeHistoryMessage = {
+  type: string;
+  text?: string;
+  outcome?: 'succeeded' | 'failed' | 'interrupted';
+  time?: { created?: number; completed?: number };
+  content?: Array<{ type: string; text?: string }>;
+};
+
+type OpenCodeHistoryPage = {
+  data: OpenCodeHistoryMessage[];
+  cursor: { next?: string | null };
+};
+
+export function openCodePromptRecoveryAction(
+  hasPromptEvidence: boolean,
+  active: boolean,
+  outcome: 'succeeded' | 'failed' | 'interrupted' | undefined,
+): OpenCodePromptRecoveryAction {
+  if (hasPromptEvidence) return 'adopt';
+  if (active || outcome) return 'inspect';
+  return 'dispatch';
+}
+
+async function loadOpenCodePromptHistory(
+  receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
+  inbox: Array<{ id: string }>,
+  loadPage: (cursor?: string) => Promise<OpenCodeHistoryPage>,
+): Promise<{ hasPromptEvidence: boolean; latestMessages: OpenCodeHistoryMessage[] }> {
+  const seen = new Set<string>();
+  async function search(
+    latestMessages: OpenCodeHistoryMessage[] | undefined,
+    cursor?: string,
+  ): Promise<{ hasPromptEvidence: boolean; latestMessages: OpenCodeHistoryMessage[] }> {
+    const page = await loadPage(cursor);
+    const latest = latestMessages ?? page.data;
+    if (openCodePromptHasBackendEvidence(receipt, page.data, inbox))
+      return { hasPromptEvidence: true, latestMessages: latest };
+    const next = page.cursor.next ?? undefined;
+    if (!next) return { hasPromptEvidence: false, latestMessages: latest };
+    if (seen.has(next)) throw new Error('OpenCode message history cursor did not advance.');
+    seen.add(next);
+    return search(latest, next);
+  }
+  return search(undefined);
+}
+
 export async function openCodePromptHasHistoryEvidence(
   receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
   inbox: Array<{ id: string }>,
-  loadPage: (cursor?: string) => Promise<{
-    data: Array<{ type: string; text?: string }>;
-    cursor: { next?: string | null };
-  }>,
+  loadPage: (cursor?: string) => Promise<OpenCodeHistoryPage>,
 ): Promise<boolean> {
-  const seen = new Set<string>();
-  async function search(cursor?: string): Promise<boolean> {
-    const page = await loadPage(cursor);
-    if (openCodePromptHasBackendEvidence(receipt, page.data, inbox)) return true;
-    const next = page.cursor.next ?? undefined;
-    if (!next) return false;
-    if (seen.has(next)) throw new Error('OpenCode message history cursor did not advance.');
-    seen.add(next);
-    return search(next);
-  }
-  return search();
+  return (await loadOpenCodePromptHistory(receipt, inbox, loadPage)).hasPromptEvidence;
+}
+
+export async function openCodePromptSettlement(
+  receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
+  outcome: 'succeeded' | 'failed' | 'interrupted' | undefined,
+  loadPage: (cursor?: string) => Promise<OpenCodeHistoryPage>,
+): Promise<Pick<SpawnReceipt, 'state' | 'result'>> {
+  const history = await loadOpenCodePromptHistory(receipt, [], loadPage);
+  if (!history.hasPromptEvidence) return { state: 'unavailable', result: null };
+  const idle = history.latestMessages.find((message) => message.type === 'idle');
+  const finished = idle?.outcome ?? outcome;
+  if (!finished) return { state: 'unavailable', result: null };
+  const result =
+    history.latestMessages
+      .flatMap((message) =>
+        message.type === 'assistant' && message.time?.completed
+          ? (message.content ?? []).flatMap((part) =>
+              part.type === 'text' ? [part.text ?? ''] : [],
+            )
+          : [],
+      )
+      .join('\n')
+      .slice(-16_000) || null;
+  return {
+    state:
+      finished === 'succeeded' ? 'completed' : finished === 'failed' ? 'failed' : 'interrupted',
+    result,
+  };
 }
 
 export function acpTurnEvidenceState(evidence: AcpTurnEvidence | null): SpawnState | null {
