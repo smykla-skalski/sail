@@ -39,8 +39,11 @@ const SENSITIVE_KEYS: [&str; 17] = [
     "session_id",
     "session-id",
 ];
-const SECRET_PREFIXES: [&str; 12] = [
+const SECRET_PREFIXES: [&str; 15] = [
     "sk-",
+    "sk_",
+    "npm_",
+    "glpat-",
     "ghp_",
     "gho_",
     "ghu_",
@@ -112,10 +115,15 @@ fn value_end(chars: &[char], start: usize) -> usize {
         return start;
     };
     if matches!(first, '"' | '\'') {
-        return chars[start + 1..]
-            .iter()
-            .position(|&c| c == first)
-            .map_or(chars.len(), |offset| start + 2 + offset);
+        let mut index = start + 1;
+        while index < chars.len() {
+            match chars[index] {
+                '\\' => index += 2,
+                c if c == first => return index + 1,
+                _ => index += 1,
+            }
+        }
+        return chars.len();
     }
     chars[start..]
         .iter()
@@ -208,7 +216,7 @@ impl Redactor {
             }
             let value_start = skip_blanks(&chars, cursor);
             output.extend(&chars[index..value_start]);
-            if lower.contains("cookie") {
+            if lower.contains("cookie") || lower.contains("authorization") {
                 output.push_str(REDACTED);
                 break;
             }
@@ -516,6 +524,30 @@ mod tests {
         let out = lines(&events).join("\n");
         assert!(!out.contains("hunter2") && !out.contains("more"), "{out}");
         assert!(out.contains("bob"));
+    }
+
+    #[test]
+    fn redacts_every_authorization_scheme_and_escaped_quotes() {
+        let cases = [
+            ("Authorization: Negotiate LEAKEDTAIL123", "LEAKEDTAIL"),
+            ("Proxy-Authorization: Negotiate YIIabcdef", "YIIabcdef"),
+            (
+                "Authorization: Digest username=bob response=LEAKEDTAIL123",
+                "LEAKEDTAIL",
+            ),
+            ("token: \"abc\\\"LEAKEDTAIL ghi\"", "LEAKEDTAIL"),
+            ("password=\"a b\\\" LEAKEDTAIL\"", "LEAKEDTAIL"),
+            ("key: sk_live_abcdefghijklmnop", "abcdefghijklmnop"),
+            (
+                "npm_abcdefghijklmnopqrstuvwxyz0123456789",
+                "abcdefghijklmnop",
+            ),
+            ("glpat-abcdefghijklmnopqrst", "abcdefghijklmnop"),
+        ];
+        for (case, secret) in cases {
+            let out = redact(case, &[]);
+            assert!(!out.contains(secret), "{case:?} -> {out:?}");
+        }
     }
 
     #[test]
