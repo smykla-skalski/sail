@@ -205,7 +205,7 @@ export async function beginShipItRun(
   const command = slashCommands(prompt).find((item) => item.name.toLowerCase() === 'ship-it');
   if (!command) return null;
   const issue =
-    /^\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
+    /^(?:\s+(?:--issue|--risk\s+(?:low|medium|high))(?=\s))*\s+(https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+|(?:[^/\s]+\/[^/\s]+)?#\d+)/i.exec(
       prompt.slice(command.end),
     )?.[1];
   if (!issue) return null;

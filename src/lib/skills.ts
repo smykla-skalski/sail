@@ -8,7 +8,7 @@ export interface SkillChoice {
 export function progressiveSkillInstructions(
   name: string,
   core: string,
-  references: string[],
+  references: readonly string[],
 ): string {
   return [
     core,

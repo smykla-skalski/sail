@@ -1154,22 +1154,79 @@ pub fn browser_pane_register(
 
 const SAIL_SKILL: &str = include_str!("../../skills/sail/SKILL.md");
 const SHIP_IT_SKILL: &str = include_str!("../../skills/ship-it/SKILL.md");
+macro_rules! ship_it_file {
+    ($path:literal) => {
+        include_str!(concat!("../../skills/ship-it/", $path))
+    };
+}
+
+// Must match src/lib/bundled-skill-catalog.ts and the files under skills/ship-it.
 const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
+    ("inputs.md", ship_it_file!("references/inputs.md")),
+    ("explore.md", ship_it_file!("references/explore.md")),
+    ("branch.md", ship_it_file!("references/branch.md")),
     (
-        "inputs.md",
-        include_str!("../../skills/ship-it/references/inputs.md"),
+        "implementation.md",
+        ship_it_file!("references/implementation.md"),
+    ),
+    ("review.md", ship_it_file!("references/review.md")),
+    ("test.md", ship_it_file!("references/test.md")),
+    ("pr-loop.md", ship_it_file!("references/pr-loop.md")),
+    ("completion.md", ship_it_file!("references/completion.md")),
+    (
+        "orchestration.md",
+        ship_it_file!("references/orchestration.md"),
     ),
     (
-        "convergence.md",
-        include_str!("../../skills/ship-it/references/convergence.md"),
+        "capabilities.md",
+        ship_it_file!("references/capabilities.md"),
     ),
     (
-        "fallbacks.md",
-        include_str!("../../skills/ship-it/references/fallbacks.md"),
+        "capabilities.json",
+        ship_it_file!("references/capabilities.json"),
+    ),
+    ("roles.md", ship_it_file!("references/roles.md")),
+    ("roles.json", ship_it_file!("references/roles.json")),
+    ("checkpoint.md", ship_it_file!("references/checkpoint.md")),
+    ("claims.md", ship_it_file!("references/claims.md")),
+    ("telemetry.md", ship_it_file!("references/telemetry.md")),
+    (
+        "telemetry.schema.json",
+        ship_it_file!("references/telemetry.schema.json"),
     ),
     (
-        "pr-loop.md",
-        include_str!("../../skills/ship-it/references/pr-loop.md"),
+        "telemetry-v1.schema.json",
+        ship_it_file!("references/telemetry-v1.schema.json"),
+    ),
+    ("evidence.md", ship_it_file!("references/evidence.md")),
+    ("risk.md", ship_it_file!("references/risk.md")),
+    (
+        "risk-policy.json",
+        ship_it_file!("references/risk-policy.json"),
+    ),
+    ("release.md", ship_it_file!("references/release.md")),
+    (
+        "release-policy.json",
+        ship_it_file!("references/release-policy.json"),
+    ),
+    ("convergence.md", ship_it_file!("references/convergence.md")),
+    (
+        "convergence-policy.json",
+        ship_it_file!("references/convergence-policy.json"),
+    ),
+    ("ci-triage.md", ship_it_file!("references/ci-triage.md")),
+    (
+        "ci-triage.schema.json",
+        ship_it_file!("references/ci-triage.schema.json"),
+    ),
+    ("fallbacks.md", ship_it_file!("references/fallbacks.md")),
+    (
+        "scripts/ci_triage.py",
+        ship_it_file!("scripts/ci_triage.py"),
+    ),
+    (
+        "scripts/telemetry.py",
+        ship_it_file!("scripts/telemetry.py"),
     ),
 ];
 const ADVERSARIAL_REVIEW_SKILL: &str = include_str!("../../skills/adversarial-review/SKILL.md");
@@ -1799,6 +1856,9 @@ mod skill_tests {
         assert!(manager.0.clients.lock().unwrap().is_empty());
     }
     use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn skill_is_announced_and_readable_without_a_browser_bridge() {
@@ -1841,12 +1901,33 @@ mod skill_tests {
         assert!(listed["structuredContent"]["coreVersion"]
             .as_str()
             .is_some_and(|version| version.starts_with("sha256:")));
-        assert_eq!(
-            listed["structuredContent"]["references"]
-                .as_array()
-                .map(Vec::len),
-            Some(4)
-        );
+        let listed_names: BTreeSet<String> = listed["structuredContent"]["references"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference["name"].as_str().map(str::to_owned))
+            .collect();
+        let skill_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/ship-it");
+        let bundled_files: BTreeSet<String> = ["references", "scripts"]
+            .into_iter()
+            .flat_map(|directory| {
+                fs::read_dir(skill_root.join(directory))
+                    .expect("bundled skill directory is readable")
+                    .filter_map(move |entry| {
+                        let name = entry
+                            .expect("bundled skill entry is readable")
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned();
+                        match (directory, name.starts_with('.')) {
+                            (_, true) => None,
+                            ("scripts", false) => Some(format!("scripts/{name}")),
+                            _ => Some(name),
+                        }
+                    })
+            })
+            .collect();
+        assert_eq!(listed_names, bundled_files);
 
         let loaded = call_bridge(&json!({
             "name":"skill_reference",
@@ -1861,13 +1942,25 @@ mod skill_tests {
             .as_str()
             .is_some_and(|text| text.contains("# Resolving the ship-it input")));
 
+        let script = call_bridge(&json!({
+            "name":"skill_reference",
+            "arguments":{"skill":"ship-it","reference":"scripts/ci_triage.py"}
+        }));
+        assert_eq!(
+            script["structuredContent"]["reference"],
+            "scripts/ci_triage.py"
+        );
+        assert!(script["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("def main(")));
+
         let convergence = call_bridge(&json!({
             "name":"skill_reference",
             "arguments":{"skill":"ship-it","reference":"convergence.md"}
         }));
         assert!(convergence["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("# ship-it convergence contract")));
+            .is_some_and(|text| text.contains("# Bounded validation convergence")));
     }
 
     #[test]
