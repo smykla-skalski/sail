@@ -9,6 +9,7 @@
     "lint": "oxlint --deny-warnings . && eslint . && prettier --check .",
     "format": "prettier --write .",
     "test": "node --test test/*.test.ts",
+    "test:agent-replay": "node scripts/replay-agent-failures.mjs",
     "test:contract": "node test/live-contract.mjs",
     "build": "npm run check && vite build",
     "build:e2e": "tauri build --debug --no-bundle --features e2e --config src-tauri/tauri.e2e.conf.json",

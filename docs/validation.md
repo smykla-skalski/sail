@@ -40,6 +40,26 @@ Use a clean user profile, the compatibility baseline above, a disposable Git rep
 
 Record failures with the exact versions, OS, step, visible error, and relevant OpenCode log. Do not claim the credentialed Architect flow passed from the contract test alone: it does not invoke a model, create prompts, or generate file changes.
 
+## Agent workflow failure replay
+
+The redacted corpus in `test/fixtures/agent-failures/corpus.json` captures failures that must remain fixed across Claude, Codex, and OpenCode. Add a case when a production or manual-validation failure exposes a reusable workflow boundary. Remove repository names, revisions, credentials, user data, and absolute paths before committing it.
+
+Run the matrix with one profile entry per routing or workflow policy under evaluation:
+
+```sh
+npm run test:agent-replay -- \
+  --config replay-config.json \
+  --corpus test/fixtures/agent-failures/corpus.json \
+  --output replay-output-candidate \
+  --baseline replay-output-current/report.json
+```
+
+The config names a release, providers, profiles, and one runner command per provider. Runner arguments must contain `{input}` and `{output}` placeholders. Sail gives every matrix entry a private working directory, home, temporary directory, XDG directories, and stable seed. Only environment variables named in `forwardEnvironment` enter the run.
+
+Each runner reads the invocation JSON and writes an observation JSON with evidence-backed grades for ownership, acceptance, evidence freshness, permission behavior, recovery, and final outcome. It also records elapsed time, turns, tool calls, permission requests, retries, human interventions, failed commands, and repeated work. A task is accepted only when its outcome and all six grades pass.
+
+When a baseline is supplied, the command fails before a policy becomes the default if any provider/profile route loses coverage, acceptance rate, or a grade pass rate. It also fails when average accepted-task cost increases by more than the configured threshold, which defaults to 15 percent. Keep the generated report as a release artifact so routing and workflow policy changes compare against the same corpus.
+
 ## Release checklist
 
 - [ ] Bump `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` to the same version; update `Cargo.lock` and the compatibility baseline.
