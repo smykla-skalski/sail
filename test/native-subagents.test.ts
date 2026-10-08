@@ -5,10 +5,12 @@ import { automaticPermissionPolicy } from '../src/lib/capability-profiles.ts';
 import {
   disconnectNativeSubagents,
   finalizeNativeSubagentRestore,
+  nativeMessageLimit,
   nativeSubagentCounts,
   nativeSubagentReceipts,
-  reconcileNativeSubagents,
   nativeSubagentThreads,
+  nativeTranscriptLimit,
+  reconcileNativeSubagents,
   setNativeSubagentWaiting,
   updateNativeSubagents,
 } from '../src/lib/native-subagents.ts';
@@ -98,6 +100,117 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
   assert.equal(store['codex:grandchild'].transcript.length, 0);
   assert.equal(nativeSubagentReceipts(store)[0].result, null);
   assert.deepEqual(nativeSubagentCounts(store, 'codex', 'parent'), { active: 1, waiting: 0 });
+});
+
+await test('a long-running child keeps its prompt and the newest bounded transcript', () => {
+  let store = updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'worker',
+      task: 'Task',
+      prompt: 'Start here',
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+  );
+  const steps = nativeTranscriptLimit + 20;
+  for (let index = 0; index < steps; index++)
+    store = updateNativeSubagents(
+      store,
+      event('child', {
+        sessionUpdate: 'tool_call',
+        toolCallId: `tool-${index}`,
+        title: `Step ${index}`,
+        status: 'completed',
+      }),
+      '/repo',
+      index + 2,
+    );
+  for (const text of ['x'.repeat(nativeMessageLimit), 'y'.repeat(10), 'END'])
+    store = updateNativeSubagents(
+      store,
+      event('child', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } }),
+      '/repo',
+      steps + 2,
+    );
+
+  const transcript = store['codex:child'].transcript;
+  assert.equal(transcript.length, nativeTranscriptLimit);
+  assert.deepEqual(transcript[0], {
+    id: 'codex:child:prompt',
+    type: 'user',
+    text: 'Start here',
+    created: 1,
+  });
+  assert.equal(transcript[1].id, `tool-${steps - nativeTranscriptLimit + 2}`);
+  const last = transcript.at(-1);
+  assert.ok(last?.type === 'assistant');
+  assert.equal(last.text.length, nativeMessageLimit);
+  assert.ok(last.text.startsWith('…x'));
+  assert.ok(last.text.endsWith(`${'y'.repeat(10)}END`));
+  assert.equal(nativeSubagentCounts(store, 'codex', 'parent').active, 1);
+});
+
+await test('a capped message never starts inside a surrogate pair', () => {
+  for (const text of ['😀'.repeat(30_000), `${'😀'.repeat(30_000)}!`]) {
+    let store = updateNativeSubagents(
+      {},
+      event('parent', {
+        sessionUpdate: 'subagent_spawned',
+        subagentSessionId: 'child',
+        name: 'worker',
+        task: 'Task',
+        capabilities: {},
+      }),
+      '/repo',
+      1,
+    );
+    store = updateNativeSubagents(
+      store,
+      event('child', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } }),
+      '/repo',
+      2,
+    );
+    const last = store['codex:child'].transcript.at(-1);
+    assert.ok(last?.type === 'assistant');
+    assert.ok(last.text.isWellFormed());
+    assert.ok(last.text.length <= nativeMessageLimit);
+    assert.ok(last.text.length >= nativeMessageLimit - 1);
+    assert.ok(text.endsWith(last.text.slice(1)));
+  }
+});
+
+await test('an update that changes nothing leaves a long spawn prompt whole', () => {
+  const prompt = 'P'.repeat(nativeMessageLimit + 10_000);
+  let store = updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'worker',
+      task: 'Task',
+      prompt,
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+  );
+  for (const update of [
+    { sessionUpdate: 'usage_update', used: 10, size: 100 },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Working' } },
+  ])
+    store = updateNativeSubagents(store, event('child', update), '/repo', 2);
+
+  assert.deepEqual(
+    store['codex:child'].transcript.map((entry) => [entry.type, 'text' in entry && entry.text]),
+    [
+      ['user', prompt],
+      ['assistant', 'Working'],
+    ],
+  );
 });
 
 await test('replayed lifecycle deduplicates and unfinished history disconnects', () => {
@@ -452,4 +565,150 @@ await test('a first replay still restores historical children', () => {
   const child = restored['codex:root:replay-subagent:toolu_1'];
   assert.equal(child?.restored, true);
   assert.equal(child?.rootSessionId, 'root');
+});
+
+function spawnedChild(prompt?: string) {
+  return updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'worker',
+      task: 'Task',
+      ...(prompt === undefined ? {} : { prompt }),
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+  );
+}
+
+await test('tool output is capped even when the tool is not the newest entry', () => {
+  let store = spawnedChild();
+  for (const update of [
+    { sessionUpdate: 'tool_call', toolCallId: 'shell', title: 'Run', status: 'in_progress' },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Waiting' } },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'shell',
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: 'o'.repeat(200_000) } }],
+      rawOutput: 'r'.repeat(200_000),
+    },
+  ])
+    store = updateNativeSubagents(store, event('child', update), '/repo', 2);
+
+  const tool = store['codex:child'].transcript.find((entry) => entry.id === 'shell');
+  assert.ok(tool?.type === 'tool');
+  assert.equal(tool.status, 'completed');
+  assert.equal(tool.content.length, nativeMessageLimit);
+  assert.ok(tool.content.startsWith('…o'));
+  assert.ok(typeof tool.output !== 'string' || tool.output.length <= nativeMessageLimit);
+  assert.equal(store['codex:child'].transcript.at(-1)?.type, 'assistant');
+});
+
+await test('an update for a tool the bound evicted adds no stub entry', () => {
+  let store = spawnedChild('Start here');
+  for (let index = 0; index < nativeTranscriptLimit + 5; index++)
+    store = updateNativeSubagents(
+      store,
+      event('child', {
+        sessionUpdate: 'tool_call',
+        toolCallId: `tool-${index}`,
+        title: `Step ${index}`,
+        status: 'in_progress',
+      }),
+      '/repo',
+      index + 2,
+    );
+  const before = store['codex:child'].transcript;
+  assert.ok(!before.some((entry) => entry.id === 'tool-0'));
+
+  store = updateNativeSubagents(
+    store,
+    event('child', {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tool-0',
+      status: 'completed',
+    }),
+    '/repo',
+    999,
+  );
+
+  const after = store['codex:child'].transcript;
+  assert.equal(after, before);
+  store = updateNativeSubagents(
+    store,
+    event('child', {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: `tool-${nativeTranscriptLimit + 4}`,
+      status: 'completed',
+    }),
+    '/repo',
+    1000,
+  );
+  const last = store['codex:child'].transcript.at(-1);
+  assert.ok(last?.type === 'tool');
+  assert.equal(last.status, 'completed');
+});
+
+await test('a chunk appended to a long spawn prompt keeps the prompt start', () => {
+  const prompt = `START${'P'.repeat(nativeMessageLimit + 10_000)}`;
+  const store = updateNativeSubagents(
+    spawnedChild(prompt),
+    event('child', {
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: 'more' },
+    }),
+    '/repo',
+    2,
+  );
+
+  const first = store['codex:child'].transcript[0];
+  assert.ok(first.type === 'user');
+  assert.ok(first.text.startsWith('START'));
+  assert.ok(first.text.endsWith('more'));
+});
+
+await test('structured tool input and output are capped as text', () => {
+  const big = 'Y'.repeat(100_000);
+  const store = updateNativeSubagents(
+    spawnedChild(),
+    event('child', {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'write',
+      title: 'Write',
+      rawInput: { command: 'write', content: big },
+      rawOutput: { stdout: big, done: true },
+    }),
+    '/repo',
+    2,
+  );
+
+  const tool = store['codex:child'].transcript.find((entry) => entry.id === 'write');
+  assert.ok(tool?.type === 'tool');
+  assert.ok(typeof tool.input === 'string' && tool.input.length === nativeMessageLimit);
+  assert.ok(tool.input.startsWith('{"command":"write"'));
+  assert.ok(typeof tool.output === 'string' && tool.output.length === nativeMessageLimit);
+  assert.ok(tool.output.endsWith('"done":true}'));
+});
+
+await test('small structured tool values stay structured', () => {
+  const store = updateNativeSubagents(
+    spawnedChild(),
+    event('child', {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'read',
+      title: 'Read',
+      rawInput: { path: '/repo/a.ts' },
+      rawOutput: { lines: 3 },
+    }),
+    '/repo',
+    2,
+  );
+
+  const tool = store['codex:child'].transcript.find((entry) => entry.id === 'read');
+  assert.ok(tool?.type === 'tool');
+  assert.deepEqual(tool.input, { path: '/repo/a.ts' });
+  assert.deepEqual(tool.output, { lines: 3 });
 });
