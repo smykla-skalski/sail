@@ -109,6 +109,7 @@
     registeredShipBranch,
     refreshShippingIssueAfterClaim,
     resumedShippingIssueChanges,
+    serializeShippingClaimOperation,
     resolvedWorkerModel,
     settleClosedPullRequest,
     shippingClockWasSuspended,
@@ -577,7 +578,7 @@
   const shippingPromptGenerations = new SvelteMap<string, number>();
   const shippingPromptDispatches = createPromptDispatchTracker();
   const shippingPromptRecoveryTimeoutMillis = 150_000;
-  const shipClaimAcquisitions = new SvelteMap<string, Promise<ShippingClaim>>();
+  const shipClaimOperations = new SvelteMap<string, Promise<void>>();
   const shippingInstanceId = crypto.randomUUID();
   let shippingClockWall = Date.now();
   let shippingClockMonotonic = performance.now();
@@ -3517,9 +3518,13 @@
     directHandoff = false,
   ): Promise<ShippingClaim> {
     const key = `${run.id}:${issue.id}`;
-    const pending = shipClaimAcquisitions.get(key);
-    if (pending) return pending;
-    const acquisition = (async () => {
+    return serializeShippingClaimOperation(shipClaimOperations, key, async () => {
+      const existing = issue.claim;
+      if (existing && shippingClaimOwnedByInstance(existing, shippingInstanceId)) {
+        if (directHandoff && issue.state === 'failed')
+          await updateShipIssue(run, issue, directClaimHandoffChanges(issue, existing));
+        return existing;
+      }
       const leaseStartedAt = performance.now();
       const acquiredAt = new Date().toISOString();
       const claim = await invoke<ShippingClaim>('acquire_shipping_claim', {
@@ -3568,13 +3573,7 @@
         nextClaimHeartbeatDeadline(performance.now(), leaseDeadline),
       );
       return claim;
-    })();
-    shipClaimAcquisitions.set(key, acquisition);
-    try {
-      return await acquisition;
-    } finally {
-      shipClaimAcquisitions.delete(key);
-    }
+    });
   }
 
   function clearShippingClaimLeaseFence(validationKey: string): void {
@@ -3996,6 +3995,19 @@
     revalidate = false,
     forceHeartbeat = false,
     resumeFence = false,
+  ): Promise<boolean> {
+    const key = `${run.id}:${issue.id}`;
+    return serializeShippingClaimOperation(shipClaimOperations, key, () =>
+      refreshShippingClaimLocked(run, issue, revalidate, forceHeartbeat, resumeFence),
+    );
+  }
+
+  async function refreshShippingClaimLocked(
+    run: ShipRun,
+    issue: ShipIssue,
+    revalidate: boolean,
+    forceHeartbeat: boolean,
+    resumeFence: boolean,
   ): Promise<boolean> {
     const claim = issue.claim;
     if (!claim || claim.status !== 'active') return true;

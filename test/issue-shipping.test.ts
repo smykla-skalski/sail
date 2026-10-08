@@ -46,6 +46,7 @@ import {
   shippingClockWasSuspended,
   shippingClaimOwnedByInstance,
   shippingWorkerSettled,
+  serializeShippingClaimOperation,
   shippingSetupAction,
   terminalClaimReleaseReady,
   type DirectShipAuthorization,
@@ -1459,6 +1460,43 @@ void test('same-thread retry continues with its existing failed shipping run', a
   assert.equal(adopted, true);
   assert.equal(current.length, 1);
   assert.equal(current[0].issues[0].state, 'failed');
+});
+
+void test('same-thread retry waits for the monitor heartbeat before renewing', async () => {
+  const operations = new Map<string, Promise<void>>();
+  let revision = 0;
+  let retrySubmittedRevision: number | null = null;
+  let releaseFirst!: () => void;
+  const firstBlocked = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let firstStarted!: () => void;
+  const firstEntered = new Promise<void>((resolve) => {
+    firstStarted = resolve;
+  });
+  let secondEntered = false;
+
+  const first = serializeShippingClaimOperation(operations, 'run:issue', async () => {
+    firstStarted();
+    const submitted = revision;
+    await firstBlocked;
+    revision = submitted + 1;
+  });
+  await firstEntered;
+  const second = serializeShippingClaimOperation(operations, 'run:issue', async () => {
+    secondEntered = true;
+    const submitted = revision;
+    retrySubmittedRevision = submitted;
+    revision = submitted + 1;
+  });
+
+  await Promise.resolve();
+  assert.equal(secondEntered, false);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.equal(revision, 2);
+  assert.equal(retrySubmittedRevision, 1);
+  assert.equal(operations.size, 0);
 });
 
 void test('uses one recorded implementation model as the missing worker model', () => {

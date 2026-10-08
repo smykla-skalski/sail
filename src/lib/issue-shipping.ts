@@ -48,6 +48,26 @@ export interface PromptDispatchTracker {
   track: <T>(key: string, start: () => T) => T;
 }
 
+export async function serializeShippingClaimOperation<T>(
+  operations: Map<string, Promise<void>>,
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = operations.get(key);
+  let finish!: () => void;
+  const current = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  operations.set(key, current);
+  if (previous) await previous;
+  try {
+    return await operation();
+  } finally {
+    finish();
+    if (operations.get(key) === current) operations.delete(key);
+  }
+}
+
 export type BoundedPromptDispatch<T> =
   | { status: 'acknowledged'; value: T }
   | { status: 'failed'; cause: unknown }
