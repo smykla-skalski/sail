@@ -393,6 +393,63 @@ void test('the evidence bound retains each latest gate above a full command hist
   );
 });
 
+void test('older required evidence remains merge-ready after later commands fill the bound', () => {
+  const requiredCriteria = ['criterion-one', 'criterion-two', 'criterion-three'];
+  const requiredGates = ['code-adversary', 'findings-adversary', 'test-adversary'];
+  let manifests: EvidenceManifest[] = [];
+  for (const [index, name] of requiredGates.entries())
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision',
+      requiredCriteria,
+      evidence({
+        id: `required-gate-${index}`,
+        name,
+        timestamp: index + 1,
+        criteria: [],
+      }),
+    );
+  manifests = recordTaskEvidence(
+    manifests,
+    'revision',
+    requiredCriteria,
+    evidence({
+      id: 'required-criteria',
+      kind: 'command',
+      name: 'task contract',
+      timestamp: 4,
+      criteria: requiredCriteria,
+    }),
+  );
+  for (let index = 0; index < 100; index += 1)
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision',
+      requiredCriteria,
+      evidence({
+        id: `later-command-${index}`,
+        kind: 'command',
+        name: `later command ${index}`,
+        timestamp: 10 + index,
+        criteria: [],
+      }),
+    );
+
+  const retainedIds = manifests[0].evidence.map((entry) => entry.id);
+  const readiness = evidenceReadiness(manifests, 'revision', requiredGates, requiredCriteria);
+
+  assert.equal(manifests[0].evidence.length, 100);
+  assert.deepEqual(retainedIds.slice(0, 4), [
+    'required-gate-0',
+    'required-gate-1',
+    'required-gate-2',
+    'required-criteria',
+  ]);
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.missingGates, []);
+  assert.deepEqual(readiness.unverifiedCriteria, []);
+});
+
 void test('normalizes duplicate persisted revisions to the newest manifest', () => {
   const first = recordTaskEvidence([], 'revision', criteria, evidence())[0];
   const newest = {
@@ -1473,6 +1530,28 @@ void test('rekeys a transient legacy CI observation and preserves a real retry',
   summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
   assert.equal(manifests[0].evidence.length, 2);
   assert.equal(summary.totals.checks, 2);
+});
+
+void test('temporary CI identity loss keeps the enriched execution counted once', () => {
+  const url = 'https://github.test/actions/runs/identity-refresh';
+  const stable = ciEvidence(
+    { name: 'build', url, databaseId: 50, runId: 10, attempt: 1 },
+    'passed',
+    10,
+  );
+  let manifests = recordCiEvidenceObservation([], 'revision', criteria, stable);
+  const fallback = ciEvidence({ name: 'build', url, identityUncertain: true }, 'passed', 20);
+
+  manifests = reconcileCiEvidenceSnapshot(manifests, 'revision', [fallback]);
+  manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, fallback);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+
+  assert.equal(manifests[0].evidence.length, 1);
+  assert.equal(manifests[0].evidence[0].id, stable.id);
+  assert.equal(manifests[0].evidence[0].identityUncertain, false);
+  assert.equal(summary.totals.checks, 1);
+  assert.equal(summary.identityCoverageComplete, true);
+  assert.equal(summary.accepted, true);
 });
 
 void test('rekeys a compacted legacy CI failure with monotonic economics', () => {

@@ -4649,6 +4649,7 @@
               evidenceOutputReference,
               evidenceTimestamp,
               evidenceSequence,
+              evidenceEconomics: report.economics,
             },
           });
           committedReceipt = $state.snapshot(

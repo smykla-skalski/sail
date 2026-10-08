@@ -4,7 +4,7 @@ import type { SpawnReceipt, SpawnState } from './agent-results';
 import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
 import { taskCheckpointSchema } from './task-checkpoint.ts';
-import { taskEconomicsSchema } from './task-economics.ts';
+import { taskEconomicsSchema, type TaskEconomics } from './task-economics.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
@@ -71,6 +71,7 @@ export type GateMetadata = {
   evidenceOutputReference?: string;
   evidenceTimestamp?: number;
   evidenceSequence?: number;
+  evidenceEconomics?: TaskEconomics;
   protocolVersion?: 2;
 };
 
@@ -169,6 +170,7 @@ export const gateMetadataSchema = z.object({
   evidenceOutputReference: z.string().min(1).max(2000).optional(),
   evidenceTimestamp: z.number().int().nonnegative().optional(),
   evidenceSequence: z.number().int().positive().optional(),
+  evidenceEconomics: taskEconomicsSchema.optional(),
   protocolVersion: z.literal(2).optional(),
 });
 
@@ -343,6 +345,11 @@ export function rollbackValidationReceipt(
       current.validation.evidenceSequence,
       previous.validation.evidenceSequence,
       committed.validation.evidenceSequence,
+    ),
+    evidenceEconomics: restoreIfUnchanged(
+      current.validation.evidenceEconomics,
+      previous.validation.evidenceEconomics,
+      committed.validation.evidenceEconomics,
     ),
   };
   return { ...current, validation };
@@ -643,6 +650,7 @@ export function recoverValidationEvidence(
         timestamp: gate.evidenceTimestamp!,
         outputReference: gate.evidenceOutputReference!,
         criteria,
+        economics: gate.evidenceEconomics,
         ...(gate.evidenceSequence !== undefined ? { sequence: gate.evidenceSequence } : {}),
       },
       baseRevision,

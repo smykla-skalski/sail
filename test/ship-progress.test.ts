@@ -430,32 +430,42 @@ void test('durable gate receipts recover manifest evidence after restart', () =>
     selectedAt: 1,
     history: [],
   };
-  issue.gates = [
-    {
-      id: 'durable-receipt',
+  const economics = { ...emptyTaskEconomics('validator', 'test'), checks: 1 };
+  const receipt = validationReceipt();
+  Object.assign(receipt, {
+    receiptId: 'durable-receipt',
+    targetId: 'validator',
+    state: 'completed',
+    created: 10,
+    updated: 11,
+    validation: {
+      ...receipt.validation,
       gate: 'test-adversary',
-      requestedModel: 'test',
-      provider: 'codex',
-      model: 'test',
-      threadId: 'validator',
-      directory: '/worktree',
-      state: 'completed',
-      created: 10,
-      updated: 11,
-      error: null,
       verdict: 'PASS',
       revision: 'revision-one',
+      baseRevision: undefined,
       evidenceCriteria: issue.checkpoint!.acceptanceCriteria,
       evidenceOutputReference: 'thread:validator',
       evidenceTimestamp: 11,
+      evidenceEconomics: economics,
     },
-  ];
+  });
+  const restoredReceipt = loadSpawnReceipts(JSON.stringify(saveBoundedReceipt([], receipt)))[0];
+  issue.gates = [gateSnapshot(restoredReceipt)!];
 
   const recovered = recoverValidationEvidence(issue, undefined);
   assert.ok(recovered);
   Object.assign(issue, recovered);
+  const summary = summarizeTaskEconomics(
+    issue.evidenceManifests ?? [],
+    shipEvidenceReadiness(issue),
+    issue.evidenceRevision,
+  );
   assert.equal(issue.evidenceManifests?.[0]?.evidence[0]?.id, 'gate:durable-receipt');
+  assert.deepEqual(issue.evidenceManifests?.[0]?.evidence[0]?.economics, economics);
   assert.equal(shipEvidenceReadiness(issue).ready, true);
+  assert.equal(summary.economicsComplete, true);
+  assert.equal(summary.totals.checks, 1);
   assert.equal(recoverValidationEvidence(issue, undefined), null);
 });
 

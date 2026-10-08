@@ -151,11 +151,24 @@ function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
     const previous = latestGates.get(entry.name);
     if (!previous || evidenceIsNewer(entry, previous)) latestGates.set(entry.name, entry);
   }
+  const latestCriteria = new Map<string, TaskEvidence>();
+  for (const entry of latestOutcomeEvidence(sorted)) {
+    if (entry.result !== 'passed') continue;
+    for (const criterion of entry.criteria) {
+      const previous = latestCriteria.get(criterion);
+      if (!previous || evidenceIsNewer(entry, previous)) latestCriteria.set(criterion, entry);
+    }
+  }
   const protectedIds = new Set([...latestGates.values()].map((entry) => entry.id));
+  for (const entry of [...latestCriteria.values()].toSorted(compareEvidence).toReversed()) {
+    if (protectedIds.size >= evidenceLimit) break;
+    protectedIds.add(entry.id);
+  }
   const retained = sorted
     .filter((entry) => !protectedIds.has(entry.id))
     .slice(-(evidenceLimit - protectedIds.size));
-  return [...retained, ...latestGates.values()].toSorted(compareEvidence);
+  const protectedEvidence = sorted.filter((entry) => protectedIds.has(entry.id));
+  return [...retained, ...protectedEvidence].toSorted(compareEvidence);
 }
 
 function boundEvidenceManifests(manifests: EvidenceManifest[]): EvidenceManifest[] {
@@ -223,6 +236,26 @@ function ciObservationContent(entry: TaskEvidence): string {
 
 function isCiObservation(entry: TaskEvidence): boolean {
   return entry.id.startsWith('ci:') && entry.provider === 'github' && entry.kind === 'command';
+}
+
+function matchingStableCiObservation(
+  entries: TaskEvidence[],
+  fallback: TaskEvidence,
+): TaskEvidence | undefined {
+  if (
+    !isCiObservation(fallback) ||
+    fallback.identityUncertain !== true ||
+    !fallback.reconciliationKey
+  )
+    return undefined;
+  const matches = entries.filter(
+    (candidate) =>
+      isCiObservation(candidate) &&
+      candidate.identityUncertain !== true &&
+      candidate.reconciliationKey === fallback.reconciliationKey &&
+      candidate.outputReference === fallback.outputReference,
+  );
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 function archivedEvidenceContentMatches(entry: TaskEvidence, contentDigest: string): boolean {
@@ -422,10 +455,12 @@ function withBoundedEvidence(
 ): EvidenceManifest {
   const sorted = evidence.toSorted(compareEvidence);
   if (sorted.length <= evidenceLimit) return { ...manifest, evidence: sorted };
-  const evicted = sorted.slice(0, -evidenceLimit);
+  const retained = boundEvidence(sorted);
+  const retainedIds = new Set(retained.map((entry) => entry.id));
+  const evicted = sorted.filter((entry) => !retainedIds.has(entry.id));
   return {
     ...manifest,
-    evidence: sorted.slice(-evidenceLimit),
+    evidence: retained,
     economicsRollup: rollUpEconomics(manifest.economicsRollup, evicted),
   };
 }
@@ -880,6 +915,42 @@ export function recordCiEvidenceObservation(
     synced = moveRollup(synced, updated, index);
     rollup = updated;
   }
+  if (parsedEntry.identityUncertain === true) {
+    const index = synced.findIndex(
+      (manifest) =>
+        manifest.revision === revision &&
+        manifest.baseRevision === (baseRevision ?? null) &&
+        !manifest.stale,
+    );
+    const manifest = synced[index];
+    const stable = matchingStableCiObservation(manifest?.evidence ?? [], parsedEntry);
+    if (stable) {
+      if (parsedEntry.timestamp < stable.timestamp) return synced;
+      return synced.with(index, {
+        ...manifest,
+        evidence: manifest.evidence.flatMap((candidate) => {
+          if (candidate.id === parsedEntry.id && candidate !== stable) return [];
+          if (candidate !== stable) return [candidate];
+          return [
+            {
+              ...stable,
+              result: parsedEntry.result,
+              timestamp: parsedEntry.timestamp,
+              outputReference: parsedEntry.outputReference,
+              criteria: parsedEntry.criteria,
+              economics: mergeCiEconomics(
+                parsedEntry.economics,
+                stable.economics,
+                parsedEntry.economics,
+                parsedEntry.result,
+              ),
+            },
+          ];
+        }),
+        updatedAt: Math.max(manifest.updatedAt, parsedEntry.timestamp),
+      });
+    }
+  }
   if (parsedEntry.identityUncertain !== true && parsedEntry.reconciliationKey) {
     const retained = synced.flatMap((manifest, manifestIndex) =>
       manifest.evidence.map((candidate, evidenceIndex) => ({
@@ -1057,6 +1128,10 @@ export function reconcileCiEvidenceSnapshot(
   );
   if (index < 0) return parsed;
   const active = new Set(snapshot.map((entry) => entry.id));
+  for (const observation of snapshot) {
+    const stable = matchingStableCiObservation(parsed[index].evidence, observation);
+    if (stable) active.add(stable.id);
+  }
   const evicted = parsed[index].evidence.filter(
     (entry) => isCiObservation(entry) && !active.has(entry.id),
   );
