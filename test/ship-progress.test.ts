@@ -23,6 +23,7 @@ import {
   gateSnapshot,
   loadShipRuns,
   parseShipReport,
+  requireValidatorEconomics,
   refreshedIssueState,
   shipOwner,
   shipCheckpointOwner,
@@ -41,6 +42,11 @@ import {
   type SpawnReceipt,
 } from '../src/lib/agent-results.ts';
 import { evidenceReadiness, recordTaskEvidence } from '../src/lib/task-evidence.ts';
+import {
+  emptyTaskEconomics,
+  summarizeTaskEconomics,
+  syntheticCiEconomics,
+} from '../src/lib/task-economics.ts';
 
 void test('reopened queued issues recover across restart without retrying worker failures', () => {
   const run = fixture();
@@ -250,6 +256,10 @@ function withMergeEvidence(issue: ReturnType<typeof fixture>['issues'][number]) 
         timestamp: 10 + index,
         outputReference: `thread:${gate}`,
         criteria: issue.checkpoint!.acceptanceCriteria,
+        economics: {
+          ...emptyTaskEconomics('validator', gate === 'test-adversary' ? 'test' : 'review'),
+          checks: 1,
+        },
       }),
     issue.evidenceManifests ?? [],
   );
@@ -267,6 +277,7 @@ function withMergeEvidence(issue: ReturnType<typeof fixture>['issues'][number]) 
       timestamp: 20,
       outputReference: 'https://example.test/build',
       criteria: [],
+      economics: syntheticCiEconomics(),
     },
   );
   const requiredGates = issue.checkpoint!.requiredGates;
@@ -968,6 +979,14 @@ void test('merge readiness rejects missing, failed, and stale revision evidence'
 
   Object.assign(issue, mergeEvidence);
   assert.equal(shipEvidenceReadiness(issue).ready, true);
+  const economics = summarizeTaskEconomics(
+    issue.evidenceManifests ?? [],
+    shipEvidenceReadiness(issue),
+    issue.evidenceRevision,
+  );
+  assert.equal(economics.accepted, true);
+  assert.equal(economics.economicsComplete, true);
+  assert.equal(economics.totals.checks, issue.checkpoint!.requiredGates.length + 1);
   assert.equal(shipIssuePresentation(run, issue).nextAction, 'Merge the pull request');
   assert.equal(shipMergeClaim(issue), 'Ready for merge');
 
@@ -1227,16 +1246,36 @@ for (const [name, report] of [
 }
 
 void test('accepts typed stage and verdict reports, with gate-specific verdicts', () => {
+  const reviewEconomics = {
+    ...emptyTaskEconomics('validator', 'review'),
+    checks: 1,
+  };
   assert.deepEqual(parseShipReport({ stage: 'ci', status: 'blocked', reason: 'Check failed' }), {
     stage: 'ci',
     status: 'blocked',
     reason: 'Check failed',
   });
-  assert.deepEqual(parseShipReport({ verdict: 'CLEAN' }), { verdict: 'CLEAN' });
-  assert.deepEqual(parseShipReport({ gate: 'code-adversary', verdict: 'CLEAN' }), {
-    gate: 'code-adversary',
+  assert.deepEqual(parseShipReport({ verdict: 'CLEAN', economics: reviewEconomics }), {
     verdict: 'CLEAN',
+    economics: reviewEconomics,
   });
+  assert.deepEqual(
+    parseShipReport({ gate: 'code-adversary', verdict: 'CLEAN', economics: reviewEconomics }),
+    {
+      gate: 'code-adversary',
+      verdict: 'CLEAN',
+      economics: reviewEconomics,
+    },
+  );
+  const legacy = parseShipReport({ verdict: 'CLEAN' });
+  assert.doesNotThrow(() => requireValidatorEconomics(legacy, true));
+  assert.throws(() => requireValidatorEconomics(legacy, false));
+  assert.throws(() =>
+    parseShipReport({
+      verdict: 'CLEAN',
+      economics: { ...emptyTaskEconomics('primary', 'review'), checks: 1 },
+    }),
+  );
   assert.throws(() => validateGateVerdict('code-adversary', 'PASS'));
   assert.throws(() => validateGateVerdict('test-adversary', 'CLEAN'));
   assert.doesNotThrow(() => validateGateVerdict('test-adversary', 'PASS'));

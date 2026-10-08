@@ -4,6 +4,7 @@ import type { SpawnReceipt, SpawnState } from './agent-results';
 import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
 import { taskCheckpointSchema } from './task-checkpoint.ts';
+import { taskEconomicsSchema } from './task-economics.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
@@ -26,7 +27,15 @@ export const stages = [
 ] as const;
 export const verdicts = ['CLEAN', 'NEEDS_FIXES', 'PASS', 'FAIL', 'BLOCKED'] as const;
 export type GateVerdict = (typeof verdicts)[number];
-export type ShipCheck = { name: string; state: string; url: string };
+export type ShipCheck = {
+  name: string;
+  state: string;
+  url: string;
+  databaseId?: number;
+  runId?: number;
+  attempt?: number;
+  identityUncertain?: boolean;
+};
 export type ShippingPullRequest = {
   url: string;
   state: string;
@@ -62,6 +71,7 @@ export type GateMetadata = {
   evidenceOutputReference?: string;
   evidenceTimestamp?: number;
   evidenceSequence?: number;
+  protocolVersion?: 2;
 };
 
 export function nextGateSequence(gates: Pick<ShipGate, 'sequence'>[]): number {
@@ -159,6 +169,7 @@ export const gateMetadataSchema = z.object({
   evidenceOutputReference: z.string().min(1).max(2000).optional(),
   evidenceTimestamp: z.number().int().nonnegative().optional(),
   evidenceSequence: z.number().int().positive().optional(),
+  protocolVersion: z.literal(2).optional(),
 });
 
 const reportSchema = z.union([
@@ -176,6 +187,7 @@ const reportSchema = z.union([
       reason: z.string().max(2000).optional(),
       criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
       outputReference: z.string().min(1).max(2000).optional(),
+      economics: taskEconomicsSchema.optional(),
       revision: z.string().min(1).optional(),
     })
     .strict(),
@@ -185,12 +197,23 @@ const reportSchema = z.union([
       reason: z.string().max(2000).optional(),
       criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
       outputReference: z.string().min(1).max(2000).optional(),
+      economics: taskEconomicsSchema.optional(),
     })
     .strict(),
 ]);
 
 export function parseShipReport(value: unknown) {
   const report = reportSchema.parse(value);
+  if ('verdict' in report && report.economics) {
+    if (report.economics.role !== 'validator')
+      throw new Error('Validation verdict economics must use the validator role.');
+    if ('gate' in report) {
+      const phase = report.gate === 'test-adversary' ? 'test' : 'review';
+      if (report.economics.phase !== phase)
+        throw new Error(`Validation verdict economics must use the ${phase} phase.`);
+    } else if (!['review', 'test'].includes(report.economics.phase))
+      throw new Error('Validation verdict economics must use a validation phase.');
+  }
   if (
     ('status' in report && report.status === 'blocked') ||
     ('verdict' in report && ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict))
@@ -198,6 +221,14 @@ export function parseShipReport(value: unknown) {
     if (!report.reason?.trim()) throw new Error('A blocked or failed report needs a reason.');
   }
   return report;
+}
+
+export function requireValidatorEconomics(
+  report: ReturnType<typeof parseShipReport>,
+  allowLegacyMissing: boolean,
+): void {
+  if ('verdict' in report && !report.economics && !allowLegacyMissing)
+    throw new Error('Validation verdicts require validator economics.');
 }
 
 export function validateGateVerdict(gate: GateName, verdict: GateVerdict): void {
@@ -1043,7 +1074,19 @@ const shipIssueSchema = z.object({
     .array(z.object({ at: z.number(), stage: z.string(), reason: z.string().optional() }))
     .optional(),
   issueState: z.enum(['OPEN', 'CLOSED']).optional(),
-  checks: z.array(z.object({ name: z.string(), state: z.string(), url: z.string() })).optional(),
+  checks: z
+    .array(
+      z.object({
+        name: z.string(),
+        state: z.string(),
+        url: z.string(),
+        databaseId: z.number().int().positive().optional(),
+        runId: z.number().int().positive().optional(),
+        attempt: z.number().int().positive().optional(),
+        identityUncertain: z.boolean().optional(),
+      }),
+    )
+    .optional(),
   refreshedAt: z.number().optional(),
   refreshError: nullableString.optional(),
   checkpoint: taskCheckpointSchema.optional(),

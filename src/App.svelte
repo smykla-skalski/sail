@@ -45,6 +45,7 @@
     gateSnapshot,
     loadShipRuns,
     parseShipReport,
+    requireValidatorEconomics,
     refreshedIssueState,
     refreshedPullRequest,
     shipGatesSettled,
@@ -90,6 +91,7 @@
   import {
     commitRevisionBoundEvidence,
     evidenceReadiness,
+    ciEvidenceIdentity,
     mergeEvidenceManifests,
     nextTaskEvidenceSequence,
     readStableEvidenceBoundary,
@@ -98,9 +100,12 @@
     requireEvidenceRevision,
     recordTaskEvidence,
     rollbackTaskEvidenceRecord,
+    recordCiEvidenceObservation,
+    reconcileCiEvidenceSnapshot,
     syncEvidenceManifest,
     taskEvidenceSchema,
     type EvidenceResult,
+    type TaskEvidence,
   } from './lib/task-evidence.ts';
   import {
     selectShipValidationPolicy,
@@ -111,6 +116,11 @@
     type ShipRisk,
     type ShipValidationConfig,
   } from './lib/ship-risk-policy.ts';
+  import {
+    syntheticCiEconomics,
+    taskEconomicsSchema,
+    type TaskEconomics,
+  } from './lib/task-economics.ts';
   import DiffPanel from './DiffPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
@@ -2455,10 +2465,10 @@
         ? 'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run exactly those gates in this Ship It session with the implementation agent and model. Do not call validation_gate or require agent coordination.'
         : 'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run exactly those gates in fresh subagent sessions. If a gate session cannot launch, pause and report the reason in this thread.';
       const gateReporting = inlineGates
-        ? 'Before every adversary pass, read the checkpoint revision. After the pass, use ship_progress with that revision, its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, and reason when blocked or failed.'
+        ? 'Before every adversary pass, read the checkpoint revision. After the pass, use ship_progress with that revision, its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, validator economics counters, and reason when blocked or failed.'
         : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
       const target = shippingTarget;
-      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from ${target.repository}:${target.baseBranch} at ${target.baseRevision}. Use that exact repository and base branch for the pull request. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. Before each quality command, read the checkpoint execution boundary; record the result with task_evidence_record and its expectedRevision, expectedMutationGeneration, and expectedBaseRevision, mapping exact acceptance criterion strings and a bounded output reference. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
+      const prompt = `/ship-it ${issue.url}\n\nSail already created this issue worktree from ${target.repository}:${target.baseBranch} at ${target.baseRevision}. Use that exact repository and base branch for the pull request. Stay here; skip branch creation and cleanup. Read the canonical task checkpoint before resuming. Resolve the issue, then replace its initial objective and acceptance criteria with the concrete task contract. Update the checkpoint after every phase, blocker, revision change, and next-action change. Before each quality command, read the checkpoint execution boundary; record the result with task_evidence_record and its expectedRevision, expectedMutationGeneration, and expectedBaseRevision, mapping exact acceptance criterion strings and a bounded output reference. Include the economics counters attributable to that activity (role, phase, turns, tools, permissions, compactions, token categories, elapsed time, retries, findings, checks, human interventions, failed commands, approval latency, and repeated work). Classify activity as primary, subagent, validator, guardian, synthetic, or probe. ${gateExecution} Use ship_progress to report each stage (implementing, reviewing, testing, pull_request, ci, and merging), with status running or blocked and a reason when blocked. ${gateReporting}`;
       saveSpawnReceipt({
         receiptId,
         accessKey: crypto.randomUUID(),
@@ -2586,29 +2596,43 @@
         cleanCommit === pr.headRefOid
       ) {
         const timestamp = Date.now();
-        for (const check of pr.checks)
-          evidenceManifests = recordTaskEvidence(
+        const observations: TaskEvidence[] = pr.checks.map((check) => {
+          const identity = ciEvidenceIdentity(revision, check);
+          const state = checkState(check);
+          return {
+            id: identity.id,
+            kind: 'command',
+            name: `ci:${check.name}`,
+            provider: 'github',
+            model: null,
+            result: state === 'passing' ? 'passed' : state === 'failing' ? 'failed' : 'pending',
+            timestamp,
+            outputReference: check.url || pr.url,
+            criteria: [],
+            economics: {
+              ...syntheticCiEconomics(),
+              failedCommands: state === 'failing' ? 1 : 0,
+            },
+            identityUncertain: identity.uncertain,
+            reconciliationKey: identity.reconciliationKey,
+            executionOrder: identity.executionOrder,
+          };
+        });
+        evidenceManifests = reconcileCiEvidenceSnapshot(
+          evidenceManifests,
+          revision,
+          observations,
+          baseRevision,
+        );
+        for (const observation of observations) {
+          evidenceManifests = recordCiEvidenceObservation(
             evidenceManifests,
             revision,
             checkpoint.acceptanceCriteria,
-            {
-              id: `ci:${check.name}:${timestamp}`,
-              kind: 'command',
-              name: `ci:${check.name}`,
-              provider: 'github',
-              model: null,
-              result:
-                checkState(check) === 'passing'
-                  ? 'passed'
-                  : checkState(check) === 'failing'
-                    ? 'failed'
-                    : 'pending',
-              timestamp,
-              outputReference: check.url || pr.url,
-              criteria: [],
-            },
+            observation,
             baseRevision,
           );
+        }
       }
       await updateShipIssue(
         run,
@@ -3972,6 +3996,10 @@
         timestamp: Date.now(),
         outputReference: request.arguments.outputReference,
         criteria: request.arguments.criteria,
+        economics:
+          request.arguments.economics === undefined
+            ? undefined
+            : taskEconomicsSchema.parse(request.arguments.economics),
       });
       const readBoundary = () =>
         readStableEvidenceBoundary(
@@ -4297,6 +4325,7 @@
     expectedRevision: unknown,
     baseRevision: string,
     evidenceIdentity?: { id: string; timestamp: number; sequence?: number },
+    economics?: TaskEconomics,
   ): Promise<
     Pick<ShipIssue, 'evidenceRevision' | 'evidenceManifests'> & { evidenceSequence: number }
   > {
@@ -4324,6 +4353,7 @@
         sequence: evidenceSequence,
         outputReference: outputReference ?? fallbackReference,
         criteria: criteria ?? [],
+        economics,
       },
       baseRevision,
     );
@@ -4377,6 +4407,7 @@
           item.targetDirectory === request.directory,
       );
       if (!receipt?.validation) {
+        requireValidatorEconomics(report, false);
         if (crossValidation.choices.length || crossValidation.strictDifferentModel)
           throw new Error(
             'Inline gate verdicts are disabled while cross-validation is configured.',
@@ -4435,6 +4466,7 @@
                 timestamp: now,
                 sequence: evidenceSequence,
               },
+              report.economics,
             );
             requireEvidenceBaseRevision(
               evidenceChanges.evidenceRevision!,
@@ -4503,6 +4535,7 @@
       const validation = receipt.validation;
       if (shippingWorkerSettled(receipt.state))
         throw new Error('This validation attempt has already finished.');
+      requireValidatorEconomics(report, validation.protocolVersion !== 2);
       if (validation.revisionDrifted)
         throw new Error('The worktree changed during validation. Rerun the gate.');
       const owner = shipOwner(shipRuns, receipt.sourceDirectory, receipt.sourceId);
@@ -4561,6 +4594,7 @@
                   timestamp: evidenceTimestamp,
                   sequence: validation.evidenceSequence,
                 },
+                report.economics,
               )
             : null;
           if (owner && evidenceChanges)
@@ -4670,7 +4704,7 @@
       throw new Error('Choose a Ship It validation gate.');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Gate prompt must be 1–8000 characters.');
-    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, and a bounded output reference. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, FAIL, or BLOCKED. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
+    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, FAIL, or BLOCKED. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
     if (
       !Array.isArray(implementingModels) ||
       !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
@@ -4794,6 +4828,7 @@
           requestedModel: choice.model,
           sequence,
           evidenceSequence,
+          protocolVersion: 2,
         },
         state: 'starting',
         created: Date.now(),
@@ -4834,6 +4869,7 @@
             revision,
             mutationGeneration,
             baseRevision,
+            protocolVersion: 2,
           },
         });
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));

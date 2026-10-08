@@ -99,7 +99,7 @@ pub async fn shipping_pull_request(
             )?;
             let details: serde_json::Value = serde_json::from_str(&details)
                 .map_err(|_| "GitHub returned invalid pull request details.".to_string())?;
-            if let Some(pr) = shipping_pull_request_snapshot(
+            if let Some(mut pr) = shipping_pull_request_snapshot(
                 value,
                 &details,
                 &source,
@@ -107,6 +107,12 @@ pub async fn shipping_pull_request(
                 &branch,
                 &base_branch,
             )? {
+                let mut enriched = value.clone();
+                enriched["statusCheckRollup"] = complete_check_rollup_or_original(
+                    value,
+                    check_rollup_with_identities(worktree, &target, &pr.head_ref_oid),
+                );
+                pr.checks = parse_pull_request_checks(&enriched)?.checks;
                 prs.push(pr);
             }
         }
@@ -215,6 +221,13 @@ pub struct PullRequestCheck {
     name: String,
     state: String,
     url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<u64>,
+    identity_uncertain: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1615,6 +1628,20 @@ fn parse_pull_request_checks(pr: &serde_json::Value) -> Result<PullRequestChecks
                     .or_else(|| check["targetUrl"].as_str())
                     .unwrap_or("")
                     .to_string(),
+                database_id: check["databaseId"].as_u64(),
+                run_id: check["checkSuite"]["workflowRun"]["databaseId"]
+                    .as_u64()
+                    .or_else(|| check["checkSuite"]["workflowRun"]["runDatabaseId"].as_u64()),
+                attempt: check["checkSuite"]["workflowRun"]["runAttempt"]
+                    .as_u64()
+                    .or_else(|| check["checkSuite"]["workflowRun"]["attempt"].as_u64()),
+                identity_uncertain: check["databaseId"].as_u64().is_none()
+                    && check["checkSuite"]["workflowRun"]["databaseId"]
+                        .as_u64()
+                        .is_none()
+                    && check["checkSuite"]["workflowRun"]["runDatabaseId"]
+                        .as_u64()
+                        .is_none(),
             }
         })
         .collect();
@@ -1623,6 +1650,75 @@ fn parse_pull_request_checks(pr: &serde_json::Value) -> Result<PullRequestChecks
         url,
         checks,
     })
+}
+
+fn check_rollup_with_identities(
+    worktree: &Path,
+    target: &str,
+    oid: &str,
+) -> Result<serde_json::Value, String> {
+    let (owner, name) = target
+        .split_once('/')
+        .ok_or("GitHub repository identity is invalid.")?;
+    let query = r#"query($owner:String!,$name:String!,$oid:GitObjectID!,$after:String){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$after){nodes{__typename ... on CheckRun{databaseId name status conclusion detailsUrl checkSuite{workflowRun{databaseId runAttempt}}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage endCursor}}}}}}}"#;
+    let owner_argument = format!("owner={owner}");
+    let name_argument = format!("name={name}");
+    let oid_argument = format!("oid={oid}");
+    let query_argument = format!("query={query}");
+    collect_check_rollup_pages(|cursor| {
+        let cursor_argument = cursor.map(|value| format!("after={value}"));
+        let mut arguments = vec![
+            "api",
+            "graphql",
+            "-f",
+            &owner_argument,
+            "-f",
+            &name_argument,
+            "-f",
+            &oid_argument,
+            "-f",
+            &query_argument,
+        ];
+        if let Some(argument) = &cursor_argument {
+            arguments.extend(["-f", argument]);
+        }
+        let output = gh_command(worktree, &arguments)?;
+        serde_json::from_str(&output).map_err(|error| error.to_string())
+    })
+}
+
+fn collect_check_rollup_pages(
+    mut fetch: impl FnMut(Option<&str>) -> Result<serde_json::Value, String>,
+) -> Result<serde_json::Value, String> {
+    let mut cursor: Option<String> = None;
+    let mut checks = Vec::new();
+    loop {
+        let response = fetch(cursor.as_deref())?;
+        let contexts = &response["data"]["repository"]["object"]["statusCheckRollup"]["contexts"];
+        checks.extend(
+            contexts["nodes"]
+                .as_array()
+                .cloned()
+                .ok_or("GitHub GraphQL returned invalid check identities.")?,
+        );
+        match contexts["pageInfo"]["hasNextPage"].as_bool() {
+            Some(false) => return Ok(serde_json::Value::Array(checks)),
+            Some(true) => {}
+            None => return Err("GitHub GraphQL returned invalid check pagination.".to_string()),
+        }
+        let next = contexts["pageInfo"]["endCursor"]
+            .as_str()
+            .filter(|next| Some(*next) != cursor.as_deref())
+            .ok_or("GitHub GraphQL returned an incomplete check identity page.")?;
+        cursor = Some(next.to_string());
+    }
+}
+
+fn complete_check_rollup_or_original(
+    original: &serde_json::Value,
+    enrichment: Result<serde_json::Value, String>,
+) -> serde_json::Value {
+    enrichment.unwrap_or_else(|_| original["statusCheckRollup"].clone())
 }
 
 #[tauri::command]
@@ -1839,9 +1935,10 @@ fn open_url(url: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_worktree, marked_issue, marker, pull_request_head, shipping_pull_request_matches,
-        shipping_pull_request_snapshot, validate_external_url, validate_graph, IssueDraft,
-        IssueGraphDraft,
+        checked_worktree, collect_check_rollup_pages, complete_check_rollup_or_original,
+        marked_issue, marker, parse_pull_request_checks, pull_request_head,
+        shipping_pull_request_matches, shipping_pull_request_snapshot, validate_external_url,
+        validate_graph, IssueDraft, IssueGraphDraft,
     };
     use std::{fs, process::Command};
 
@@ -1963,6 +2060,58 @@ mod tests {
         assert!(checked_worktree(path.clone(), path.clone(), "main", true).is_ok());
         assert!(checked_worktree(path.clone(), path, "main", false).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pull_request_checks_preserve_stable_run_identity_and_attempt() {
+        let pr = serde_json::json!({
+            "number": 1,
+            "url": "https://github.test/pull/1",
+            "statusCheckRollup": [{
+                "__typename": "CheckRun",
+                "databaseId": 50,
+                "name": "build",
+                "status": "IN_PROGRESS",
+                "conclusion": null,
+                "detailsUrl": null,
+                "checkSuite": { "workflowRun": { "databaseId": 10, "runAttempt": 2 } }
+            }]
+        });
+        let parsed = parse_pull_request_checks(&pr).unwrap();
+        let check = &parsed.checks[0];
+        assert_eq!(check.url, "");
+        assert_eq!(check.state, "PENDING");
+        assert_eq!(check.database_id, Some(50));
+        assert_eq!(check.run_id, Some(10));
+        assert_eq!(check.attempt, Some(2));
+        assert!(!check.identity_uncertain);
+    }
+
+    #[test]
+    fn incomplete_second_check_page_keeps_the_complete_cli_fallback() {
+        let mut calls = 0;
+        let result = collect_check_rollup_pages(|cursor| {
+            calls += 1;
+            if cursor.is_some() {
+                return Err("page two failed".to_string());
+            }
+            Ok(serde_json::json!({
+                "data": { "repository": { "object": { "statusCheckRollup": {
+                    "contexts": {
+                        "nodes": (0..100).map(|index| serde_json::json!({"name": index})).collect::<Vec<_>>(),
+                        "pageInfo": { "hasNextPage": true, "endCursor": "page-2" }
+                    }
+                } } } }
+            }))
+        });
+
+        assert_eq!(calls, 2);
+        assert_eq!(result.as_ref().unwrap_err(), "page two failed");
+        let original = serde_json::json!({
+            "statusCheckRollup": (0..101).map(|index| serde_json::json!({"name": index})).collect::<Vec<_>>()
+        });
+        let retained = complete_check_rollup_or_original(&original, result);
+        assert_eq!(retained.as_array().unwrap().len(), 101);
     }
 
     #[test]
