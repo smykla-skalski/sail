@@ -36,6 +36,8 @@ export type ShipCheck = {
   runId?: number;
   attempt?: number;
   statusContextId?: string;
+  revision?: string;
+  workflow?: string;
   identityUncertain?: boolean;
 };
 export type ShippingPullRequest = {
@@ -1219,9 +1221,31 @@ const shipIssueSchema = z.object({
         runId: z.number().int().positive().optional(),
         attempt: z.number().int().positive().optional(),
         statusContextId: z.string().min(1).optional(),
+        revision: z.string().min(1).optional(),
+        workflow: z.string().min(1).optional(),
         identityUncertain: z.boolean().optional(),
       }),
     )
+    .optional(),
+  ciTriages: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        revision: z.string().min(1),
+        workflow: z.string().min(1),
+        job: z.string().min(1),
+        attempt: z.number().int().positive(),
+        classification: z.enum(['code', 'flaky', 'infrastructure', 'unknown']),
+        excerpt: z.string(),
+        url: z.string(),
+        routedAt: z.number().int().nonnegative(),
+        resolvedAt: z.number().int().nonnegative().nullable(),
+        recurrence: z.number().int().positive(),
+        rerunAllowed: z.boolean(),
+        rerunReason: z.string().min(1),
+      }),
+    )
+    .max(200)
     .optional(),
   refreshedAt: z.number().optional(),
   refreshError: nullableString.optional(),

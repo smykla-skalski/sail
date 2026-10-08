@@ -2899,6 +2899,9 @@ pub struct PullRequestCheck {
     attempt: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status_context_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
+    workflow: String,
     identity_uncertain: bool,
 }
 
@@ -4521,7 +4524,7 @@ pub async fn pull_request_checks(
                 "--limit",
                 "500",
                 "--json",
-                "number,url,statusCheckRollup,headRepositoryOwner,headRefName",
+                "number,url,headRefOid,statusCheckRollup,headRepositoryOwner,headRefName",
             ],
         )?;
         let prs: Vec<serde_json::Value> = serde_json::from_str(&response)
@@ -4591,12 +4594,17 @@ fn parse_pull_request_checks(pr: &serde_json::Value) -> Result<PullRequestChecks
             } else {
                 check["conclusion"].as_str().unwrap_or("PENDING")
             };
+            let name = check["name"]
+                .as_str()
+                .or_else(|| check["context"].as_str())
+                .unwrap_or("Unknown check")
+                .to_string();
+            let workflow = name
+                .split_once(" / ")
+                .map_or("GitHub Actions", |(workflow, _)| workflow)
+                .to_string();
             PullRequestCheck {
-                name: check["name"]
-                    .as_str()
-                    .or_else(|| check["context"].as_str())
-                    .unwrap_or("Unknown check")
-                    .to_string(),
+                name,
                 state: state.to_string(),
                 url: check["detailsUrl"]
                     .as_str()
@@ -4611,6 +4619,8 @@ fn parse_pull_request_checks(pr: &serde_json::Value) -> Result<PullRequestChecks
                     .as_u64()
                     .or_else(|| check["checkSuite"]["workflowRun"]["attempt"].as_u64()),
                 status_context_id: check["id"].as_str().map(str::to_string),
+                revision: pr["headRefOid"].as_str().map(str::to_string),
+                workflow,
                 identity_uncertain: check["databaseId"].as_u64().is_none()
                     && check["checkSuite"]["workflowRun"]["databaseId"]
                         .as_u64()
@@ -4662,6 +4672,53 @@ fn check_rollup_with_identities(
         let output = gh_command(worktree, &arguments)?;
         serde_json::from_str(&output).map_err(|error| error.to_string())
     })
+}
+
+fn bounded_failure_log(log: &str) -> String {
+    const MAX_LINES: usize = 80;
+    const MAX_CHARACTERS: usize = 12_000;
+    const CONTEXT: usize = 3;
+    let lines = log.lines().collect::<Vec<_>>();
+    let mut selected = vec![false; lines.len()];
+    for (index, line) in lines.iter().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        if ![
+            "error",
+            "failed",
+            "failure",
+            "panic",
+            "fatal",
+            "timeout",
+            "exception",
+            "assertion",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            continue;
+        }
+        let start = index.saturating_sub(CONTEXT);
+        let end = (index + CONTEXT + 1).min(lines.len());
+        selected[start..end].fill(true);
+    }
+    let mut excerpt = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| selected[index].then_some(*line))
+        .collect::<Vec<_>>();
+    if excerpt.is_empty() {
+        excerpt = lines.into_iter().rev().take(MAX_LINES).collect();
+        excerpt.reverse();
+    } else if excerpt.len() > MAX_LINES {
+        excerpt = excerpt.split_off(excerpt.len() - MAX_LINES);
+    }
+    let excerpt = excerpt.join("\n");
+    let start = excerpt
+        .char_indices()
+        .rev()
+        .nth(MAX_CHARACTERS - 1)
+        .map_or(0, |(index, _)| index);
+    excerpt[start..].trim().to_string()
 }
 
 fn collect_check_rollup_pages(
@@ -4743,12 +4800,7 @@ pub async fn failed_check_log(
                 "--log",
             ],
         )?;
-        let start = log
-            .char_indices()
-            .rev()
-            .nth(99_999)
-            .map_or(0, |(index, _)| index);
-        Ok(log[start..].to_string())
+        Ok(bounded_failure_log(&log))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -4912,29 +4964,30 @@ fn open_url(url: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquisition_retry_claim, acquisition_retry_outcome, active_claim_winner, checked_worktree,
-        claim_body, claim_from_comment, claim_lock_description, claim_lock_name, claim_lock_owner,
-        claim_released, claim_revision_lock_owner, claim_server_expiry, claim_time_from_millis,
-        claim_time_millis, collect_check_rollup_pages, command_output_with_timeout,
-        command_output_with_timeouts, complete_check_rollup_or_original,
-        delete_observed_repository_lock_if_owned, delete_predecessor_stop_lock_if_owned,
-        delete_verified_claim_fence, delete_verified_claim_fence_after_release,
-        effectively_active_claim, eligible_claim_author, equivalent_pull_request_match,
-        exact_heartbeat_marker, fence_matches_claim, finish_claim_transition, has_active_takeover,
-        heartbeat_retry_claim, heartbeat_stored_claim, initial_claim_window, marked_issue, marker,
-        matching_claim_release, merge_heartbeat_response, parse_claim, parse_claim_lock_owner,
-        parse_pull_request_checks, pending_claim_revision_lock_owner, posted_release_claim,
-        predecessor_stop_lock_matches, predecessor_stop_lock_owner, pull_request_head,
-        recent_equivalent_pull_request_cutoff, reconciled_active_revision,
-        reconciled_claim_release, reconciled_heartbeat_revision, references_issue,
-        reject_equivalent_work_after_claim, released_claim_marker, renewed_claim_window,
-        require_expected_target_repository, rollback_unapplied_heartbeat_fence, select_claim_lock,
-        shipping_claim_observation, shipping_claim_observation_with_current,
-        shipping_pull_request_matches, shipping_pull_request_snapshot,
-        submitted_heartbeat_still_current, transition_lock_owner, transition_lock_recoverable,
-        valid_claim_time, valid_stored_claim, validate_claim_coordination_permission,
-        validate_external_url, validate_graph, validated_claim_input, with_verified_claim_takeover,
-        ClaimLock, IssueDraft, IssueGraphDraft, RepositoryLabelState, ShippingClaim,
+        acquisition_retry_claim, acquisition_retry_outcome, active_claim_winner,
+        bounded_failure_log, checked_worktree, claim_body, claim_from_comment,
+        claim_lock_description, claim_lock_name, claim_lock_owner, claim_released,
+        claim_revision_lock_owner, claim_server_expiry, claim_time_from_millis, claim_time_millis,
+        collect_check_rollup_pages, command_output_with_timeout, command_output_with_timeouts,
+        complete_check_rollup_or_original, delete_observed_repository_lock_if_owned,
+        delete_predecessor_stop_lock_if_owned, delete_verified_claim_fence,
+        delete_verified_claim_fence_after_release, effectively_active_claim, eligible_claim_author,
+        equivalent_pull_request_match, exact_heartbeat_marker, fence_matches_claim,
+        finish_claim_transition, has_active_takeover, heartbeat_retry_claim,
+        heartbeat_stored_claim, initial_claim_window, marked_issue, marker, matching_claim_release,
+        merge_heartbeat_response, parse_claim, parse_claim_lock_owner, parse_pull_request_checks,
+        pending_claim_revision_lock_owner, posted_release_claim, predecessor_stop_lock_matches,
+        predecessor_stop_lock_owner, pull_request_head, recent_equivalent_pull_request_cutoff,
+        reconciled_active_revision, reconciled_claim_release, reconciled_heartbeat_revision,
+        references_issue, reject_equivalent_work_after_claim, released_claim_marker,
+        renewed_claim_window, require_expected_target_repository,
+        rollback_unapplied_heartbeat_fence, select_claim_lock, shipping_claim_observation,
+        shipping_claim_observation_with_current, shipping_pull_request_matches,
+        shipping_pull_request_snapshot, submitted_heartbeat_still_current, transition_lock_owner,
+        transition_lock_recoverable, valid_claim_time, valid_stored_claim,
+        validate_claim_coordination_permission, validate_external_url, validate_graph,
+        validated_claim_input, with_verified_claim_takeover, ClaimLock, IssueDraft,
+        IssueGraphDraft, RepositoryLabelState, ShippingClaim,
     };
     use std::{cell::Cell, collections::HashMap, fs, process::Command, time::Duration};
 
@@ -5229,7 +5282,28 @@ mod tests {
         assert_eq!(check.database_id, Some(50));
         assert_eq!(check.run_id, Some(10));
         assert_eq!(check.attempt, Some(2));
+        assert_eq!(check.workflow, "GitHub Actions");
         assert!(!check.identity_uncertain);
+    }
+
+    #[test]
+    fn failed_check_logs_keep_only_bounded_failure_context() {
+        let log = (0..200)
+            .map(|index| {
+                if index == 100 {
+                    "error: compilation failed".to_string()
+                } else {
+                    format!("ordinary output {index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let excerpt = bounded_failure_log(&log);
+        assert!(excerpt.contains("error: compilation failed"));
+        assert!(excerpt.contains("ordinary output 97"));
+        assert!(excerpt.contains("ordinary output 103"));
+        assert!(!excerpt.contains("ordinary output 0\n"));
+        assert!(excerpt.len() <= 12_000);
     }
 
     #[test]

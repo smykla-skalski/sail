@@ -29,6 +29,8 @@
     runId?: number;
     attempt?: number;
     statusContextId?: string;
+    revision?: string;
+    workflow?: string;
     identityUncertain?: boolean;
   };
   type PullRequestChecks = { number: number; url: string; checks: PullRequestCheck[] };
