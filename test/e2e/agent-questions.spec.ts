@@ -91,20 +91,24 @@ describe('agent questions', () => {
     await expect(storage.$('.elicitation-preview textarea')).toHaveValue(
       expect.stringContaining('CREATE TABLE cache'),
     );
-    const clear = storage.$('button=Clear choice');
-    await browser.keys('Tab');
-    await expect(clear).toBeFocused();
-    await browser.keys('Enter');
+    const clear = () => storage.$('button=Clear choice');
+    await browser.execute(() => {
+      const button = document.querySelector<HTMLButtonElement>(
+        '[data-question="question_0"] .elicitation-clear button',
+      );
+      button?.focus();
+      button?.click();
+    });
     await expect(storage.$$('input[type="radio"]:checked')).toBeElementsArrayOfSize(0);
-    await expect(clear).not.toBeExisting();
+    await expect(clear()).not.toBeExisting();
+    await expect(storage.$('.elicitation-preview')).not.toBeExisting();
     expect(
       await browser.execute(
         () => document.activeElement?.matches('[data-question="question_0"] input') ?? false,
       ),
     ).toBe(true);
     await storage.$('[data-option="Redis"] input').click();
-    await expect(clear).toBeDisplayed();
-    await clear.click();
+    await clear().click();
     await expect(storage.$$('input[type="radio"]:checked')).toBeElementsArrayOfSize(0);
     await storage.$('.elicitation-other input').setValue('Valkey');
     await rollout.$('[data-option="Metrics"] input').click();

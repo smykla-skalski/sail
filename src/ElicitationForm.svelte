@@ -50,10 +50,10 @@
       : value === option;
   }
 
-  function clear(field: ElicitationChoiceField, event: MouseEvent) {
-    const group = (event.currentTarget as HTMLElement).closest('fieldset');
+  function clear(field: ElicitationChoiceField, name: string) {
     set(field.key, undefined);
-    group?.querySelector<HTMLInputElement>('input[type="radio"]')?.focus();
+    document.querySelector<HTMLInputElement>(`input[name="${CSS.escape(name)}"]`)?.focus();
+    focused = { ...focused, [field.key]: '' };
   }
 
   function preview(field: ElicitationChoiceField) {
@@ -161,7 +161,7 @@
                 size="sm"
                 variant="ghost"
                 aria-label={`Clear choice${field.title ? ` for ${field.title}` : ''}`}
-                onclick={(event: MouseEvent) => clear(field, event)}>Clear choice</Button
+                onclick={() => clear(field, id)}>Clear choice</Button
               >
             </div>
           {/if}
