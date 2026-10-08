@@ -4,6 +4,8 @@ import type { SpawnReceipt, SpawnState } from './agent-results';
 import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
 import { taskCheckpointSchema } from './task-checkpoint.ts';
+import { taskEconomicsSchema, type TaskEconomics } from './task-economics.ts';
+import type { ContextHandoff } from './context-handoff.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
@@ -26,7 +28,18 @@ export const stages = [
 ] as const;
 export const verdicts = ['CLEAN', 'NEEDS_FIXES', 'PASS', 'FAIL', 'BLOCKED'] as const;
 export type GateVerdict = (typeof verdicts)[number];
-export type ShipCheck = { name: string; state: string; url: string };
+export type ShipCheck = {
+  name: string;
+  state: string;
+  url: string;
+  databaseId?: number;
+  runId?: number;
+  attempt?: number;
+  statusContextId?: string;
+  revision?: string;
+  workflow?: string;
+  identityUncertain?: boolean;
+};
 export type ShippingPullRequest = {
   url: string;
   state: string;
@@ -62,6 +75,8 @@ export type GateMetadata = {
   evidenceOutputReference?: string;
   evidenceTimestamp?: number;
   evidenceSequence?: number;
+  evidenceEconomics?: TaskEconomics;
+  protocolVersion?: 2;
 };
 
 export function nextGateSequence(gates: Pick<ShipGate, 'sequence'>[]): number {
@@ -159,6 +174,8 @@ export const gateMetadataSchema = z.object({
   evidenceOutputReference: z.string().min(1).max(2000).optional(),
   evidenceTimestamp: z.number().int().nonnegative().optional(),
   evidenceSequence: z.number().int().positive().optional(),
+  evidenceEconomics: taskEconomicsSchema.optional(),
+  protocolVersion: z.literal(2).optional(),
 });
 
 const reportSchema = z.union([
@@ -176,6 +193,7 @@ const reportSchema = z.union([
       reason: z.string().max(2000).optional(),
       criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
       outputReference: z.string().min(1).max(2000).optional(),
+      economics: taskEconomicsSchema.optional(),
       revision: z.string().min(1).optional(),
     })
     .strict(),
@@ -185,12 +203,23 @@ const reportSchema = z.union([
       reason: z.string().max(2000).optional(),
       criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
       outputReference: z.string().min(1).max(2000).optional(),
+      economics: taskEconomicsSchema.optional(),
     })
     .strict(),
 ]);
 
 export function parseShipReport(value: unknown) {
   const report = reportSchema.parse(value);
+  if ('verdict' in report && report.economics) {
+    if (report.economics.role !== 'validator')
+      throw new Error('Validation verdict economics must use the validator role.');
+    if ('gate' in report) {
+      const phase = report.gate === 'test-adversary' ? 'test' : 'review';
+      if (report.economics.phase !== phase)
+        throw new Error(`Validation verdict economics must use the ${phase} phase.`);
+    } else if (!['review', 'test'].includes(report.economics.phase))
+      throw new Error('Validation verdict economics must use a validation phase.');
+  }
   if (
     ('status' in report && report.status === 'blocked') ||
     ('verdict' in report && ['BLOCKED', 'FAIL', 'NEEDS_FIXES'].includes(report.verdict))
@@ -198,6 +227,14 @@ export function parseShipReport(value: unknown) {
     if (!report.reason?.trim()) throw new Error('A blocked or failed report needs a reason.');
   }
   return report;
+}
+
+export function requireValidatorEconomics(
+  report: ReturnType<typeof parseShipReport>,
+  allowLegacyMissing: boolean,
+): void {
+  if ('verdict' in report && !report.economics && !allowLegacyMissing)
+    throw new Error('Validation verdicts require validator economics.');
 }
 
 export function validateGateVerdict(gate: GateName, verdict: GateVerdict): void {
@@ -312,6 +349,11 @@ export function rollbackValidationReceipt(
       current.validation.evidenceSequence,
       previous.validation.evidenceSequence,
       committed.validation.evidenceSequence,
+    ),
+    evidenceEconomics: restoreIfUnchanged(
+      current.validation.evidenceEconomics,
+      previous.validation.evidenceEconomics,
+      committed.validation.evidenceEconomics,
     ),
   };
   return { ...current, validation };
@@ -612,6 +654,7 @@ export function recoverValidationEvidence(
         timestamp: gate.evidenceTimestamp!,
         outputReference: gate.evidenceOutputReference!,
         criteria,
+        economics: gate.evidenceEconomics,
         ...(gate.evidenceSequence !== undefined ? { sequence: gate.evidenceSequence } : {}),
       },
       baseRevision,
@@ -633,23 +676,130 @@ export function shipMergeClaim(issue: ShipIssue): string {
   return 'PR open';
 }
 
+export function shipOwnedThreadIds(
+  issue: ShipIssue,
+  receipts: Array<
+    Partial<Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetId' | 'targetDirectory'>>
+  > = [],
+): string[] {
+  const lineage = new Set(
+    [
+      issue.threadId,
+      ...(issue.checkpointThreadIds ?? []),
+      ...(issue.contextHandoffs ?? []).flatMap((handoff) => [
+        handoff.fromThreadId,
+        handoff.toThreadId,
+      ]),
+    ].filter(Boolean),
+  );
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const receipt of receipts) {
+      if (
+        receipt.sourceDirectory !== issue.path ||
+        receipt.targetDirectory !== issue.path ||
+        !receipt.sourceId ||
+        !lineage.has(receipt.sourceId) ||
+        !receipt.targetId ||
+        lineage.has(receipt.targetId)
+      )
+        continue;
+      lineage.add(receipt.targetId);
+      expanded = true;
+    }
+  }
+  return [...lineage].filter((threadId): threadId is string => Boolean(threadId));
+}
+
 export function shipTaskThreadsSettled(
   issue: ShipIssue,
   states: Partial<Record<string, SpawnState>>,
-  receipts: Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'>[],
+  receipts: Array<
+    Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'> &
+      Partial<
+        Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetDirectory' | 'dispatchPending'>
+      >
+  >,
+  discoveredThreadIds: Iterable<string> = [],
 ): boolean {
-  const threadIds = [...new Set([issue.threadId, ...(issue.checkpointThreadIds ?? [])])].filter(
-    (threadId): threadId is string => Boolean(threadId),
-  );
+  const threadIds = [
+    ...new Set([
+      ...shipOwnedThreadIds(issue, receipts),
+      ...discoveredThreadIds,
+      ...(issue.contextHandoffs ?? []).flatMap((handoff) => [
+        handoff.fromThreadId,
+        handoff.toThreadId,
+      ]),
+    ]),
+  ].filter((threadId): threadId is string => Boolean(threadId));
   return threadIds.every((threadId) => {
     const live = states[threadId] ?? 'unavailable';
-    const receipt = receipts.find((item) =>
-      threadId === issue.threadId ? item.receiptId === issue.receiptId : item.targetId === threadId,
+    const matchingReceipts = receipts.filter(
+      (item) =>
+        (threadId === issue.threadId && item.receiptId === issue.receiptId) ||
+        (item.targetId === threadId &&
+          (item.targetDirectory === undefined || item.targetDirectory === issue.path)),
     );
-    if (receipt && !shippingWorkerSettled(receipt.state)) return false;
+    if (
+      matchingReceipts.some(
+        (receipt) => receipt.dispatchPending || !shippingWorkerSettled(receipt.state),
+      )
+    )
+      return false;
     if (live !== 'unavailable') return shippingWorkerSettled(live);
-    return receipt !== undefined && shippingWorkerSettled(receipt.state);
+    return (
+      matchingReceipts.length > 0 &&
+      matchingReceipts.every(
+        (receipt) => !receipt.dispatchPending && shippingWorkerSettled(receipt.state),
+      )
+    );
   });
+}
+
+export function shipOwnershipQuietGeneration(
+  nativeSubagentGeneration: number,
+  nativeGeneration: number,
+  openCodeDescendants: Iterable<string>,
+): string {
+  return JSON.stringify([
+    nativeSubagentGeneration,
+    nativeGeneration,
+    ...[...new Set(openCodeDescendants)].toSorted(),
+  ]);
+}
+
+export function shipOwnershipQuietPass(
+  previousGeneration: number | null,
+  currentGeneration: number,
+  hasUnsettledOwnership: boolean,
+): { settled: boolean; nextGeneration: number | null } {
+  if (hasUnsettledOwnership) return { settled: false, nextGeneration: null };
+  return {
+    settled: previousGeneration === currentGeneration,
+    nextGeneration: currentGeneration,
+  };
+}
+
+export function shipTaskReceiptIdsToProtect(
+  issue: ShipIssue,
+  receipts: Pick<
+    SpawnReceipt,
+    'receiptId' | 'targetId' | 'targetDirectory' | 'state' | 'dispatchPending'
+  >[],
+): string[] {
+  const ownedThreadIds = new Set([issue.threadId, ...(issue.checkpointThreadIds ?? [])]);
+  return receipts
+    .filter(
+      (receipt) =>
+        (receipt.receiptId === issue.receiptId &&
+          (issue.workerSettled !== true || issue.claim?.status === 'active')) ||
+        (!!issue.path &&
+          ownedThreadIds.has(receipt.targetId) &&
+          receipt.targetDirectory === issue.path &&
+          (receipt.dispatchPending === true || !shippingWorkerSettled(receipt.state))),
+    )
+    .map((receipt) => receipt.receiptId);
 }
 
 export function reconciledShipGates(issue: ShipIssue, receipts: SpawnReceipt[]): ShipGate[] {
@@ -981,6 +1131,24 @@ export function appendShipEvent(
 }
 
 const nullableString = z.string().nullable();
+const shippingClaimSchema = z.object({
+  id: z.string(),
+  instanceId: z.string().min(1).optional(),
+  holder: z.string(),
+  task: z.string(),
+  acquiredAt: z.string(),
+  heartbeatAt: z.string(),
+  expiresAt: z.string(),
+  status: z.enum(['active', 'released']),
+  releasedAt: z.string().optional(),
+  releaseReason: z.string().optional(),
+  takeoverOf: z.string().optional(),
+  releasedHeartbeatAt: z.string().optional(),
+  releasedExpiresAt: z.string().optional(),
+  releasedCommentUpdatedAtMillis: z.number().int().nonnegative().optional(),
+  commentId: z.number().int().positive(),
+  commentUpdatedAtMillis: z.number().int().nonnegative().optional(),
+});
 const shipGateSchema = gateMetadataSchema.extend({
   id: z.string(),
   provider: z.string(),
@@ -1043,11 +1211,95 @@ const shipIssueSchema = z.object({
     .array(z.object({ at: z.number(), stage: z.string(), reason: z.string().optional() }))
     .optional(),
   issueState: z.enum(['OPEN', 'CLOSED']).optional(),
-  checks: z.array(z.object({ name: z.string(), state: z.string(), url: z.string() })).optional(),
+  checks: z
+    .array(
+      z.object({
+        name: z.string(),
+        state: z.string(),
+        url: z.string(),
+        databaseId: z.number().int().positive().optional(),
+        runId: z.number().int().positive().optional(),
+        attempt: z.number().int().positive().optional(),
+        statusContextId: z.string().min(1).optional(),
+        revision: z.string().min(1).optional(),
+        workflow: z.string().min(1).optional(),
+        identityUncertain: z.boolean().optional(),
+      }),
+    )
+    .optional(),
+  ciTriages: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        revision: z.string().min(1),
+        workflow: z.string().min(1),
+        job: z.string().min(1),
+        attempt: z.number().int().positive(),
+        classification: z.enum(['code', 'flaky', 'infrastructure', 'unknown']),
+        excerpt: z.string(),
+        url: z.string(),
+        routedAt: z.number().int().nonnegative(),
+        resolvedAt: z.number().int().nonnegative().nullable(),
+        recurrence: z.number().int().positive(),
+        rerunAllowed: z.boolean(),
+        rerunReason: z.string().min(1),
+      }),
+    )
+    .max(200)
+    .optional(),
   refreshedAt: z.number().optional(),
   refreshError: nullableString.optional(),
+  claimFencePending: z.boolean().optional(),
+  claimRevalidationPending: z.boolean().optional(),
+  claimHandoffPending: z.boolean().optional(),
+  dispatchFencePending: z.boolean().optional(),
+  claim: shippingClaimSchema.optional(),
   checkpoint: taskCheckpointSchema.optional(),
   checkpointThreadIds: z.array(z.string()).optional(),
+  contextCompactions: z
+    .object({
+      claude: z.number().int().nonnegative().optional(),
+      codex: z.number().int().nonnegative().optional(),
+      opencode: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
+  contextEventIds: z.array(z.string().min(1)).max(200).optional(),
+  contextHandoffs: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        provider: z.enum(['claude', 'codex', 'opencode']),
+        fromThreadId: z.string().min(1),
+        toThreadId: z.string().nullable(),
+        context: z.number().min(0).max(100),
+        compactions: z.number().int().nonnegative(),
+        checkpointSequence: z.number().int().nonnegative(),
+        revision: z.string().nullable(),
+        offeredAt: z.number().int().nonnegative(),
+        startedAt: z.number().int().nonnegative().nullable(),
+        retriesBefore: z.number().int().nonnegative(),
+        lostStateFailuresBefore: z.number().int().nonnegative(),
+        retriesAfter: z.number().int().nonnegative().nullable(),
+        lostStateFailuresAfter: z.number().int().nonnegative().nullable(),
+        outcome: z
+          .enum(['pending', 'reduced', 'unchanged', 'no_regression', 'regressed', 'failed'])
+          .transform((outcome): ContextHandoff['outcome'] =>
+            outcome === 'reduced' || outcome === 'unchanged' ? 'no_regression' : outcome,
+          ),
+        error: z.string().nullable(),
+      }),
+    )
+    .max(100)
+    .optional(),
+  contextCheckpointRequestedAt: z.number().int().nonnegative().optional(),
+  contextCheckpointRequestedSequence: z.number().int().nonnegative().optional(),
+  contextHandoffOfferedAt: z.number().int().nonnegative().optional(),
+  contextHandoffOfferedSequence: z.number().int().nonnegative().optional(),
+  contextPercent: z.number().min(0).max(100).optional(),
+  contextPercentByThread: z.record(z.string().min(1), z.number().min(0).max(100)).optional(),
+  handoffRecoveryRequired: z.boolean().optional(),
+  retryCount: z.number().int().nonnegative().optional(),
+  lostStateFailures: z.number().int().nonnegative().optional(),
   evidenceManifests: evidenceManifestsSchema.optional(),
   evidenceRevision: z.string().min(1).optional(),
   evidenceCommit: z.string().min(1).optional(),
@@ -1102,7 +1354,19 @@ export function loadShipRuns(raw: string | null): ShipRun[] {
     if (!Array.isArray(value)) return [];
     return value.flatMap((item) => {
       const parsed = shipRunSchema.safeParse(item);
-      return parsed.success ? [parsed.data] : [];
+      if (!parsed.success) return [];
+      for (const issue of parsed.data.issues)
+        issue.contextHandoffs = issue.contextHandoffs?.map((handoff) =>
+          handoff.outcome === 'pending' &&
+          !handoff.toThreadId &&
+          handoff.fromThreadId !== issue.threadId
+            ? Object.assign({}, handoff, {
+                outcome: 'failed' as const,
+                error: 'Retired stale handoff offer during recovery.',
+              })
+            : handoff,
+        );
+      return [parsed.data];
     });
   } catch {
     return [];

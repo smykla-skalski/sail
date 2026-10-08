@@ -1,6 +1,6 @@
 # ship-it PR loop: open, wait, fix, merge
 
-From a reviewed and tested branch to a merged PR. Never end the turn while CI or Copilot is pending: keep polling (background waits are fine) until the PR is merged or a hard stop is reached.
+From a reviewed and tested branch to a merged PR. Apply [convergence.md](convergence.md) throughout this loop. Never end the turn while required CI or a required human approval is pending: keep polling (background waits are fine) until the PR is merged or a hard stop is reached. Never request or wait for Copilot review.
 
 ## Before the first push
 
@@ -23,34 +23,21 @@ Push the branch and create a PR against the default branch. Title: the conventio
 
 Follow the repository's own PR template or conventions when it documents them. Capture the PR number.
 
-## Request Copilot
-
-```bash
-gh pr edit <n> --add-reviewer copilot-pull-request-reviewer
-```
-
-If that fails, fall back to the REST API:
-
-```bash
-gh api -X POST repos/<owner>/<repo>/pulls/<n>/requested_reviewers \
-  -f 'reviewers[]=copilot-pull-request-reviewer[bot]'
-```
-
-A failure to request Copilot never fails PR creation; note it and keep waiting, since many repositories request Copilot automatically.
-
-## Wait for CI and Copilot
+## Wait for required hosted gates
 
 Poll every 5–10 minutes; do not busy-loop. On each poll inspect:
 
 - `gh pr checks <n>`.
-- Reviews: `gh api repos/<owner>/<repo>/pulls/<n>/reviews` (Copilot's author login contains `copilot`).
+- Required human reviews and outstanding review requests.
 - Unresolved, non-outdated review threads, via GraphQL `repository.pullRequest.reviewThreads` (`isResolved`, `isOutdated`, comments).
 
-If CI fails, read the failed run logs (`gh run view <id> --log-failed`), fix, push, and keep waiting. If after roughly 30 minutes Copilot has neither reviewed nor has a pending review request, stop and ask whether to merge without it; never silently skip the Copilot wait.
+If required CI fails, read the failed run logs (`gh run view <id> --log-failed`), fix, push, and keep waiting within the convergence budget. At the cap, report the failed check and required next action. Do not restart adversarial review for an infrastructure failure or a routine CI fix.
 
-## Address Copilot feedback
+Never request or wait for Copilot. If Copilot already left an actionable comment, handle it under the same rules as other feedback, but its absence, pending state or lack of re-review never blocks delivery.
 
-For every unresolved Copilot thread:
+## Address required feedback
+
+For every unresolved thread that repository policy requires:
 
 - Valid, actionable: fix it, commit (signed, conventional), push, reply with what changed, resolve the thread.
 - Questionable: use the codebase to decide; ask only when necessary.
@@ -63,15 +50,16 @@ gh api graphql -f query='mutation($id:ID!,$body:String!){addPullRequestReviewThr
 gh api graphql -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' -f id=<thread-id>
 ```
 
-Then return to waiting. Stop for a human decision if the same thread loops more than three times.
+Then return to waiting. Stop for a human decision if the same required thread loops more than three times. Convert later non-blocking findings into follow-up issues instead of extending the delivery loop.
 
 ## Merge
 
 Merge only when all of these hold:
 
-- Every CI check succeeded.
-- Copilot submitted at least one review (a no-comments review counts). Do not wait for Copilot to re-review fix commits.
-- Every Copilot comment is fixed or answered, and its thread is resolved.
+- Every repository-required CI check succeeded.
+- Every repository-required human approval is present.
+- Every required review comment is fixed or answered, and its thread is resolved.
+- The convergence contract is satisfied; do not add discretionary review cycles before merging.
 
 How to merge, in order:
 

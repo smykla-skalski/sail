@@ -25,7 +25,16 @@
     changedFiles: number | null;
     error: string | null;
   };
-  type PullRequestCheck = { name: string; state: string; url: string };
+  type PullRequestCheck = {
+    name: string;
+    state: string;
+    url: string;
+    databaseId?: number;
+    runId?: number;
+    attempt?: number;
+    statusContextId?: string;
+    identityUncertain?: boolean;
+  };
   type PullRequestChecks = { number: number; url: string; checks: PullRequestCheck[] };
   type RepositoryChecks = {
     checks: Record<string, PullRequestChecks | null>;

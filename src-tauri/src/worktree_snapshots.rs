@@ -34,6 +34,9 @@ impl Drop for PrivateIndex {
 
 fn git(root: &Path, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
+    // Snapshot refs nest two hashes, which exceeds the legacy Windows path limit.
+    #[cfg(windows)]
+    command.arg("-c").arg("core.longpaths=true");
     command.arg("-C").arg(root).args(args);
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);

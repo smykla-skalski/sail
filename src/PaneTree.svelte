@@ -17,6 +17,7 @@
   import BrowserPane from './BrowserPane.svelte';
   import SideChat from './SideChat.svelte';
   import type { AgentThread, AgentAvailability, AgentEntry } from './lib/acp';
+  import { acpPermissionActivitySourceId } from './lib/acp-permissions';
   import type { OpenCodeClient, SessionInfo } from './lib/opencode';
   import type { SetupReport } from './lib/onboarding';
   import type { BrowserAttachment } from './lib/browser-pick';
@@ -28,11 +29,16 @@
   import type { ReviewCapture, ReviewPreview } from './lib/review-evidence';
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import type { PublishedGraph } from './lib/issue-graph';
-  import type { ShipRun } from './lib/issue-shipping';
+  import type { DirectShipAuthorization, ShipIssue, ShipRun } from './lib/issue-shipping';
   import type { ActivityHistoryEvent } from './lib/activity-history';
   import type { WorkspaceActivityItem } from './lib/workspace-activity';
   import type { ShipItIssue } from './lib/implementation-models';
   import type { TaskLocation } from './lib/task-location';
+  import {
+    permissionDecisionTitle,
+    permissionOutcome,
+    type CapabilityProfile,
+  } from './lib/capability-profiles';
   import type { NativeSubagent } from './lib/native-subagents';
   import { threadKey } from './lib/recent-threads';
   import { getPlan, getHistory, type PlanSnapshot, type HistoryEntry } from './lib/plan';
@@ -52,6 +58,8 @@
     directory: string;
     project: string;
     taskLocation: TaskLocation;
+    capabilityProfile: CapabilityProfile;
+    onensureprofile: (directory: string, profile: CapabilityProfile) => Promise<() => void>;
     dark: boolean;
     agents: AgentAvailability[];
     sideChat: SideChatState | null;
@@ -67,6 +75,7 @@
     onshiprefresh: () => Promise<void>;
     onshipopen: (path: string, threadId?: string | null) => Promise<void>;
     onshipsettings: () => Promise<void>;
+    onshiphandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
     onship: (
       graph: PublishedGraph,
       provider: ShipRun['provider'],
@@ -78,7 +87,8 @@
       directory: string,
       threadId: string,
       workerModel?: string,
-    ) => Promise<void>;
+      requireClaim?: boolean,
+    ) => Promise<DirectShipAuthorization | undefined>;
     postTurnChecks: PostTurnCheck[];
     onretrycheck: (check: PostTurnCheck) => void;
     agentUsage: Record<string, AgentUsage>;
@@ -148,6 +158,8 @@
     directory,
     project,
     taskLocation,
+    capabilityProfile,
+    onensureprofile,
     dark,
     agents,
     sideChat,
@@ -163,6 +175,7 @@
     onshiprefresh,
     onshipopen,
     onshipsettings,
+    onshiphandoff,
     onship,
     onshipit,
     postTurnChecks,
@@ -554,6 +567,7 @@
       {onshiprefresh}
       {onshipopen}
       {onshipsettings}
+      {onshiphandoff}
       {onship}
       {onshipit}
       {postTurnChecks}
@@ -622,6 +636,8 @@
       {onreviewcheck}
       {onreviewpreview}
       {onreviewcapturephase}
+      {capabilityProfile}
+      {onensureprofile}
     />
     <div
       class="pane-divider"
@@ -662,6 +678,7 @@
       {onshiprefresh}
       {onshipopen}
       {onshipsettings}
+      {onshiphandoff}
       {onship}
       {onshipit}
       {postTurnChecks}
@@ -730,6 +747,8 @@
       {onreviewcheck}
       {onreviewpreview}
       {onreviewcapturephase}
+      {capabilityProfile}
+      {onensureprofile}
     />
   </div>
 {:else}
@@ -885,6 +904,9 @@
               {onusage}
               {onstatus}
               {onshipit}
+              {capabilityProfile}
+              {onensureprofile}
+              {ondecision}
             />
             {#if nativeDetailsVisible}
               <section class="native-details side-area" aria-label="OpenCode session details">
@@ -941,6 +963,7 @@
                       closeNativeDetails();
                     }}
                     onsettings={onshipsettings}
+                    onhandoff={onshiphandoff}
                   />
                 {:else if nativeTab === 'history'}
                   <PlanHistoryPanel
@@ -1036,7 +1059,23 @@
               oncreated={(thread) => oncreated(pane.id, thread)}
               {onactivity}
               ondecision={(thread, permission, optionId) =>
-                ondecision(thread, String(permission.id), permission.title, optionId)}
+                ondecision(
+                  thread,
+                  acpPermissionActivitySourceId(
+                    permission.id,
+                    permission.generation,
+                    permission.fingerprint,
+                  ),
+                  permission.policy
+                    ? permissionDecisionTitle(
+                        permission.title,
+                        permission.policy,
+                        permissionOutcome(permission.options, optionId),
+                      )
+                    : permission.title,
+                  permissionOutcome(permission.options, optionId),
+                )}
+              {capabilityProfile}
               {onstatus}
               {onreplaychange}
               onterminal={onagentterminal}
@@ -1069,6 +1108,7 @@
                       closeAcpDetails();
                     }}
                     onsettings={onshipsettings}
+                    onhandoff={onshiphandoff}
                   />
                 {:else if acpTab === 'activity'}
                   <WorkspaceActivity
@@ -1143,6 +1183,7 @@
             focused={focused === sideChat.id}
             focusPrompt={focusPromptPane === sideChat.id}
             {onpromptfocused}
+            {onensureprofile}
           />
         </section>
       {/key}

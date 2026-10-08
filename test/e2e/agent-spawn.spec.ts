@@ -588,7 +588,26 @@ describe('provider selected agent spawn', () => {
     const report = await callMcp(
       gateConfig,
       started.threadId.slice('acp:claude:'.length),
-      { verdict: 'CLEAN' },
+      {
+        verdict: 'CLEAN',
+        economics: {
+          role: 'validator',
+          phase: 'review',
+          turns: 1,
+          toolCalls: 0,
+          permissionRequests: 0,
+          compactions: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+          elapsedMs: 0,
+          retries: 0,
+          findings: 0,
+          checks: 1,
+          humanInterventions: 0,
+          failedCommands: 0,
+          approvalLatencyMs: 0,
+          repeatedWork: 0,
+        },
+      },
       'ship_progress',
     );
     expect(report.isError).not.toBe(true);

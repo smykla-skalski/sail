@@ -10,6 +10,13 @@
   import type { SetupCheck, SetupReport } from './lib/onboarding';
   import type { ValidationChoice } from './lib/cross-validation';
   import {
+    evaluateModelRouting,
+    modelRouteRoles,
+    type ModelRoute,
+    type ModelRouteRole,
+  } from './lib/model-routing';
+  import { shipRiskLevels, type ShipRisk } from './lib/ship-risk-policy';
+  import {
     settingsAction,
     settingsRequest,
     settingsState,
@@ -25,6 +32,11 @@
   let selectedSection = $state<'general' | 'opencode' | 'agents'>('general');
   let validationAgent = $state('');
   let validationModel = $state('');
+  let routingRole = $state<ModelRouteRole>('implementation');
+  let routingRisk = $state<ShipRisk>('medium');
+  let routingProvider = $state<ModelRoute['provider']>('codex');
+  let routingModel = $state('');
+  let routingVariant = $state('');
   let themePickerOpen = $state(false);
   let requestError = $state('');
   type HookEntry = {
@@ -190,6 +202,42 @@
     const agent = snapshot.agents.find((item) => item.id === choice.agent);
     if (!agent?.available) return agent?.reason || 'Agent is unavailable';
     return null;
+  }
+
+  function saveRoute() {
+    if (!snapshot || !routingModel.trim()) return;
+    const route: ModelRoute = {
+      role: routingRole,
+      risk: routingRisk,
+      provider: routingProvider,
+      model: routingModel.trim(),
+      ...(routingVariant.trim() ? { variant: routingVariant.trim() } : {}),
+    };
+    send({
+      type: 'model-routing',
+      value: {
+        ...snapshot.modelRouting,
+        routes: [
+          ...snapshot.modelRouting.routes.filter(
+            (item) => item.role !== route.role || item.risk !== route.risk,
+          ),
+          route,
+        ],
+      },
+    });
+  }
+
+  function removeRoute(route: ModelRoute) {
+    if (!snapshot) return;
+    send({
+      type: 'model-routing',
+      value: {
+        ...snapshot.modelRouting,
+        routes: snapshot.modelRouting.routes.filter(
+          (item) => item.role !== route.role || item.risk !== route.risk,
+        ),
+      },
+    });
   }
 
   function keydown(event: KeyboardEvent) {
@@ -434,6 +482,96 @@
           disabled={!validationAgent || !validationModel.trim()}
           onclick={addValidationChoice}>Add model</Button
         >
+      </section>
+      <section class="settings-card">
+        <h2>Model routing</h2>
+        <p>
+          Assign exact agent models by work role and task risk. Exact routes reject aliases such as
+          <code>default</code>, <code>latest</code>, or <code>sonnet</code> at launch.
+        </p>
+        {#each snapshot?.modelRouting.routes ?? [] as route (`${route.role}:${route.risk}`)}
+          <p class="runtime-binary">
+            <strong>{route.role} · {route.risk}</strong> — {route.provider} / {route.model}{route.variant
+              ? ` · ${route.variant}`
+              : ''}
+            <Button size="sm" onclick={() => removeRoute(route)}>Remove</Button>
+          </p>
+        {:else}<p role="status">No explicit model routes configured.</p>{/each}
+        <label for="routing-role">Role</label>
+        <select id="routing-role" bind:value={routingRole}>
+          {#each modelRouteRoles as role (role)}<option value={role}>{role}</option>{/each}
+        </select>
+        <label for="routing-risk">Task risk</label>
+        <select id="routing-risk" bind:value={routingRisk}>
+          {#each shipRiskLevels as risk (risk)}<option value={risk}>{risk}</option>{/each}
+        </select>
+        <label for="routing-provider">Provider</label>
+        <select id="routing-provider" bind:value={routingProvider}>
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+          <option value="opencode">OpenCode</option>
+        </select>
+        <label for="routing-model">Exact model ID</label>
+        <input id="routing-model" bind:value={routingModel} placeholder="Exact model ID" />
+        <label for="routing-variant">Variant</label>
+        <input
+          id="routing-variant"
+          bind:value={routingVariant}
+          placeholder="Optional effort/variant"
+        />
+        <Button size="sm" disabled={!routingModel.trim()} onclick={saveRoute}>Save route</Button>
+        <p class="runtime-binary">
+          Accepted-task corpus: {snapshot
+            ? evaluateModelRouting(snapshot.modelRouting).accepted
+            : 0}/{snapshot ? evaluateModelRouting(snapshot.modelRouting).acceptedTotal : 0} routed · failure
+          corpus: {snapshot
+            ? evaluateModelRouting(snapshot.modelRouting).failuresPrevented
+            : 0}/{snapshot ? evaluateModelRouting(snapshot.modelRouting).failureTotal : 0} prevented
+        </p>
+        <p>Require independent review for:</p>
+        {#each shipRiskLevels as risk (risk)}
+          <label class="attention-setting">
+            <input
+              type="checkbox"
+              checked={snapshot?.modelRouting.independentReviewRisks.includes(risk) ?? false}
+              onchange={(event) =>
+                snapshot &&
+                send({
+                  type: 'model-routing',
+                  value: {
+                    ...snapshot.modelRouting,
+                    independentReviewRisks: event.currentTarget.checked
+                      ? [...new Set([...snapshot.modelRouting.independentReviewRisks, risk])]
+                      : snapshot.modelRouting.independentReviewRisks.filter(
+                          (candidate) => candidate !== risk,
+                        ),
+                  },
+                })}
+            />
+            {risk}
+          </label>
+        {/each}
+      </section>
+      <section class="settings-card">
+        <h2>Context handoff</h2>
+        <p>
+          Ask Ship workers to checkpoint ten percentage points before this limit, then offer a
+          fresh-thread handoff at the limit.
+        </p>
+        <label for="context-handoff-threshold">Context threshold (%)</label>
+        <input
+          id="context-handoff-threshold"
+          type="number"
+          min="60"
+          max="95"
+          step="1"
+          value={snapshot?.contextHandoffThreshold ?? 85}
+          onchange={(event) =>
+            send({
+              type: 'context-handoff-threshold',
+              value: Number(event.currentTarget.value),
+            })}
+        />
       </section>
       <section class="settings-card hook-inspector">
         <h2>Runtime hook integration</h2>

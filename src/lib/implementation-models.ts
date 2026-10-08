@@ -72,6 +72,25 @@ export type ShipItIssue = {
   number: number;
 };
 
+async function shipItRepository(directory: string): Promise<string> {
+  const repository = await invoke<string>('github_issue_repository', { repository: directory });
+  return repository.toLowerCase();
+}
+
+function rejectForeignShipItIssue(repository: string, issue: ShipItIssue): void {
+  if (issue.repository.toLowerCase() === repository) return;
+  throw new Error(
+    `This checkout ships ${repository}, not ${issue.repository}. Open ${issue.repository} before running /ship-it.`,
+  );
+}
+
+export async function assertShipItIssueRepository(
+  directory: string,
+  issue: ShipItIssue,
+): Promise<void> {
+  rejectForeignShipItIssue(await shipItRepository(directory), issue);
+}
+
 export function savedShipItOwner(directory: string): string | null {
   const owner = getSetting(shipOwnerKey(directory));
   return owner?.trim() || null;
@@ -190,24 +209,28 @@ export async function beginShipItRun(
       prompt.slice(command.end),
     )?.[1];
   if (!issue) return null;
-  const canonical = async (reference: string): Promise<string> => {
+  const repository = await shipItRepository(directory);
+  const canonical = (reference: string): string => {
     const number = Number(reference.match(/\d+$/)![0]);
     if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Choose an issue.');
     const qualified = /^(?:https?:\/\/github\.com\/)?([^/\s]+\/[^/#\s]+)(?:\/issues\/|#)/i.exec(
       reference,
     );
     if (qualified) return `${qualified[1].toLowerCase()}#${number}`;
-    const repository = await invoke<string>('github_issue_repository', { repository: directory });
-    return `${repository.toLowerCase()}#${number}`;
+    return `${repository}#${number}`;
   };
-  const identity = await canonical(issue);
+  const identity = canonical(issue);
+  const [issueRepository, issueNumber] = identity.split('#');
+  rejectForeignShipItIssue(repository, {
+    repository: issueRepository,
+    number: Number(issueNumber),
+  });
   const saved = getSetting(runKey(directory));
-  const previous = saved ? await canonical(saved) : undefined;
+  const previous = saved ? canonical(saved) : undefined;
   if (previous && previous !== identity)
     throw new Error(`This worktree tracks ${previous}. Start ${identity} in a new worktree.`);
   setSetting(runKey(directory), identity);
-  const [repository, number] = identity.split('#');
-  return { repository, number: Number(number) };
+  return { repository: issueRepository, number: Number(issueNumber) };
 }
 
 export function implementationModels(directory: string): string[] {

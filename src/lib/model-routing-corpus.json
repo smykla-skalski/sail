@@ -1,0 +1,32 @@
+{
+  "revision": "2026-10-08.1",
+  "acceptedTasks": [
+    { "id": "map-code", "role": "exploration", "risk": "low" },
+    { "id": "small-change", "role": "implementation", "risk": "low" },
+    { "id": "cross-cutting-change", "role": "implementation", "risk": "high" },
+    { "id": "reproduce-regression", "role": "debugging", "risk": "medium" },
+    {
+      "id": "independent-review",
+      "role": "review",
+      "risk": "medium",
+      "implementingModels": ["implementation-model"]
+    },
+    { "id": "ci-failure", "role": "ci-triage", "risk": "medium" }
+  ],
+  "failureCases": [
+    { "id": "reject-default-alias", "role": "implementation", "risk": "low", "model": "default" },
+    {
+      "id": "reject-latest-alias",
+      "role": "debugging",
+      "risk": "medium",
+      "model": "provider:model-latest"
+    },
+    {
+      "id": "reject-review-self-selection",
+      "role": "review",
+      "risk": "medium",
+      "implementingModels": ["review-model"],
+      "model": "review-model"
+    }
+  ]
+}

@@ -10,16 +10,39 @@
   import type { OpenCodeClient } from './lib/opencode';
   import { openExternalLink } from './lib/external-link';
   import OptionPicker from './OptionPicker.svelte';
+  import {
+    openCodePermissionToolCall,
+    permissionPolicy,
+    type CapabilityProfile,
+    type PermissionPolicyDecision,
+  } from './lib/capability-profiles';
+  import { openCodePermissionRejections } from './lib/opencode-permission-resolution';
 
   interface Props {
     pendingPermissions: PermissionRequest[];
     pendingForms: FormInfo[];
     client: OpenCodeClient | null;
     sessionID: string | null;
+    workspace: string;
     onchanged: () => Promise<void>;
+    capabilityProfile?: CapabilityProfile;
+    ondecision?: (
+      request: PermissionRequest,
+      decision: 'once' | 'always' | 'reject',
+      policy: PermissionPolicyDecision,
+    ) => void;
   }
 
-  let { pendingPermissions, pendingForms, client, sessionID, onchanged }: Props = $props();
+  let {
+    pendingPermissions,
+    pendingForms,
+    client,
+    sessionID,
+    workspace,
+    onchanged,
+    capabilityProfile = 'build',
+    ondecision,
+  }: Props = $props();
   type Value = string | number | boolean | string[];
   let drafts = $state<Record<string, Record<string, Value>>>({});
   let customInputs = $state<Record<string, string>>({});
@@ -29,6 +52,19 @@
   let suggestionOpen = $state<string | null>(null);
   let error = $state('');
   let status = $state('');
+
+  function requestPolicy(request: PermissionRequest): PermissionPolicyDecision {
+    return permissionPolicy({
+      profile: capabilityProfile,
+      workspace,
+      title: request.action,
+      toolCall: openCodePermissionToolCall(request),
+      options: [
+        { optionId: 'once', kind: 'allow_once' },
+        { optionId: 'reject', kind: 'reject_once' },
+      ],
+    });
+  }
 
   function suggestionKeydown(event: KeyboardEvent) {
     const button = event.currentTarget as HTMLButtonElement;
@@ -180,14 +216,30 @@
     try {
       await source.permission.get({ sessionID: selected, requestID: request.id });
       if (sessionID !== selected) return;
-      await source.permission.reply({
-        sessionID: selected,
-        requestID: request.id,
-        decision,
-        ...(decision === 'reject' && feedback[request.id]?.trim()
-          ? { message: feedback[request.id].trim() }
-          : {}),
-      });
+      if (decision === 'reject') {
+        await openCodePermissionRejections.reject({
+          selected: request,
+          list: () => source.permission.list({ sessionID: selected }),
+          reply: () =>
+            source.permission.reply({
+              sessionID: selected,
+              requestID: request.id,
+              decision,
+              ...(feedback[request.id]?.trim() ? { message: feedback[request.id].trim() } : {}),
+            }),
+          record: (settledRequest) =>
+            ondecision?.(settledRequest, decision, requestPolicy(settledRequest)),
+        });
+      } else {
+        await openCodePermissionRejections.resolveAutomatically({
+          selected: request,
+          decision,
+          reply: () =>
+            source.permission.reply({ sessionID: selected, requestID: request.id, decision }),
+          record: (settledRequest, settledDecision) =>
+            ondecision?.(settledRequest, settledDecision, requestPolicy(settledRequest)),
+        });
+      }
       if (sessionID === selected)
         status = decision === 'reject' ? 'Permission rejected.' : 'Permission allowed.';
     } catch (cause) {
@@ -248,6 +300,7 @@
     {#if error}<p class="notice error" role="alert">{error}</p>{/if}
     {#if status}<p class="notice" role="status">{status}</p>{/if}
     {#each pendingPermissions as request (request.id)}
+      {@const policy = requestPolicy(request)}
       <article
         class="prompt-card"
         data-request-id={request.id}
@@ -255,6 +308,9 @@
         tabindex="-1"
       >
         <h3>Allow {request.action}?</h3>
+        <p class="prompt-warning" data-policy-risk={policy.risk}>
+          {policy.profile} · {policy.risk} risk · policy {policy.policyRevision}: {policy.reason}
+        </p>
         {#if request.message}<p>{request.message}</p>{/if}
         <ul>
           {#each request.resources as resource, index (`${resource}:${index}`)}<li>
@@ -276,9 +332,12 @@
             oninput={(event) => (feedback[request.id] = event.currentTarget.value)}></textarea>
         </label>
         <div class="prompt-actions">
-          <button disabled={!!busyID} onclick={() => decide(request, 'once')}>Allow once</button>
-          <button disabled={!!busyID} onclick={() => decide(request, 'always')}>Allow always</button
-          >
+          {#if policy.recommendation !== 'deny'}<button
+              disabled={!!busyID}
+              onclick={() => decide(request, 'once')}>Allow once</button
+            ><button disabled={!!busyID} onclick={() => decide(request, 'always')}
+              >Allow always</button
+            >{/if}
           <button disabled={!!busyID} onclick={() => decide(request, 'reject')}>Reject</button>
         </div>
       </article>

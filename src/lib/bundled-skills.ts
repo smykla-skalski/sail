@@ -9,6 +9,7 @@ export const bundledSkills: SkillChoice[] = [
     description: 'Implement, review, test, and ship one change',
     instructions: progressiveSkillInstructions('ship-it', shipIt, [
       'inputs.md',
+      'convergence.md',
       'fallbacks.md',
       'pr-loop.md',
     ]),

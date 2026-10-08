@@ -1,14 +1,41 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { AgentEvent } from '../src/lib/acp.ts';
+import { automaticPermissionPolicy } from '../src/lib/capability-profiles.ts';
 import {
   disconnectNativeSubagents,
   finalizeNativeSubagentRestore,
   nativeSubagentCounts,
   nativeSubagentReceipts,
+  reconcileNativeSubagents,
+  nativeSubagentThreads,
   setNativeSubagentWaiting,
   updateNativeSubagents,
 } from '../src/lib/native-subagents.ts';
+
+await test('backend snapshot exposes a child before its queued frontend event runs', () => {
+  const store = reconcileNativeSubagents(
+    {},
+    [
+      {
+        agent: 'codex',
+        capabilityProfile: 'review',
+        sessionId: 'late-child',
+        parentSessionId: 'owner',
+        directory: '/worktree',
+        outcome: 'working',
+      },
+    ],
+    10,
+  );
+
+  const receipts = nativeSubagentReceipts(store);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].sourceId, 'acp:codex:owner');
+  assert.equal(receipts[0].targetId, 'acp:codex:late-child');
+  assert.equal(receipts[0].state, 'working');
+  assert.equal(store['codex:late-child'].capabilityProfile, 'review');
+});
 
 function event(sessionId: string, update: Record<string, unknown>): AgentEvent {
   return {
@@ -30,6 +57,8 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
     }),
     '/repo',
     1,
+    false,
+    'review',
   );
   store = updateNativeSubagents(
     store,
@@ -42,6 +71,8 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
     }),
     '/repo',
     2,
+    false,
+    'build',
   );
   store = updateNativeSubagents(
     store,
@@ -56,6 +87,13 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
   assert.equal(store['codex:child'].rootSessionId, 'parent');
   assert.equal(store['codex:grandchild'].parentSessionId, 'child');
   assert.equal(store['codex:grandchild'].rootSessionId, 'parent');
+  assert.equal(store['codex:child'].capabilityProfile, 'review');
+  assert.equal(store['codex:grandchild'].capabilityProfile, 'review');
+  assert.equal(
+    nativeSubagentThreads(store).find((thread) => thread.sessionId === 'grandchild')
+      ?.capabilityProfile,
+    'review',
+  );
   assert.equal(store['codex:child'].transcript.at(-1)?.type, 'assistant');
   assert.equal(store['codex:grandchild'].transcript.length, 0);
   assert.equal(nativeSubagentReceipts(store)[0].result, null);
@@ -65,7 +103,7 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
 await test('replayed lifecycle deduplicates and unfinished history disconnects', () => {
   const spawn = event('parent', {
     sessionUpdate: 'subagent_spawned',
-    subagentSessionId: 'child',
+    subagentSessionId: 'parent:replay-subagent:child',
     name: 'worker',
     task: 'Task',
     capabilities: {},
@@ -73,10 +111,10 @@ await test('replayed lifecycle deduplicates and unfinished history disconnects',
   let store = updateNativeSubagents({}, spawn, '/repo', 1, true);
   store = updateNativeSubagents(store, spawn, '/repo', 2, true);
   assert.equal(Object.keys(store).length, 1);
-  assert.equal(store['codex:child'].created, 1);
+  assert.equal(store['codex:parent:replay-subagent:child'].created, 1);
 
   store = finalizeNativeSubagentRestore(store, 'codex', 'parent', 3);
-  assert.equal(store['codex:child'].outcome, 'unknown');
+  assert.equal(store['codex:parent:replay-subagent:child'].outcome, 'unknown');
   assert.equal(nativeSubagentReceipts(store)[0].state, 'unavailable');
 });
 
@@ -115,9 +153,103 @@ await test('terminal outcomes stay distinct and disconnect only affects live chi
     '/repo',
     3,
   );
-  store = disconnectNativeSubagents(store, 'codex', 4);
+  store = disconnectNativeSubagents(store, 'codex', ['live'], 4);
   assert.equal(store['codex:done'].outcome, 'interrupted');
   assert.equal(store['codex:live'].outcome, 'unknown');
+});
+
+await test('disconnect leaves children from another capability connection live', () => {
+  let store = updateNativeSubagents(
+    {},
+    event('review-parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'review-child',
+      name: 'reviewer',
+      task: 'Review changes',
+    }),
+    '/repo',
+    1,
+    false,
+    'review',
+  );
+  store = updateNativeSubagents(
+    store,
+    event('build-parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'build-child',
+      name: 'builder',
+      task: 'Implement changes',
+    }),
+    '/repo',
+    2,
+    false,
+    'build',
+  );
+
+  store = disconnectNativeSubagents(store, 'codex', ['review-parent', 'review-child'], 3);
+
+  assert.equal(store['codex:review-child'].outcome, 'unknown');
+  assert.equal(store['codex:build-child'].outcome, 'working');
+});
+
+await test('review native child keeps medium-risk actions denied', () => {
+  const store = updateNativeSubagents(
+    {},
+    event('review-parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'review-child',
+      name: 'reviewer',
+      task: 'Review changes',
+    }),
+    '/repo',
+    1,
+    false,
+    'review',
+  );
+  const thread = nativeSubagentThreads(store)[0];
+
+  const decision = automaticPermissionPolicy({
+    profile: thread.capabilityProfile ?? 'build',
+    workspace: thread.directory,
+    title: 'Edit file',
+    toolCall: { command: 'apply_patch' },
+    options: [
+      { optionId: 'allow', kind: 'allow_once' },
+      { optionId: 'deny', kind: 'reject_once' },
+    ],
+  });
+
+  assert.equal(decision.profile, 'review');
+  assert.equal(decision.risk, 'medium');
+  assert.equal(decision.recommendation, 'deny');
+  assert.equal(decision.optionId, 'deny');
+});
+
+await test('review replay replaces a cached build profile before permission policy runs', () => {
+  const spawn = event('parent', {
+    sessionUpdate: 'subagent_spawned',
+    subagentSessionId: 'child',
+    name: 'reviewer',
+    task: 'Review changes',
+  });
+  let store = updateNativeSubagents({}, spawn, '/repo', 1, false, 'build');
+
+  store = updateNativeSubagents(store, spawn, '/repo', 2, true, 'review');
+  const thread = nativeSubagentThreads(store)[0];
+  const decision = automaticPermissionPolicy({
+    profile: thread.capabilityProfile ?? 'build',
+    workspace: thread.directory,
+    title: 'Edit file',
+    toolCall: { command: 'apply_patch' },
+    options: [
+      { optionId: 'allow', kind: 'allow_once' },
+      { optionId: 'deny', kind: 'reject_once' },
+    ],
+  });
+
+  assert.equal(thread.capabilityProfile, 'review');
+  assert.equal(decision.recommendation, 'deny');
+  assert.equal(decision.optionId, 'deny');
 });
 
 await test('late and duplicate events cannot revive a terminal child', () => {
@@ -237,7 +369,7 @@ await test('malformed and self-referential lifecycle events leave parents intact
     {},
     event('parent', {
       sessionUpdate: 'subagent_spawned',
-      subagentSessionId: 'broken-child',
+      subagentSessionId: 'parent:replay-subagent:broken',
       name: 42,
       capabilities: {},
     }),
@@ -245,5 +377,79 @@ await test('malformed and self-referential lifecycle events leave parents intact
     1,
     true,
   );
-  assert.equal(restored['codex:broken-child'].error, 'Incomplete subagent history');
+  assert.equal(
+    restored['codex:parent:replay-subagent:broken'].error,
+    'Incomplete subagent history',
+  );
+});
+
+function spawnEvent(parent: string, child: string): AgentEvent {
+  return event(parent, {
+    sessionUpdate: 'subagent_spawned',
+    subagentSessionId: child,
+    name: 'explore',
+    task: 'Map the code',
+    capabilities: {},
+  });
+}
+
+await test('a replay of a live session does not duplicate its live children', () => {
+  const live = updateNativeSubagents({}, spawnEvent('root', 'task-1'), '/repo', 1);
+  const replayed = updateNativeSubagents(
+    live,
+    spawnEvent('root', 'root:replay-subagent:toolu_1'),
+    '/repo',
+    2,
+    true,
+  );
+  assert.equal(replayed, live);
+  const nested = updateNativeSubagents(
+    replayed,
+    spawnEvent('root:replay-subagent:toolu_1', 'root:replay-subagent:toolu_2'),
+    '/repo',
+    3,
+    false,
+  );
+  assert.equal(nested, live);
+  const finalized = finalizeNativeSubagentRestore(nested, 'codex', 'root', 4);
+  assert.deepEqual(
+    Object.values(finalized).map((child) => [child.sessionId, child.outcome]),
+    [['task-1', 'working']],
+  );
+});
+
+await test('a claude child spawned while its session replays stays live', () => {
+  const live = { ...spawnEvent('root', 'root:live-child'), agent: 'claude' as const };
+  const store = updateNativeSubagents({}, live, '/repo', 1, true);
+  const child = store['claude:root:live-child'];
+  assert.equal(child?.restored, false);
+  assert.equal(child?.outcome, 'working');
+  assert.equal(finalizeNativeSubagentRestore(store, 'claude', 'root', 2), store);
+});
+
+await test('an adapter without replay markers still restores its children', () => {
+  const store = updateNativeSubagents({}, spawnEvent('root', 'thread-7'), '/repo', 1, true);
+  assert.equal(store['codex:thread-7']?.restored, true);
+  const finalized = finalizeNativeSubagentRestore(store, 'codex', 'root', 2);
+  assert.equal(finalized['codex:thread-7']?.outcome, 'unknown');
+  assert.equal(finalized['codex:thread-7']?.activity, 'Disconnected');
+});
+
+await test('a first replay still restores historical children', () => {
+  const restored = updateNativeSubagents(
+    {},
+    event('root', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'root:replay-subagent:toolu_1',
+      name: 'explore',
+      task: 'Map the code',
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+    true,
+  );
+  const child = restored['codex:root:replay-subagent:toolu_1'];
+  assert.equal(child?.restored, true);
+  assert.equal(child?.rootSessionId, 'root');
 });

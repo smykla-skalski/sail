@@ -3,6 +3,7 @@
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { Button } from '@smykla-skalski/sui';
+  import { isSessionNotFoundError } from '@opencode/client';
   import type { FormInfo, PermissionRequest } from '@opencode/client';
   import Markdown from './Markdown.svelte';
   import ActivityStatus from './ActivityStatus.svelte';
@@ -39,7 +40,17 @@
     savedShipItOwner,
     type ShipItIssue,
   } from './lib/implementation-models';
-  import { runSerialOpenCodeTurn } from './lib/opencode-turns';
+  import {
+    dispatchAuthorizedDirectShipPrompt,
+    directShipClaimPrompt,
+    type DirectShipAuthorization,
+  } from './lib/issue-shipping';
+  import {
+    openCodeInboxSettled,
+    runOpenCodePromptStart,
+    runSerialOpenCodeTurn,
+    waitForAuthoritativeOpenCodeSettlement,
+  } from './lib/opencode-turns';
   import { openCodeHeaderStatus } from './lib/agent-status';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
@@ -79,6 +90,11 @@
     type TaskLocation as TaskLocationValue,
   } from './lib/task-location';
   import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
+  import {
+    holdCapabilityProfileReservation,
+    permissionDecisionTitle,
+    type CapabilityProfile,
+  } from './lib/capability-profiles';
 
   let {
     client,
@@ -107,6 +123,9 @@
     onusage,
     onworkspaceactivity,
     onshipit,
+    capabilityProfile = 'build',
+    onensureprofile,
+    ondecision,
   }: {
     client: OpenCodeClient | null;
     runtimeState: 'starting' | 'connected' | 'error';
@@ -141,7 +160,11 @@
       directory: string,
       threadId: string,
       workerModel?: string,
-    ) => Promise<void>;
+      requireClaim?: boolean,
+    ) => Promise<DirectShipAuthorization | undefined>;
+    capabilityProfile?: CapabilityProfile;
+    onensureprofile?: (directory: string, profile: CapabilityProfile) => Promise<() => void>;
+    ondecision?: (thread: AgentThread, id: string, title: string, outcome: string) => void;
   } = $props();
 
   let session = $state<SessionInfo | null>(null);
@@ -182,7 +205,7 @@
         path,
         sourceId,
         session?.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-      );
+      ).catch((cause) => (error = describe(cause)));
   });
 
   function isShipItPrompt(text: string): boolean {
@@ -413,12 +436,20 @@
   }
 
   function summary(info: SessionInfo): AgentThread {
+    const savedProfile = info.metadata?.sailCapabilityProfile;
     return {
       agent: 'opencode',
       sessionId: info.id,
       directory,
       title: info.title ?? 'OpenCode thread',
       updated: info.time.updated,
+      capabilityProfile:
+        savedProfile === 'explore' ||
+        savedProfile === 'review' ||
+        savedProfile === 'build' ||
+        savedProfile === 'release'
+          ? savedProfile
+          : (thread?.capabilityProfile ?? capabilityProfile),
     };
   }
 
@@ -756,7 +787,17 @@
     stopRequested = false;
     lastExecutionStatus = null;
     error = '';
+    let releaseProfile: (() => void) | undefined;
     try {
+      const savedProfile = session?.metadata?.sailCapabilityProfile;
+      const activeProfile: CapabilityProfile =
+        savedProfile === 'explore' ||
+        savedProfile === 'review' ||
+        savedProfile === 'build' ||
+        savedProfile === 'release'
+          ? savedProfile
+          : (thread?.capabilityProfile ?? capabilityProfile);
+      releaseProfile = await onensureprofile?.(turnDirectory, activeProfile);
       let id = activeID;
       if (!id) {
         const info = await source.session.create({
@@ -769,7 +810,7 @@
               }
             : undefined,
           location: { directory: turnDirectory },
-          metadata: { saiHarness: true },
+          metadata: { saiHarness: true, sailCapabilityProfile: activeProfile },
           title: text ? (text.length > 60 ? `${text.slice(0, 57)}…` : text) : 'New work',
         });
         if (current !== generation || disposed) return;
@@ -782,6 +823,8 @@
       running = true;
       if (session) onstatus(summary(session), 'working');
       const promptRequest = runSerialOpenCodeTurn(id, async () => {
+        let directClaim = '';
+        let directAuthorization: DirectShipAuthorization | undefined;
         const target = await source.session.get({ sessionID: id });
         if (target.location.directory !== turnDirectory)
           throw new Error('Target session moved to another worktree.');
@@ -790,7 +833,15 @@
           : undefined;
         if (shipIssue) {
           recordShipItOwner(turnDirectory, `opencode:${id}`);
-          await onshipit?.(shipIssue, turnDirectory, `opencode:${id}`, implementingModel);
+          directAuthorization = await onshipit?.(
+            shipIssue,
+            turnDirectory,
+            `opencode:${id}`,
+            implementingModel,
+            true,
+          );
+          if (!directAuthorization) throw new Error('Direct shipping claim was not acquired.');
+          directClaim = directShipClaimPrompt(directAuthorization.claim);
         }
         await invoke('record_turn_snapshot', { path: turnDirectory, thread: `opencode:${id}` });
         const tracking = await beginImplementationTurn(
@@ -798,20 +849,41 @@
           implementingModel,
           `opencode:${id}`,
         );
-        let response;
+        let response: Awaited<ReturnType<OpenCodeClient['session']['prompt']>>;
         try {
-          response = await source.session.prompt({
-            sessionID: id,
-            text: resolveSkillPrompt(skills, text, implementingModel),
-            skills: promptSkill(skills, text)?.id
-              ? [{ id: promptSkill(skills, text)!.id! }]
-              : undefined,
-            delivery: queued ? 'steer' : undefined,
-            files: paths.map((path) => ({
-              uri: fileUri(path),
-              name: clipboardNames.get(path) ?? path.split(/[\\/]/).at(-1),
-            })),
-          });
+          response = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
+            runOpenCodePromptStart(turnDirectory, () =>
+              source.session.prompt({
+                sessionID: id,
+                text: resolveSkillPrompt(skills, text, implementingModel) + directClaim,
+                skills: promptSkill(skills, text)?.id
+                  ? [{ id: promptSkill(skills, text)!.id! }]
+                  : undefined,
+                delivery: queued ? 'steer' : undefined,
+                files: paths.map((path) => ({
+                  uri: fileUri(path),
+                  name: clipboardNames.get(path) ?? path.split(/[\\/]/).at(-1),
+                })),
+              }),
+            ),
+          );
+          const heldRelease = releaseProfile;
+          releaseProfile = undefined;
+          const completion = waitForAuthoritativeOpenCodeSettlement(
+            () => (client ?? source).session.wait({ sessionID: id }),
+            () =>
+              openCodeInboxSettled(response.id, (pageCursor) =>
+                (client ?? source).message.list({
+                  sessionID: id,
+                  limit: 100,
+                  order: 'desc',
+                  cursor: pageCursor,
+                }),
+              ),
+            { terminal: isSessionNotFoundError },
+          );
+          if (heldRelease)
+            void holdCapabilityProfileReservation(heldRelease, completion).catch(() => undefined);
         } catch (cause) {
           await recordImplementationModel(turnDirectory, implementingModel, tracking);
           throw cause;
@@ -882,6 +954,7 @@
       }
       if (external) throw cause;
     } finally {
+      releaseProfile?.();
       for (const path of paths) inFlightCaptures.delete(path);
       if (!accepted)
         for (const path of paths)
@@ -1126,6 +1199,21 @@
         {pendingForms}
         {client}
         sessionID={activeID}
+        workspace={thread?.directory ?? directory}
+        capabilityProfile={thread?.capabilityProfile ?? capabilityProfile}
+        ondecision={(request, decision, policy) => {
+          if (thread)
+            ondecision?.(
+              thread,
+              request.id,
+              permissionDecisionTitle(
+                `Allow ${request.action}?`,
+                policy,
+                decision === 'reject' ? 'rejected' : 'completed',
+              ),
+              decision === 'reject' ? 'rejected' : 'completed',
+            );
+        }}
         onchanged={async () => {
           if (activeID) await refreshRequests(activeID);
         }}
