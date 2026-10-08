@@ -2,7 +2,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,8 @@ struct Client {
     profile: CapabilityProfile,
 }
 
+const RELEASED_TOKENS_KEPT: usize = 64;
+
 #[derive(Default)]
 struct Inner {
     port: Mutex<u16>,
@@ -41,6 +43,7 @@ struct Inner {
     page_ready: Condvar,
     panes: Mutex<Vec<PaneRef>>,
     clients: Mutex<HashMap<String, Client>>,
+    released_tokens: Mutex<VecDeque<String>>,
     targets: Mutex<HashMap<String, String>>,
     guards: Mutex<HashMap<String, String>>,
     blocked: Mutex<HashMap<String, String>>,
@@ -178,9 +181,32 @@ impl BrowserManager {
         })
     }
 
+    pub fn active_tokens(&self) -> Vec<String> {
+        let mut tokens: Vec<String> = self
+            .0
+            .clients
+            .lock()
+            .map(|clients| clients.keys().cloned().collect())
+            .unwrap_or_default();
+        if let Ok(released) = self.0.released_tokens.lock() {
+            tokens.extend(released.iter().cloned());
+        }
+        tokens
+    }
+
     pub fn release(&self, token: &str) {
-        if let Ok(mut clients) = self.0.clients.lock() {
-            clients.remove(token);
+        let removed = self
+            .0
+            .clients
+            .lock()
+            .is_ok_and(|mut clients| clients.remove(token).is_some());
+        if removed {
+            if let Ok(mut released) = self.0.released_tokens.lock() {
+                if released.len() >= RELEASED_TOKENS_KEPT {
+                    released.pop_front();
+                }
+                released.push_back(token.to_string());
+            }
         }
     }
 
@@ -2000,5 +2026,31 @@ mod mcp_session_tests {
         let acp = json!({"_meta":{"sessionID":"acp-session"}});
         assert_eq!(mcp_session_id(&opencode), Some("ses_opencode"));
         assert_eq!(mcp_session_id(&acp), Some("acp-session"));
+    }
+}
+
+#[cfg(test)]
+mod token_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn released_tokens_stay_listed_for_redaction_with_a_bound() {
+        let manager = BrowserManager::default();
+        *manager.0.port.lock().unwrap() = 1;
+        let directory = std::env::temp_dir().canonicalize().unwrap();
+        let directory = directory.to_string_lossy();
+        let first = manager.config(&directory, None, None).unwrap().token;
+        let live = manager.config(&directory, None, None).unwrap().token;
+        manager.release(&first);
+        let tokens = manager.active_tokens();
+        assert!(tokens.contains(&first) && tokens.contains(&live));
+        for _ in 0..RELEASED_TOKENS_KEPT + 5 {
+            let token = manager.config(&directory, None, None).unwrap().token;
+            manager.release(&token);
+        }
+        let tokens = manager.active_tokens();
+        assert!(!tokens.contains(&first));
+        assert!(tokens.contains(&live));
+        assert!(tokens.len() <= RELEASED_TOKENS_KEPT + 1);
     }
 }

@@ -1,6 +1,8 @@
 import type { SessionInfo, SessionMessageInfo } from './opencode';
 import { needsChildSummary } from './opencode-subagent-summary.ts';
 import { mergeMessages } from './timeline.ts';
+import { receiptSourceId, type SpawnReceipt } from './agent-results.ts';
+import { subagentRuns } from './subagent-runs.ts';
 
 type Page<T> = { data: T[]; cursor: { next?: string | null } };
 
@@ -59,6 +61,71 @@ type Parent = {
   closed: boolean;
   stop: () => void;
 };
+
+/** Label for a child's state. A child that ended without a recorded failure reads "Finished". */
+export function openCodeChildStatusLabel(state: SpawnReceipt['state']): string | undefined {
+  return state === 'completed' ? 'Finished' : undefined;
+}
+
+/** What a child is doing now, from its newest assistant message. */
+export function openCodeChildActivity(
+  state: SpawnReceipt['state'],
+  summary: SessionMessageInfo | undefined,
+): string {
+  const fallback =
+    state === 'working'
+      ? 'Thinking'
+      : state === 'completed'
+        ? 'Finished'
+        : state === 'failed'
+          ? 'Failed'
+          : state === 'interrupted'
+            ? 'Interrupted'
+            : 'Queued';
+  if (!summary || summary.type !== 'assistant') return fallback;
+  const part = summary.content.findLast((item) => item.type === 'tool' || item.type === 'text');
+  if (part?.type === 'tool') return `${part.name} · ${part.state.status}`;
+  if (part?.type === 'text') return part.text.slice(0, 160);
+  return fallback;
+}
+
+/** Child sessions as receipts, so views that list spawned agents can list them too. */
+export function openCodeChildReceipts(
+  parentSessionId: string,
+  directory: string,
+  { children, active, summaries }: Pick<OpenCodeChildren, 'children' | 'active' | 'summaries'>,
+): SpawnReceipt[] {
+  const sessions = new Map(children.map((child) => [child.id, child]));
+  return subagentRuns({ openCode: [{ parentSessionId, directory, children, active }] }).flatMap(
+    (run): SpawnReceipt[] => {
+      const child = run.sessionId ? sessions.get(run.sessionId) : undefined;
+      if (!child || !run.directory) return [];
+      return [
+        {
+          receiptId: `opencode-child:${child.id}`,
+          accessKey: '',
+          requestId: `opencode-child:${child.id}`,
+          project: directory,
+          sourceId: receiptSourceId('opencode', parentSessionId),
+          sourceDirectory: directory,
+          targetId: run.id,
+          turnId: null,
+          targetDirectory: run.directory,
+          worktreeId: null,
+          provider: 'opencode',
+          prompt: child.title ?? child.agent ?? null,
+          state: run.state,
+          created: child.time.created,
+          updated: child.time.updated,
+          result: null,
+          error: null,
+          activity: openCodeChildActivity(run.state, summaries[child.id]),
+          ...(child.agent ? { name: child.agent } : {}),
+        },
+      ];
+    },
+  );
+}
 
 export function emptyOpenCodeChildren(): OpenCodeChildren {
   return {

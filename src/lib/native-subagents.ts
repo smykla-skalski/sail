@@ -1,4 +1,10 @@
-import type { AgentEntry, AgentEvent, AgentThread, NativeSubagentSnapshot } from './acp.ts';
+import type {
+  AgentEntry,
+  AgentEvent,
+  AgentMessage,
+  AgentThread,
+  NativeSubagentSnapshot,
+} from './acp.ts';
 import { updateEntries } from './acp.ts';
 import type { SpawnReceipt, SpawnState } from './agent-results.ts';
 import type { CapabilityProfile } from './capability-profiles.ts';
@@ -19,6 +25,8 @@ export type NativeSubagent = {
   outcome: NativeSubagentOutcome;
   activity: string;
   transcript: AgentEntry[];
+  /** Tool calls seen, counted as they arrive because the bounded transcript evicts old ones. */
+  toolCount?: number;
   created: number;
   updated: number;
   restored: boolean;
@@ -197,6 +205,7 @@ export function updateNativeSubagents(
         outcome: settled ?? 'working',
         activity: settled ? (previous?.activity ?? 'Starting…') : 'Starting…',
         transcript: nextTranscript,
+        ...(previous?.toolCount === undefined ? {} : { toolCount: previous.toolCount }),
         created: previous?.created ?? now,
         updated: now,
         restored: previous?.restored || replayed,
@@ -256,10 +265,15 @@ export function updateNativeSubagents(
             : undefined,
         );
   const settled = ['completed', 'failed', 'interrupted'].includes(child.outcome);
+  const newTool =
+    update.sessionUpdate === 'tool_call' &&
+    toolCallId !== undefined &&
+    !child.transcript.some((entry) => entry.type === 'tool' && entry.id === toolCallId);
   return {
     ...store,
     [id]: {
       ...child,
+      ...(newTool ? { toolCount: (child.toolCount ?? 0) + 1 } : {}),
       outcome: settled ? child.outcome : child.outcome === 'waiting' ? 'waiting' : 'working',
       activity: settled ? child.activity : toolActivity(update, child.activity),
       transcript,
@@ -313,6 +327,7 @@ export function reconcileNativeSubagents(
         outcome: snapshot.outcome,
         activity,
         transcript: previous?.transcript ?? [],
+        ...(previous?.toolCount === undefined ? {} : { toolCount: previous.toolCount }),
         created: previous?.created ?? now,
         updated: now,
         restored: previous?.restored ?? false,
@@ -408,6 +423,16 @@ export function nativeSubagentStatus(child: NativeSubagent): {
   };
 }
 
+/** The child's final message, which is its result. The state text alone is not a result. */
+export function nativeSubagentResult(child: NativeSubagent): string | null {
+  if (!['completed', 'failed', 'interrupted'].includes(child.outcome)) return null;
+  if (reportsInterruption(child.transcript)) return null;
+  const last = child.transcript.findLast(
+    (entry): entry is AgentMessage => entry.type === 'assistant',
+  );
+  return last?.text.trim() || null;
+}
+
 export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt[] {
   return Object.values(store).map((child) => {
     const status = nativeSubagentStatus(child);
@@ -427,11 +452,11 @@ export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt
       state: status.state,
       created: child.created,
       updated: child.updated,
-      result: ['completed', 'failed', 'interrupted', 'unknown'].includes(child.outcome)
-        ? status.activity
-        : null,
+      result: nativeSubagentResult(child),
       error: child.error ?? null,
       activity: status.activity,
+      name: child.name,
+      toolCount: child.toolCount,
     };
   });
 }

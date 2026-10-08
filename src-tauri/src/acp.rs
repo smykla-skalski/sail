@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -343,6 +343,7 @@ struct Connection {
     pending: Mutex<HashMap<u64, mpsc::Sender<PendingResponse>>>,
     reader_progress: ReaderProgress,
     permission_state: Mutex<PermissionState>,
+    elicitation_state: Mutex<HashMap<String, PendingElicitation>>,
     next_permission_generation: AtomicU64,
     prompt_state: Mutex<PromptState>,
     cancelled_prompts: Mutex<HashSet<String>>,
@@ -456,6 +457,12 @@ struct PendingPermission {
     received_at: u64,
     generation: u64,
     fingerprint: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingElicitation {
+    message: Value,
+    received_at: u64,
 }
 
 #[cfg(test)]
@@ -1880,6 +1887,18 @@ pub fn acp_pending_inbox(
                 received_at: permission.received_at,
             });
         }
+        for elicitation in runtime
+            .elicitation_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+        {
+            pending.push(PendingPermissionInfo {
+                agent: runtime.agent.clone(),
+                message: elicitation.message.clone(),
+                received_at: elicitation.received_at,
+            });
+        }
     }
     pending.sort_by_key(|item| item.received_at);
     Ok(pending)
@@ -1966,7 +1985,8 @@ fn client_capabilities(profile: CapabilityProfile) -> Value {
         "fs":{"readTextFile":false,"writeTextFile":false},
         "terminal":profile.enables_terminal(),
         "subagents":{},
-        "plan":{}
+        "plan":{},
+        "elicitation":{"form":{}}
     })
 }
 
@@ -2261,23 +2281,20 @@ fn connect_blocking(
     })?;
     let input = child.stdin.take().ok_or("Agent stdin unavailable.")?;
     let output = child.stdout.take().ok_or("Agent stdout unavailable.")?;
-    if let Some(mut stderr) = child.stderr.take() {
+    if let Some(stderr) = child.stderr.take() {
         let stderr_agent = agent.clone();
+        let stderr_app = app.clone();
         std::thread::spawn(move || {
-            let mut buffer = [0; 4096];
-            let mut total_bytes = 0u64;
-            loop {
-                match stderr.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(bytes) => total_bytes = total_bytes.saturating_add(bytes as u64),
-                }
-            }
-            if total_bytes > 0 {
-                crate::diagnostics::record(
-                    "agent_stderr",
-                    json!({"agent":stderr_agent,"bytes":total_bytes}),
-                );
-            }
+            crate::stderr_log::forward(
+                stderr,
+                &stderr_agent,
+                || {
+                    stderr_app
+                        .state::<crate::browser_agent::BrowserManager>()
+                        .active_tokens()
+                },
+                crate::diagnostics::record,
+            );
         });
     }
     let runtime = Arc::new(Connection {
@@ -2291,6 +2308,7 @@ fn connect_blocking(
         pending: Mutex::new(HashMap::new()),
         reader_progress: ReaderProgress::default(),
         permission_state: Mutex::new(PermissionState::default()),
+        elicitation_state: Mutex::new(HashMap::new()),
         next_permission_generation: AtomicU64::new(1),
         prompt_state: Mutex::new(PromptState::default()),
         cancelled_prompts: Mutex::new(HashSet::new()),
@@ -2465,6 +2483,30 @@ fn connect_blocking(
                         continue;
                     }
                 }
+                if message.get("method").and_then(Value::as_str) == Some("$/cancel_request") {
+                    if let Some(id) = message.pointer("/params/id") {
+                        if let Ok(mut elicitations) = reader.elicitation_state.lock() {
+                            elicitations.remove(&id.to_string());
+                        }
+                    }
+                }
+                if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+                    if let Some(id) = message.get("id").cloned() {
+                        let received_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        if let Ok(mut elicitations) = reader.elicitation_state.lock() {
+                            elicitations.insert(
+                                id.to_string(),
+                                PendingElicitation {
+                                    message: message.clone(),
+                                    received_at,
+                                },
+                            );
+                        }
+                    }
+                }
                 if message.get("method").and_then(Value::as_str)
                     == Some("session/request_permission")
                 {
@@ -2631,6 +2673,76 @@ pub fn acp_pending_permissions(
         })
         .map(|pending| pending.message.clone())
         .collect())
+}
+
+#[tauri::command]
+pub fn acp_pending_elicitations(
+    manager: State<'_, AgentManager>,
+    agent: String,
+    session_id: String,
+) -> Result<Vec<Value>, String> {
+    let runtime = connection_for_session(&manager, &agent, &session_id)?;
+    let pending = runtime
+        .elicitation_state
+        .lock()
+        .map_err(|error| error.to_string())?;
+    Ok(pending
+        .values()
+        .filter(|request| {
+            request
+                .message
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str)
+                == Some(session_id.as_str())
+        })
+        .map(|request| request.message.clone())
+        .collect())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpElicitationParams {
+    agent: String,
+    request_id: Value,
+    action: String,
+    content: Option<Value>,
+}
+
+#[tauri::command]
+pub fn acp_elicitation(
+    manager: State<'_, AgentManager>,
+    params: AcpElicitationParams,
+) -> Result<(), String> {
+    let runtime = manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .values()
+        .find(|runtime| runtime.agent == params.agent)
+        .cloned()
+        .ok_or_else(|| "Agent is not connected.".to_string())?;
+    let key = params.request_id.to_string();
+    let pending = runtime
+        .elicitation_state
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&key)
+        .ok_or_else(|| "Elicitation request is no longer pending.".to_string())?;
+    let mut result = json!({"action":params.action});
+    if let Some(content) = params.content {
+        result["content"] = content;
+    }
+    if let Err(error) =
+        runtime.write(&json!({"jsonrpc":"2.0","id":params.request_id,"result":result}))
+    {
+        runtime
+            .elicitation_state
+            .lock()
+            .map_err(|cause| cause.to_string())?
+            .insert(key, pending);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]

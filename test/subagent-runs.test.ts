@@ -347,7 +347,7 @@ await test('OpenCode children are keyed by session id with live state', () => {
       ['opencode:ses-a', 'working'],
       ['opencode:ses-b', 'completed'],
       ['opencode:ses-c', 'failed'],
-      ['opencode:ses-d', 'queued'],
+      ['opencode:ses-d', 'completed'],
     ],
   );
   assert.equal(runs[0].parentId, 'opencode:ses-parent');

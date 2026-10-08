@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getSetting, setSetting } from './settings.ts';
+import { forgetPlanningState } from './planning-state.ts';
 import { toolCommand } from './tool-display.ts';
 import type { CapabilityProfile, PermissionPolicyDecision } from './capability-profiles.ts';
 
@@ -666,8 +667,9 @@ export const acp = {
     restoreSession('acp_load_session', agent, cwd, sessionId, profile),
   resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
     restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
-  forget: (agent: AgentId, sessionId: string) => {
+  forget: (agent: AgentId, directory: string, sessionId: string) => {
     forgetSessionState(agent, sessionId);
+    forgetPlanningState({ agent, directory, sessionId });
     return invoke<void>('acp_forget_session', { agent, sessionId });
   },
   prompt: (
@@ -711,6 +713,14 @@ export const acp = {
     }),
   pendingPermissions: (agent: AgentId, sessionId: string) =>
     invoke<AgentEvent['message'][]>('acp_pending_permissions', { agent, sessionId }),
+  pendingElicitations: (agent: AgentId, sessionId: string) =>
+    invoke<AgentEvent['message'][]>('acp_pending_elicitations', { agent, sessionId }),
+  elicitation: (
+    agent: AgentId,
+    requestId: string | number,
+    action: 'accept' | 'decline' | 'cancel',
+    content?: Record<string, unknown>,
+  ) => invoke<void>('acp_elicitation', { params: { agent, requestId, action, content } }),
   pendingInbox: () => invoke<AcpPendingInboxItem[]>('acp_pending_inbox'),
   activity: () => invoke<Record<AgentId, AgentActivity>>('acp_activity'),
   nativeSubagents: (directory: string) =>

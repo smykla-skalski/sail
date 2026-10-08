@@ -5,11 +5,13 @@
   import { listen } from '@tauri-apps/api/event';
   import { Button } from '@smykla-skalski/sui';
   import ActivityStatus from './ActivityStatus.svelte';
+  import ElicitationForm, { type Elicitation } from './ElicitationForm.svelte';
   import TaskLocation from './TaskLocation.svelte';
   import Markdown from './Markdown.svelte';
   import ChatMessage from './ChatMessage.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
+  import ShellCommandCard from './ShellCommandCard.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
@@ -103,7 +105,19 @@
     isFailedStatus,
     notificationStats,
     splitTaskNotifications,
+    type TaskSegment,
   } from './lib/task-notification';
+  import {
+    isShellDraft,
+    keepShellRuns,
+    shellCommand,
+    splitShellCommands,
+    takeShellRuns,
+    withShellContext,
+    type ShellResult,
+    type ShellRun,
+    type ShellSegment,
+  } from './lib/shell-command';
   import { splitKlaudiushMessage, type KlaudiushRule } from './lib/klaudiush';
   import { getSetting, removeSetting, setSetting } from './lib/settings';
   import { recordDiagnostic, type DiagnosticEvent } from './lib/diagnostics';
@@ -120,6 +134,12 @@
   import { permissionPolicy, type CapabilityProfile } from './lib/capability-profiles';
   import { permissionResolver } from './lib/permission-resolution';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
+  import {
+    loadNativePlan,
+    loadStructuredQuestions,
+    saveNativePlan,
+    saveStructuredQuestions,
+  } from './lib/planning-state';
   import {
     acpPermissionIdentity,
     enqueueAcpPermission,
@@ -241,9 +261,19 @@
   const commandUpdates: Record<string, unknown[]> = {};
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
-  const skillMatches = $derived(matchingSkills(skills, draft));
+  const shellMode = $derived(isShellDraft(draft));
+  const skillMatches = $derived(shellMode ? [] : matchingSkills(skills, draft));
+  let shellRuns = $state<ShellRun[]>([]);
+  const pendingShellRuns = $derived(shellRuns.filter((run) => run.session === activeSessionId));
   $effect(() => {
-    if (skillQuery(draft) !== null && ready && directory && !activeSessionId && !creatingSession)
+    if (
+      !shellMode &&
+      skillQuery(draft) !== null &&
+      ready &&
+      directory &&
+      !activeSessionId &&
+      !creatingSession
+    )
       void ensureSession('New thread').catch((cause) => {
         error = describe(cause);
       });
@@ -476,6 +506,8 @@
     untrack(() => onentrieschange?.(snapshot, activeSessionId, available));
   });
   let permissions = $state<AgentPermission[]>([]);
+  let elicitations = $state<Elicitation[]>([]);
+  let elicitationDrafts = $state<Record<string, Record<string, unknown>>>({});
   let configOptions = $state<AgentConfigOption[]>([]);
   let pickerOpen = $state<'model' | 'effort' | null>(null);
   let configPickerOpen = $state<string | null>(null);
@@ -700,6 +732,8 @@
 
   function applyUpdate(update: Record<string, unknown>) {
     nativePlan = nativePlanUpdate(agent, update, nativePlan);
+    if (activeSessionId && nativePlan)
+      saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
     onnativeplan?.(nativePlan);
     if (replaying) {
       updateEntriesInPlace(replayEntries, update);
@@ -834,6 +868,75 @@
     if (thread) onstatus(thread, 'waiting');
   }
 
+  function queueElicitation(message: AgentEvent['message']) {
+    const params = message.params;
+    const sessionId = activeSessionId;
+    if (
+      !params ||
+      !sessionId ||
+      params.sessionId !== sessionId ||
+      message.id == null ||
+      params.mode !== 'form' ||
+      !params.requestedSchema ||
+      typeof params.requestedSchema !== 'object' ||
+      Array.isArray(params.requestedSchema)
+    )
+      return;
+    const schema = params.requestedSchema as Record<string, unknown>;
+    const id = String(message.id);
+    if (elicitations.some((item) => String(item.id) === id)) return;
+    const properties =
+      schema.properties &&
+      typeof schema.properties === 'object' &&
+      !Array.isArray(schema.properties)
+        ? (schema.properties as Record<string, Record<string, unknown>>)
+        : {};
+    elicitationDrafts[id] ??= Object.fromEntries(
+      Object.entries(properties).flatMap(([key, property]) =>
+        property.default === undefined ? [] : [[key, property.default]],
+      ),
+    );
+    elicitations = [
+      ...elicitations,
+      { id: message.id, sessionId, message: String(params.message ?? ''), schema },
+    ];
+    saveStructuredQuestions({ agent, directory, sessionId }, elicitations);
+    if (thread) onstatus(thread, 'waiting');
+  }
+
+  async function answerElicitation(
+    elicitation: Elicitation,
+    action: 'accept' | 'decline' | 'cancel',
+  ) {
+    const id = String(elicitation.id);
+    const schema = elicitation.schema;
+    const required = Array.isArray(schema.required)
+      ? schema.required.filter((key): key is string => typeof key === 'string')
+      : [];
+    const content = elicitationDrafts[id] ?? {};
+    if (action === 'accept')
+      for (const key of required)
+        if (content[key] === undefined || content[key] === '') {
+          error = `${key} is required.`;
+          return;
+        }
+    try {
+      await acp.elicitation(
+        agent,
+        elicitation.id,
+        action,
+        action === 'accept' ? content : undefined,
+      );
+      elicitations = elicitations.filter((item) => String(item.id) !== id);
+      delete elicitationDrafts[id];
+      if (activeSessionId)
+        saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
+      if (thread && !elicitations.length && !permissions.length) onstatus(thread, 'working');
+    } catch (cause) {
+      error = describe(cause);
+    }
+  }
+
   async function activate(id: string | null) {
     rememberTranscript();
     const previousSessionId = activeSessionId;
@@ -853,15 +956,24 @@
     setReplaying(false);
     replayEntries = [];
     permissions = [];
-    nativePlan = null;
-    onnativeplan?.(null);
     selectedThreadId = id;
     activeSessionId = id;
+    nativePlan = id ? loadNativePlan({ agent, directory, sessionId: id }) : null;
+    elicitations = id ? loadStructuredQuestions({ agent, directory, sessionId: id }) : [];
+    elicitationDrafts = {};
+    onnativeplan?.(nativePlan);
     entries = id && thread ? loadRecentTranscript(thread) : [];
+    const backgroundUpdates = id && !nativeEntries ? takeBackgroundUpdates(agent, id) : null;
     const liveView =
       id && !nativeEntries
-        ? liveSessionView(entries, takeBackgroundUpdates(agent, id), sessionState(agent, id))
+        ? liveSessionView(entries, backgroundUpdates, sessionState(agent, id))
         : null;
+    if (backgroundUpdates && id) {
+      for (const update of backgroundUpdates)
+        nativePlan = nativePlanUpdate(agent, update, nativePlan);
+      if (nativePlan) saveNativePlan({ agent, directory, sessionId: id }, nativePlan);
+      onnativeplan?.(nativePlan);
+    }
     if (liveView) entries = liveView.entries;
     visibleCount = 50;
     historyLoaded = !id;
@@ -977,6 +1089,22 @@
           () => current === generation && activeSessionId === id,
         );
         if (waiting) for (const request of waiting) queuePermission(request);
+        const pendingElicitations = await acp.pendingElicitations(agent, id).then(
+          (requests) => ({ requests, available: true }),
+          () => ({ requests: [], available: false }),
+        );
+        if (current === generation && activeSessionId === id && pendingElicitations.available) {
+          const pendingIDs = new Set(
+            pendingElicitations.requests.flatMap((request) =>
+              request.method === 'elicitation/create' && request.id != null
+                ? [String(request.id)]
+                : [],
+            ),
+          );
+          elicitations = elicitations.filter((item) => pendingIDs.has(String(item.id)));
+          for (const request of pendingElicitations.requests) queueElicitation(request);
+          saveStructuredQuestions({ agent, directory, sessionId: id }, elicitations);
+        }
       }
       if (current === generation) ready = true;
     } catch (cause) {
@@ -1053,6 +1181,7 @@
       configOptions = session.configOptions ?? [];
       if (Array.isArray(session.availableCommands)) updateSkills(session.availableCommands);
       activeSessionId = session.sessionId;
+      for (const run of shellRuns) if (run.session === null) run.session = session.sessionId;
       if (queued.length) saveQueuedAgentMessages(agent, directory, session.sessionId, queued);
       if (commandUpdates[session.sessionId]) updateSkills(commandUpdates[session.sessionId]);
       selectedThreadId = session.sessionId;
@@ -1083,6 +1212,7 @@
   }
 
   onMount(() => {
+    if (!ephemeral) shellRuns = takeShellRuns(`${directory}\0${agent}`);
     let unlistenHookActivity: (() => void) | undefined;
     void listen<unknown>('sail:hook-activity', ({ payload }) => {
       const activity = parseHookActivity(payload);
@@ -1111,6 +1241,11 @@
         acpDisconnectAffectsSession(message, activeSessionId, activeCapabilityProfile)
       ) {
         inFlightSteer?.finish();
+        if (activeSessionId) {
+          elicitations = [];
+          elicitationDrafts = {};
+          saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, []);
+        }
         ready = false;
         busy = false;
         if (thread) onstatus(thread, 'failed');
@@ -1146,6 +1281,16 @@
           (!steer.turnId || steer.turnId === params.turnId)
         )
           steer.finish();
+      }
+      if (message.method === '$/cancel_request') {
+        const id = params?.id;
+        if (typeof id === 'string' || typeof id === 'number') {
+          elicitations = elicitations.filter((item) => String(item.id) !== String(id));
+          delete elicitationDrafts[String(id)];
+          if (activeSessionId)
+            saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
+        }
+        return;
       }
       if (!params || params.sessionId !== activeSessionId) return;
       if (message.method === 'sail/permission_resolved') {
@@ -1192,6 +1337,8 @@
           void steerQueued();
       } else if (message.method === 'session/request_permission' && message.id != null) {
         queuePermission(message);
+      } else if (message.method === 'elicitation/create' && message.id != null) {
+        queueElicitation(message);
       }
     })
       .then((unsubscribe) => {
@@ -1240,6 +1387,8 @@
       }
       images.forEach((image) => void invoke('browser_remove_capture', { path: image.imagePath }));
       clipboardAttachments.forEach((attachment) => removeClipboardAttachment(attachment));
+      if (ephemeral) shellRuns.filter((run) => run.status === 'running').forEach(stopShell);
+      else keepShellRuns(`${directory}\0${agent}`, shellRuns);
     };
   });
 
@@ -1249,6 +1398,14 @@
     const text =
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
+    const shell = external ? null : shellCommand(text);
+    if (shell !== null) {
+      if (shell && directory) {
+        draft = '';
+        void runShell(shell);
+      }
+      return;
+    }
     let shipIssue: ShipItIssue | null;
     try {
       shipIssue = await beginShipItRun(directory, text, promptSkill(skills, text)?.name ?? null);
@@ -1310,15 +1467,37 @@
       clearClipboardImagePreviews();
     }
     const userEntryId = crypto.randomUUID();
+    const shellSession = activeSessionId;
+    const sentShell =
+      external && !queuedMessage
+        ? []
+        : shellRuns.filter((run) => run.session === shellSession && run.status !== 'running');
+    shellRuns = shellRuns.filter((run) => !sentShell.includes(run));
+    const restoreShell = () => {
+      const session = deliverySessionId ?? shellSession;
+      for (const run of sentShell) run.session = session;
+      shellRuns = [...sentShell, ...shellRuns];
+    };
     flushUpdates();
-    entries = [...entries, { id: userEntryId, type: 'user', text, created: Date.now() }];
+    entries = [
+      ...entries,
+      {
+        id: userEntryId,
+        type: 'user',
+        text: withShellContext(sentShell, text),
+        created: Date.now(),
+      },
+    ];
     void follow();
     try {
       if (!activeSessionId || !activityThread)
         activityThread = await ensureSession(text.slice(0, 60) || 'Attached files', true);
       if (activityThread?.title === 'New thread')
         activityThread = { ...activityThread, title: text.slice(0, 60) || 'Attached files' };
-      if (current !== generation && (!disposed || ephemeral)) return;
+      if (current !== generation && (!disposed || ephemeral)) {
+        restoreShell();
+        return;
+      }
       if (activityThread) onstatus(activityThread, 'working');
       phase = 'config';
       if (settingConfig) await settingConfig;
@@ -1349,6 +1528,7 @@
         finalStatus = 'interrupted';
         notifyOnDone = false;
         if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');
+        restoreShell();
         if (current === generation) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
@@ -1372,10 +1552,12 @@
         implementationModel,
         `acp:${turnAgent}:${id}`,
       );
-      const promptText =
+      const promptText = withShellContext(
+        sentShell,
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
-          : skillText + directClaim;
+          : skillText + directClaim,
+      );
       phase = 'prompt';
       if (id && sentImages.length)
         onattachmentsent?.(
@@ -1412,6 +1594,7 @@
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
+      restoreShell();
       const backendStatus =
         phase === 'prompt' && deliverySessionId
           ? await acpFinishedPromptStatus(turnAgent, deliverySessionId, turnId)
@@ -1509,6 +1692,40 @@
         setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, false);
       }
     }
+  }
+
+  async function runShell(command: string) {
+    const run: ShellRun = {
+      id: crypto.randomUUID(),
+      directory,
+      session: activeSessionId,
+      command,
+      status: 'running',
+      code: null,
+      output: '',
+      created: Date.now(),
+    };
+    shellRuns = [...shellRuns, run];
+    void follow();
+    let result: Partial<ShellRun>;
+    try {
+      result = await invoke<ShellResult>('run_shell_command', { id: run.id, directory, command });
+    } catch (cause) {
+      result = { status: 'failed', output: describe(cause) };
+    }
+    const finished = shellRuns.find((item) => item.id === run.id);
+    if (finished) Object.assign(finished, result);
+    if (!disposed) void follow();
+  }
+
+  function userSegments(text: string): (TaskSegment | ShellSegment)[] {
+    return splitShellCommands(text).flatMap((part): (TaskSegment | ShellSegment)[] =>
+      part.type === 'text' ? splitTaskNotifications(part.text) : [part],
+    );
+  }
+
+  function stopShell(run: ShellRun) {
+    void invoke('cancel_shell_command', { id: run.id }).catch(() => {});
   }
 
   function withAttachedFiles(text: string, attachments: QueuedAgentMessage['attachments']) {
@@ -1973,7 +2190,7 @@
       {/snippet}
       {#each displayEntries as entry (entry.id)}
         {#if entry.type === 'spawn-response'}
-          <SpawnResponse receipt={entry.receipt} />
+          <SpawnResponse receipt={entry.receipt} onopen={onopensubagent} />
         {:else if entry.type === 'tool-group'}
           {#each entry.tools.filter(toolFailed) as tool (tool.id)}{@render failureCard(tool)}{/each}
           {#if isBusy && (entry.id === displayEntries.at(-1)?.id || entry.tools.some(toolRunning))}
@@ -2029,10 +2246,12 @@
         {:else}
           {@const segments =
             entry.type === 'user'
-              ? splitTaskNotifications(entry.text)
+              ? userSegments(entry.text)
               : [{ type: 'text' as const, text: entry.text }]}
           {#each segments as segment, index (index)}
-            {#if segment.type === 'notification'}
+            {#if segment.type === 'shell'}
+              <ShellCommandCard run={segment.shell} />
+            {:else if segment.type === 'notification'}
               {@const note = segment.notification}
               <div
                 class="agent-subagent-card"
@@ -2086,6 +2305,9 @@
           {/each}
         {/if}
       {/each}
+      {#each pendingShellRuns as run (run.id)}
+        <ShellCommandCard {run} pending onstop={() => stopShell(run)} />
+      {/each}
       {#each coordinationMessages.filter((message) => !entries.some((entry) => entry.type === 'user' && entry.text.includes(coordinationPrompt(message)))) as message (message.id)}
         <ChatMessage
           kind="user"
@@ -2133,8 +2355,11 @@
     </div>
   </div>
   <div class="agent-composer composer-wrap">
-    <div class="composer">
+    <div class="composer" class:shell-mode={shellMode}>
       <TaskLocation location={promptLocation} />
+      {#if shellMode}<p class="composer-shell-hint" role="status">
+          Shell mode · Enter runs the command in this worktree
+        </p>{/if}
       {#if error}<p class="agent-error" role="alert">
           {error} <button onclick={() => void activate(activeSessionId)}>Retry</button>
         </p>{/if}
@@ -2176,6 +2401,16 @@
           </div>
         </div>
       {/each}
+      {#each elicitations as elicitation (elicitation.id)}
+        <ElicitationForm
+          {elicitation}
+          {agent}
+          onanswer={(request, action, content) => {
+            if (content) elicitationDrafts[String(request.id)] = content;
+            return answerElicitation(request, action);
+          }}
+        />
+      {/each}
       <textarea
         bind:this={prompt}
         data-pane-prompt
@@ -2196,7 +2431,7 @@
         }}
         onkeydown={keydown}
         rows="3"
-        placeholder={`Message ${name}…`}
+        placeholder={`Message ${name}… (start with ! to run a shell command)`}
         disabled={!directory || !!nativeEntries}></textarea>
       {#each clipboardImagePreviews as preview (preview.path)}
         <figure
@@ -2274,8 +2509,10 @@
             >{/if}
           <Button
             onclick={() => void send()}
-            disabled={!ready || !!nativeEntries || (!draft.trim() && !clipboardAttachments.length)}
-            >{isBusy ? 'Queue ↗' : 'Send ↗'}</Button
+            disabled={shellMode
+              ? !shellCommand(draft) || !directory || !!nativeEntries
+              : !ready || !!nativeEntries || (!draft.trim() && !clipboardAttachments.length)}
+            >{shellMode ? 'Run ↵' : isBusy ? 'Queue ↗' : 'Send ↗'}</Button
           >
         </div>
       </div>

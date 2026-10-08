@@ -32,10 +32,25 @@
   import SpawnActivity from './SpawnActivity.svelte';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
+  import ShellCommandCard from './ShellCommandCard.svelte';
+  import {
+    isShellDraft,
+    shellCommand,
+    splitShellCommands,
+    withShellContext,
+    type ShellResult,
+    type ShellRun,
+  } from './lib/shell-command';
   import ChatMessage from './ChatMessage.svelte';
   import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import PlanPanel from './PlanPanel.svelte';
-  import type { NativePlan } from './lib/native-plan';
+  import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
+  import {
+    loadNativePlan,
+    clearStructuredQuestions,
+    removeStructuredQuestion,
+    saveNativePlan,
+  } from './lib/planning-state';
   import ShipPanel from './ShipPanel.svelte';
   import AppTopbar from './AppTopbar.svelte';
   import {
@@ -1225,7 +1240,12 @@
   let skills = $state<SkillChoice[]>(bundledSkills);
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
-  const skillMatches = $derived(matchingSkills(skills, draft));
+  const shellMode = $derived(isShellDraft(draft));
+  const skillMatches = $derived(shellMode ? [] : matchingSkills(skills, draft));
+  let shellRuns = $state<ShellRun[]>([]);
+  const pendingShellRuns = $derived(
+    shellRuns.filter((run) => run.directory === directory && run.session === sessionID),
+  );
   $effect(() => {
     const source = client;
     const path = directory;
@@ -1615,9 +1635,11 @@
   let chatMessages = $derived(
     messages.filter((message) => message.type === 'user' || message.type === 'assistant'),
   );
+  let openCodeChildReceipts = $state.raw<SpawnReceipt[]>([]);
   const mainSpawnActivity = $derived(
     spawnReceiptsForSource(spawnReceipts, sessionID ? `opencode:${sessionID}` : null, directory),
   );
+  const mainActivityChildren = $derived([...mainSpawnActivity, ...openCodeChildReceipts]);
   const mainPostTurnChecks = $derived(
     postTurnResults.filter(
       (check) => check.directory === directory && check.thread === `opencode:${sessionID}`,
@@ -1641,7 +1663,7 @@
             )
           : [],
       ),
-      children: mainSpawnActivity,
+      children: mainActivityChildren,
       decisions: [
         ...pendingPermissions.map((request) => ({
           id: request.id,
@@ -8632,6 +8654,21 @@
         const location = byDirectory.get(thread.directory);
         if (!location) continue;
         const nativeChild = nativeSubagents[nativeSubagentId(pending.agent, sessionId)];
+        if (pending.message.method === 'elicitation/create') {
+          const message = pending.message.params?.message;
+          items.push({
+            ...location,
+            key: `elicitation:${pending.agent}:${sessionId}:${requestId}`,
+            kind: 'question',
+            agent: `${agentAvailability.find((item) => item.id === pending.agent)?.name ?? pending.agent}${nativeChild ? ` · ${nativeChild.name}` : ''}`,
+            agentId: pending.agent,
+            sessionId,
+            requestId,
+            text: typeof message === 'string' ? message : 'Agent question',
+            receivedAt: pending.receivedAt,
+          });
+          continue;
+        }
         const tool = pending.message.params?.toolCall;
         const title =
           tool && typeof tool === 'object' && 'title' in tool && typeof tool.title === 'string'
@@ -9232,7 +9269,7 @@
       forgetThreadAttention(thread);
       if (thread.agent !== 'opencode') {
         forgetRecentTranscript(thread);
-        void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+        void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
       }
     }
     delete paneLayouts[path];
@@ -9336,7 +9373,7 @@
         forgetThreadAttention(thread);
         if (thread.agent !== 'opencode') {
           forgetRecentTranscript(thread);
-          void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+          void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
         }
       }
       delete paneLayouts[path];
@@ -10655,7 +10692,7 @@
       }
       return;
     }
-    if (item.kind === 'acp-permission') {
+    if (item.kind === 'acp-permission' || item.kind === 'question') {
       const thread = [...agentThreads, ...nativeChildThreads].find(
         (entry) =>
           entry.agent === item.agentId &&
@@ -11335,7 +11372,7 @@
 
   async function selectMainWorkspaceActivity(item: WorkspaceActivityItem) {
     if (item.kind === 'child') {
-      const receipt = mainSpawnActivity.find((entry) => entry.receiptId === item.sourceId);
+      const receipt = mainActivityChildren.find((entry) => entry.receiptId === item.sourceId);
       if (receipt?.targetId && receipt.targetDirectory) {
         await openSpawnTarget(receipt);
         return;
@@ -11707,7 +11744,7 @@
     }
     void tick().then(() => forgetRecentTranscript(thread));
     if (thread.agent !== 'opencode')
-      void acp.forget(thread.agent, thread.sessionId).catch(() => {});
+      void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
   }
 
   function agentThreadKey(thread: AgentThread): string {
@@ -12292,6 +12329,18 @@
         const update = params?.update;
         if (update && typeof update === 'object') {
           const data = update as Record<string, unknown>;
+          const thread = [...agentThreads, ...nativeChildThreads].find(
+            (item) => item.agent === event.agent && item.sessionId === sessionId,
+          );
+          const planDirectory = thread?.directory ?? eventDirectory;
+          const priorPlan = loadNativePlan({
+            agent: event.agent,
+            directory: planDirectory,
+            sessionId,
+          });
+          const plan = nativePlanUpdate(event.agent, data, priorPlan);
+          if (plan)
+            saveNativePlan({ agent: event.agent, directory: planDirectory, sessionId }, plan);
           if (replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
             invalidateBackgroundSession(event.agent, sessionId);
           else bufferBackgroundUpdate(event.agent, sessionId, data);
@@ -12388,10 +12437,17 @@
     }
     if (
       event.message.method === 'session/request_permission' ||
+      event.message.method === 'elicitation/create' ||
+      event.message.method === '$/cancel_request' ||
       event.message.method === 'sail/permission_resolved' ||
       event.message.method === 'sail/disconnected'
     )
       scheduleInboxRefresh();
+    if (event.message.method === '$/cancel_request') {
+      const requestID = event.message.params?.id;
+      if (typeof requestID === 'string' || typeof requestID === 'number')
+        removeStructuredQuestion(event.agent, requestID);
+    }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
@@ -12459,6 +12515,8 @@
         Object.values(nativeSubagents)
           .filter((child) => child.agent === event.agent)
           .map((child) => child.sessionId);
+      for (const sessionId of disconnectedSessionIds)
+        clearStructuredQuestions(event.agent, sessionId);
       nativeSubagents = disconnectNativeSubagents(
         nativeSubagents,
         event.agent,
@@ -13601,8 +13659,44 @@
     void tick().then(() => mainPrompt?.focus());
   }
 
+  async function runShell(command: string) {
+    const path = directory;
+    if (!path) return;
+    const run: ShellRun = {
+      id: crypto.randomUUID(),
+      session: sessionID,
+      directory: path,
+      command,
+      status: 'running',
+      code: null,
+      output: '',
+      created: Date.now(),
+    };
+    shellRuns = [...shellRuns, run];
+    let result: Partial<ShellRun>;
+    try {
+      result = await invoke<ShellResult>('run_shell_command', {
+        id: run.id,
+        directory: path,
+        command,
+      });
+    } catch (cause) {
+      result = { status: 'failed', output: describe(cause) };
+    }
+    const finished = shellRuns.find((item) => item.id === run.id);
+    if (finished) Object.assign(finished, result);
+  }
+
   async function send() {
     await pendingPaste;
+    const shell = shellCommand(draft);
+    if (shell !== null) {
+      if (shell && directory && !sending) {
+        draft = '';
+        void runShell(shell);
+      }
+      return;
+    }
     const command = draft.trim().toLowerCase();
     if (!attachedFiles.length && (command === '/model' || command === '/effort')) {
       if (!inputReady || running || sending || switching) return;
@@ -13635,6 +13729,11 @@
     }
     if (current !== selection || path !== directory) return;
     const files = [...attachedFiles];
+    const shellSession = id;
+    const sentShell = shellRuns.filter(
+      (run) => run.directory === path && run.session === shellSession && run.status !== 'running',
+    );
+    shellRuns = shellRuns.filter((run) => !sentShell.includes(run));
     let accepted = false;
     for (const file of files) {
       if (pickedImageText.has(file)) inFlightCaptures.add(file);
@@ -13709,8 +13808,10 @@
           implementingModel,
           `opencode:${targetId}`,
         );
-        const resolvedPrompt =
-          resolveSkillPrompt(sourceSkills, text, implementingModel) + directClaimPrompt;
+        const resolvedPrompt = withShellContext(
+          sentShell,
+          resolveSkillPrompt(sourceSkills, text, implementingModel) + directClaimPrompt,
+        );
         const shippingReceipt = await prepareOpenCodeShippingDispatch(
           directAuthorization,
           `opencode:${targetId}`,
@@ -13818,6 +13919,10 @@
       }
       if (current === selection && path === directory) await refreshSession(id);
     } catch (cause) {
+      if (!accepted) {
+        for (const run of sentShell) run.session = id;
+        shellRuns = [...sentShell, ...shellRuns];
+      }
       if (current === selection && path === directory) {
         if (!accepted) {
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
@@ -14512,7 +14617,7 @@
                   </div>{/if}
                 {#each displayChatMessages as message (message.id)}
                   {#if message.type === 'spawn-response'}
-                    <SpawnResponse receipt={message.receipt} />
+                    <SpawnResponse receipt={message.receipt} onopen={openSpawnTarget} />
                   {:else if message.type === 'user'}
                     {@const attribution = coordinationMessageForText(
                       message.text,
@@ -14527,11 +14632,20 @@
                       messageId={message.id}
                       created={message.time.created}
                     >
-                      <Markdown
-                        source={attribution
-                          ? message.text.replace(coordinationPrompt(attribution), attribution.text)
-                          : message.text}
-                      />
+                      {#each splitShellCommands(message.text) as segment, index (index)}
+                        {#if segment.type === 'shell'}
+                          <ShellCommandCard run={segment.shell} />
+                        {:else}
+                          <Markdown
+                            source={attribution
+                              ? segment.text.replace(
+                                  coordinationPrompt(attribution),
+                                  attribution.text,
+                                )
+                              : segment.text}
+                          />
+                        {/if}
+                      {/each}
                       {#if message.files?.length}<div class="message-files">
                           {#each message.files as file, fileIndex (fileIndex)}<span
                               >{file.name ??
@@ -14591,7 +14705,21 @@
                         </p>{/if}
                     </ChatMessage>{/if}
                 {/each}
-                <OpenCodeSubagents {client} parentID={sessionID} />
+                <OpenCodeSubagents
+                  {client}
+                  parentID={sessionID}
+                  {directory}
+                  onopen={openSpawnTarget}
+                  onchildren={(receipts) => (openCodeChildReceipts = receipts)}
+                />
+                {#each pendingShellRuns as run (run.id)}
+                  <ShellCommandCard
+                    {run}
+                    pending
+                    onstop={() =>
+                      void invoke('cancel_shell_command', { id: run.id }).catch(() => {})}
+                  />
+                {/each}
                 {#each coordinationMessages.filter((message) => sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`) && !chatMessages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
                   <ChatMessage
                     kind="user"
@@ -14660,8 +14788,11 @@
                   }}
                   onchanged={() => refreshPrompts()}
                 />
-                <div class="composer">
+                <div class="composer" class:shell-mode={shellMode}>
                   <TaskLocation location={mainPromptLocation} />
+                  {#if shellMode}<p class="composer-shell-hint" role="status">
+                      Shell mode · Enter runs the command in this worktree
+                    </p>{/if}
                   <textarea
                     role="combobox"
                     aria-autocomplete="list"
@@ -14682,7 +14813,7 @@
                     rows="3"
                     wrap="soft"
                     placeholder={inputReady
-                      ? 'Describe the work or ask a question…'
+                      ? 'Describe the work or ask a question… (start with ! to run a shell command)'
                       : 'OpenCode needs a connected model…'}
                     disabled={!inputReady || sending}></textarea>
                   {#if attachedFiles.length}<div class="attachments">
@@ -14739,8 +14870,11 @@
                         onclick={attachFiles}
                         disabled={!inputReady || sending}>Attach files</Button
                       >
-                      <Button onclick={send} disabled={!canSend} loading={sending}
-                        >{running ? 'Queue ↗' : 'Send ↗'}</Button
+                      <Button
+                        onclick={send}
+                        disabled={shellMode ? !shellCommand(draft) || !directory : !canSend}
+                        loading={sending}
+                        >{shellMode ? 'Run ↵' : running ? 'Queue ↗' : 'Send ↗'}</Button
                       >
                     </div>
                   </div>
@@ -14800,6 +14934,7 @@
         onentries={(id, entries, sessionId, ready) =>
           (agentEntrySnapshots = { ...agentEntrySnapshots, [id]: { entries, sessionId, ready } })}
         {changesPanes}
+        dockDetails={!mainDetailsVisible && !shipFallbackVisible && !mobileLayout}
         main={mainPaneContent}
         mainPicker={showMainPicker}
         canClose={leaves(paneLayout).length > 1 ||

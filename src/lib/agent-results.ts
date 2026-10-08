@@ -47,6 +47,10 @@ export type SpawnReceipt = {
   error: string | null;
   dispatchPending?: boolean;
   activity?: string;
+  /** Agent type the parent gave the child, such as `Explore`. */
+  name?: string;
+  /** Tool calls the child made, when its transcript reports them. */
+  toolCount?: number;
   model?: string;
   routing?: SpawnRouting;
   validation?: GateMetadata;
@@ -93,6 +97,9 @@ export function loadSpawnReceipts(raw: string | null): SpawnReceipt[] {
     );
     for (const receipt of receipts) {
       if (typeof receipt.model !== 'string') delete receipt.model;
+      if (typeof receipt.name !== 'string') delete receipt.name;
+      if (!Number.isSafeInteger(receipt.toolCount) || receipt.toolCount! < 0)
+        delete receipt.toolCount;
       if (
         receipt.routing &&
         (!['exploration', 'implementation', 'debugging', 'review', 'ci-triage'].includes(
@@ -214,7 +221,7 @@ export function receiptIsSettled(state: SpawnState): boolean {
 }
 
 export function receiptNeedsLiveActivity(receipt: SpawnReceipt): boolean {
-  return !receiptIsSettled(receipt.state) || (!receipt.result && !receipt.error);
+  return !receiptIsSettled(receipt.state);
 }
 
 export function boundedSpawnOutput(receipt: SpawnReceipt, limit = 4_000): string {
