@@ -151,6 +151,18 @@ describe('agent status bar', () => {
     await browser.pause(300);
     expect(await statusMismatches()).toEqual([]);
 
+    await startStatusSampler();
+    await $('.agent-composer textarea').setValue('Delayed approval');
+    await $(sendButton).click();
+    await expect($('.agent-header .activity-status')).toHaveText(
+      expect.stringContaining('Working'),
+    );
+    await expect($('.agent-permission')).toBeDisplayed();
+    await $('.agent-permission button').click();
+    await expect($('.agent-header .activity-status')).toHaveText(expect.stringContaining('Ready'));
+    await browser.pause(300);
+    expect(await statusMismatches()).toEqual([]);
+
     await browser.setWindowSize(700, 700);
     await $('.sidebar-toggle').click();
     const mobileLayout = await browser.execute(() => {

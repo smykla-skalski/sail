@@ -633,9 +633,8 @@
   let liveTurn = $state(false);
   // The app marks a thread done from the turn-finished event, before this pane's prompt call
   // returns; the header follows that event so both settle in the same frame.
-  let finishedTurnId = $state<string | null>(null);
+  let turnEnded = $state(false);
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
-  const turnEnded = $derived(!!activeTurnId && finishedTurnId === activeTurnId);
   const visibleStatus = $derived(
     agentHeaderStatus({
       connecting,
@@ -1158,6 +1157,7 @@
     liveTurn = false;
     stopRequested = false;
     activeTurnId = null;
+    turnEnded = false;
     error = '';
     ready = false;
     connecting = true;
@@ -1435,11 +1435,12 @@
       }
       if (message.method === 'sail/prompt_finished' && typeof params?.sessionId === 'string') {
         if (
+          busy &&
           params.sessionId === activeSessionId &&
           typeof params.turnId === 'string' &&
           params.turnId === activeTurnId
         )
-          finishedTurnId = params.turnId;
+          turnEnded = true;
         if (
           liveTurn &&
           params.sessionId === activeSessionId &&
@@ -1637,6 +1638,7 @@
     let finishTurn!: () => void;
     completedTurn = new Promise<void>((resolve) => (finishTurn = resolve));
     activeTurnId = turnId;
+    turnEnded = false;
     let activityThread = thread;
     let finalStatus: ThreadStatus = 'done';
     let notifyOnDone = true;
@@ -1872,7 +1874,10 @@
       if (deliverySessionId) discardSteeredAttachments(deliverySessionId);
       if (activeTurnId === turnId) activeTurnId = null;
       // Clear busy first so the header and the status bar settle in the same frame.
-      if (current === generation) busy = false;
+      if (current === generation) {
+        busy = false;
+        turnEnded = false;
+      }
       if (activityThread) onstatus(activityThread, finalStatus, notifyOnDone);
       finishTurn();
       if (
