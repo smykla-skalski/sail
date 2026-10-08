@@ -91,6 +91,26 @@
   } from './lib/ship-progress';
   import type { PublishedGraph } from './lib/issue-graph';
   import {
+    migrateShipArchive,
+    parseShipArchiveDelay,
+    shipArchiveMigrationKey,
+    shipRunArchived,
+    shipRunDueForArchive,
+    type ShipArchiveDelay,
+  } from './lib/ship-archive';
+  import {
+    shipArchiveAction,
+    shipArchiveConfirmation,
+    shipMergeAction,
+    shipMergeConfirmation,
+    shipRetryAction,
+    shipRetryConfirmation,
+    shipStopAction,
+    shipStopConfirmation,
+    stoppedMessage,
+    type ShipActionId,
+  } from './lib/ship-actions';
+  import {
     adoptRegisteredDirectShipRun,
     acpWorkerTerminationConfirmed,
     assertDirectShipPromptAuthorization,
@@ -141,6 +161,7 @@
     shippingSetupAction,
     settledLostClaimFence,
     terminalClaimReleaseReady,
+    terminalClaimReleaseReason,
     type DirectShipAuthorization,
     type ShippingClaim,
     type ShippingClaimObservation,
@@ -163,6 +184,7 @@
     initialTaskCheckpoint,
     prepareTaskCheckpointUpdate,
     reconcileTaskCheckpoint,
+    updateTaskCheckpoint,
   } from './lib/task-checkpoint.ts';
   import {
     ContextPressureRecorder,
@@ -232,6 +254,7 @@
   import DiffPanel from './DiffPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
+  import ShipQueue from './ShipQueue.svelte';
   import TaskOverview from './TaskOverview.svelte';
   import type { GitHubIssue, PullRequestCheck } from './ProjectSidebar.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
@@ -608,7 +631,29 @@
         return taskLocation;
       });
   });
-  let shipRuns = $state<ShipRun[]>(loadShipRuns(getSetting('sai-ship-runs')));
+  const initialShipArchiveDelay = parseShipArchiveDelay(getSetting('sai-ship-archive-delay'));
+  const shipArchiveMigration =
+    getSetting(shipArchiveMigrationKey) === 'done'
+      ? null
+      : migrateShipArchive(
+          loadShipRuns(getSetting('sai-ship-runs')),
+          initialShipArchiveDelay,
+          Date.now(),
+        );
+  const initialShipRuns = shipArchiveMigration?.runs ?? loadShipRuns(getSetting('sai-ship-runs'));
+  const initialShipArchiveNotice = shipArchiveMigration?.archived
+    ? shipArchiveMigration.archived
+    : Number(getSetting('sai-ship-archive-notice')) || 0;
+  if (shipArchiveMigration) {
+    if (shipArchiveMigration.archived > 0) {
+      setSetting('sai-ship-runs', JSON.stringify(initialShipRuns));
+      setSetting('sai-ship-archive-notice', String(initialShipArchiveNotice));
+    }
+    setSetting(shipArchiveMigrationKey, 'done');
+  }
+  let shipArchiveDelay = $state<ShipArchiveDelay>(initialShipArchiveDelay);
+  let shipRuns = $state<ShipRun[]>(initialShipRuns);
+  let shipArchiveNotice = $state(initialShipArchiveNotice);
 
   function capabilityProfileForDirectory(path: string): CapabilityProfile {
     const issue = shipRuns
@@ -1059,11 +1104,14 @@
       attentionLedger,
       [
         ...sessionAttention,
-        ...shipAttentionCandidates(shipRuns, {
-          mergeOwner,
-          now: attentionClock,
-          requestThreads: threadRequestKeys(sessionAttention),
-        }),
+        ...shipAttentionCandidates(
+          shipRuns.filter((run) => !shipRunArchived(run)),
+          {
+            mergeOwner,
+            now: attentionClock,
+            requestThreads: threadRequestKeys(sessionAttention),
+          },
+        ),
         ...subagentAttentionCandidates(
           visibleSpawnReceipts,
           threadRequestKeys(sessionAttention),
@@ -1387,8 +1435,10 @@
     );
   }
   let mobileView = $state<'sessions' | 'chat' | 'details'>('chat');
-  let workspaceView = $state<'workspace' | 'overview'>(
-    getSetting('sai-workspace-view') === 'overview' ? 'overview' : 'workspace',
+  let workspaceView = $state<'workspace' | 'overview' | 'ship-queue'>(
+    ['overview', 'ship-queue'].includes(getSetting('sai-workspace-view') ?? '')
+      ? (getSetting('sai-workspace-view') as 'overview' | 'ship-queue')
+      : 'workspace',
   );
   let sidebarVisible = $state(true);
   let mobileLayout = $state(window.matchMedia('(max-width: 850px)').matches);
@@ -2161,6 +2211,7 @@
       agentThreadListEnabled,
       agentMessagesEnabled,
       mergeOwner,
+      shipArchiveDelay,
       contextHandoffThreshold,
     };
   }
@@ -2343,6 +2394,10 @@
         } else if (action.type === 'merge-owner') {
           mergeOwner = parseMergeOwner(action.value);
           setSetting('sai-ship-merge-owner', mergeOwner);
+        } else if (action.type === 'ship-archive-delay') {
+          shipArchiveDelay = parseShipArchiveDelay(action.value);
+          setSetting('sai-ship-archive-delay', shipArchiveDelay);
+          void archiveDueShipRuns();
         } else if (action.type === 'context-handoff-threshold') {
           const previousThreshold = contextHandoffThreshold;
           contextHandoffThreshold = parseContextHandoffThreshold(String(action.value));
@@ -2759,6 +2814,201 @@
   async function saveShipRuns(): Promise<void> {
     const value = JSON.stringify(shipRuns);
     await setSettingDurable('sai-ship-runs', value);
+  }
+
+  async function archiveDueShipRuns(): Promise<void> {
+    const now = Date.now();
+    const due = shipRuns.filter((run) => shipRunDueForArchive(run, shipArchiveDelay, now));
+    if (!due.length) return;
+    for (const run of due) {
+      run.archivedAt = now;
+      run.archivedBy = 'auto';
+    }
+    await saveShipRuns();
+  }
+
+  async function confirmShipAction(request: {
+    title: string;
+    message: string;
+    confirmLabel: string;
+    destructive: boolean;
+  }): Promise<boolean> {
+    return confirmInApp(request.title, request.message, request.confirmLabel, {
+      destructive: request.destructive,
+    });
+  }
+
+  async function mergeShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const available = shipMergeAction(issue);
+    if (!available.enabled) throw new Error(available.reason ?? 'This pull request cannot merge.');
+    if (!(await confirmShipAction(shipMergeConfirmation(issue, run.remote)))) return '';
+    const ready = shipMergeAction(issue);
+    if (!ready.enabled) throw new Error(ready.reason ?? 'This pull request cannot merge.');
+    const outcome = await invoke<{
+      method: 'github' | 'bot-comment';
+      strategy: string;
+      comment: string | null;
+    }>('ship_merge_pull_request', {
+      request: {
+        repository: run.repository,
+        policyDirectory: issue.path,
+        expectedRepository: run.remote,
+        pullRequest: issue.pullRequest,
+        expectedHead: issue.checkpoint?.revision,
+        evidenceReady: shipEvidenceReadiness(issue).ready,
+      },
+    });
+    void tickShippingRuns(true);
+    return outcome.method === 'bot-comment'
+      ? `Posted “${outcome.comment}” on the pull request. The repository's bot merges it.`
+      : `Merged the pull request (${outcome.strategy}).`;
+  }
+
+  async function retryShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const available = shipRetryAction(issue);
+    if (!available.enabled) throw new Error(available.reason ?? 'This issue cannot be retried.');
+    if (
+      issue.claim?.status === 'active' &&
+      !shippingClaimOwnedByInstance(issue.claim, shippingInstanceId)
+    )
+      throw new Error(
+        'Another Sail instance holds the shipping claim for this issue. Retry after it releases or expires.',
+      );
+    if (!(await confirmShipAction(shipRetryConfirmation(issue)))) return '';
+    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+      await stopShippingWorker(issue);
+    const checkpoint = issue.checkpoint;
+    const resumed =
+      checkpoint && (checkpoint.status === 'cancelled' || checkpoint.status === 'failed')
+        ? updateTaskCheckpoint(
+            checkpoint,
+            {
+              status: 'active',
+              phase: checkpoint.phase === 'complete' ? 'implement' : checkpoint.phase,
+              nextAction: 'Resume from the saved checkpoint after the retry.',
+            },
+            Date.now(),
+          )
+        : checkpoint;
+    await updateShipIssue(run, issue, {
+      state: 'pending',
+      error: null,
+      blockedReason: null,
+      refreshError: null,
+      workerSettled: false,
+      receiptId: null,
+      threadId: null,
+      cancelledAt: undefined,
+      stage: undefined,
+      reportedStatus: undefined,
+      claimFencePending: false,
+      claimRevalidationPending: false,
+      claimHandoffPending: false,
+      dispatchFencePending: false,
+      retryCount: (issue.retryCount ?? 0) + 1,
+      ...(resumed ? { checkpoint: resumed } : {}),
+    });
+    launchReadyShipIssues(run);
+    return 'Retry queued. A fresh worker resumes from the saved checkpoint.';
+  }
+
+  async function stopShipRun(run: ShipRun): Promise<string> {
+    const available = shipStopAction(run);
+    if (!available.enabled) throw new Error(available.reason ?? 'Nothing to stop.');
+    if (run.issues.some((issue) => activeShipLaunches.has(`${run.id}:${issue.id}`)))
+      throw new Error('A worker is still launching. Stop the run once it has started.');
+    if (!(await confirmShipAction(shipStopConfirmation(run)))) return '';
+    const stopping = run.issues.filter((issue) =>
+      ['pending', 'starting', 'working', 'awaiting_merge'].includes(issue.state),
+    );
+    const markStopped = (issue: ShipIssue) => {
+      const checkpoint = issue.checkpoint;
+      return updateShipIssue(run, issue, {
+        state: 'failed',
+        error: stoppedMessage,
+        blockedReason: null,
+        workerSettled: true,
+        cancelledAt: Date.now(),
+        ...(checkpoint && checkpoint.status !== 'completed'
+          ? {
+              checkpoint: updateTaskCheckpoint(
+                checkpoint,
+                { status: 'cancelled', blocker: null },
+                Date.now(),
+              ),
+            }
+          : {}),
+      });
+    };
+    const saved = stopping.filter((issue) => issue.state === 'pending').map(markStopped);
+    const unsettled = stopping.filter((issue) => !issue.cancelledAt);
+    const outcomes = await Promise.allSettled(
+      unsettled.map(async (issue) => {
+        if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+          await stopShippingWorker(issue);
+        await markStopped(issue);
+      }),
+    );
+    await Promise.all(saved);
+    const failures = outcomes.flatMap((outcome, index) =>
+      outcome.status === 'rejected'
+        ? [`#${unsettled[index]?.number}: ${describe(outcome.reason)}`]
+        : [],
+    );
+    if (failures.length) throw new Error(`Could not stop ${failures.join('; ')}`);
+    return 'Run stopped. Claims are released as cancelled.';
+  }
+
+  async function archiveShipRunByUser(run: ShipRun): Promise<string> {
+    const available = shipArchiveAction(run);
+    if (!available.enabled) throw new Error(available.reason ?? 'This run cannot be archived.');
+    if (!(await confirmShipAction(shipArchiveConfirmation(run)))) return '';
+    run.archivedAt = Date.now();
+    run.archivedBy = 'user';
+    await saveShipRuns();
+    return 'Run archived. Use the Archived filter to find it.';
+  }
+
+  async function unarchiveShipRunByUser(run: ShipRun): Promise<string> {
+    delete run.archivedAt;
+    delete run.archivedBy;
+    run.unarchivedAt = Date.now();
+    await saveShipRuns();
+    void tickShippingRuns(true);
+    return 'Run restored.';
+  }
+
+  async function runShipAction(
+    id: ShipActionId,
+    run: ShipRun,
+    issue: ShipIssue | null,
+  ): Promise<string> {
+    if (id === 'merge' && issue) return mergeShipIssue(run, issue);
+    if (id === 'retry' && issue) return retryShipIssue(run, issue);
+    if (id === 'stop') return stopShipRun(run);
+    if (id === 'archive') return archiveShipRunByUser(run);
+    if (id === 'unarchive') return unarchiveShipRunByUser(run);
+    throw new Error('Unknown Ship action.');
+  }
+
+  async function openShipQueueIssue(runId: string, issueId: string) {
+    const run = shipRuns.find((item) => item.id === runId);
+    if (!run) return;
+    showWorkspace();
+    if (directory !== run.repository && coordinationProject(directory) !== run.repository)
+      await loadProject(run.repository, false);
+    showShipRuns();
+    shipFocusRequest = {
+      id: (shipFocusRequest?.id ?? 0) + 1,
+      runId,
+      issueId,
+      focus: 'issue',
+    };
+  }
+
+  function dismissShipArchiveNotice() {
+    shipArchiveNotice = 0;
+    setSetting('sai-ship-archive-notice', '0');
   }
 
   async function updateShipIssue(
@@ -4289,7 +4539,7 @@
             number: issue.number,
             claim,
             instanceId: shippingInstanceId,
-            reason: issue.state,
+            reason: terminalClaimReleaseReason(issue),
           })
         : heartbeatDue
           ? await invoke<ShippingClaim>('heartbeat_shipping_claim', {
@@ -5110,6 +5360,13 @@
           refreshError: null,
           refreshedAt: Date.now(),
         });
+        if (issue.title === `Issue #${issue.number}`) {
+          const title = await invoke<string>('ship_issue_title', {
+            repository: run.repository,
+            reference: issue.id,
+          }).catch(() => '');
+          if (title) await update({ title });
+        }
         const branch = worktree?.branch ?? issue.branch;
         if (branch && issue.state !== 'pending')
           await refreshShippingPullRequest(
@@ -5520,11 +5777,13 @@
     detectShippingClockResume();
     shippingBusy = true;
     try {
+      const active = shipRuns.filter((run) => !shipRunArchived(run));
       await persistShipRefresh(
-        shipRuns.map((run) => refreshShippingRun(run, refreshCompleted)),
+        active.map((run) => refreshShippingRun(run, refreshCompleted)),
         saveShipRuns,
       );
-      for (const run of shipRuns) launchReadyShipIssues(run);
+      for (const run of active) launchReadyShipIssues(run);
+      await archiveDueShipRuns();
     } catch (cause) {
       error = describe(cause);
     } finally {
@@ -14384,6 +14643,12 @@
     setSetting('sai-workspace-view', workspaceView);
   }
 
+  function showShipQueue() {
+    workspaceView = 'ship-queue';
+    mobileView = 'chat';
+    setSetting('sai-workspace-view', workspaceView);
+  }
+
   function showWorkspace() {
     workspaceView = 'workspace';
     setSetting('sai-workspace-view', workspaceView);
@@ -14537,6 +14802,8 @@
       onmobileview={(view) => void showMobileView(view)}
       overview={workspaceView === 'overview'}
       onoverview={() => (workspaceView === 'overview' ? showWorkspace() : showTaskOverview())}
+      shipQueue={workspaceView === 'ship-queue'}
+      onshipqueue={() => (workspaceView === 'ship-queue' ? showWorkspace() : showShipQueue())}
       projectName={directory ? locationName(directory) : 'Workspace'}
       projectDisabled={runtimeState !== 'connected' &&
         !agentAvailability.some((agent) => agent.available)}
@@ -15038,7 +15305,21 @@
         onopencheck={openTaskOverviewCheck}
       />
     {/if}
-    <div class="workspace-pane-host" hidden={workspaceView === 'overview'}>
+    {#if workspaceView === 'ship-queue'}
+      <ShipQueue
+        runs={shipRuns}
+        busy={shippingBusy}
+        {mergeOwner}
+        archiveNotice={shipArchiveNotice}
+        onrefresh={() => tickShippingRuns(true)}
+        onopen={openShipQueueIssue}
+        onaction={runShipAction}
+        ondismissnotice={dismissShipArchiveNotice}
+        onsettings={openSettings}
+        onclose={showWorkspace}
+      />
+    {/if}
+    <div class="workspace-pane-host" hidden={workspaceView !== 'workspace'}>
       <PaneTree
         active={workspaceView === 'workspace'}
         pane={paneLayout}
@@ -15066,6 +15347,9 @@
         onshipopen={openShipTarget}
         onshipsettings={openSettings}
         onshiphandoff={handoffShipIssue}
+        onshipaction={runShipAction}
+        ondismissshipnotice={dismissShipArchiveNotice}
+        {shipArchiveNotice}
         onship={(graph, provider, limit, source) =>
           startShippingRun(graph, provider, limit, source)}
         onshipit={adoptDirectShipRunWithAuthorization}
@@ -15163,6 +15447,9 @@
         onrefresh={() => tickShippingRuns(true)}
         onopen={openShipTarget}
         onhandoff={handoffShipIssue}
+        onaction={runShipAction}
+        ondismissnotice={dismissShipArchiveNotice}
+        archiveNotice={shipArchiveNotice}
         onsettings={async () => {
           closeShipRuns();
           await openSettings();
@@ -15303,6 +15590,9 @@
             onrefresh={() => tickShippingRuns(true)}
             onopen={openShipTarget}
             onhandoff={handoffShipIssue}
+            onaction={runShipAction}
+            ondismissnotice={dismissShipArchiveNotice}
+            archiveNotice={shipArchiveNotice}
             onsettings={async () => {
               closeShipRuns();
               await openSettings();
