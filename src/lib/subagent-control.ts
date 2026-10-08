@@ -1,12 +1,37 @@
 import type { InboxItem } from './inbox.ts';
 import type { SpawnReceipt } from './agent-results.ts';
 
+export type PermissionResolution = 'answered' | 'cancelled';
+
 export type AnsweredPermission = {
   key: string;
   agentId: string;
   sessionId: string;
   title: string;
+  outcome: PermissionResolution;
 };
+
+/** How a `sail/permission_resolved` event settled its request. Stop and turn cancel resolve
+ * pending requests as cancelled, which must not read as an answer. */
+export function permissionResolution(
+  params: Record<string, unknown> | undefined,
+): PermissionResolution {
+  return params?.sailPermissionOutcome === 'cancelled' ? 'cancelled' : 'answered';
+}
+
+export function permissionResolutionLabel(outcome: PermissionResolution): string {
+  return outcome === 'cancelled' ? 'Cancelled' : 'Answered';
+}
+
+/** One note per request instance: ACP request ids restart with each connection. */
+export function answeredPermissionKey(
+  agentId: string,
+  sessionId: string,
+  requestId: string | number,
+  generation: unknown,
+): string {
+  return `acp:${agentId}:${sessionId}:${requestId}:${typeof generation === 'number' ? generation : ''}`;
+}
 
 /** What a subagent group card needs from the app: the children's pending permissions, the ones
  * answered already, and the stop actions. */
@@ -20,8 +45,8 @@ export type SubagentControl = {
   onstopall: (receipts: SpawnReceipt[]) => Promise<void>;
 };
 
-/** The adapter reports a second answer to a settled request with this text. Every surface treats
- * it as "Answered" instead of an error. */
+/** The adapter reports a second answer to a settled request with this text. Surfaces drop the
+ * request instead of showing an error; the resolution event says whether it was answered. */
 export function permissionAlreadyAnswered(cause: unknown): boolean {
   const text = cause instanceof Error ? cause.message : String(cause);
   return /no longer pending/i.test(text);

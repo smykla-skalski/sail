@@ -3,8 +3,11 @@ import test from 'node:test';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 import type { InboxItem } from '../src/lib/inbox.ts';
 import {
+  answeredPermissionKey,
   childPermissions,
   permissionAlreadyAnswered,
+  permissionResolution,
+  permissionResolutionLabel,
   stoppableSubagents,
   subagentStop,
 } from '../src/lib/subagent-control.ts';
@@ -84,7 +87,7 @@ void test('stop all skips native, Ship-managed and settled children', () => {
 void test('child permissions match by agent, session and directory', () => {
   const control = {
     permissions: [permission('a'), permission('b'), permission('a', 'claude')],
-    answered: [{ key: 'k', agentId: 'codex', sessionId: 'a', title: 'Run' }],
+    answered: [{ key: 'k', agentId: 'codex', sessionId: 'a', title: 'Run', outcome: 'answered' }],
   };
   const found = childPermissions(control, receipt('a'));
   assert.equal(found.pending.length, 1);
@@ -92,10 +95,32 @@ void test('child permissions match by agent, session and directory', () => {
   assert.deepEqual(childPermissions(control, receipt('z')), { pending: [], answered: [] });
 });
 
-void test('a request that is no longer pending counts as answered', () => {
+void test('a request that is no longer pending is recognised as settled', () => {
   assert.equal(
     permissionAlreadyAnswered(new Error('Permission request is no longer pending.')),
     true,
   );
   assert.equal(permissionAlreadyAnswered('Agent session is not connected.'), false);
+});
+
+await test('a cancelled request does not read as answered', () => {
+  const cases: [Record<string, unknown> | undefined, string][] = [
+    [{ sailPermissionOutcome: 'cancelled' }, 'Cancelled'],
+    [{ sailPermissionOutcome: 'selected' }, 'Answered'],
+    [{}, 'Answered'],
+    [undefined, 'Answered'],
+  ];
+  for (const [params, label] of cases)
+    assert.equal(permissionResolutionLabel(permissionResolution(params)), label);
+});
+
+await test('a reused request id gets its own note per connection generation', () => {
+  assert.notEqual(
+    answeredPermissionKey('codex', 'child', 7, 1),
+    answeredPermissionKey('codex', 'child', 7, 2),
+  );
+  assert.equal(
+    answeredPermissionKey('codex', 'child', 7, 'x'),
+    answeredPermissionKey('codex', 'child', 7, undefined),
+  );
 });

@@ -8,6 +8,7 @@ import {
   shortcutForEvent,
   shortcutLabel,
   shortcuts,
+  terminalOwnsKey,
   type ShortcutId,
 } from '../src/lib/shortcuts.ts';
 
@@ -94,4 +95,17 @@ void test('platform detection reads the platform string, then the user agent', (
   assert.equal(detectShortcutPlatform({ platform: 'Win32', userAgent: 'Mozilla Mac' }), 'other');
   assert.equal(detectShortcutPlatform({ platform: '', userAgent: 'X11; Linux' }), 'other');
   assert.equal(detectShortcutPlatform({ platform: '', userAgent: 'Macintosh' }), 'mac');
+});
+
+await test('a terminal keeps Ctrl+[ and Ctrl+] while Cmd shortcuts still work there', () => {
+  const terminal = { closest: (selector: string) => (selector === '.xterm' ? {} : null) };
+  const composer = { closest: () => null };
+  const cases: [Pick<KeyboardEvent, 'ctrlKey' | 'metaKey'>, typeof terminal | null, boolean][] = [
+    [{ ctrlKey: true, metaKey: false }, terminal, true],
+    [{ ctrlKey: true, metaKey: false }, composer, false],
+    [{ ctrlKey: true, metaKey: false }, null, false],
+    [{ ctrlKey: false, metaKey: true }, terminal, false],
+  ];
+  for (const [event, target, expected] of cases)
+    assert.equal(terminalOwnsKey(event, target), expected);
 });
