@@ -3097,7 +3097,20 @@
     });
   }
 
+  const shipMergesInFlight = new SvelteSet<string>();
+
   async function mergeShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const key = `${run.id}:${issue.id}`;
+    if (shipMergesInFlight.has(key)) throw new Error('A merge request is already in progress.');
+    shipMergesInFlight.add(key);
+    try {
+      return await requestShipMerge(run, issue);
+    } finally {
+      shipMergesInFlight.delete(key);
+    }
+  }
+
+  async function requestShipMerge(run: ShipRun, issue: ShipIssue): Promise<string> {
     const available = shipMergeAction(issue);
     if (!available.enabled) throw new Error(available.reason ?? 'This pull request cannot merge.');
     if (!(await confirmShipAction(shipMergeConfirmation(issue, run.remote)))) return '';
