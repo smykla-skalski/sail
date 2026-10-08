@@ -412,6 +412,18 @@
     }
   }
 
+  $effect(() => {
+    if (compact) closeMenu();
+  });
+
+  function railWorktrees(path: string): ProjectWorktree[] {
+    return repositoryCollapsed(path) ? [] : (catalog.worktrees[path] ?? []);
+  }
+
+  function railLocations(path: string): string[] {
+    return repositoryCollapsed(path) ? [] : [path, ...railWorktrees(path).map((w) => w.path)];
+  }
+
   function closeMenu(restoreFocus = false) {
     menu = null;
     if (restoreFocus) menuTrigger?.focus();
@@ -893,16 +905,17 @@
     {disabled}
     onclick={() => onselectdefault(path)}>{repositoryName(path).charAt(0).toUpperCase()}</button
   >
-  {#each catalog.worktrees[path] ?? [] as worktree (worktree.path)}
+  {#each railWorktrees(path) as worktree (worktree.path)}
     <button
       aria-label={`Open worktree ${worktree.branch}`}
       aria-current={worktree.path === directory ? 'page' : undefined}
       title={worktree.branch}
       disabled={disabled || !!worktreeDeletions[worktree.path]}
-      onclick={() => onselect(worktree.path)}><span aria-hidden="true">⑂</span></button
+      onclick={() => onselect(worktree.path)}
+      ><span aria-hidden="true">⑂{worktree.branch.charAt(0)}</span></button
     >
   {/each}
-  {#each [path, ...(catalog.worktrees[path] ?? []).map((worktree) => worktree.path)] as location (location)}
+  {#each railLocations(path) as location (location)}
     {#each threads[location] ?? [] as thread (threadKey(thread))}
       {@const status = threadStatus(thread)}
       {@const key = threadKey(thread)}

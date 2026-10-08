@@ -8,6 +8,7 @@ import {
   sidebarMaxWidth,
   sidebarMinWidth,
   sidebarRailWidth,
+  stepSidebarWidth,
 } from '../src/lib/sidebar-width.ts';
 
 void test('narrow drags snap to the icon rail', () => {
@@ -34,4 +35,18 @@ void test('saved width falls back to the default when missing or invalid', () =>
   assert.equal(parseSidebarWidth('wide'), sidebarDefaultWidth);
   assert.equal(parseSidebarWidth('300'), 300);
   assert.equal(parseSidebarWidth('64'), sidebarRailWidth);
+});
+
+void test('empty or non-positive saved widths fall back to the default', () => {
+  for (const value of ['', '  ', '-5', '0'])
+    assert.equal(parseSidebarWidth(value), sidebarDefaultWidth);
+});
+
+void test('keyboard steps reach the rail and leave it', () => {
+  assert.equal(stepSidebarWidth(sidebarMinWidth, -20), sidebarRailWidth);
+  assert.equal(stepSidebarWidth(230, -50), sidebarMinWidth);
+  assert.equal(stepSidebarWidth(300, -20), 280);
+  assert.equal(stepSidebarWidth(sidebarRailWidth, 20), sidebarMinWidth);
+  assert.equal(stepSidebarWidth(sidebarRailWidth, -20), sidebarRailWidth);
+  assert.equal(stepSidebarWidth(540, 50, 560), 560);
 });

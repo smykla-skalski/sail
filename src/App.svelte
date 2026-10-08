@@ -281,6 +281,7 @@
     sidebarMaxWidth,
     sidebarMinWidth,
     sidebarRailWidth,
+    stepSidebarWidth,
   } from './lib/sidebar-width';
   import ShipQueue from './ShipQueue.svelte';
   import TaskOverview from './TaskOverview.svelte';
@@ -1561,7 +1562,7 @@
     Number.isFinite(savedDetailsWidth) && savedDetailsWidth >= 320 ? savedDetailsWidth : 420,
   );
   let workspaceWidth = $state(0);
-  let shellWidth = $state(0);
+  let shellWidth = $state(window.innerWidth);
   let sidebarWidth = $state(parseSidebarWidth(getSetting('sai-sidebar-width')));
   let sidebarResizeStart: { x: number; width: number } | null = null;
   let appShellElement = $state<HTMLDivElement>();
@@ -2399,11 +2400,9 @@
     const step = event.shiftKey ? 50 : 20;
     const width =
       event.key === 'ArrowRight'
-        ? sidebarRail
-          ? sidebarMinWidth
-          : visibleSidebarWidth + step
+        ? stepSidebarWidth(visibleSidebarWidth, step, maxSidebarWidth)
         : event.key === 'ArrowLeft'
-          ? visibleSidebarWidth - step
+          ? stepSidebarWidth(visibleSidebarWidth, -step, maxSidebarWidth)
           : event.key === 'Home'
             ? sidebarRailWidth
             : event.key === 'End'
