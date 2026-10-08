@@ -1,6 +1,7 @@
-import type { AgentEntry, AgentEvent, AgentThread } from './acp.ts';
+import type { AgentEntry, AgentEvent, AgentThread, NativeSubagentSnapshot } from './acp.ts';
 import { updateEntries } from './acp.ts';
 import type { SpawnReceipt, SpawnState } from './agent-results.ts';
+import type { CapabilityProfile } from './capability-profiles.ts';
 
 export type NativeSubagentOutcome =
   'working' | 'waiting' | 'completed' | 'failed' | 'interrupted' | 'unknown';
@@ -22,6 +23,7 @@ export type NativeSubagent = {
   updated: number;
   restored: boolean;
   error?: string;
+  capabilityProfile: CapabilityProfile;
 };
 
 export type NativeSubagentStore = Record<string, NativeSubagent>;
@@ -83,6 +85,7 @@ export function updateNativeSubagents(
   directory: string,
   now = Date.now(),
   restored = false,
+  capabilityProfile: CapabilityProfile = 'build',
 ): NativeSubagentStore {
   if (event.message.method !== 'session/update') return store;
   const params = record(event.message.params);
@@ -138,6 +141,11 @@ export function updateNativeSubagents(
         created: previous?.created ?? now,
         updated: now,
         restored: previous?.restored || replayed,
+        capabilityProfile: replayed
+          ? capabilityProfile
+          : (previous?.capabilityProfile ??
+            store[nativeSubagentId(event.agent, parentSessionId)]?.capabilityProfile ??
+            capabilityProfile),
         ...(malformed ? { error: 'Incomplete subagent history' } : {}),
       },
     };
@@ -185,6 +193,63 @@ export function updateNativeSubagents(
   };
 }
 
+export function reconcileNativeSubagents(
+  store: NativeSubagentStore,
+  snapshots: NativeSubagentSnapshot[],
+  now = Date.now(),
+): NativeSubagentStore {
+  let next = store;
+  for (let pass = 0; pass < snapshots.length; pass += 1) {
+    let changed = false;
+    for (const snapshot of snapshots) {
+      const id = nativeSubagentId(snapshot.agent, snapshot.sessionId);
+      const previous = next[id];
+      const rootSessionId = rootSession(next, snapshot.agent, snapshot.parentSessionId);
+      if (
+        previous?.directory === snapshot.directory &&
+        previous.capabilityProfile === snapshot.capabilityProfile &&
+        previous.parentSessionId === snapshot.parentSessionId &&
+        previous.rootSessionId === rootSessionId &&
+        previous.outcome === snapshot.outcome
+      )
+        continue;
+      const activity =
+        snapshot.outcome === 'completed'
+          ? 'Completed'
+          : snapshot.outcome === 'failed'
+            ? 'Failed'
+            : snapshot.outcome === 'interrupted'
+              ? 'Interrupted'
+              : snapshot.outcome === 'waiting'
+                ? 'Needs permission'
+                : previous?.activity || 'Starting…';
+      if (next === store) next = Object.assign({}, store);
+      next[id] = {
+        id,
+        agent: snapshot.agent,
+        capabilityProfile: snapshot.capabilityProfile,
+        directory: snapshot.directory,
+        sessionId: snapshot.sessionId,
+        parentSessionId: snapshot.parentSessionId,
+        rootSessionId,
+        name: previous?.name ?? 'Subagent',
+        task: previous?.task ?? 'Delegated task',
+        ...(previous?.prompt ? { prompt: previous.prompt } : {}),
+        outcome: snapshot.outcome,
+        activity,
+        transcript: previous?.transcript ?? [],
+        created: previous?.created ?? now,
+        updated: now,
+        restored: previous?.restored ?? false,
+        ...(previous?.error ? { error: previous.error } : {}),
+      };
+      changed = true;
+    }
+    if (!changed) break;
+  }
+  return next;
+}
+
 export function setNativeSubagentWaiting(
   store: NativeSubagentStore,
   agent: string,
@@ -230,12 +295,18 @@ export function finalizeNativeSubagentRestore(
 export function disconnectNativeSubagents(
   store: NativeSubagentStore,
   agent: string,
+  sessionIds: readonly string[],
   now = Date.now(),
 ): NativeSubagentStore {
   let changed = false;
   const next = { ...store };
   for (const [id, child] of Object.entries(store)) {
-    if (child.agent !== agent || !['working', 'waiting'].includes(child.outcome)) continue;
+    if (
+      child.agent !== agent ||
+      !sessionIds.includes(child.sessionId) ||
+      !['working', 'waiting'].includes(child.outcome)
+    )
+      continue;
     next[id] = { ...child, outcome: 'unknown', activity: 'Disconnected', updated: now };
     changed = true;
   }
@@ -287,6 +358,7 @@ export function nativeSubagentThreads(store: NativeSubagentStore): AgentThread[]
     directory: child.directory,
     title: child.task || child.name,
     updated: child.updated,
+    capabilityProfile: child.capabilityProfile,
   }));
 }
 

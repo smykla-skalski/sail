@@ -1,4 +1,14 @@
 fn main() {
+    let policy_path = "../src/lib/capability-policy.json";
+    println!("cargo:rerun-if-changed={policy_path}");
+    let policy: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(policy_path).expect("failed to read capability policy"),
+    )
+    .expect("failed to parse capability policy");
+    let revision = policy["revision"]
+        .as_str()
+        .expect("capability policy revision must be a string");
+    println!("cargo:rustc-env=SAIL_CAPABILITY_POLICY_REVISION={revision}");
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "diagnostic_event",
@@ -7,6 +17,7 @@ fn main() {
             "save_setting",
             "list_interrupted_agent_turns",
             "finish_interrupted_agent_turn",
+            "get_acp_turn_evidence",
             "start_runtime",
             "repository_path_available",
             "validate_repository",
@@ -15,6 +26,9 @@ fn main() {
             "working_tree_revision",
             "working_tree_generation",
             "working_tree_commit",
+            "shipping_base_revision",
+            "shipping_worktree_target",
+            "shipping_changed_paths",
             "worktree_overviews",
             "record_turn_snapshot",
             "list_turn_snapshots",
@@ -47,6 +61,11 @@ fn main() {
             "shipping_target_repository",
             "shipping_pull_request",
             "shipping_dependency_closed",
+            "acquire_shipping_claim",
+            "observe_shipping_claim",
+            "complete_predecessor_shipping_claim_fence",
+            "heartbeat_shipping_claim",
+            "release_shipping_claim",
             "pull_request_checks",
             "failed_check_log",
             "open_pull_request",
@@ -60,15 +79,18 @@ fn main() {
             "acp_connect",
             "acp_new_session",
             "acp_forget_session",
+            "acp_release_session_fence",
             "acp_load_session",
             "acp_resume_session",
             "acp_prompt",
             "acp_steer",
             "acp_cancel",
             "acp_permission",
+            "acp_permission_resources_trusted",
             "acp_pending_permissions",
             "acp_pending_inbox",
             "acp_activity",
+            "acp_native_subagents",
             "acp_prepare_restart",
             "acp_set_config",
             "acp_authenticate",

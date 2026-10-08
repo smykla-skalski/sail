@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getSetting, setSetting } from './settings.ts';
 import { toolCommand } from './tool-display.ts';
+import type { CapabilityProfile, PermissionPolicyDecision } from './capability-profiles.ts';
 
 export type AgentId = string;
 
@@ -19,6 +20,7 @@ export interface AgentThread {
   directory: string;
   title: string;
   updated: number;
+  capabilityProfile?: CapabilityProfile;
 }
 
 export interface InterruptedAgentTurn {
@@ -32,6 +34,15 @@ export interface InterruptedAgentTurn {
 export interface AcpPromptOutcome {
   stopReason: string;
   sailInterrupted?: boolean;
+}
+
+export interface AcpTurnEvidence {
+  agent: AgentId;
+  sessionId: string;
+  turnId: string;
+  status: 'prepared' | 'dispatch_uncertain' | 'dispatched' | 'done' | 'failed' | 'interrupted';
+  error: string | null;
+  updatedAt: number;
 }
 
 export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
@@ -134,6 +145,9 @@ export interface AgentPermission {
   sessionId: string;
   title: string;
   options: { optionId: string; name: string; kind: string }[];
+  policy?: PermissionPolicyDecision;
+  generation?: number;
+  fingerprint?: string;
 }
 
 export interface AgentConfigOption {
@@ -164,6 +178,26 @@ export interface AgentEvent {
   };
 }
 
+export function acpDisconnectedSessionIds(message: AgentEvent['message']): string[] | null {
+  if (message.method !== 'sail/disconnected') return null;
+  const sessionIds = message.params?.sessionIds;
+  if (!Array.isArray(sessionIds)) return null;
+  return sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string');
+}
+
+export function acpDisconnectAffectsSession(
+  message: AgentEvent['message'],
+  sessionId: string | null,
+  profile?: CapabilityProfile,
+): boolean {
+  if (message.method !== 'sail/disconnected') return false;
+  const sessionIds = acpDisconnectedSessionIds(message);
+  if (sessionId && sessionIds) return sessionIds.includes(sessionId);
+  const disconnectedProfile = message.params?.profile;
+  if (profile && typeof disconnectedProfile === 'string') return disconnectedProfile === profile;
+  return sessionIds === null;
+}
+
 export interface AgentActivity {
   alive: boolean;
   active: string[];
@@ -179,6 +213,20 @@ export interface AgentActivity {
       error?: string | null;
     }
   >;
+}
+
+export interface NativeSubagentSnapshot {
+  agent: AgentId;
+  capabilityProfile: CapabilityProfile;
+  sessionId: string;
+  parentSessionId: string;
+  directory: string;
+  outcome: 'working' | 'waiting' | 'completed' | 'failed' | 'interrupted' | 'unknown';
+}
+
+export interface NativeSubagentSnapshotSet {
+  generation: number;
+  subagents: NativeSubagentSnapshot[];
 }
 
 export interface AcpPendingInboxItem {
@@ -274,7 +322,9 @@ export function loadAgentThreads(): AgentThread[] {
         typeof item.sessionId === 'string' &&
         typeof item.directory === 'string' &&
         typeof item.title === 'string' &&
-        typeof item.updated === 'number',
+        typeof item.updated === 'number' &&
+        (item.capabilityProfile === undefined ||
+          ['explore', 'review', 'build', 'release'].includes(item.capabilityProfile)),
     );
   } catch {
     return [];
@@ -569,18 +619,23 @@ function restoreSession(
   agent: AgentId,
   cwd: string,
   sessionId: string,
+  profile: CapabilityProfile,
 ) {
-  const key = JSON.stringify([agent, cwd, sessionId]);
+  const key = JSON.stringify([agent, cwd, sessionId, profile]);
   const existing = restoringSessions.get(key);
   if (existing) return existing;
+  // A restore replays history, so this session's buffered updates can no longer be trusted.
   invalidateBackgroundSession(agent, sessionId);
-  const request = invoke<Record<string, unknown>>(method, { agent, cwd, sessionId }).then(
-    (session) => {
-      invalidateBackgroundSession(agent, sessionId);
-      rememberRestoredState(agent, sessionId, session);
-      return session;
-    },
-  );
+  const request = invoke<Record<string, unknown>>(method, {
+    agent,
+    cwd,
+    sessionId,
+    profile,
+  }).then((session) => {
+    invalidateBackgroundSession(agent, sessionId);
+    rememberRestoredState(agent, sessionId, session);
+    return session;
+  });
   restoringSessions.set(key, request);
   void request
     .finally(() => {
@@ -592,23 +647,25 @@ function restoreSession(
 
 export const acp = {
   agents: () => invoke<AgentAvailability[]>('acp_agents'),
-  connect: (agent: AgentId) => invoke<Record<string, unknown>>('acp_connect', { agent }),
-  create: (agent: AgentId, cwd: string) =>
+  connect: (agent: AgentId, profile?: CapabilityProfile) =>
+    invoke<Record<string, unknown>>('acp_connect', { agent, profile }),
+  create: (agent: AgentId, cwd: string, profile?: CapabilityProfile, nativeGeneration?: number) =>
     invoke<{
       sessionId: string;
       configOptions?: AgentConfigOption[];
       availableCommands?: AgentCommand[];
     }>('acp_new_session', {
-      agent,
-      cwd,
+      params: { agent, cwd, profile, nativeGeneration },
     }).then((session) => {
       rememberRestoredState(agent, session.sessionId, session);
       return session;
     }),
-  load: (agent: AgentId, cwd: string, sessionId: string) =>
-    restoreSession('acp_load_session', agent, cwd, sessionId),
-  resume: (agent: AgentId, cwd: string, sessionId: string) =>
-    restoreSession('acp_resume_session', agent, cwd, sessionId),
+  releaseSessionFence: (agent: AgentId, sessionId: string) =>
+    invoke<void>('acp_release_session_fence', { agent, sessionId }),
+  load: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
+    restoreSession('acp_load_session', agent, cwd, sessionId, profile),
+  resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
+    restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
   forget: (agent: AgentId, sessionId: string) => {
     forgetSessionState(agent, sessionId);
     return invoke<void>('acp_forget_session', { agent, sessionId });
@@ -629,12 +686,37 @@ export const acp = {
     }),
   cancel: (agent: AgentId, sessionId: string, turnId: string | null) =>
     invoke<void>('acp_cancel', { agent, sessionId, turnId }),
-  permission: (agent: AgentId, requestId: string | number, optionId: string | null) =>
-    invoke<void>('acp_permission', { agent, requestId, optionId }),
+  permission: (
+    agent: AgentId,
+    requestId: string | number,
+    optionId: string | null,
+    sessionId: string,
+    requestGeneration: number | undefined,
+    requestFingerprint: string | undefined,
+  ) =>
+    invoke<void>('acp_permission', {
+      params: {
+        agent,
+        requestId,
+        optionId,
+        sessionId,
+        requestGeneration,
+        requestFingerprint,
+      },
+    }),
+  permissionResourcesTrusted: (workspace: string, resources: string[]) =>
+    invoke<{ trusted: boolean; canonicalResources: string[] }>('acp_permission_resources_trusted', {
+      workspace,
+      resources,
+    }),
   pendingPermissions: (agent: AgentId, sessionId: string) =>
     invoke<AgentEvent['message'][]>('acp_pending_permissions', { agent, sessionId }),
   pendingInbox: () => invoke<AcpPendingInboxItem[]>('acp_pending_inbox'),
   activity: () => invoke<Record<AgentId, AgentActivity>>('acp_activity'),
+  nativeSubagents: (directory: string) =>
+    invoke<NativeSubagentSnapshotSet>('acp_native_subagents', { directory }),
+  turnEvidence: (agent: AgentId, sessionId: string, turnId: string) =>
+    invoke<AcpTurnEvidence | null>('get_acp_turn_evidence', { agent, sessionId, turnId }),
   interruptedTurns: () => invoke<InterruptedAgentTurn[]>('list_interrupted_agent_turns'),
   finishInterruptedTurn: (turn: InterruptedAgentTurn) =>
     invoke<void>('finish_interrupted_agent_turn', {
@@ -654,8 +736,8 @@ export const acp = {
         rememberSessionState(agent, sessionId, { configOptions: result.configOptions });
       return result;
     }),
-  authenticate: (agent: AgentId, methodId: string) =>
-    invoke<Record<string, unknown>>('acp_authenticate', { agent, methodId }),
+  authenticate: (agent: AgentId, methodId: string, profile?: CapabilityProfile) =>
+    invoke<Record<string, unknown>>('acp_authenticate', { agent, methodId, profile }),
 };
 
 export async function acpFinishedPromptStatus(

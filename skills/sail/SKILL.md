@@ -11,6 +11,12 @@ Use them when the user asks you to coordinate agents, inspect or create
 worktrees, operate Sail terminals, message another thread, or use Sail's embedded
 browser. Read the tool schemas before calling them.
 
+Sail assigns this session an `explore`, `review`, `build`, or `release`
+capability profile. The MCP catalog contains only tools enabled by that profile,
+and disabled tools are rejected even if called from stale schema context. Do not
+work around a missing tool. Permission prompts include Sail's risk classification,
+reason, and policy revision; unknown and high-risk actions require a person.
+
 ## Workflow references
 
 - Bundled workflow prompts contain the core contract only. When that contract
@@ -29,18 +35,27 @@ browser. Read the tool schemas before calling them.
   next action; never infer success from the phase alone. Pass the sequence and
   revision from the last read. If Git drifted, inspect it and set
   `rebindRevision` explicitly; on a stale-update error, read and merge again.
-- Read the checkpoint revision before each command, then record results with
-  `task_evidence_record` using that `expectedRevision` and the exact acceptance
-  criterion strings from the checkpoint and a bounded log, terminal, or URL
-  reference. Read the checkpoint before an inline gate and pass its `revision`
+- Read the checkpoint execution boundary before each command, then record results
+  with `task_evidence_record` using its `expectedRevision`,
+  `expectedMutationGeneration`, and `expectedBaseRevision`, plus the exact
+  acceptance criterion strings from the checkpoint and a bounded log, terminal,
+  or URL reference. Read the checkpoint before an inline gate and pass its `revision`
   with the `ship_progress` verdict; cross-validation gates use their launch
   revision. Re-read after source changes; stale evidence never makes a
   task merge-ready.
+- Before starting Ship validation, call `validation_policy` with an explicit
+  `low`, `medium`, or `high` risk. Inspect the returned selected risk, required
+  gates, policy sources, and revision. Run only the required gates. If the
+  worktree changes, select the policy again; Sail retains earlier escalation.
 - Use `worktree_list` to find project worktrees and live agent threads. Use
   `worktree_info` for details about a listed path.
-- Use `agent_spawn` to start Claude, Codex, or OpenCode without interactive
-  approval. The default target is a new worktree; an existing target shares files.
-  Use `worktree_create` when the user should choose a new worktree in Sail.
+- Use `agent_spawn` with an explicit `role` and `risk`; Sail selects the exact
+  configured provider, model, and variant. Roles are `exploration`,
+  `implementation`, `debugging`, `review`, and `ci-triage`; risks are `low`,
+  `medium`, and `high`. Never replace a rejected or missing route with an alias or
+  an unconfigured model. The default target is a new worktree; an existing target
+  shares files. Use `worktree_create` when the user should choose a new worktree
+  in Sail.
 - For an assigned Ship issue, use `ship_progress` to report `stage` (implementing,
   reviewing, testing, pull_request, ci, merging) and `status` (running or blocked).
   Include a concrete `reason` when blocked. Validation sessions use the same tool
@@ -52,7 +67,9 @@ browser. Read the tool schemas before calling them.
   a fresh session in this worktree. Wait for its receipt before the next pass.
 - Keep the `receiptId` and `accessKey` returned by `agent_spawn` together. Pass
   both to `agent_status`, `agent_wait`, or `agent_result`. Wait for completion
-  before relying on another agent's work.
+  before relying on another agent's work. Inspect the receipt's requested and
+  actual provider, model, and variant. When it marks independent review as
+  required, launch the configured review route before treating the task as done.
 - Use `project_threads` and `thread_message` to contact another thread in the
   same project. Use `worktree_status` for a short sidebar status comment.
 

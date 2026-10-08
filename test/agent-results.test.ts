@@ -2,17 +2,41 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acpReceiptState,
+  acpPromptHasBackendEvidence,
+  acpReplacementDispatchAction,
+  acpTurnDispatchProven,
+  acpTurnEvidenceState,
+  acpTurnNeedsProviderInspection,
+  acpTurnPromptCanRetry,
+  activeSpawnReceiptForThread,
   activeSubagentsForSource,
   boundedSpawnOutput,
+  handoffReceiptForInterruptedTurn,
+  handoffReceiptNeedsResolution,
+  handoffPromptNeedsRecovery,
   isSubagentThread,
   loadSpawnReceipts,
+  openCodeDescendantSessions,
+  openCodePromptHasBackendEvidence,
+  openCodePromptHasHistoryEvidence,
+  openCodePromptRecoveryAction,
+  openCodePromptSettlement,
   receiptForSource,
+  receiptMatchesTurn,
   receiptNeedsRefresh,
+  receiptTurnMessages,
+  promptConflictTurnId,
+  failedPromptDispatch,
+  failedUnsubmittedDispatch,
   receiptIsSettled,
   receiptNeedsLiveActivity,
   receiptSourceId,
+  pendingHandoffReplacement,
+  replacementReceiptForInspection,
+  resolvedHandoffRecoveryError,
   runningSubagentsForSource,
   saveBoundedReceipt,
+  spawnPromptDispatchAllowed,
   spawnReceiptsForSource,
   withSpawnResponses,
   type SpawnReceipt,
@@ -37,6 +61,12 @@ const receipt: SpawnReceipt = {
   result: 'Done',
   error: null,
 };
+
+void test('receipt settlement is correlated to its current turn', () => {
+  assert.equal(receiptMatchesTurn(receipt, 'turn-one'), true);
+  assert.equal(receiptMatchesTurn({ ...receipt, turnId: 'turn-two' }, 'turn-one'), false);
+  assert.equal(receiptMatchesTurn(undefined, 'turn-one'), false);
+});
 
 await test('spawn receipts stay scoped to the launching source and project', () => {
   assert.deepEqual(
@@ -100,6 +130,25 @@ await test('spawn receipts stay scoped to the launching source and project', () 
   );
 });
 
+await test('spawn receipts persist requested and actual route identity', () => {
+  const routed: SpawnReceipt = {
+    ...receipt,
+    routing: {
+      role: 'implementation',
+      risk: 'high',
+      independentReviewRequired: true,
+      requested: { provider: 'codex', model: 'gpt-6.1-sol', variant: 'xhigh' },
+      actual: { provider: 'codex', model: 'gpt-6.1-sol', variant: 'xhigh' },
+    },
+  };
+  assert.deepEqual(loadSpawnReceipts(JSON.stringify([routed]))[0].routing, routed.routing);
+  const invalid = {
+    ...routed,
+    routing: { ...routed.routing!, requested: { ...routed.routing!.requested, model: null } },
+  };
+  assert.equal(loadSpawnReceipts(JSON.stringify([invalid]))[0].routing, undefined);
+});
+
 await test('receipts survive restart with bounded results and honest states', () => {
   const saved = saveBoundedReceipt([], {
     ...receipt,
@@ -117,6 +166,190 @@ await test('receipts survive restart with bounded results and honest states', ()
   );
   assert.deepEqual(loadSpawnReceipts('{invalid'), []);
   assert.deepEqual(loadSpawnReceipts(JSON.stringify([{ ...receipt, targetId: 1 }])), []);
+  assert.equal(
+    loadSpawnReceipts(JSON.stringify([{ ...receipt, dispatchPending: true }]))[0].dispatchPending,
+    true,
+  );
+});
+
+await test('receipt settlement selects the exact turn in a multi-turn session', () => {
+  const messages = [
+    { id: 'idle-two', type: 'idle' },
+    { id: 'assistant-two', type: 'assistant' },
+    { id: 'turn-two', type: 'user', text: 'same prompt' },
+    { id: 'idle-one', type: 'idle' },
+    { id: 'assistant-one', type: 'assistant' },
+    { id: 'turn-one', type: 'user', text: 'same prompt' },
+  ];
+  assert.deepEqual(
+    receiptTurnMessages(messages, 'turn-one', 'same prompt')?.map((message) => message.id),
+    ['turn-one', 'assistant-one', 'idle-one'],
+  );
+  assert.deepEqual(
+    receiptTurnMessages(messages, 'turn-two', 'same prompt')?.map((message) => message.id),
+    ['turn-two', 'assistant-two', 'idle-two'],
+  );
+  assert.equal(receiptTurnMessages(messages, 'missing', 'same prompt'), null);
+});
+
+await test('known pre-dispatch failures clear the durable admission fence', () => {
+  assert.deepEqual(failedUnsubmittedDispatch('authorization expired'), {
+    state: 'failed',
+    error: 'authorization expired',
+    dispatchPending: false,
+  });
+  assert.deepEqual(failedPromptDispatch({ _tag: 'SessionNotFoundError' }, 'missing session'), {
+    state: 'failed',
+    error: 'missing session',
+    dispatchPending: false,
+  });
+  assert.deepEqual(failedPromptDispatch({ name: 'TypeError' }, 'network failed'), {
+    state: 'failed',
+    error: 'network failed',
+  });
+});
+
+await test('durable prompt ID conflicts retain the admission fence for reconciliation', () => {
+  const conflict = {
+    _tag: 'ConflictError',
+    resource: 'turn-one',
+  };
+
+  assert.equal(promptConflictTurnId(conflict), 'turn-one');
+  assert.deepEqual(failedPromptDispatch(conflict, 'already admitted'), {
+    state: 'failed',
+    error: 'already admitted',
+  });
+  assert.equal(promptConflictTurnId({ _tag: 'ConflictError' }), null);
+});
+
+await test('an active launch transaction fences an idle created session', () => {
+  const starting = { ...receipt, state: 'starting' as const };
+  const active = new Set([starting.receiptId]);
+
+  assert.equal(
+    activeSpawnReceiptForThread([starting], active, starting.targetId!, starting.targetDirectory!),
+    starting,
+  );
+  assert.equal(
+    activeSpawnReceiptForThread([starting], new Set(), starting.targetId!, '/repo/task'),
+    null,
+  );
+  assert.equal(spawnPromptDispatchAllowed(starting), true);
+  assert.equal(spawnPromptDispatchAllowed({ ...starting, state: 'unavailable' }), true);
+  assert.equal(spawnPromptDispatchAllowed({ ...starting, state: 'interrupted' }), false);
+});
+
+await test('durable ACP evidence distinguishes completion from uncertain dispatch', () => {
+  const evidence = {
+    agent: 'codex',
+    sessionId: 'target',
+    turnId: 'turn-one',
+    status: 'done' as const,
+    error: null,
+    updatedAt: 1,
+  };
+
+  assert.equal(acpTurnEvidenceState(evidence), 'completed');
+  assert.equal(acpTurnEvidenceState({ ...evidence, status: 'failed' }), 'failed');
+  assert.equal(acpTurnEvidenceState({ ...evidence, status: 'interrupted' }), 'interrupted');
+  assert.equal(acpTurnEvidenceState({ ...evidence, status: 'dispatched' }), 'unavailable');
+  assert.equal(acpTurnEvidenceState({ ...evidence, status: 'prepared' }), 'unavailable');
+  assert.equal(acpTurnDispatchProven({ ...evidence, status: 'prepared' }), false);
+  assert.equal(acpTurnPromptCanRetry({ ...evidence, status: 'prepared' }), true);
+  assert.equal(acpTurnNeedsProviderInspection({ ...evidence, status: 'dispatch_uncertain' }), true);
+  assert.equal(acpTurnDispatchProven({ ...evidence, status: 'dispatch_uncertain' }), false);
+  assert.equal(acpTurnPromptCanRetry({ ...evidence, status: 'dispatch_uncertain' }), false);
+  assert.equal(acpTurnDispatchProven({ ...evidence, status: 'dispatched' }), true);
+  assert.equal(acpTurnNeedsProviderInspection({ ...evidence, status: 'dispatched' }), true);
+  assert.equal(acpTurnDispatchProven(evidence), true);
+  assert.equal(acpTurnDispatchProven(null), false);
+  assert.equal(acpTurnEvidenceState(null), null);
+});
+
+await test('uncertain ACP replacement dispatch requires inspection instead of source restoration', () => {
+  const evidence = {
+    agent: 'codex',
+    sessionId: 'replacement',
+    turnId: 'handoff-turn',
+    status: 'dispatch_uncertain' as const,
+    error: 'transport write failed',
+    updatedAt: 1,
+  };
+
+  const action = acpReplacementDispatchAction(evidence);
+
+  assert.equal(action, 'inspect');
+});
+
+await test('uncertain replacement remains owned even after its prompt promise reports failure', () => {
+  const failed = {
+    ...receipt,
+    receiptId: 'handoff-replacement',
+    requestId: 'handoff:handoff-one',
+    state: 'failed' as const,
+    error: 'transport write failed',
+  };
+
+  const preserved = replacementReceiptForInspection(
+    failed,
+    'Prompt dispatch may have completed before restart; inspect the restored provider session before cancelling and retrying.',
+    3,
+  );
+
+  assert.deepEqual(preserved, {
+    ...failed,
+    state: 'unavailable',
+    error:
+      'Prompt dispatch may have completed before restart; inspect the restored provider session before cancelling and retrying.',
+    updated: 3,
+  });
+  assert.equal(handoffReceiptNeedsResolution(preserved), true);
+});
+
+await test('restart routes a dispatched ACP handoff away from generic continuation recovery', () => {
+  const handoff = {
+    ...receipt,
+    requestId: 'handoff:handoff-one',
+    state: 'working' as const,
+  };
+  const interrupted = {
+    agent: 'codex',
+    sessionId: 'target',
+    directory: '/repo/task',
+    turnId: 'turn-one',
+    text: 'Continue from the canonical checkpoint',
+  };
+
+  const recovered = handoffReceiptForInterruptedTurn(interrupted, [handoff]);
+
+  assert.equal(recovered, handoff);
+});
+
+await test('uncertain handoff receipts require explicit provider resolution', () => {
+  const uncertain = {
+    ...receipt,
+    requestId: 'handoff:handoff-one',
+    state: 'unavailable' as const,
+    error:
+      'Prompt dispatch may have completed before restart; inspect the restored provider session before cancelling and retrying.',
+  };
+
+  assert.equal(handoffReceiptNeedsResolution(uncertain), true);
+  assert.equal(handoffReceiptNeedsResolution({ ...uncertain, state: 'working' }), false);
+  assert.equal(handoffReceiptNeedsResolution({ ...uncertain, requestId: 'ship:one' }), false);
+});
+
+await test('resolved handoff recovery clears only its inspection error', () => {
+  const inspection =
+    'Prompt dispatch may have completed before restart; inspect the restored provider session.';
+
+  assert.equal(resolvedHandoffRecoveryError(false, inspection), null);
+  assert.equal(
+    resolvedHandoffRecoveryError(false, 'Different worker failure.'),
+    'Different worker failure.',
+  );
+  assert.equal(resolvedHandoffRecoveryError(true, inspection), inspection);
 });
 
 await test('live activity stays until a settled result is preserved', () => {
@@ -239,6 +472,323 @@ await test('ACP reconnect requires the same turn to prove state', () => {
     }),
     'interrupted',
   );
+});
+
+await test('ACP recovery requires live backend evidence instead of a persisted interruption', () => {
+  const working = { ...receipt, state: 'working' as const };
+  const activity = {
+    alive: true,
+    active: ['target'],
+    activeTurns: { target: 'turn-one' },
+    waiting: [],
+    sessions: ['target'],
+    finished: {},
+  };
+
+  assert.equal(acpPromptHasBackendEvidence(working, activity), true);
+  assert.equal(acpPromptHasBackendEvidence(working, { ...activity, activeTurns: {} }), false);
+  assert.equal(
+    acpPromptHasBackendEvidence(working, {
+      ...activity,
+      activeTurns: {},
+      finished: { target: { turnId: 'turn-one', status: 'done', notify: true } },
+    }),
+    true,
+  );
+});
+
+await test('ACP handoff ownership published before prompt startup recovers after restart', () => {
+  const recoverable = {
+    ...receipt,
+    receiptId: 'handoff-receipt',
+    requestId: 'handoff:handoff-one',
+    state: 'starting' as const,
+  };
+  const issue = {
+    state: 'working',
+    receiptId: recoverable.receiptId,
+    threadId: recoverable.targetId,
+    contextHandoffs: [
+      {
+        id: 'handoff-one',
+        fromThreadId: 'acp:claude:source',
+        toThreadId: recoverable.targetId,
+        outcome: 'pending',
+      },
+    ],
+  };
+
+  assert.equal(handoffPromptNeedsRecovery(issue, recoverable), true);
+});
+
+await test('handoff replacement created before ownership transfer is adopted after restart', () => {
+  const replacement = {
+    ...receipt,
+    receiptId: 'handoff-receipt',
+    requestId: 'handoff:handoff-one',
+    sourceDirectory: '/repo/task',
+    state: 'starting' as const,
+  };
+  const issue = {
+    state: 'working',
+    path: '/repo/task',
+    receiptId: 'old-receipt',
+    threadId: receipt.sourceId,
+    contextHandoffs: [
+      {
+        id: 'handoff-one',
+        fromThreadId: receipt.sourceId,
+        toThreadId: null,
+        outcome: 'pending',
+      },
+    ],
+  };
+
+  assert.equal(pendingHandoffReplacement(issue, [replacement]), replacement);
+  assert.equal(
+    pendingHandoffReplacement(issue, [{ ...replacement, state: 'failed' }])?.state,
+    'failed',
+  );
+  assert.equal(pendingHandoffReplacement(issue, [{ ...replacement, turnId: null }]), null);
+});
+
+await test('OpenCode handoff prompt recovery requires replacement ownership', () => {
+  const recoverable = {
+    ...receipt,
+    provider: 'opencode' as const,
+    targetId: 'opencode:replacement',
+    receiptId: 'handoff-receipt',
+    requestId: 'handoff:handoff-one',
+    state: 'starting' as const,
+  };
+  const issue = {
+    state: 'working',
+    receiptId: recoverable.receiptId,
+    threadId: recoverable.targetId,
+    contextHandoffs: [
+      {
+        id: 'handoff-one',
+        fromThreadId: receipt.sourceId,
+        toThreadId: recoverable.targetId,
+        outcome: 'pending',
+      },
+    ],
+  };
+
+  assert.equal(handoffPromptNeedsRecovery(issue, recoverable), true);
+  assert.equal(
+    handoffPromptNeedsRecovery({ ...issue, receiptId: 'old-receipt' }, recoverable),
+    false,
+  );
+});
+
+await test('OpenCode handoff dispatch ignores unrelated session activity', () => {
+  const handoff = {
+    prompt: 'Continue from the canonical checkpoint',
+    turnId: 'handoff-turn',
+  };
+
+  assert.equal(
+    openCodePromptHasBackendEvidence(
+      handoff,
+      [{ type: 'user', text: 'Unrelated prompt' }],
+      [{ id: 'unrelated-turn' }],
+    ),
+    false,
+  );
+  assert.equal(
+    openCodePromptHasBackendEvidence(
+      handoff,
+      [{ type: 'user', text: 'Continue from the canonical checkpoint' }],
+      [],
+    ),
+    true,
+  );
+  assert.equal(openCodePromptHasBackendEvidence(handoff, [], [{ id: 'handoff-turn' }]), true);
+});
+
+await test('OpenCode replacement adoption finds a durable prompt beyond the newest 50 messages', async () => {
+  const handoff = {
+    prompt: 'Continue from the canonical checkpoint',
+    turnId: 'handoff-turn',
+  };
+  const newerMessages = Array.from({ length: 50 }, (_, index) => ({
+    type: 'assistant',
+    text: `Newer message ${index}`,
+  }));
+  const pages = new Map([
+    [undefined, { data: newerMessages, cursor: { next: 'older' } }],
+    [
+      'older',
+      {
+        data: [{ type: 'user', text: 'Continue from the canonical checkpoint' }],
+        cursor: { next: null },
+      },
+    ],
+  ]);
+
+  const dispatched = await openCodePromptHasHistoryEvidence(handoff, [], async (cursor) =>
+    pages.get(cursor)!,
+  );
+
+  assert.equal(dispatched, true);
+});
+
+await test('OpenCode task ownership includes paginated nested descendants', async () => {
+  const pages = new Map([
+    [
+      'root:',
+      {
+        data: [
+          { id: 'child-one', parentID: 'root', location: { directory: '/repo/task' } },
+          { id: 'other-worktree', parentID: 'root', location: { directory: '/repo/other' } },
+        ],
+        cursor: { next: 'older' },
+      },
+    ],
+    [
+      'root:older',
+      {
+        data: [{ id: 'child-two', parentID: 'root', location: { directory: '/repo/task' } }],
+        cursor: { next: null },
+      },
+    ],
+    [
+      'child-one:',
+      {
+        data: [{ id: 'grandchild', parentID: 'child-one', location: { directory: '/repo/task' } }],
+        cursor: { next: null },
+      },
+    ],
+    ['child-two:', { data: [], cursor: { next: null } }],
+    ['grandchild:', { data: [], cursor: { next: null } }],
+  ]);
+
+  const descendants = await openCodeDescendantSessions(
+    ['root'],
+    '/repo/task',
+    async (parentID, cursor) => pages.get(`${parentID}:${cursor ?? ''}`)!,
+  );
+
+  assert.deepEqual(
+    descendants.map((session) => [session.id, session.parentID]),
+    [
+      ['child-one', 'root'],
+      ['child-two', 'root'],
+      ['grandchild', 'child-one'],
+    ],
+  );
+});
+
+await test('completed OpenCode handoff settlement finds its prompt beyond the newest 50 messages', async () => {
+  const handoff = {
+    prompt: 'Continue from the canonical checkpoint',
+    turnId: 'handoff-turn',
+  };
+  const pages = new Map([
+    [
+      undefined,
+      {
+        data: [
+          { type: 'idle', outcome: 'succeeded' as const },
+          ...Array.from({ length: 49 }, (_, index) => ({
+            type: 'assistant',
+            text: `Completed output ${index}`,
+          })),
+        ],
+        cursor: { next: 'older' },
+      },
+    ],
+    [
+      'older',
+      {
+        data: [
+          {
+            id: 'handoff-turn',
+            type: 'user',
+            text: 'Continue from the canonical checkpoint',
+          },
+        ],
+        cursor: { next: null },
+      },
+    ],
+  ]);
+
+  const settled = await openCodePromptSettlement(handoff, async (cursor) => pages.get(cursor)!);
+
+  assert.deepEqual(settled, { state: 'completed', result: null });
+});
+
+await test('OpenCode handoff settlement ignores a later successful turn', async () => {
+  const handoff = {
+    prompt: 'Continue from the canonical checkpoint',
+    turnId: 'handoff-turn',
+  };
+  const page = {
+    data: [
+      { type: 'idle', outcome: 'succeeded' as const },
+      {
+        type: 'assistant',
+        time: { completed: 6 },
+        content: [{ type: 'text', text: 'Later prompt output' }],
+      },
+      { id: 'later-turn', type: 'user', text: 'Fix something else' },
+      { type: 'idle', outcome: 'failed' as const },
+      {
+        type: 'assistant',
+        time: { completed: 3 },
+        content: [{ type: 'text', text: 'Handoff failure output' }],
+      },
+      {
+        id: 'handoff-turn',
+        type: 'user',
+        text: 'Continue from the canonical checkpoint',
+      },
+    ],
+    cursor: { next: null },
+  };
+
+  const settled = await openCodePromptSettlement(handoff, async () => page);
+
+  assert.deepEqual(settled, { state: 'failed', result: 'Handoff failure output' });
+});
+
+await test('unrelated OpenCode activity after a pre-dispatch crash requires inspection', () => {
+  assert.equal(openCodePromptRecoveryAction(false, true, undefined), 'inspect');
+});
+
+await test('unrelated OpenCode outcome after a pre-dispatch crash requires inspection', () => {
+  assert.equal(openCodePromptRecoveryAction(false, false, 'succeeded'), 'inspect');
+});
+
+await test('owned handoff prompts recover across every unsettled restart window', () => {
+  const recoverable = {
+    ...receipt,
+    receiptId: 'handoff-receipt',
+    requestId: 'handoff:handoff-one',
+    targetId: 'opencode:replacement',
+    provider: 'opencode' as const,
+    state: 'starting' as const,
+  };
+  const issue = {
+    state: 'working',
+    receiptId: recoverable.receiptId,
+    threadId: recoverable.targetId,
+    contextHandoffs: [
+      {
+        id: 'handoff-one',
+        fromThreadId: receipt.sourceId,
+        toThreadId: recoverable.targetId,
+        outcome: 'pending',
+      },
+    ],
+  };
+
+  for (const state of ['starting', 'working', 'unavailable'] as const) {
+    const crashed = { ...recoverable, state };
+    assert.equal(handoffPromptNeedsRecovery(issue, crashed), true, state);
+    assert.equal(receiptNeedsRefresh(crashed), true, state);
+  }
 });
 
 for (const [state, refresh] of [

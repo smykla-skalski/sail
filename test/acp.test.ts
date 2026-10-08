@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  acpDisconnectAffectsSession,
   bufferBackgroundUpdate,
   forgetRecentTranscript,
   groupAgentEntries,
@@ -17,12 +18,26 @@ import {
   updateEntriesBatch,
   updateEntriesInPlace,
   type AgentEntry,
+  type AgentEvent,
   type AgentThread,
 } from '../src/lib/acp.ts';
 import { toolCommand } from '../src/lib/tool-display.ts';
 
 const normalizeEntries = (entries: AgentEntry[]) =>
   entries.map((entry) => (entry.type === 'tool' ? entry : { ...entry, id: entry.type }));
+
+void test('scoped ACP disconnect only affects sessions from the exited connection', () => {
+  const message: AgentEvent['message'] = {
+    method: 'sail/disconnected',
+    params: { profile: 'review', sessionIds: ['review-session', 'review-child'] },
+  };
+
+  assert.equal(acpDisconnectAffectsSession(message, 'review-session', 'review'), true);
+  assert.equal(acpDisconnectAffectsSession(message, 'review-child', 'review'), true);
+  assert.equal(acpDisconnectAffectsSession(message, 'build-session', 'build'), false);
+  assert.equal(acpDisconnectAffectsSession(message, null, 'build'), false);
+  assert.equal(acpDisconnectAffectsSession(message, null, 'review'), true);
+});
 
 void test('ACP chunks stream into one assistant message and tool updates keep their place', () => {
   const first = updateEntries([], {

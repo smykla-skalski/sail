@@ -53,6 +53,35 @@ describe('native Ship run history', () => {
           error: 'Manual test found a failure',
           workerModel: 'model-implementation',
           models: ['model-implementation'],
+          validationPolicy: {
+            risk: 'high',
+            requiredGates: ['code-adversary', 'findings-adversary', 'test-adversary'],
+            sources: ['path rule src-tauri/**: high (src-tauri/src/lib.rs)'],
+            revision: 'fixture-revision',
+            changedPaths: ['src-tauri/src/lib.rs'],
+            selectedAt: 1,
+            history: [
+              {
+                requestedRisk: 'medium',
+                selectedRisk: 'high',
+                sources: ['path rule src-tauri/**: high (src-tauri/src/lib.rs)'],
+                at: 1,
+              },
+            ],
+          },
+          claim: {
+            id: 'claim-fixture',
+            holder: 'Sail claude (ship-fix)',
+            task: 'ship:ship-fixture:first',
+            acquiredAt: '2026-10-07T10:00:00.000Z',
+            heartbeatAt: '2026-10-07T10:01:00.000Z',
+            expiresAt: '2026-10-07T10:03:00.000Z',
+            status: 'released',
+            releasedAt: '2026-10-07T10:02:00.000Z',
+            releaseReason: 'failed',
+            takeoverOf: 'expired-claim',
+            commentId: 99,
+          },
           checks: [
             {
               name: 'Build',
@@ -198,6 +227,9 @@ describe('native Ship run history', () => {
     await expect($('.ship-now-item:first-child .ship-claims')).toHaveText(
       expect.stringContaining('Worker'),
     );
+    await expect($('.ship-now-item:first-child .ship-claims')).toHaveText(
+      expect.stringContaining('ClaimReleased'),
+    );
     const initialWidth = await browser.execute(() => window.innerWidth);
     const zoomTo200 = async (width: number, remaining = 8): Promise<number> => {
       if (width <= initialWidth / 1.9 || remaining === 0) return width;
@@ -228,8 +260,14 @@ describe('native Ship run history', () => {
     await expect($('.ship-issue-detail')).toHaveText(
       expect.stringContaining('model-implementation'),
     );
+    await expect($('.ship-issue-detail')).toHaveText(
+      expect.stringContaining('Audited takeover of expired-claim'),
+    );
+    await expect($('.ship-issue-detail')).toHaveText(expect.stringContaining('Released'));
     await expect($('.ship-gates')).toHaveText(expect.stringContaining('codex / model-test'));
     await expect($('.ship-gates')).toHaveText(expect.stringContaining('FAIL'));
+    await expect($('.ship-policy')).toHaveText(expect.stringContaining('Selected risk high'));
+    await expect($('.ship-policy')).toHaveText(expect.stringContaining('src-tauri/**: high'));
     await expect($('.ship-checks summary')).toHaveText('CI: Failed');
     const listScroll = await browser.execute(() => {
       const panel = document.querySelector<HTMLElement>('.ship-panel')!;

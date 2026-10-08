@@ -150,8 +150,7 @@ describe('project terminal MCP inspection', () => {
     const source = await browser.tauri.execute(async ({ core }, directory) => {
       await core.invoke('acp_connect', { agent: 'claude' });
       return core.invoke<{ sessionId: string }>('acp_new_session', {
-        agent: 'claude',
-        cwd: directory,
+        params: { agent: 'claude', cwd: directory },
       });
     }, path);
     await browser.execute(

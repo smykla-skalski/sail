@@ -3449,6 +3449,8 @@ dependencies = [
  "block2",
  "cairo-rs 0.18.5",
  "cairo-rs 0.22.9",
+ "chrono",
+ "httpdate",
  "netstat2",
  "nix 0.31.3",
  "notify-rust",
@@ -3470,9 +3472,11 @@ dependencies = [
  "tauri-plugin-wdio-webdriver",
  "toml 1.1.6+spec-1.1.0",
  "uuid",
+ "wait-timeout",
  "webkit2gtk",
  "webview2-com 0.39.1",
  "windows 0.62.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4909,6 +4913,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb067e4cbd1ff067d1df46c9194b5de0e98efd2810bbc95c5d5e5f25a3231150"
 dependencies = [
  "cc",
+ "libc",
+]
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
  "libc",
 ]
 

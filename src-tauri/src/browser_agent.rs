@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
+const CAPABILITY_POLICY_REVISION: &str = env!("SAIL_CAPABILITY_POLICY_REVISION");
+
 #[derive(Clone)]
 struct Page {
     directory: PathBuf,
@@ -29,6 +31,7 @@ struct Client {
     directory: PathBuf,
     session: Option<String>,
     agent: Option<String>,
+    profile: CapabilityProfile,
 }
 
 #[derive(Default)]
@@ -105,6 +108,34 @@ pub struct McpConfig {
 }
 
 impl BrowserManager {
+    pub fn config_for_profile(
+        &self,
+        directory: &str,
+        session: Option<&str>,
+        agent: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<McpConfig, String> {
+        let profile = profile
+            .map(|value| {
+                CapabilityProfile::parse(value).ok_or(
+                    "Unknown capability profile. Expected explore, review, build, or release.",
+                )
+            })
+            .transpose()?;
+        let mut config = self.config(directory, session, agent)?;
+        if let Some(profile) = profile {
+            config
+                .env
+                .insert("SAIL_CAPABILITY_PROFILE".into(), profile.as_str().into());
+            if let Ok(mut clients) = self.0.clients.lock() {
+                if let Some(client) = clients.get_mut(&config.token) {
+                    client.profile = profile;
+                }
+            }
+        }
+        Ok(config)
+    }
+
     pub fn config(
         &self,
         directory: &str,
@@ -125,6 +156,7 @@ impl BrowserManager {
                     directory,
                     session: session.map(str::to_string),
                     agent: agent.map(str::to_string),
+                    profile: CapabilityProfile::Build,
                 },
             );
         let port = *self.0.port.lock().map_err(|error| error.to_string())?;
@@ -140,6 +172,7 @@ impl BrowserManager {
             env: BTreeMap::from([
                 ("SAIL_BROWSER_PORT".into(), port.to_string()),
                 ("SAIL_BROWSER_TOKEN".into(), token.clone()),
+                ("SAIL_CAPABILITY_PROFILE".into(), "build".into()),
             ]),
             token,
         })
@@ -489,7 +522,8 @@ impl BrowserManager {
             "ship_progress"
             | "task_checkpoint_read"
             | "task_checkpoint_update"
-            | "task_evidence_record" => None,
+            | "task_evidence_record"
+            | "validation_policy" => None,
             _ => return Err("Unknown coordination action.".into()),
         };
         let settings = crate::settings::load_settings(app.clone())?;
@@ -557,6 +591,7 @@ impl BrowserManager {
         }
         let directory = client.directory.clone();
         let source_agent = client.agent.clone();
+        let profile = client.profile;
         let session = request.session_id.as_deref();
         let session = client
             .session
@@ -565,12 +600,21 @@ impl BrowserManager {
             .unwrap_or(&request.token)
             .to_string();
         drop(clients);
+        if !profile.enables(&request.name) {
+            return Err(format!(
+                "Tool {} is disabled by the {} capability profile (policy {}).",
+                request.name,
+                profile.as_str(),
+                CAPABILITY_POLICY_REVISION
+            ));
+        }
         if matches!(
             request.name.as_str(),
             "worktree_create"
                 | "worktree_list"
                 | "worktree_info"
                 | "agent_spawn"
+                | "validation_policy"
                 | "validation_gate"
                 | "ship_progress"
                 | "task_checkpoint_read"
@@ -1088,8 +1132,14 @@ pub fn browser_mcp_config(
     directory: String,
     session: Option<String>,
     agent: Option<String>,
+    profile: Option<String>,
 ) -> Result<McpConfig, String> {
-    manager.config(&directory, session.as_deref(), agent.as_deref())
+    manager.config_for_profile(
+        &directory,
+        session.as_deref(),
+        agent.as_deref(),
+        profile.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -1108,6 +1158,10 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
     (
         "inputs.md",
         include_str!("../../skills/ship-it/references/inputs.md"),
+    ),
+    (
+        "convergence.md",
+        include_str!("../../skills/ship-it/references/convergence.md"),
     ),
     (
         "fallbacks.md",
@@ -1223,8 +1277,13 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "agent_spawn",
-        "Start Claude, Codex, or OpenCode with a prompt in a new worktree by default. An explicit existing target shares its files. Agent spawns start without interactive approval. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
-        "provider,prompt",
+        "Start an agent using an explicit role and task-risk model route, or a legacy provider selection. A new worktree is used by default; an explicit existing target shares its files. Pass UUID receiptId and accessKey together to inspect queued or starting state before launch returns.",
+        "role,risk,prompt",
+    ),
+    (
+        "validation_policy",
+        "Select and persist this Ship task's validation risk before validation. Sail combines the explicit choice with repository defaults and changed-path rules, never lowers a prior selection, and returns the required gates and policy sources.",
+        "risk",
     ),
     (
         "validation_gate",
@@ -1248,8 +1307,8 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "task_evidence_record",
-        "Record a bounded command result against its execution revision and map it to zero or more acceptance criteria. Read the checkpoint before the command and pass its revision as expectedRevision.",
-        "command,result,criteria,outputReference,expectedRevision",
+        "Record a bounded command result and privacy-safe economics counters against its execution boundary. Read the checkpoint before the command and pass its execution revision, mutation generation, and base revision.",
+        "command,result,criteria,outputReference,expectedRevision,expectedMutationGeneration,expectedBaseRevision,economics",
     ),
     (
         "agent_status",
@@ -1339,6 +1398,126 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+fn economics_input_schema() -> Value {
+    let counter = || json!({"type":"integer","minimum":0,"maximum":9007199254740991_u64});
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "role":{"type":"string","enum":["primary","subagent","validator","guardian","synthetic","probe"]},
+            "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","review","test","ci","pr","complete"]},
+            "turns":counter(),
+            "toolCalls":counter(),
+            "permissionRequests":counter(),
+            "compactions":counter(),
+            "tokens":{
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{
+                    "input":counter(),
+                    "output":counter(),
+                    "reasoning":counter(),
+                    "cacheRead":counter(),
+                    "cacheWrite":counter()
+                },
+                "required":["input","output","reasoning","cacheRead","cacheWrite"]
+            },
+            "elapsedMs":counter(),
+            "retries":counter(),
+            "findings":counter(),
+            "checks":counter(),
+            "humanInterventions":counter(),
+            "failedCommands":counter(),
+            "approvalLatencyMs":counter(),
+            "repeatedWork":counter()
+        },
+        "required":["role","phase","turns","toolCalls","permissionRequests","compactions","tokens","elapsedMs","retries","findings","checks","humanInterventions","failedCommands","approvalLatencyMs","repeatedWork"]
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CapabilityProfile {
+    Explore,
+    Review,
+    Build,
+    Release,
+}
+
+impl CapabilityProfile {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "explore" => Some(Self::Explore),
+            "review" => Some(Self::Review),
+            "build" => Some(Self::Build),
+            "release" => Some(Self::Release),
+            _ => None,
+        }
+    }
+
+    fn active() -> Self {
+        std::env::var("SAIL_CAPABILITY_PROFILE")
+            .ok()
+            .as_deref()
+            .and_then(Self::parse)
+            .unwrap_or(Self::Build)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Explore => "explore",
+            Self::Review => "review",
+            Self::Build => "build",
+            Self::Release => "release",
+        }
+    }
+
+    fn enables(self, tool: &str) -> bool {
+        const CORE: &[&str] = &[
+            "sail_skill",
+            "skill_reference",
+            "worktree_list",
+            "worktree_info",
+            "agent_status",
+            "agent_wait",
+            "agent_result",
+            "terminal_list",
+            "terminal_read",
+            "terminal_wait",
+            "worktree_status",
+            "project_threads",
+            "read_page",
+            "screenshot",
+            "task_checkpoint_read",
+            "task_checkpoint_update",
+            "ship_progress",
+        ];
+        if CORE.contains(&tool) {
+            return true;
+        }
+        match self {
+            Self::Explore => false,
+            Self::Review => tool == "validation_gate",
+            Self::Build => true,
+            Self::Release => matches!(
+                tool,
+                "terminal_create"
+                    | "terminal_write"
+                    | "terminal_stop"
+                    | "thread_message"
+                    | "navigate"
+                    | "click"
+                    | "type"
+                    | "run_script"
+            ),
+        }
+    }
+
+    pub(crate) fn enables_terminal(self) -> bool {
+        matches!(self, Self::Build | Self::Release)
+    }
+}
+
 pub fn run_mcp_stdio() {
     let input = std::io::stdin();
     let mut output = std::io::stdout().lock();
@@ -1350,10 +1529,12 @@ pub fn run_mcp_stdio() {
             continue;
         };
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+        let profile = CapabilityProfile::active();
         let result = match method {
             "initialize" => mcp_initialize(),
             "ping" => json!({}),
-            "tools/list" => json!({"tools": TOOLS.iter().map(|(name, description, fields)| {
+            "tools/list" => {
+                json!({"tools": TOOLS.iter().filter(|(name, _, _)| profile.enables(name)).map(|(name, description, fields)| {
                 if *name == "skill_reference" {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object",
@@ -1369,6 +1550,8 @@ pub fn run_mcp_stdio() {
                         "type":"object",
                         "properties":{
                             "provider":{"type":"string","enum":["claude","codex","opencode"]},
+                            "role":{"type":"string","enum":["exploration","implementation","debugging","review","ci-triage"]},
+                            "risk":{"type":"string","enum":["low","medium","high"]},
                             "prompt":{"type":"string"},
                             "receiptId":{"type":"string","format":"uuid"},
                             "accessKey":{"type":"string","format":"uuid"},
@@ -1377,7 +1560,8 @@ pub fn run_mcp_stdio() {
                                 {"type":"object","properties":{"kind":{"const":"existing"},"path":{"type":"string"}},"required":["kind","path"]}
                             ]}
                         },
-                        "required":["provider","prompt"]
+                        "required":["prompt"],
+                        "anyOf":[{"required":["role","risk"]},{"required":["provider"]}]
                     }});
                 }
                 if *name == "validation_gate" {
@@ -1391,6 +1575,13 @@ pub fn run_mcp_stdio() {
                         "required":["gate","prompt","implementingModels"]
                     }});
                 }
+                if *name == "validation_policy" {
+                    return json!({"name":name,"description":description,"inputSchema":{
+                        "type":"object",
+                        "properties":{"risk":{"type":"string","enum":["low","medium","high"]}},
+                        "required":["risk"]
+                    }});
+                }
                 if *name == "ship_progress" {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object","properties":{
@@ -1401,8 +1592,9 @@ pub fn run_mcp_stdio() {
                             "reason":{"type":"string","maxLength":2000},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
                             "outputReference":{"type":"string","minLength":1,"maxLength":2000},
-                            "revision":{"type":"string","minLength":1}
-                        },"oneOf":[{"required":["stage","status"]},{"required":["verdict"]}]
+                            "revision":{"type":"string","minLength":1},
+                            "economics":economics_input_schema()
+                        },"oneOf":[{"required":["stage","status"]},{"required":["verdict","economics"]}]
                     }});
                 }
                 if *name == "task_checkpoint_update" {
@@ -1434,9 +1626,12 @@ pub fn run_mcp_stdio() {
                             "command":{"type":"string","minLength":1,"maxLength":1000},
                             "result":{"type":"string","enum":["passed","failed","pending","blocked"]},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
-                            "outputReference":{"type":"string","minLength":1,"maxLength":2000}
-                            ,"expectedRevision":{"type":"string","minLength":1}
-                        },"required":["command","result","criteria","outputReference","expectedRevision"]
+                            "outputReference":{"type":"string","minLength":1,"maxLength":2000},
+                            "expectedRevision":{"type":"string","minLength":1},
+                            "expectedMutationGeneration":{"type":"string","minLength":1},
+                            "expectedBaseRevision":{"type":"string","minLength":1},
+                            "economics":economics_input_schema()
+                        },"required":["command","result","criteria","outputReference","expectedRevision","expectedMutationGeneration","expectedBaseRevision","economics"]
                     }});
                 }
                 if *name == "agent_wait" {
@@ -1462,8 +1657,20 @@ pub fn run_mcp_stdio() {
                 }
                 let properties: serde_json::Map<String, Value> = fields.split(',').filter(|field| !field.is_empty()).map(|field| (field.to_string(), json!({"type":"string"}))).collect();
                 json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":properties.keys().collect::<Vec<_>>()}})
-            }).collect::<Vec<_>>() }),
-            "tools/call" => call_bridge(message.get("params").unwrap_or(&Value::Null)),
+            }).collect::<Vec<_>>() })
+            }
+            "tools/call" => {
+                let params = message.get("params").unwrap_or(&Value::Null);
+                match params.get("name").and_then(Value::as_str) {
+                    Some(name) if profile.enables(name) => call_bridge(params),
+                    Some(name) => json!({"content":[{"type":"text","text":format!(
+                        "Tool {name} is disabled by the {} capability profile (policy {}).",
+                        profile.as_str(),
+                        CAPABILITY_POLICY_REVISION
+                    )}],"isError":true}),
+                    None => call_bridge(params),
+                }
+            }
             _ => json!({"error":"Unknown MCP method."}),
         };
         let response = json!({"jsonrpc":"2.0","id":id,"result":result});
@@ -1554,7 +1761,43 @@ mod picker_tests {
 
 #[cfg(test)]
 mod skill_tests {
-    use super::{call_bridge, mcp_initialize, SAIL_SKILL, TOOLS};
+    use super::{
+        call_bridge, mcp_initialize, BrowserManager, CapabilityProfile, CAPABILITY_POLICY_REVISION,
+        SAIL_SKILL, TOOLS,
+    };
+
+    #[test]
+    fn capability_profiles_expose_only_role_tools() {
+        assert!(CapabilityProfile::Explore.enables("read_page"));
+        assert!(!CapabilityProfile::Explore.enables("terminal_create"));
+        assert!(CapabilityProfile::Review.enables("validation_gate"));
+        assert!(!CapabilityProfile::Review.enables("agent_spawn"));
+        assert!(CapabilityProfile::Build.enables("terminal_create"));
+        assert!(CapabilityProfile::Release.enables("thread_message"));
+        assert!(!CapabilityProfile::Release.enables("agent_spawn"));
+        assert_eq!(CapabilityProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn capability_policy_revision_comes_from_the_shared_manifest() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/capability-policy.json")).unwrap();
+        assert_eq!(manifest["revision"], CAPABILITY_POLICY_REVISION);
+    }
+
+    #[test]
+    fn invalid_profile_is_rejected_before_registering_a_client() {
+        let manager = BrowserManager::default();
+        let error = match manager.config_for_profile("/not-used", None, None, Some("admin")) {
+            Ok(_) => panic!("invalid profile was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "Unknown capability profile. Expected explore, review, build, or release."
+        );
+        assert!(manager.0.clients.lock().unwrap().is_empty());
+    }
     use serde_json::json;
 
     #[test]
@@ -1570,6 +1813,17 @@ mod skill_tests {
         assert!(TOOLS
             .iter()
             .any(|(name, _, _)| *name == "task_evidence_record"));
+        assert_eq!(
+            TOOLS
+                .iter()
+                .find(|(name, _, _)| *name == "task_evidence_record")
+                .unwrap()
+                .2,
+            "command,result,criteria,outputReference,expectedRevision,expectedMutationGeneration,expectedBaseRevision,economics"
+        );
+        assert!(TOOLS
+            .iter()
+            .any(|(name, _, _)| *name == "validation_policy"));
         assert_eq!(
             call_bridge(&json!({"name":"sail_skill","arguments":{}}))["content"][0]["text"],
             SAIL_SKILL
@@ -1591,7 +1845,7 @@ mod skill_tests {
             listed["structuredContent"]["references"]
                 .as_array()
                 .map(Vec::len),
-            Some(3)
+            Some(4)
         );
 
         let loaded = call_bridge(&json!({
@@ -1606,6 +1860,14 @@ mod skill_tests {
         assert!(loaded["content"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains("# Resolving the ship-it input")));
+
+        let convergence = call_bridge(&json!({
+            "name":"skill_reference",
+            "arguments":{"skill":"ship-it","reference":"convergence.md"}
+        }));
+        assert!(convergence["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("# ship-it convergence contract")));
     }
 
     #[test]

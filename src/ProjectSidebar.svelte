@@ -21,7 +21,18 @@
   import { getSetting, setSetting } from './lib/settings';
   import { issueBranch, parseGitHubIssueLink, worktreeBranchName } from './lib/github-issues';
 
-  export type PullRequestCheck = { name: string; state: string; url: string };
+  export type PullRequestCheck = {
+    name: string;
+    state: string;
+    url: string;
+    databaseId?: number;
+    runId?: number;
+    attempt?: number;
+    statusContextId?: string;
+    revision?: string;
+    workflow?: string;
+    identityUncertain?: boolean;
+  };
   type PullRequestChecks = { number: number; url: string; checks: PullRequestCheck[] };
   type RepositoryChecks = {
     checks: Record<string, PullRequestChecks | null>;

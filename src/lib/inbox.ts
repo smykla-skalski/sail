@@ -1,4 +1,9 @@
 import type { ProjectCatalog } from './projects';
+import {
+  permissionDecisionTitle,
+  type CapabilityProfile,
+  type PermissionPolicyDecision,
+} from './capability-profiles.ts';
 
 export type InboxLocation = {
   directory: string;
@@ -18,7 +23,22 @@ export type InboxItem = InboxLocation & {
   read?: boolean;
   eventId?: string;
   options?: { optionId: string; name: string; kind: string }[];
+  allow?: boolean;
+  policy?: PermissionPolicyDecision;
+  permissionPolicies?: Record<string, PermissionPolicyDecision>;
+  permissionTitle?: string;
+  generation?: string | number;
+  fingerprint?: string;
 };
+
+export function inboxPermissionDecisionTitle(
+  item: Pick<InboxItem, 'permissionTitle' | 'policy' | 'text'>,
+  outcome: 'completed' | 'rejected',
+): string {
+  return item.permissionTitle && item.policy
+    ? permissionDecisionTitle(item.permissionTitle, item.policy, outcome)
+    : item.text;
+}
 
 export type InboxOutcome = {
   key: string;
@@ -42,6 +62,25 @@ export type InboxCheck = {
   status: string;
   updated: number;
 };
+
+export function inboxPermissionProfile(
+  item: Pick<InboxItem, 'policy'>,
+  fallback: CapabilityProfile,
+): CapabilityProfile {
+  return item.policy?.profile ?? fallback;
+}
+
+export function inboxRejectedPermissionPolicy(
+  item: Pick<InboxItem, 'permissionPolicies' | 'policy' | 'requestId'>,
+  requestId: string,
+  fallback: () => PermissionPolicyDecision,
+): PermissionPolicyDecision {
+  return (
+    item.permissionPolicies?.[requestId] ??
+    (String(item.requestId) === requestId ? item.policy : undefined) ??
+    fallback()
+  );
+}
 
 export function failedCheckOutcome(check: InboxCheck): InboxOutcome | null {
   if (check.status !== 'failed' && check.status !== 'timed_out') return null;

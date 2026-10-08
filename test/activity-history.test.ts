@@ -6,6 +6,8 @@ import {
   recentActivityEvents,
   saveActivityHistory,
 } from '../src/lib/activity-history.ts';
+import { permissionDecisionTitle } from '../src/lib/capability-profiles.ts';
+import { acpPermissionActivitySourceId } from '../src/lib/acp-permissions.ts';
 
 await test('activity history deduplicates provider updates with latest scoped outcome', () => {
   const events = recentActivityEvents([
@@ -103,6 +105,54 @@ await test('activity history bounds display text without storing output', () => 
   assert.equal('output' in event, false);
 });
 
+await test('permission history retains policy context when the provider title is oversized', () => {
+  const title = permissionDecisionTitle('x'.repeat(240), {
+    profile: 'explore',
+    risk: 'low',
+    recommendation: 'allow',
+    optionId: 'allow',
+    reason: 'Low-risk action is enabled for exploration.',
+    policyRevision: '2026-10-07.1',
+  });
+
+  const [event] = recentActivityEvents([
+    {
+      workspace: '/repo/a',
+      kind: 'decision',
+      source: 'Codex',
+      sourceId: 'permission',
+      title,
+      outcome: 'completed',
+      at: 10,
+    },
+  ]);
+
+  assert.match(
+    event.title,
+    /^explore · low risk · policy 2026-10-07\.1 — Allowed by policy: Low-risk action is enabled for exploration\./,
+  );
+  assert.equal(event.title.length, 240);
+  assert.equal(event.title.endsWith('…'), true);
+});
+
+await test('permission history describes the actual rejected settlement', () => {
+  const title = permissionDecisionTitle(
+    'Read README.md',
+    {
+      profile: 'explore',
+      risk: 'low',
+      recommendation: 'allow',
+      optionId: 'allow',
+      reason: 'Low-risk action is enabled for exploration.',
+      policyRevision: '2026-10-07.1',
+    },
+    'rejected',
+  );
+
+  assert.match(title, /— Rejected:/);
+  assert.doesNotMatch(title, /Allowed by policy/);
+});
+
 await test('activity history reloads only valid bounded durable events', () => {
   const stored = saveActivityHistory(
     Array.from({ length: 110 }, (_, index) => ({
@@ -124,4 +174,36 @@ await test('activity history reloads only valid bounded durable events', () => {
   assert.equal(restored[0].id, 'event-109');
   assert.deepEqual(loadActivityHistory('{"kind":"tool"}'), []);
   assert.deepEqual(loadActivityHistory('[{"kind":"invented"}]'), []);
+});
+
+await test('sequential ACP decisions retain reused provider request IDs', () => {
+  const events = recentActivityEvents([
+    {
+      workspace: '/repo/a',
+      kind: 'decision',
+      source: 'Codex',
+      sourceId: acpPermissionActivitySourceId(7, 1, 'first-fingerprint'),
+      title: 'Read first file',
+      outcome: 'completed',
+      at: 10,
+      agent: 'codex',
+      sessionId: 'session-1',
+    },
+    {
+      workspace: '/repo/a',
+      kind: 'decision',
+      source: 'Codex',
+      sourceId: acpPermissionActivitySourceId(7, 2, 'second-fingerprint'),
+      title: 'Read second file',
+      outcome: 'completed',
+      at: 20,
+      agent: 'codex',
+      sessionId: 'session-1',
+    },
+  ]);
+
+  assert.deepEqual(
+    events.map((event) => event.title),
+    ['Read second file', 'Read first file'],
+  );
 });
