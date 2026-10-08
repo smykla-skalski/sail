@@ -328,6 +328,23 @@ fn eligible_claim_author(author_association: &str) -> bool {
     matches!(author_association, "OWNER" | "MEMBER" | "COLLABORATOR")
 }
 
+fn validate_claim_coordination_permission(repository: &serde_json::Value) -> Result<(), String> {
+    if repository["permissions"]["push"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    Err(
+        "Shipping claims require write access to the upstream repository. No claim was posted."
+            .to_string(),
+    )
+}
+
+fn require_claim_coordination_permission(directory: &Path, target: &str) -> Result<(), String> {
+    let output = gh_command(directory, &["api", &format!("repos/{target}")])?;
+    let repository: serde_json::Value = serde_json::from_str(&output)
+        .map_err(|_| "GitHub returned invalid repository permissions.".to_string())?;
+    validate_claim_coordination_permission(&repository)
+}
+
 fn claim_server_expiry(claim: &ShippingClaim) -> Option<i64> {
     let duration = claim_time_millis(&claim.expires_at)? - claim_time_millis(&claim.heartbeat_at)?;
     let server_expiry = claim.comment_updated_at_millis?.checked_add(duration)?;
@@ -2137,6 +2154,7 @@ pub async fn acquire_shipping_claim(
         }
         let repository = PathBuf::from(crate::validate_repository(repository)?);
         let target = target_repository(&repository)?;
+        require_claim_coordination_permission(&repository, &target)?;
         if let Some(conflict) = equivalent_shipping_work(&repository, &target, number)? {
             return Err(conflict);
         }
@@ -4884,10 +4902,10 @@ mod tests {
         shipping_claim_observation, shipping_claim_observation_with_current,
         shipping_pull_request_matches, shipping_pull_request_snapshot,
         submitted_heartbeat_still_current, transition_lock_owner, transition_lock_recoverable,
-        collect_check_rollup_pages, complete_check_rollup_or_original, valid_claim_time,
-        valid_stored_claim, validate_external_url, validate_graph, validated_claim_input,
-        with_verified_claim_takeover, ClaimLock, IssueDraft, IssueGraphDraft,
-        RepositoryLabelState, ShippingClaim, parse_pull_request_checks,
+        collect_check_rollup_pages, complete_check_rollup_or_original, parse_pull_request_checks,
+        valid_claim_time, valid_stored_claim, validate_claim_coordination_permission,
+        validate_external_url, validate_graph, validated_claim_input, with_verified_claim_takeover,
+        ClaimLock, IssueDraft, IssueGraphDraft, RepositoryLabelState, ShippingClaim,
     };
     use std::{cell::Cell, collections::HashMap, fs, process::Command, time::Duration};
 
@@ -5788,6 +5806,28 @@ mod tests {
         ] {
             assert!(!eligible_claim_author(association), "{association}");
         }
+    }
+
+    #[test]
+    fn upstream_writers_can_coordinate_shipping_claims() {
+        let repository = serde_json::json!({ "permissions": { "push": true } });
+
+        assert_eq!(validate_claim_coordination_permission(&repository), Ok(()));
+    }
+
+    #[test]
+    fn public_fork_contributors_are_rejected_before_claim_mutation() {
+        let repository = serde_json::json!({
+            "permissions": { "pull": true, "triage": false, "push": false }
+        });
+
+        assert_eq!(
+            validate_claim_coordination_permission(&repository),
+            Err(
+                "Shipping claims require write access to the upstream repository. No claim was posted."
+                    .to_string()
+            )
+        );
     }
 
     #[test]

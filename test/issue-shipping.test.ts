@@ -1432,6 +1432,35 @@ void test('concurrent adoption of one thread keeps one run', async () => {
   assert.equal(runs[0].issues[0].threadId, 'acp:codex:one');
 });
 
+void test('same-thread retry continues with its existing failed shipping run', async () => {
+  const input = {
+    id: 'first',
+    project: '/repo',
+    directory: '/repo/first',
+    repository: 'owner/repo',
+    number: 11,
+    provider: 'codex' as const,
+    threadId: 'acp:codex:one',
+    workerModel: 'openai:gpt-5',
+    approvedAt: 100,
+  };
+  const runs = adoptDirectShipRun([], input);
+  runs[0].issues[0].state = 'failed';
+  let current = runs;
+
+  const adopted = await adoptRegisteredDirectShipRun(
+    Promise.resolve([{ path: '/repo/first', branch: 'fix/one', present: true }]),
+    { ...input, id: 'retry', approvedAt: 200 },
+    () => current,
+    (value) => (current = value),
+    async () => {},
+  );
+
+  assert.equal(adopted, true);
+  assert.equal(current.length, 1);
+  assert.equal(current[0].issues[0].state, 'failed');
+});
+
 void test('uses one recorded implementation model as the missing worker model', () => {
   const issue = run().issues[0];
   issue.models = ['kong-ai-gateway:zai-org/GLM-5.3'];

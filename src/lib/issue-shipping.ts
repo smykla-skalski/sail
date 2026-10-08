@@ -380,7 +380,7 @@ export async function adoptRegisteredDirectShipRun(
     .flatMap((run) => run.issues)
     .find((issue) => issue.path === input.directory && issue.threadId === input.threadId);
   const adopted = adoptDirectShipRun(current, { ...input, branch });
-  if (adopted === current) return false;
+  if (adopted === current) return previousIssue !== undefined;
   setRuns(adopted);
   try {
     await saveRuns();
