@@ -631,18 +631,22 @@
     }),
   );
   let liveTurn = $state(false);
+  // The app marks a thread done from the turn-finished event, before this pane's prompt call
+  // returns; the header follows that event so both settle in the same frame.
+  let finishedTurnId = $state<string | null>(null);
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
+  const turnEnded = $derived(!!activeTurnId && finishedTurnId === activeTurnId);
   const visibleStatus = $derived(
     agentHeaderStatus({
       connecting,
       ready,
       waiting: permissions.length > 0,
-      sending: busy,
+      sending: busy && !turnEnded,
       hasSession: !!activeSessionId,
       running,
       activityReady,
       historyLoading,
-      busy: isBusy,
+      busy: isBusy && !turnEnded,
     }),
   );
   const workspaceActivity = $derived(
@@ -1348,6 +1352,8 @@
       if (commandUpdates[session.sessionId]) updateSkills(commandUpdates[session.sessionId]);
       selectedThreadId = session.sessionId;
       oncreated(created);
+      // The header turns Working with the session, so the app learns of the turn in that flush.
+      if (forTurn) onstatus(created, 'working');
       return created;
     })();
     creatingSession = task;
@@ -1428,6 +1434,12 @@
           commandUpdates[params.sessionId] = update.availableCommands;
       }
       if (message.method === 'sail/prompt_finished' && typeof params?.sessionId === 'string') {
+        if (
+          params.sessionId === activeSessionId &&
+          typeof params.turnId === 'string' &&
+          params.turnId === activeTurnId
+        )
+          finishedTurnId = params.turnId;
         if (
           liveTurn &&
           params.sessionId === activeSessionId &&
@@ -1859,8 +1871,9 @@
       if (!keepImages) discardAttachments(sentImages, sentClipboard);
       if (deliverySessionId) discardSteeredAttachments(deliverySessionId);
       if (activeTurnId === turnId) activeTurnId = null;
-      if (activityThread) onstatus(activityThread, finalStatus, notifyOnDone);
+      // Clear busy first so the header and the status bar settle in the same frame.
       if (current === generation) busy = false;
+      if (activityThread) onstatus(activityThread, finalStatus, notifyOnDone);
       finishTurn();
       if (
         current === generation &&

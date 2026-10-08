@@ -609,7 +609,7 @@
     type AgentUsage,
     type RateWindow,
   } from './lib/agent-usage';
-  import { buildAgentStatusItems } from './lib/agent-status';
+  import { buildAgentStatusItems, statusBarAttentionCount } from './lib/agent-status';
   import {
     settingsAction,
     settingsRequest,
@@ -1216,6 +1216,8 @@
   let inboxDialog: HTMLDialogElement;
   let inboxRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let inboxGeneration = 0;
+  // Requests resolved since a refresh started; that refresh's stale list must not bring them back.
+  const resolvedDuringRefresh = new SvelteMap<string, number>();
   const inboxSeen = loadInboxSeen(getSetting('sai-inbox-seen'));
   let recentThreadKeys = $state<string[]>(
     loadRecentThreadKeys(getSetting('sai-recent-agent-threads'), [
@@ -9877,7 +9879,11 @@
         result.status === 'fulfilled' && result.value.resolved ? [result.value.key] : [],
       ),
     );
-    inboxItems = sortInbox(items.filter((item) => !resolved.has(item.key)));
+    for (const [key, at] of resolvedDuringRefresh)
+      if (at < generation) resolvedDuringRefresh.delete(key);
+    inboxItems = sortInbox(
+      items.filter((item) => !resolved.has(item.key) && !resolvedDuringRefresh.has(item.key)),
+    );
     inboxError =
       !source ||
       acpResult.status === 'rejected' ||
@@ -13365,6 +13371,13 @@
         }
       }
     }
+    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
+      // The scheduled refresh lags; the thread header already shows the request answered.
+      const resolvedKey = `acp:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
+      resolvedDuringRefresh.set(resolvedKey, inboxGeneration);
+      if (inboxItems.some((item) => item.key === resolvedKey))
+        inboxItems = inboxItems.filter((item) => item.key !== resolvedKey);
+    }
     if (
       event.message.method === 'session/request_permission' ||
       event.message.method === 'elicitation/create' ||
@@ -16085,7 +16098,11 @@
     </section>{/if}
   <AgentStatusBar
     items={agentStatusItems}
-    attentionCount={attentionCounts.statusBar}
+    attentionCount={statusBarAttentionCount(
+      attentionCounts.statusBar,
+      agentStatusItems,
+      threadRequestKeys(sessionAttention),
+    )}
     onopen={(key) => jumpToRecentThread(key)}
   />
 </div>
