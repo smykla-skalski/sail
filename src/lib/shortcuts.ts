@@ -178,13 +178,13 @@ export function matchesShortcut(event: KeyEventLike, shortcut: Shortcut): boolea
   );
 }
 
-/** Ctrl+[ and Ctrl+] are Escape and a control character in a terminal, so they stay there.
- * Cmd on macOS still works from a terminal. */
+/** Ctrl+[ is Escape in a terminal, so it stays there. Cmd on macOS and the shifted sibling
+ * shortcuts still work from a terminal. */
 export function terminalOwnsKey(
-  event: Pick<KeyboardEvent, 'ctrlKey' | 'metaKey'>,
+  event: Pick<KeyboardEvent, 'ctrlKey' | 'metaKey' | 'shiftKey'>,
   target: { closest?: (selector: string) => unknown } | null,
 ): boolean {
-  return event.ctrlKey && !event.metaKey && !!target?.closest?.('.xterm');
+  return event.ctrlKey && !event.metaKey && !event.shiftKey && !!target?.closest?.('.xterm');
 }
 
 /** The registered shortcut that matches the event, if any. */

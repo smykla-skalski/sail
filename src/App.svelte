@@ -1955,12 +1955,7 @@
     const requestId = params?.requestId;
     if (typeof requestId !== 'string' && typeof requestId !== 'number') return;
     const inboxKey = `acp:${agentId}:${sessionId}:${requestId}`;
-    const key = answeredPermissionKey(
-      agentId,
-      sessionId,
-      requestId,
-      params?.sailPermissionGeneration,
-    );
+    const key = answeredPermissionKey(agentId, sessionId, requestId, params);
     const title =
       inboxItems.find((item) => item.key === inboxKey)?.permissionTitle ??
       permissionTitles.get(inboxKey) ??

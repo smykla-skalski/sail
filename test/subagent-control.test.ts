@@ -114,13 +114,19 @@ await test('a cancelled request does not read as answered', () => {
     assert.equal(permissionResolutionLabel(permissionResolution(params)), label);
 });
 
-await test('a reused request id gets its own note per connection generation', () => {
+await test('a reused request id gets its own note per request instance', () => {
+  const first = { sailPermissionGeneration: 1, sailPermissionFingerprint: 'a' };
+  const reconnected = { sailPermissionGeneration: 1, sailPermissionFingerprint: 'b' };
   assert.notEqual(
-    answeredPermissionKey('codex', 'child', 7, 1),
-    answeredPermissionKey('codex', 'child', 7, 2),
+    answeredPermissionKey('codex', 'child', 7, first),
+    answeredPermissionKey('codex', 'child', 7, reconnected),
+  );
+  assert.notEqual(
+    answeredPermissionKey('codex', 'child', 7, { sailPermissionGeneration: 1 }),
+    answeredPermissionKey('codex', 'child', 7, { sailPermissionGeneration: 2 }),
   );
   assert.equal(
-    answeredPermissionKey('codex', 'child', 7, 'x'),
+    answeredPermissionKey('codex', 'child', 7, {}),
     answeredPermissionKey('codex', 'child', 7, undefined),
   );
 });

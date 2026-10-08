@@ -550,6 +550,10 @@
     [],
   );
 
+  // Requests this surface dropped after "no longer pending", kept until their resolution event
+  // says how they were settled. The event and the rejection arrive in either order.
+  let settledElsewhere: AgentPermission[] = [];
+
   function noteAnswered(permission: AgentPermission, outcome: PermissionResolution) {
     const identity = acpPermissionIdentity(permission);
     if (answeredNotes.some((note) => note.identity === identity)) return;
@@ -1110,6 +1114,7 @@
     replayEntries = [];
     permissions = [];
     answeredNotes = [];
+    settledElsewhere = [];
     selectedThreadId = id;
     activeSessionId = id;
     nativePlan = id ? loadNativePlan({ agent, directory, sessionId: id }) : null;
@@ -1458,7 +1463,7 @@
           return;
         permissionInventoryRevision++;
         const shown = permissions;
-        permissions = removeResolvedAcpPermission(permissions, {
+        const resolvedIdentity = {
           id: params.requestId,
           sessionId: params.sessionId,
           generation:
@@ -1469,9 +1474,14 @@
             typeof params.sailPermissionFingerprint === 'string'
               ? params.sailPermissionFingerprint
               : undefined,
-        });
+        };
+        permissions = removeResolvedAcpPermission(permissions, resolvedIdentity);
         const outcome = permissionResolution(params);
         for (const gone of shown) if (!permissions.includes(gone)) noteAnswered(gone, outcome);
+        const waiting = settledElsewhere;
+        settledElsewhere = removeResolvedAcpPermission(waiting, resolvedIdentity);
+        for (const gone of waiting)
+          if (!settledElsewhere.includes(gone)) noteAnswered(gone, outcome);
         if (thread && running && permissions.length === 0) onstatus(thread, 'working');
       } else if (message.method === 'session/update') {
         const update = params.update;
@@ -2159,6 +2169,8 @@
     } catch (cause) {
       if (permissionAlreadyAnswered(cause)) {
         // Settled elsewhere; its resolution event records whether it was answered or cancelled.
+        if (permissions.some((item) => acpPermissionIdentity(item) === identity))
+          settledElsewhere = [...settledElsewhere, permission].slice(-20);
         permissions = permissions.filter((item) => acpPermissionIdentity(item) !== identity);
         if (thread && lastRequest) onstatus(thread, 'working');
         return;

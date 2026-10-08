@@ -23,14 +23,23 @@ export function permissionResolutionLabel(outcome: PermissionResolution): string
   return outcome === 'cancelled' ? 'Cancelled' : 'Answered';
 }
 
-/** One note per request instance: ACP request ids restart with each connection. */
+/** One note per request instance: ACP request ids and generations restart with each
+ * connection, so the per-request fingerprint tells reused ids apart. */
 export function answeredPermissionKey(
   agentId: string,
   sessionId: string,
   requestId: string | number,
-  generation: unknown,
+  params: Record<string, unknown> | undefined,
 ): string {
-  return `acp:${agentId}:${sessionId}:${requestId}:${typeof generation === 'number' ? generation : ''}`;
+  const fingerprint = params?.sailPermissionFingerprint;
+  const generation = params?.sailPermissionGeneration;
+  const instance =
+    typeof fingerprint === 'string' && fingerprint
+      ? fingerprint
+      : typeof generation === 'number'
+        ? String(generation)
+        : '';
+  return `acp:${agentId}:${sessionId}:${requestId}:${instance}`;
 }
 
 /** What a subagent group card needs from the app: the children's pending permissions, the ones
