@@ -2142,11 +2142,15 @@ fn register_session(
 }
 
 #[tauri::command]
-pub async fn acp_agents(app: AppHandle) -> Result<Vec<AgentAvailability>, String> {
+pub async fn acp_agents(
+    app: AppHandle,
+    include_opencode: Option<bool>,
+) -> Result<Vec<AgentAvailability>, String> {
+    let include_opencode = include_opencode.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         agent_availability(
             crate::settings::string_setting(&app, OPENCODE_BINARY_SETTING),
-            None,
+            |id| include_opencode || id != "opencode",
         )
     })
     .await
@@ -2155,13 +2159,13 @@ pub async fn acp_agents(app: AppHandle) -> Result<Vec<AgentAvailability>, String
 
 fn agent_availability(
     opencode_binary: Result<Option<String>, String>,
-    only: Option<&str>,
+    keep: impl Fn(&str) -> bool,
 ) -> Vec<AgentAvailability> {
     #[cfg(feature = "e2e")]
     if let Some(path) = std::env::var_os("SAIL_ACP_TEST_AGENT") {
         return AGENTS
             .iter()
-            .filter(|agent| only.is_none_or(|id| id == agent.id))
+            .filter(|agent| keep(agent.id))
             .map(|agent| AgentAvailability {
                 id: agent.id.into(),
                 name: agent.name.into(),
@@ -2176,7 +2180,7 @@ fn agent_availability(
     let major = node.as_ref().and_then(node_major);
     AGENTS
         .iter()
-        .filter(|agent| only.is_none_or(|id| id == agent.id))
+        .filter(|agent| keep(agent.id))
         .map(|agent| match agent.launch {
             Launch::OpenCode => match opencode_binary.clone().and_then(crate::resolve_binary) {
                 Ok(binary) => AgentAvailability {
@@ -2237,6 +2241,23 @@ pub async fn acp_connect(
         .map_err(|error| error.to_string())?
 }
 
+fn agent_availability_for(app: &AppHandle, agent: &str) -> Result<AgentAvailability, String> {
+    let availability = agent_availability(
+        crate::settings::string_setting(app, OPENCODE_BINARY_SETTING),
+        |id| id == agent,
+    )
+    .into_iter()
+    .next()
+    .ok_or("Unknown agent.")?;
+    if availability.available {
+        Ok(availability)
+    } else {
+        Err(availability
+            .reason
+            .unwrap_or_else(|| "Agent unavailable.".into()))
+    }
+}
+
 fn connect_blocking(
     app: AppHandle,
     manager: &AgentManager,
@@ -2244,18 +2265,18 @@ fn connect_blocking(
     profile: CapabilityProfile,
 ) -> Result<Value, String> {
     let definition = definition(&agent)?;
-    let availability = agent_availability(
-        crate::settings::string_setting(&app, OPENCODE_BINARY_SETTING),
-        Some(&agent),
-    )
-    .into_iter()
-    .next()
-    .ok_or("Unknown agent.")?;
-    if !availability.available {
-        return Err(availability
-            .reason
-            .unwrap_or_else(|| "Agent unavailable.".into()));
-    }
+    let live = manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(&(agent.clone(), profile))
+        .is_some_and(|existing| existing.alive.load(Ordering::Acquire));
+    // Probe before taking the agent lock; a live connection needs no availability check.
+    let mut availability = if live {
+        None
+    } else {
+        Some(agent_availability_for(&app, &agent)?)
+    };
     let mut agents = manager.0.lock().map_err(|error| error.to_string())?;
     let key = (agent.clone(), profile);
     if let Some(existing) = agents.get(&key) {
@@ -2285,6 +2306,10 @@ fn connect_blocking(
             };
         }
     }
+    let availability = match availability.take() {
+        Some(availability) => availability,
+        None => agent_availability_for(&app, &agent)?,
+    };
     let original_path = std::env::var_os("PATH").unwrap_or_default();
     #[cfg(feature = "e2e")]
     let test_agent = std::env::var_os("SAIL_ACP_TEST_AGENT");
@@ -4247,7 +4272,7 @@ mod native_agent_tests {
     }
 
     fn opencode(binary: &Path) -> AgentAvailability {
-        agent_availability(Ok(Some(binary.to_string_lossy().into_owned())), None)
+        agent_availability(Ok(Some(binary.to_string_lossy().into_owned())), |_| true)
             .into_iter()
             .find(|agent| agent.id == "opencode")
             .unwrap()
@@ -4288,16 +4313,18 @@ mod native_agent_tests {
 
     #[test]
     fn settings_error_makes_opencode_unavailable_with_the_cause() {
-        let agent = agent_availability(Err("Cannot parse settings: bad".into()), Some("opencode"))
-            .pop()
-            .unwrap();
+        let agent = agent_availability(Err("Cannot parse settings: bad".into()), |id| {
+            id == "opencode"
+        })
+        .pop()
+        .unwrap();
         assert!(!agent.available);
         assert_eq!(agent.reason.as_deref(), Some("Cannot parse settings: bad"));
     }
 
     #[test]
     fn availability_can_target_one_agent() {
-        let ids: Vec<_> = agent_availability(Ok(None), Some("claude"))
+        let ids: Vec<_> = agent_availability(Ok(None), |id| id == "claude")
             .into_iter()
             .map(|agent| agent.id)
             .collect();
@@ -4305,12 +4332,33 @@ mod native_agent_tests {
     }
 
     #[test]
-    fn npx_agents_keep_their_availability_entries() {
-        let (root, binary) = fake_opencode("2.0.24");
-        let ids: Vec<_> = agent_availability(Ok(Some(binary.to_string_lossy().into_owned())), None)
+    fn skipping_opencode_never_runs_its_version_probe() {
+        let root = std::env::temp_dir().join(format!("sail-opencode-acp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("probed");
+        let binary = root.join("opencode");
+        std::fs::write(&binary, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ids: Vec<_> =
+            agent_availability(Ok(Some(binary.to_string_lossy().into_owned())), |id| {
+                id != "opencode"
+            })
             .into_iter()
             .map(|agent| agent.id)
             .collect();
+        assert_eq!(ids, ["claude", "codex"]);
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn npx_agents_keep_their_availability_entries() {
+        let (root, binary) = fake_opencode("2.0.24");
+        let ids: Vec<_> =
+            agent_availability(Ok(Some(binary.to_string_lossy().into_owned())), |_| true)
+                .into_iter()
+                .map(|agent| agent.id)
+                .collect();
         assert_eq!(ids, ["claude", "codex", "opencode"]);
         std::fs::remove_dir_all(root).unwrap();
     }

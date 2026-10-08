@@ -647,11 +647,7 @@ function restoreSession(
 }
 
 export const acp = {
-  // OpenCode stays on its native runtime until routing switches to ACP.
-  agents: () =>
-    invoke<AgentAvailability[]>('acp_agents').then((agents) =>
-      agents.filter((agent) => agent.id !== 'opencode'),
-    ),
+  agents: () => invoke<AgentAvailability[]>('acp_agents'),
   connect: (agent: AgentId, profile?: CapabilityProfile) =>
     invoke<Record<string, unknown>>('acp_connect', { agent, profile }),
   create: (agent: AgentId, cwd: string, profile?: CapabilityProfile, nativeGeneration?: number) =>
