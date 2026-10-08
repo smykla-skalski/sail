@@ -44,6 +44,9 @@
   import ChatMessage from './ChatMessage.svelte';
   import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import PlanHistoryPanel from './PlanHistoryPanel.svelte';
+  import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
+  import { isPlanTool } from './lib/plan-engine';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
   import {
     loadNativePlan,
@@ -483,7 +486,7 @@
     type SessionMessageInfo,
   } from './lib/opencode';
   import { recordDiagnostic } from './lib/diagnostics';
-  import { getPlan, type PlanSnapshot } from './lib/plan';
+  import { getPlan, openCodePlanBackend, type PlanSnapshot } from './lib/plan';
   import { mergeMessages, nearBottom } from './lib/timeline';
   import {
     cachedOpenCodeTimelines,
@@ -776,6 +779,10 @@
       | 'task_checkpoint_read'
       | 'task_checkpoint_update'
       | 'task_evidence_record'
+      | 'sail_plan_propose'
+      | 'sail_plan_ask'
+      | 'sail_plan_step'
+      | 'sail_plan_amend'
       | 'agent_status'
       | 'agent_wait'
       | 'agent_result'
@@ -1301,7 +1308,9 @@
   let reviewCaptures = $state<(ReviewCapture & { directory: string })[]>([]);
   let mainDiffEvidenceUpdated = $state(Date.now());
   let diffComments = $state<Record<string, DiffComment[]>>({});
-  let pendingAgentBatches = $state<Record<string, { id: string; text: string }>>({});
+  let pendingAgentBatches = $state<
+    Record<string, { id: string; text: string; leavePlanMode?: boolean }>
+  >({});
   let issuePrefills = $state<Record<string, { id: string; text: string }>>({});
   let agentEntrySnapshots = $state.raw<
     Record<string, { sessionId: string | null; entries: AgentEntry[]; ready: boolean }>
@@ -1411,7 +1420,7 @@
   let diffLoading = $state(false);
   let diffError = $state('');
   let selectedFilePath = $state<string | null>(null);
-  type SideTab = 'plan' | 'changes' | 'history' | 'ship';
+  type SideTab = 'plan' | 'planhistory' | 'changes' | 'history' | 'ship';
   let sideTab = $state<SideTab>('plan');
   let detailsOpen = $state(true);
   let diffRefresh = 0;
@@ -1603,6 +1612,14 @@
       if (acpAgent) void refreshAgentDiff();
       else void refreshDiff();
     }
+  }
+
+  function revealMainPlan(scope: PlanScope, reason: string) {
+    if (!acpPlanScope || planKey(scope) !== planKey(acpPlanScope)) return;
+    if (!['proposed', 'questions', 'amended', 'checkpoint', 'done'].includes(reason)) return;
+    sideTab = 'plan';
+    agentChangesOpen = true;
+    if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'details';
   }
 
   async function toggleChanges() {
@@ -2293,17 +2310,44 @@
   let effortChoices = $derived(
     (chosenModel?.variants ?? []).map((variant) => ({ value: variant.id, name: variant.id })),
   );
-  let showPlanPanel = $derived(!!snapshot.plan || !!snapshot.questions || !!nativePlan);
+  let acpPlanTick = $state(0);
+  let acpPlanScope = $derived<PlanScope | null>(
+    acpAgent && acpThread ? { agent: acpAgent, directory, sessionId: acpThread.sessionId } : null,
+  );
+  let acpSnapshot = $derived.by((): PlanSnapshot => {
+    void acpPlanTick;
+    return acpPlanScope ? acpPlans().snapshot(acpPlanScope) : { plan: null, questions: null };
+  });
+  let acpPlanHistory = $derived.by(() => {
+    void acpPlanTick;
+    return acpPlanScope ? acpPlans().history(acpPlanScope) : [];
+  });
+  let mainPlanBackend = $derived(
+    acpPlanScope
+      ? acpPlanBackend(acpPlans(), acpPlanScope, {
+          send: (text, options) => sendPlanMessage('main', text, options),
+        })
+      : null,
+  );
+  let showPlanPanel = $derived(
+    !!snapshot.plan ||
+      !!snapshot.questions ||
+      !!nativePlan ||
+      !!acpSnapshot.plan ||
+      !!acpSnapshot.questions,
+  );
   let activeSideTab = $derived(
     sideTab === 'ship'
       ? 'ship'
       : showPlanPanel && sideTab === 'plan'
         ? 'plan'
-        : acpAgent && sideTab !== 'history'
-          ? 'changes'
-          : sideTab === 'history'
-            ? 'history'
-            : 'changes',
+        : acpAgent && sideTab === 'planhistory' && acpPlanHistory.length
+          ? 'planhistory'
+          : acpAgent && sideTab !== 'history'
+            ? 'changes'
+            : sideTab === 'history'
+              ? 'history'
+              : 'changes',
   );
   let mainDetailsVisible = $derived(
     workspaceView === 'workspace' &&
@@ -2340,7 +2384,9 @@
     sideTab = 'changes';
     if (window.matchMedia('(max-width: 850px)').matches) mobileView = 'chat';
   }
-  let diffAnnotations = $derived(annotateDiffs(diffs, snapshot.plan, directory));
+  let diffAnnotations = $derived(
+    annotateDiffs(diffs, acpAgent ? acpSnapshot.plan : snapshot.plan, directory),
+  );
 
   function setTheme(value: boolean) {
     dark = value;
@@ -2437,6 +2483,10 @@
     let unlistenAgentEvents: (() => void) | undefined;
     let unlistenBrowserAccess: (() => void) | undefined;
     let unlistenCoordination: (() => void) | undefined;
+    const unsubscribePlans = acpPlans().subscribe((change) => {
+      acpPlanTick += 1;
+      revealMainPlan(change.scope, change.reason);
+    });
     let unlistenTerminalExit: (() => void) | undefined;
     const coordinationRetry = setInterval(() => {
       if (isTauri()) retryCoordinationDeliveries();
@@ -2697,6 +2747,7 @@
       unlistenAgentEvents?.();
       unlistenBrowserAccess?.();
       unlistenCoordination?.();
+      unsubscribePlans();
       unlistenTerminalExit?.();
       unlistenAgentTerminals?.();
       unlistenNotificationClick?.();
@@ -6968,6 +7019,17 @@
       source.kind === 'acp'
         ? `acp:${source.agent}:${request.sessionId}`
         : `opencode:${request.sessionId}`;
+    if (isPlanTool(request.name)) {
+      if (source.kind !== 'acp')
+        throw new Error(
+          'Plan review tools need an ACP agent session; OpenCode uses its own plugin.',
+        );
+      return acpPlans().runTool(
+        { agent: source.agent, directory: request.directory, sessionId: request.sessionId },
+        request.name,
+        request.arguments,
+      );
+    }
     if (
       request.name === 'terminal_create' ||
       request.name === 'terminal_write' ||
@@ -12363,14 +12425,31 @@
       }
       return;
     }
+    return sendAgentPaneBatch(id, text, false);
+  }
+
+  function sendAgentPaneBatch(id: string, text: string, leavePlanMode: boolean): Promise<void> {
     const agent =
       id === 'main' ? acpAgent : leaves(paneLayout).find((leaf) => leaf.id === id)?.agent;
     if (!agent || pendingAgentBatches[id]) throw new Error('Agent pane is not ready for comments.');
-    const batch = { id: crypto.randomUUID(), text };
+    const batch = { id: crypto.randomUUID(), text, leavePlanMode };
     return new Promise<void>((resolve, reject) => {
       batchWaiters.set(batch.id, { resolve, reject });
       pendingAgentBatches = { ...pendingAgentBatches, [id]: batch };
     });
+  }
+
+  async function sendPlanMessage(
+    id: string,
+    text: string,
+    options: { leavePlanMode: boolean },
+  ): Promise<void> {
+    await sendAgentPaneBatch(id, text, options.leavePlanMode);
+  }
+
+  function revealPlanPane(id: string) {
+    if (id === 'main') return;
+    if (!changesPanes.includes(id)) changesPanes = [...changesPanes, id];
   }
 
   function focusMainPane() {
@@ -15688,6 +15767,8 @@
         ondiffcommentssent={removeSentDiffComments}
         onsenddiffcomments={sendDiffComments}
         {pendingAgentBatches}
+        onsendplan={sendPlanMessage}
+        onrevealplan={revealPlanPane}
         onbatchcomplete={completeAgentBatch}
         onpickedconsumed={markPickConsumed}
         onattachmentsent={assignReviewCaptures}
@@ -15802,6 +15883,10 @@
             role="tab"
             aria-selected={activeSideTab === 'changes'}
             onclick={toggleChanges}>Changes ({diffs.length})</button
+          >{/if}{#if acpAgent && acpPlanHistory.length}<button
+            class:active={activeSideTab === 'planhistory'}
+            aria-current={activeSideTab === 'planhistory' ? 'page' : undefined}
+            onclick={() => switchSideTab('planhistory')}>Plan history</button
           >{/if}{#if sessionID || acpAgent}<button
             class:active={activeSideTab === 'history'}
             role="tab"
@@ -15817,7 +15902,27 @@
       </div>
       <div class="side-panel-body">
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
-            {#if acpAgent && nativePlan}<section class="native-plan-panel" aria-label="Native plan">
+            {#if acpAgent && (acpSnapshot.plan || acpSnapshot.questions)}<PlanPanel
+                snapshot={acpSnapshot}
+                backend={mainPlanBackend}
+                {directory}
+                sessionID={acpThread?.sessionId ?? null}
+                {dark}
+                onchanged={async () => {
+                  acpPlanTick += 1;
+                }}
+                onselectfile={selectDiffPath}
+                shipRun={shipRuns.find(
+                  (run) =>
+                    run.repository === (coordinationProject(directory) ?? directory) &&
+                    run.source === acpSnapshot.plan?.sessionID,
+                ) ?? null}
+                onship={(graph, provider, limit) =>
+                  startShippingRun(graph, provider, limit, acpSnapshot.plan?.sessionID ?? '')}
+              />{:else if acpAgent && nativePlan}<section
+                class="native-plan-panel"
+                aria-label="Native plan"
+              >
                 <Markdown source={nativePlan.markdown} />
                 {#if nativePlan.tasks.length}<ul>
                     {#each nativePlan.tasks as task (`${task.status}:${task.title}`)}<li>
@@ -15849,7 +15954,7 @@
                 </div>
               </section>{:else}<PlanPanel
                 {snapshot}
-                client={connecting ? null : client}
+                backend={connecting || !client ? null : openCodePlanBackend(client, directory)}
                 {directory}
                 {sessionID}
                 {dark}
@@ -15871,7 +15976,7 @@
             <DiffPanel
               {directory}
               files={diffs}
-              annotations={acpAgent ? {} : diffAnnotations}
+              annotations={diffAnnotations}
               selected={selectedFilePath}
               loading={diffLoading}
               error={diffError}
@@ -15893,6 +15998,18 @@
                     ? `opencode:${sessionID}`
                     : null,
               )}
+            />
+          </div>{/if}
+        {#if acpAgent && acpPlanHistory.length}<div
+            class:inactive={activeSideTab !== 'planhistory'}
+            class="side-view"
+          >
+            <PlanHistoryPanel
+              events={acpPlanHistory}
+              session={undefined}
+              loading={false}
+              error=""
+              onrefresh={() => (acpPlanTick += 1)}
             />
           </div>{/if}
         {#if sessionID || acpAgent}<div

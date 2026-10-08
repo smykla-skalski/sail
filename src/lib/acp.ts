@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getSetting, setSetting } from './settings.ts';
+import { acpPlans } from './acp-plans.ts';
 import { forgetPlanningState } from './planning-state.ts';
 import { toolCommand } from './tool-display.ts';
 import type { CapabilityProfile, PermissionPolicyDecision } from './capability-profiles.ts';
@@ -670,6 +671,7 @@ export const acp = {
   forget: (agent: AgentId, directory: string, sessionId: string) => {
     forgetSessionState(agent, sessionId);
     forgetPlanningState({ agent, directory, sessionId });
+    acpPlans().forget({ agent, directory, sessionId });
     return invoke<void>('acp_forget_session', { agent, sessionId });
   },
   prompt: (

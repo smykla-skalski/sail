@@ -140,6 +140,8 @@
   import { permissionPolicy, type CapabilityProfile } from './lib/capability-profiles';
   import { permissionResolver } from './lib/permission-resolution';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
+  import { acpPlans } from './lib/acp-plans';
+  import { modeAfterPlan } from './lib/plan-engine';
   import {
     loadNativePlan,
     loadStructuredQuestions,
@@ -170,7 +172,7 @@
     onattachmentsent?: (ids: string[], thread: string, turn: string) => void;
     prefill?: { id: string; text: string };
     onprefillconsumed?: (id: string) => void;
-    externalPrompt?: { id: string; text: string };
+    externalPrompt?: { id: string; text: string; leavePlanMode?: boolean };
     onexternalresult?: (id: string, failure: string | null) => void;
     onpromptfocused?: () => void;
     oncreated: (thread: AgentThread) => void;
@@ -700,6 +702,46 @@
         option.type === 'select' && option.options.some((choice) => choice.value === 'plan'),
     ),
   );
+  let workingMode = $state<string | null>(null);
+  let planReviewPlugin = $state<{ source: string; entry: string } | null>(null);
+
+  $effect(() => {
+    const value = planModeOption?.currentValue;
+    if (value && value !== 'plan') workingMode = value;
+  });
+
+  $effect(() => {
+    planReviewPlugin = null;
+    if (agent !== 'opencode' || !directory) return;
+    const path = directory;
+    void (async () => {
+      try {
+        const found = await invoke<{ source: string; entry: string } | null>(
+          'opencode_plan_review_plugin',
+          { directory: path },
+        );
+        if (path === directory) planReviewPlugin = found;
+      } catch {
+        planReviewPlugin = null;
+      }
+    })();
+  });
+
+  async function leavePlanMode() {
+    const id = activeSessionId;
+    const option = planModeOption;
+    planRequested = false;
+    if (!id || !option) return;
+    const target = modeAfterPlan(option, workingMode);
+    if (!target) return;
+    if (settingConfig) await settingConfig;
+    const result = await acp.setConfig(agent, id, option.id, target);
+    configOptions =
+      result.configOptions ??
+      configOptions.map((item) =>
+        item.id === option.id ? Object.assign({}, item, { currentValue: target }) : item,
+      );
+  }
 
   $effect(() => {
     if (isBusy) {
@@ -748,10 +790,12 @@
     }
     const request = externalPrompt;
     lastExternalPrompt = request.id;
-    void send(request.text).then(
-      () => onexternalresult?.(request.id, null),
-      (cause) => onexternalresult?.(request.id, describe(cause)),
-    );
+    void (request.leavePlanMode ? leavePlanMode() : Promise.resolve())
+      .then(() => send(request.text))
+      .then(
+        () => onexternalresult?.(request.id, null),
+        (cause) => onexternalresult?.(request.id, describe(cause)),
+      );
   });
 
   function describe(cause: unknown): string {
@@ -790,6 +834,8 @@
       activePlanRevision.revisedPlanSeen = true;
     if (activeSessionId && nativePlan)
       saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
+    if (activeSessionId && !replaying)
+      acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
     onnativeplan?.(nativePlan);
     if (replaying) {
       updateEntriesInPlace(replayEntries, update);
@@ -1029,8 +1075,10 @@
         ? liveSessionView(entries, backgroundUpdates, sessionState(agent, id))
         : null;
     if (backgroundUpdates && id) {
-      for (const update of backgroundUpdates)
+      for (const update of backgroundUpdates) {
         nativePlan = nativePlanUpdate(agent, update, nativePlan);
+        acpPlans().observe({ agent, directory, sessionId: id }, update);
+      }
       if (nativePlan) saveNativePlan({ agent, directory, sessionId: id }, nativePlan);
       onnativeplan?.(nativePlan);
     }
@@ -2500,6 +2548,11 @@
       {#if shellMode}<p class="composer-shell-hint" role="status">
           Shell mode · Enter runs the command in this worktree
         </p>{/if}
+      {#if planReviewPlugin}<p class="agent-warning" role="status">
+          The OpenCode plan-review plugin is still enabled ({planReviewPlugin.entry} in
+          {planReviewPlugin.source}). OpenCode sees its plan tools next to Sail's sail_plan_* tools.
+          Remove the plugin from your OpenCode config; Sail reviews plans for every agent itself.
+        </p>{/if}
       {#if error}<p class="agent-error" role="alert">
           {error} <button onclick={() => void activate(activeSessionId)}>Retry</button>
         </p>{/if}
@@ -2942,6 +2995,11 @@
   }
   .agent-error {
     color: var(--sui-danger-ink);
+  }
+  .agent-warning {
+    margin: 0;
+    color: var(--sui-warning-ink);
+    font-size: 12px;
   }
   .agent-permission {
     margin-bottom: 10px;

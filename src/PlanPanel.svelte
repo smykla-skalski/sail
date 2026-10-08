@@ -6,25 +6,22 @@
   import IssueGraphPanel from './IssueGraphPanel.svelte';
   import Markdown from './Markdown.svelte';
   import {
-    answerQuestions,
     canExecutePlan,
     executionSummary,
-    getPlan,
-    reviewPlan,
     skippedSteps,
     snapshotAnswers,
+    type PlanBackend,
     type PlanDecision,
     type PlanQuestion,
     type PlanQuestions,
     type PlanSnapshot,
   } from './lib/plan';
-  import type { OpenCodeClient } from './lib/opencode';
   import type { PublishedGraph } from './lib/issue-graph';
   import type { ShipRun } from './lib/issue-shipping';
 
   interface Props {
     snapshot: PlanSnapshot;
-    client: OpenCodeClient | null;
+    backend: PlanBackend | null;
     directory: string;
     sessionID: string | null;
     dark: boolean;
@@ -36,7 +33,7 @@
 
   let {
     snapshot,
-    client,
+    backend,
     directory,
     sessionID,
     dark,
@@ -147,12 +144,15 @@
   $effect(() => {
     const key = plan ? `${scopeKey(directory, plan.sessionID)}:${plan.version}` : '';
     if (key !== currentPlan) {
+      const sameSession =
+        !!key &&
+        key.slice(0, key.lastIndexOf(':')) === currentPlan.slice(0, currentPlan.lastIndexOf(':'));
       currentPlan = key;
       decisions = {};
       note = '';
       editing = {};
       reviewErrors = {};
-      diagramValidity = {};
+      if (!sameSession) diagramValidity = {};
       confirming = false;
       reviewStatus = '';
       if (key) loadPlanDraft(key);
@@ -320,7 +320,7 @@
 
   async function sendAnswers() {
     if (
-      !client ||
+      !backend ||
       !questions ||
       questions.sessionID !== sessionID ||
       pending ||
@@ -361,7 +361,7 @@
     error = '';
     let accepted = false;
     try {
-      await answerQuestions(client, directory, batch.sessionID, batch.id, validated);
+      await backend.answer(batch.sessionID, batch.id, validated);
       accepted = true;
       saveOutcome(scope, batch, draft, 'answered');
       if (scope === currentScope && questions?.id === batch.id) answerStatus = 'answered';
@@ -387,11 +387,10 @@
   }
 
   async function sendReview(action: 'revise' | 'execute') {
-    if (!client || !plan || pending || (action === 'execute' && !canExecute)) return;
+    if (!backend || !plan || pending || (action === 'execute' && !canExecute)) return;
     if (!validateReview()) return;
     const submitted = plan;
     const key = currentPlan;
-    const path = directory;
     const draft: PlanDecision[] = [];
     for (const decision of Object.values(decisions))
       draft.push({ ...decision, ...(decision.edit ? { edit: { ...decision.edit } } : {}) });
@@ -400,7 +399,7 @@
     error = '';
     reviewStatus = 'Sending review…';
     try {
-      const latest = await getPlan(client, path, submitted.sessionID);
+      const latest = await backend.latest(submitted.sessionID);
       if (currentPlan !== key) return;
       if (latest.plan?.version !== submitted.version || latest.plan.state !== 'review') {
         reviewStatus = '';
@@ -408,7 +407,7 @@
         await onchanged().catch(() => {});
         return;
       }
-      await reviewPlan(client, path, submitted, action, draft, submittedNote);
+      await backend.review(submitted, action, draft, submittedNote);
       if (currentPlan === key)
         reviewStatus = action === 'execute' ? 'Execution approved.' : 'Changes requested.';
       removeSetting(planDraftKey(key));
