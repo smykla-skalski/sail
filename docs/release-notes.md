@@ -15,6 +15,12 @@ There is no automatic updater. To update, download the next package for your pla
 - **Ship runs** shows the repository name; hover it for the full path.
 - A new thread shows **Connecting** until its agent session starts, and an OpenCode thread without a model shows **Model setup needed** instead of **Needs input**, so the thread header and the status bar agree on whether an agent is running.
 
+## Adapter diagnostics
+
+- When an agent adapter writes to stderr, `sail.log` now records its lines as `agent_stderr_line` entries tagged with the agent, and the existing `agent_stderr` entry still reports the total byte count.
+- Forwarding is bounded per adapter process: the first 48 lines, at most 12 KB in total, each cut to 512 bytes. Later output is dropped, and `agent_stderr` reports `forwardedLines`, `forwardedBytes`, `droppedLines` and `droppedBytes`.
+- Secrets are redacted before writing: live `SAIL_BROWSER_TOKEN` values, `Bearer` and `Basic` credentials, values of keys such as token, password, API key and cookie, URL passwords, and common key formats (OpenAI, GitHub, Slack, AWS, Google, JWT). Redaction is best effort; do not attach `sail.log` to public reports without reading it.
+
 ## Ship status
 
 - Ship shows "Fixing · round N" while a worker repairs NEEDS_FIXES or FAIL findings, and "Fixing (CI)" while it repairs failing checks. Only a blocked worker report or a BLOCKED verdict shows "Needs input", with the checkpoint blocker as the reason.

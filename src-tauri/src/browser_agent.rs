@@ -178,6 +178,14 @@ impl BrowserManager {
         })
     }
 
+    pub fn active_tokens(&self) -> Vec<String> {
+        self.0
+            .clients
+            .lock()
+            .map(|clients| clients.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn release(&self, token: &str) {
         if let Ok(mut clients) = self.0.clients.lock() {
             clients.remove(token);
