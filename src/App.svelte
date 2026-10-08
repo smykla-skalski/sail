@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { keyboardScrollable } from './lib/scroll-focus';
   class ValidationCandidateUnavailable extends Error {
     constructor(message: string, cause?: unknown) {
       super(cause === undefined ? message : `${message}: ${describe(cause)}`, { cause });
@@ -69,8 +70,13 @@
     nextValidationReservation,
     reserveInlineValidation,
     gateSnapshot,
+    currentShipBlockedReason,
     loadShipRunStore,
+    repositoryForRemote,
     serializeShipRuns,
+    shippingWorkerGone,
+    unrecoverableGraceExpired,
+    unrecoverableIssuePlan,
     parseShipReport,
     requireValidatorEconomics,
     refreshedIssueState,
@@ -113,6 +119,8 @@
     shipArchiveConfirmation,
     shipMergeAction,
     shipMergeConfirmation,
+    shipReopenAction,
+    shipReopenConfirmation,
     shipRetryAction,
     shipRetryConfirmation,
     shipStopAction,
@@ -608,6 +616,7 @@
     addWorktree,
     assignRepository,
     loadProjectCatalog,
+    owningRepository,
     removeRepository,
     removeWorktree,
     worktreeAt,
@@ -1274,7 +1283,7 @@
       openCodeSessions: paletteOpenCodeSessions,
       commands: savedCommands,
       actions: paletteActions({
-        dark,
+        theme: themePreference,
         overview: workspaceView === 'overview',
         hasDirectory: !!directory,
       }),
@@ -1406,6 +1415,8 @@
     if (!side.parentThreadId && thread) sideChat = { ...side, parentThreadId: thread.sessionId };
   });
   let messages = $state<SessionMessageInfo[]>([]);
+  // Off while history (cache, first page, older pages) mounts, so its failed tools stay silent.
+  let liveTools = $state(false);
   let olderMessageCursor = $state<string | null>(null);
   let loadingOlder = $state(false);
   let restoringTimelineSelection: number | null = null;
@@ -1805,9 +1816,13 @@
     const cursor = olderMessageCursor;
     const page = await source.message.list({ sessionID: id, limit: 50, cursor });
     if (current !== selection || id !== sessionID) return;
+    const wasLive = liveTools;
+    liveTools = false;
     messages = mergeMessages(messages, page.data);
     olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
     cacheCurrentTimeline();
+    await tick();
+    if (current === selection && id === sessionID) liveTools = wasLive;
     await restoreOlderMessages(source, id, current, count, anchorID);
   }
   let client = $state<OpenCodeClient | null>(null);
@@ -3159,22 +3174,23 @@
     return posted;
   }
 
-  async function retryShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
-    const available = shipRetryAction(issue);
-    if (!available.enabled) throw new Error(available.reason ?? 'This issue cannot be retried.');
+  function requireShipClaimOwnership(issue: ShipIssue, action: string): void {
     if (
       issue.claim?.status === 'active' &&
       !shippingClaimOwnedByInstance(issue.claim, shippingInstanceId)
     )
       throw new Error(
-        'Another Sail instance holds the shipping claim for this issue. Retry after it releases or expires.',
+        `Another Sail instance holds the shipping claim for this issue. ${action} after it releases or expires.`,
       );
-    if (!(await confirmShipAction(shipRetryConfirmation(issue)))) return '';
-    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
-      await stopShippingWorker(issue);
-    const stillRetryable = shipRetryAction(issue);
-    if (!stillRetryable.enabled)
-      throw new Error(stillRetryable.reason ?? 'This issue changed and cannot be retried.');
+  }
+
+  /** Stops leftovers and queues a fresh worker that resumes from the saved checkpoint. */
+  async function restartShipIssue(
+    run: ShipRun,
+    issue: ShipIssue,
+    nextAction: string,
+    changes: Partial<ShipIssue> = {},
+  ): Promise<void> {
     const checkpoint = issue.checkpoint;
     const resumed =
       checkpoint && (checkpoint.status === 'cancelled' || checkpoint.status === 'failed')
@@ -3183,7 +3199,7 @@
             {
               status: 'active',
               phase: checkpoint.phase === 'complete' ? 'implement' : checkpoint.phase,
-              nextAction: 'Resume from the saved checkpoint after the retry.',
+              nextAction,
             },
             Date.now(),
           )
@@ -3204,10 +3220,61 @@
       claimHandoffPending: false,
       dispatchFencePending: false,
       retryCount: (issue.retryCount ?? 0) + 1,
+      ...changes,
       ...(resumed ? { checkpoint: resumed } : {}),
     });
     launchReadyShipIssues(run);
+  }
+
+  async function retryShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const available = shipRetryAction(issue);
+    if (!available.enabled) throw new Error(available.reason ?? 'This issue cannot be retried.');
+    requireShipClaimOwnership(issue, 'Retry');
+    if (!(await confirmShipAction(shipRetryConfirmation(issue)))) return '';
+    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+      await stopShippingWorker(issue);
+    const stillRetryable = shipRetryAction(issue);
+    if (!stillRetryable.enabled)
+      throw new Error(stillRetryable.reason ?? 'This issue changed and cannot be retried.');
+    await restartShipIssue(run, issue, 'Resume from the saved checkpoint after the retry.');
     return 'Retry queued. A fresh worker resumes from the saved checkpoint.';
+  }
+
+  async function reopenShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const available = shipReopenAction(issue);
+    if (!available.enabled)
+      throw new Error(available.reason ?? 'This pull request cannot be reopened.');
+    requireShipClaimOwnership(issue, 'Reopen');
+    if (!(await confirmShipAction(shipReopenConfirmation(issue, run.remote)))) return '';
+    const ready = shipReopenAction(issue);
+    if (!ready.enabled)
+      throw new Error(ready.reason ?? 'This issue changed and cannot be reopened.');
+    const outcome = await invoke<{ head: string; pullRequest: string; alreadyOpen: boolean }>(
+      'ship_reopen_pull_request',
+      {
+        request: {
+          repository: run.repository,
+          expectedRepository: run.remote,
+          pullRequest: issue.pullRequest,
+        },
+      },
+    );
+    if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+      await stopShippingWorker(issue);
+    const key = `${run.id}:${issue.id}`;
+    // A lookup started before the reopen would report the pull request closed again.
+    beginLatestRefresh(shippingPullRequestGenerations, key);
+    const cached = shippingPullRequests.get(key);
+    if (cached) shippingPullRequests.set(key, { ...cached, state: 'OPEN' });
+    await restartShipIssue(
+      run,
+      issue,
+      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.`,
+      { pullRequestState: 'OPEN', pullRequestHead: outcome.head },
+    );
+    return outcome.alreadyOpen
+      ? 'The pull request was already open. A fresh worker resumes from the saved checkpoint.'
+      : 'Pull request reopened. A fresh worker resumes from the saved checkpoint.';
   }
 
   async function stopShipRun(run: ShipRun): Promise<string> {
@@ -3286,6 +3353,7 @@
   ): Promise<string> {
     if (id === 'merge' && issue) return mergeShipIssue(run, issue);
     if (id === 'retry' && issue) return retryShipIssue(run, issue);
+    if (id === 'reopen' && issue) return reopenShipIssue(run, issue);
     if (id === 'stop') return stopShipRun(run);
     if (id === 'archive') return archiveShipRunByUser(run);
     if (id === 'unarchive') return unarchiveShipRunByUser(run);
@@ -3999,9 +4067,11 @@
     limit: number,
     source: string,
   ): Promise<void> {
-    const repository = coordinationProject(directory) ?? directory;
+    const repository = coordinationProject(directory);
     const remote = graph.issues[0]?.repository ?? '';
-    if (!repository || !remote) throw new Error('Select a published repository issue graph.');
+    if (!remote) throw new Error('Select a published repository issue graph.');
+    if (!repository)
+      throw new Error('Open the project repository or one of its worktrees to ship this plan.');
     const checkoutRemote = await invoke<string>('shipping_target_repository', { repository });
     if (checkoutRemote.toLowerCase() !== remote.toLowerCase())
       throw new Error(`Select a ${remote} checkout to ship this issue graph.`);
@@ -4387,7 +4457,9 @@
       await fenceRecoveredShippingWorker(
         run,
         issue,
-        `Shipping claim recovery failed: ${describe(cause)}`,
+        missingRepositoryPath(cause)
+          ? 'Shipping repository no longer exists. Start a new run from the project.'
+          : `Shipping claim recovery failed: ${describe(cause)}`,
       );
       return false;
     }
@@ -4534,7 +4606,7 @@
   }
 
   async function retryShippingClaimFence(run: ShipRun, issue: ShipIssue): Promise<void> {
-    const blockedReason = issue.blockedReason ?? 'Shipping claim recovery requires worker fencing.';
+    const blockedReason = currentShipBlockedReason(issue.blockedReason);
     await fenceRecoveredShippingWorker(run, issue, blockedReason, false);
     if (!issue.workerSettled) return;
     const claim = issue.claim;
@@ -4564,6 +4636,17 @@
         const settled = settledLostClaimFence(claim, cause);
         if (settled) {
           await updateShipIssue(run, issue, settled);
+          return;
+        }
+        if (missingRepositoryPath(cause)) {
+          await updateShipIssue(run, issue, {
+            state: 'failed',
+            claim: undefined,
+            claimFencePending: false,
+            claimRevalidationPending: false,
+            claimHandoffPending: false,
+            refreshError: null,
+          });
           return;
         }
         await updateShipIssue(run, issue, {
@@ -5011,25 +5094,29 @@
       if (!client) throw new Error('OpenCode is unavailable; stop the worker manually.');
       const source = client;
       const sessionId = threadId.slice('opencode:'.length);
-      await reconcilePersistedOpenCodeDispatches(issue, threadId, source);
-      const stopped = await confirmOpenCodeWorkerStopped(
-        () => source.session.interrupt({ sessionID: sessionId }),
-        async () => {
-          const [active, inbox] = await Promise.all([
-            source.session.active(),
-            source.session.inbox.list({ sessionID: sessionId }),
-          ]);
-          return {
-            running: active[sessionId]?.type === 'running',
-            queued: inbox.map((item) => item.id),
-          };
-        },
-        (inboxId) => source.session.inbox.cancel({ sessionID: sessionId, inboxID: inboxId }),
-        () => new Promise((resolve) => setTimeout(resolve, 100)),
-        50,
-        () => !!dispatchKey && shippingPromptDispatchPending(issue, dispatchKey),
-      );
-      if (!stopped) throw new Error('OpenCode worker did not confirm termination.');
+      try {
+        await reconcilePersistedOpenCodeDispatches(issue, threadId, source);
+        const stopped = await confirmOpenCodeWorkerStopped(
+          () => source.session.interrupt({ sessionID: sessionId }),
+          async () => {
+            const [active, inbox] = await Promise.all([
+              source.session.active(),
+              source.session.inbox.list({ sessionID: sessionId }),
+            ]);
+            return {
+              running: active[sessionId]?.type === 'running',
+              queued: inbox.map((item) => item.id),
+            };
+          },
+          (inboxId) => source.session.inbox.cancel({ sessionID: sessionId, inboxID: inboxId }),
+          () => new Promise((resolve) => setTimeout(resolve, 100)),
+          50,
+          () => !!dispatchKey && shippingPromptDispatchPending(issue, dispatchKey),
+        );
+        if (!stopped) throw new Error('OpenCode worker did not confirm termination.');
+      } catch (cause) {
+        if (!shippingWorkerGone(cause) && !isSessionNotFoundError(cause)) throw cause;
+      }
       return;
     }
     const match = /^acp:([^:]+):(.+)$/.exec(threadId);
@@ -5043,8 +5130,12 @@
           );
     const [, agent, sessionId] = match;
     const turnId = receipt?.turnId ?? null;
-    await acp.cancel(agent, sessionId, turnId);
-    await waitForAcpWorkerTermination(agent, sessionId, turnId, performance.now() + 5_000);
+    try {
+      await acp.cancel(agent, sessionId, turnId);
+      await waitForAcpWorkerTermination(agent, sessionId, turnId, performance.now() + 5_000);
+    } catch (cause) {
+      if (!shippingWorkerGone(cause)) throw cause;
+    }
     if (receipt) updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
   }
 
@@ -5524,9 +5615,25 @@
       return;
     const worker = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
     const path = issue.path ?? worker?.targetDirectory;
+    const worktreeGone = path
+      ? !(await invoke<boolean>('repository_path_available', { path }).catch(() => true))
+      : false;
+    if (worktreeGone && !issue.worktreeUnavailable) await update({ worktreeUnavailable: true });
+    else if (!worktreeGone && issue.worktreeUnavailable && !isDirectShipRun(run))
+      await update({ worktreeUnavailable: false });
+    if (worktreeGone && !issue.shippingTarget && issue.branch) {
+      const target = await invoke<ShippingTarget>('shipping_repository_target', {
+        repository: run.repository,
+        branch: issue.branch,
+      }).catch(() => null);
+      if (target && target.repository.toLowerCase() === run.remote.toLowerCase())
+        await update({ shippingTarget: target });
+    }
+    const pullRequestPath = worktreeGone ? null : path;
+    const pullRequestLookup = !worktreeGone || !!issue.shippingTarget;
     let currentRevision: string | undefined;
     let currentBaseRevision: string | undefined;
-    if (path) {
+    if (path && !worktreeGone) {
       const shippingTarget = await shippingTargetFor(run, issue, path);
       const models = implementationModels(path);
       const modelUncertain = implementationAttributionUncertain(path);
@@ -5666,12 +5773,12 @@
           if (title) await update({ title });
         }
         const branch = worktree?.branch ?? issue.branch;
-        if (branch && issue.state !== 'pending')
+        if (branch && issue.state !== 'pending' && pullRequestLookup)
           await refreshShippingPullRequest(
             run,
             { ...issue, branch },
             currentRevision,
-            path,
+            pullRequestPath,
             currentBaseRevision,
           );
         if (issue.refreshError) return;
@@ -5726,8 +5833,14 @@
       await update({ refreshError: describe(cause) });
       return;
     }
-    if (issue.state !== 'pending')
-      await refreshShippingPullRequest(run, issue, currentRevision, path, currentBaseRevision);
+    if (issue.state !== 'pending' && pullRequestLookup)
+      await refreshShippingPullRequest(
+        run,
+        issue,
+        currentRevision,
+        pullRequestPath,
+        currentBaseRevision,
+      );
     if (issue.refreshError) return;
     if (issue.state === 'merged') {
       if (issue.workerSettled && !issue.path) return;
@@ -5762,7 +5875,11 @@
           requiredShipGatesSatisfied(issue.validationPolicy, issue.gates ?? []))
       ) {
         try {
-          await updateShipIssue(run, issue, await settledImplementationAttribution(issue.path));
+          await updateShipIssue(
+            run,
+            issue,
+            worktreeGone ? {} : await settledImplementationAttribution(issue.path),
+          );
           if (
             !shipGatesSettled(issue) ||
             !shipEvidenceReadiness(issue).ready ||
@@ -5976,7 +6093,7 @@
             ))
           )
             return;
-          if (pr?.url) await update({ state: 'awaiting_merge', error: null });
+          if (pr?.url) await update({ state: 'awaiting_merge', workerSettled: true, error: null });
           else if (Date.now() - current.updated > 60_000)
             await update({
               state: 'failed',
@@ -6070,17 +6187,123 @@
     for (const issue of readyShipIssues(run, unsettledReceiptIds)) scheduleShipLaunch(run, issue);
   }
 
+  const shipRepairMisses = new SvelteMap<string, { key: string; retryAt: number }>();
+  const shipRepositoryDeadSince = new SvelteMap<string, number>();
+
+  // Older runs stored a worktree path as their repository; once that worktree
+  // is deleted every claim and fence call fails, so point them at the checkout.
+  // Returns when each still-unrecoverable run was first seen dead.
+  async function repairShipRunRepositories(): Promise<Map<string, number>> {
+    const runs = shipRuns.filter((run) => !shipRunArchived(run));
+    const available = await Promise.all(
+      runs.map((run) =>
+        invoke<boolean>('repository_path_available', { path: run.repository }).catch(() => true),
+      ),
+    );
+    const dead = runs.filter((_, index) => !available[index]);
+    for (const [index, run] of runs.entries())
+      if (available[index]) shipRepositoryDeadSince.delete(run.id);
+    if (!dead.length) return new SvelteMap();
+    const catalogKey = projectCatalog.repositories.join('\0');
+    const now = Date.now();
+    const lookups = dead.filter((run) => {
+      const miss = shipRepairMisses.get(run.id);
+      return !miss || miss.key !== catalogKey || miss.retryAt <= now;
+    });
+    const repaired = new SvelteSet<string>();
+    if (lookups.length) {
+      const candidates = await Promise.all(
+        projectCatalog.repositories.map(async (path) => {
+          try {
+            return {
+              path,
+              remote: await invoke<string>('shipping_target_repository', { repository: path }),
+              failed: false,
+            };
+          } catch {
+            return { path, remote: null, failed: true };
+          }
+        }),
+      );
+      const lookupFailed = candidates.some((candidate) => candidate.failed);
+      for (const run of lookups) {
+        const repository = repositoryForRemote(
+          candidates,
+          run.remote,
+          owningRepository(projectCatalog, run.repository),
+        );
+        if (repository) {
+          run.repository = repository;
+          repaired.add(run.id);
+          shipRepairMisses.delete(run.id);
+          continue;
+        }
+        const since = shipRepositoryDeadSince.get(run.id) ?? now;
+        const definitive = !lookupFailed || unrecoverableGraceExpired(since, now);
+        shipRepairMisses.set(run.id, {
+          key: catalogKey,
+          retryAt: definitive ? Number.POSITIVE_INFINITY : now + 60_000,
+        });
+      }
+      if (repaired.size) await saveShipRuns();
+    }
+    const unrecoverable = new SvelteMap<string, number>();
+    for (const run of dead) {
+      if (repaired.has(run.id)) {
+        shipRepositoryDeadSince.delete(run.id);
+        continue;
+      }
+      const since = shipRepositoryDeadSince.get(run.id) ?? Date.now();
+      shipRepositoryDeadSince.set(run.id, since);
+      unrecoverable.set(run.id, since);
+    }
+    return unrecoverable;
+  }
+
+  async function settleUnrecoverableShipRun(run: ShipRun): Promise<void> {
+    const reason = 'Shipping repository no longer exists. Start a new run from the project.';
+    await Promise.all(
+      run.issues.map(async (issue) => {
+        const plan = unrecoverableIssuePlan(issue);
+        if (plan === 'none') return;
+        if (plan === 'fail') await fenceRecoveredShippingWorker(run, issue, reason);
+        if (plan === 'fail' && !issue.workerSettled) return;
+        const keepsState =
+          plan === 'clear' && (issue.state === 'merged' || issue.state === 'awaiting_merge');
+        await updateShipIssue(run, issue, {
+          claim: undefined,
+          claimFencePending: false,
+          refreshError: null,
+          ...(keepsState
+            ? {}
+            : {
+                claimRevalidationPending: false,
+                claimHandoffPending: false,
+                worktreeUnavailable: true,
+              }),
+        });
+      }),
+    );
+  }
+
   async function tickShippingRuns(refreshCompleted = false): Promise<void> {
     if (shippingBusy || disposed || !isTauri() || !acpRecoveryReady) return;
     detectShippingClockResume();
     shippingBusy = true;
     try {
+      const unrecoverable = await repairShipRunRepositories();
       const active = shipRuns.filter((run) => !shipRunArchived(run));
       await persistShipRefresh(
-        active.map((run) => refreshShippingRun(run, refreshCompleted)),
+        active.map((run) => {
+          const since = unrecoverable.get(run.id);
+          if (since === undefined) return refreshShippingRun(run, refreshCompleted);
+          return unrecoverableGraceExpired(since, Date.now())
+            ? settleUnrecoverableShipRun(run)
+            : Promise.resolve();
+        }),
         saveShipRuns,
       );
-      for (const run of active) launchReadyShipIssues(run);
+      for (const run of active) if (!unrecoverable.has(run.id)) launchReadyShipIssues(run);
       await archiveDueShipRuns();
     } catch (cause) {
       error = describe(cause);
@@ -6651,12 +6874,7 @@
   }
 
   function coordinationProject(path: string): string | null {
-    if (projectCatalog.repositories.includes(path)) return path;
-    return (
-      Object.entries(projectCatalog.worktrees).find(([, worktrees]) =>
-        worktrees.some((worktree) => worktree.path === path),
-      )?.[0] ?? null
-    );
+    return owningRepository(projectCatalog, path);
   }
 
   async function coordinationSource(request: CoordinationRequest): Promise<CoordinationSource> {
@@ -10955,7 +11173,7 @@
 
   function runPaletteAction(id: PaletteActionId) {
     // Actions that open a dialog or move focus must not get it pulled back to the palette trigger.
-    closeCommandPalette(id === 'theme.toggle' || id === 'sidebar.toggle');
+    closeCommandPalette(id.startsWith('theme.') || id === 'sidebar.toggle');
     switch (id) {
       case 'pane.split':
         splitFocusedPane('row');
@@ -10985,8 +11203,14 @@
       case 'settings.open':
         void openSettings();
         break;
-      case 'theme.toggle':
-        setTheme(dark ? 'light' : 'dark');
+      case 'theme.system':
+        setTheme('system');
+        break;
+      case 'theme.light':
+        setTheme('light');
+        break;
+      case 'theme.dark':
+        setTheme('dark');
         break;
       case 'shortcuts.help':
         openShortcutSheet();
@@ -13907,6 +14131,7 @@
     discardLiveText();
     ++timelineRefresh;
     timelineSession = '';
+    liveTools = false;
     messages = [];
     olderMessageCursor = null;
     loadingOlder = false;
@@ -13977,6 +14202,7 @@
       olderMessageCursor = first.cursor.next ?? null;
       cacheCurrentTimeline();
       await tick();
+      if (valid()) liveTools = true;
       scrollToLatest();
       return;
     }
@@ -13997,6 +14223,8 @@
     if (!valid()) return;
     messages = mergeMessages(messages, acceptProjectedMessages(incoming, observed));
     cacheCurrentTimeline();
+    await tick();
+    if (valid()) liveTools = true;
   }
 
   async function loadOlderMessages() {
@@ -14020,11 +14248,14 @@
     try {
       const page = await client.message.list({ sessionID: id, limit: 50, cursor });
       if (current !== selection || id !== sessionID) return;
+      const wasLive = liveTools;
+      liveTools = false;
       messages = mergeMessages(messages, acceptProjectedMessages(page.data, observed));
       olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
       cacheCurrentTimeline();
       if (!underfilled) followChat = false;
       await tick();
+      if (current === selection && id === sessionID) liveTools = wasLive;
       if (chatScroll)
         chatScroll.scrollTop =
           underfilled && followChat
@@ -15477,6 +15708,7 @@
               <div
                 class="conversation"
                 bind:this={chatScroll}
+                {@attach keyboardScrollable}
                 onscroll={() => {
                   followChat = chatScroll ? nearBottom(chatScroll) : true;
                   if (chatScroll && chatScroll.scrollTop <= 80) void loadOlderMessages();
@@ -15510,6 +15742,7 @@
                 <Transcript
                   items={mainTranscript}
                   busy={running}
+                  live={liveTools}
                   coordinationMessages={mainCoordinationMessages}
                   onopen={openSpawnTarget}
                   control={subagentControl}

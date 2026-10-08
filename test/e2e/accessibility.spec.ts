@@ -69,6 +69,14 @@ async function openPalette() {
   });
 }
 
+function theme() {
+  return browser.execute(() => ({
+    stored: localStorage.getItem('sai-theme'),
+    applied: document.documentElement.dataset.suiTheme,
+    system: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
+  }));
+}
+
 function selectText(selector = '.agent-header') {
   return browser.execute((target: string) => {
     const header = document.querySelector(target);
@@ -211,6 +219,38 @@ describe('palette actions and accessibility', () => {
       async () =>
         (await browser.execute(() => document.documentElement.dataset.suiTheme)) === 'light',
     );
+  });
+
+  it('switches the theme away from System and back from the palette', async () => {
+    const choose = async (query: string) => {
+      await openPalette();
+      await input().setValue(query);
+      await expect($('.palette-entry[data-kind="action"]')).toHaveText(
+        expect.stringContaining(query),
+      );
+      await browser.keys('Enter');
+      await expect($('.command-palette[open]')).not.toExist();
+    };
+
+    await choose('system theme');
+    await browser.waitUntil(async () => (await theme()).stored === 'system');
+    await openPalette();
+    await input().setValue('system theme');
+    await expect($('.palette-entry[data-kind="action"]')).not.toExist();
+    await browser.keys('Escape');
+
+    const fromSystem = (await theme()).system === 'dark' ? 'light' : 'dark';
+    await choose(`${fromSystem} theme`);
+    await browser.waitUntil(async () => {
+      const current = await theme();
+      return current.stored === fromSystem && current.applied === fromSystem;
+    });
+
+    await choose('system theme');
+    await browser.waitUntil(async () => {
+      const current = await theme();
+      return current.stored === 'system' && current.applied === current.system;
+    });
   });
 
   it('opens the command palette from its top bar button', async () => {

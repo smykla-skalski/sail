@@ -1852,6 +1852,10 @@ time {
   overflow: auto;
   padding: 28px var(--transcript-gutter);
 }
+.conversation:focus-visible {
+  outline: 3px solid var(--sui-primary);
+  outline-offset: -3px;
+}
 .chat-area > .conversation,
 .chat-area > .chat-body > .conversation {
   min-width: 0;

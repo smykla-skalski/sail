@@ -3,6 +3,7 @@ import type { ProjectCatalog } from './projects';
 import { threadKey } from './recent-threads.ts';
 import { commandsForDirectory, type SavedCommand } from './saved-commands.ts';
 import { shortcutFor, type ShortcutId } from './shortcuts.ts';
+import type { ThemePreference } from './theme.ts';
 
 export type PaletteActionId =
   | 'pane.split'
@@ -14,7 +15,9 @@ export type PaletteActionId =
   | 'ship.open'
   | 'changes.toggle'
   | 'settings.open'
-  | 'theme.toggle'
+  | 'theme.system'
+  | 'theme.light'
+  | 'theme.dark'
   | 'shortcuts.help'
   | 'sidebar.toggle';
 
@@ -28,7 +31,7 @@ export type PaletteAction = {
 };
 
 export type PaletteActionContext = {
-  dark: boolean;
+  theme: ThemePreference;
   overview: boolean;
   hasDirectory: boolean;
 };
@@ -41,8 +44,21 @@ function registryAction(
   return { id, label: shortcutFor(id).label, detail, shortcut: id, disabled };
 }
 
+const themeLabels: Record<ThemePreference, string> = {
+  system: 'Follow system theme',
+  light: 'Switch to light theme',
+  dark: 'Switch to dark theme',
+};
+
+/** One action for each theme choice other than the current one. */
+function themeActions(current: ThemePreference): PaletteAction[] {
+  return (['system', 'light', 'dark'] as const)
+    .filter((theme) => theme !== current)
+    .map((theme) => ({ id: `theme.${theme}`, label: themeLabels[theme], detail: 'Appearance' }));
+}
+
 /** App actions the palette offers; labels and hints for shortcuts come from the registry. */
-export function paletteActions({ dark, overview, hasDirectory }: PaletteActionContext) {
+export function paletteActions({ theme, overview, hasDirectory }: PaletteActionContext) {
   const actions: PaletteAction[] = [
     registryAction('pane.split', 'Open another pane beside this one', !hasDirectory),
     registryAction('terminal.split', 'Open a terminal beside this pane', !hasDirectory),
@@ -62,11 +78,7 @@ export function paletteActions({ dark, overview, hasDirectory }: PaletteActionCo
       shortcut: 'details.toggle',
     },
     registryAction('settings.open', 'Theme, notifications and agents'),
-    {
-      id: 'theme.toggle',
-      label: dark ? 'Switch to light theme' : 'Switch to dark theme',
-      detail: 'Appearance',
-    },
+    ...themeActions(theme),
     registryAction('shortcuts.help', 'List every keyboard shortcut'),
     registryAction('sidebar.toggle', 'Show or hide the project sidebar'),
   ];
@@ -294,10 +306,11 @@ export function searchCommandPalette({
               : 0,
       );
     }
-    const projectSlots = 50 - Math.min(saved.length, 10) - actionEntries.length;
+    // Actions come on top of the 50 project and command entries, so no project is dropped.
+    const projectSlots = 50 - Math.min(saved.length, 10);
     return [
       ...projects.slice(0, projectSlots),
-      ...saved.slice(0, 50 - projectSlots - actionEntries.length),
+      ...saved.slice(0, 50 - projectSlots),
       ...actionEntries,
     ];
   }
