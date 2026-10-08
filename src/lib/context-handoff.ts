@@ -1,4 +1,5 @@
 import type { TaskCheckpoint } from './task-checkpoint.ts';
+import type { SpawnReceipt } from './agent-results.ts';
 
 export const defaultContextHandoffThreshold = 85;
 export const contextCheckpointLead = 10;
@@ -20,7 +21,7 @@ export type ContextHandoff = {
   lostStateFailuresBefore: number;
   retriesAfter: number | null;
   lostStateFailuresAfter: number | null;
-  outcome: 'pending' | 'reduced' | 'unchanged' | 'regressed' | 'failed';
+  outcome: 'pending' | 'no_regression' | 'regressed' | 'failed';
   error: string | null;
 };
 
@@ -99,13 +100,37 @@ export function handoffOutcome(
   return {
     retriesAfter: retries,
     lostStateFailuresAfter: lostStateFailures,
-    outcome:
-      retryDelta > 0 || lostStateDelta > 0
-        ? 'regressed'
-        : handoff.retriesBefore > 0 || handoff.lostStateFailuresBefore > 0
-          ? 'reduced'
-          : 'unchanged',
+    outcome: retryDelta > 0 || lostStateDelta > 0 ? 'regressed' : 'no_regression',
   };
+}
+
+export function reconcileHandoffOutcomes(
+  handoffs: ContextHandoff[] | undefined,
+  receipts: Pick<SpawnReceipt, 'requestId' | 'targetId' | 'state' | 'error'>[],
+  retries: number,
+  lostStateFailures: number,
+): ContextHandoff[] | undefined {
+  if (!handoffs) return handoffs;
+  let changed = false;
+  const reconciled = handoffs.map((handoff) => {
+    if (handoff.outcome !== 'pending' || !handoff.toThreadId) return handoff;
+    const receipt = receipts.find(
+      (candidate) =>
+        candidate.requestId === `handoff:${handoff.id}` &&
+        candidate.targetId === handoff.toThreadId &&
+        ['completed', 'failed', 'interrupted'].includes(candidate.state),
+    );
+    if (!receipt) return handoff;
+    changed = true;
+    return receipt.state === 'completed'
+      ? { ...handoff, ...handoffOutcome(handoff, retries, lostStateFailures) }
+      : {
+          ...handoff,
+          outcome: 'failed' as const,
+          error: receipt.error ?? receipt.state,
+        };
+  });
+  return changed ? reconciled : handoffs;
 }
 
 export function contextHandoffPrompt(input: {

@@ -424,7 +424,8 @@
               </p>
               <ol>
                 {#each issue.contextHandoffs as handoff (handoff.id)}<li>
-                    {handoff.provider} · {handoff.context}% · {handoff.outcome} · retries
+                    {handoff.provider} · {handoff.context}% · {handoff.outcome.replaceAll('_', ' ')} ·
+                    retries
                     {handoff.retriesBefore}→{handoff.retriesAfter ?? 'pending'} · lost-state
                     {handoff.lostStateFailuresBefore}→{handoff.lostStateFailuresAfter ?? 'pending'}
                   </li>{/each}

@@ -5,6 +5,7 @@ import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
 import { taskCheckpointSchema } from './task-checkpoint.ts';
 import { taskEconomicsSchema, type TaskEconomics } from './task-economics.ts';
+import type { ContextHandoff } from './context-handoff.ts';
 import {
   evidenceManifestsSchema,
   evidenceReadiness,
@@ -478,22 +479,6 @@ export function shipCheckpointOwner(runs: ShipRun[], directory: string, threadId
   return undefined;
 }
 
-function shipSpawnOwner(runs: ShipRun[], directory: string, threadId: string) {
-  const checkpointOwner = shipCheckpointOwner(runs, directory, threadId);
-  if (checkpointOwner) return checkpointOwner;
-  for (const run of runs) {
-    const issue = run.issues.find(
-      (item) =>
-        item.path === directory &&
-        item.contextHandoffs?.some(
-          (handoff) => handoff.fromThreadId === threadId || handoff.toThreadId === threadId,
-        ),
-    );
-    if (issue) return { run, issue };
-  }
-  return undefined;
-}
-
 export function authorizeShipCheckpointThread(
   runs: ShipRun[],
   sourceDirectory: string,
@@ -501,7 +486,7 @@ export function authorizeShipCheckpointThread(
   targetDirectory: string | null,
   targetId: string | null,
 ): boolean {
-  const owner = shipSpawnOwner(runs, sourceDirectory, sourceId);
+  const owner = shipCheckpointOwner(runs, sourceDirectory, sourceId);
   if (!owner || !targetId || targetDirectory !== owner.issue.path) return false;
   if (owner.issue.checkpointThreadIds?.includes(targetId)) return false;
   owner.issue.checkpointThreadIds = [...(owner.issue.checkpointThreadIds ?? []), targetId];
@@ -1199,7 +1184,11 @@ const shipIssueSchema = z.object({
         lostStateFailuresBefore: z.number().int().nonnegative(),
         retriesAfter: z.number().int().nonnegative().nullable(),
         lostStateFailuresAfter: z.number().int().nonnegative().nullable(),
-        outcome: z.enum(['pending', 'reduced', 'unchanged', 'regressed', 'failed']),
+        outcome: z
+          .enum(['pending', 'reduced', 'unchanged', 'no_regression', 'regressed', 'failed'])
+          .transform((outcome): ContextHandoff['outcome'] =>
+            outcome === 'reduced' || outcome === 'unchanged' ? 'no_regression' : outcome,
+          ),
         error: z.string().nullable(),
       }),
     )

@@ -95,8 +95,8 @@
     contextCheckpointLead,
     contextHandoffPrompt,
     contextPressureStage,
-    handoffOutcome,
     parseContextHandoffThreshold,
+    reconcileHandoffOutcomes,
     updateThreadContextPressure,
     type ContextProvider,
   } from './lib/context-handoff.ts';
@@ -3407,6 +3407,14 @@
     refreshCompleted = false,
   ): Promise<void> {
     const update = (changes: Partial<ShipIssue>) => updateShipIssue(run, issue, changes, false);
+    const recoveredHandoffs = reconcileHandoffOutcomes(
+      issue.contextHandoffs,
+      spawnReceipts,
+      issue.retryCount ?? 0,
+      issue.lostStateFailures ?? 0,
+    );
+    if (recoveredHandoffs !== issue.contextHandoffs)
+      await update({ contextHandoffs: recoveredHandoffs });
     if (
       !refreshCompleted &&
       issue.state === 'merged' &&
@@ -3841,23 +3849,14 @@
     if (shippingWorkerSettled(receipt.state) && receipt.targetId)
       for (const run of shipRuns)
         for (const issue of run.issues) {
-          const pending = issue.contextHandoffs?.find(
-            (handoff) => handoff.toThreadId === receipt.targetId && handoff.outcome === 'pending',
+          const contextHandoffs = reconcileHandoffOutcomes(
+            issue.contextHandoffs,
+            [receipt],
+            issue.retryCount ?? 0,
+            issue.lostStateFailures ?? 0,
           );
-          if (!pending) continue;
-          issue.contextHandoffs = issue.contextHandoffs?.map((handoff) => {
-            if (handoff.id !== pending.id) return handoff;
-            return receipt.state === 'completed'
-              ? Object.assign(
-                  {},
-                  handoff,
-                  handoffOutcome(handoff, issue.retryCount ?? 0, issue.lostStateFailures ?? 0),
-                )
-              : Object.assign({}, handoff, {
-                  outcome: 'failed' as const,
-                  error: receipt.error ?? receipt.state,
-                });
-          });
+          if (contextHandoffs === issue.contextHandoffs) continue;
+          issue.contextHandoffs = contextHandoffs;
           void saveShipRuns().catch((cause) => (error = describe(cause)));
         }
     const owner = shipOwner(shipRuns, receipt.sourceDirectory, receipt.sourceId);

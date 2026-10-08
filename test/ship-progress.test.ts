@@ -907,6 +907,35 @@ void test('retires stale pending handoff offers during recovery', () => {
   assert.equal(restored?.error, 'Retired stale handoff offer during recovery.');
 });
 
+void test('normalizes legacy handoff reduction claims to no regression', () => {
+  const run = fixture();
+  const legacy = JSON.parse(JSON.stringify(run));
+  legacy.issues[0].contextHandoffs = [
+    {
+      id: 'settled',
+      provider: 'codex',
+      fromThreadId: 'old',
+      toThreadId: 'new',
+      context: 90,
+      compactions: 1,
+      checkpointSequence: 2,
+      revision: 'abc',
+      offeredAt: 10,
+      startedAt: 11,
+      retriesBefore: 1,
+      lostStateFailuresBefore: 0,
+      retriesAfter: 1,
+      lostStateFailuresAfter: 0,
+      outcome: 'reduced',
+      error: null,
+    },
+  ];
+
+  const restored = loadShipRuns(JSON.stringify([legacy]));
+
+  assert.equal(restored[0].issues[0].contextHandoffs?.[0].outcome, 'no_regression');
+});
+
 void test('checkpoint ownership follows same-worktree handoff ancestry', () => {
   const run = fixture();
   run.issues[0].path = '/worktree';
@@ -1031,9 +1060,9 @@ void test('late retired-worker children block cleanup without restoring retired 
   assert.equal(shipCheckpointOwner([run], '/worktree', 'old'), undefined);
   assert.equal(
     authorizeShipCheckpointThread([run], '/worktree', 'old', '/worktree', 'late-child'),
-    true,
+    false,
   );
-  assert.equal(shipCheckpointOwner([run], '/worktree', 'late-child')?.issue, issue);
+  assert.equal(shipCheckpointOwner([run], '/worktree', 'late-child'), undefined);
   assert.equal(
     shipTaskThreadsSettled(issue, { old: 'completed', new: 'completed', 'late-child': 'working' }, [
       ...receipts,

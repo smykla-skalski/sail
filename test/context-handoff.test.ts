@@ -6,6 +6,7 @@ import {
   contextPressureStage,
   handoffOutcome,
   parseContextHandoffThreshold,
+  reconcileHandoffOutcomes,
   updateThreadContextPressure,
 } from '../src/lib/context-handoff.ts';
 import { initialTaskCheckpoint } from '../src/lib/task-checkpoint.ts';
@@ -64,8 +65,50 @@ void test('records whether retries or lost-state failures regressed', () => {
     retriesBefore: 1,
     lostStateFailuresBefore: 0,
   };
-  assert.equal(handoffOutcome(handoff, 1, 0).outcome, 'reduced');
+  assert.equal(handoffOutcome(handoff, 1, 0).outcome, 'no_regression');
   assert.equal(handoffOutcome(handoff, 2, 0).outcome, 'regressed');
+});
+
+void test('recovers a pending handoff from its persisted completed receipt', () => {
+  const handoff = {
+    id: 'handoff-one',
+    provider: 'codex' as const,
+    fromThreadId: 'old',
+    toThreadId: 'new',
+    context: 90,
+    compactions: 1,
+    checkpointSequence: 2,
+    revision: 'abc',
+    offeredAt: 10,
+    startedAt: 11,
+    retriesBefore: 1,
+    lostStateFailuresBefore: 0,
+    retriesAfter: null,
+    lostStateFailuresAfter: null,
+    outcome: 'pending' as const,
+    error: null,
+  };
+
+  const recovered = reconcileHandoffOutcomes(
+    [handoff],
+    [
+      {
+        requestId: 'handoff:handoff-one',
+        targetId: 'new',
+        state: 'completed',
+        error: null,
+      },
+    ],
+    1,
+    0,
+  );
+
+  assert.deepEqual(recovered?.[0], {
+    ...handoff,
+    retriesAfter: 1,
+    lostStateFailuresAfter: 0,
+    outcome: 'no_regression',
+  });
 });
 
 void test('tracks context pressure independently for primary and descendant threads', () => {
