@@ -3,6 +3,7 @@
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { Button } from '@smykla-skalski/sui';
+  import { isSessionNotFoundError } from '@opencode/client';
   import type { FormInfo, PermissionRequest } from '@opencode/client';
   import Markdown from './Markdown.svelte';
   import ActivityStatus from './ActivityStatus.svelte';
@@ -39,7 +40,12 @@
     savedShipItOwner,
     type ShipItIssue,
   } from './lib/implementation-models';
-  import { runOpenCodePromptStart, runSerialOpenCodeTurn } from './lib/opencode-turns';
+  import {
+    openCodeInboxSettled,
+    runOpenCodePromptStart,
+    runSerialOpenCodeTurn,
+    waitForAuthoritativeOpenCodeSettlement,
+  } from './lib/opencode-turns';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
   import { withSpawnResponses, type SpawnReceipt } from './lib/agent-results';
@@ -78,6 +84,11 @@
     type TaskLocation as TaskLocationValue,
   } from './lib/task-location';
   import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
+  import {
+    holdCapabilityProfileReservation,
+    permissionDecisionTitle,
+    type CapabilityProfile,
+  } from './lib/capability-profiles';
 
   let {
     client,
@@ -106,6 +117,9 @@
     onusage,
     onworkspaceactivity,
     onshipit,
+    capabilityProfile = 'build',
+    onensureprofile,
+    ondecision,
   }: {
     client: OpenCodeClient | null;
     runtimeState: 'starting' | 'connected' | 'error';
@@ -141,6 +155,9 @@
       threadId: string,
       workerModel?: string,
     ) => Promise<void>;
+    capabilityProfile?: CapabilityProfile;
+    onensureprofile?: (directory: string, profile: CapabilityProfile) => Promise<() => void>;
+    ondecision?: (thread: AgentThread, id: string, title: string, outcome: string) => void;
   } = $props();
 
   let session = $state<SessionInfo | null>(null);
@@ -417,12 +434,20 @@
   }
 
   function summary(info: SessionInfo): AgentThread {
+    const savedProfile = info.metadata?.sailCapabilityProfile;
     return {
       agent: 'opencode',
       sessionId: info.id,
       directory,
       title: info.title ?? 'OpenCode thread',
       updated: info.time.updated,
+      capabilityProfile:
+        savedProfile === 'explore' ||
+        savedProfile === 'review' ||
+        savedProfile === 'build' ||
+        savedProfile === 'release'
+          ? savedProfile
+          : (thread?.capabilityProfile ?? capabilityProfile),
     };
   }
 
@@ -760,7 +785,17 @@
     stopRequested = false;
     lastExecutionStatus = null;
     error = '';
+    let releaseProfile: (() => void) | undefined;
     try {
+      const savedProfile = session?.metadata?.sailCapabilityProfile;
+      const activeProfile: CapabilityProfile =
+        savedProfile === 'explore' ||
+        savedProfile === 'review' ||
+        savedProfile === 'build' ||
+        savedProfile === 'release'
+          ? savedProfile
+          : (thread?.capabilityProfile ?? capabilityProfile);
+      releaseProfile = await onensureprofile?.(turnDirectory, activeProfile);
       let id = activeID;
       if (!id) {
         const info = await source.session.create({
@@ -773,7 +808,7 @@
               }
             : undefined,
           location: { directory: turnDirectory },
-          metadata: { saiHarness: true },
+          metadata: { saiHarness: true, sailCapabilityProfile: activeProfile },
           title: text ? (text.length > 60 ? `${text.slice(0, 57)}…` : text) : 'New work',
         });
         if (current !== generation || disposed) return;
@@ -802,7 +837,7 @@
           implementingModel,
           `opencode:${id}`,
         );
-        let response;
+        let response: Awaited<ReturnType<OpenCodeClient['session']['prompt']>>;
         try {
           response = await runOpenCodePromptStart(turnDirectory, () =>
             source.session.prompt({
@@ -818,6 +853,23 @@
               })),
             }),
           );
+          const heldRelease = releaseProfile;
+          releaseProfile = undefined;
+          const completion = waitForAuthoritativeOpenCodeSettlement(
+            () => (client ?? source).session.wait({ sessionID: id }),
+            () =>
+              openCodeInboxSettled(response.id, (pageCursor) =>
+                (client ?? source).message.list({
+                  sessionID: id,
+                  limit: 100,
+                  order: 'desc',
+                  cursor: pageCursor,
+                }),
+              ),
+            { terminal: isSessionNotFoundError },
+          );
+          if (heldRelease)
+            void holdCapabilityProfileReservation(heldRelease, completion).catch(() => undefined);
         } catch (cause) {
           await recordImplementationModel(turnDirectory, implementingModel, tracking);
           throw cause;
@@ -888,6 +940,7 @@
       }
       if (external) throw cause;
     } finally {
+      releaseProfile?.();
       for (const path of paths) inFlightCaptures.delete(path);
       if (!accepted)
         for (const path of paths)
@@ -1132,6 +1185,21 @@
         {pendingForms}
         {client}
         sessionID={activeID}
+        workspace={thread?.directory ?? directory}
+        capabilityProfile={thread?.capabilityProfile ?? capabilityProfile}
+        ondecision={(request, decision, policy) => {
+          if (thread)
+            ondecision?.(
+              thread,
+              request.id,
+              permissionDecisionTitle(
+                `Allow ${request.action}?`,
+                policy,
+                decision === 'reject' ? 'rejected' : 'completed',
+              ),
+              decision === 'reject' ? 'rejected' : 'completed',
+            );
+        }}
         onchanged={async () => {
           if (activeID) await refreshRequests(activeID);
         }}

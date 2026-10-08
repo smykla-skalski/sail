@@ -17,6 +17,7 @@
   import BrowserPane from './BrowserPane.svelte';
   import SideChat from './SideChat.svelte';
   import type { AgentThread, AgentAvailability, AgentEntry } from './lib/acp';
+  import { acpPermissionActivitySourceId } from './lib/acp-permissions';
   import type { OpenCodeClient, SessionInfo } from './lib/opencode';
   import type { SetupReport } from './lib/onboarding';
   import type { BrowserAttachment } from './lib/browser-pick';
@@ -33,6 +34,11 @@
   import type { WorkspaceActivityItem } from './lib/workspace-activity';
   import type { ShipItIssue } from './lib/implementation-models';
   import type { TaskLocation } from './lib/task-location';
+  import {
+    permissionDecisionTitle,
+    permissionOutcome,
+    type CapabilityProfile,
+  } from './lib/capability-profiles';
   import type { NativeSubagent } from './lib/native-subagents';
   import { threadKey } from './lib/recent-threads';
   import { getPlan, getHistory, type PlanSnapshot, type HistoryEntry } from './lib/plan';
@@ -52,6 +58,8 @@
     directory: string;
     project: string;
     taskLocation: TaskLocation;
+    capabilityProfile: CapabilityProfile;
+    onensureprofile: (directory: string, profile: CapabilityProfile) => Promise<() => void>;
     dark: boolean;
     agents: AgentAvailability[];
     sideChat: SideChatState | null;
@@ -148,6 +156,8 @@
     directory,
     project,
     taskLocation,
+    capabilityProfile,
+    onensureprofile,
     dark,
     agents,
     sideChat,
@@ -622,6 +632,8 @@
       {onreviewcheck}
       {onreviewpreview}
       {onreviewcapturephase}
+      {capabilityProfile}
+      {onensureprofile}
     />
     <div
       class="pane-divider"
@@ -730,6 +742,8 @@
       {onreviewcheck}
       {onreviewpreview}
       {onreviewcapturephase}
+      {capabilityProfile}
+      {onensureprofile}
     />
   </div>
 {:else}
@@ -885,6 +899,9 @@
               {onusage}
               {onstatus}
               {onshipit}
+              {capabilityProfile}
+              {onensureprofile}
+              {ondecision}
             />
             {#if nativeDetailsVisible}
               <section class="native-details side-area" aria-label="OpenCode session details">
@@ -1036,7 +1053,23 @@
               oncreated={(thread) => oncreated(pane.id, thread)}
               {onactivity}
               ondecision={(thread, permission, optionId) =>
-                ondecision(thread, String(permission.id), permission.title, optionId)}
+                ondecision(
+                  thread,
+                  acpPermissionActivitySourceId(
+                    permission.id,
+                    permission.generation,
+                    permission.fingerprint,
+                  ),
+                  permission.policy
+                    ? permissionDecisionTitle(
+                        permission.title,
+                        permission.policy,
+                        permissionOutcome(permission.options, optionId),
+                      )
+                    : permission.title,
+                  permissionOutcome(permission.options, optionId),
+                )}
+              {capabilityProfile}
               {onstatus}
               {onreplaychange}
               onterminal={onagentterminal}
@@ -1144,6 +1177,7 @@
             focused={focused === sideChat.id}
             focusPrompt={focusPromptPane === sideChat.id}
             {onpromptfocused}
+            {onensureprofile}
           />
         </section>
       {/key}

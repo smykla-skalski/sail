@@ -55,6 +55,7 @@
   } from './lib/agent-queue';
   import {
     acp,
+    acpDisconnectAffectsSession,
     acpFinishedPromptStatus,
     acpPromptInterrupted,
     groupAgentEntries,
@@ -106,6 +107,15 @@
     type TaskLocation as TaskLocationValue,
   } from './lib/task-location';
   import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
+  import { permissionPolicy, type CapabilityProfile } from './lib/capability-profiles';
+  import { permissionResolver } from './lib/permission-resolution';
+  import {
+    acpPermissionIdentity,
+    enqueueAcpPermission,
+    fencedAcpPermissionInventory,
+    reconcileRejectedAcpPermission,
+    removeResolvedAcpPermission,
+  } from './lib/acp-permissions';
 
   interface Props {
     agent: AgentId;
@@ -150,6 +160,7 @@
       workerModel?: string,
     ) => Promise<void>;
     nativeEntries?: AgentEntry[];
+    capabilityProfile?: CapabilityProfile;
   }
   let {
     agent,
@@ -186,8 +197,11 @@
     onworkspaceactivity,
     onshipit,
     nativeEntries,
+    capabilityProfile = 'build',
   }: Props = $props();
   let mounted = $state(false);
+  let permissionInventoryRevision = 0;
+  const activeCapabilityProfile = $derived(thread?.capabilityProfile ?? capabilityProfile);
   let hookActivities = $state<HookActivity[]>([]);
   function mergeHookActivities(items: HookActivity[]) {
     const merged = new SvelteMap(hookActivities.map((item) => [item.id, item]));
@@ -707,7 +721,7 @@
     setReplaying(true);
     replayEntries = [];
     try {
-      await acp.load(agent, directory, id);
+      await acp.load(agent, directory, id, activeCapabilityProfile);
       if (current !== generation) return;
       entries = restoreEntryTimes(replayEntries, entries);
       visibleCount = 50;
@@ -749,7 +763,6 @@
   function queuePermission(message: AgentEvent['message']) {
     const params = message.params;
     if (!params || params.sessionId !== activeSessionId || message.id == null) return;
-    if (permissions.some((permission) => String(permission.id) === String(message.id))) return;
     const tool = params.toolCall;
     const title =
       tool && typeof tool === 'object' && 'title' in tool && typeof tool.title === 'string'
@@ -765,7 +778,29 @@
             typeof option.kind === 'string',
         )
       : [];
-    permissions = [...permissions, { id: message.id, sessionId: activeSessionId!, title, options }];
+    const policy = permissionPolicy({
+      profile: activeCapabilityProfile,
+      workspace: directory,
+      title,
+      toolCall: tool,
+      options,
+    });
+    const permission: AgentPermission = {
+      id: message.id,
+      sessionId: activeSessionId!,
+      title,
+      options,
+      policy,
+      generation:
+        typeof params.sailPermissionGeneration === 'number'
+          ? params.sailPermissionGeneration
+          : undefined,
+      fingerprint:
+        typeof params.sailPermissionFingerprint === 'string'
+          ? params.sailPermissionFingerprint
+          : undefined,
+    };
+    permissions = enqueueAcpPermission(permissions, permission);
     if (thread) onstatus(thread, 'waiting');
   }
 
@@ -826,7 +861,7 @@
       return;
     }
     try {
-      const info = await acp.connect(agent);
+      const info = await acp.connect(agent, activeCapabilityProfile);
       if (current !== generation) return;
       authMethods = (info.authMethods as AgentAuthMethod[] | undefined) ?? [];
       if (id) {
@@ -854,8 +889,8 @@
         }
         const session =
           restoresSubagents || !canResume
-            ? await acp.load(agent, directory, id)
-            : await acp.resume(agent, directory, id);
+            ? await acp.load(agent, directory, id, activeCapabilityProfile)
+            : await acp.resume(agent, directory, id, activeCapabilityProfile);
         if (current === generation && (restoresSubagents || !canResume)) {
           entries = restoreEntryTimes(replayEntries, entries);
           setReplaying(false);
@@ -873,8 +908,12 @@
         if (current === generation && Array.isArray(session.availableCommands))
           updateSkills(session.availableCommands);
         if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
-        const waiting = await acp.pendingPermissions(agent, id);
-        if (current === generation) for (const request of waiting) queuePermission(request);
+        const waiting = await fencedAcpPermissionInventory(
+          () => acp.pendingPermissions(agent, id),
+          () => permissionInventoryRevision,
+          () => current === generation && activeSessionId === id,
+        );
+        if (waiting) for (const request of waiting) queuePermission(request);
       }
       if (current === generation) ready = true;
     } catch (cause) {
@@ -926,7 +965,7 @@
     const sessionDirectory = directory;
     let task!: Promise<AgentThread>;
     task = (async () => {
-      const session = await acp.create(sessionAgent, sessionDirectory);
+      const session = await acp.create(sessionAgent, sessionDirectory, activeCapabilityProfile);
       const created: AgentThread = {
         agent: sessionAgent,
         model: session.configOptions?.find(
@@ -936,6 +975,7 @@
         directory: sessionDirectory,
         title,
         updated: Date.now(),
+        capabilityProfile: activeCapabilityProfile,
       };
       if (current !== generation) {
         if (ephemeral) await acp.cancel(sessionAgent, session.sessionId, null).catch(() => {});
@@ -1003,7 +1043,10 @@
     void listen<AgentEvent>('acp-event', ({ payload }) => {
       if (disposed || payload.agent !== agent) return;
       const { message } = payload;
-      if (message.method === 'sail/disconnected') {
+      if (
+        message.method === 'sail/disconnected' &&
+        acpDisconnectAffectsSession(message, activeSessionId, activeCapabilityProfile)
+      ) {
         inFlightSteer?.finish();
         ready = false;
         busy = false;
@@ -1035,9 +1078,24 @@
       }
       if (!params || params.sessionId !== activeSessionId) return;
       if (message.method === 'sail/permission_resolved') {
-        permissions = permissions.filter(
-          (permission) => String(permission.id) !== String(params.requestId),
-        );
+        if (
+          (typeof params.requestId !== 'string' && typeof params.requestId !== 'number') ||
+          typeof params.sessionId !== 'string'
+        )
+          return;
+        permissionInventoryRevision++;
+        permissions = removeResolvedAcpPermission(permissions, {
+          id: params.requestId,
+          sessionId: params.sessionId,
+          generation:
+            typeof params.sailPermissionGeneration === 'number'
+              ? params.sailPermissionGeneration
+              : undefined,
+          fingerprint:
+            typeof params.sailPermissionFingerprint === 'string'
+              ? params.sailPermissionFingerprint
+              : undefined,
+        });
         if (thread && running && permissions.length === 0) onstatus(thread, 'working');
       } else if (message.method === 'session/update') {
         const update = params.update;
@@ -1096,7 +1154,16 @@
       if (ephemeral && activeSessionId) {
         void acp.cancel(agent, activeSessionId, activeTurnId).catch(() => {});
         for (const permission of permissions)
-          void acp.permission(agent, permission.id, null).catch(() => {});
+          void acp
+            .permission(
+              agent,
+              permission.id,
+              null,
+              permission.sessionId,
+              permission.generation,
+              permission.fingerprint,
+            )
+            .catch(() => {});
       }
       images.forEach((image) => void invoke('browser_remove_capture', { path: image.imagePath }));
       clipboardAttachments.forEach((attachment) => removeClipboardAttachment(attachment));
@@ -1517,7 +1584,18 @@
     try {
       await acp.cancel(agent, sessionId, activeTurnId);
       cancelSent = true;
-      await Promise.all(pending.map((permission) => acp.permission(agent, permission.id, null)));
+      await Promise.all(
+        pending.map((permission) =>
+          acp.permission(
+            agent,
+            permission.id,
+            null,
+            permission.sessionId,
+            permission.generation,
+            permission.fingerprint,
+          ),
+        ),
+      );
       if (current !== generation || activeSessionId !== sessionId) return;
       permissions = [];
       markTools('stopping', ['pending', 'in_progress']);
@@ -1530,18 +1608,68 @@
   }
 
   async function answer(permission: AgentPermission, optionId: string) {
-    const lastRequest = permissions.length === 1 && permissions[0]?.id === permission.id;
+    const identity = acpPermissionIdentity(permission);
+    const lastRequest =
+      permissions.length === 1 && acpPermissionIdentity(permissions[0]!) === identity;
     if (thread && lastRequest) onstatus(thread, 'working');
     try {
-      await acp.permission(agent, permission.id, optionId);
-      permissions = permissions.filter((item) => item.id !== permission.id);
-      if (thread) ondecision?.(thread, permission, optionId);
+      await permissionResolver.resolve({
+        key: `acp:${agent}:${permission.sessionId}:${permission.id}`,
+        generation: permission.fingerprint ?? permission.generation ?? permission.sessionId,
+        policy:
+          permission.policy ??
+          permissionPolicy({
+            profile: activeCapabilityProfile,
+            workspace: directory,
+            title: permission.title,
+            toolCall: {},
+            options: permission.options,
+          }),
+        optionId,
+        respond: (selectedOptionId: string | null) =>
+          acp.permission(
+            agent,
+            permission.id,
+            selectedOptionId,
+            permission.sessionId,
+            permission.generation,
+            permission.fingerprint,
+          ),
+        record: (selectedOptionId: string | null) => {
+          if (selectedOptionId === null) return;
+          if (thread) ondecision?.(thread, permission, selectedOptionId);
+        },
+      });
+      permissions = permissions.filter((item) => acpPermissionIdentity(item) !== identity);
     } catch (cause) {
       error = describe(cause);
-      if (thread && lastRequest) {
-        const pending = await acp.pendingPermissions(agent, permission.sessionId).catch(() => []);
-        if (pending.some((message) => message.id === permission.id)) onstatus(thread, 'waiting');
-      }
+      const pending = await acp.pendingPermissions(agent, permission.sessionId).catch(() => null);
+      const pendingIdentities = pending?.flatMap((message) => {
+        const sessionId = message.params?.sessionId;
+        return (typeof message.id === 'string' || typeof message.id === 'number') &&
+          typeof sessionId === 'string'
+          ? [
+              {
+                id: message.id,
+                sessionId,
+                generation:
+                  typeof message.params?.sailPermissionGeneration === 'number'
+                    ? message.params.sailPermissionGeneration
+                    : undefined,
+                fingerprint:
+                  typeof message.params?.sailPermissionFingerprint === 'string'
+                    ? message.params.sailPermissionFingerprint
+                    : undefined,
+              },
+            ]
+          : [];
+      });
+      const remainsPending = pendingIdentities?.some(
+        (candidate) => acpPermissionIdentity(candidate) === identity,
+      );
+      if (thread && lastRequest && remainsPending) onstatus(thread, 'waiting');
+      if (pendingIdentities)
+        permissions = reconcileRejectedAcpPermission(permissions, permission, pendingIdentities);
     }
   }
 
@@ -1597,7 +1725,7 @@
     authenticating = true;
     error = '';
     try {
-      await acp.authenticate(agent, methodId);
+      await acp.authenticate(agent, methodId, activeCapabilityProfile);
       authNeeded = false;
       if (activeSessionId) await activate(activeSessionId);
       else if (pickerOpen) await ensureSession('New thread');
@@ -1929,7 +2057,7 @@
           {/each}
         </div>
       {/if}
-      {#each permissions as permission (String(permission.id))}
+      {#each permissions as permission (acpPermissionIdentity(permission))}
         <div
           class="agent-permission"
           role="group"
@@ -1940,12 +2068,16 @@
           tabindex="-1"
         >
           <strong>{permission.title}</strong>
+          {#if permission.policy}<small
+              >{permission.policy.profile} · {permission.policy.risk} risk · policy {permission
+                .policy.policyRevision}: {permission.policy.reason}</small
+            >{/if}
           <div>
-            {#each permission.options as option (option.optionId)}<Button
-                size="sm"
-                variant={option.kind.startsWith('allow') ? 'primary' : 'secondary'}
-                onclick={() => answer(permission, option.optionId)}>{option.name}</Button
-              >{/each}
+            {#each permission.options as option (option.optionId)}{#if permission.policy?.recommendation !== 'deny' || !option.kind.startsWith('allow')}<Button
+                  size="sm"
+                  variant={option.kind.startsWith('allow') ? 'primary' : 'secondary'}
+                  onclick={() => answer(permission, option.optionId)}>{option.name}</Button
+                >{/if}{/each}
           </div>
         </div>
       {/each}

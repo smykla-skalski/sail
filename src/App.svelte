@@ -103,6 +103,21 @@
     type ContextProvider,
   } from './lib/context-handoff.ts';
   import {
+    automaticPermissionPolicy,
+    CapabilityProfileReservationCoordinator,
+    capabilityProfileForPhase,
+    capabilityProfileFromMetadata,
+    capabilityProfileForRuntime,
+    conflictingCapabilityProfiles,
+    holdCapabilityProfileReservation,
+    openCodePermissionToolCall,
+    permissionDecisionTitle,
+    permissionOutcome,
+    permissionPolicy,
+    permissionReadResources,
+    type CapabilityProfile,
+  } from './lib/capability-profiles';
+  import {
     commitRevisionBoundEvidence,
     evidenceReadiness,
     ciEvidenceIdentity,
@@ -189,10 +204,20 @@
     recordImplementationModel,
   } from './lib/implementation-models';
   import {
+    holdAcceptedOpenCodeTurn,
+    openCodeInboxSettled,
     runOpenCodeCleanup,
     runOpenCodePromptStart,
+    runReservedOpenCodeTurn,
     runSerialOpenCodeTurn,
+    waitForAuthoritativeOpenCodeSettlement,
   } from './lib/opencode-turns';
+  import {
+    assertAutomaticPermissionAllowed,
+    permissionResolver,
+    type AutomaticPermissionRequest,
+  } from './lib/permission-resolution';
+  import { openCodePermissionRejections } from './lib/opencode-permission-resolution';
   import {
     prepareToolFailureDraft,
     openCodeErrorDetails,
@@ -207,6 +232,9 @@
   import {
     failedCheckOutcome,
     inboxLocations,
+    inboxPermissionDecisionTitle,
+    inboxPermissionProfile,
+    inboxRejectedPermissionPolicy,
     inboxTurnMessageIndex,
     isInboxOutcome,
     loadInboxOutcomes,
@@ -270,6 +298,8 @@
   } from './lib/panes';
   import {
     acp,
+    acpDisconnectAffectsSession,
+    acpDisconnectedSessionIds,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
     forgetRecentTranscript,
@@ -285,6 +315,7 @@
     type AgentThread,
     type InterruptedAgentTurn,
   } from './lib/acp';
+  import { acpPermissionActivitySourceId } from './lib/acp-permissions';
   import {
     compatibleOpenCodeVersion,
     connect,
@@ -460,6 +491,36 @@
       });
   });
   let shipRuns = $state<ShipRun[]>(loadShipRuns(getSetting('sai-ship-runs')));
+
+  function capabilityProfileForDirectory(path: string): CapabilityProfile {
+    const issue = shipRuns
+      .flatMap((run) => run.issues)
+      .find((candidate) => candidate.path === path);
+    return capabilityProfileForPhase(issue?.checkpoint?.phase);
+  }
+
+  function capabilityProfileForSession(
+    session: Pick<SessionInfo, 'metadata'> | null | undefined,
+    path: string,
+  ): CapabilityProfile {
+    return capabilityProfileFromMetadata(session?.metadata, capabilityProfileForDirectory(path));
+  }
+
+  function capabilityProfileForAcpSession(
+    agent: AgentId,
+    path: string,
+    sessionId: string,
+    fallback?: CapabilityProfile,
+  ): CapabilityProfile {
+    return (
+      agentThreads.find(
+        (thread) =>
+          thread.agent === agent && thread.directory === path && thread.sessionId === sessionId,
+      )?.capabilityProfile ??
+      fallback ??
+      capabilityProfileForDirectory(path)
+    );
+  }
   let shippingBusy = $state(false);
   const activeShipLaunches = new SvelteSet<string>();
   let acpRecoveryReady = false;
@@ -496,7 +557,8 @@
   let browserAccessDisabled = $state(
     getSetting(`sai-browser-disabled:${savedDirectory}`) === 'true',
   );
-  const openCodeBrowserServers = new SvelteSet<string>();
+  const openCodeBrowserServers = new SvelteMap<string, CapabilityProfile>();
+  const openCodeProfileReservations = new CapabilityProfileReservationCoordinator();
   type BrowserMcpConfig = { command: string; args: string[]; env: Record<string, string> };
   type BrowserAccessRequest = { id: string; sessionId: string; directory: string; origin?: string };
   type CoordinationRequest = {
@@ -1616,7 +1678,7 @@
         workspace: item.directory,
         kind: 'decision',
         source: item.agent,
-        sourceId: String(item.requestId ?? item.key),
+        sourceId: inboxDecisionActivitySourceId(item),
         title: item.text,
         outcome: 'waiting',
         at: item.receivedAt,
@@ -2186,8 +2248,26 @@
     await recoverRuntime();
   }
 
-  async function ensureOpenCodeBrowser(path: string) {
-    if (!client || openCodeBrowserServers.has(path)) return;
+  async function configureOpenCodeBrowser(
+    path: string,
+    profile: CapabilityProfile = capabilityProfileForDirectory(path),
+  ) {
+    if (!client || openCodeBrowserServers.get(path) === profile) return;
+    const activeProfiles = new Set(
+      [...nativeThreads, ...sidebarOpenCodeThreads]
+        .filter(
+          (thread) =>
+            thread.directory === path &&
+            thread.capabilityProfile &&
+            (activeSessionIDs.includes(thread.sessionId) || runningAgentThreads[threadKey(thread)]),
+        )
+        .map((thread) => thread.capabilityProfile!),
+    );
+    const conflicts = conflictingCapabilityProfiles(activeProfiles, profile);
+    if (conflicts.length)
+      throw new Error(
+        `Wait for the active ${conflicts.join('/')} OpenCode turn before switching to the ${profile} capability profile.`,
+      );
     let delayed = false;
     if (import.meta.env.MODE === 'e2e') {
       const delay = Number(sessionStorage.getItem('sai-e2e-browser-setup-delay'));
@@ -2197,7 +2277,10 @@
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
-    const config = await invoke<BrowserMcpConfig>('browser_mcp_config', { directory: path });
+    const config = await invoke<BrowserMcpConfig>('browser_mcp_config', {
+      directory: path,
+      profile,
+    });
     await client.mcp.add({
       server: 'sail-browser',
       location: { directory: path },
@@ -2208,8 +2291,45 @@
         codemode: false,
       },
     });
-    openCodeBrowserServers.add(path);
+    openCodeBrowserServers.set(path, profile);
     if (delayed) sessionStorage.setItem('sai-e2e-browser-setup-finished', path);
+  }
+
+  async function reserveOpenCodeBrowser(
+    path: string,
+    profile: CapabilityProfile,
+  ): Promise<() => void> {
+    return openCodeProfileReservations.reserve(path, profile, () =>
+      configureOpenCodeBrowser(path, profile),
+    );
+  }
+
+  async function ensureOpenCodeBrowser(
+    path: string,
+    profile: CapabilityProfile = capabilityProfileForDirectory(path),
+  ): Promise<void> {
+    const release = await reserveOpenCodeBrowser(path, profile);
+    release();
+  }
+
+  function waitForOpenCodeInboxSettlement(
+    source: OpenCodeClient,
+    sessionId: string,
+    inboxId: string,
+  ): Promise<void> {
+    return waitForAuthoritativeOpenCodeSettlement(
+      () => (client ?? source).session.wait({ sessionID: sessionId }),
+      () =>
+        openCodeInboxSettled(inboxId, (cursor) =>
+          (client ?? source).message.list({
+            sessionID: sessionId,
+            limit: 100,
+            order: 'desc',
+            cursor,
+          }),
+        ),
+      { terminal: isSessionNotFoundError },
+    );
   }
 
   function toggleAgentBrowserAccess() {
@@ -2235,13 +2355,29 @@
     client = nextClient;
     nativeActivityReady = false;
     openCodeBrowserServers.clear();
+    openCodeProfileReservations.beginConfigurationGeneration();
     activeBinary = info.binaryPath;
     runtimeState = 'connected';
     runtimeError = '';
     hasConnected = true;
-    if (directory)
-      await ensureOpenCodeBrowser(directory).catch((cause) => (error = describe(cause)));
-    await resync().catch((cause) => {
+    const resynced = await resync().then(
+      () => true,
+      (cause) => {
+        error = describe(cause);
+        return false;
+      },
+    );
+    if (directory && resynced) {
+      const profile = capabilityProfileForRuntime(
+        sessions.filter((session) => session.location.directory === directory),
+        activeSessionIDs,
+        capabilityProfileForDirectory(directory),
+      );
+      if (profile === null) error = 'Active OpenCode sessions use conflicting capability profiles.';
+      else
+        await ensureOpenCodeBrowser(directory, profile).catch((cause) => (error = describe(cause)));
+    }
+    await reconcileOpenCodePermissions(nextClient).catch((cause) => {
       error = describe(cause);
     });
     await reconcileOpenCodeSpawnReceipts();
@@ -2249,6 +2385,12 @@
     eventController = new AbortController();
     connecting = false;
     void watchEvents(nextClient, eventController.signal);
+  }
+
+  function reconcileOpenCodePermissions(source: OpenCodeClient): Promise<void> {
+    return openCodePermissionRejections.reconcile((pendingSessionID) =>
+      source.permission.list({ sessionID: pendingSessionID }),
+    );
   }
 
   async function recoverRuntime() {
@@ -4151,14 +4293,24 @@
         updateSpawnReceipt(receipt.receiptId, { turnId });
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       }
-      const startingPrompt = runOpenCodePromptStart(receipt.targetDirectory, () =>
-        source.session.prompt({
-          sessionID: sessionId,
-          text: prompt,
-          id: turnId,
-        }),
+      const profile = capabilityProfileForSession(session, receipt.targetDirectory);
+      const inboxItem = await runReservedOpenCodeTurn(
+        sessionId,
+        () => reserveOpenCodeBrowser(receipt.targetDirectory!, profile),
+        async () => {
+          const target = await source.session.get({ sessionID: sessionId });
+          if (target.location.directory !== receipt.targetDirectory)
+            throw new Error('Target session moved to another worktree.');
+          return runOpenCodePromptStart(receipt.targetDirectory!, () =>
+            source.session.prompt({
+              sessionID: sessionId,
+              text: prompt,
+              id: turnId,
+            }),
+          );
+        },
+        (accepted) => waitForOpenCodeInboxSettlement(source, sessionId, accepted.id),
       );
-      const inboxItem = await startingPrompt;
       updateSpawnReceipt(receipt.receiptId, { state: 'queued', turnId: inboxItem.id });
     } finally {
       activeSpawnRequests.delete(receipt.receiptId);
@@ -4184,8 +4336,15 @@
         sessionCapabilities &&
         typeof sessionCapabilities === 'object' &&
         'resume' in sessionCapabilities;
-      if (canResume) await acp.resume(receipt.provider, receipt.targetDirectory, sessionId);
-      else await acp.load(receipt.provider, receipt.targetDirectory, sessionId);
+      const capabilityProfile = capabilityProfileForAcpSession(
+        receipt.provider,
+        receipt.targetDirectory,
+        sessionId,
+        receipt.validation ? 'review' : undefined,
+      );
+      if (canResume)
+        await acp.resume(receipt.provider, receipt.targetDirectory, sessionId, capabilityProfile);
+      else await acp.load(receipt.provider, receipt.targetDirectory, sessionId, capabilityProfile);
       const restoredActivity = (await acp.activity())[receipt.provider] ?? null;
       if (acpPromptHasBackendEvidence(receipt, restoredActivity)) {
         reconcileAcpSpawnReceipt(receipt, restoredActivity);
@@ -4306,7 +4465,17 @@
     setAgentReplay(receipt.provider, sessionId, true);
     try {
       await acp.connect(receipt.provider);
-      await acp.load(receipt.provider, receipt.targetDirectory, sessionId);
+      await acp.load(
+        receipt.provider,
+        receipt.targetDirectory,
+        sessionId,
+        capabilityProfileForAcpSession(
+          receipt.provider,
+          receipt.targetDirectory,
+          sessionId,
+          receipt.validation ? 'review' : undefined,
+        ),
+      );
       const promptIndex = replay.findLastIndex(
         (entry) => entry.type === 'user' && entry.text.includes(receipt.prompt!),
       );
@@ -4438,8 +4607,12 @@
               sessionCapabilities &&
               typeof sessionCapabilities === 'object' &&
               'resume' in sessionCapabilities;
-            if (canResume) await acp.resume(thread.agent, thread.directory, thread.sessionId);
-            else await acp.load(thread.agent, thread.directory, thread.sessionId);
+            const capabilityProfile =
+              thread.capabilityProfile ?? capabilityProfileForDirectory(thread.directory);
+            if (canResume)
+              await acp.resume(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
+            else
+              await acp.load(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
           }
           await waitForCoordinationThread(thread);
           if (disposed) return;
@@ -4494,11 +4667,22 @@
             session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
             target.id,
           );
-          const turn = runOpenCodePromptStart(target.directory, () =>
-            promptClient.session.prompt({
-              sessionID: sessionId,
-              text,
-            }),
+          const profile = capabilityProfileForSession(session, target.directory);
+          const turn = runReservedOpenCodeTurn(
+            sessionId,
+            () => reserveOpenCodeBrowser(target.directory, profile),
+            async () => {
+              const current = await promptClient.session.get({ sessionID: sessionId });
+              if (current.location.directory !== target.directory)
+                throw new Error('Target session moved to another worktree.');
+              return runOpenCodePromptStart(target.directory, () =>
+                promptClient.session.prompt({
+                  sessionID: sessionId,
+                  text,
+                }),
+              );
+            },
+            (accepted) => waitForOpenCodeInboxSettlement(promptClient, sessionId, accepted.id),
           );
           void turn
             .then(() => promptClient.session.wait({ sessionID: sessionId }))
@@ -6092,8 +6276,11 @@
     if (!validation)
       await beginShipItRun(created.path, prompt, promptSkill(skills, prompt)?.name ?? null);
     if (source.kind === 'acp') {
+      const capabilityProfile: CapabilityProfile = validation
+        ? 'review'
+        : capabilityProfileForDirectory(created.path);
       const session = await acp
-        .create(source.agent, created.path, nativeGeneration)
+        .create(source.agent, created.path, capabilityProfile, nativeGeneration)
         .catch((cause) => {
           if (!validation) throw cause;
           throw new ValidationCandidateUnavailable(`${source.agent} is unavailable`, cause);
@@ -6132,6 +6319,7 @@
           directory: created.path,
           title: prompt.slice(0, 60),
           updated: Date.now(),
+          capabilityProfile,
         };
         saveAgentThread(thread);
         if (receiptId)
@@ -6243,123 +6431,142 @@
       throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
     }
     const promptClient = client;
-    await ensureOpenCodeBrowser(created.path).catch((cause) => {
+    const capabilityProfile: CapabilityProfile = validation
+      ? 'review'
+      : capabilityProfileForDirectory(created.path);
+    let releaseProfile: (() => void) | undefined = await reserveOpenCodeBrowser(
+      created.path,
+      capabilityProfile,
+    ).catch((cause) => {
       if (!validation) throw cause;
       throw new ValidationCandidateUnavailable('OpenCode is unavailable', cause);
     });
-    const session = await promptClient.session
-      .create({
-        location: { directory: created.path },
-        metadata: { saiHarness: true },
-        title: prompt.slice(0, 60),
-        agent: source.agent === 'OpenCode' ? undefined : source.agent,
-        model: source.model,
-      })
-      .catch((cause) => {
-        if (!validation) throw cause;
-        throw new ValidationCandidateUnavailable(
-          `OpenCode / ${source.model?.providerID}:${source.model?.id} is unavailable`,
-          cause,
-        );
-      });
-    if (
-      source.model &&
-      (session.model?.providerID !== source.model.providerID ||
-        session.model.id !== source.model.id)
-    ) {
-      const message = `Cannot verify OpenCode selected model ${source.model.providerID}:${source.model.id}.`;
-      throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
-    }
-    if (receiptId)
-      updateSpawnReceipt(receiptId, {
-        targetId: `opencode:${session.id}`,
-        model: session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-        targetDirectory: created.path,
-        worktreeId: created.path,
-      });
-    if (receiptId)
-      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
-    if (receiptId) await saveShipRuns();
-    rememberRecentThread({
-      agent: 'opencode',
-      sessionId: session.id,
-      directory: created.path,
-      title: prompt.slice(0, 60),
-      updated: Date.now(),
-    });
-    await invoke('record_turn_snapshot', {
-      path: created.path,
-      thread: `opencode:${session.id}`,
-    });
-    const tracking = validation
-      ? null
-      : await beginImplementationTurn(
-          created.path,
-          session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-          `opencode:${session.id}`,
-        );
-    const turnId = receiptId ? crypto.randomUUID() : undefined;
-    if (receiptId) {
-      updateSpawnReceipt(receiptId, { turnId: turnId! });
-      await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
-    }
-    await beforePrompt?.();
-    if (receiptId) requireSpawnPromptDispatch(receiptId);
-    const startingPrompt = runOpenCodePromptStart(created.path, () =>
-      promptClient.session.prompt({
-        sessionID: session.id,
-        text: prompt,
-        id: turnId,
-      }),
-    );
-    if (receiptId) updateSpawnReceipt(receiptId, { state: 'working' });
-    if (receiptId)
-      void startingPrompt
-        .then(async (inbox) => {
-          updateSpawnReceipt(receiptId, { turnId: inbox.id });
-          try {
-            await promptClient.session.wait({ sessionID: session.id });
-            if (tracking)
-              await recordImplementationModel(
-                created.path,
-                session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-                tracking,
-              );
-            const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
-            if (receipt) await settleOpenCodeReceipt(receipt, promptClient);
-          } catch (cause) {
-            if (tracking) abandonImplementationTurn(created.path, tracking);
-            updateSpawnReceipt(receiptId, { state: 'unavailable', error: describe(cause) });
-          }
-          return undefined;
+    try {
+      const session = await promptClient.session
+        .create({
+          location: { directory: created.path },
+          metadata: { saiHarness: true, sailCapabilityProfile: capabilityProfile },
+          title: prompt.slice(0, 60),
+          agent: source.agent === 'OpenCode' ? undefined : source.agent,
+          model: source.model,
         })
         .catch((cause) => {
-          if (tracking) abandonImplementationTurn(created.path, tracking);
-          updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+          if (!validation) throw cause;
+          throw new ValidationCandidateUnavailable(
+            `OpenCode / ${source.model?.providerID}:${source.model?.id} is unavailable`,
+            cause,
+          );
         });
-    else if (tracking)
-      void startingPrompt
-        .then(() => promptClient.session.wait({ sessionID: session.id }))
-        .then(() =>
-          recordImplementationModel(
+      if (
+        source.model &&
+        (session.model?.providerID !== source.model.providerID ||
+          session.model.id !== source.model.id)
+      ) {
+        const message = `Cannot verify OpenCode selected model ${source.model.providerID}:${source.model.id}.`;
+        throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
+      }
+      if (receiptId)
+        updateSpawnReceipt(receiptId, {
+          targetId: `opencode:${session.id}`,
+          model: session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+          targetDirectory: created.path,
+          worktreeId: created.path,
+        });
+      if (receiptId)
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      if (receiptId) await saveShipRuns();
+      rememberRecentThread({
+        agent: 'opencode',
+        sessionId: session.id,
+        directory: created.path,
+        title: prompt.slice(0, 60),
+        updated: Date.now(),
+        capabilityProfile,
+      });
+      await invoke('record_turn_snapshot', {
+        path: created.path,
+        thread: `opencode:${session.id}`,
+      });
+      const tracking = validation
+        ? null
+        : await beginImplementationTurn(
             created.path,
             session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-            tracking,
-          ),
-        )
-        .catch((cause) => {
-          abandonImplementationTurn(created.path, tracking);
-          error = `Could not track implementation model: ${describe(cause)}`;
-        });
-    await awaitCoordinationStart(startingPrompt, async () => {
-      if (!client) return false;
-      const active = await client.session.active();
-      return active[session.id]?.type === 'running';
-    });
-    void startingPrompt.catch((cause) => {
-      error = `Could not start agent thread: ${describe(cause)}`;
-    });
-    return { path: created.path, branch: created.branch, threadId: `opencode:${session.id}` };
+            `opencode:${session.id}`,
+          );
+      const turnId = receiptId ? crypto.randomUUID() : undefined;
+      if (receiptId) {
+        updateSpawnReceipt(receiptId, { turnId: turnId! });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      }
+      await beforePrompt?.();
+      if (receiptId) requireSpawnPromptDispatch(receiptId);
+      const startingPrompt = runOpenCodePromptStart(created.path, () =>
+        promptClient.session.prompt({
+          sessionID: session.id,
+          text: prompt,
+          id: turnId,
+        }),
+      );
+      if (receiptId) {
+        updateSpawnReceipt(receiptId, { state: 'working' });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+      }
+      const heldRelease = releaseProfile;
+      releaseProfile = undefined;
+      void holdAcceptedOpenCodeTurn(heldRelease, startingPrompt, (accepted) =>
+        waitForOpenCodeInboxSettlement(promptClient, session.id, accepted.id),
+      ).catch(() => undefined);
+      if (receiptId)
+        void startingPrompt
+          .then(async (inbox) => {
+            updateSpawnReceipt(receiptId, { turnId: inbox.id });
+            try {
+              await promptClient.session.wait({ sessionID: session.id });
+              if (tracking)
+                await recordImplementationModel(
+                  created.path,
+                  session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+                  tracking,
+                );
+              const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+              if (receipt) await settleOpenCodeReceipt(receipt, promptClient);
+            } catch (cause) {
+              if (tracking) abandonImplementationTurn(created.path, tracking);
+              updateSpawnReceipt(receiptId, { state: 'unavailable', error: describe(cause) });
+            }
+            return undefined;
+          })
+          .catch((cause) => {
+            if (tracking) abandonImplementationTurn(created.path, tracking);
+            updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+          });
+      else if (tracking)
+        void startingPrompt
+          .then(() => promptClient.session.wait({ sessionID: session.id }))
+          .then(() =>
+            recordImplementationModel(
+              created.path,
+              session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
+              tracking,
+            ),
+          )
+          .catch((cause) => {
+            abandonImplementationTurn(created.path, tracking);
+            error = `Could not track implementation model: ${describe(cause)}`;
+          });
+      await awaitCoordinationStart(startingPrompt, async () => {
+        if (!client) return false;
+        const active = await client.session.active();
+        return active[session.id]?.type === 'running';
+      });
+      void startingPrompt.catch((cause) => {
+        error = `Could not start agent thread: ${describe(cause)}`;
+      });
+      return { path: created.path, branch: created.branch, threadId: `opencode:${session.id}` };
+    } finally {
+      releaseProfile?.();
+    }
   }
 
   function requireSpawnPromptDispatch(receiptId: string): void {
@@ -6505,23 +6712,64 @@
             const ids = [
               ...new Set([...permissions.data, ...forms.data].map((item) => item.sessionID)),
             ];
-            const agents = new Map(
+            const sessionDetails = new Map(
               await Promise.all(
                 ids.map(async (id) => {
-                  const agent = await source.session
-                    .get({ sessionID: id })
-                    .then((session) => session.agent)
-                    .catch(() => null);
-                  return [id, agent] as const;
+                  const session = await source.session.get({ sessionID: id }).catch(() => null);
+                  return [id, session] as const;
                 }),
               ),
             );
-            return { location, permissions: permissions.data, forms: forms.data, agents };
+            const resourceTrust = new Map(
+              await Promise.all(
+                permissions.data.map(async (request) => {
+                  const toolCall = openCodePermissionToolCall(request);
+                  const trust = await acp
+                    .permissionResourcesTrusted(
+                      location.directory,
+                      permissionReadResources(toolCall),
+                    )
+                    .catch(() => ({ trusted: false, canonicalResources: [] }));
+                  return [request.id, trust] as const;
+                }),
+              ),
+            );
+            return {
+              location,
+              permissions: permissions.data,
+              forms: forms.data,
+              sessionDetails,
+              resourceTrust,
+            };
           })
         : []),
     ]);
     if (generation !== inboxGeneration || disposed) return;
     const items: InboxItem[] = [];
+    const automaticPermissions: AutomaticPermissionRequest[] = [];
+    const acpResourceTrust =
+      acpResult.status === 'fulfilled'
+        ? new Map(
+            await Promise.all(
+              acpResult.value.map(async (pending) => {
+                const sessionId = pending.message.params?.sessionId;
+                const thread = [...agentThreads, ...nativeChildThreads].find(
+                  (item) => item.agent === pending.agent && item.sessionId === sessionId,
+                );
+                const trust = thread
+                  ? await acp
+                      .permissionResourcesTrusted(
+                        thread.directory,
+                        permissionReadResources(pending.message.params?.toolCall),
+                      )
+                      .catch(() => ({ trusted: false, canonicalResources: [] }))
+                  : { trusted: false, canonicalResources: [] };
+                return [pending, trust] as const;
+              }),
+            ),
+          )
+        : new Map();
+    if (generation !== inboxGeneration || disposed) return;
     if (acpResult.status === 'fulfilled') {
       for (const pending of acpResult.value) {
         const sessionId = pending.message.params?.sessionId;
@@ -6549,7 +6797,25 @@
                 typeof option.kind === 'string',
             )
           : [];
-        const key = `acp:${pending.agent}:${requestId}`;
+        const resourceTrust = acpResourceTrust.get(pending);
+        const policy = automaticPermissionPolicy({
+          profile: thread.capabilityProfile ?? capabilityProfileForDirectory(thread.directory),
+          workspace: thread.directory,
+          title,
+          toolCall: tool,
+          options,
+          resourceTrust,
+        });
+        const key = `acp:${pending.agent}:${sessionId}:${requestId}`;
+        const rawPermissionGeneration = pending.message.params?.sailPermissionGeneration;
+        const permissionGeneration =
+          typeof rawPermissionGeneration === 'number'
+            ? rawPermissionGeneration
+            : pending.receivedAt;
+        const rawPermissionFingerprint = pending.message.params?.sailPermissionFingerprint;
+        const permissionFingerprint =
+          typeof rawPermissionFingerprint === 'string' ? rawPermissionFingerprint : undefined;
+        const decisionTitle = permissionDecisionTitle(title, policy);
         items.push({
           ...location,
           key,
@@ -6558,29 +6824,245 @@
           agentId: pending.agent,
           sessionId,
           requestId,
-          text: title,
+          text: decisionTitle,
           receivedAt: pending.receivedAt,
           options,
+          allow: policy.recommendation !== 'deny',
+          policy,
+          permissionTitle: title,
+          generation: permissionGeneration,
+          fingerprint: permissionFingerprint,
+        });
+        automaticPermissions.push({
+          key,
+          generation: permissionFingerprint ?? permissionGeneration,
+          policy,
+          respond: async (optionId) => {
+            if (policy.recommendation === 'allow') {
+              const latestTrust = await acp.permissionResourcesTrusted(
+                thread.directory,
+                permissionReadResources(tool),
+              );
+              assertAutomaticPermissionAllowed(
+                {
+                  profile: policy.profile,
+                  workspace: thread.directory,
+                  title,
+                  toolCall: tool,
+                  options,
+                  resourceTrust: latestTrust,
+                },
+                optionId,
+              );
+            }
+            await acp.permission(
+              pending.agent,
+              requestId,
+              optionId,
+              sessionId,
+              permissionGeneration,
+              permissionFingerprint,
+            );
+          },
+          record: (optionId) =>
+            recordDecisionActivity(
+              thread,
+              acpPermissionActivitySourceId(requestId, permissionGeneration, permissionFingerprint),
+              decisionTitle,
+              permissionOutcome(options, optionId),
+            ),
         });
       }
     }
+    const openCodeSource = source;
     for (const result of openCodeResults) {
-      if (result.status !== 'fulfilled') continue;
-      const { location, permissions, forms, agents } = result.value;
+      if (result.status !== 'fulfilled' || !openCodeSource) continue;
+      const { location, permissions, forms, sessionDetails, resourceTrust } = result.value;
+      const permissionCounts = new SvelteMap<string, number>();
+      for (const request of permissions)
+        permissionCounts.set(request.sessionID, (permissionCounts.get(request.sessionID) ?? 0) + 1);
+      const permissionPolicies = Object.fromEntries(
+        permissions.map((request) => {
+          return [
+            request.id,
+            automaticPermissionPolicy({
+              profile: capabilityProfileForSession(
+                sessionDetails.get(request.sessionID),
+                location.directory,
+              ),
+              workspace: location.directory,
+              title: request.action,
+              toolCall: openCodePermissionToolCall(request),
+              options: [
+                { optionId: 'once', kind: 'allow_once' },
+                { optionId: 'reject', kind: 'reject_once' },
+              ],
+              resourceTrust: resourceTrust.get(request.id),
+            }),
+          ] as const;
+        }),
+      );
       for (const request of permissions) {
+        openCodePermissionRejections.observe(request);
         const key = `opencode:permission:${request.id}`;
+        const title =
+          request.message?.trim() || `Allow ${request.action} on ${request.resources.join(', ')}?`;
+        const policy = permissionPolicies[request.id];
+        const decisionTitle = permissionDecisionTitle(title, policy);
         items.push({
           ...location,
           key,
           kind: 'opencode-permission',
-          agent: agents.get(request.sessionID) ?? 'OpenCode',
+          agent: sessionDetails.get(request.sessionID)?.agent ?? 'OpenCode',
           sessionId: request.sessionID,
           requestId: request.id,
-          text:
-            request.message?.trim() ||
-            `Allow ${request.action} on ${request.resources.join(', ')}?`,
+          text: decisionTitle,
+          allow: policy.recommendation !== 'deny',
+          policy,
+          permissionPolicies,
+          permissionTitle: title,
           receivedAt: openCodeRequestTime(request.id) ?? inboxTime(key),
         });
+        if (policy.recommendation !== 'deny' || permissionCounts.get(request.sessionID) === 1)
+          automaticPermissions.push({
+            key,
+            generation: request.sessionID,
+            policy,
+            respond: async (optionId) => {
+              const latestRequest = await openCodeSource.permission.get({
+                sessionID: request.sessionID,
+                requestID: request.id,
+              });
+              if (policy.recommendation === 'allow') {
+                const latestToolCall = openCodePermissionToolCall(latestRequest);
+                const latestTrust = await acp.permissionResourcesTrusted(
+                  location.directory,
+                  permissionReadResources(latestToolCall),
+                );
+                assertAutomaticPermissionAllowed(
+                  {
+                    profile: policy.profile,
+                    workspace: location.directory,
+                    title: latestRequest.action,
+                    toolCall: latestToolCall,
+                    options: [
+                      { optionId: 'once', kind: 'allow_once' },
+                      { optionId: 'reject', kind: 'reject_once' },
+                    ],
+                    resourceTrust: latestTrust,
+                  },
+                  optionId,
+                );
+              }
+              if (optionId === 'reject')
+                return (
+                  (await openCodePermissionRejections.reject({
+                    selected: request,
+                    automatic: true,
+                    list: () => openCodeSource.permission.list({ sessionID: request.sessionID }),
+                    validate: async (pendingRequests) => {
+                      const decisions = await Promise.all(
+                        pendingRequests.map(async (pendingRequest) => {
+                          const pendingToolCall = openCodePermissionToolCall(pendingRequest);
+                          const pendingTrust = await acp.permissionResourcesTrusted(
+                            location.directory,
+                            permissionReadResources(pendingToolCall),
+                          );
+                          return automaticPermissionPolicy({
+                            profile: policy.profile,
+                            workspace: location.directory,
+                            title: pendingRequest.action,
+                            toolCall: pendingToolCall,
+                            options: [
+                              { optionId: 'once', kind: 'allow_once' },
+                              { optionId: 'reject', kind: 'reject_once' },
+                            ],
+                            resourceTrust: pendingTrust,
+                          });
+                        }),
+                      );
+                      return (
+                        decisions.length > 0 &&
+                        decisions.every((decision) => decision.recommendation === 'deny')
+                      );
+                    },
+                    reply: () =>
+                      openCodeSource.permission.reply({
+                        sessionID: request.sessionID,
+                        requestID: request.id,
+                        decision: 'reject',
+                      }),
+                    record: (settledRequest) => {
+                      const settledPolicy = inboxRejectedPermissionPolicy(
+                        { permissionPolicies },
+                        settledRequest.id,
+                        () =>
+                          permissionPolicy({
+                            profile: policy.profile,
+                            workspace: location.directory,
+                            title: settledRequest.action,
+                            toolCall: openCodePermissionToolCall(settledRequest),
+                            options: [
+                              { optionId: 'once', kind: 'allow_once' },
+                              { optionId: 'reject', kind: 'reject_once' },
+                            ],
+                          }),
+                      );
+                      recordDecisionActivity(
+                        {
+                          agent: 'opencode',
+                          directory: location.directory,
+                          sessionId: settledRequest.sessionID,
+                          title:
+                            sessionDetails.get(settledRequest.sessionID)?.title ??
+                            'OpenCode session',
+                          updated: Date.now(),
+                          capabilityProfile: settledPolicy.profile,
+                        },
+                        settledRequest.id,
+                        permissionDecisionTitle(
+                          settledRequest.message?.trim() || settledRequest.action,
+                          settledPolicy,
+                          'rejected',
+                        ),
+                        'rejected',
+                      );
+                    },
+                  })) !== null
+                );
+              else
+                await openCodePermissionRejections.resolveAutomatically({
+                  selected: latestRequest,
+                  decision: 'once',
+                  reply: () =>
+                    openCodeSource.permission.reply({
+                      sessionID: request.sessionID,
+                      requestID: request.id,
+                      decision: 'once',
+                    }),
+                  record: (settledRequest, reply) =>
+                    recordDecisionActivity(
+                      {
+                        agent: 'opencode',
+                        directory: location.directory,
+                        sessionId: settledRequest.sessionID,
+                        title:
+                          sessionDetails.get(settledRequest.sessionID)?.title ?? 'OpenCode session',
+                        updated: Date.now(),
+                        capabilityProfile: policy.profile,
+                      },
+                      settledRequest.id,
+                      permissionDecisionTitle(
+                        settledRequest.message?.trim() || settledRequest.action,
+                        policy,
+                        reply === 'reject' ? 'rejected' : 'completed',
+                      ),
+                      reply === 'reject' ? 'rejected' : 'completed',
+                    ),
+                });
+            },
+            record: () => undefined,
+          });
       }
       for (const form of forms) {
         const key = `opencode:form:${form.id}`;
@@ -6588,7 +7070,7 @@
           ...location,
           key,
           kind: 'question',
-          agent: agents.get(form.sessionID) ?? 'OpenCode',
+          agent: sessionDetails.get(form.sessionID)?.agent ?? 'OpenCode',
           sessionId: form.sessionID,
           requestId: form.id,
           text: [form.title, ...form.fields.map((field) => field.title ?? field.key)].join(' · '),
@@ -6617,11 +7099,24 @@
           agentAvailability.find((agent) => agent.id === outcome.agentId)?.name ?? outcome.agentId,
       });
     }
-    inboxItems = sortInbox(items);
+    const automaticResults = await Promise.allSettled(
+      automaticPermissions.map(async (request) => ({
+        key: request.key,
+        resolved: await permissionResolver.resolve(request),
+      })),
+    );
+    if (generation !== inboxGeneration || disposed) return;
+    const resolved = new Set(
+      automaticResults.flatMap((result) =>
+        result.status === 'fulfilled' && result.value.resolved ? [result.value.key] : [],
+      ),
+    );
+    inboxItems = sortInbox(items.filter((item) => !resolved.has(item.key)));
     inboxError =
       !source ||
       acpResult.status === 'rejected' ||
-      openCodeResults.some((result) => result.status === 'rejected')
+      openCodeResults.some((result) => result.status === 'rejected') ||
+      automaticResults.some((result) => result.status === 'rejected')
         ? 'Some projects could not be checked.'
         : '';
     inboxLoading = false;
@@ -8285,21 +8780,135 @@
           entry.directory === item.directory,
       );
       if (!thread) throw new Error('Thread is no longer available.');
-      await acp.permission(thread.agent, item.requestId!, optionId);
+      await permissionResolver.resolve({
+        key: item.key,
+        generation: item.fingerprint ?? item.generation ?? item.receivedAt,
+        policy: item.policy!,
+        optionId,
+        respond: (selectedOptionId: string | null) =>
+          acp.permission(
+            thread.agent,
+            item.requestId!,
+            selectedOptionId,
+            item.sessionId,
+            typeof item.generation === 'number' ? item.generation : undefined,
+            item.fingerprint,
+          ),
+        record: (selectedOptionId: string | null) =>
+          recordDecisionActivity(
+            thread,
+            inboxDecisionActivitySourceId(item),
+            inboxPermissionDecisionTitle(
+              item,
+              selectedOptionId === null ||
+                permissionOutcome(item.options ?? [], selectedOptionId) === 'rejected'
+                ? 'rejected'
+                : 'completed',
+            ),
+            selectedOptionId === null
+              ? 'rejected'
+              : permissionOutcome(item.options ?? [], selectedOptionId),
+          ),
+      });
+      await refreshInbox();
+      void restoreAgentActivity();
+      return;
     } else if (item.kind === 'opencode-permission') {
       if (!client) throw new Error('OpenCode is not connected.');
+      const source = client;
       try {
-        await client.permission.get({
+        const request = await source.permission.get({
           sessionID: item.sessionId,
           requestID: String(item.requestId),
         });
-        await client.permission.reply({
-          sessionID: item.sessionId,
-          requestID: String(item.requestId),
-          decision: optionId === 'reject' ? 'reject' : 'once',
-        });
+        if (optionId === 'reject') {
+          const profile = inboxPermissionProfile(
+            item,
+            capabilityProfileForDirectory(item.directory),
+          );
+          await openCodePermissionRejections.reject({
+            selected: request,
+            list: () => source.permission.list({ sessionID: item.sessionId }),
+            reply: () =>
+              source.permission.reply({
+                sessionID: item.sessionId,
+                requestID: String(item.requestId),
+                decision: 'reject',
+              }),
+            record: (settledRequest) => {
+              const policy = inboxRejectedPermissionPolicy(item, settledRequest.id, () =>
+                permissionPolicy({
+                  profile,
+                  workspace: item.directory,
+                  title: settledRequest.action,
+                  toolCall: openCodePermissionToolCall(settledRequest),
+                  options: [
+                    { optionId: 'once', kind: 'allow_once' },
+                    { optionId: 'reject', kind: 'reject_once' },
+                  ],
+                }),
+              );
+              recordDecisionActivity(
+                {
+                  agent: 'opencode',
+                  directory: item.directory,
+                  sessionId: item.sessionId,
+                  title: item.text,
+                  updated: item.receivedAt,
+                  capabilityProfile: profile,
+                },
+                settledRequest.id,
+                permissionDecisionTitle(
+                  settledRequest.message?.trim() || settledRequest.action,
+                  policy,
+                  'rejected',
+                ),
+                'rejected',
+              );
+            },
+          });
+          await refreshInbox();
+          return;
+        }
+        await openCodePermissionRejections.resolvePendingAutomatically(
+          {
+            selected: request,
+            decision: 'once',
+            reply: () =>
+              source.permission.reply({
+                sessionID: item.sessionId,
+                requestID: String(item.requestId),
+                decision: 'once',
+              }),
+            record: (settledRequest, reply) =>
+              recordDecisionActivity(
+                {
+                  agent: item.agentId ?? 'opencode',
+                  directory: item.directory,
+                  sessionId: item.sessionId,
+                  title: item.text,
+                  updated: item.receivedAt,
+                },
+                settledRequest.id,
+                item.policy
+                  ? inboxPermissionDecisionTitle(
+                      item,
+                      reply === 'reject' ? 'rejected' : 'completed',
+                    )
+                  : item.text,
+                reply === 'reject' ? 'rejected' : 'completed',
+              ),
+          },
+          isPermissionNotFoundError,
+        );
+        await refreshInbox();
+        if (item.sessionId === sessionID) void refreshPrompts();
+        return;
       } catch (cause) {
         if (!isPermissionNotFoundError(cause)) throw cause;
+        await refreshInbox();
+        if (item.sessionId === sessionID) void refreshPrompts();
+        return;
       }
     }
     recordDecisionActivity(
@@ -8312,11 +8921,9 @@
       },
       String(item.requestId ?? item.key),
       item.text,
-      optionId === null || optionId === 'reject' ? 'rejected' : 'completed',
+      optionId === null ? 'rejected' : optionId === 'reject' ? 'rejected' : 'completed',
     );
     await refreshInbox();
-    if (item.kind === 'acp-permission') void restoreAgentActivity();
-    if (item.kind === 'opencode-permission' && item.sessionId === sessionID) void refreshPrompts();
   }
 
   function createAgentThread(thread: AgentThread) {
@@ -8696,7 +9303,7 @@
           !isInboxOutcome(candidate) &&
           candidate.directory === event.workspace &&
           candidate.sessionId === event.sessionId &&
-          String(candidate.requestId ?? candidate.key) === event.sourceId,
+          inboxDecisionActivitySourceId(candidate) === event.sourceId,
       );
       if (item) {
         await openInboxItem(item);
@@ -8741,6 +9348,49 @@
       },
     ]);
     setSetting('sai-activity-history', saveActivityHistory(durableActivityHistory));
+  }
+
+  function inboxDecisionActivitySourceId(item: InboxItem): string {
+    if (item.kind !== 'acp-permission') return String(item.requestId ?? item.key);
+    return acpPermissionActivitySourceId(
+      item.requestId ?? item.key,
+      item.generation ?? item.receivedAt,
+      item.fingerprint,
+    );
+  }
+
+  function recordEvictedOpenCodeRejection(request: PermissionRequest, eventDirectory?: string) {
+    const existing = [...nativeThreads, ...sidebarOpenCodeThreads].find(
+      (thread) =>
+        thread.sessionId === request.sessionID &&
+        (!eventDirectory || thread.directory === eventDirectory),
+    );
+    const path = eventDirectory ?? existing?.directory;
+    if (!path) return;
+    const profile = existing?.capabilityProfile ?? capabilityProfileForDirectory(path);
+    const policy = permissionPolicy({
+      profile,
+      workspace: path,
+      title: request.action,
+      toolCall: openCodePermissionToolCall(request),
+      options: [
+        { optionId: 'once', kind: 'allow_once' },
+        { optionId: 'reject', kind: 'reject_once' },
+      ],
+    });
+    recordDecisionActivity(
+      existing ?? {
+        agent: 'opencode',
+        directory: path,
+        sessionId: request.sessionID,
+        title: 'OpenCode session',
+        updated: Date.now(),
+        capabilityProfile: profile,
+      },
+      request.id,
+      permissionDecisionTitle(request.message?.trim() || request.action, policy, 'rejected'),
+      'rejected',
+    );
   }
 
   async function selectMainWorkspaceActivity(item: WorkspaceActivityItem) {
@@ -9007,19 +9657,31 @@
     if (id === 'main' && !acpAgent) {
       if (!client || !sessionID || running || sending)
         throw new Error('Wait for the current agent turn.');
-      const promptClient = client;
+      const source = client;
       const current = selection;
       const session = sessionID;
+      const path = directory;
+      const profile = capabilityProfileForSession(selectedSession, path);
       sending = true;
       running = true;
       activity = 'Thinking';
       try {
-        await invoke('record_turn_snapshot', {
-          path: directory,
-          thread: `opencode:${session}`,
-        });
-        await runOpenCodePromptStart(directory, () =>
-          promptClient.session.prompt({ sessionID: session, text }),
+        await runReservedOpenCodeTurn(
+          session,
+          () => reserveOpenCodeBrowser(path, profile),
+          async () => {
+            const target = await source.session.get({ sessionID: session });
+            if (target.location.directory !== path)
+              throw new Error('Target session moved to another worktree.');
+            await invoke('record_turn_snapshot', {
+              path,
+              thread: `opencode:${session}`,
+            });
+            return runOpenCodePromptStart(path, () =>
+              source.session.prompt({ sessionID: session, text }),
+            );
+          },
+          (accepted) => waitForOpenCodeInboxSettlement(source, session, accepted.id),
         );
         if (current === selection && session === sessionID)
           void refreshSession(session).catch((cause) => (error = describe(cause)));
@@ -9353,8 +10015,10 @@
             sessionCapabilities &&
             typeof sessionCapabilities === 'object' &&
             'resume' in sessionCapabilities;
-          if (canResume) await acp.resume(turn.agent, turn.directory, turn.sessionId);
-          else await acp.load(turn.agent, turn.directory, turn.sessionId);
+          const recoveredProfile = recoveredThread.capabilityProfile ?? 'build';
+          if (canResume)
+            await acp.resume(turn.agent, turn.directory, turn.sessionId, recoveredProfile);
+          else await acp.load(turn.agent, turn.directory, turn.sessionId, recoveredProfile);
           if (disposed) return;
           if (await alreadyActive()) {
             updateAgentThreadStatus(recoveredThread, 'working');
@@ -9617,12 +10281,17 @@
 
   function handleAgentEvent(event: AgentEvent) {
     const eventSessionId = event.message.params?.sessionId;
-    const eventDirectory =
+    const eventThread =
       typeof eventSessionId === 'string'
-        ? ([...agentThreads, ...nativeChildThreads].find(
+        ? [...agentThreads, ...nativeChildThreads].find(
             (thread) => thread.agent === event.agent && thread.sessionId === eventSessionId,
-          )?.directory ?? directory)
-        : directory;
+          )
+        : undefined;
+    const eventDirectory = eventThread?.directory ?? directory;
+    const eventProfile = capabilityProfileFromMetadata(
+      event.message.params,
+      eventThread?.capabilityProfile ?? capabilityProfileForDirectory(eventDirectory),
+    );
     const previousNativeSubagents = nativeSubagents;
     nativeSubagents = updateNativeSubagents(
       nativeSubagents,
@@ -9632,6 +10301,7 @@
       typeof eventSessionId === 'string' &&
         (!!replayingAgentSessions[JSON.stringify([event.agent, eventSessionId])] ||
           !!nativeSubagents[nativeSubagentId(event.agent, eventSessionId)]?.restored),
+      eventProfile,
     );
     if (nativeSubagents !== previousNativeSubagents) nativeSubagentGeneration += 1;
     const nativeUpdate = event.message.params?.update;
@@ -9813,16 +10483,38 @@
       ))
         updateSpawnReceipt(receipt.receiptId, { state: 'waiting' });
     } else if (event.message.method === 'sail/disconnected') {
-      nativeSubagents = disconnectNativeSubagents(nativeSubagents, event.agent);
+      const disconnectedSessionIds =
+        acpDisconnectedSessionIds(event.message) ??
+        Object.values(nativeSubagents)
+          .filter((child) => child.agent === event.agent)
+          .map((child) => child.sessionId);
+      nativeSubagents = disconnectNativeSubagents(
+        nativeSubagents,
+        event.agent,
+        disconnectedSessionIds,
+      );
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
+          acpDisconnectAffectsSession(
+            event.message,
+            item.sessionId,
+            item.capabilityProfile ?? capabilityProfileForDirectory(item.directory),
+          ) &&
           ['working', 'waiting'].includes(threadAttention[threadKey(item)]?.status ?? ''),
       ))
         updateAgentThreadStatus(thread, 'failed');
-      for (const receipt of spawnReceipts.filter(
-        (item) => item.provider === event.agent && !receiptIsSettled(item.state),
-      ))
+      for (const receipt of spawnReceipts.filter((item) => {
+        const prefix = `acp:${event.agent}:`;
+        const sessionId = item.targetId?.startsWith(prefix)
+          ? item.targetId.slice(prefix.length)
+          : null;
+        return (
+          item.provider === event.agent &&
+          acpDisconnectAffectsSession(event.message, sessionId) &&
+          !receiptIsSettled(item.state)
+        );
+      }))
         updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
     }
   }
@@ -9889,6 +10581,7 @@
       directory: path,
       title: info.title ?? 'OpenCode thread',
       updated: info.time.updated,
+      capabilityProfile: capabilityProfileForSession(info, path),
     };
     if (!automatic) showSidebarThread(nativeThread);
     rememberRecentThread(nativeThread);
@@ -10003,11 +10696,14 @@
     savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null, kind: undefined }));
     const path = directory;
     const current = selection;
+    let releaseProfile: (() => void) | undefined;
     try {
+      const capabilityProfile = capabilityProfileForDirectory(path);
+      releaseProfile = await reserveOpenCodeBrowser(path, capabilityProfile);
       const session = await client.session.create({
         agent: 'architect',
         location: { directory: path },
-        metadata: { saiHarness: true },
+        metadata: { saiHarness: true, sailCapabilityProfile: capabilityProfile },
         title: 'New plan',
       });
       if (current !== selection || path !== directory) return;
@@ -10017,6 +10713,8 @@
       await selectSession(session.id, true);
     } catch (cause) {
       error = describe(cause);
+    } finally {
+      releaseProfile?.();
     }
   }
 
@@ -10630,6 +11328,9 @@
           void resync().catch((cause) => {
             error = describe(cause);
           });
+          void reconcileOpenCodePermissions(source).catch((cause) => {
+            error = describe(cause);
+          });
           void reconcileOpenCodeSpawnReceipts();
         }
         if (
@@ -10861,6 +11562,7 @@
           event.type === 'form.cancelled'
         ) {
           if (event.type === 'permission.asked') {
+            openCodePermissionRejections.observe(event.data);
             const thread = sidebarOpenCodeThreads.find(
               (item) =>
                 item.sessionId === event.data.sessionID &&
@@ -10880,8 +11582,15 @@
             inboxTime(`opencode:permission:${event.data.id}`, event.created);
           if (event.type === 'form.created' && !openCodeRequestTime(event.data.form.id))
             inboxTime(`opencode:form:${event.data.form.id}`, event.created);
-          if (event.type === 'permission.replied')
+          if (event.type === 'permission.replied') {
+            openCodePermissionRejections.settle(
+              event.data.sessionID,
+              event.data.requestID,
+              event.data.reply,
+              (request) => recordEvictedOpenCodeRejection(request, event.location?.directory),
+            );
             forgetInboxTime(`opencode:permission:${event.data.requestID}`);
+          }
           if (event.type === 'form.replied' || event.type === 'form.cancelled')
             forgetInboxTime(`opencode:form:${event.data.id}`);
           scheduleRefresh();
@@ -10963,13 +11672,16 @@
     attachedFiles = [];
     sending = true;
     error = '';
+    let releaseProfile: (() => void) | undefined;
     try {
+      const capabilityProfile = capabilityProfileForSession(selectedSession, path);
+      releaseProfile = await reserveOpenCodeBrowser(path, capabilityProfile);
       if (!id) {
         const session = await source.session.create({
           agent: requestedAgent,
           model: requestedModel,
           location: { directory: path },
-          metadata: { saiHarness: true },
+          metadata: { saiHarness: true, sailCapabilityProfile: capabilityProfile },
           title: text ? (text.length > 60 ? `${text.slice(0, 57)}…` : text) : 'New work',
         });
         id = session.id;
@@ -11015,7 +11727,7 @@
           implementingModel,
           `opencode:${targetId}`,
         );
-        let response;
+        let response: Awaited<ReturnType<OpenCodeClient['session']['prompt']>>;
         try {
           response = await runOpenCodePromptStart(path, () =>
             source.session.prompt({
@@ -11031,20 +11743,39 @@
               })),
             }),
           );
+          const heldRelease = releaseProfile;
+          releaseProfile = undefined;
+          const completion = waitForAuthoritativeOpenCodeSettlement(
+            () => (client ?? source).session.wait({ sessionID: targetId }),
+            async () => {
+              const currentClient = client;
+              if (!currentClient) return false;
+              return openCodeInboxSettled(response.id, (cursor) =>
+                currentClient.message.list({
+                  sessionID: targetId,
+                  limit: 100,
+                  order: 'desc',
+                  cursor,
+                }),
+              );
+            },
+            { terminal: isSessionNotFoundError },
+          )
+            .then(
+              () => recordImplementationModel(path, implementingModel, tracking),
+              () => recordImplementationModel(path, implementingModel, tracking),
+            )
+            .catch((cause) => {
+              abandonImplementationTurn(path, tracking);
+              error = `Could not track implementation model: ${describe(cause)}`;
+            });
+          if (heldRelease)
+            void holdCapabilityProfileReservation(heldRelease, completion).catch(() => undefined);
+          else void completion;
         } catch (cause) {
           await recordImplementationModel(path, implementingModel, tracking);
           throw cause;
         }
-        void source.session
-          .wait({ sessionID: targetId })
-          .then(
-            () => recordImplementationModel(path, implementingModel, tracking),
-            () => recordImplementationModel(path, implementingModel, tracking),
-          )
-          .catch((cause) => {
-            abandonImplementationTurn(path, tracking);
-            error = `Could not track implementation model: ${describe(cause)}`;
-          });
         return response;
       });
       sending = false;
@@ -11086,6 +11817,7 @@
         }
       }
     } finally {
+      releaseProfile?.();
       for (const file of files) inFlightCaptures.delete(file);
       sending = false;
     }
@@ -11736,10 +12468,21 @@
                 ondecision={(thread, permission, optionId) =>
                   recordDecisionActivity(
                     thread,
-                    String(permission.id),
-                    permission.title,
-                    optionId === 'reject' ? 'rejected' : 'completed',
+                    acpPermissionActivitySourceId(
+                      permission.id,
+                      permission.generation,
+                      permission.fingerprint,
+                    ),
+                    permission.policy
+                      ? permissionDecisionTitle(
+                          permission.title,
+                          permission.policy,
+                          permissionOutcome(permission.options, optionId),
+                        )
+                      : permission.title,
+                    permissionOutcome(permission.options, optionId),
                   )}
+                capabilityProfile={capabilityProfileForDirectory(directory)}
                 running={!!(acpThread && runningAgentThreads[agentThreadKey(acpThread)])}
                 focused={focusedPane === 'main'}
                 oncreated={createAgentThread}
@@ -11943,6 +12686,28 @@
                   {pendingForms}
                   client={connecting ? null : client}
                   {sessionID}
+                  workspace={directory}
+                  capabilityProfile={capabilityProfileForSession(currentSession, directory)}
+                  ondecision={(request, decision, policy) => {
+                    if (!sessionID) return;
+                    recordDecisionActivity(
+                      {
+                        agent: 'opencode',
+                        directory,
+                        sessionId: sessionID,
+                        title: currentSession?.title ?? 'OpenCode session',
+                        updated: Date.now(),
+                        capabilityProfile: capabilityProfileForSession(currentSession, directory),
+                      },
+                      request.id,
+                      permissionDecisionTitle(
+                        `Allow ${request.action}?`,
+                        policy,
+                        decision === 'reject' ? 'rejected' : 'completed',
+                      ),
+                      decision === 'reject' ? 'rejected' : 'completed',
+                    );
+                  }}
                   onchanged={() => refreshPrompts()}
                 />
                 <div class="composer">
@@ -12056,6 +12821,8 @@
         {directory}
         project={coordinationProject(directory) ?? directory}
         {taskLocation}
+        capabilityProfile={capabilityProfileForDirectory(directory)}
+        onensureprofile={reserveOpenCodeBrowser}
         {dark}
         agents={paneAgents}
         {sideChat}

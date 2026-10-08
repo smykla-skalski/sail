@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { AgentEvent } from '../src/lib/acp.ts';
+import { automaticPermissionPolicy } from '../src/lib/capability-profiles.ts';
 import {
   disconnectNativeSubagents,
   finalizeNativeSubagentRestore,
   nativeSubagentCounts,
   nativeSubagentReceipts,
   reconcileNativeSubagents,
+  nativeSubagentThreads,
   setNativeSubagentWaiting,
   updateNativeSubagents,
 } from '../src/lib/native-subagents.ts';
@@ -17,6 +19,7 @@ await test('backend snapshot exposes a child before its queued frontend event ru
     [
       {
         agent: 'codex',
+        capabilityProfile: 'review',
         sessionId: 'late-child',
         parentSessionId: 'owner',
         directory: '/worktree',
@@ -31,6 +34,7 @@ await test('backend snapshot exposes a child before its queued frontend event ru
   assert.equal(receipts[0].sourceId, 'acp:codex:owner');
   assert.equal(receipts[0].targetId, 'acp:codex:late-child');
   assert.equal(receipts[0].state, 'working');
+  assert.equal(store['codex:late-child'].capabilityProfile, 'review');
 });
 
 function event(sessionId: string, update: Record<string, unknown>): AgentEvent {
@@ -53,6 +57,8 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
     }),
     '/repo',
     1,
+    false,
+    'review',
   );
   store = updateNativeSubagents(
     store,
@@ -65,6 +71,8 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
     }),
     '/repo',
     2,
+    false,
+    'build',
   );
   store = updateNativeSubagents(
     store,
@@ -79,6 +87,13 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
   assert.equal(store['codex:child'].rootSessionId, 'parent');
   assert.equal(store['codex:grandchild'].parentSessionId, 'child');
   assert.equal(store['codex:grandchild'].rootSessionId, 'parent');
+  assert.equal(store['codex:child'].capabilityProfile, 'review');
+  assert.equal(store['codex:grandchild'].capabilityProfile, 'review');
+  assert.equal(
+    nativeSubagentThreads(store).find((thread) => thread.sessionId === 'grandchild')
+      ?.capabilityProfile,
+    'review',
+  );
   assert.equal(store['codex:child'].transcript.at(-1)?.type, 'assistant');
   assert.equal(store['codex:grandchild'].transcript.length, 0);
   assert.equal(nativeSubagentReceipts(store)[0].result, null);
@@ -138,9 +153,103 @@ await test('terminal outcomes stay distinct and disconnect only affects live chi
     '/repo',
     3,
   );
-  store = disconnectNativeSubagents(store, 'codex', 4);
+  store = disconnectNativeSubagents(store, 'codex', ['live'], 4);
   assert.equal(store['codex:done'].outcome, 'interrupted');
   assert.equal(store['codex:live'].outcome, 'unknown');
+});
+
+await test('disconnect leaves children from another capability connection live', () => {
+  let store = updateNativeSubagents(
+    {},
+    event('review-parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'review-child',
+      name: 'reviewer',
+      task: 'Review changes',
+    }),
+    '/repo',
+    1,
+    false,
+    'review',
+  );
+  store = updateNativeSubagents(
+    store,
+    event('build-parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'build-child',
+      name: 'builder',
+      task: 'Implement changes',
+    }),
+    '/repo',
+    2,
+    false,
+    'build',
+  );
+
+  store = disconnectNativeSubagents(store, 'codex', ['review-parent', 'review-child'], 3);
+
+  assert.equal(store['codex:review-child'].outcome, 'unknown');
+  assert.equal(store['codex:build-child'].outcome, 'working');
+});
+
+await test('review native child keeps medium-risk actions denied', () => {
+  const store = updateNativeSubagents(
+    {},
+    event('review-parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'review-child',
+      name: 'reviewer',
+      task: 'Review changes',
+    }),
+    '/repo',
+    1,
+    false,
+    'review',
+  );
+  const thread = nativeSubagentThreads(store)[0];
+
+  const decision = automaticPermissionPolicy({
+    profile: thread.capabilityProfile ?? 'build',
+    workspace: thread.directory,
+    title: 'Edit file',
+    toolCall: { command: 'apply_patch' },
+    options: [
+      { optionId: 'allow', kind: 'allow_once' },
+      { optionId: 'deny', kind: 'reject_once' },
+    ],
+  });
+
+  assert.equal(decision.profile, 'review');
+  assert.equal(decision.risk, 'medium');
+  assert.equal(decision.recommendation, 'deny');
+  assert.equal(decision.optionId, 'deny');
+});
+
+await test('review replay replaces a cached build profile before permission policy runs', () => {
+  const spawn = event('parent', {
+    sessionUpdate: 'subagent_spawned',
+    subagentSessionId: 'child',
+    name: 'reviewer',
+    task: 'Review changes',
+  });
+  let store = updateNativeSubagents({}, spawn, '/repo', 1, false, 'build');
+
+  store = updateNativeSubagents(store, spawn, '/repo', 2, true, 'review');
+  const thread = nativeSubagentThreads(store)[0];
+  const decision = automaticPermissionPolicy({
+    profile: thread.capabilityProfile ?? 'build',
+    workspace: thread.directory,
+    title: 'Edit file',
+    toolCall: { command: 'apply_patch' },
+    options: [
+      { optionId: 'allow', kind: 'allow_once' },
+      { optionId: 'deny', kind: 'reject_once' },
+    ],
+  });
+
+  assert.equal(thread.capabilityProfile, 'review');
+  assert.equal(decision.recommendation, 'deny');
+  assert.equal(decision.optionId, 'deny');
 });
 
 await test('late and duplicate events cannot revive a terminal child', () => {

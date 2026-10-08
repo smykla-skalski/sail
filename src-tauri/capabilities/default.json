@@ -70,6 +70,7 @@
     "allow-acp-steer",
     "allow-acp-cancel",
     "allow-acp-permission",
+    "allow-acp-permission-resources-trusted",
     "allow-acp-pending-permissions",
     "allow-acp-pending-inbox",
     "allow-acp-activity",

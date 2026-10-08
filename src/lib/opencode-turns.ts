@@ -49,3 +49,89 @@ export function runSerialOpenCodeTurn<T>(sessionId: string, turn: () => Promise<
   });
   return result;
 }
+
+export function runReservedOpenCodeTurn<T>(
+  sessionId: string,
+  reserve: () => Promise<() => void>,
+  turn: () => Promise<T>,
+  settle: (accepted: T) => Promise<unknown>,
+): Promise<T> {
+  return runSerialOpenCodeTurn(sessionId, async () => {
+    const release = await reserve();
+    try {
+      const accepted = await turn();
+      void Promise.resolve()
+        .then(() => settle(accepted))
+        .finally(release)
+        .catch(() => undefined);
+      return accepted;
+    } catch (cause) {
+      release();
+      throw cause;
+    }
+  });
+}
+
+export async function holdAcceptedOpenCodeTurn<T>(
+  release: () => void,
+  accepted: Promise<T>,
+  settle: (accepted: T) => Promise<unknown>,
+): Promise<void> {
+  try {
+    await settle(await accepted);
+  } finally {
+    release();
+  }
+}
+
+export async function waitForAuthoritativeOpenCodeSettlement(
+  wait: () => Promise<void>,
+  settled: () => Promise<boolean>,
+  options: {
+    retry?: () => Promise<void>;
+    terminal?: (cause: unknown) => boolean;
+  } = {},
+): Promise<void> {
+  const retry = options.retry ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 1_000)));
+  const terminal = options.terminal ?? (() => false);
+  async function attempt(): Promise<void> {
+    try {
+      await wait();
+    } catch (waitCause) {
+      if (terminal(waitCause)) return;
+    }
+    try {
+      if (await settled()) return;
+    } catch (settlementCause) {
+      if (terminal(settlementCause)) return;
+    }
+    await retry();
+    return attempt();
+  }
+  return attempt();
+}
+
+export async function openCodeInboxSettled(
+  inboxID: string,
+  list: (cursor?: string) => Promise<{
+    data: readonly { id: string; type: string }[];
+    cursor: { next?: string | null };
+  }>,
+): Promise<boolean> {
+  async function visit(
+    cursor: string | undefined,
+    idleAfterInbox: boolean,
+    seen: Set<string>,
+  ): Promise<boolean> {
+    const page = await list(cursor);
+    for (const message of page.data) {
+      if (message.id === inboxID) return idleAfterInbox;
+      if (message.type === 'idle') idleAfterInbox = true;
+    }
+    const next = page.cursor.next ?? undefined;
+    if (!next || seen.has(next)) return false;
+    seen.add(next);
+    return visit(next, idleAfterInbox, seen);
+  }
+  return visit(undefined, false, new Set());
+}

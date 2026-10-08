@@ -1,4 +1,14 @@
 fn main() {
+    let policy_path = "../src/lib/capability-policy.json";
+    println!("cargo:rerun-if-changed={policy_path}");
+    let policy: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(policy_path).expect("failed to read capability policy"),
+    )
+    .expect("failed to parse capability policy");
+    let revision = policy["revision"]
+        .as_str()
+        .expect("capability policy revision must be a string");
+    println!("cargo:rustc-env=SAIL_CAPABILITY_POLICY_REVISION={revision}");
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "diagnostic_event",
@@ -70,6 +80,7 @@ fn main() {
             "acp_steer",
             "acp_cancel",
             "acp_permission",
+            "acp_permission_resources_trusted",
             "acp_pending_permissions",
             "acp_pending_inbox",
             "acp_activity",

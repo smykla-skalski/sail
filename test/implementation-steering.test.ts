@@ -194,6 +194,40 @@ void test('disconnect records edits from a detached steering turn', async () => 
   assert.deepEqual(await activeImplementationModels(directory), []);
 });
 
+void test('disconnect from another capability connection leaves detached steering active', async () => {
+  const directory = '/test/steer-other-connection';
+  const fake = transport(directory);
+  const tracking = await trackImplementationSteer(
+    directory,
+    'model-a',
+    'codex',
+    'build-session',
+    'old-turn',
+    async () => ({ outcome: 'startedNewTurn' }),
+  );
+  await tracking.response;
+  let completed = false;
+  void tracking.completed.then(() => {
+    completed = true;
+    return undefined;
+  });
+
+  fake.emit({
+    method: 'sail/disconnected',
+    params: { profile: 'review', sessionIds: ['review-session'] },
+  });
+  await Promise.resolve();
+
+  assert.equal(completed, false);
+  fake.edit();
+  fake.emit({
+    method: 'sail/disconnected',
+    params: { profile: 'build', sessionIds: ['build-session'] },
+  });
+  await tracking.completed;
+  assert.deepEqual(implementationModels(directory), ['model-a']);
+});
+
 void test('injected steering records edits without waiting for a detached lifecycle', async () => {
   const directory = '/test/steer-injected';
   const fake = transport(directory);
