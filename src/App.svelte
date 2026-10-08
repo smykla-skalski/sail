@@ -10202,7 +10202,10 @@
     restorePaletteFocus = true;
     paletteStep = { kind: 'projects' };
     paletteQuery = '';
-    paletteIndex = 0;
+    paletteIndex = Math.max(
+      0,
+      paletteEntries.findIndex((entry) => !entry.disabled),
+    );
     paletteError = '';
     paletteOpenCodeSessions = [];
     paletteDialog.showModal();
