@@ -595,7 +595,8 @@ for await (const line of createInterface({ input: process.stdin })) {
         stop();
         clearInterval(interval);
         send({ id: message.id, result: { stopReason: 'end_turn' } });
-      }, 250);
+        // Slow enough that six thread switches still leave the turn running.
+      }, 400);
       const stop = trackWork(sessionId, () => clearInterval(interval));
       continue;
     }
@@ -613,6 +614,49 @@ for await (const line of createInterface({ input: process.stdin })) {
         });
       }, 6000);
       const stop = trackWork(sessionId, () => clearTimeout(timer));
+      continue;
+    }
+    if (text === 'Second live subagent') {
+      const child = `${sessionId}:second-child`;
+      update(sessionId, {
+        sessionUpdate: 'subagent_spawned',
+        name: 'explore',
+        task: 'Inspect second delegation',
+        capabilities: {},
+        subagentSessionId: child,
+      });
+      update(child, {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'second-read',
+        title: 'Read second fixture',
+        status: 'in_progress',
+      });
+      let streamed = 0;
+      const stream = setInterval(() => {
+        streamed += 1;
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `second-${streamed} ` },
+        });
+      }, 250);
+      const timer = setTimeout(() => {
+        stop();
+        clearInterval(stream);
+        update(sessionId, {
+          sessionUpdate: 'subagent_state_update',
+          subagentSessionId: child,
+          state: 'completed',
+        });
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Second subagent finished.' },
+        });
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }, 8000);
+      const stop = trackWork(sessionId, () => {
+        clearTimeout(timer);
+        clearInterval(stream);
+      });
       continue;
     }
     if (text === 'Live native subagent') {
@@ -634,8 +678,17 @@ for await (const line of createInterface({ input: process.stdin })) {
         title: 'Read live fixture',
         status: 'in_progress',
       });
+      let part = 0;
+      const stream = setInterval(() => {
+        part += 1;
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `live-${part} ` },
+        });
+      }, 250);
       const timer = setTimeout(() => {
         stop();
+        clearInterval(stream);
         update(sessionId, {
           sessionUpdate: 'subagent_state_update',
           subagentSessionId: child,
@@ -655,7 +708,10 @@ for await (const line of createInterface({ input: process.stdin })) {
         });
         send({ id: message.id, result: { stopReason: 'end_turn' } });
       }, 6000);
-      const stop = trackWork(sessionId, () => clearTimeout(timer));
+      const stop = trackWork(sessionId, () => {
+        clearTimeout(timer);
+        clearInterval(stream);
+      });
       continue;
     }
     if (text === 'Check tools') {

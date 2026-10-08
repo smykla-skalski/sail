@@ -778,7 +778,8 @@
   async function activate(id: string | null) {
     rememberTranscript();
     const previousSessionId = activeSessionId;
-    if (previousSessionId && previousSessionId !== id && !nativeEntries && !ephemeral)
+    // Opening a native child leaves the parent running too, so its updates still need buffering.
+    if (previousSessionId && previousSessionId !== id && !ephemeral)
       trackBackgroundSession(agent, previousSessionId);
     rememberDraft(previousSessionId);
     const savedDraft = recallComposerDraft(composerDraftKey(directory, agent, id));

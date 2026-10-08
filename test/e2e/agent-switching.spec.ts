@@ -358,8 +358,33 @@ describe('agent sessions survive thread switches', () => {
     await switchAwayAndBack('Continuity codex', 'Codex sibling');
     await switchAwayAndBack('Continuity codex', 'Continuity elsewhere', 1);
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-60 '), {
-      wait: 15_000,
+      wait: 30_000,
     });
     expect(restarts(codex)).toBe(before);
+  });
+
+  it('keeps the parent transcript after visiting its native child', async () => {
+    await openThread('Continuity main');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await sendPrompt('Second live subagent');
+    const child =
+      "//button[contains(@class,'project-agent-row') and contains(.,'Inspect second delegation')]";
+    await expect($(child)).toHaveText(expect.stringContaining('Working'));
+    await $(child).click();
+    await expect($('.agent-header')).toHaveText(
+      expect.stringContaining('Inspect second delegation'),
+    );
+    await browser.pause(1500);
+    await openThread('Continuity main');
+    const kept = await $('.agent-conversation').getText();
+    const streamed = [...kept.matchAll(/second-(\d+) /g)].map((match) => Number(match[1]));
+    expect(streamed.length).toBeGreaterThan(1);
+    expect(Math.min(...streamed)).toBe(1);
+    for (const part of streamed) expect(kept.split(`second-${part} `).length - 1).toBe(1);
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Second subagent finished.'),
+      { wait: 20_000 },
+    );
+    expect(restarts(first)).toBe(0);
   });
 });
