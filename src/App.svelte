@@ -1274,7 +1274,7 @@
       openCodeSessions: paletteOpenCodeSessions,
       commands: savedCommands,
       actions: paletteActions({
-        dark,
+        theme: themePreference,
         overview: workspaceView === 'overview',
         hasDirectory: !!directory,
       }),
@@ -10961,7 +10961,7 @@
 
   function runPaletteAction(id: PaletteActionId) {
     // Actions that open a dialog or move focus must not get it pulled back to the palette trigger.
-    closeCommandPalette(id === 'theme.toggle' || id === 'sidebar.toggle');
+    closeCommandPalette(id.startsWith('theme.') || id === 'sidebar.toggle');
     switch (id) {
       case 'pane.split':
         splitFocusedPane('row');
@@ -10991,8 +10991,14 @@
       case 'settings.open':
         void openSettings();
         break;
-      case 'theme.toggle':
-        setTheme(dark ? 'light' : 'dark');
+      case 'theme.system':
+        setTheme('system');
+        break;
+      case 'theme.light':
+        setTheme('light');
+        break;
+      case 'theme.dark':
+        setTheme('dark');
         break;
       case 'shortcuts.help':
         openShortcutSheet();
