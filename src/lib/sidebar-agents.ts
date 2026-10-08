@@ -1,6 +1,7 @@
-import type { AgentThread } from './acp';
+import type { AgentSessionListing, AgentThread } from './acp';
 import type { AttentionMap, ThreadStatus } from './attention';
 import { threadKey } from './recent-threads.ts';
+import { acpThreadId, sameThreadId } from './thread-id.ts';
 import {
   activeSubagentsForSource,
   receiptIsSettled,
@@ -27,13 +28,7 @@ export type SidebarThreadRow = {
 
 export type SidebarSessionSource = {
   session: {
-    list: (input: {
-      directory: string;
-      limit: number;
-      order: 'desc';
-      parentID: null;
-      cursor?: string;
-    }) => Promise<{
+    list: (input: { directory: string; limit: number; order: 'desc'; cursor?: string }) => Promise<{
       data: {
         id: string;
         parentID?: string;
@@ -55,38 +50,63 @@ function recentThreadFirst(left: AgentThread, right: AgentThread): number {
   return right.updated - left.updated;
 }
 
-export async function listSidebarOpenCodeThreads(
+const maxListedPages = 50;
+
+/**
+ * Ids of OpenCode subagent sessions in one directory. OpenCode's ACP session/list returns them as
+ * peers of their parents, so the sidebar drops them until the listing carries a parent marker.
+ */
+export async function listOpenCodeChildSessionIds(
   source: SidebarSessionSource,
   path: string,
   cursor?: string,
   seen = new Set<string>(),
-  threads: AgentThread[] = [],
-  outcomes: Record<string, ThreadStatus> = {},
-): Promise<{ threads: AgentThread[]; outcomes: Record<string, ThreadStatus> }> {
+  children = new Set<string>(),
+): Promise<Set<string>> {
   const page = await source.session.list({
     directory: path,
     limit: 100,
     order: 'desc',
-    parentID: null,
     ...(cursor ? { cursor } : {}),
   });
-  for (const session of page.data) {
-    if (session.location.directory !== path || session.parentID) continue;
-    const thread: AgentThread = {
-      agent: 'opencode',
-      directory: path,
-      sessionId: session.id,
-      title: session.title ?? 'Untitled session',
-      updated: session.time.updated,
-    };
-    threads.push(thread);
-    if (session.outcome)
-      outcomes[threadKey(thread)] = session.outcome === 'succeeded' ? 'done' : session.outcome;
-  }
+  for (const session of page.data) if (session.parentID) children.add(session.id);
   const next = page.cursor.next ?? undefined;
-  if (!next || next === cursor || seen.has(next)) return { threads, outcomes };
+  if (!next || next === cursor || seen.has(next) || seen.size >= maxListedPages) return children;
   seen.add(next);
-  return listSidebarOpenCodeThreads(source, path, next, seen, threads, outcomes);
+  return listOpenCodeChildSessionIds(source, path, next, seen, children);
+}
+
+const trimmedPath = (path: string) => path.replace(/\/+$/, '');
+
+/** Pages through an agent's own session history for one directory, including sessions Sail never saw. */
+export async function listSidebarAcpThreads(
+  agent: string,
+  list: (cursor?: string) => Promise<AgentSessionListing>,
+  path: string,
+  cursor?: string,
+  seen = new Set<string>(),
+  threads: AgentThread[] = [],
+): Promise<AgentThread[]> {
+  const listing = await list(cursor);
+  for (const session of listing.sessions) {
+    if (
+      trimmedPath(session.cwd) !== trimmedPath(path) ||
+      typeof session.sessionId !== 'string' ||
+      !session.sessionId.trim()
+    )
+      continue;
+    threads.push({
+      agent,
+      directory: path,
+      sessionId: session.sessionId,
+      title: session.title?.trim() || 'Untitled session',
+      updated: session.updatedAt ? Date.parse(session.updatedAt) || 0 : 0,
+    });
+  }
+  const next = listing.nextCursor ?? undefined;
+  if (!next || next === cursor || seen.has(next) || seen.size >= maxListedPages) return threads;
+  seen.add(next);
+  return listSidebarAcpThreads(agent, list, path, next, seen, threads);
 }
 
 export function groupSidebarThreads(threads: AgentThread[]): Record<string, AgentThread[]> {
@@ -94,7 +114,13 @@ export function groupSidebarThreads(threads: AgentThread[]): Record<string, Agen
   for (const thread of threads) {
     const key = threadKey(thread);
     const previous = unique.get(key);
-    if (!previous || previous.updated < thread.updated) unique.set(key, thread);
+    if (!previous) {
+      unique.set(key, thread);
+      continue;
+    }
+    const newest = previous.updated < thread.updated ? thread : previous;
+    const renamed = previous.renamed ? previous : thread.renamed ? thread : null;
+    unique.set(key, renamed ? { ...newest, title: renamed.title, renamed: true } : newest);
   }
   const grouped: Record<string, AgentThread[]> = {};
   for (const thread of unique.values()) (grouped[thread.directory] ??= []).push(thread);
@@ -147,7 +173,7 @@ export function sidebarThreadRows(
       const thread = receipt.receiptId.startsWith('opencode-child:') ? childThread(receipt) : null;
       return thread &&
         thread.directory === receipt.sourceDirectory &&
-        listed.has(`${receipt.sourceDirectory}\0${receipt.sourceId}`) &&
+        listed.has(`${receipt.sourceDirectory}\0${acpThreadId(receipt.sourceId)}`) &&
         !listed.has(sidebarThreadIdentity(thread))
         ? [thread]
         : [];
@@ -158,7 +184,7 @@ export function sidebarThreadRows(
   const receiptByChild = new Map<string, SpawnReceipt>(
     native.flatMap((receipt) =>
       receipt.targetId && receipt.targetDirectory
-        ? [[`${receipt.targetDirectory}\0${receipt.targetId}`, receipt] as const]
+        ? [[`${receipt.targetDirectory}\0${acpThreadId(receipt.targetId)}`, receipt] as const]
         : [],
     ),
   );
@@ -168,7 +194,7 @@ export function sidebarThreadRows(
     if (nestedReceipt(receipt) || receipt.sourceDirectory === receipt.targetDirectory) continue;
     const thread = childThread(receipt);
     if (!thread) continue;
-    const parentKey = `${receipt.sourceDirectory}\0${receipt.sourceId}`;
+    const parentKey = `${receipt.sourceDirectory}\0${acpThreadId(receipt.sourceId)}`;
     const parent = byIdentity.get(parentKey);
     if (parent && retained(receipt)) {
       const real = anywhere.get(sidebarThreadIdentity(thread));
@@ -184,7 +210,7 @@ export function sidebarThreadRows(
   for (const thread of threads) {
     const receipt = receiptByChild.get(sidebarThreadIdentity(thread));
     const parent = receipt
-      ? byIdentity.get(`${receipt.sourceDirectory}\0${receipt.sourceId}`)
+      ? byIdentity.get(`${receipt.sourceDirectory}\0${acpThreadId(receipt.sourceId)}`)
       : undefined;
     if (!parent || parent === thread) roots.push(thread);
     else {
@@ -265,8 +291,6 @@ export function sidebarThreadStatus(
   attention: AttentionMap,
   openCodeOutcomes: Record<string, ThreadStatus>,
   acpActivityReady: boolean,
-  nativeActivityReady: boolean,
-  nativeUnavailableDirectories: string[],
   spawnReceipts: SpawnReceipt[] = [],
 ): ThreadStatus | null {
   const key = threadKey(thread);
@@ -277,7 +301,7 @@ export function sidebarThreadStatus(
       : (saved ?? null);
   const child = spawnReceipts.find(
     (receipt) =>
-      receipt.targetId === receiptSourceId(thread.agent, thread.sessionId) &&
+      sameThreadId(receipt.targetId, receiptSourceId(thread.agent, thread.sessionId)) &&
       receipt.targetDirectory === thread.directory,
   );
   if (child && !(saved && receiptIsSettled(child.state) && thread.updated > child.updated)) {
@@ -292,13 +316,7 @@ export function sidebarThreadStatus(
               ? 'done'
               : null;
   }
-  if (
-    (status === 'working' || status === 'waiting') &&
-    (thread.agent === 'opencode'
-      ? !nativeActivityReady || nativeUnavailableDirectories.includes(thread.directory)
-      : !acpActivityReady)
-  )
-    status = null;
+  if ((status === 'working' || status === 'waiting') && !acpActivityReady) status = null;
   if (status !== 'failed' && status !== 'interrupted') {
     const active = activeSubagentsForSource(
       spawnReceipts,
@@ -310,12 +328,7 @@ export function sidebarThreadStatus(
         spawnReceipts,
         receiptSourceId(thread.agent, thread.sessionId),
         thread.directory,
-      ).filter((receipt) =>
-        receipt.provider === 'opencode'
-          ? nativeActivityReady &&
-            !nativeUnavailableDirectories.includes(receipt.targetDirectory ?? '')
-          : acpActivityReady,
-      );
+      ).filter(() => acpActivityReady);
       if (confirmed.some((receipt) => receipt.state === 'waiting')) status = 'waiting';
       else if (status !== 'working' && status !== 'waiting')
         status = confirmed.length ? 'working' : null;
@@ -397,7 +410,8 @@ export function openedFailedChildren(
   return new Set(
     nativeFailedChildren(receipts)
       .filter(
-        (receipt) => receipt.targetId === target && receipt.targetDirectory === selected.directory,
+        (receipt) =>
+          sameThreadId(receipt.targetId, target) && receipt.targetDirectory === selected.directory,
       )
       .map((receipt) => receipt.receiptId),
   );

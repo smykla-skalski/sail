@@ -127,7 +127,7 @@ describe('OpenCode subagents', () => {
         (await browser.execute(
           () =>
             document.querySelector<HTMLOutputElement>('output[aria-label="Opened thread"]')!.value,
-        )) === '/repo|opencode:child-c',
+        )) === '/repo|acp:opencode:child-c',
       { timeout: 5_000, timeoutMsg: 'Open did not open the child session' },
     );
   });

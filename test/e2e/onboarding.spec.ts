@@ -125,7 +125,7 @@ describe('repository setup', () => {
       expect.stringContaining('github:smykla-skalski/opencode-plugin-plan-review'),
     );
     await returnToWorkspace();
-    await expect($('[aria-label="New plan"]')).toBeDisabled();
+    await expect($('[aria-label="New plan"]')).toBeEnabled();
     if ((await $('.topbar-actions').getText()).includes('Ready'))
       await expect($('.composer textarea')).toBeEnabled();
     else await expect($('.composer textarea')).not.toExist();

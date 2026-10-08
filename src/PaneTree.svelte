@@ -4,8 +4,6 @@
   import type { WorkingDiffInfo } from './lib/diff';
   import PaneTree from './PaneTree.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
-  import { getSetting, setSetting } from './lib/settings';
-  import OpenCodePane from './OpenCodePane.svelte';
   import DiffPanel from './DiffPanel.svelte';
   import PlanPanel from './PlanPanel.svelte';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
@@ -20,7 +18,7 @@
   import SideChat from './SideChat.svelte';
   import type { AgentThread, AgentAvailability, AgentEntry } from './lib/acp';
   import { acpPermissionActivitySourceId } from './lib/acp-permissions';
-  import type { OpenCodeClient, SessionInfo } from './lib/opencode';
+  import type { OpenCodeClient } from './lib/opencode';
   import type { SetupReport } from './lib/onboarding';
   import type { BrowserAttachment } from './lib/browser-pick';
   import type { DiffComment } from './lib/diff-comments';
@@ -49,13 +47,7 @@
   } from './lib/capability-profiles';
   import type { NativeSubagent } from './lib/native-subagents';
   import { threadKey } from './lib/recent-threads';
-  import {
-    getPlan,
-    getHistory,
-    openCodePlanBackend,
-    type PlanSnapshot,
-    type HistoryEntry,
-  } from './lib/plan';
+  import type { PlanSnapshot } from './lib/plan';
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
   import { annotateDiffs } from './lib/diff';
   import {
@@ -287,19 +279,12 @@
   let diffRevision = '';
   let diffRevisionPath = '';
   let diffEvidenceUpdated = $state(Date.now());
-  let nativeSnapshot = $state<PlanSnapshot>({ plan: null, questions: null });
-  let nativeHistory = $state<HistoryEntry[]>([]);
-  let nativeSession = $state<SessionInfo>();
-  let nativeHistoryError = $state('');
-  let nativeDetailsOpen = $state(false);
-  let nativeTab = $state<'plan' | 'changes' | 'history' | 'activity' | 'ship'>('changes');
   let acpTab = $state<'plan' | 'history' | 'changes' | 'activity' | 'ship'>('changes');
   let acpPlanTick = $state(0);
   let planRevealed = false;
   const emptySnapshot: PlanSnapshot = { plan: null, questions: null };
   const acpScope = $derived.by((): PlanScope | null => {
-    if ('direction' in pane || !pane.agent || pane.agent === 'opencode' || !pane.thread)
-      return null;
+    if ('direction' in pane || !pane.agent || !pane.thread) return null;
     return { agent: pane.agent, directory, sessionId: pane.thread.sessionId };
   });
   const acpSnapshot = $derived.by(() => {
@@ -321,34 +306,6 @@
   let selectPaneActivity = $state<(item: WorkspaceActivityItem) => Promise<void>>(async () => {
     throw new Error('The activity source is unavailable.');
   });
-  let nativeDetailsGeneration = 0;
-  const NATIVE_DETAILS_SETTING = 'sai-native-details';
-  const nativeDetailsVisible = $derived(nativeDetailsOpen || changesPanes.includes(pane.id));
-  const nativeDocked = $derived(dockDetails && focused === pane.id);
-  let previousChangesOpen = false;
-
-  // Moves the details into the app shell so it spans the window height like the sidebar.
-  function dockInShell(node: HTMLElement, docked: boolean) {
-    const home = node.parentElement;
-    const shell = node.closest<HTMLElement>('.app-shell');
-    const apply = (value: boolean) => {
-      if (!shell || !home) return;
-      if (value) {
-        shell.append(node);
-        shell.dataset.nativeDetails = 'true';
-      } else {
-        delete shell.dataset.nativeDetails;
-        home.append(node);
-      }
-    };
-    apply(docked);
-    return {
-      update: apply,
-      destroy() {
-        if (shell && node.parentElement === shell) delete shell.dataset.nativeDetails;
-      },
-    };
-  }
   let previousAcpOpen = false;
 
   function updatePaneActivity(
@@ -378,10 +335,7 @@
   function paneOwnsChild(event: ActivityHistoryEvent): boolean {
     if ('direction' in pane || !pane.agent || !pane.thread || event.kind !== 'subagent')
       return false;
-    const source =
-      pane.agent === 'opencode'
-        ? `opencode:${pane.thread.sessionId}`
-        : `acp:${pane.agent}:${pane.thread.sessionId}`;
+    const source = `acp:${pane.agent}:${pane.thread.sessionId}`;
     return spawnReceiptsForSource(spawnReceipts, source, directory).some(
       (receipt) => receipt.receiptId === event.sourceId,
     );
@@ -433,17 +387,11 @@
     };
   }
 
-  function closeNativeDetails() {
-    nativeDetailsOpen = false;
-    setSetting(NATIVE_DETAILS_SETTING, 'closed');
-    if (changesPanes.includes(pane.id)) onchanges(pane.id);
-  }
-
   function closeAcpDetails() {
     if (changesPanes.includes(pane.id)) onchanges(pane.id);
   }
 
-  function closeOpenCodeShipOnEscape(event: KeyboardEvent) {
+  function closeShipOnEscape(event: KeyboardEvent) {
     if (
       event.key !== 'Escape' ||
       event.defaultPrevented ||
@@ -455,84 +403,18 @@
       event.shiftKey ||
       'direction' in pane ||
       pane.id !== focused ||
-      pane.agent !== 'opencode' ||
-      !nativeDetailsVisible ||
-      nativeTab !== 'ship' ||
+      !pane.agent ||
+      !changesPanes.includes(pane.id) ||
+      acpTab !== 'ship' ||
       document.querySelector('dialog[open]')
     )
       return;
     event.preventDefault();
-    closeNativeDetails();
-  }
-
-  async function refreshNativeDetails() {
-    if (!client || 'direction' in pane || !pane.thread || pane.agent !== 'opencode') return;
-    const id = pane.thread.sessionId;
-    const path = directory;
-    const generation = ++nativeDetailsGeneration;
-    if (setup?.rpc.state !== 'ready') {
-      nativeSnapshot = { plan: null, questions: null };
-      nativeHistory = [];
-      nativeHistoryError = 'Install the plan-review plugin to record plan history.';
-      return;
-    }
-    const [plan, history, session] = await Promise.allSettled([
-      getPlan(client, path, id),
-      getHistory(client, path, id),
-      client.session.get({ sessionID: id }),
-    ]);
-    if (
-      generation !== nativeDetailsGeneration ||
-      path !== directory ||
-      'direction' in pane ||
-      id !== pane.thread?.sessionId
-    )
-      return;
-    if (plan.status === 'fulfilled') {
-      nativeSnapshot = plan.value;
-      if (
-        (plan.value.plan || plan.value.questions) &&
-        !nativeDetailsOpen &&
-        getSetting(NATIVE_DETAILS_SETTING) !== 'closed'
-      ) {
-        nativeDetailsOpen = true;
-        nativeTab = 'plan';
-      }
-    } else nativeHistoryError = String(plan.reason);
-    if (history.status === 'fulfilled') {
-      nativeHistory = history.value;
-      nativeHistoryError = '';
-    } else nativeHistoryError = String(history.reason);
-    if (session.status === 'fulfilled') nativeSession = session.value;
+    closeAcpDetails();
   }
 
   $effect(() => {
-    if ('direction' in pane) return;
-    ++nativeDetailsGeneration;
-    nativeSnapshot = { plan: null, questions: null };
-    nativeHistory = [];
-    nativeSession = undefined;
-    nativeDetailsOpen = getSetting(NATIVE_DETAILS_SETTING) === 'open';
-    nativeTab = 'changes';
-    const id = pane.thread?.sessionId;
-    const source = client;
-    const rpc = setup?.rpc.state;
-    if (pane.agent !== 'opencode' || !id || !source || !rpc) return;
-    void refreshNativeDetails();
-  });
-
-  $effect(() => {
-    if ('direction' in pane || pane.agent !== 'opencode') return;
-    const changesOpen = changesPanes.includes(pane.id);
-    if (changesOpen === previousChangesOpen) return;
-    previousChangesOpen = changesOpen;
-    nativeDetailsOpen = changesOpen;
-    setSetting(NATIVE_DETAILS_SETTING, changesOpen ? 'open' : 'closed');
-    if (changesOpen) nativeTab = 'changes';
-  });
-
-  $effect(() => {
-    if ('direction' in pane || !pane.agent || pane.agent === 'opencode') return;
+    if ('direction' in pane || !pane.agent) return;
     const open = changesPanes.includes(pane.id);
     if (open && !previousAcpOpen) acpTab = planRevealed ? 'plan' : 'changes';
     planRevealed = false;
@@ -552,30 +434,6 @@
       acpTab = 'plan';
       onrevealplan(paneId);
     });
-  });
-
-  $effect(() => {
-    if ('direction' in pane || pane.agent !== 'opencode' || !pane.thread || !client) return;
-    const source = client;
-    const id = pane.thread.sessionId;
-    const path = directory;
-    const controller = new AbortController();
-    void (async () => {
-      try {
-        for await (const event of source.event.subscribe({ signal: controller.signal })) {
-          if (controller.signal.aborted) return;
-          if (
-            event.type === 'rpc.planreview.changed' &&
-            event.location?.directory === path &&
-            id === pane.thread?.sessionId
-          )
-            void refreshNativeDetails();
-        }
-      } catch {
-        return;
-      }
-    })();
-    return () => controller.abort();
   });
 
   async function refreshDiff(quiet = false) {
@@ -604,12 +462,7 @@
 
   $effect(() => {
     if ('direction' in pane || pane.id === 'main') return;
-    if (
-      pane.agent === 'opencode'
-        ? !nativeDetailsVisible || nativeTab !== 'changes'
-        : !changesPanes.includes(pane.id) || acpTab !== 'changes'
-    )
-      return;
+    if (!changesPanes.includes(pane.id) || acpTab !== 'changes') return;
     void refreshDiff();
     const timer = setInterval(() => void refreshDiff(true), 5000);
     return () => clearInterval(timer);
@@ -647,7 +500,7 @@
   }
 </script>
 
-<svelte:window onkeydown={closeOpenCodeShipOnEscape} />
+<svelte:window onkeydown={closeShipOnEscape} />
 
 {#if 'direction' in pane}
   <div
@@ -977,189 +830,6 @@
             onfocus={() => onfocus(pane.id)}
             {onshortcut}
           />
-        {/key}
-      {:else if pane.agent === 'opencode'}
-        {#key `${pane.id}:opencode`}
-          <div
-            class="pane-agent-content"
-            class:changes-open={nativeDetailsVisible && !nativeDocked}
-          >
-            <OpenCodePane
-              {client}
-              {runtimeState}
-              {directory}
-              {taskLocation}
-              thread={pane.thread}
-              {setup}
-              coordinationMessages={coordinationMessages.filter(
-                (message) =>
-                  pane.thread &&
-                  message.target ===
-                    coordinationKey(directory, `opencode:${pane.thread.sessionId}`),
-              )}
-              postTurnChecks={postTurnChecks.filter(
-                (check) =>
-                  pane.thread &&
-                  check.directory === directory &&
-                  check.thread === `opencode:${pane.thread.sessionId}`,
-              )}
-              {onretrycheck}
-              spawnReceipts={spawnReceiptsForSource(
-                spawnReceipts,
-                pane.thread ? `opencode:${pane.thread.sessionId}` : null,
-                directory,
-              )}
-              {onopensubagent}
-              {subagentControl}
-              focused={focused === pane.id}
-              focusPrompt={focusPromptPane === pane.id}
-              picked={pickedAttachments[pane.id]}
-              externalPrompt={pendingAgentBatches[pane.id]}
-              onexternalresult={onbatchcomplete}
-              {onpickedconsumed}
-              {onattachmentsent}
-              {onpromptfocused}
-              oncreated={(thread) => oncreated(pane.id, thread)}
-              onactivity={(thread) => {
-                onactivity(thread);
-                void refreshNativeDetails();
-              }}
-              {onhistorychange}
-              onworkspaceactivity={updatePaneActivity}
-              {onusage}
-              {onstatus}
-              {onshipit}
-              {capabilityProfile}
-              {onensureprofile}
-              {ondecision}
-            />
-            {#if nativeDetailsVisible}
-              <section
-                class="native-details side-area"
-                aria-label="OpenCode session details"
-                use:dockInShell={nativeDocked}
-              >
-                <nav class="side-tabs" aria-label="OpenCode detail tabs">
-                  <div class="side-tabs-list" role="tablist" aria-label="OpenCode details">
-                    {#if nativeSnapshot.plan || nativeSnapshot.questions}<button
-                        class:active={nativeTab === 'plan'}
-                        role="tab"
-                        aria-selected={nativeTab === 'plan'}
-                        onclick={() => (nativeTab = 'plan')}>Plan</button
-                      >{/if}<button
-                      class:active={nativeTab === 'changes'}
-                      role="tab"
-                      aria-selected={nativeTab === 'changes'}
-                      onclick={() => (nativeTab = 'changes')}>Changes ({diffs.length})</button
-                    ><button
-                      class:active={nativeTab === 'history'}
-                      role="tab"
-                      aria-selected={nativeTab === 'history'}
-                      onclick={() => (nativeTab = 'history')}>Plan history</button
-                    ><button
-                      class:active={nativeTab === 'activity'}
-                      role="tab"
-                      aria-selected={nativeTab === 'activity'}
-                      onclick={() => (nativeTab = 'activity')}>Activity</button
-                    ><button
-                      data-detail-tab="ship"
-                      class:active={nativeTab === 'ship'}
-                      role="tab"
-                      aria-selected={nativeTab === 'ship'}
-                      aria-label={`Ship runs, ${shipNeedsInput} need input`}
-                      onclick={() => (nativeTab = 'ship')}>Ship runs ({shipNeedsInput})</button
-                    >
-                  </div>
-                  <button
-                    class="side-tabs-close"
-                    aria-label="Close OpenCode details"
-                    onclick={closeNativeDetails}>×</button
-                  >
-                </nav>
-                {#if nativeTab === 'plan'}
-                  <PlanPanel
-                    snapshot={nativeSnapshot}
-                    backend={client ? openCodePlanBackend(client, directory) : null}
-                    {directory}
-                    sessionID={pane.thread?.sessionId ?? null}
-                    {dark}
-                    onchanged={refreshNativeDetails}
-                    shipRun={shipRuns.find(
-                      (run) =>
-                        run.source === nativeSnapshot.plan?.sessionID && run.repository === project,
-                    ) ?? null}
-                    onship={(graph, provider, limit) =>
-                      onship(graph, provider, limit, nativeSnapshot.plan?.sessionID ?? '')}
-                    onselectfile={(file) => {
-                      selectedFile = file;
-                      nativeTab = 'changes';
-                    }}
-                  />
-                {:else if nativeTab === 'ship'}
-                  <ShipPanel
-                    repository={project}
-                    runs={shipRuns}
-                    busy={shippingBusy}
-                    {mergeOwner}
-                    {nativeSubagents}
-                    onclose={closeNativeDetails}
-                    onrefresh={onshiprefresh}
-                    onopen={async (path, threadId) => {
-                      await onshipopen(path, threadId);
-                      closeNativeDetails();
-                    }}
-                    onsettings={onshipsettings}
-                    onhandoff={onshiphandoff}
-                    onaction={onshipaction}
-                    ondismissnotice={ondismissshipnotice}
-                    archiveNotice={shipArchiveNotice}
-                  />
-                {:else if nativeTab === 'history'}
-                  <PlanHistoryPanel
-                    events={nativeHistory}
-                    session={nativeSession}
-                    loading={false}
-                    error={nativeHistoryError}
-                    onrefresh={refreshNativeDetails}
-                  />
-                {:else if nativeTab === 'activity'}
-                  <WorkspaceActivity
-                    items={paneActivityItems}
-                    events={activityEvents}
-                    agent="opencode"
-                    sessionId={pane.thread?.sessionId}
-                    loading={activityLoading}
-                    error={activityError}
-                    onrefresh={onactivityrefresh}
-                    onselect={selectPaneActivitySource}
-                    onselecthistory={selectPaneActivityHistory}
-                  />
-                {:else}
-                  <DiffPanel
-                    {directory}
-                    files={diffs}
-                    annotations={annotateDiffs(diffs, nativeSnapshot.plan, directory)}
-                    selected={selectedFile}
-                    loading={diffLoading}
-                    error={diffError}
-                    onselect={(file) => (selectedFile = file)}
-                    onrefresh={refreshDiff}
-                    onclose={closeNativeDetails}
-                    scope={`${directory}\0${pane.id}\0opencode:${pane.thread?.sessionId ?? 'new'}`}
-                    comments={diffComments[
-                      `${directory}\0${pane.id}\0opencode:${pane.thread?.sessionId ?? 'new'}`
-                    ] ?? []}
-                    oncomments={ondiffcomments}
-                    oncommentssent={ondiffcommentssent}
-                    onsendcomments={(scope, text) => onsenddiffcomments(pane.id, scope, text)}
-                    evidence={reviewEvidence(
-                      pane.thread ? `opencode:${pane.thread.sessionId}` : null,
-                    )}
-                  />
-                {/if}
-              </section>
-            {/if}
-          </div>
         {/key}
       {:else if pane.agent}
         {#key `${directory}:${pane.id}:${pane.agent}`}

@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import {
   paletteActions,
   searchCommandPalette,
-  type PaletteOpenCodeSession,
   type PaletteSearch,
   type PaletteStep,
 } from '../src/lib/command-palette.ts';
@@ -20,6 +19,7 @@ const catalog: ProjectCatalog = {
 const agents: AgentAvailability[] = [
   { id: 'claude', name: 'Claude', binaryPath: '/bin/claude', available: true, reason: null },
   { id: 'codex', name: 'Codex', binaryPath: null, available: false, reason: 'Not installed' },
+  { id: 'opencode', name: 'OpenCode', binaryPath: '/bin/opencode', available: true, reason: null },
 ];
 const threads: AgentThread[] = [
   {
@@ -47,20 +47,10 @@ function search(step: PaletteStep, query = '', options: Partial<PaletteSearch> =
     currentDirectory: '/work/alpha',
     agents,
     threads,
-    openCodeAvailable: true,
-    openCodeSessions: [],
     commands: [],
     runningThreadKeys: [],
     ...options,
   });
-}
-
-function session(
-  id: string,
-  directory: string,
-  parentID: string | null = null,
-): PaletteOpenCodeSession {
-  return { id, title: id, directory, parentID, updated: 3 };
 }
 
 void test('project search keeps duplicate names distinct and shows group context', () => {
@@ -133,9 +123,9 @@ void test('agent step exposes availability without silently choosing an agent', 
   assert.deepEqual(
     search(step).map((entry) => [entry.agent, !!entry.disabled]),
     [
-      ['opencode', false],
       ['claude', false],
       ['codex', true],
+      ['opencode', false],
     ],
   );
   assert.equal(search(step, 'codex')[0]?.detail, 'Not installed');
@@ -155,23 +145,53 @@ void test('session step offers new first, then only matching worktree sessions',
   assert.equal(search(step, 'newest')[0]?.thread?.sessionId, 'new');
 });
 
-void test('OpenCode session step filters parent and other worktree sessions', () => {
+void test('a session saved in Sail and listed by the agent appears once', () => {
   const step: PaletteStep = {
     kind: 'sessions',
     repository: '/work/alpha',
     directory: '/work/alpha-feature',
     agent: 'opencode',
   };
-  const matches = search(step, '', {
-    openCodeSessions: [
-      session('right', '/work/alpha-feature'),
-      session('other', '/work/bravo'),
-      session('child', '/work/alpha-feature', 'right'),
-    ],
-  });
+  const saved: AgentThread = {
+    agent: 'opencode',
+    directory: '/work/alpha-feature',
+    sessionId: 'ses_both',
+    title: 'Saved title',
+    updated: 5,
+  };
+  const entries = search(step, '', { threads: [saved, { ...saved, title: 'Listed title' }] });
   assert.deepEqual(
-    matches.map((entry) => entry.sessionId ?? entry.kind),
-    ['new-session', 'right'],
+    entries.map((entry) => entry.thread?.sessionId ?? entry.kind),
+    ['new-session', 'ses_both'],
+  );
+  assert.equal(new Set(entries.map((entry) => entry.id)).size, entries.length);
+});
+
+void test('OpenCode sessions list like every other ACP agent', () => {
+  const step: PaletteStep = {
+    kind: 'sessions',
+    repository: '/work/alpha',
+    directory: '/work/alpha-feature',
+    agent: 'opencode',
+  };
+  const listed: AgentThread = {
+    agent: 'opencode',
+    directory: '/work/alpha-feature',
+    sessionId: 'ses_external',
+    title: 'Started in the terminal',
+    updated: 9,
+  };
+  assert.deepEqual(
+    search(step, '', { threads: [...threads, listed] }).map(
+      (entry) => entry.thread?.sessionId ?? entry.kind,
+    ),
+    ['new-session', 'ses_external'],
+  );
+  assert.equal(
+    search({ kind: 'projects' }, 'terminal', { threads: [listed] }).find(
+      (entry) => entry.kind === 'thread',
+    )?.detail,
+    'OpenCode · alpha / feature',
   );
 });
 

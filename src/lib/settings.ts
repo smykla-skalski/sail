@@ -54,6 +54,10 @@ function persist(key: string, value: string | null): void {
   );
 }
 
+export function settingKeys(): string[] {
+  return Object.keys(localStorage).filter(isSetting);
+}
+
 export function getSetting(key: string): string | null {
   return ready ? (values[key] ?? null) : localStorage.getItem(key);
 }

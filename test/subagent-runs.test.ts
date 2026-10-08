@@ -302,7 +302,7 @@ await test('MCP children are keyed by their thread and ship workers need no adap
         receiptId: 'ship:worker',
         requestId: 'ship:/repo:12',
         provider: 'opencode',
-        targetId: 'opencode:ses-worker',
+        targetId: 'acp:opencode:ses-worker',
         targetDirectory: '/repo/issue-12',
         created: 2,
       }),
@@ -313,7 +313,7 @@ await test('MCP children are keyed by their thread and ship workers need no adap
     runs.map((run) => [run.id, run.sessionId, run.directory, run.controls]),
     [
       ['receipt:pending', null, null, { prompt: false, cancel: false }],
-      ['opencode:ses-worker', 'ses-worker', '/repo/issue-12', { prompt: true, cancel: true }],
+      ['acp:opencode:ses-worker', 'ses-worker', '/repo/issue-12', { prompt: true, cancel: true }],
     ],
   );
 });
@@ -344,13 +344,13 @@ await test('OpenCode children are keyed by session id with live state', () => {
   assert.deepEqual(
     runs.map((run) => [run.id, run.state]),
     [
-      ['opencode:ses-a', 'working'],
-      ['opencode:ses-b', 'completed'],
-      ['opencode:ses-c', 'failed'],
-      ['opencode:ses-d', 'completed'],
+      ['acp:opencode:ses-a', 'working'],
+      ['acp:opencode:ses-b', 'completed'],
+      ['acp:opencode:ses-c', 'failed'],
+      ['acp:opencode:ses-d', 'completed'],
     ],
   );
-  assert.equal(runs[0].parentId, 'opencode:ses-parent');
+  assert.equal(runs[0].parentId, 'acp:opencode:ses-parent');
   assert.equal(runs[0].name, 'general');
   assert.equal(runs[0].task, 'Search the docs');
   assert.equal(runs[0].model, 'provider-a:model-a');

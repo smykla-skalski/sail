@@ -54,6 +54,7 @@
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
   import { isPlanTool } from './lib/plan-engine';
+  import { openCodeSessionId, sameThreadId } from './lib/thread-id';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
   import {
     loadNativePlan,
@@ -417,7 +418,6 @@
     searchCommandPalette,
     type PaletteActionId,
     type PaletteEntry,
-    type PaletteOpenCodeSession,
     type PaletteStep,
   } from './lib/command-palette';
   import {
@@ -431,7 +431,8 @@
   } from './lib/recent-threads';
   import {
     groupSidebarThreads,
-    listSidebarOpenCodeThreads,
+    listOpenCodeChildSessionIds,
+    listSidebarAcpThreads,
     recordSidebarOpenCodeOutcome,
     sidebarThreadStatus,
   } from './lib/sidebar-agents';
@@ -1041,8 +1042,6 @@
   let sidebarOpenCodeOutcomes = $state<Record<string, ThreadStatus>>({});
   let threadAttention = $state<AttentionMap>(loadAttention(getSetting('sai-thread-attention')));
   let acpActivityReady = $state(false);
-  let nativeActivityReady = $state(false);
-  let nativeUnavailableDirectories = $state<string[]>([]);
   let sidebarThreads = $derived(
     groupSidebarThreads(
       [...agentThreads, ...nativeChildThreads, ...sidebarOpenCodeThreads].filter(
@@ -1061,8 +1060,6 @@
             threadAttention,
             sidebarOpenCodeOutcomes,
             acpActivityReady,
-            nativeActivityReady,
-            nativeUnavailableDirectories,
             visibleSpawnReceipts,
           ),
         ]),
@@ -1084,8 +1081,6 @@
           threadAttention,
           sidebarOpenCodeOutcomes,
           acpActivityReady,
-          nativeActivityReady,
-          nativeUnavailableDirectories,
           visibleSpawnReceipts,
         ),
       ]),
@@ -1231,12 +1226,10 @@
   let paletteQuery = $state('');
   let paletteIndex = $state(0);
   let paletteStep = $state<PaletteStep>({ kind: 'projects' });
-  let paletteOpenCodeSessions = $state<PaletteOpenCodeSession[]>([]);
   let paletteLoading = $state(false);
   let paletteBusy = $state(false);
   let paletteError = $state('');
   let paletteSessionGeneration = 0;
-  let paletteSearchTimer: ReturnType<typeof setTimeout> | undefined;
   let paletteWorktreeRequest = $state<{
     id: string;
     path: string;
@@ -1280,8 +1273,6 @@
       currentDirectory: directory,
       agents: agentAvailability,
       threads: [...agentThreads, ...sidebarOpenCodeThreads],
-      openCodeAvailable: runtimeState === 'connected',
-      openCodeSessions: paletteOpenCodeSessions,
       commands: savedCommands,
       actions: paletteActions({
         theme: themePreference,
@@ -1299,19 +1290,6 @@
   let runtimeError = $state('');
   let workReady = $state(false);
   let planReady = $state(false);
-  let paneAgents = $derived<AgentAvailability[]>([
-    ...agentAvailability,
-    {
-      id: 'opencode',
-      name: 'OpenCode',
-      binaryPath: activeBinary || null,
-      available: runtimeState === 'connected' && workReady,
-      reason:
-        runtimeState === 'connected'
-          ? 'Complete OpenCode setup in this worktree'
-          : 'OpenCode unavailable',
-    },
-  ]);
   let selectedAgentID = $state('');
   let selectedModelKey = $state('');
   let selectedVariant = $state('');
@@ -1346,7 +1324,6 @@
     if (retained.length !== Object.keys(agentEntrySnapshots).length)
       agentEntrySnapshots = Object.fromEntries(retained);
   });
-  let pendingOpenCodeStart = $state<{ path: string; text: string | null } | null>(null);
   const batchWaiters = new SvelteMap<
     string,
     { resolve: () => void; reject: (error: Error) => void }
@@ -1366,6 +1343,7 @@
   let sessions = $state<SessionInfo[]>([]);
   let selectedSession = $state<SessionInfo | null>(null);
   let editingSessionID = $state<string | null>(null);
+  let editingThread = $state<AgentThread | null>(null);
   let editedTitle = $state('');
   let renameSessionDialog: HTMLDialogElement;
   let activeSessionIDs = $state<string[]>([]);
@@ -1842,7 +1820,6 @@
   let pendingForms = $state<FormInfo[]>([]);
   let selection = 0;
   const paneSelections = new SvelteMap<string, number>();
-  let nativeActivityGeneration = 0;
   let sidebarInventoryGeneration = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
   let projectLoadGeneration = 0;
@@ -1857,20 +1834,10 @@
     composerTaskLocation(taskLocation, directory, currentSession?.location.directory),
   );
   let actionAgentThread = $derived(
-    focusedPane === 'main'
-      ? acpThread
-      : focusedLeaf?.agent && focusedLeaf.agent !== 'opencode'
-        ? focusedLeaf.thread
-        : null,
+    focusedPane === 'main' ? acpThread : focusedLeaf?.agent ? focusedLeaf.thread : null,
   );
   let actionOpenCodeSession = $derived(
-    focusedPane === 'main'
-      ? acpAgent
-        ? null
-        : currentSession
-      : focusedLeaf?.agent === 'opencode' && focusedLeaf.thread
-        ? { id: focusedLeaf.thread.sessionId, title: focusedLeaf.thread.title }
-        : null,
+    focusedPane === 'main' ? (acpAgent ? null : currentSession) : null,
   );
   let focusedConversationTitle = $derived(
     focusedPane !== 'main'
@@ -1958,9 +1925,11 @@
     if (policy === 'parent-turn') throw new Error(parentTurnStopHint);
     if (policy !== 'stop' || !receipt.targetId)
       throw new Error('This subagent stops through Stop run.');
-    if (receipt.targetId.startsWith('opencode:')) {
+    const openCodeSession =
+      receipt.provider === 'opencode' ? openCodeSessionId(receipt.targetId) : null;
+    if (openCodeSession) {
       if (!client) throw new Error('OpenCode is unavailable, so the subagent cannot stop.');
-      await client.session.interrupt({ sessionID: receipt.targetId.slice('opencode:'.length) });
+      await client.session.interrupt({ sessionID: openCodeSession });
     } else {
       const match = /^acp:([^:]+):(.+)$/.exec(receipt.targetId);
       if (!match) throw new Error('This subagent cannot be stopped safely.');
@@ -1994,12 +1963,16 @@
     onstopall: stopAllSubagents,
   });
   const mainSpawnActivity = $derived(
-    spawnReceiptsForSource(spawnReceipts, sessionID ? `opencode:${sessionID}` : null, directory),
+    spawnReceiptsForSource(
+      spawnReceipts,
+      sessionID ? `acp:opencode:${sessionID}` : null,
+      directory,
+    ),
   );
   const mainActivityChildren = $derived([...mainSpawnActivity, ...openCodeChildReceipts]);
   const mainPostTurnChecks = $derived(
     postTurnResults.filter(
-      (check) => check.directory === directory && check.thread === `opencode:${sessionID}`,
+      (check) => check.directory === directory && check.thread === `acp:opencode:${sessionID}`,
     ),
   );
   const mainWorkspaceActivity = $derived(
@@ -2203,7 +2176,7 @@
     if (!sessionID || !running) return;
     const path = directory;
     const id = sessionID;
-    const sourceId = `opencode:${id}`;
+    const sourceId = `acp:opencode:${id}`;
     const saved = savedShipItIssue(path);
     const ownsPending = hasPendingImplementationTurn(path, sourceId);
     const savedOwner = savedShipItOwner(path);
@@ -2233,7 +2206,7 @@
   const mainCoordinationMessages = $derived(
     coordinationMessages.filter(
       (message) =>
-        !!sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`),
+        !!sessionID && message.target === coordinationKey(directory, `acp:opencode:${sessionID}`),
     ),
   );
   const mainTranscript = $derived(
@@ -2242,7 +2215,7 @@
         chatMessages,
         spawnReceiptsForSource(
           spawnReceipts,
-          sessionID ? `opencode:${sessionID}` : null,
+          sessionID ? `acp:opencode:${sessionID}` : null,
           directory,
         ),
         { liveText },
@@ -2765,9 +2738,7 @@
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
     void tickShippingRuns();
     healthTimer = setInterval(() => void checkRuntime(), 5000);
-    const sidebarRefreshTimer = setInterval(() => {
-      if (client) void refreshSidebarOpenCodeThreads(client, JSON.parse(sidebarDirectoryKey));
-    }, 30_000);
+    const sidebarRefreshTimer = setInterval(scheduleSidebarInventoryRefresh, 30_000);
     diffPollTimer = setInterval(() => {
       const visible = !window.matchMedia('(max-width: 850px)').matches || mobileView === 'details';
       if (acpAgent && agentChangesOpen && activeSideTab === 'changes' && visible && !diffLoading) {
@@ -2939,7 +2910,6 @@
     clearTimeout(recoveryTimer);
     eventController?.abort();
     client = nextClient;
-    nativeActivityReady = false;
     openCodeBrowserServers.clear();
     openCodeProfileReservations.beginConfigurationGeneration();
     activeBinary = info.binaryPath;
@@ -2983,8 +2953,6 @@
     if (connecting || disposed) return;
     connecting = true;
     eventController?.abort();
-    ++nativeActivityGeneration;
-    nativeActivityReady = false;
     clearTimeout(recoveryTimer);
     runtimeState = 'starting';
     runtimeError = '';
@@ -3059,35 +3027,7 @@
   async function resync() {
     if (!client || !directory) return;
     discardLiveText();
-    const current = selection;
     await refreshSetup(directory);
-    if (current !== selection) return;
-    const path = directory;
-    await refreshSessions();
-    if (current !== selection || path !== directory) return;
-    await reconcileNativeActivity();
-    if (current !== selection || path !== directory) return;
-    if (!workReady && !planReady) return;
-    if (
-      acpAgent ||
-      getSetting(`sai-main-pane-empty:${path}`) === 'true' ||
-      leaves(paneLayout).some((pane) => pane.id === 'main' && !!pane.kind)
-    )
-      return;
-    const saved = getSetting(`sai-session:${path}`);
-    const initial = sessionID ?? saved ?? sessions[0]?.id;
-    if (initial && initial !== sessionID) {
-      if (!(await restoreSession(initial))) {
-        if (current !== selection || path !== directory) return;
-        removeSetting(`sai-session:${path}`);
-        if (sessions[0]) await selectSession(sessions[0].id, true);
-      }
-    } else if (initial) {
-      await refreshSession(initial);
-    }
-    const active = await client.session.active();
-    if (path !== directory) return;
-    running = !!sessionID && active[sessionID]?.type === 'running';
   }
 
   function saveProjectCatalog(next: ProjectCatalog) {
@@ -3421,9 +3361,8 @@
   }
 
   function contextProvider(threadId: string): ContextProvider {
-    if (threadId.startsWith('opencode:')) return 'opencode';
+    if (openCodeSessionId(threadId)) return 'opencode';
     if (threadId.startsWith('acp:claude:')) return 'claude';
-    if (threadId.startsWith('acp:opencode:')) return 'opencode';
     return 'codex';
   }
 
@@ -3527,9 +3466,9 @@
   }
 
   function recordOpenCodeContextPressure(path: string, id: string, context: number): Promise<void> {
-    if (!shipCheckpointOwner(shipRuns, path, `opencode:${id}`)) return Promise.resolve();
+    if (!shipCheckpointOwner(shipRuns, path, `acp:opencode:${id}`)) return Promise.resolve();
     return openCodePressureRecorder.record(`${path}:${id}`, context, () =>
-      recordShipContextPressure(path, `opencode:${id}`, context),
+      recordShipContextPressure(path, `acp:opencode:${id}`, context),
     );
   }
 
@@ -3581,9 +3520,7 @@
     threadIds: Iterable<string>,
   ): Promise<string[]> {
     if (!issue.path) return [];
-    const roots = [...threadIds]
-      .filter((threadId) => threadId.startsWith('opencode:'))
-      .map((threadId) => threadId.slice('opencode:'.length));
+    const roots = [...threadIds].map(openCodeSessionId).filter((sessionId) => sessionId !== null);
     if (!roots.length) return [];
     if (!client) throw new Error('OpenCode is unavailable, so task subagents cannot be settled.');
     const source = client;
@@ -3601,12 +3538,12 @@
         authorizeShipCheckpointThread(
           shipRuns,
           child.location.directory,
-          `opencode:${child.parentID}`,
+          `acp:opencode:${child.parentID}`,
           child.location.directory,
-          `opencode:${child.id}`,
+          `acp:opencode:${child.id}`,
         ) || authorized;
     if (authorized) await saveShipRuns();
-    return descendants.map((child) => `opencode:${child.id}`);
+    return descendants.map((child) => `acp:opencode:${child.id}`);
   }
 
   async function waitForSettledShipWorker(
@@ -3648,9 +3585,10 @@
       return cancelShipThread(issue, threadId, attempts - 1);
     }
     if (shippingWorkerSettled(current)) return current;
-    if (threadId.startsWith('opencode:')) {
+    const openCodeSession = openCodeSessionId(threadId);
+    if (openCodeSession) {
       if (!client) throw new Error('OpenCode is unavailable, so a task worker cannot stop.');
-      await client.session.interrupt({ sessionID: threadId.slice('opencode:'.length) });
+      await client.session.interrupt({ sessionID: openCodeSession });
     } else {
       const match = /^acp:([^:]+):(.+)$/.exec(threadId);
       if (!match) throw new Error('A task worker identity cannot be stopped safely.');
@@ -3739,7 +3677,8 @@
     }
     if (!client) return 'inspect';
     const source = client;
-    const sessionId = receipt.targetId.slice('opencode:'.length);
+    const sessionId = openCodeSessionId(receipt.targetId);
+    if (!sessionId) return 'inspect';
     try {
       const [session, inbox] = await Promise.all([
         source.session.get({ sessionID: sessionId }),
@@ -3773,9 +3712,11 @@
       'Cancel and retry',
     );
     if (!confirmed) return;
-    if (receipt.provider === 'opencode') {
+    const openCodeSession =
+      receipt.provider === 'opencode' ? openCodeSessionId(receipt.targetId) : null;
+    if (openCodeSession) {
       if (!client) throw new Error('OpenCode is unavailable, so this handoff cannot be retried.');
-      const sessionId = receipt.targetId.slice('opencode:'.length);
+      const sessionId = openCodeSession;
       const active = await client.session.active();
       if (active[sessionId]?.type === 'running')
         await client.session.interrupt({ sessionID: sessionId });
@@ -5042,11 +4983,11 @@
     const pending = spawnReceipts.filter(
       (receipt) =>
         receipt.dispatchPending === true &&
-        receipt.targetId === threadId &&
+        sameThreadId(receipt.targetId, threadId) &&
         receipt.targetDirectory === issue.path,
     );
-    if (!pending.length) return;
-    const sessionId = threadId.slice('opencode:'.length);
+    const sessionId = openCodeSessionId(threadId);
+    if (!pending.length || !sessionId) return;
     const admissions = await Promise.all(
       pending.map(async (receipt) => ({
         receipt,
@@ -5098,10 +5039,11 @@
     threadId: string,
     dispatchKey?: string,
   ): Promise<void> {
-    if (threadId.startsWith('opencode:')) {
+    const openCodeSession = openCodeSessionId(threadId);
+    if (openCodeSession) {
       if (!client) throw new Error('OpenCode is unavailable; stop the worker manually.');
       const source = client;
-      const sessionId = threadId.slice('opencode:'.length);
+      const sessionId = openCodeSession;
       try {
         await reconcilePersistedOpenCodeDispatches(issue, threadId, source);
         const stopped = await confirmOpenCodeWorkerStopped(
@@ -5409,12 +5351,14 @@
   async function directShipWorkerState(issue: ShipIssue): Promise<SpawnState> {
     if (!issue.threadId || !issue.path) return 'unavailable';
     const native = nativeChildReceipts.find(
-      (receipt) => receipt.targetId === issue.threadId && receipt.targetDirectory === issue.path,
+      (receipt) =>
+        sameThreadId(receipt.targetId, issue.threadId!) && receipt.targetDirectory === issue.path,
     );
     if (native) return native.state;
-    if (issue.threadId.startsWith('opencode:')) {
+    const openCodeSession = openCodeSessionId(issue.threadId);
+    if (openCodeSession) {
       if (!client) return 'unavailable';
-      const sessionId = issue.threadId.slice('opencode:'.length);
+      const sessionId = openCodeSession;
       try {
         const [session, active, inbox, permissions, forms] = await Promise.all([
           client.session.get({ sessionID: sessionId }),
@@ -5490,8 +5434,8 @@
     const openCodeDescendants = await reconcileProviderOpenCodeDescendants(issue, knownThreadIds);
     const threadIds = [...new Set([...knownThreadIds, ...openCodeDescendants])];
     const openCodeSessionIds = threadIds
-      .filter((threadId) => threadId.startsWith('opencode:'))
-      .map((threadId) => threadId.slice('opencode:'.length));
+      .map(openCodeSessionId)
+      .filter((sessionId) => sessionId !== null);
     const ownershipGeneration = shipOwnershipQuietGeneration(
       generation,
       nativeGeneration,
@@ -6425,7 +6369,7 @@
     source: OpenCodeClient,
     outcome?: 'succeeded' | 'failed' | 'interrupted',
   ) {
-    const sessionId = receipt.targetId?.slice('opencode:'.length);
+    const sessionId = openCodeSessionId(receipt.targetId);
     if (!sessionId || !receipt.prompt) {
       updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
       return;
@@ -6496,7 +6440,7 @@
       );
       reconcileAcpSpawnReceipt(receipt, receiptActivity);
     } else if (client) {
-      const sessionId = receipt.targetId.slice('opencode:'.length);
+      const sessionId = openCodeSessionId(receipt.targetId) ?? receipt.targetId;
       try {
         const [session, active, inbox, permissions, forms] = await Promise.all([
           client.session.get({ sessionID: sessionId }),
@@ -6538,7 +6482,8 @@
     const recoveryFailure = openCodePromptRecoveryFailure(receipt.targetId, receipt.prompt);
     if (recoveryFailure) throw new Error(recoveryFailure);
     const source = client;
-    const sessionId = receipt.targetId!.slice('opencode:'.length);
+    const sessionId = openCodeSessionId(receipt.targetId);
+    if (!sessionId) throw new Error('Recovered OpenCode worker has no target session.');
     activeSpawnRequests.add(receipt.receiptId);
     let trackingDispatch = false;
     try {
@@ -6926,37 +6871,22 @@
         title: thread.title,
         agent: thread.agent,
       }));
-    if (!client) return threads;
-    const openCode = client;
-    async function collect(
-      path: string,
-      cursor: string | undefined,
-      seen: Set<string>,
-    ): Promise<CoordinationThread[]> {
-      const page = await openCode.session.list({
-        directory: path,
-        limit: 100,
-        order: 'desc',
-        parentID: null,
-        ...(cursor ? { cursor } : {}),
-      });
-      const found = page.data
-        .filter((session) => session.location.directory === path && !session.parentID)
-        .map((session) => ({
-          id: `opencode:${session.id}`,
-          directory: path,
-          title: session.title ?? 'OpenCode thread',
-          agent: session.agent ?? 'OpenCode',
-        }));
-      const next = page.cursor.next ?? undefined;
-      if (!next || seen.has(next)) return found;
-      seen.add(next);
-      return [...found, ...(await collect(path, next, seen))];
-    }
-    const listed = await Promise.all(
-      directories.map((path) => collect(path, undefined, new Set())),
-    );
-    return [...threads, ...listed.flat()];
+    if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available))
+      return threads;
+    const known = new Set(threads.map((thread) => thread.id));
+    const listed = await Promise.all(directories.map((path) => listOpenCodeRootThreads(path)));
+    return [
+      ...threads,
+      ...listed
+        .flat()
+        .map((thread) => ({
+          id: `acp:opencode:${thread.sessionId}`,
+          directory: thread.directory,
+          title: thread.title,
+          agent: 'opencode',
+        }))
+        .filter((thread) => !known.has(thread.id)),
+    ];
   }
 
   function shippingOwnerForCoordination(target: CoordinationThread) {
@@ -6982,6 +6912,23 @@
     setSetting('sai-coordination-messages', JSON.stringify(coordinationMessages));
   }
 
+  /** Native spawn and Ship workers run on the OpenCode server until it is removed, so ACP must not prompt them. */
+  async function nativeOpenCodeTarget(target: CoordinationThread): Promise<boolean> {
+    const sessionId = openCodeSessionId(target.id);
+    if (!sessionId || !client) return false;
+    if (
+      spawnReceipts.some(
+        (receipt) =>
+          receipt.provider === 'opencode' &&
+          receipt.targetDirectory === target.directory &&
+          sameThreadId(receipt.targetId, target.id),
+      )
+    )
+      return true;
+    const active = await client.session.active().catch(() => null);
+    return active?.[sessionId]?.type === 'running';
+  }
+
   function queueCoordinationDelivery(target: CoordinationThread, message: CoordinationMessage) {
     const previous = coordinationDeliveries.get(message.target) ?? Promise.resolve();
     const delivery = previous
@@ -6990,11 +6937,13 @@
         if (disposed || coordinationMessages.find((item) => item.id === message.id)?.delivered)
           return;
         const text = coordinationPrompt(message);
-        const thread = agentThreads.find(
-          (item) =>
-            item.directory === target.directory &&
-            target.id === `acp:${item.agent}:${item.sessionId}`,
-        );
+        const thread = (await nativeOpenCodeTarget(target))
+          ? undefined
+          : [...agentThreads, ...sidebarOpenCodeThreads].find(
+              (item) =>
+                item.directory === target.directory &&
+                target.id === `acp:${item.agent}:${item.sessionId}`,
+            );
         if (thread) {
           const info = await acp.connect(thread.agent);
           const agentActivity = (await acp.activity())[thread.agent];
@@ -7138,7 +7087,8 @@
         } else {
           if (!client) throw new Error('OpenCode is unavailable for the receiving thread.');
           const promptClient = client;
-          const sessionId = target.id.slice('opencode:'.length);
+          const sessionId = openCodeSessionId(target.id);
+          if (!sessionId) throw new Error('The receiving OpenCode thread is unavailable.');
           await waitForOpenCodeCoordinationThread(sessionId);
           if (disposed) return;
           await invoke('record_turn_snapshot', { path: target.directory, thread: target.id });
@@ -7320,7 +7270,7 @@
     const sourceId =
       source.kind === 'acp'
         ? `acp:${source.agent}:${request.sessionId}`
-        : `opencode:${request.sessionId}`;
+        : `acp:opencode:${request.sessionId}`;
     if (isPlanTool(request.name)) {
       if (source.kind !== 'acp')
         throw new Error(
@@ -9214,7 +9164,7 @@
       if (receiptId) {
         const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
         updateSpawnReceipt(receiptId, {
-          targetId: `opencode:${session.id}`,
+          targetId: `acp:opencode:${session.id}`,
           model: session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
           targetDirectory: created.path,
           worktreeId: created.path,
@@ -9245,14 +9195,14 @@
       });
       await invoke('record_turn_snapshot', {
         path: created.path,
-        thread: `opencode:${session.id}`,
+        thread: `acp:opencode:${session.id}`,
       });
       const tracking = validation
         ? null
         : await beginImplementationTurn(
             created.path,
             session.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-            `opencode:${session.id}`,
+            `acp:opencode:${session.id}`,
           );
       const turnId = receiptId ? crypto.randomUUID() : undefined;
       if (receiptId) {
@@ -9341,7 +9291,7 @@
       void startingPrompt.catch((cause) => {
         error = `Could not start agent thread: ${describe(cause)}`;
       });
-      return { path: created.path, branch: created.branch, threadId: `opencode:${session.id}` };
+      return { path: created.path, branch: created.branch, threadId: `acp:opencode:${session.id}` };
     } finally {
       releaseProfile?.();
     }
@@ -10088,12 +10038,7 @@
     if (directory !== created.path) return;
     const startAgent = () => {
       if (directory !== created.path) return;
-      if (agent === 'opencode') {
-        if (workReady) {
-          newWork();
-          if (issuePrompt) draft = issuePrompt;
-        } else pendingOpenCodeStart = { path: created.path, text: issuePrompt };
-      } else if (agent) {
+      if (agent) {
         if (issuePrompt)
           issuePrefills = {
             ...issuePrefills,
@@ -10133,16 +10078,6 @@
     startAgent();
     removeSetting(`sai-pending-worktree-start:${created.path}`);
   }
-
-  $effect(() => {
-    const pending = pendingOpenCodeStart;
-    if (!pending || directory !== pending.path || !workReady || switching || sending) return;
-    pendingOpenCodeStart = null;
-    newWork();
-    if (pending.text) draft = pending.text;
-    error = '';
-    focusPaneForTyping('main');
-  });
 
   const deletingWorktreeRequests = new SvelteSet<string>();
 
@@ -10604,24 +10539,6 @@
     if (client) await ensureOpenCodeBrowser(path).catch((cause) => (error = describe(cause)));
     if (!client || !(await refreshSetup(path)) || current !== selection) return;
     draft = viewStates.get(viewKey())?.draft ?? '';
-    if (acpAgent) return;
-    if (!workReady && !planReady) return;
-    try {
-      await refreshSessions();
-      if (current !== selection) return;
-      if (
-        getSetting(`sai-main-pane-empty:${directory}`) === 'true' ||
-        leaves(paneLayout).some((pane) => pane.id === 'main' && !!pane.kind)
-      )
-        return;
-      const saved = getSetting(`sai-session:${directory}`);
-      if (saved && (await restoreSession(saved))) return;
-      if (current !== selection) return;
-      if (saved) removeSetting(`sai-session:${directory}`);
-      if (sessions[0]) await selectSession(sessions[0].id, true);
-    } catch (cause) {
-      error = describe(cause);
-    }
   }
 
   async function selectDefaultWorktree(path: string) {
@@ -10808,45 +10725,71 @@
     }
   }
 
-  async function refreshSidebarOpenCodeThreads(source: OpenCodeClient, paths: string[]) {
+  async function listOpenCodeRootThreads(path: string): Promise<AgentThread[]> {
+    const source = client;
+    const [threads, children] = await Promise.all([
+      listSidebarAcpThreads(
+        'opencode',
+        (cursor) => acp.listSessions('opencode', path, cursor, 'explore'),
+        path,
+      ),
+      source
+        ? listOpenCodeChildSessionIds(source, path).catch(() => new Set<string>())
+        : Promise.resolve(new Set<string>()),
+    ]);
+    return threads.filter((thread) => !children.has(thread.sessionId));
+  }
+
+  async function refreshSidebarOpenCodeThreads(paths: string[]): Promise<string | null> {
+    if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)) return null;
     const generation = ++sidebarInventoryGeneration;
-    const results = await Promise.allSettled(
-      paths.map((path) => listSidebarOpenCodeThreads(source, path)),
-    );
-    if (generation !== sidebarInventoryGeneration || disposed || source !== client) return;
+    const results = await Promise.allSettled(paths.map((path) => listOpenCodeRootThreads(path)));
+    if (generation !== sidebarInventoryGeneration || disposed) return null;
     const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
-    const retained = sidebarOpenCodeThreads.filter((thread) => failed.has(thread.directory));
+    const listed = new Set(paths);
+    const retained = sidebarOpenCodeThreads.filter(
+      (thread) => !listed.has(thread.directory) || failed.has(thread.directory),
+    );
+    const renamed = new Map(
+      agentThreads.filter((thread) => thread.renamed).map((thread) => [threadKey(thread), thread]),
+    );
     sidebarOpenCodeThreads = [
-      ...results.flatMap((result) => (result.status === 'fulfilled' ? result.value.threads : [])),
+      ...results
+        .flatMap((result) => (result.status === 'fulfilled' ? result.value : []))
+        .map((thread) => {
+          const saved = renamed.get(threadKey(thread));
+          return saved ? Object.assign({}, thread, { title: saved.title, renamed: true }) : thread;
+        }),
       ...retained,
     ];
-    sidebarOpenCodeOutcomes = Object.assign(
-      {},
-      ...results.flatMap((result) =>
-        result.status === 'fulfilled' ? [result.value.outcomes] : [],
-      ),
-      Object.fromEntries(
-        retained.flatMap((thread) => {
-          const key = threadKey(thread);
-          const outcome = sidebarOpenCodeOutcomes[key];
-          return outcome ? [[key, outcome]] : [];
-        }),
-      ),
-    );
-    void reconcileNativeActivity();
+    const failure = results.find((result) => result.status === 'rejected');
+    return failure?.status === 'rejected'
+      ? `Could not list OpenCode sessions: ${describe(failure.reason)}`
+      : null;
+  }
+
+  let sidebarInventoryFailure = '';
+
+  function reportSidebarInventoryFailure(failure: string | null) {
+    // The 30 s refresh must not re-raise the same failure over the user's current error.
+    if (failure && failure !== sidebarInventoryFailure) error = failure;
+    sidebarInventoryFailure = failure ?? '';
   }
 
   function scheduleSidebarInventoryRefresh() {
     clearTimeout(sidebarInventoryTimer);
     sidebarInventoryTimer = setTimeout(() => {
-      if (client) void refreshSidebarOpenCodeThreads(client, JSON.parse(sidebarDirectoryKey));
+      void refreshSidebarOpenCodeThreads(JSON.parse(sidebarDirectoryKey)).then(
+        reportSidebarInventoryFailure,
+        (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
+      );
     }, 250);
   }
 
   $effect(() => {
-    const source = client;
-    const paths: string[] = JSON.parse(sidebarDirectoryKey);
-    if (source) void refreshSidebarOpenCodeThreads(source, paths);
+    const tracked = sidebarDirectoryKey;
+    const available = agentAvailability.some((agent) => agent.id === 'opencode' && agent.available);
+    if (tracked && available) scheduleSidebarInventoryRefresh();
   });
 
   async function refreshSessions() {
@@ -10922,29 +10865,6 @@
     }
   }
 
-  async function restoreSession(id: string) {
-    if (!client) return false;
-    const path = directory;
-    const current = selection;
-    try {
-      const info = await client.session.get({ sessionID: id });
-      if (
-        current !== selection ||
-        path !== directory ||
-        info.location.directory !== path ||
-        info.parentID
-      )
-        return false;
-      selectedSession = info;
-      syncSessionChoice(info);
-      await selectSession(id, true);
-      return true;
-    } catch (cause) {
-      if (isSessionNotFoundError(cause)) return false;
-      throw cause;
-    }
-  }
-
   function clearSelectedSession() {
     saveViewState();
     cacheCurrentTimeline();
@@ -10996,13 +10916,11 @@
       paletteEntries.findIndex((entry) => !entry.disabled),
     );
     paletteError = '';
-    paletteOpenCodeSessions = [];
     paletteDialog.showModal();
     void tick().then(() => paletteInput.focus());
   }
 
   function closeCommandPalette(restore = true) {
-    clearTimeout(paletteSearchTimer);
     ++paletteSessionGeneration;
     restorePaletteFocus = restore;
     paletteDialog.close();
@@ -11014,16 +10932,14 @@
   }
 
   function setPaletteStep(step: PaletteStep) {
-    clearTimeout(paletteSearchTimer);
     ++paletteSessionGeneration;
     paletteStep = step;
     paletteQuery = '';
     paletteError = '';
-    paletteOpenCodeSessions = [];
     paletteLoading = false;
     paletteIndex = 0;
     if (step.kind === 'sessions' && step.agent === 'opencode')
-      void loadPaletteOpenCodeSessions(step.directory, '');
+      void loadPaletteOpenCodeSessions(step.directory);
     void tick().then(() => {
       paletteIndex = Math.max(
         0,
@@ -11043,50 +10959,13 @@
     else if (step.kind === 'worktrees') setPaletteStep({ kind: 'projects' });
   }
 
-  async function loadPaletteOpenCodeSessions(path: string, search: string) {
-    const source = client;
-    if (!source) {
-      paletteLoading = false;
-      paletteError = 'OpenCode is unavailable.';
-      return;
-    }
-    const sessionSource = source.session;
+  async function loadPaletteOpenCodeSessions(path: string) {
     const generation = ++paletteSessionGeneration;
     paletteLoading = true;
     paletteError = '';
     try {
-      async function collect(
-        cursor: string | null,
-        matches: PaletteOpenCodeSession[],
-        seen: Set<string>,
-      ): Promise<PaletteOpenCodeSession[]> {
-        const result = await sessionSource.list({
-          directory: path,
-          limit: 50,
-          order: 'desc',
-          parentID: null,
-          ...(search.trim() ? { search: search.trim() } : {}),
-          ...(cursor ? { cursor } : {}),
-        });
-        if (generation !== paletteSessionGeneration) return matches;
-        matches.push(
-          ...result.data
-            .filter((session) => session.location.directory === path && !session.parentID)
-            .map((session) => ({
-              id: session.id,
-              title: session.title ?? 'Untitled session',
-              directory: session.location.directory,
-              parentID: session.parentID ?? null,
-              updated: session.time.updated,
-            })),
-        );
-        const next = result.cursor.next ?? null;
-        if (matches.length >= 50 || !next || next === cursor || seen.has(next)) return matches;
-        seen.add(next);
-        return collect(next, matches, seen);
-      }
-      const matches = await collect(null, [], new Set());
-      if (generation === paletteSessionGeneration) paletteOpenCodeSessions = matches.slice(0, 50);
+      const failure = await refreshSidebarOpenCodeThreads([path]);
+      if (generation === paletteSessionGeneration && failure) paletteError = failure;
     } catch (cause) {
       if (generation === paletteSessionGeneration) paletteError = describe(cause);
     } finally {
@@ -11101,14 +10980,6 @@
       paletteEntries.findIndex((entry) => !entry.disabled),
     );
     paletteError = '';
-    clearTimeout(paletteSearchTimer);
-    if (paletteStep.kind === 'sessions' && paletteStep.agent === 'opencode') {
-      ++paletteSessionGeneration;
-      paletteOpenCodeSessions = [];
-      paletteLoading = true;
-      const path = paletteStep.directory;
-      paletteSearchTimer = setTimeout(() => void loadPaletteOpenCodeSessions(path, value), 180);
-    }
     void tick().then(() => {
       paletteIndex = Math.max(
         0,
@@ -11286,7 +11157,7 @@
       const workspaceError = error;
       try {
         if (!(await jumpToRecentThread(threadKey(entry.thread))))
-          throw new Error('This session is no longer available.');
+          throw new Error(jumpFailure || 'This session is no longer available.');
         closeCommandPalette(false);
       } catch (cause) {
         error = workspaceError;
@@ -11364,7 +11235,7 @@
       return;
     }
     if (step.kind !== 'sessions') return;
-    if (!['new-session', 'thread', 'opencode-session'].includes(entry.kind)) return;
+    if (!['new-session', 'thread'].includes(entry.kind)) return;
     paletteBusy = true;
     paletteError = '';
     try {
@@ -11383,15 +11254,9 @@
         await pending;
       }
       if (expectedProjectLoad !== projectLoadGeneration || !directory) return;
-      if (step.agent === 'opencode' && entry.kind === 'new-session' && !workReady)
-        throw new Error('Complete OpenCode setup in this worktree before starting a session.');
       closeCommandPalette(false);
       focusMainPane();
-      if (step.agent === 'opencode') {
-        if (entry.kind === 'new-session') newWork();
-        else if (entry.kind === 'opencode-session' && entry.sessionId)
-          await selectSession(entry.sessionId);
-      } else if (entry.kind === 'new-session') openAgent(step.agent);
+      if (entry.kind === 'new-session') openAgent(step.agent);
       focusPaneForTyping('main');
     } catch (cause) {
       paletteError = describe(cause);
@@ -11448,6 +11313,8 @@
     const previous = agentThreads.find((item) => threadKey(item) === threadKey(thread));
     if (previous && previous.updated > thread.updated)
       thread = { ...thread, updated: previous.updated };
+    if (previous?.renamed && !thread.renamed)
+      thread = { ...thread, title: previous.title, renamed: true };
     agentThreads = [
       thread,
       ...agentThreads.filter(
@@ -11481,17 +11348,8 @@
   }
 
   function rememberRecentThread(thread: AgentThread) {
-    if (thread.agent === 'opencode') {
-      nativeThreads = [
-        thread,
-        ...nativeThreads.filter((item) => threadKey(item) !== threadKey(thread)),
-      ].slice(0, 100);
-      sidebarOpenCodeThreads = [
-        thread,
-        ...sidebarOpenCodeThreads.filter((item) => threadKey(item) !== threadKey(thread)),
-      ];
-      setSetting('sai-recent-native-threads', JSON.stringify(nativeThreads));
-    }
+    if (!agentThreads.some((item) => threadKey(item) === threadKey(thread)))
+      saveAgentThread(thread);
     recentThreadKeys = touchRecentThread(recentThreadKeys, thread);
     setSetting('sai-recent-agent-threads', JSON.stringify(recentThreadKeys));
   }
@@ -11517,12 +11375,7 @@
     ]);
     const availableThreads = new Set(
       [...agentThreads, ...nativeChildThreads, ...nativeThreads]
-        .filter(
-          (thread) =>
-            (thread.agent === 'opencode'
-              ? runtimeState === 'connected'
-              : availableAgents.has(thread.agent)) && projectPaths.has(thread.directory),
-        )
+        .filter((thread) => availableAgents.has(thread.agent) && projectPaths.has(thread.directory))
         .map(threadKey),
     );
     return recentThreadKeys.filter((key) => availableThreads.has(key));
@@ -11541,70 +11394,83 @@
     return thread ? threadKey(thread) : null;
   }
 
-  // ACP OpenCode threads share the agent id with the native server's threads.
-  function usesNativeOpenCode(thread: AgentThread): boolean {
-    return (
-      thread.agent === 'opencode' &&
-      !agentThreads.includes(thread) &&
-      !nativeChildThreads.includes(thread)
-    );
+  let jumpFailure = '';
+
+  function threadAgentUnavailable(thread: AgentThread): string | null {
+    const agent = agentAvailability.find((item) => item.id === thread.agent);
+    if (agent?.available) return null;
+    return `${agent?.name ?? thread.agent} is unavailable.${agent?.reason ? ` ${agent.reason}` : ''}`;
   }
 
   async function jumpToRecentThread(key: string): Promise<boolean> {
-    const thread = [
-      ...agentThreads,
-      ...nativeChildThreads,
-      ...nativeThreads,
-      ...sidebarOpenCodeThreads,
-    ].find((item) => threadKey(item) === key);
-    if (
-      !thread ||
-      (usesNativeOpenCode(thread)
-        ? runtimeState !== 'connected'
-        : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available))
-    )
+    jumpFailure = '';
+    const known = () =>
+      [...agentThreads, ...nativeChildThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
+        (item) => threadKey(item) === key,
+      );
+    const thread = known();
+    if (!thread) {
+      jumpFailure = 'This thread is no longer listed.';
       return false;
+    }
+    const unavailable = threadAgentUnavailable(thread);
+    if (unavailable) {
+      jumpFailure = unavailable;
+      return false;
+    }
     showWorkspace();
     const jump = ++recentJumpGeneration;
     let expectedProjectLoad = projectLoadGeneration;
-    const sameDirectory = thread.directory === directory;
-    const target = sameDirectory
-      ? (await invoke<boolean>('repository_path_available', { path: directory }).catch(() => false))
-        ? directory
-        : null
-      : await invoke<string>('validate_repository', { path: thread.directory }).catch(() => null);
-    if (!target || jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
-      return false;
-    if (thread.directory !== directory || target !== directory) {
-      const pending = loadProject(thread.directory, false);
-      expectedProjectLoad = projectLoadGeneration;
-      if (thread.agent === 'opencode') await pending;
-      else
-        void pending.catch((cause) => {
-          if (expectedProjectLoad === projectLoadGeneration) error = describe(cause);
-        });
+    if (thread.directory === directory) {
+      const available = await invoke<boolean>('repository_path_available', {
+        path: directory,
+      }).catch(() => false);
+      if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
+        return false;
+      if (!available) {
+        jumpFailure = 'This session is no longer available.';
+        return false;
+      }
+      showSidebarThread(thread);
+      focusMainPane();
+      openAgent(thread.agent, thread, true);
+      focusPaneForTyping('main');
+      return true;
     }
+    const target = await invoke<string>('validate_repository', { path: thread.directory }).catch(
+      (cause: unknown) => {
+        jumpFailure = describe(cause);
+        return null;
+      },
+    );
+    if (!target) return false;
     if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
       return false;
-    const selected = [
-      ...agentThreads,
-      ...nativeChildThreads,
-      ...nativeThreads,
-      ...sidebarOpenCodeThreads,
-    ].find(
-      (item) =>
-        item.directory === directory &&
-        item.agent === thread.agent &&
-        item.sessionId === thread.sessionId,
-    );
-    if (!selected) return false;
+    const pending = loadProject(thread.directory, false);
+    expectedProjectLoad = projectLoadGeneration;
+    void pending.catch((cause) => {
+      if (expectedProjectLoad === projectLoadGeneration) error = describe(cause);
+    });
+    if (jump !== recentJumpGeneration || expectedProjectLoad !== projectLoadGeneration)
+      return false;
+    const selected = known();
+    if (!selected || selected.directory !== directory) {
+      jumpFailure = 'This thread is no longer listed.';
+      return false;
+    }
     showSidebarThread(selected);
     focusMainPane();
-    if (usesNativeOpenCode(selected)) {
-      if (!(await selectSession(selected.sessionId))) return false;
-    } else openAgent(selected.agent, selected, true);
+    openAgent(selected.agent, selected, true);
     focusPaneForTyping('main');
     return true;
+  }
+
+  async function selectSidebarThread(key: string) {
+    try {
+      if (!(await jumpToRecentThread(key)) && jumpFailure) error = jumpFailure;
+    } catch (cause) {
+      error = describe(cause);
+    }
   }
 
   async function openShipTarget(path: string, threadId?: string | null, prefill?: string | null) {
@@ -11623,19 +11489,11 @@
         ...sidebarOpenCodeThreads,
       ].find(
         (item) =>
-          item.directory === path &&
-          (item.agent === 'opencode' && usesNativeOpenCode(item)
-            ? `opencode:${item.sessionId}`
-            : `acp:${item.agent}:${item.sessionId}`) === threadId,
+          item.directory === path && sameThreadId(threadId, `acp:${item.agent}:${item.sessionId}`),
       );
       if (!thread)
         throw new Error('Session history is unavailable. Open the worktree to inspect it.');
-      if (
-        usesNativeOpenCode(thread)
-          ? runtimeState !== 'connected'
-          : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available)
-      )
-        throw new Error('This session’s agent is unavailable.');
+      if (threadAgentUnavailable(thread)) throw new Error('This session’s agent is unavailable.');
       if (!(await jumpToRecentThread(threadKey(thread))))
         throw new Error('Session history is unavailable. Open the worktree to inspect it.');
       if (prefill) prefillWorkerComposer(thread, prefill);
@@ -11645,11 +11503,6 @@
 
   /** Puts the worker's pending request in its composer and focuses it; a busy worker queues the reply. */
   function prefillWorkerComposer(thread: AgentThread, text: string) {
-    if (usesNativeOpenCode(thread)) {
-      draft = [draft.trim(), text].filter(Boolean).join('\n\n');
-      focusPaneForTyping('main');
-      return;
-    }
     issuePrefills = {
       ...issuePrefills,
       [thread.directory]: { id: crypto.randomUUID(), text },
@@ -11731,8 +11584,7 @@
       );
       if (thread) await jumpToRecentThread(threadKey(thread));
     } else {
-      if (directory !== item.directory) await loadProject(item.directory, false);
-      if (directory === item.directory) await selectSession(item.sessionId);
+      await jumpToRecentThread(JSON.stringify(['opencode', item.directory, item.sessionId]));
     }
     await focusInboxRequest(item);
   }
@@ -12347,9 +12199,7 @@
     const thread = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads].find(
       (item) =>
         item.directory === check.directory &&
-        (item.agent === 'opencode'
-          ? `opencode:${item.sessionId}`
-          : `acp:${item.agent}:${item.sessionId}`) === check.thread,
+        sameThreadId(check.thread, `acp:${item.agent}:${item.sessionId}`),
     );
     if (!thread || !(await jumpToRecentThread(threadKey(thread)))) {
       error = 'The session for this check is unavailable.';
@@ -12631,10 +12481,7 @@
 
   function createPaneThread(id: string, thread: AgentThread) {
     invalidatePaneSelection(id);
-    const sessionKey =
-      thread.agent === 'opencode'
-        ? `opencode:${thread.sessionId}`
-        : `acp:${thread.agent}:${thread.sessionId}`;
+    const sessionKey = `acp:${thread.agent}:${thread.sessionId}`;
     migrateDiffComments(diffCommentKey(id), `${directory}\0${id}\0${sessionKey}`);
     savePaneLayout(updatePane(paneLayout, id, { thread }));
     if (thread.agent === 'opencode') {
@@ -12646,23 +12493,9 @@
     rememberRecentThread(thread);
   }
 
-  function recordPaneActivity(thread: AgentThread) {
-    if (thread.agent !== 'opencode') {
-      saveAgentThread(thread);
-      return;
-    }
-    const pane = leaves(paneLayout).find(
-      (leaf) => leaf.agent === 'opencode' && leaf.thread?.sessionId === thread.sessionId,
-    );
-    if (pane) savePaneLayout(updatePane(paneLayout, pane.id, { thread }));
-    rememberRecentThread(thread);
-    void refreshSessions().catch((cause) => (error = describe(cause)));
-  }
-
   function choosePaneAgent(id: string, agent: AgentId) {
     if (id === 'main') {
-      if (agent === 'opencode') newWork();
-      else openAgent(agent);
+      openAgent(agent);
       return;
     }
     invalidatePaneSelection(id);
@@ -12703,10 +12536,8 @@
 
   function diffCommentKey(id: string) {
     if (id === 'main')
-      return `${directory}\0main\0${acpAgent ? `acp:${acpAgent}:${acpThread?.sessionId ?? 'new'}` : `opencode:${sessionID ?? 'new'}`}`;
+      return `${directory}\0main\0${acpAgent ? `acp:${acpAgent}:${acpThread?.sessionId ?? 'new'}` : `acp:opencode:${sessionID ?? 'new'}`}`;
     const pane = leaves(paneLayout).find((leaf) => leaf.id === id);
-    if (pane?.agent === 'opencode')
-      return `${directory}\0${id}\0opencode:${pane.thread?.sessionId ?? 'new'}`;
     return `${directory}\0${id}\0acp:${pane?.agent ?? 'none'}:${pane?.thread?.sessionId ?? 'new'}`;
   }
 
@@ -12770,7 +12601,7 @@
               throw new Error('Target session moved to another worktree.');
             await invoke('record_turn_snapshot', {
               path,
-              thread: `opencode:${session}`,
+              thread: `acp:opencode:${session}`,
             });
             return runOpenCodePromptStart(path, () =>
               source.session.prompt({ sessionID: session, text }),
@@ -12878,8 +12709,14 @@
       );
     }
     void tick().then(() => forgetRecentTranscript(thread));
-    if (thread.agent !== 'opencode')
-      void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
+    if (thread.agent === 'opencode') {
+      sidebarOpenCodeThreads = sidebarOpenCodeThreads.filter(
+        (item) => threadKey(item) !== threadKey(thread),
+      );
+      // session/list keeps returning a deleted OpenCode session.
+      removeSidebarThread(thread);
+    }
+    void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
   }
 
   function agentThreadKey(thread: AgentThread): string {
@@ -12892,11 +12729,8 @@
     if (focusedPane !== 'main' && !pane) return null;
     const agent = pane ? pane.agent : acpAgent;
     const thread = pane ? pane.thread : acpThread;
-    if (agent && thread)
-      return agent === 'opencode'
-        ? `opencode:${thread.sessionId}`
-        : `acp:${agent}:${thread.sessionId}`;
-    if (focusedPane === 'main' && !acpAgent && sessionID) return `opencode:${sessionID}`;
+    if (agent && thread) return `acp:${agent}:${thread.sessionId}`;
+    if (focusedPane === 'main' && !acpAgent && sessionID) return `acp:opencode:${sessionID}`;
     return null;
   }
 
@@ -13007,75 +12841,6 @@
       (leaves(paneLayout).some((pane) => pane.thread && threadKey(pane.thread) === key) ||
         (!acpAgent && !!sessionID && focusedThreadKey() === key))
     );
-  }
-
-  async function reconcileNativeActivity() {
-    if (!client) return;
-    const source = client;
-    const generation = ++nativeActivityGeneration;
-    try {
-      const paths: string[] = JSON.parse(sidebarDirectoryKey);
-      const [active, requests] = await Promise.all([
-        source.session.active(),
-        Promise.allSettled(
-          paths.map(async (path) => {
-            const [permissions, forms] = await Promise.all([
-              source.permission.request.list({ location: { directory: path } }),
-              source.form.list({ location: { directory: path } }),
-            ]);
-            return [
-              ...permissions.data.map((request) => request.sessionID),
-              ...forms.data.map((form) => form.sessionID),
-            ];
-          }),
-        ),
-      ]);
-      if (generation !== nativeActivityGeneration || source !== client) return;
-      activeSessionIDs = Object.keys(active);
-      const waiting = new Set(
-        requests.flatMap((result) => (result.status === 'fulfilled' ? result.value : [])),
-      );
-      const unavailable = new Set(
-        paths.filter((_, index) => requests[index]?.status === 'rejected'),
-      );
-      const known = groupSidebarThreads([...sidebarOpenCodeThreads, ...nativeThreads]);
-      const threads = Object.values(known).flat();
-      const stale = threads.filter(
-        (thread) =>
-          !unavailable.has(thread.directory) &&
-          !waiting.has(thread.sessionId) &&
-          !active[thread.sessionId] &&
-          ['working', 'waiting'].includes(threadAttention[threadKey(thread)]?.status ?? ''),
-      );
-      const outcomes = await Promise.allSettled(
-        stale.map((thread) => source.session.get({ sessionID: thread.sessionId })),
-      );
-      if (generation !== nativeActivityGeneration || source !== client) return;
-      nativeActivityReady = true;
-      nativeUnavailableDirectories = [...unavailable];
-      const ended = new Map(stale.map((thread, index) => [threadKey(thread), outcomes[index]]));
-      for (const thread of threads) {
-        if (unavailable.has(thread.directory)) continue;
-        const result = ended.get(threadKey(thread));
-        const status = waiting.has(thread.sessionId)
-          ? 'waiting'
-          : active[thread.sessionId]
-            ? 'working'
-            : result
-              ? result.status === 'fulfilled'
-                ? result.value.outcome === 'succeeded'
-                  ? 'done'
-                  : (result.value.outcome ?? null)
-                : null
-              : null;
-        if (status && status !== threadAttention[threadKey(thread)]?.status)
-          updateAgentThreadStatus(thread, status);
-        else if (result && !status) forgetThreadAttention(thread);
-      }
-    } catch {
-      if (generation === nativeActivityGeneration && source === client) nativeActivityReady = false;
-      return;
-    }
   }
 
   async function recoverInterruptedAgentTurns() {
@@ -13828,71 +13593,8 @@
     }
   }
 
-  function newWork() {
-    if (!workReady || switching || sending) return;
-    if (focusedPane !== 'main' && leaves(paneLayout).some((pane) => pane.id === focusedPane)) {
-      choosePaneAgent(focusedPane, 'opencode');
-      return;
-    }
-    focusMainPane();
-    acpAgent = null;
-    acpThread = null;
-    savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null, kind: undefined }));
-    clearMainPaneEmpty();
-    saveViewState();
-    cacheCurrentTimeline();
-    ++selection;
-    sessionID = null;
-    selectedSession = null;
-    newSessionMode = 'work';
-    selectedAgentID =
-      setup?.agents.find((agent) => agent.id !== 'architect')?.id ?? selectedAgentID;
-    if (setup?.defaultModel) selectedModelKey = modelKey(setup.defaultModel);
-    selectedVariant = setup?.defaultModel?.variant ?? '';
-    resetTimeline();
-    snapshot = { plan: null, questions: null };
-    diffs = [];
-    selectedFilePath = null;
-    sideTab = 'changes';
-    ++diffRefresh;
-    diffLoading = false;
-    pendingPermissions = [];
-    pendingForms = [];
-    clearDraftAttachments();
-    running = false;
-    draft = viewStates.get(viewKey())?.draft ?? '';
-    mobileView = 'chat';
-    error = '';
-  }
-
-  async function newPlan() {
-    if (!client || !directory || !planReady || switching || sending) return;
-    focusMainPane();
-    acpAgent = null;
-    acpThread = null;
-    savePaneLayout(updatePane(paneLayout, 'main', { agent: null, thread: null, kind: undefined }));
-    const path = directory;
-    const current = selection;
-    let releaseProfile: (() => void) | undefined;
-    try {
-      const capabilityProfile = capabilityProfileForDirectory(path);
-      releaseProfile = await reserveOpenCodeBrowser(path, capabilityProfile);
-      const session = await client.session.create({
-        agent: 'architect',
-        location: { directory: path },
-        metadata: { saiHarness: true, sailCapabilityProfile: capabilityProfile },
-        title: 'New plan',
-      });
-      if (current !== selection || path !== directory) return;
-      await refreshSessions();
-      if (current !== selection || path !== directory) return;
-      selectedSession = session;
-      await selectSession(session.id, true);
-    } catch (cause) {
-      error = describe(cause);
-    } finally {
-      releaseProfile?.();
-    }
+  function newPlan() {
+    openAgent('opencode');
   }
 
   async function chooseAgent(id: string) {
@@ -14049,17 +13751,41 @@
 
   function startRename(session: { id: string; title?: string }) {
     editingSessionID = session.id;
+    editingThread = null;
     editedTitle = session.title ?? '';
     renameSessionDialog.showModal();
   }
 
+  function startThreadRename(thread: AgentThread) {
+    editingThread = thread;
+    editingSessionID = null;
+    editedTitle = thread.title;
+    renameSessionDialog.showModal();
+  }
+
+  function renameAgentThread(thread: AgentThread, title: string) {
+    const renamed = { ...thread, title, renamed: true };
+    saveAgentThread(renamed);
+    sidebarOpenCodeThreads = sidebarOpenCodeThreads.map((item) =>
+      threadKey(item) === threadKey(thread) ? { ...item, title, renamed: true } : item,
+    );
+    if (acpThread && threadKey(acpThread) === threadKey(thread))
+      acpThread = { ...acpThread, title, renamed: true };
+  }
+
   async function saveRename() {
-    if (!client || !editingSessionID) return;
     const title = editedTitle.trim();
     if (!title) {
       error = 'Enter a session title.';
       return;
     }
+    if (editingThread) {
+      renameAgentThread(editingThread, title);
+      editingThread = null;
+      renameSessionDialog.close();
+      return;
+    }
+    if (!client || !editingSessionID) return;
     try {
       await client.session.update({ sessionID: editingSessionID, title });
       const renamedID = editingSessionID;
@@ -14195,7 +13921,7 @@
   }
 
   const mainSpawnRevision = $derived(
-    spawnReceiptsForSource(spawnReceipts, sessionID ? `opencode:${sessionID}` : null, directory)
+    spawnReceiptsForSource(spawnReceipts, sessionID ? `acp:opencode:${sessionID}` : null, directory)
       .map((receipt) => receipt.updated)
       .join(','),
   );
@@ -14461,7 +14187,7 @@
       key,
       setTimeout(() => {
         shipContextTimers.delete(key);
-        if (!shipCheckpointOwner(shipRuns, path, `opencode:${id}`)) return;
+        if (!shipCheckpointOwner(shipRuns, path, `acp:opencode:${id}`)) return;
         void source.message
           .list({ sessionID: id, limit: 50, order: 'desc' })
           .then(async (page) => {
@@ -14572,7 +14298,7 @@
           if (path)
             void recordShipContextEvent(
               path,
-              `opencode:${eventSession}`,
+              `acp:opencode:${eventSession}`,
               event.id,
               event.type === 'session.compaction.started' ? 'compaction' : 'retry',
             ).catch((cause) => (error = describe(cause)));
@@ -14587,11 +14313,12 @@
             event.location?.directory ??
             thread?.directory ??
             (eventSession === sessionID ? directory : '');
-          if (path) void runCompletedChecks(path, `opencode:${eventSession}`, event.id);
+          if (path) void runCompletedChecks(path, `acp:opencode:${eventSession}`, event.id);
         }
         if (typeof eventSession === 'string' && event.type === 'session.text.delta') {
           for (const receipt of spawnReceipts.filter(
-            (item) => item.targetId === `opencode:${eventSession}` && !receiptIsSettled(item.state),
+            (item) =>
+              item.targetId === `acp:opencode:${eventSession}` && !receiptIsSettled(item.state),
           ))
             updateSpawnReceipt(receipt.receiptId, {
               result: `${receipt.result ?? ''}${event.data.delta}`.slice(-16_000),
@@ -14600,12 +14327,14 @@
         }
         if (typeof eventSession === 'string' && event.type === 'session.execution.started')
           for (const receipt of spawnReceipts.filter(
-            (item) => item.targetId === `opencode:${eventSession}` && !receiptIsSettled(item.state),
+            (item) =>
+              item.targetId === `acp:opencode:${eventSession}` && !receiptIsSettled(item.state),
           ))
             updateSpawnReceipt(receipt.receiptId, { state: 'working' });
         if (typeof eventSession === 'string' && event.type === 'session.tool.input.started')
           for (const receipt of spawnReceipts.filter(
-            (item) => item.targetId === `opencode:${eventSession}` && !receiptIsSettled(item.state),
+            (item) =>
+              item.targetId === `acp:opencode:${eventSession}` && !receiptIsSettled(item.state),
           ))
             updateSpawnReceipt(receipt.receiptId, { activity: `Using ${event.data.name}` });
         if (
@@ -14616,7 +14345,6 @@
             event.type === 'session.execution.interrupted')
         ) {
           ++sidebarInventoryGeneration;
-          ++nativeActivityGeneration;
           const matchingThreads = sidebarOpenCodeThreads.filter(
             (item) =>
               item.sessionId === eventSession &&
@@ -14780,7 +14508,6 @@
             forgetInboxTime(`opencode:form:${event.data.id}`);
           scheduleRefresh();
           scheduleInboxRefresh();
-          void reconcileNativeActivity();
         }
       }
     } catch (cause) {
@@ -14794,8 +14521,6 @@
     }
     if (!signal.aborted) {
       if (!failed) recordDiagnostic('opencode_event_stream_ended');
-      ++nativeActivityGeneration;
-      nativeActivityReady = false;
       runtimeState = 'starting';
       recoveryTimer = setTimeout(() => void recoverRuntime(), 1500);
     }
@@ -14912,7 +14637,7 @@
         });
         id = session.id;
         if (current === selection && path === directory) {
-          migrateDiffComments(diffCommentKey('main'), `${path}\0main\0opencode:${id}`);
+          migrateDiffComments(diffCommentKey('main'), `${path}\0main\0acp:opencode:${id}`);
           await refreshSessions();
           if (current === selection && path === directory) {
             selectedSession = session;
@@ -14946,22 +14671,22 @@
           ? `${target.model.providerID}:${target.model.id}`
           : undefined;
         if (shipIssue) {
-          recordShipItOwner(path, `opencode:${targetId}`);
+          recordShipItOwner(path, `acp:opencode:${targetId}`);
           directAuthorization = await adoptDirectShipRunWithAuthorization(
             shipIssue,
             path,
-            `opencode:${targetId}`,
+            `acp:opencode:${targetId}`,
             implementingModel,
             true,
           );
           if (!directAuthorization) throw new Error('Direct shipping claim was not acquired.');
           directClaimPrompt = directShipClaimPrompt(directAuthorization.claim);
         }
-        await invoke('record_turn_snapshot', { path, thread: `opencode:${targetId}` });
+        await invoke('record_turn_snapshot', { path, thread: `acp:opencode:${targetId}` });
         const tracking = await beginImplementationTurn(
           path,
           implementingModel,
-          `opencode:${targetId}`,
+          `acp:opencode:${targetId}`,
         );
         const resolvedPrompt = withShellContext(
           sentShell,
@@ -14969,7 +14694,7 @@
         );
         const shippingReceipt = await prepareOpenCodeShippingDispatch(
           directAuthorization,
-          `opencode:${targetId}`,
+          `acp:opencode:${targetId}`,
           path,
           resolvedPrompt,
         );
@@ -15058,7 +14783,8 @@
         const captureId = pickedCaptureIds.get(file);
         return captureId ? [captureId] : [];
       });
-      if (captureIds.length) assignReviewCaptures(captureIds, `opencode:${targetId}`, response.id);
+      if (captureIds.length)
+        assignReviewCaptures(captureIds, `acp:opencode:${targetId}`, response.id);
       accepted = true;
       const staged = files.filter((file) => clipboardAttachmentPaths.delete(file));
       staged.forEach((file) => clipboardAttachmentNames.delete(file));
@@ -15449,10 +15175,7 @@
         openCodeOutcomes={sidebarOpenCodeOutcomes}
         spawnReceipts={navigableReceipts}
         {acpActivityReady}
-        {nativeActivityReady}
-        {nativeUnavailableDirectories}
         selectedThread={focusedThreadKey()}
-        openCodeAvailable={runtimeState === 'connected'}
         worktreeDialogRequest={paletteWorktreeRequest}
         {worktreeCreations}
         {worktreeDeletions}
@@ -15465,7 +15188,7 @@
           if (path !== directory) void loadProject(path);
         }}
         onselectdefault={(path) => void selectDefaultWorktree(path)}
-        onselectthread={(key) => void jumpToRecentThread(key)}
+        onselectthread={(key) => void selectSidebarThread(key)}
         onremovethread={removeSidebarThread}
         onaddrepository={(groupID) => void chooseProject(groupID)}
         onaddgroup={addProjectGroup}
@@ -15530,10 +15253,8 @@
       {directory}
       agents={agentAvailability}
       onopenagent={(agent) => openAgent(agent)}
-      newWorkDisabled={!workReady || switching || sending}
-      onnewwork={newWork}
-      planDisabled={!planReady || switching || sending}
-      onnewplan={() => void newPlan()}
+      planDisabled={!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)}
+      onnewplan={newPlan}
       onswitchthread={() =>
         reopenCommandPalette({
           kind: 'agents',
@@ -15544,6 +15265,7 @@
         ? {
             kind: 'agent',
             title: actionAgentThread.title,
+            onrename: () => actionAgentThread && startThreadRename(actionAgentThread),
             ondelete: () => actionAgentThread && void deleteAgentThread(actionAgentThread),
           }
         : actionOpenCodeSession
@@ -15698,7 +15420,7 @@
                 onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
               />
             {/key}
-          {:else}
+          {:else if sessionID || newSessionMode}
             <div class="agent-header">
               <div class="agent-heading">
                 <HarnessIcon agent="opencode" /><strong>OpenCode</strong><span
@@ -15938,6 +15660,29 @@
                   </div>
                 </div>
               </div>{/if}
+          {:else}
+            <div class="chat-body">
+              <div class="conversation">
+                <div class="welcome">
+                  <div class="welcome-mark">◇</div>
+                  <p class="eyebrow">START WORK</p>
+                  <h1>What are we working on?</h1>
+                  <p>
+                    {agentAvailability.some((agent) => agent.available)
+                      ? 'Choose an available agent to start in this repository.'
+                      : 'No agent is available. Install one or set OpenCode up in settings.'}
+                  </p>
+                  {#if !directory}<Button onclick={() => chooseProject()}>Select repository</Button
+                    >{:else}<div class="welcome-agents">
+                      {#each agentAvailability.filter((agent) => agent.available) as agent (agent.id)}<Button
+                          variant="secondary"
+                          onclick={() => openAgent(agent.id)}
+                          >Start with <HarnessIcon agent={agent.id} /> {agent.name}</Button
+                        >{/each}
+                    </div>{/if}
+                </div>
+              </div>
+            </div>
           {/if}
         </main>
       </div>
@@ -15980,7 +15725,7 @@
         capabilityProfile={capabilityProfileForDirectory(directory)}
         onensureprofile={reserveOpenCodeBrowser}
         {dark}
-        agents={paneAgents}
+        agents={agentAvailability}
         {sideChat}
         {client}
         {setup}
@@ -16038,7 +15783,7 @@
         onpickedconsumed={markPickConsumed}
         onattachmentsent={assignReviewCaptures}
         onshortcut={keydownWorkspace}
-        onactivity={recordPaneActivity}
+        onactivity={saveAgentThread}
         onhistorychange={() => openCodeTimelineRevision++}
         activityEvents={currentActivityHistory}
         activityLoading={inboxLoading}
@@ -16260,7 +16005,7 @@
                     ? `acp:${acpAgent}:${acpThread.sessionId}`
                     : null
                   : sessionID
-                    ? `opencode:${sessionID}`
+                    ? `acp:opencode:${sessionID}`
                     : null,
               )}
             />
