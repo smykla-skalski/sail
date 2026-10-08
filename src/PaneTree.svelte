@@ -30,7 +30,12 @@
   import type { ReviewCapture, ReviewPreview } from './lib/review-evidence';
   import type { AgentUsage, RateWindow } from './lib/agent-usage';
   import type { PublishedGraph } from './lib/issue-graph';
-  import type { DirectShipAuthorization, ShipIssue, ShipRun } from './lib/issue-shipping';
+  import type {
+    DirectShipAuthorization,
+    MergeOwner,
+    ShipIssue,
+    ShipRun,
+  } from './lib/issue-shipping';
   import type { ActivityHistoryEvent } from './lib/activity-history';
   import type { WorkspaceActivityItem } from './lib/workspace-activity';
   import type { ShipItIssue } from './lib/implementation-models';
@@ -73,6 +78,7 @@
     shipRuns: ShipRun[];
     shipNeedsInput: number;
     shippingBusy: boolean;
+    mergeOwner?: MergeOwner;
     nativeSubagents: NativeSubagent[];
     onshiprefresh: () => Promise<void>;
     onshipopen: (path: string, threadId?: string | null) => Promise<void>;
@@ -175,6 +181,7 @@
     shipRuns,
     shipNeedsInput,
     shippingBusy,
+    mergeOwner = 'you',
     nativeSubagents,
     onshiprefresh,
     onshipopen,
@@ -600,6 +607,7 @@
       {shipRuns}
       {shipNeedsInput}
       {shippingBusy}
+      {mergeOwner}
       {nativeSubagents}
       {onshiprefresh}
       {onshipopen}
@@ -713,6 +721,7 @@
       {shipRuns}
       {shipNeedsInput}
       {shippingBusy}
+      {mergeOwner}
       {nativeSubagents}
       {onshiprefresh}
       {onshipopen}
@@ -1003,6 +1012,7 @@
                     repository={project}
                     runs={shipRuns}
                     busy={shippingBusy}
+                    {mergeOwner}
                     {nativeSubagents}
                     onclose={closeNativeDetails}
                     onrefresh={onshiprefresh}
@@ -1149,6 +1159,7 @@
                     repository={project}
                     runs={shipRuns}
                     busy={shippingBusy}
+                    {mergeOwner}
                     {nativeSubagents}
                     onclose={closeAcpDetails}
                     onrefresh={onshiprefresh}

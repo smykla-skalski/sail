@@ -246,11 +246,14 @@
     background: var(--sui-surface);
   }
   .map-node[data-state='blocked'],
+  .map-node[data-state='closed without merge'],
   .map-node[data-state='failed'],
   .map-node.error {
     border-left-color: var(--sui-danger);
   }
   .map-node[data-state='waiting'],
+  .map-node[data-state='waiting for input'],
+  .map-node[data-state='awaiting merge'],
   .map-node[data-state='queued'] {
     border-left-color: var(--activity-waiting);
   }

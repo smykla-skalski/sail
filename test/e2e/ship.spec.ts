@@ -1,12 +1,59 @@
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ShipRun } from '../../src/lib/issue-shipping';
+import type { ShipIssue, ShipRun } from '../../src/lib/issue-shipping';
 
 const validationGates = () =>
   $("//h4[normalize-space()='Validation gates']/following-sibling::ol[1]");
+
+const batchIssue = (index: number, extra: Partial<ShipIssue>): ShipIssue =>
+  Object.assign(
+    {
+      id: `batch-${index}`,
+      number: 100 + index,
+      url: `https://github.com/fixture/repo/issues/${100 + index}`,
+      title: `Batch issue ${index + 1}`,
+      dependsOn: [],
+      state: 'pending' as const,
+      branch: `batch-${index}`,
+      path: null,
+      receiptId: null,
+      threadId: null,
+      pullRequest: null,
+      error: null,
+    },
+    extra,
+  );
+
+const auditDirectory = process.env.SAIL_VISUAL_AUDIT_DIR;
+
+const capture = async (name: string) => {
+  if (!auditDirectory) return;
+  mkdirSync(auditDirectory, { recursive: true });
+  await browser.saveScreenshot(join(auditDirectory, `${name}.png`));
+};
+
+const setTheme = (theme: 'light' | 'dark') =>
+  browser.execute((value) => {
+    document.documentElement.dataset.suiTheme = value;
+  }, theme);
+
+const showList = async () => {
+  const back = $('.ship-back');
+  if (await back.isExisting()) await back.click();
+};
+
+const openIssue = async (id: string) => {
+  await showList();
+  await $(`[data-ship-issue-id="${id}"]`).click();
+};
+
+const toggleShip = () =>
+  browser.execute(() =>
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true })),
+  );
 
 describe('native Ship run history', () => {
   const root = mkdtempSync(join(tmpdir(), 'sail-ship-view-'));
@@ -198,7 +245,18 @@ describe('native Ship run history', () => {
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('Ship dashboard fixture'));
     await $('.ship-scope button:nth-child(2)').click();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('Other project fixture'));
+    await $('.ship-run-option*=Ship dashboard fixture').click();
+    await expect($('.ship-run-option[aria-pressed="true"]')).toHaveText(
+      expect.stringContaining('Ship dashboard fixture'),
+    );
+    await expect($('.ship-run-option[aria-pressed="true"]')).toHaveText(
+      expect.stringContaining('fixture/repo'),
+    );
+    await expect($('.ship-run-option[aria-pressed="true"]')).toHaveText(
+      expect.stringContaining('Launched'),
+    );
     await $('.ship-scope button:first-child').click();
+    await expect($('.ship-run-option')).not.toExist();
     await browser.keys('Escape');
     await expect($('.ship-panel')).not.toBeDisplayed();
     await browser.execute(() =>
@@ -212,30 +270,21 @@ describe('native Ship run history', () => {
     const subtitle = $('.ship-panel header .ship-repository');
     await expect(subtitle).toHaveText(repository.split('/').at(-1)!);
     await expect(subtitle).toHaveAttribute('title', repository);
-    await expect($('.ship-run-option[aria-pressed="true"]')).toHaveText(
-      expect.stringContaining('Ship dashboard fixture'),
+    await expect(
+      $('.ship-group[data-group="needs-input"] [data-ship-issue-id="first"]'),
+    ).toHaveText(expect.stringContaining('Recovery needed'));
+    await expect($('[data-ship-issue-id="first"] .ship-line')).toHaveText(
+      expect.stringContaining('Shipping failed'),
     );
-    await expect($('.ship-run-option[aria-pressed="true"]')).toHaveText(
-      expect.stringContaining('fixture/repo'),
+    await expect(
+      $('.ship-group[data-group="waiting"] [data-ship-issue-id="dependent"]'),
+    ).toHaveText(expect.stringContaining('Waiting on #41'));
+    await expect($('[data-ship-issue-id="dependent"] .ship-line')).toHaveText(
+      expect.stringContaining('Blocked by dependency'),
     );
-    await expect($('.ship-run-option[aria-pressed="true"]')).toHaveText(
-      expect.stringContaining('Launched'),
-    );
-    await expect($('.ship-now')).toHaveText(expect.stringContaining('Needs attention first'));
-    await expect($('.ship-now')).toHaveText(expect.stringContaining('Shipping failed'));
-    await expect($('.ship-now')).toHaveText(expect.stringContaining('Blocked by dependency'));
-    await expect($$('.ship-now-item')).toBeElementsArrayOfSize(10);
-    await expect($('.ship-now-item:first-child')).toHaveAttribute('data-ship-issue-id', 'first');
-    await expect($('.ship-now-item:first-child')).toHaveText(
-      expect.stringContaining('Recovery needed'),
-    );
-    await expect($('.ship-now-item:first-child')).toHaveText(expect.stringContaining('Next'));
-    await expect($('.ship-now-item:first-child .ship-claims')).toHaveText(
-      expect.stringContaining('Worker'),
-    );
-    await expect($('.ship-now-item:first-child .ship-claims')).toHaveText(
-      expect.stringContaining('ClaimReleased'),
-    );
+    await expect($$('.ship-now-item')).toBeElementsArrayOfSize(2);
+    await expect($('.ship-group[data-group="done"]')).not.toExist();
+    await expect($('.ship-done-toggle')).toHaveText('Show done (8)');
     const initialWidth = await browser.execute(() => window.innerWidth);
     const zoomTo200 = async (width: number, remaining = 8): Promise<number> => {
       if (width <= initialWidth / 1.9 || remaining === 0) return width;
@@ -258,11 +307,11 @@ describe('native Ship run history', () => {
     await browser.waitUntil(
       async () => (await browser.execute(() => window.innerWidth)) === initialWidth,
     );
-    await $('[data-ship-issue-id="dependent"]').click();
+    await openIssue('dependent');
     await expect(
       $('.ship-issue-detail a[href="https://github.com/owner/repo/issues/123"]'),
     ).toBeDisplayed();
-    await $('[data-ship-issue-id="first"]').click();
+    await openIssue('first');
     await expect($('.ship-issue-detail')).toHaveText(
       expect.stringContaining('model-implementation'),
     );
@@ -275,28 +324,17 @@ describe('native Ship run history', () => {
     await expect($('.ship-policy')).toHaveText(expect.stringContaining('Selected risk high'));
     await expect($('.ship-policy')).toHaveText(expect.stringContaining('src-tauri/**: high'));
     await expect($('.ship-checks summary')).toHaveText('CI: Failed');
-    const listScroll = await browser.execute(() => {
-      const panel = document.querySelector<HTMLElement>('.ship-panel')!;
-      const list = document.querySelector<HTMLElement>('.ship-now')!;
-      panel.scrollTop = list.offsetTop;
-      document.querySelector<HTMLButtonElement>('[data-ship-issue-id="merged"]')!.click();
-      return panel.scrollTop;
-    });
-    await browser.waitUntil(async () =>
-      browser.execute(
-        () =>
-          document.querySelector('[data-ship-issue-id="merged"]')?.getAttribute('aria-pressed') ===
-          'true',
-      ),
-    );
-    expect(
-      await browser.execute(() => document.querySelector<HTMLElement>('.ship-panel')!.scrollTop),
-    ).toBe(listScroll);
+    await showList();
+    await $('.ship-done-toggle').click();
+    await expect($$('.ship-now-item')).toBeElementsArrayOfSize(10);
+    await expect($('.ship-group[data-group="done"]')).toBeDisplayed();
+    await openIssue('merged');
+    await expect($('.ship-issue-detail h3')).toHaveText(expect.stringContaining('#43'));
     await expect($('.ship-issue-detail')).toHaveText(
       expect.stringContaining('Worktree removed after merge'),
     );
-    await expect($('.ship-issue-detail button')).toBeDisabled();
-    await $('[data-ship-issue-id="first"]').click();
+    await expect($('.ship-issue-detail .ship-actions button')).toBeDisabled();
+    await openIssue('first');
     await $('.ship-issue-detail .ship-actions button').click();
     await expect($('.ship-panel')).not.toBeDisplayed();
     await browser.execute(() =>
@@ -305,21 +343,22 @@ describe('native Ship run history', () => {
       ),
     );
     await $('.ship-panel header button').click();
+    await openIssue('first');
     await expect($('.ship-issue-detail')).toHaveText(expect.stringContaining('Refresh failed:'));
     await expect(validationGates()).toHaveText(
       expect.stringContaining('Reproduced fixture failure'),
     );
-    await $('[data-ship-issue-id="dependent"]').click();
+    await openIssue('dependent');
     await $('.ship-issue-detail .ship-actions button').click();
     await expect($('.ship-panel > .ship-error[role="alert"]')).toExist();
-    await $('[aria-label="Close Ship runs"]').click();
+    await $('[aria-label="Hide Ship panel"]').click();
     await browser.execute(() =>
       window.dispatchEvent(
         new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
       ),
     );
     await expect($('.ship-panel > .ship-error[role="alert"]')).not.toExist();
-    await $('[aria-label="Close Ship runs"]').click();
+    await $('[aria-label="Hide Ship panel"]').click();
     await browser.execute(() => localStorage.clear());
     await browser.refresh();
     await expect($('.app-shell')).toBeDisplayed();
@@ -328,10 +367,11 @@ describe('native Ship run history', () => {
         new KeyboardEvent('keydown', { key: 'l', metaKey: true, bubbles: true }),
       ),
     );
+    await openIssue('first');
     await expect(validationGates()).toHaveText(
       expect.stringContaining('Reproduced fixture failure'),
     );
-    await $('[aria-label="Close Ship runs"]').click();
+    await $('[aria-label="Hide Ship panel"]').click();
 
     await browser.keys(['Meta', 'd']);
     await expect($('.pane-split.row')).toBeDisplayed();
@@ -344,7 +384,7 @@ describe('native Ship run history', () => {
     );
     await expect($('.ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('Ship dashboard fixture'));
-    await $('[aria-label="Close Ship runs"]').click();
+    await $('[aria-label="Hide Ship panel"]').click();
 
     await browser.tauri.execute(async ({ core }, path) => {
       await core.invoke('save_setting', {
@@ -373,7 +413,7 @@ describe('native Ship run history', () => {
         return panel.scrollWidth <= panel.clientWidth;
       }),
     ).toBe(true);
-    await $('[aria-label="Close Ship runs"]').click();
+    await $('[aria-label="Hide Ship panel"]').click();
     await browser.setWindowSize(1280, 850);
 
     await browser.keys(['Meta', 'd']);
@@ -456,5 +496,135 @@ describe('native Ship run history', () => {
     await $('.mobile-switcher button:nth-child(1)').click();
     await expect($('.pane-leaf.focused .native-details')).not.toBeDisplayed();
     await browser.setWindowSize(1280, 850);
+  });
+
+  it('keeps a batch of 20 issues scannable with a drill-in detail and keyboard navigation', async () => {
+    const states: Partial<ShipIssue>[] = [
+      ...Array.from({ length: 3 }, () => ({ state: 'failed', error: 'Needs a decision' })),
+      ...Array.from({ length: 12 }, () => ({ state: 'pending', dependsOn: ['batch-0'] })),
+      ...Array.from({ length: 5 }, () => ({ state: 'merged', workerSettled: true })),
+    ];
+    const run: ShipRun = {
+      id: 'ship-batch',
+      source: 'plan',
+      repository,
+      remote: 'fixture/repo',
+      provider: 'claude',
+      limit: 1,
+      approvedAt: 5,
+      externalClosed: {},
+      umbrella: {
+        number: 90,
+        title: 'Batch fixture',
+        url: 'https://github.com/fixture/repo/issues/90',
+      },
+      issues: states.map((extra, index) => batchIssue(index, extra)),
+    };
+    await browser.tauri.execute(async ({ core }, input) => {
+      await core.invoke('save_setting', { key: 'sai-ship-runs', value: JSON.stringify([input]) });
+    }, run);
+    await browser.execute(() => {
+      localStorage.clear();
+      localStorage.setItem('sail-settings-migrated-v1', '1');
+      sessionStorage.setItem('sail-e2e-settings', 'enabled');
+    });
+    await browser.setWindowSize(1280, 850);
+    await browser.refresh();
+    await expect($('.app-shell')).toBeDisplayed();
+    await toggleShip();
+    await expect($('.ship-panel')).toBeDisplayed();
+
+    const headings = await $$('.ship-group h4').map((heading) => heading.getText());
+    expect(headings).toEqual(['Needs input 3', 'Waiting 12']);
+    await expect($('[data-ship-issue-id="batch-0"]')).toBeDisplayedInViewport();
+    await capture('ship-list-grouped');
+    await setTheme('dark');
+    await capture('ship-list-grouped-dark');
+    await setTheme('light');
+    await expect($('.ship-done-toggle')).toHaveText('Show done (5)');
+    await $('.ship-done-toggle').click();
+    await expect($$('.ship-now-item')).toBeElementsArrayOfSize(20);
+    const extent = await browser.execute(() => {
+      const panel = document.querySelector<HTMLElement>('.ship-panel')!;
+      return { scroll: panel.scrollHeight, window: window.innerHeight };
+    });
+    expect(extent.scroll).toBeLessThanOrEqual(extent.window * 2);
+    await $('.ship-done-toggle').click();
+
+    await browser.setWindowSize(520, 850);
+    await $('.mobile-switcher button:nth-child(3)').click();
+    await expect($('.ship-panel')).toBeDisplayed();
+    await expect($('.ship-panel')).not.toHaveElementClass('wide');
+    await expect($('.ship-issue-detail')).not.toExist();
+    await $('[data-ship-issue-id="batch-3"]').click();
+    await expect($('.ship-now')).not.toExist();
+    await expect($('.ship-issue-detail')).toBeDisplayed();
+    await expect($('.ship-issue-detail h3')).toBeFocused();
+    await expect($('.ship-issue-detail h3')).toHaveText(expect.stringContaining('#103'));
+    await capture('ship-detail-drill-in');
+    await browser.keys('Escape');
+    await expect($('.ship-panel')).toBeDisplayed();
+    await expect($('.ship-issue-detail')).not.toExist();
+    await expect($('[data-ship-issue-id="batch-3"]')).toBeFocused();
+
+    await browser.keys('ArrowDown');
+    await expect($('[data-ship-issue-id="batch-4"]')).toBeFocused();
+    await browser.keys('ArrowUp');
+    await browser.keys('ArrowUp');
+    await expect($('[data-ship-issue-id="batch-2"]')).toBeFocused();
+    await browser.keys('Enter');
+    await expect($('.ship-issue-detail h3')).toBeFocused();
+    await expect($('.ship-issue-detail h3')).toHaveText(expect.stringContaining('#102'));
+    await $('.ship-back').click();
+
+    await browser.setWindowSize(1280, 850);
+    await browser.tauri.execute(async ({ core }) => {
+      await core.invoke('save_setting', { key: 'sai-details-width', value: '680' });
+    });
+    await browser.refresh();
+    await expect($('.app-shell')).toBeDisplayed();
+    await toggleShip();
+    await expect($('.ship-panel')).toHaveElementClass('wide');
+    await expect($('.ship-content.split .ship-now')).toBeDisplayed();
+    await expect($('.ship-content.split .ship-issue-detail')).toBeDisplayed();
+    await expect($('.ship-issue-detail h3')).toHaveText(expect.stringContaining('#100'));
+    await $('[data-ship-issue-id="batch-4"]').click();
+    await expect($('.ship-issue-detail h3')).toBeFocused();
+    await expect($('.ship-issue-detail h3')).toHaveText(expect.stringContaining('#104'));
+    await expect($('[data-ship-issue-id="batch-0"]')).toBeDisplayed();
+    await capture('ship-split-detail');
+    await setTheme('dark');
+    await capture('ship-split-detail-dark');
+    await setTheme('light');
+    await browser.keys('Escape');
+    await expect($('[data-ship-issue-id="batch-4"]')).toBeFocused();
+    await expect($('.ship-panel')).toBeDisplayed();
+
+    await $$('.view-toggle button')[1].click();
+    await expect($('.dependency-map')).toBeDisplayed();
+    await expect($('.ship-now')).not.toExist();
+    await $$('.view-toggle button')[0].click();
+    await expect($('.ship-now')).toBeDisplayed();
+
+    await browser.tauri.execute(async ({ core }, input) => {
+      await core.invoke('save_setting', { key: 'sai-details-width', value: '420' });
+      await core.invoke('save_setting', {
+        key: 'sai-ship-runs',
+        value: JSON.stringify([
+          Object.assign({}, input, {
+            issues: input.issues.map((issue) => Object.assign({}, issue, { state: 'merged' })),
+          }),
+        ]),
+      });
+    }, run);
+    await browser.refresh();
+    await expect($('.app-shell')).toBeDisplayed();
+    await toggleShip();
+    await expect($('.ship-all-done')).toHaveText(expect.stringContaining('All 20 issues merged'));
+    await expect($('.ship-now-item')).not.toExist();
+    await $('.ship-all-done button').click();
+    await expect($$('.ship-now-item')).toBeElementsArrayOfSize(20);
+    await $('[aria-label="Hide Ship panel"]').click();
+    await expect($('.ship-panel')).not.toBeDisplayed();
   });
 });
