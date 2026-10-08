@@ -69,10 +69,10 @@ async function openPalette() {
   });
 }
 
-function selectHeader() {
-  return browser.execute(() => {
-    const header = document.querySelector('.agent-header');
-    if (!header || !navigator.clipboard) throw new Error('No selectable header or clipboard');
+function selectText(selector = '.agent-header') {
+  return browser.execute((target: string) => {
+    const header = document.querySelector(target);
+    if (!header || !navigator.clipboard) throw new Error('No selectable text or clipboard');
     const writes: string[] = [];
     const original = navigator.clipboard.writeText.bind(navigator.clipboard);
     Object.defineProperty(navigator.clipboard, 'writeText', {
@@ -97,7 +97,7 @@ function selectHeader() {
         done(writes);
       }, 150),
     );
-  });
+  }, selector);
 }
 
 describe('palette actions and accessibility', () => {
@@ -260,8 +260,30 @@ describe('palette actions and accessibility', () => {
     await expect($('.project-menu')).not.toExist();
   });
 
+  it('shows and announces "Copied" for a copy inside a modal dialog', async () => {
+    await pressShortcut('/');
+    await expect($('.shortcuts-dialog[open]')).toBeDisplayed();
+    expect((await selectText('.shortcuts-list')).join(' ')).toContain('Toggle sidebar');
+    const status = $('.shortcuts-dialog .copy-status[role="status"]');
+    await expect(status).toHaveText('Copied');
+    await expect(status).toBeDisplayed();
+    await browser.keys('Escape');
+    await expect($('.shortcuts-dialog[open]')).not.toExist();
+
+    expect((await selectText()).join(' ')).toContain('Accessibility thread');
+    await browser.waitUntil(() =>
+      browser.execute(() => {
+        const region = document.querySelector('.copy-status');
+        return !region?.closest('dialog') && region?.textContent?.trim() === 'Copied';
+      }),
+    );
+    await browser.waitUntil(async () => (await $('.copy-status').getText()) === '', {
+      timeout: 5000,
+    });
+  });
+
   it('copies selections only when select-to-copy is on and announces "Copied"', async () => {
-    expect((await selectHeader()).join(' ')).toContain('Accessibility thread');
+    expect((await selectText()).join(' ')).toContain('Accessibility thread');
     await expect($('.copy-status[role="status"]')).toHaveText('Copied');
     await browser.waitUntil(async () => (await $('.copy-status').getText()) === '', {
       timeout: 5000,
@@ -270,7 +292,7 @@ describe('palette actions and accessibility', () => {
     await browser.execute(() => localStorage.setItem('sai-auto-copy-enabled', 'false'));
     await browser.refresh();
     await expect($('.agent-header')).toBeDisplayed();
-    expect(await selectHeader()).toEqual([]);
+    expect(await selectText()).toEqual([]);
     await expect($('.copy-status')).toHaveText('');
   });
 });

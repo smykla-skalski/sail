@@ -501,7 +501,7 @@
     removeClipboardFile,
     stageClipboardFile,
   } from './lib/attachments';
-  import { copyCompletedSelection } from './lib/auto-copy';
+  import { copyCompletedSelection, copyStatusHost } from './lib/auto-copy';
   import {
     coordinationKey,
     coordinationPrompt,
@@ -1118,6 +1118,8 @@
   let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
   let copiedStatus = $state('');
   let copiedStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  let copyStatusRegion: HTMLDivElement;
+  let copyStatusHome: { parent: Node; next: Node | null } | undefined;
   let shortcutsDialog: HTMLDialogElement;
   const shortcutPlatform = detectShortcutPlatform();
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
@@ -10961,11 +10963,33 @@
     shortcutsDialog.showModal();
   }
 
+  function placeCopyStatus() {
+    const node = window.getSelection()?.anchorNode;
+    const anchor = node instanceof Element ? node : (node?.parentElement ?? null);
+    const host = copyStatusHost(anchor, [...document.querySelectorAll('dialog:modal')]);
+    copyStatusHome ??= {
+      parent: copyStatusRegion.parentNode as Node,
+      next: copyStatusRegion.nextSibling,
+    };
+    if (host) {
+      if (copyStatusRegion.parentNode === host) return false;
+      host.append(copyStatusRegion);
+      return true;
+    }
+    const { parent, next } = copyStatusHome;
+    if (copyStatusRegion.parentNode === parent) return false;
+    parent.insertBefore(copyStatusRegion, next?.parentNode === parent ? next : null);
+    return true;
+  }
+
   async function announceCopied() {
     clearTimeout(copiedStatusTimer);
+    const moved = placeCopyStatus();
     copiedStatus = '';
     // A cleared region makes a repeated "Copied" a new live-region change.
     await tick();
+    // Screen readers skip changes made as a live region is inserted.
+    if (moved) await new Promise((resolve) => setTimeout(resolve, 100));
     copiedStatus = 'Copied';
     copiedStatusTimer = setTimeout(() => (copiedStatus = ''), 2000);
   }
@@ -16181,7 +16205,13 @@
     {/each}
   </dl>
 </dialog>
-<div class="copy-status" role="status" aria-live="polite" aria-atomic="true">
+<div
+  class="copy-status"
+  role="status"
+  aria-live="polite"
+  aria-atomic="true"
+  bind:this={copyStatusRegion}
+>
   {#if copiedStatus}<span>{copiedStatus}</span>{/if}
 </div>
 <dialog class="commands-dialog" bind:this={snapshotsDialog} aria-label="Worktree restore history">
