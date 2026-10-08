@@ -169,6 +169,14 @@ function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
   for (const entry of [...latestCriteria.values()].toSorted(compareEvidence).toReversed()) {
     protectedIds.add(entry.id);
   }
+  for (const entry of latest.toSorted(compareEvidence).toReversed()) {
+    if (
+      entry.kind === 'command' &&
+      !isCiObservation(entry) &&
+      ['failed', 'pending', 'blocked'].includes(entry.result)
+    )
+      protectedIds.add(entry.id);
+  }
   for (const entry of latest.filter(isCiObservation).toSorted(compareEvidence).toReversed()) {
     if (protectedIds.size >= evidenceHistoryLimit) break;
     protectedIds.add(entry.id);
@@ -250,7 +258,7 @@ function isCiObservation(entry: TaskEvidence): boolean {
   return entry.id.startsWith('ci:') && entry.provider === 'github' && entry.kind === 'command';
 }
 
-function matchingStableCiObservation(
+function matchingReconciledCiObservation(
   entries: TaskEvidence[],
   fallback: TaskEvidence,
 ): TaskEvidence | undefined {
@@ -263,7 +271,7 @@ function matchingStableCiObservation(
   const matches = entries.filter(
     (candidate) =>
       isCiObservation(candidate) &&
-      candidate.identityUncertain !== true &&
+      candidate.id !== fallback.id &&
       candidate.reconciliationKey === fallback.reconciliationKey &&
       candidate.outputReference === fallback.outputReference,
   );
@@ -890,9 +898,7 @@ export function ciEvidenceIdentity(
   const stableRun = check.runId ?? check.databaseId;
   const stableStatus = check.statusContextId;
   const stableStatusRun = stableStatus === undefined ? undefined : normalizedCiRunUrl(check.url);
-  const uncertain =
-    check.identityUncertain === true ||
-    (stableRun === undefined && (stableStatus === undefined || stableStatusRun === undefined));
+  const uncertain = check.identityUncertain === true || stableRun === undefined;
   const execution =
     stableRun !== undefined
       ? `${revision}\u0000${check.name}\u0000${check.runId ?? 'no-run'}\u0000${
@@ -955,24 +961,24 @@ export function recordCiEvidenceObservation(
         !manifest.stale,
     );
     const manifest = synced[index];
-    const stable = matchingStableCiObservation(manifest?.evidence ?? [], parsedEntry);
-    if (stable) {
-      if (parsedEntry.timestamp < stable.timestamp) return synced;
+    const matching = matchingReconciledCiObservation(manifest?.evidence ?? [], parsedEntry);
+    if (matching) {
+      if (parsedEntry.timestamp < matching.timestamp) return synced;
       return synced.with(index, {
         ...manifest,
         evidence: manifest.evidence.flatMap((candidate) => {
-          if (candidate.id === parsedEntry.id && candidate !== stable) return [];
-          if (candidate !== stable) return [candidate];
+          if (candidate.id === parsedEntry.id && candidate !== matching) return [];
+          if (candidate !== matching) return [candidate];
           return [
             {
-              ...stable,
+              ...matching,
               result: parsedEntry.result,
               timestamp: parsedEntry.timestamp,
               outputReference: parsedEntry.outputReference,
               criteria: parsedEntry.criteria,
               economics: mergeCiEconomics(
                 parsedEntry.economics,
-                stable.economics,
+                matching.economics,
                 parsedEntry.economics,
                 parsedEntry.result,
               ),
@@ -1193,8 +1199,8 @@ export function reconcileCiEvidenceSnapshot(
   if (index < 0) return parsed;
   const active = new Set(snapshot.map((entry) => entry.id));
   for (const observation of snapshot) {
-    const stable = matchingStableCiObservation(parsed[index].evidence, observation);
-    if (stable) active.add(stable.id);
+    const reconciled = matchingReconciledCiObservation(parsed[index].evidence, observation);
+    if (reconciled) active.add(reconciled.id);
   }
   const evicted = parsed[index].evidence.filter(
     (entry) => isCiObservation(entry) && !active.has(entry.id),

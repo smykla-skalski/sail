@@ -315,6 +315,67 @@ void test('latest failed or pending command blocks readiness until it passes', (
   assert.equal(readiness.ready, true);
 });
 
+void test('bounded history preserves failed and pending commands until they pass', () => {
+  let manifests = recordTaskEvidence(
+    [],
+    'revision',
+    criteria,
+    evidence({
+      id: 'failed-command',
+      kind: 'command',
+      name: 'npm test',
+      result: 'failed',
+      criteria: [],
+    }),
+  );
+  manifests = recordTaskEvidence(
+    manifests,
+    'revision',
+    criteria,
+    evidence({
+      id: 'pending-command',
+      kind: 'command',
+      name: 'npm audit',
+      result: 'pending',
+      timestamp: 25,
+      criteria: [],
+    }),
+  );
+  manifests = recordTaskEvidence(
+    manifests,
+    'revision',
+    criteria,
+    evidence({ id: 'required-gate', criteria, timestamp: 30 }),
+  );
+  for (let index = 0; index < 100; index += 1)
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision',
+      criteria,
+      evidence({
+        id: `unrelated-${index}`,
+        kind: 'command',
+        name: `unrelated-${index}`,
+        timestamp: 40 + index,
+        criteria: [],
+      }),
+    );
+
+  const readiness = evidenceReadiness(manifests, 'revision', ['code-adversary'], criteria);
+
+  assert.equal(
+    manifests[0].evidence.some((entry) => entry.id === 'failed-command'),
+    true,
+  );
+  assert.equal(
+    manifests[0].evidence.some((entry) => entry.id === 'pending-command'),
+    true,
+  );
+  assert.deepEqual(readiness.failedCommands, ['npm test']);
+  assert.deepEqual(readiness.pendingCommands, ['npm audit']);
+  assert.equal(readiness.ready, false);
+});
+
 void test('rejects unknown criteria and bounds manifests and entries', () => {
   assert.throws(
     () => recordTaskEvidence([], 'revision', criteria, evidence({ criteria: ['invented'] })),
@@ -1248,7 +1309,7 @@ void test('counts each CI execution once across polling and status changes', () 
   assert.equal(summarizeTaskEconomics(manifests, { ready: false }, 'revision').totals.checks, 2);
 });
 
-void test('counts a Buildkite execution once when GitHub replaces its status context', () => {
+void test('reconciles status updates without claiming a stable execution identity', () => {
   const pending = ciEvidence(
     {
       name: 'buildkite/test',
@@ -1277,11 +1338,11 @@ void test('counts a Buildkite execution once when GitHub replaces its status con
   assert.equal(manifests[0].evidence.length, 1);
   assert.equal(manifests[0].evidence[0].result, 'passed');
   assert.equal(summary.totals.checks, 1);
-  assert.equal(summary.identityCoverageComplete, true);
-  assert.equal(summary.accepted, true);
+  assert.equal(summary.identityCoverageComplete, false);
+  assert.equal(summary.accepted, false);
 });
 
-void test('counts independent Buildkite executions with the same context separately', () => {
+void test('counts status executions with distinct run URLs separately', () => {
   const first = ciEvidence(
     {
       name: 'buildkite/test',
@@ -1308,11 +1369,11 @@ void test('counts independent Buildkite executions with the same context separat
 
   assert.notEqual(first.id, second.id);
   assert.equal(summary.totals.checks, 2);
-  assert.equal(summary.identityCoverageComplete, true);
-  assert.equal(summary.accepted, true);
+  assert.equal(summary.identityCoverageComplete, false);
+  assert.equal(summary.accepted, false);
 });
 
-void test('recovers Buildkite economics when a persisted status gains stable identity', () => {
+void test('reconciles a persisted status without claiming stable identity', () => {
   const url = 'https://buildkite.com/acme/widgets/builds/101';
   const pending = ciEvidence(
     { name: 'buildkite/test', url, identityUncertain: true },
@@ -1331,8 +1392,41 @@ void test('recovers Buildkite economics when a persisted status gains stable ide
   const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
 
   assert.equal(summary.totals.checks, 1);
-  assert.equal(summary.identityCoverageComplete, true);
-  assert.equal(summary.accepted, true);
+  assert.equal(summary.identityCoverageComplete, false);
+  assert.equal(summary.accepted, false);
+});
+
+void test('marks same-url status reruns ambiguous instead of accepting an undercount', () => {
+  const first = ciEvidence(
+    {
+      name: 'external/build',
+      url: 'https://ci.test/latest',
+      statusContextId: 'SC_first',
+    },
+    'passed',
+    10,
+  );
+  const second = ciEvidence(
+    {
+      name: 'external/build',
+      url: 'https://ci.test/latest',
+      statusContextId: 'SC_second',
+    },
+    'passed',
+    20,
+  );
+  let manifests = recordCiEvidenceObservation([], 'revision', criteria, first);
+
+  manifests = reconcileCiEvidenceSnapshot(manifests, 'revision', [second]);
+  manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, second);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+
+  assert.equal(first.id, second.id);
+  assert.equal(first.identityUncertain, true);
+  assert.equal(manifests[0].evidence.length, 1);
+  assert.equal(summary.totals.checks, 1);
+  assert.equal(summary.identityCoverageComplete, false);
+  assert.equal(summary.accepted, false);
 });
 
 void test('marks status contexts without a run URL as identity-incomplete', () => {
