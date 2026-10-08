@@ -32,6 +32,15 @@
   import SpawnActivity from './SpawnActivity.svelte';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
+  import ShellCommandCard from './ShellCommandCard.svelte';
+  import {
+    isShellDraft,
+    shellCommand,
+    splitShellCommands,
+    withShellContext,
+    type ShellResult,
+    type ShellRun,
+  } from './lib/shell-command';
   import ChatMessage from './ChatMessage.svelte';
   import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import PlanPanel from './PlanPanel.svelte';
@@ -1225,7 +1234,12 @@
   let skills = $state<SkillChoice[]>(bundledSkills);
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
-  const skillMatches = $derived(matchingSkills(skills, draft));
+  const shellMode = $derived(isShellDraft(draft));
+  const skillMatches = $derived(shellMode ? [] : matchingSkills(skills, draft));
+  let shellRuns = $state<ShellRun[]>([]);
+  const pendingShellRuns = $derived(
+    shellRuns.filter((run) => run.directory === directory && run.session === sessionID),
+  );
   $effect(() => {
     const source = client;
     const path = directory;
@@ -13606,8 +13620,44 @@
     void tick().then(() => mainPrompt?.focus());
   }
 
+  async function runShell(command: string) {
+    const path = directory;
+    if (!path) return;
+    const run: ShellRun = {
+      id: crypto.randomUUID(),
+      session: sessionID,
+      directory: path,
+      command,
+      status: 'running',
+      code: null,
+      output: '',
+      created: Date.now(),
+    };
+    shellRuns = [...shellRuns, run];
+    let result: Partial<ShellRun>;
+    try {
+      result = await invoke<ShellResult>('run_shell_command', {
+        id: run.id,
+        directory: path,
+        command,
+      });
+    } catch (cause) {
+      result = { status: 'failed', output: describe(cause) };
+    }
+    const finished = shellRuns.find((item) => item.id === run.id);
+    if (finished) Object.assign(finished, result);
+  }
+
   async function send() {
     await pendingPaste;
+    const shell = shellCommand(draft);
+    if (shell !== null) {
+      if (shell && directory && !sending) {
+        draft = '';
+        void runShell(shell);
+      }
+      return;
+    }
     const command = draft.trim().toLowerCase();
     if (!attachedFiles.length && (command === '/model' || command === '/effort')) {
       if (!inputReady || running || sending || switching) return;
@@ -13640,6 +13690,11 @@
     }
     if (current !== selection || path !== directory) return;
     const files = [...attachedFiles];
+    const shellSession = id;
+    const sentShell = shellRuns.filter(
+      (run) => run.directory === path && run.session === shellSession && run.status !== 'running',
+    );
+    shellRuns = shellRuns.filter((run) => !sentShell.includes(run));
     let accepted = false;
     for (const file of files) {
       if (pickedImageText.has(file)) inFlightCaptures.add(file);
@@ -13714,8 +13769,10 @@
           implementingModel,
           `opencode:${targetId}`,
         );
-        const resolvedPrompt =
-          resolveSkillPrompt(sourceSkills, text, implementingModel) + directClaimPrompt;
+        const resolvedPrompt = withShellContext(
+          sentShell,
+          resolveSkillPrompt(sourceSkills, text, implementingModel) + directClaimPrompt,
+        );
         const shippingReceipt = await prepareOpenCodeShippingDispatch(
           directAuthorization,
           `opencode:${targetId}`,
@@ -13823,6 +13880,10 @@
       }
       if (current === selection && path === directory) await refreshSession(id);
     } catch (cause) {
+      if (!accepted) {
+        for (const run of sentShell) run.session = id;
+        shellRuns = [...sentShell, ...shellRuns];
+      }
       if (current === selection && path === directory) {
         if (!accepted) {
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
@@ -14532,11 +14593,20 @@
                       messageId={message.id}
                       created={message.time.created}
                     >
-                      <Markdown
-                        source={attribution
-                          ? message.text.replace(coordinationPrompt(attribution), attribution.text)
-                          : message.text}
-                      />
+                      {#each splitShellCommands(message.text) as segment, index (index)}
+                        {#if segment.type === 'shell'}
+                          <ShellCommandCard run={segment.shell} />
+                        {:else}
+                          <Markdown
+                            source={attribution
+                              ? segment.text.replace(
+                                  coordinationPrompt(attribution),
+                                  attribution.text,
+                                )
+                              : segment.text}
+                          />
+                        {/if}
+                      {/each}
                       {#if message.files?.length}<div class="message-files">
                           {#each message.files as file, fileIndex (fileIndex)}<span
                               >{file.name ??
@@ -14603,6 +14673,14 @@
                   onopen={openSpawnTarget}
                   onchildren={(receipts) => (openCodeChildReceipts = receipts)}
                 />
+                {#each pendingShellRuns as run (run.id)}
+                  <ShellCommandCard
+                    {run}
+                    pending
+                    onstop={() =>
+                      void invoke('cancel_shell_command', { id: run.id }).catch(() => {})}
+                  />
+                {/each}
                 {#each coordinationMessages.filter((message) => sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`) && !chatMessages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
                   <ChatMessage
                     kind="user"
@@ -14671,8 +14749,11 @@
                   }}
                   onchanged={() => refreshPrompts()}
                 />
-                <div class="composer">
+                <div class="composer" class:shell-mode={shellMode}>
                   <TaskLocation location={mainPromptLocation} />
+                  {#if shellMode}<p class="composer-shell-hint" role="status">
+                      Shell mode · Enter runs the command in this worktree
+                    </p>{/if}
                   <textarea
                     role="combobox"
                     aria-autocomplete="list"
@@ -14693,7 +14774,7 @@
                     rows="3"
                     wrap="soft"
                     placeholder={inputReady
-                      ? 'Describe the work or ask a question…'
+                      ? 'Describe the work or ask a question… (start with ! to run a shell command)'
                       : 'OpenCode needs a connected model…'}
                     disabled={!inputReady || sending}></textarea>
                   {#if attachedFiles.length}<div class="attachments">
@@ -14750,8 +14831,11 @@
                         onclick={attachFiles}
                         disabled={!inputReady || sending}>Attach files</Button
                       >
-                      <Button onclick={send} disabled={!canSend} loading={sending}
-                        >{running ? 'Queue ↗' : 'Send ↗'}</Button
+                      <Button
+                        onclick={send}
+                        disabled={shellMode ? !shellCommand(draft) || !directory : !canSend}
+                        loading={sending}
+                        >{shellMode ? 'Run ↵' : running ? 'Queue ↗' : 'Send ↗'}</Button
                       >
                     </div>
                   </div>

@@ -47,6 +47,8 @@ fn main() {
             "cancel_post_turn_check",
             "list_post_turn_checks",
             "run_post_turn_check",
+            "run_shell_command",
+            "cancel_shell_command",
             "inspect_agent_hooks",
             "inspect_hook_integration",
             "enable_hook_integration",

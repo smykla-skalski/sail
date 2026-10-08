@@ -215,6 +215,7 @@ pub mod hook_activity;
 mod hook_inspector;
 mod post_turn_checks;
 mod settings;
+mod shell_command;
 mod terminal;
 mod worktree_config;
 mod worktree_snapshots;
@@ -2845,6 +2846,7 @@ pub fn run() {
         .manage(acp_terminal::AcpTerminalManager::default())
         .manage(terminal::TerminalManager::default())
         .manage(post_turn_checks::CheckLock::default())
+        .manage(shell_command::ShellRuns::default())
         .manage(browser_agent::BrowserManager::default())
         .manage(browser::CaptureStore::default())
         .manage(hook_activity::HookActivityManager::default())
@@ -2885,6 +2887,8 @@ pub fn run() {
             post_turn_checks::cancel_post_turn_check,
             post_turn_checks::list_post_turn_checks,
             post_turn_checks::run_post_turn_check,
+            shell_command::run_shell_command,
+            shell_command::cancel_shell_command,
             hook_inspector::inspect_agent_hooks,
             hook_activity::inspect_hook_integration,
             hook_activity::enable_hook_integration,

@@ -11,6 +11,7 @@
   import ChatMessage from './ChatMessage.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
+  import ShellCommandCard from './ShellCommandCard.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
@@ -104,7 +105,19 @@
     isFailedStatus,
     notificationStats,
     splitTaskNotifications,
+    type TaskSegment,
   } from './lib/task-notification';
+  import {
+    isShellDraft,
+    keepShellRuns,
+    shellCommand,
+    splitShellCommands,
+    takeShellRuns,
+    withShellContext,
+    type ShellResult,
+    type ShellRun,
+    type ShellSegment,
+  } from './lib/shell-command';
   import { splitKlaudiushMessage, type KlaudiushRule } from './lib/klaudiush';
   import { getSetting, removeSetting, setSetting } from './lib/settings';
   import { recordDiagnostic, type DiagnosticEvent } from './lib/diagnostics';
@@ -242,9 +255,19 @@
   const commandUpdates: Record<string, unknown[]> = {};
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
-  const skillMatches = $derived(matchingSkills(skills, draft));
+  const shellMode = $derived(isShellDraft(draft));
+  const skillMatches = $derived(shellMode ? [] : matchingSkills(skills, draft));
+  let shellRuns = $state<ShellRun[]>([]);
+  const pendingShellRuns = $derived(shellRuns.filter((run) => run.session === activeSessionId));
   $effect(() => {
-    if (skillQuery(draft) !== null && ready && directory && !activeSessionId && !creatingSession)
+    if (
+      !shellMode &&
+      skillQuery(draft) !== null &&
+      ready &&
+      directory &&
+      !activeSessionId &&
+      !creatingSession
+    )
       void ensureSession('New thread').catch((cause) => {
         error = describe(cause);
       });
@@ -1125,6 +1148,7 @@
       configOptions = session.configOptions ?? [];
       if (Array.isArray(session.availableCommands)) updateSkills(session.availableCommands);
       activeSessionId = session.sessionId;
+      for (const run of shellRuns) if (run.session === null) run.session = session.sessionId;
       if (queued.length) saveQueuedAgentMessages(agent, directory, session.sessionId, queued);
       if (commandUpdates[session.sessionId]) updateSkills(commandUpdates[session.sessionId]);
       selectedThreadId = session.sessionId;
@@ -1155,6 +1179,7 @@
   }
 
   onMount(() => {
+    if (!ephemeral) shellRuns = takeShellRuns(`${directory}\0${agent}`);
     let unlistenHookActivity: (() => void) | undefined;
     void listen<unknown>('sail:hook-activity', ({ payload }) => {
       const activity = parseHookActivity(payload);
@@ -1318,6 +1343,8 @@
       }
       images.forEach((image) => void invoke('browser_remove_capture', { path: image.imagePath }));
       clipboardAttachments.forEach((attachment) => removeClipboardAttachment(attachment));
+      if (ephemeral) shellRuns.filter((run) => run.status === 'running').forEach(stopShell);
+      else keepShellRuns(`${directory}\0${agent}`, shellRuns);
     };
   });
 
@@ -1327,6 +1354,14 @@
     const text =
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
+    const shell = external ? null : shellCommand(text);
+    if (shell !== null) {
+      if (shell && directory) {
+        draft = '';
+        void runShell(shell);
+      }
+      return;
+    }
     let shipIssue: ShipItIssue | null;
     try {
       shipIssue = await beginShipItRun(directory, text, promptSkill(skills, text)?.name ?? null);
@@ -1388,15 +1423,37 @@
       clearClipboardImagePreviews();
     }
     const userEntryId = crypto.randomUUID();
+    const shellSession = activeSessionId;
+    const sentShell =
+      external && !queuedMessage
+        ? []
+        : shellRuns.filter((run) => run.session === shellSession && run.status !== 'running');
+    shellRuns = shellRuns.filter((run) => !sentShell.includes(run));
+    const restoreShell = () => {
+      const session = deliverySessionId ?? shellSession;
+      for (const run of sentShell) run.session = session;
+      shellRuns = [...sentShell, ...shellRuns];
+    };
     flushUpdates();
-    entries = [...entries, { id: userEntryId, type: 'user', text, created: Date.now() }];
+    entries = [
+      ...entries,
+      {
+        id: userEntryId,
+        type: 'user',
+        text: withShellContext(sentShell, text),
+        created: Date.now(),
+      },
+    ];
     void follow();
     try {
       if (!activeSessionId || !activityThread)
         activityThread = await ensureSession(text.slice(0, 60) || 'Attached files', true);
       if (activityThread?.title === 'New thread')
         activityThread = { ...activityThread, title: text.slice(0, 60) || 'Attached files' };
-      if (current !== generation && (!disposed || ephemeral)) return;
+      if (current !== generation && (!disposed || ephemeral)) {
+        restoreShell();
+        return;
+      }
       if (activityThread) onstatus(activityThread, 'working');
       phase = 'config';
       if (settingConfig) await settingConfig;
@@ -1427,6 +1484,7 @@
         finalStatus = 'interrupted';
         notifyOnDone = false;
         if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');
+        restoreShell();
         if (current === generation) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
@@ -1450,10 +1508,12 @@
         implementationModel,
         `acp:${turnAgent}:${id}`,
       );
-      const promptText =
+      const promptText = withShellContext(
+        sentShell,
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
-          : skillText + directClaim;
+          : skillText + directClaim,
+      );
       phase = 'prompt';
       if (id && sentImages.length)
         onattachmentsent?.(
@@ -1490,6 +1550,7 @@
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
+      restoreShell();
       const backendStatus =
         phase === 'prompt' && deliverySessionId
           ? await acpFinishedPromptStatus(turnAgent, deliverySessionId, turnId)
@@ -1587,6 +1648,40 @@
         setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, false);
       }
     }
+  }
+
+  async function runShell(command: string) {
+    const run: ShellRun = {
+      id: crypto.randomUUID(),
+      directory,
+      session: activeSessionId,
+      command,
+      status: 'running',
+      code: null,
+      output: '',
+      created: Date.now(),
+    };
+    shellRuns = [...shellRuns, run];
+    void follow();
+    let result: Partial<ShellRun>;
+    try {
+      result = await invoke<ShellResult>('run_shell_command', { id: run.id, directory, command });
+    } catch (cause) {
+      result = { status: 'failed', output: describe(cause) };
+    }
+    const finished = shellRuns.find((item) => item.id === run.id);
+    if (finished) Object.assign(finished, result);
+    if (!disposed) void follow();
+  }
+
+  function userSegments(text: string): (TaskSegment | ShellSegment)[] {
+    return splitShellCommands(text).flatMap((part): (TaskSegment | ShellSegment)[] =>
+      part.type === 'text' ? splitTaskNotifications(part.text) : [part],
+    );
+  }
+
+  function stopShell(run: ShellRun) {
+    void invoke('cancel_shell_command', { id: run.id }).catch(() => {});
   }
 
   function withAttachedFiles(text: string, attachments: QueuedAgentMessage['attachments']) {
@@ -2107,10 +2202,12 @@
         {:else}
           {@const segments =
             entry.type === 'user'
-              ? splitTaskNotifications(entry.text)
+              ? userSegments(entry.text)
               : [{ type: 'text' as const, text: entry.text }]}
           {#each segments as segment, index (index)}
-            {#if segment.type === 'notification'}
+            {#if segment.type === 'shell'}
+              <ShellCommandCard run={segment.shell} />
+            {:else if segment.type === 'notification'}
               {@const note = segment.notification}
               <div
                 class="agent-subagent-card"
@@ -2164,6 +2261,9 @@
           {/each}
         {/if}
       {/each}
+      {#each pendingShellRuns as run (run.id)}
+        <ShellCommandCard {run} pending onstop={() => stopShell(run)} />
+      {/each}
       {#each coordinationMessages.filter((message) => !entries.some((entry) => entry.type === 'user' && entry.text.includes(coordinationPrompt(message)))) as message (message.id)}
         <ChatMessage
           kind="user"
@@ -2211,8 +2311,11 @@
     </div>
   </div>
   <div class="agent-composer composer-wrap">
-    <div class="composer">
+    <div class="composer" class:shell-mode={shellMode}>
       <TaskLocation location={promptLocation} />
+      {#if shellMode}<p class="composer-shell-hint" role="status">
+          Shell mode · Enter runs the command in this worktree
+        </p>{/if}
       {#if error}<p class="agent-error" role="alert">
           {error} <button onclick={() => void activate(activeSessionId)}>Retry</button>
         </p>{/if}
@@ -2284,7 +2387,7 @@
         }}
         onkeydown={keydown}
         rows="3"
-        placeholder={`Message ${name}…`}
+        placeholder={`Message ${name}… (start with ! to run a shell command)`}
         disabled={!directory || !!nativeEntries}></textarea>
       {#each clipboardImagePreviews as preview (preview.path)}
         <figure
@@ -2362,8 +2465,10 @@
             >{/if}
           <Button
             onclick={() => void send()}
-            disabled={!ready || !!nativeEntries || (!draft.trim() && !clipboardAttachments.length)}
-            >{isBusy ? 'Queue ↗' : 'Send ↗'}</Button
+            disabled={shellMode
+              ? !shellCommand(draft) || !directory || !!nativeEntries
+              : !ready || !!nativeEntries || (!draft.trim() && !clipboardAttachments.length)}
+            >{shellMode ? 'Run ↵' : isBusy ? 'Queue ↗' : 'Send ↗'}</Button
           >
         </div>
       </div>

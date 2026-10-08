@@ -1970,6 +1970,18 @@ button:disabled {
 .composer:focus-within {
   border-color: var(--sui-primary);
 }
+.composer.shell-mode {
+  border-color: var(--sui-warning-ink);
+}
+.composer.shell-mode textarea {
+  font-family: ui-monospace, monospace;
+}
+.composer-shell-hint {
+  margin: 10px 16px 0;
+  color: var(--sui-warning-ink);
+  font-size: 12px;
+  font-weight: 600;
+}
 .composer textarea {
   display: block;
   width: 100%;
