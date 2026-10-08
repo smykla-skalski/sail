@@ -1331,6 +1331,58 @@ void test('rollback removes compacted economics while preserving concurrent evid
   assert.equal(rolledBack.evidenceManifests[0].evidence.at(-1)?.id, 'concurrent-99');
 });
 
+void test('rollback removes an immediately archived write and preserves concurrent archive', () => {
+  const protectedFailures = Array.from({ length: 100 }, (_, index) =>
+    measuredEvidence(`failure-${index}`, index + 1),
+  ).reduce(
+    (manifests, entry) =>
+      recordTaskEvidence(
+        manifests,
+        'revision-a',
+        criteria,
+        { ...entry, result: 'failed', economics: { ...entry.economics!, failedCommands: 1 } },
+        'base-a',
+      ),
+    [] as EvidenceManifest[],
+  );
+  const previous = { evidenceRevision: 'revision-a', evidenceManifests: protectedFailures };
+  const committed = {
+    evidenceRevision: 'revision-a',
+    evidenceManifests: recordTaskEvidence(
+      protectedFailures,
+      'revision-a',
+      criteria,
+      measuredEvidence('own-passing', 101),
+      'base-a',
+    ),
+  };
+  const current = {
+    evidenceRevision: 'revision-a',
+    evidenceManifests: recordTaskEvidence(
+      committed.evidenceManifests,
+      'revision-a',
+      criteria,
+      measuredEvidence('concurrent-passing', 102),
+      'base-a',
+    ),
+  };
+
+  const rolledBack = rollbackTaskEvidenceRecord(current, previous, committed, 'own-passing');
+  const summary = summarizeTaskEconomics(
+    rolledBack.evidenceManifests,
+    { ready: false },
+    'revision-a',
+  );
+
+  assert.equal(summary.samples, 101);
+  assert.equal(summary.totals.turns, 101);
+  assert.equal(rolledBack.evidenceManifests[0].economicsRollup?.archivedEntries, 1);
+  assert.equal(
+    rolledBack.evidenceManifests[0].economicsRollup?.archivedEvidence[0].identityDigest,
+    evidenceIdentityDigest('concurrent-passing'),
+  );
+});
+
 void test('rejects a late evidence snapshot after a newer revision was stored', () => {
   assert.doesNotThrow(() => requireEvidenceBaseRevision('revision-a', undefined));
   assert.doesNotThrow(() => requireEvidenceBaseRevision('revision-a', 'revision-a'));
@@ -1370,6 +1422,56 @@ void test('counts each CI execution once across polling and status changes', () 
   manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, retry);
   assert.equal(manifests[0].evidence.length, 2);
   assert.equal(summarizeTaskEconomics(manifests, { ready: false }, 'revision').totals.checks, 2);
+});
+
+void test('counts a CI execution once when its workflow run identity arrives later', () => {
+  const pending = ciEvidence(
+    { name: 'build', url: 'https://github.test/jobs/50', databaseId: 50, attempt: 1 },
+    'pending',
+    10,
+  );
+  const enriched = ciEvidence(
+    {
+      name: 'build',
+      url: 'https://github.test/jobs/50',
+      databaseId: 50,
+      runId: 10,
+      attempt: 1,
+    },
+    'passed',
+    20,
+  );
+  let manifests = recordCiEvidenceObservation([], 'revision', criteria, pending);
+
+  manifests = reconcileCiEvidenceSnapshot(manifests, 'revision', [enriched]);
+  manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, enriched);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+
+  assert.equal(pending.id, enriched.id);
+  assert.equal(manifests[0].evidence.length, 1);
+  assert.equal(manifests[0].evidence[0].result, 'passed');
+  assert.equal(summary.totals.checks, 1);
+});
+
+void test('keeps independent CI checks distinct after workflow run enrichment', () => {
+  const first = ciEvidence(
+    { name: 'build', url: 'https://github.test/jobs/50', databaseId: 50, runId: 10 },
+    'passed',
+    10,
+  );
+  const second = ciEvidence(
+    { name: 'build', url: 'https://github.test/jobs/51', databaseId: 51, runId: 11 },
+    'passed',
+    20,
+  );
+  let manifests = recordCiEvidenceObservation([], 'revision', criteria, first);
+
+  manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, second);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+
+  assert.notEqual(first.id, second.id);
+  assert.equal(manifests[0].evidence.length, 2);
+  assert.equal(summary.totals.checks, 2);
 });
 
 void test('reconciles status updates without claiming a stable execution identity', () => {

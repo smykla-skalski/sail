@@ -9,6 +9,7 @@ import {
   reconcileArchivedEconomicsEvidence,
   rekeyArchivedEconomicsEvidence,
   removeArchivedEconomicsEvidence,
+  removeArchivedEconomicsEvidenceSnapshot,
   rollUpEconomics,
   taskEconomicsSchema,
   updateArchivedEconomicsEvidence,
@@ -338,6 +339,16 @@ function archivedIdentityContent(
   if (entry.identityDigest === identityDigest) return entry.contentDigest;
   return entry.identityAliases.find((alias) => alias.identityDigest === identityDigest)
     ?.contentDigest;
+}
+
+function archivedEvidenceEntry(
+  rollup: EconomicsRollup | undefined,
+  evidenceId: string,
+): EconomicsRollup['archivedEvidence'][number] | undefined {
+  const identityDigest = evidenceIdentityDigest(evidenceId);
+  return [...(rollup?.archivedTombstones ?? []), ...(rollup?.archivedEvidence ?? [])].find(
+    (candidate) => archivedIdentityContent(candidate, identityDigest) !== undefined,
+  );
 }
 
 function evidenceArchivedBy(entry: TaskEvidence, rollup: EconomicsRollup | undefined): boolean {
@@ -693,6 +704,8 @@ export function rollbackTaskEvidenceRecord(
     const saved = committedByIdentity.get(key);
     if (!saved) return [manifest];
     const savedEntry = saved.evidence.find((entry) => entry.id === evidenceId);
+    const savedArchivedEntry = archivedEvidenceEntry(saved.economicsRollup, evidenceId);
+    const priorArchivedEntry = archivedEvidenceEntry(prior?.economicsRollup, evidenceId);
     const evidence = savedEntry
       ? manifest.evidence.filter(
           (entry) => entry.id !== evidenceId || !sameEvidenceValue(entry, savedEntry),
@@ -709,7 +722,13 @@ export function rollbackTaskEvidenceRecord(
       economicsRollup:
         savedEntry && manifest.economicsRollup
           ? removeArchivedEconomicsEvidence(manifest.economicsRollup, savedEntry)
-          : manifest.economicsRollup,
+          : savedArchivedEntry && !priorArchivedEntry && manifest.economicsRollup
+            ? removeArchivedEconomicsEvidenceSnapshot(
+                manifest.economicsRollup,
+                evidenceId,
+                savedArchivedEntry,
+              )
+            : manifest.economicsRollup,
     };
     if (
       prior &&
@@ -908,13 +927,13 @@ export function ciEvidenceIdentity(
   const stableStatusRun = stableStatus === undefined ? undefined : normalizedCiRunUrl(check.url);
   const uncertain = check.identityUncertain === true || stableRun === undefined;
   const execution =
-    stableRun !== undefined
-      ? `${revision}\u0000${check.name}\u0000${check.runId ?? 'no-run'}\u0000${
-          check.databaseId ?? 'no-check'
-        }\u0000${check.attempt ?? 1}`
-      : stableStatus !== undefined
-        ? `${revision}\u0000${check.name}\u0000status\u0000${stableStatusRun ?? 'no-run-url'}`
-        : `${revision}\u0000${check.name}\u0000legacy\u0000${check.url}`;
+    check.databaseId !== undefined
+      ? `${revision}\u0000${check.name}\u0000check\u0000${check.databaseId}\u0000${check.attempt ?? 1}`
+      : check.runId !== undefined
+        ? `${revision}\u0000${check.name}\u0000run\u0000${check.runId}\u0000${check.attempt ?? 1}`
+        : stableStatus !== undefined
+          ? `${revision}\u0000${check.name}\u0000status\u0000${stableStatusRun ?? 'no-run-url'}`
+          : `${revision}\u0000${check.name}\u0000legacy\u0000${check.url}`;
   return {
     id: `ci:${stableIdentity(execution)}`,
     uncertain,

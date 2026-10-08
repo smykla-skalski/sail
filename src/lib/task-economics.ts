@@ -161,6 +161,7 @@ export const economicsRollupSchema = z
   .strict();
 
 export type EconomicsRollup = z.infer<typeof economicsRollupSchema>;
+export type ArchivedEconomicsEvidence = EconomicsRollup['archivedEvidence'][number];
 
 export const emptyTaskEconomics = (role: TaskActivityRole, phase: TaskEconomics['phase']) => ({
   role,
@@ -1420,6 +1421,37 @@ export function removeArchivedEconomicsEvidence(
   const archived = rollup[match.collection][match.index];
   if (!evidenceContentMatches(entry, archived.contentDigest))
     throw new Error(`Archived evidence identity ${entry.id} has conflicting content.`);
+  return removeArchivedEconomicsEvidenceAt(rollup, match);
+}
+
+export function removeArchivedEconomicsEvidenceSnapshot(
+  rollup: EconomicsRollup,
+  evidenceId: string,
+  snapshot: ArchivedEconomicsEvidence,
+): EconomicsRollup {
+  const identityDigest = evidenceIdentityDigest(evidenceId);
+  const expectedContent = archivedIdentityContent(snapshot, identityDigest);
+  if (expectedContent === undefined)
+    throw new Error(`Archived evidence snapshot does not contain identity ${evidenceId}.`);
+  const matches = archivedLocations(
+    rollup,
+    (candidate) => archivedIdentityContent(candidate, identityDigest) !== undefined,
+  );
+  if (!matches.length) return rollup;
+  if (matches.length > 1)
+    throw new Error(`Archived evidence identity ${evidenceId} appears more than once.`);
+  const match = matches[0];
+  const archived = rollup[match.collection][match.index];
+  if (archivedIdentityContent(archived, identityDigest) !== expectedContent)
+    throw new Error(`Archived evidence identity ${evidenceId} has conflicting content.`);
+  if (JSON.stringify(archived) !== JSON.stringify(snapshot)) return rollup;
+  return removeArchivedEconomicsEvidenceAt(rollup, match);
+}
+
+function removeArchivedEconomicsEvidenceAt(
+  rollup: EconomicsRollup,
+  match: ArchivedLocation,
+): EconomicsRollup {
   const next = structuredClone(rollup);
   migrateCausalProof(next);
   const incompleteParent = next.causalProofComplete ? null : incompleteCausalStateDigest(next);
