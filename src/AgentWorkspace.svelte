@@ -2336,7 +2336,7 @@
       }}
       aria-label={`${name} conversation`}
     >
-      {#if entries.length === 0 && !connecting && !historyLoading}
+      {#if entries.length === 0 && !connecting && !historyLoading && !liveTurn}
         <div class="agent-welcome">
           <h1>Work with {name}</h1>
           <p>Describe the work. Sail will show messages, tools, and approvals here.</p>
