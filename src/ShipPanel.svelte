@@ -122,7 +122,7 @@
   const shown: { fallback: ShipDetailFallback | null } = { fallback: null };
   const fallback = $derived(wide ? shipDetailFallback(run, rows, shown.fallback) : null);
   $effect(() => {
-    if (fallback) shown.fallback = fallback;
+    if (fallback && !selectedIssue) shown.fallback = fallback;
   });
   const issue = $derived(
     run?.issues.find((item) => item.id === selectedIssue) ??
