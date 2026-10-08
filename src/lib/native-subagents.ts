@@ -27,6 +27,8 @@ export type NativeSubagent = {
   transcript: AgentEntry[];
   /** Tool calls seen, counted as they arrive because the bounded transcript evicts old ones. */
   toolCount?: number;
+  /** Ids of the counted tool calls, so a replayed call for an evicted tool is not counted again. */
+  toolIds?: string[];
   created: number;
   updated: number;
   restored: boolean;
@@ -214,6 +216,7 @@ export function updateNativeSubagents(
         activity: settled ? (previous?.activity ?? 'Starting…') : 'Starting…',
         transcript: nextTranscript,
         ...(previous?.toolCount === undefined ? {} : { toolCount: previous.toolCount }),
+        ...(previous?.toolIds ? { toolIds: previous.toolIds } : {}),
         created: previous?.created ?? now,
         updated: now,
         restored: previous?.restored || replayed,
@@ -283,12 +286,15 @@ export function updateNativeSubagents(
   const newTool =
     update.sessionUpdate === 'tool_call' &&
     toolCallId !== undefined &&
+    !child.toolIds?.includes(toolCallId) &&
     !child.transcript.some((entry) => entry.type === 'tool' && entry.id === toolCallId);
   return {
     ...store,
     [id]: {
       ...child,
-      ...(newTool ? { toolCount: (child.toolCount ?? 0) + 1 } : {}),
+      ...(newTool
+        ? { toolCount: (child.toolCount ?? 0) + 1, toolIds: [...(child.toolIds ?? []), toolCallId] }
+        : {}),
       outcome: settled ? child.outcome : child.outcome === 'waiting' ? 'waiting' : 'working',
       activity: settled ? child.activity : toolActivity(update, child.activity),
       transcript,
@@ -344,6 +350,7 @@ export function reconcileNativeSubagents(
         activity,
         transcript: previous?.transcript ?? [],
         ...(previous?.toolCount === undefined ? {} : { toolCount: previous.toolCount }),
+        ...(previous?.toolIds ? { toolIds: previous.toolIds } : {}),
         created: previous?.created ?? now,
         updated: now,
         restored: previous?.restored ?? false,
@@ -443,6 +450,8 @@ export function nativeSubagentStatus(child: NativeSubagent): {
 export function nativeSubagentResult(child: NativeSubagent): string | null {
   if (!['completed', 'failed', 'interrupted'].includes(child.outcome)) return null;
   if (reportsInterruption(child.transcript)) return null;
+  // A failed child's error explains the failure better than whatever it said last.
+  if (child.outcome === 'failed' && child.error) return null;
   const last = child.transcript.findLast(
     (entry): entry is AgentMessage => entry.type === 'assistant',
   );

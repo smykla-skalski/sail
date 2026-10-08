@@ -523,6 +523,25 @@ await test('a failed child notice clears when the child is opened', () => {
   assert.equal(openedFailedChildren(receipts, childThread('working')).size, 0);
 });
 
+await test('a child that fails again after being opened and resumed notifies again', () => {
+  const failed = [nativeReceipt('broke', 'parent', 'failed')];
+  const resumed = [nativeReceipt('broke', 'parent', 'working')];
+  const count = (notices: ReturnType<typeof advanceFailedChildNotices>) =>
+    failedChildCount(notices, failed, 'acp:codex:parent', '/repo');
+  let notices = advanceFailedChildNotices({}, failed, () => false);
+  notices = advanceFailedChildNotices(
+    notices,
+    failed,
+    () => false,
+    openedFailedChildren(failed, childThread('broke')),
+  );
+  assert.equal(count(notices), 0);
+  notices = advanceFailedChildNotices(notices, resumed, () => false);
+  notices = advanceFailedChildNotices(notices, failed, () => false);
+  assert.equal(count(notices), 1);
+  assert.equal(failedChildLabel(count(notices)), '1 failed child');
+});
+
 await test('failed child notices count only failed native children of that parent', () => {
   const receipts = [
     nativeReceipt('a', 'parent', 'failed'),

@@ -765,6 +765,28 @@ await test('a settled child without output has no result text', () => {
   assert.equal(nativeSubagentReceipts(running)[0].result, null);
 });
 
+await test('a failed child with an error reports the error, not its last message', () => {
+  const said = childUpdates([
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Reading files…' } },
+  ]);
+  const failed = updateNativeSubagents(
+    said,
+    event('parent', {
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: 'child',
+      state: 'failed',
+      error: 'Rate limited',
+    }),
+    '/repo',
+    9,
+  );
+  const [receipt] = nativeSubagentReceipts(failed);
+  assert.equal(receipt.result, null);
+  assert.equal(receipt.error, 'Rate limited');
+  const [silent] = nativeSubagentReceipts(settle(said, 'failed'));
+  assert.equal(silent.result, 'Reading files…');
+});
+
 await test('an interruption notice is not a result', () => {
   const done = settle(
     childUpdates([
@@ -792,6 +814,13 @@ await test('tool calls are counted once, even after the transcript evicts them',
       status: 'completed',
     },
   ]);
+  assert.equal(nativeSubagentReceipts(store)[0].toolCount, calls.length);
+  store = updateNativeSubagents(
+    store,
+    event('child', { ...calls[0], status: 'completed' }),
+    '/repo',
+    3,
+  );
   assert.equal(nativeSubagentReceipts(store)[0].toolCount, calls.length);
   store = reconcileNativeSubagents(
     store,

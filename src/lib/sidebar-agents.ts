@@ -358,8 +358,11 @@ export function advanceFailedChildNotices(
     else phase = 'cleared';
     next[receipt.receiptId] = opened.has(receipt.receiptId) ? 'cleared' : phase;
   }
-  // A cleared notice outlives its receipt, so a child that reappears does not notify again.
-  for (const [id, phase] of Object.entries(notices)) if (phase === 'cleared') next[id] ??= phase;
+  // A cleared notice outlives its receipt, so a child that reappears does not notify again. A
+  // child that left the failed state drops it, so failing again notifies again.
+  const present = new Set(receipts.map((receipt) => receipt.receiptId));
+  for (const [id, phase] of Object.entries(notices))
+    if (phase === 'cleared' && !present.has(id)) next[id] ??= phase;
   const same =
     Object.keys(next).length === Object.keys(notices).length &&
     Object.entries(next).every(([id, phase]) => notices[id] === phase);
