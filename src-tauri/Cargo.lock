@@ -3450,6 +3450,7 @@ dependencies = [
  "cairo-rs 0.18.5",
  "cairo-rs 0.22.9",
  "chrono",
+ "dunce",
  "httpdate",
  "netstat2",
  "nix 0.31.3",

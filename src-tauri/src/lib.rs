@@ -52,9 +52,21 @@ impl WorktreeOperationLocks {
     }
 }
 
+/// Canonicalization git can consume. On Windows `std::fs::canonicalize` returns an
+/// extended-length `\\?\` path, which git rejects when it creates worktrees and refs.
+pub(crate) trait GitCanonical {
+    fn git_canonical(&self) -> std::io::Result<PathBuf>;
+}
+
+impl GitCanonical for Path {
+    fn git_canonical(&self) -> std::io::Result<PathBuf> {
+        dunce::canonicalize(self)
+    }
+}
+
 fn git_common_directory(repository: &Path) -> Result<PathBuf, String> {
     let repository = repository
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
     let common = git_reference(&repository, &["rev-parse", "--git-common-dir"])
         .ok_or("Cannot locate the repository Git directory.")?;
@@ -65,7 +77,7 @@ fn git_common_directory(repository: &Path) -> Result<PathBuf, String> {
         repository.join(common)
     };
     common
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Repository Git directory no longer exists.".to_string())
 }
 
@@ -91,7 +103,7 @@ fn existing_shipping_worktree(
         return Ok(None);
     };
     let path = PathBuf::from(existing.path)
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Shipping worktree is missing.")?;
     let setup = worktree_config::read(&path)?
         .map(|config| config.setup)
@@ -260,7 +272,7 @@ fn list_picker_directory(path: Option<String>) -> Result<PickerDirectory, String
                 .ok_or("Cannot find the home folder")?,
         ),
     };
-    let chosen = chosen.canonicalize().map_err(|error| error.to_string())?;
+    let chosen = chosen.git_canonical().map_err(|error| error.to_string())?;
     if !chosen.is_dir() {
         return Err("Choose a folder to browse".to_string());
     }
@@ -712,7 +724,7 @@ fn repository_path_available(path: String) -> bool {
 #[tauri::command]
 fn validate_repository(path: String) -> Result<String, String> {
     let directory = Path::new(&path)
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Repository path does not exist. Choose an existing directory.".to_string())?;
     if !directory.is_dir() {
         return Err("Repository path is not a directory.".to_string());
@@ -1505,7 +1517,7 @@ fn diff_file_contents(path: String, file: String, side: String) -> Result<Option
     if !target.exists() {
         return Ok(None);
     }
-    let canonical = target.canonicalize().map_err(|error| error.to_string())?;
+    let canonical = target.git_canonical().map_err(|error| error.to_string())?;
     if !canonical.starts_with(&root) || !canonical.is_file() {
         return Err("Diff file is outside the repository.".into());
     }
@@ -1609,7 +1621,7 @@ fn registered_worktrees(
         .filter(|entry| entry.present)
         .filter_map(|entry| {
             Path::new(&entry.path)
-                .canonicalize()
+                .git_canonical()
                 .ok()
                 .map(|path| (path, entry.branch))
         })
@@ -1617,7 +1629,7 @@ fn registered_worktrees(
     Ok(paths
         .into_iter()
         .filter_map(|path| {
-            let branch = registered.get(&Path::new(&path).canonicalize().ok()?)?;
+            let branch = registered.get(&Path::new(&path).git_canonical().ok()?)?;
             Some(RegisteredWorktree {
                 path,
                 branch: branch.clone(),
@@ -1883,7 +1895,7 @@ fn add_worktree(
     let parent = match destination_parent {
         Some(path) => {
             let parent = Path::new(&path)
-                .canonicalize()
+                .git_canonical()
                 .map_err(|_| "Worktree destination does not exist.".to_string())?;
             if !parent.is_dir() {
                 return Err("Worktree destination is not a directory.".to_string());
@@ -1938,7 +1950,7 @@ fn add_worktree(
         ));
     }
     let path = path
-        .canonicalize()
+        .git_canonical()
         .map_err(|error| format!("Cannot resolve new worktree: {error}"))?;
     let config = (|| -> Result<Option<worktree_config::WorktreeConfig>, String> {
         let config = worktree_config::read(&path)?;
@@ -2198,7 +2210,7 @@ async fn delete_worktree(
         let checked = validate_repository(repository)?;
         let _lock = operation_locks.lock(Path::new(&checked))?;
         let directory = PathBuf::from(&worktree)
-            .canonicalize()
+            .git_canonical()
             .unwrap_or_else(|_| PathBuf::from(&worktree));
         fence.cleanup(&agents, &directory, native_generation, || {
             if let Some(session_ids) = open_code_session_ids {
@@ -2617,10 +2629,10 @@ where
 {
     let (before_final_identity_check, after_final_identity_check, after_remove) = hooks;
     let repository = PathBuf::from(validate_repository(repository)?)
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
     let worktree = Path::new(&worktree)
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Worktree folder no longer exists.".to_string())?;
     if worktree == repository {
         return Err("Cannot delete the main repository.".to_string());
@@ -2632,7 +2644,7 @@ where
         .filter_map(|line| line.strip_prefix("worktree "));
     if !registered.into_iter().any(|path| {
         Path::new(path)
-            .canonicalize()
+            .git_canonical()
             .is_ok_and(|registered| registered == worktree)
     }) {
         return Err("This folder is not a worktree of the selected repository.".to_string());
@@ -2747,7 +2759,7 @@ where
             let registered = Path::new(&entry.path);
             registered == worktree
                 || registered
-                    .canonicalize()
+                    .git_canonical()
                     .is_ok_and(|registered| registered == worktree)
         });
     if re_registered {
@@ -2997,6 +3009,7 @@ mod tests {
         worktree_overviews, OpenCodeCleanupSession, WorktreeOperationLocks,
     };
     use super::{working_tree_commit, working_tree_revision};
+    use crate::GitCanonical;
     use std::collections::HashSet;
     use std::fs;
     #[cfg(unix)]
@@ -3056,7 +3069,7 @@ mod tests {
         let repository = root.join("repository");
         let child = root.join("child");
         fs::create_dir_all(&repository).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let repository_path = repository.to_str().unwrap();
         git(repository_path, &["init", "-q"]);
         git(
@@ -3095,7 +3108,7 @@ mod tests {
         let repository = root.join("repository");
         let child = root.join("child");
         fs::create_dir_all(&repository).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let repository_path = repository.to_str().unwrap();
         git(repository_path, &["init", "-q"]);
         git(
@@ -3131,7 +3144,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             recovered.path,
-            child.canonicalize().unwrap().to_str().unwrap()
+            child.git_canonical().unwrap().to_str().unwrap()
         );
         assert_eq!(recovered.branch, "ship-issue-7-test");
         fs::remove_dir_all(root).unwrap();
@@ -3206,7 +3219,7 @@ mod tests {
         let parent = root.join("worktrees");
         fs::create_dir_all(&repository).unwrap();
         fs::create_dir_all(&parent).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let repository_path = repository.to_str().unwrap();
         git(repository_path, &["init", "-q"]);
         fs::write(repository.join(".gitignore"), "node_modules/\n").unwrap();
@@ -3301,7 +3314,7 @@ mod tests {
         let parent = root.join("worktrees");
         fs::create_dir_all(&repository).unwrap();
         fs::create_dir_all(&parent).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let repository_path = repository.to_str().unwrap();
         git(repository_path, &["init", "-q"]);
         fs::write(repository.join("tracked.txt"), "before\n").unwrap();
@@ -3400,7 +3413,7 @@ mod tests {
         let parent = root.join("worktrees");
         fs::create_dir_all(&repository).unwrap();
         fs::create_dir_all(&parent).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let repository_path = repository.to_string_lossy().into_owned();
         git(&repository_path, &["init", "-q"]);
         fs::write(repository.join(".gitignore"), "*.tmp\n").unwrap();
@@ -3737,7 +3750,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("sail-revision-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -3763,7 +3776,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("sail-revision-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -3788,7 +3801,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("sail-generation-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -3814,7 +3827,7 @@ mod tests {
     fn working_tree_commit_requires_a_clean_checkout() {
         let root = std::env::temp_dir().join(format!("sail-commit-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -3878,7 +3891,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("sail-shipping-paths-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q", "-b", "main"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -3906,7 +3919,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q", "-b", "main"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -3948,7 +3961,7 @@ mod tests {
         let repository = root.join("repository");
         let missing = root.join("missing");
         fs::create_dir_all(&repository).unwrap();
-        let repository = repository.canonicalize().unwrap();
+        let repository = repository.git_canonical().unwrap();
         let path = repository.to_str().unwrap();
         git(path, &["init", "-q", "-b", "overview-test"]);
         fs::write(repository.join("changed.txt"), "change\n").unwrap();
@@ -3984,7 +3997,7 @@ mod tests {
     fn git_change_actions_handle_hunks_stale_patches_and_untracked_files() {
         let root = std::env::temp_dir().join(format!("sail-change-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -4159,7 +4172,7 @@ mod tests {
     fn unstage_file_before_first_commit_preserves_worktree() {
         let root = std::env::temp_dir().join(format!("sail-unborn-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         fs::write(root.join("new.txt"), "new line\n").unwrap();
@@ -4209,7 +4222,7 @@ mod tests {
     fn file_actions_use_literal_pathspecs() {
         let root = std::env::temp_dir().join(format!("sail-literal-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
@@ -4264,7 +4277,7 @@ mod tests {
     fn binary_file_actions_apply_complete_patches() {
         let root = std::env::temp_dir().join(format!("sail-binary-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
+        let root = root.git_canonical().unwrap();
         let path = root.to_str().unwrap();
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);

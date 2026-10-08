@@ -1,3 +1,4 @@
+use crate::GitCanonical;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -4477,7 +4478,7 @@ fn checked_worktree(
 ) -> Result<PathBuf, String> {
     let repository = PathBuf::from(crate::validate_repository(repository)?);
     let worktree = Path::new(&worktree)
-        .canonicalize()
+        .git_canonical()
         .map_err(|_| "Worktree folder no longer exists.".to_string())?;
     let listed = crate::git_reference(&repository, &["worktree", "list", "--porcelain"])
         .ok_or("Cannot inspect repository worktrees.")?;
@@ -4488,7 +4489,7 @@ fn checked_worktree(
                 .filter_map(|line| line.strip_prefix("worktree "))
                 .any(|path| {
                     Path::new(path)
-                        .canonicalize()
+                        .git_canonical()
                         .is_ok_and(|registered| registered == worktree)
                 }))
     {
@@ -4989,6 +4990,7 @@ mod tests {
         validated_claim_input, with_verified_claim_takeover, ClaimLock, IssueDraft,
         IssueGraphDraft, RepositoryLabelState, ShippingClaim,
     };
+    use crate::GitCanonical;
     use std::{cell::Cell, collections::HashMap, fs, process::Command, time::Duration};
 
     #[cfg(windows)]
@@ -5253,7 +5255,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let path = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        let path = root.git_canonical().unwrap().to_string_lossy().into_owned();
 
         assert!(checked_worktree(path.clone(), path.clone(), "main", true).is_ok());
         assert!(checked_worktree(path.clone(), path, "main", false).is_err());

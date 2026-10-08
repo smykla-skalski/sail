@@ -143,5 +143,5 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: Test Rust
-        if: env.RUN_RUST == 'true' && runner.os != 'Windows'
+        if: env.RUN_RUST == 'true'
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
