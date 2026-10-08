@@ -64,6 +64,7 @@
     loadShipRuns,
     repositoryForRemote,
     shippingWorkerGone,
+    unrecoverableIssuePlan,
     parseShipReport,
     requireValidatorEconomics,
     refreshedIssueState,
@@ -5685,39 +5686,67 @@
     for (const issue of readyShipIssues(run, unsettledReceiptIds)) scheduleShipLaunch(run, issue);
   }
 
-  const shipRepairAttempts = new SvelteMap<string, string>();
+  const shipRepairMisses = new SvelteMap<string, string>();
 
   // Older runs stored a worktree path as their repository; once that worktree
   // is deleted every claim and fence call fails, so point them at the checkout.
-  async function repairShipRunRepositories(): Promise<void> {
-    const catalogKey = projectCatalog.repositories.join('\0');
-    const pending = shipRuns.filter((run) => shipRepairAttempts.get(run.id) !== catalogKey);
+  // Returns the runs that stay unrecoverable.
+  async function repairShipRunRepositories(): Promise<Set<string>> {
     const available = await Promise.all(
-      pending.map((run) =>
+      shipRuns.map((run) =>
         invoke<boolean>('repository_path_available', { path: run.repository }).catch(() => true),
       ),
     );
-    const dead = pending.filter((_, index) => !available[index]);
-    if (!dead.length) return;
-    const candidates = await Promise.all(
-      projectCatalog.repositories.map(async (path) => ({
-        path,
-        remote: await invoke<string>('shipping_target_repository', { repository: path }).catch(
-          () => null,
-        ),
-      })),
-    );
-    let changed = false;
-    for (const run of dead) {
-      const repaired = repositoryForRemote(candidates, run.remote);
-      if (!repaired) {
-        shipRepairAttempts.set(run.id, catalogKey);
-        continue;
+    const dead = shipRuns.filter((_, index) => !available[index]);
+    if (!dead.length) return new Set();
+    const catalogKey = projectCatalog.repositories.join('\0');
+    const lookups = dead.filter((run) => shipRepairMisses.get(run.id) !== catalogKey);
+    const repaired = new SvelteSet<string>();
+    if (lookups.length) {
+      const candidates = await Promise.all(
+        projectCatalog.repositories.map(async (path) => {
+          try {
+            return {
+              path,
+              remote: await invoke<string>('shipping_target_repository', { repository: path }),
+              failed: false,
+            };
+          } catch {
+            return { path, remote: null, failed: true };
+          }
+        }),
+      );
+      const lookupFailed = candidates.some((candidate) => candidate.failed);
+      for (const run of lookups) {
+        const repository = repositoryForRemote(candidates, run.remote);
+        if (repository) {
+          run.repository = repository;
+          repaired.add(run.id);
+        } else if (!lookupFailed) shipRepairMisses.set(run.id, catalogKey);
       }
-      run.repository = repaired;
-      changed = true;
+      if (repaired.size) await saveShipRuns();
     }
-    if (changed) await saveShipRuns();
+    return new Set(dead.filter((run) => !repaired.has(run.id)).map((run) => run.id));
+  }
+
+  async function settleUnrecoverableShipRun(run: ShipRun): Promise<void> {
+    const reason = 'Shipping repository no longer exists. Start a new run from the project.';
+    await Promise.all(
+      run.issues.map(async (issue) => {
+        const plan = unrecoverableIssuePlan(issue);
+        if (plan === 'none') return;
+        if (plan === 'fail') await fenceRecoveredShippingWorker(run, issue, reason);
+        if (plan === 'fail' && !issue.workerSettled) return;
+        await updateShipIssue(run, issue, {
+          claim: undefined,
+          claimFencePending: false,
+          claimRevalidationPending: false,
+          claimHandoffPending: false,
+          refreshError: null,
+          worktreeUnavailable: true,
+        });
+      }),
+    );
   }
 
   async function tickShippingRuns(refreshCompleted = false): Promise<void> {
@@ -5725,12 +5754,16 @@
     detectShippingClockResume();
     shippingBusy = true;
     try {
-      await repairShipRunRepositories();
+      const unrecoverable = await repairShipRunRepositories();
       await persistShipRefresh(
-        shipRuns.map((run) => refreshShippingRun(run, refreshCompleted)),
+        shipRuns.map((run) =>
+          unrecoverable.has(run.id)
+            ? settleUnrecoverableShipRun(run)
+            : refreshShippingRun(run, refreshCompleted),
+        ),
         saveShipRuns,
       );
-      for (const run of shipRuns) launchReadyShipIssues(run);
+      for (const run of shipRuns) if (!unrecoverable.has(run.id)) launchReadyShipIssues(run);
     } catch (cause) {
       error = describe(cause);
     } finally {

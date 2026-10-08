@@ -1598,7 +1598,10 @@ export function repositoryForRemote(
 
 // ACP agents report a vanished session or deleted cwd with these messages.
 export function shippingWorkerGone(cause: unknown): boolean {
-  const message = cause instanceof Error ? cause.message : String(cause);
+  const message =
+    typeof cause === 'object' && cause && 'message' in cause
+      ? String(cause.message)
+      : String(cause);
   return /session is not connected|location not found/i.test(message);
 }
 
@@ -1610,4 +1613,26 @@ export function currentShipBlockedReason(reason: string | undefined | null): str
   return missingRepositoryReason.test(reason)
     ? 'Shipping repository no longer exists. Start a new run from the project.'
     : reason;
+}
+
+// What a run needs once its repository is gone and no checkout can replace it.
+export function unrecoverableIssuePlan(
+  issue: Pick<
+    ShipIssue,
+    | 'state'
+    | 'workerSettled'
+    | 'claim'
+    | 'claimFencePending'
+    | 'refreshError'
+    | 'worktreeUnavailable'
+  >,
+): 'none' | 'clear' | 'fail' {
+  const dirty =
+    !!issue.claim ||
+    !!issue.claimFencePending ||
+    !!issue.refreshError ||
+    issue.worktreeUnavailable !== true;
+  if (issue.state === 'merged') return dirty ? 'clear' : 'none';
+  if (issue.state === 'failed' && issue.workerSettled === true) return dirty ? 'clear' : 'none';
+  return 'fail';
 }

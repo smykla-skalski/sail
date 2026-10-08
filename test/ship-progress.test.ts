@@ -30,6 +30,7 @@ import {
   shipCheckpointOwner,
   currentShipBlockedReason,
   repositoryForRemote,
+  unrecoverableIssuePlan,
   shippingWorkerGone,
   authorizeShipCheckpointThread,
   commitRevisionBoundValidation,
@@ -2410,4 +2411,23 @@ void test('replaces the persisted missing-repository block reason', () => {
   );
   assert.equal(currentShipBlockedReason('Worker paused.'), 'Worker paused.');
   assert.equal(currentShipBlockedReason(null), 'Shipping claim recovery requires worker fencing.');
+});
+
+void test('plans how to settle issues of a run whose repository is gone', () => {
+  const settled = { state: 'failed' as const, workerSettled: true, worktreeUnavailable: true };
+  assert.equal(unrecoverableIssuePlan(settled), 'none');
+  assert.equal(unrecoverableIssuePlan({ ...settled, refreshError: 'Claim: boom' }), 'clear');
+  assert.equal(unrecoverableIssuePlan({ ...settled, worktreeUnavailable: false }), 'clear');
+  assert.equal(
+    unrecoverableIssuePlan({ ...settled, state: 'merged', claimFencePending: true }),
+    'clear',
+  );
+  assert.equal(unrecoverableIssuePlan({ state: 'working', workerSettled: false }), 'fail');
+  assert.equal(unrecoverableIssuePlan({ state: 'failed', workerSettled: false }), 'fail');
+});
+
+void test('reads the message of error-like objects when matching a gone worker', () => {
+  assert.equal(shippingWorkerGone({ message: 'Agent session is not connected.' }), true);
+  assert.equal(shippingWorkerGone({ message: 'denied' }), false);
+  assert.equal(shippingWorkerGone(null), false);
 });
