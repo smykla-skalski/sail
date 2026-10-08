@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  canClearChoice,
   elicitationContent,
   elicitationDefaults,
   elicitationFields,
@@ -139,6 +140,28 @@ await test('builds the content shape claude-agent-acp reads back', () => {
       },
     ),
     { approach: 'fast' },
+  );
+});
+
+await test('clears optional single choices only and omits the cleared answer', () => {
+  const fields = elicitationFields({
+    ...askUserQuestions,
+    properties: { ...askUserQuestions.properties, pick: { oneOf: [{ const: 'a' }] } },
+    required: ['pick'],
+  });
+  const byKey = Object.fromEntries(fields.map((field) => [field.key, field]));
+  const cases: [string, unknown, boolean][] = [
+    ['question_0', 'Postgres', true],
+    ['question_0', undefined, false],
+    ['question_0', '', false],
+    ['question_1', ['Search'], false],
+    ['pick', 'a', false],
+  ];
+  for (const [key, value, expected] of cases)
+    assert.equal(canClearChoice(byKey[key], value), expected, `${key}=${String(value)}`);
+  assert.deepEqual(
+    elicitationContent(fields, { question_0: undefined, question_0_custom: 'Valkey', pick: 'a' }),
+    { question_0_custom: 'Valkey', pick: 'a' },
   );
 });
 

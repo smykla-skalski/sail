@@ -3,6 +3,7 @@
   import { Button } from '@smykla-skalski/sui';
   import type { StructuredQuestion } from './lib/planning-state';
   import {
+    canClearChoice,
     elicitationContent,
     elicitationDefaults,
     elicitationFields,
@@ -47,6 +48,12 @@
     return field.kind === 'multi'
       ? Array.isArray(value) && value.map(String).includes(option)
       : value === option;
+  }
+
+  function clear(field: ElicitationChoiceField, event: MouseEvent) {
+    const group = (event.currentTarget as HTMLElement).closest('fieldset');
+    set(field.key, undefined);
+    group?.querySelector<HTMLInputElement>('input[type="radio"]')?.focus();
   }
 
   function preview(field: ElicitationChoiceField) {
@@ -148,6 +155,16 @@
               </label>
             {/each}
           </div>
+          {#if canClearChoice(field, values[field.key])}
+            <div class="elicitation-clear">
+              <Button
+                size="sm"
+                variant="ghost"
+                aria-label={`Clear choice${field.title ? ` for ${field.title}` : ''}`}
+                onclick={(event: MouseEvent) => clear(field, event)}>Clear choice</Button
+              >
+            </div>
+          {/if}
           {#if shown}
             <figure class="elicitation-preview">
               <figcaption>Preview · {shown.title}</figcaption>
@@ -322,6 +339,10 @@
     color: var(--sui-muted);
     font-size: var(--type-13);
     line-height: 1.4;
+  }
+  .elicitation-clear {
+    display: flex;
+    justify-content: flex-start;
   }
   .elicitation-preview {
     display: grid;

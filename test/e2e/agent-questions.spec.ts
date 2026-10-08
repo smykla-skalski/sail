@@ -91,6 +91,22 @@ describe('agent questions', () => {
     await expect(storage.$('.elicitation-preview textarea')).toHaveValue(
       expect.stringContaining('CREATE TABLE cache'),
     );
+    const clear = storage.$('button=Clear choice');
+    await browser.keys('Tab');
+    await expect(clear).toBeFocused();
+    await browser.keys('Enter');
+    await expect(storage.$$('input[type="radio"]:checked')).toBeElementsArrayOfSize(0);
+    await expect(clear).not.toBeExisting();
+    expect(
+      await browser.execute(
+        () => document.activeElement?.matches('[data-question="question_0"] input') ?? false,
+      ),
+    ).toBe(true);
+    await storage.$('[data-option="Redis"] input').click();
+    await expect(clear).toBeDisplayed();
+    await clear.click();
+    await expect(storage.$$('input[type="radio"]:checked')).toBeElementsArrayOfSize(0);
+    await storage.$('.elicitation-other input').setValue('Valkey');
     await rollout.$('[data-option="Metrics"] input').click();
     await rollout.$('[data-option="Docs"] input').click();
     await rollout.$('.elicitation-other input').setValue('Canary');
@@ -98,7 +114,7 @@ describe('agent questions', () => {
 
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining(
-        'Answers: {"question_0":"Postgres (Recommended)","question_1":["Metrics","Docs"],"question_1_custom":"Canary"}',
+        'Answers: {"question_0_custom":"Valkey","question_1":["Metrics","Docs"],"question_1_custom":"Canary"}',
       ),
     );
     await expect(form).not.toBeExisting();
