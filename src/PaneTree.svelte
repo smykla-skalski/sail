@@ -17,6 +17,7 @@
   import BrowserPane from './BrowserPane.svelte';
   import SideChat from './SideChat.svelte';
   import type { AgentThread, AgentAvailability, AgentEntry } from './lib/acp';
+  import { acpPermissionActivitySourceId } from './lib/acp-permissions';
   import type { OpenCodeClient, SessionInfo } from './lib/opencode';
   import type { SetupReport } from './lib/onboarding';
   import type { BrowserAttachment } from './lib/browser-pick';
@@ -1054,7 +1055,11 @@
               ondecision={(thread, permission, optionId) =>
                 ondecision(
                   thread,
-                  String(permission.id),
+                  acpPermissionActivitySourceId(
+                    permission.id,
+                    permission.generation,
+                    permission.fingerprint,
+                  ),
                   permission.policy
                     ? permissionDecisionTitle(
                         permission.title,

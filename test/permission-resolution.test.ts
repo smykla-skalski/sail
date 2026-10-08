@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { permissionPolicy } from '../src/lib/capability-profiles.ts';
-import { AutomaticPermissionResolver } from '../src/lib/permission-resolution.ts';
+import {
+  automaticPermissionPolicy,
+  openCodePermissionToolCall,
+  permissionPolicy,
+} from '../src/lib/capability-profiles.ts';
+import {
+  assertAutomaticPermissionAllowed,
+  AutomaticPermissionResolver,
+} from '../src/lib/permission-resolution.ts';
 
 const allowOnce = [
   { optionId: 'allow-background', kind: 'allow_once' },
@@ -122,4 +129,38 @@ await test('reused provider request IDs resolve again in a new generation', asyn
   await resolver.resolve(request(2));
 
   assert.equal(providerResponses, 2);
+});
+
+await test('provider-added read paths stop an already scheduled automatic approval', () => {
+  const initialPolicy = automaticPermissionPolicy({
+    profile: 'explore',
+    workspace: '/workspace',
+    title: 'read',
+    toolCall: openCodePermissionToolCall({ action: 'read', resources: [] }),
+    options: allowOnce,
+    resourceTrust: { trusted: true, canonicalResources: [] },
+  });
+
+  assert.equal(initialPolicy.recommendation, 'allow');
+  assert.throws(
+    () =>
+      assertAutomaticPermissionAllowed(
+        {
+          profile: 'explore',
+          workspace: '/workspace',
+          title: 'read',
+          toolCall: openCodePermissionToolCall({
+            action: 'read',
+            resources: ['README.md'],
+          }),
+          options: allowOnce,
+          resourceTrust: {
+            trusted: true,
+            canonicalResources: ['/workspace/README.md'],
+          },
+        },
+        'allow-background',
+      ),
+    /Permission resource changed before automatic approval/,
+  );
 });

@@ -7,6 +7,7 @@ import {
   saveActivityHistory,
 } from '../src/lib/activity-history.ts';
 import { permissionDecisionTitle } from '../src/lib/capability-profiles.ts';
+import { acpPermissionActivitySourceId } from '../src/lib/acp-permissions.ts';
 
 await test('activity history deduplicates provider updates with latest scoped outcome', () => {
   const events = recentActivityEvents([
@@ -173,4 +174,36 @@ await test('activity history reloads only valid bounded durable events', () => {
   assert.equal(restored[0].id, 'event-109');
   assert.deepEqual(loadActivityHistory('{"kind":"tool"}'), []);
   assert.deepEqual(loadActivityHistory('[{"kind":"invented"}]'), []);
+});
+
+await test('sequential ACP decisions retain reused provider request IDs', () => {
+  const events = recentActivityEvents([
+    {
+      workspace: '/repo/a',
+      kind: 'decision',
+      source: 'Codex',
+      sourceId: acpPermissionActivitySourceId(7, 1, 'first-fingerprint'),
+      title: 'Read first file',
+      outcome: 'completed',
+      at: 10,
+      agent: 'codex',
+      sessionId: 'session-1',
+    },
+    {
+      workspace: '/repo/a',
+      kind: 'decision',
+      source: 'Codex',
+      sourceId: acpPermissionActivitySourceId(7, 2, 'second-fingerprint'),
+      title: 'Read second file',
+      outcome: 'completed',
+      at: 20,
+      agent: 'codex',
+      sessionId: 'session-1',
+    },
+  ]);
+
+  assert.deepEqual(
+    events.map((event) => event.title),
+    ['Read second file', 'Read first file'],
+  );
 });

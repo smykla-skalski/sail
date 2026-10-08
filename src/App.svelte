@@ -212,7 +212,11 @@
     runSerialOpenCodeTurn,
     waitForAuthoritativeOpenCodeSettlement,
   } from './lib/opencode-turns';
-  import { permissionResolver, type AutomaticPermissionRequest } from './lib/permission-resolution';
+  import {
+    assertAutomaticPermissionAllowed,
+    permissionResolver,
+    type AutomaticPermissionRequest,
+  } from './lib/permission-resolution';
   import { openCodePermissionRejections } from './lib/opencode-permission-resolution';
   import {
     prepareToolFailureDraft,
@@ -309,6 +313,7 @@
     type AgentThread,
     type InterruptedAgentTurn,
   } from './lib/acp';
+  import { acpPermissionActivitySourceId } from './lib/acp-permissions';
   import {
     compatibleOpenCodeVersion,
     connect,
@@ -1671,7 +1676,7 @@
         workspace: item.directory,
         kind: 'decision',
         source: item.agent,
-        sourceId: String(item.requestId ?? item.key),
+        sourceId: inboxDecisionActivitySourceId(item),
         title: item.text,
         outcome: 'waiting',
         at: item.receivedAt,
@@ -6836,16 +6841,17 @@
                 thread.directory,
                 permissionReadResources(tool),
               );
-              const latestPolicy = permissionPolicy({
-                profile: policy.profile,
-                workspace: thread.directory,
-                title,
-                toolCall: tool,
-                options,
-                resourceTrust: latestTrust,
-              });
-              if (latestPolicy.recommendation !== 'allow' || latestPolicy.optionId !== optionId)
-                throw new Error('Permission resource changed before automatic approval.');
+              assertAutomaticPermissionAllowed(
+                {
+                  profile: policy.profile,
+                  workspace: thread.directory,
+                  title,
+                  toolCall: tool,
+                  options,
+                  resourceTrust: latestTrust,
+                },
+                optionId,
+              );
             }
             await acp.permission(
               pending.agent,
@@ -6859,7 +6865,7 @@
           record: (optionId) =>
             recordDecisionActivity(
               thread,
-              String(requestId),
+              acpPermissionActivitySourceId(requestId, permissionGeneration, permissionFingerprint),
               decisionTitle,
               permissionOutcome(options, optionId),
             ),
@@ -6931,19 +6937,20 @@
                   location.directory,
                   permissionReadResources(latestToolCall),
                 );
-                const latestPolicy = permissionPolicy({
-                  profile: policy.profile,
-                  workspace: location.directory,
-                  title: latestRequest.action,
-                  toolCall: latestToolCall,
-                  options: [
-                    { optionId: 'once', kind: 'allow_once' },
-                    { optionId: 'reject', kind: 'reject_once' },
-                  ],
-                  resourceTrust: latestTrust,
-                });
-                if (latestPolicy.recommendation !== 'allow' || latestPolicy.optionId !== optionId)
-                  throw new Error('Permission resource changed before automatic approval.');
+                assertAutomaticPermissionAllowed(
+                  {
+                    profile: policy.profile,
+                    workspace: location.directory,
+                    title: latestRequest.action,
+                    toolCall: latestToolCall,
+                    options: [
+                      { optionId: 'once', kind: 'allow_once' },
+                      { optionId: 'reject', kind: 'reject_once' },
+                    ],
+                    resourceTrust: latestTrust,
+                  },
+                  optionId,
+                );
               }
               if (optionId === 'reject')
                 await openCodePermissionRejections.reject({
@@ -8758,7 +8765,7 @@
         record: (selectedOptionId: string | null) =>
           recordDecisionActivity(
             thread,
-            String(item.requestId ?? item.key),
+            inboxDecisionActivitySourceId(item),
             inboxPermissionDecisionTitle(
               item,
               selectedOptionId === null ||
@@ -9264,7 +9271,7 @@
           !isInboxOutcome(candidate) &&
           candidate.directory === event.workspace &&
           candidate.sessionId === event.sessionId &&
-          String(candidate.requestId ?? candidate.key) === event.sourceId,
+          inboxDecisionActivitySourceId(candidate) === event.sourceId,
       );
       if (item) {
         await openInboxItem(item);
@@ -9309,6 +9316,15 @@
       },
     ]);
     setSetting('sai-activity-history', saveActivityHistory(durableActivityHistory));
+  }
+
+  function inboxDecisionActivitySourceId(item: InboxItem): string {
+    if (item.kind !== 'acp-permission') return String(item.requestId ?? item.key);
+    return acpPermissionActivitySourceId(
+      item.requestId ?? item.key,
+      item.generation ?? item.receivedAt,
+      item.fingerprint,
+    );
   }
 
   function recordEvictedOpenCodeRejection(request: PermissionRequest, eventDirectory?: string) {
@@ -12392,7 +12408,11 @@
                 ondecision={(thread, permission, optionId) =>
                   recordDecisionActivity(
                     thread,
-                    String(permission.id),
+                    acpPermissionActivitySourceId(
+                      permission.id,
+                      permission.generation,
+                      permission.fingerprint,
+                    ),
                     permission.policy
                       ? permissionDecisionTitle(
                           permission.title,

@@ -14,6 +14,14 @@ export function acpPermissionIdentity(permission: AcpPermissionIdentity): string
   ]);
 }
 
+export function acpPermissionActivitySourceId(
+  id: string | number,
+  generation?: string | number,
+  fingerprint?: string,
+): string {
+  return JSON.stringify([String(id), generation ?? null, fingerprint ?? null]);
+}
+
 export function enqueueAcpPermission(
   permissions: readonly AgentPermission[],
   permission: AgentPermission,

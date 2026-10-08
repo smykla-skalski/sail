@@ -1,4 +1,13 @@
-import type { PermissionPolicyDecision } from './capability-profiles.ts';
+import { automaticPermissionPolicy, type PermissionPolicyDecision } from './capability-profiles.ts';
+
+export function assertAutomaticPermissionAllowed(
+  input: Parameters<typeof automaticPermissionPolicy>[0],
+  optionId: string,
+): void {
+  const policy = automaticPermissionPolicy(input);
+  if (policy.recommendation !== 'allow' || policy.optionId !== optionId)
+    throw new Error('Permission resource changed before automatic approval.');
+}
 
 type PermissionRequestBase = {
   key: string;
