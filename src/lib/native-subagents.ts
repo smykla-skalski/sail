@@ -100,7 +100,8 @@ function boundEntry(entry: AgentEntry): AgentEntry {
     return entry.text.length > nativeMessageLimit && !entry.id.endsWith(':prompt')
       ? { ...entry, text: messageTail(entry.text) }
       : entry;
-  const content = boundValue(entry.content, messageTail) as string;
+  const content =
+    entry.content.length > nativeMessageLimit ? messageTail(entry.content) : entry.content;
   const input = boundValue(entry.input, messageHead);
   const output = boundValue(entry.output, messageTail);
   if (content === entry.content && input === entry.input && output === entry.output) return entry;
