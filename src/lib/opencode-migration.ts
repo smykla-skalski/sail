@@ -226,6 +226,16 @@ function migratePostTurnHistory(port: SettingsPort): void {
   });
 }
 
+function migrateImplementationOwners(port: SettingsPort): void {
+  for (const key of port.keys()) {
+    if (key.startsWith('sai-ship-it-owner:')) {
+      const value = port.get(key);
+      if (value !== null && acpThreadId(value) !== value) port.set(key, acpThreadId(value));
+    } else if (key.startsWith('sai-implementation-pending:'))
+      mapArray(port, key, (item) => mapStringField(item, 'owner'));
+  }
+}
+
 /**
  * Runs once per profile and is safe to repeat: it only rewrites `opencode:` references that are
  * still in the native form. A corrupt value is left untouched and does not stop the other steps.
@@ -238,6 +248,7 @@ export function migrateOpenCodeSettings(port: SettingsPort): boolean {
     migrateShipRuns,
     migrateCoordination,
     migratePostTurnHistory,
+    migrateImplementationOwners,
   ];
   for (const step of steps) {
     try {

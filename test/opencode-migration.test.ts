@@ -80,6 +80,12 @@ function legacy(): Record<string, string> {
     'sai-inbox-seen': JSON.stringify({ 'opencode:permission:p1': 1, 'opencode:form:f1': 2 }),
     'sai-inbox-outcomes': JSON.stringify([{ key: 'check:c', sessionId: 'ses_1' }]),
     'sai-worktree-agent': 'opencode',
+    [`sai-ship-it-owner:${dir}`]: thread,
+    [`sai-implementation-pending:${dir}`]: JSON.stringify([
+      { id: 't', before: 'abc', owner: thread },
+      { id: 'u', before: 'def', owner: 'acp:claude:c1' },
+      { id: 'v', before: 'ghi' },
+    ]),
   };
 }
 
@@ -145,6 +151,13 @@ void test('migrates every saved reference to the ACP form', () => {
     'opencode:form:f1': 2,
   });
   assert.equal(port.get('sai-worktree-agent'), 'opencode');
+  assert.equal(port.get(`sai-ship-it-owner:${dir}`), 'acp:opencode:ses_1');
+  assert.deepEqual(
+    JSON.parse(port.get(`sai-implementation-pending:${dir}`)!).map(
+      (turn: { owner?: string }) => turn.owner,
+    ),
+    ['acp:opencode:ses_1', 'acp:claude:c1', undefined],
+  );
   assert.equal(port.get(openCodeMigrationKey), '1');
 });
 

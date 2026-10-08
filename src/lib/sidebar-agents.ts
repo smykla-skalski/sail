@@ -28,13 +28,7 @@ export type SidebarThreadRow = {
 
 export type SidebarSessionSource = {
   session: {
-    list: (input: {
-      directory: string;
-      limit: number;
-      order: 'desc';
-      parentID: null;
-      cursor?: string;
-    }) => Promise<{
+    list: (input: { directory: string; limit: number; order: 'desc'; cursor?: string }) => Promise<{
       data: {
         id: string;
         parentID?: string;
@@ -56,41 +50,31 @@ function recentThreadFirst(left: AgentThread, right: AgentThread): number {
   return right.updated - left.updated;
 }
 
-export async function listSidebarOpenCodeThreads(
+const maxListedPages = 50;
+
+/**
+ * Ids of OpenCode subagent sessions in one directory. OpenCode's ACP session/list returns them as
+ * peers of their parents, so the sidebar drops them until the listing carries a parent marker.
+ */
+export async function listOpenCodeChildSessionIds(
   source: SidebarSessionSource,
   path: string,
   cursor?: string,
   seen = new Set<string>(),
-  threads: AgentThread[] = [],
-  outcomes: Record<string, ThreadStatus> = {},
-): Promise<{ threads: AgentThread[]; outcomes: Record<string, ThreadStatus> }> {
+  children = new Set<string>(),
+): Promise<Set<string>> {
   const page = await source.session.list({
     directory: path,
     limit: 100,
     order: 'desc',
-    parentID: null,
     ...(cursor ? { cursor } : {}),
   });
-  for (const session of page.data) {
-    if (session.location.directory !== path || session.parentID) continue;
-    const thread: AgentThread = {
-      agent: 'opencode',
-      directory: path,
-      sessionId: session.id,
-      title: session.title ?? 'Untitled session',
-      updated: session.time.updated,
-    };
-    threads.push(thread);
-    if (session.outcome)
-      outcomes[threadKey(thread)] = session.outcome === 'succeeded' ? 'done' : session.outcome;
-  }
+  for (const session of page.data) if (session.parentID) children.add(session.id);
   const next = page.cursor.next ?? undefined;
-  if (!next || next === cursor || seen.has(next)) return { threads, outcomes };
+  if (!next || next === cursor || seen.has(next) || seen.size >= maxListedPages) return children;
   seen.add(next);
-  return listSidebarOpenCodeThreads(source, path, next, seen, threads, outcomes);
+  return listOpenCodeChildSessionIds(source, path, next, seen, children);
 }
-
-const maxListedPages = 50;
 
 const trimmedPath = (path: string) => path.replace(/\/+$/, '');
 

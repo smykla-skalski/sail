@@ -420,6 +420,7 @@
   } from './lib/recent-threads';
   import {
     groupSidebarThreads,
+    listOpenCodeChildSessionIds,
     listSidebarAcpThreads,
     recordSidebarOpenCodeOutcome,
     sidebarThreadStatus,
@@ -6609,15 +6610,7 @@
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available))
       return threads;
     const known = new Set(threads.map((thread) => thread.id));
-    const listed = await Promise.all(
-      directories.map((path) =>
-        listSidebarAcpThreads(
-          'opencode',
-          (cursor) => acp.listSessions('opencode', path, cursor, 'explore'),
-          path,
-        ),
-      ),
-    );
+    const listed = await Promise.all(directories.map((path) => listOpenCodeRootThreads(path)));
     return [
       ...threads,
       ...listed
@@ -6655,6 +6648,23 @@
     setSetting('sai-coordination-messages', JSON.stringify(coordinationMessages));
   }
 
+  /** Native spawn and Ship workers run on the OpenCode server until it is removed, so ACP must not prompt them. */
+  async function nativeOpenCodeTarget(target: CoordinationThread): Promise<boolean> {
+    const sessionId = openCodeSessionId(target.id);
+    if (!sessionId || !client) return false;
+    if (
+      spawnReceipts.some(
+        (receipt) =>
+          receipt.provider === 'opencode' &&
+          receipt.targetDirectory === target.directory &&
+          sameThreadId(receipt.targetId, target.id),
+      )
+    )
+      return true;
+    const active = await client.session.active().catch(() => null);
+    return active?.[sessionId]?.type === 'running';
+  }
+
   function queueCoordinationDelivery(target: CoordinationThread, message: CoordinationMessage) {
     const previous = coordinationDeliveries.get(message.target) ?? Promise.resolve();
     const delivery = previous
@@ -6663,11 +6673,13 @@
         if (disposed || coordinationMessages.find((item) => item.id === message.id)?.delivered)
           return;
         const text = coordinationPrompt(message);
-        const thread = [...agentThreads, ...sidebarOpenCodeThreads].find(
-          (item) =>
-            item.directory === target.directory &&
-            target.id === `acp:${item.agent}:${item.sessionId}`,
-        );
+        const thread = (await nativeOpenCodeTarget(target))
+          ? undefined
+          : [...agentThreads, ...sidebarOpenCodeThreads].find(
+              (item) =>
+                item.directory === target.directory &&
+                target.id === `acp:${item.agent}:${item.sessionId}`,
+            );
         if (thread) {
           const info = await acp.connect(thread.agent);
           const agentActivity = (await acp.activity())[thread.agent];
@@ -10444,21 +10456,31 @@
     }
   }
 
+  async function listOpenCodeRootThreads(path: string): Promise<AgentThread[]> {
+    const source = client;
+    const [threads, children] = await Promise.all([
+      listSidebarAcpThreads(
+        'opencode',
+        (cursor) => acp.listSessions('opencode', path, cursor, 'explore'),
+        path,
+      ),
+      source
+        ? listOpenCodeChildSessionIds(source, path).catch(() => new Set<string>())
+        : Promise.resolve(new Set<string>()),
+    ]);
+    return threads.filter((thread) => !children.has(thread.sessionId));
+  }
+
   async function refreshSidebarOpenCodeThreads(paths: string[]): Promise<string | null> {
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available)) return null;
     const generation = ++sidebarInventoryGeneration;
-    const results = await Promise.allSettled(
-      paths.map((path) =>
-        listSidebarAcpThreads(
-          'opencode',
-          (cursor) => acp.listSessions('opencode', path, cursor, 'explore'),
-          path,
-        ),
-      ),
-    );
+    const results = await Promise.allSettled(paths.map((path) => listOpenCodeRootThreads(path)));
     if (generation !== sidebarInventoryGeneration || disposed) return null;
     const failed = new Set(paths.filter((_, index) => results[index]?.status === 'rejected'));
-    const retained = sidebarOpenCodeThreads.filter((thread) => failed.has(thread.directory));
+    const listed = new Set(paths);
+    const retained = sidebarOpenCodeThreads.filter(
+      (thread) => !listed.has(thread.directory) || failed.has(thread.directory),
+    );
     const renamed = new Map(
       agentThreads.filter((thread) => thread.renamed).map((thread) => [threadKey(thread), thread]),
     );
@@ -10477,17 +10499,20 @@
       : null;
   }
 
+  let sidebarInventoryFailure = '';
+
+  function reportSidebarInventoryFailure(failure: string | null) {
+    // The 30 s refresh must not re-raise the same failure over the user's current error.
+    if (failure && failure !== sidebarInventoryFailure) error = failure;
+    sidebarInventoryFailure = failure ?? '';
+  }
+
   function scheduleSidebarInventoryRefresh() {
     clearTimeout(sidebarInventoryTimer);
     sidebarInventoryTimer = setTimeout(() => {
       void refreshSidebarOpenCodeThreads(JSON.parse(sidebarDirectoryKey)).then(
-        (failure) => {
-          if (failure) error = failure;
-          return failure;
-        },
-        (cause: unknown) => {
-          error = describe(cause);
-        },
+        reportSidebarInventoryFailure,
+        (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
     }, 250);
   }
@@ -12373,10 +12398,13 @@
       );
     }
     void tick().then(() => forgetRecentTranscript(thread));
-    sidebarOpenCodeThreads = sidebarOpenCodeThreads.filter(
-      (item) => threadKey(item) !== threadKey(thread),
-    );
-    removeSidebarThread(thread);
+    if (thread.agent === 'opencode') {
+      sidebarOpenCodeThreads = sidebarOpenCodeThreads.filter(
+        (item) => threadKey(item) !== threadKey(thread),
+      );
+      // session/list keeps returning a deleted OpenCode session.
+      removeSidebarThread(thread);
+    }
     void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
   }
 

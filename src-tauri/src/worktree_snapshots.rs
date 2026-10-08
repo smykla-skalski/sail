@@ -129,14 +129,26 @@ fn parse_snapshot(id: String, prefix: &str) -> Option<SnapshotInfo> {
     Some(SnapshotInfo { id, kind, created })
 }
 
+/// Scopes holding a thread's snapshots; OpenCode threads also keep those taken under the native id.
+fn scopes(root: &Path, thread: &str) -> Vec<String> {
+    let mut scopes = vec![prefix(root, thread)];
+    if let Some(session) = thread.strip_prefix("acp:opencode:") {
+        scopes.push(prefix(root, &format!("opencode:{session}")));
+    }
+    scopes
+}
+
 fn list(root: &Path, thread: &str) -> Result<Vec<SnapshotInfo>, String> {
-    let scope = prefix(root, thread);
-    let output = git(root, &["for-each-ref", "--format=%(refname)", &scope], None)?;
-    let mut items = String::from_utf8(output)
-        .map_err(|error| error.to_string())?
-        .lines()
-        .filter_map(|line| parse_snapshot(line.to_string(), &scope))
-        .collect::<Vec<_>>();
+    let mut items = Vec::new();
+    for scope in scopes(root, thread) {
+        let output = git(root, &["for-each-ref", "--format=%(refname)", &scope], None)?;
+        items.extend(
+            String::from_utf8(output)
+                .map_err(|error| error.to_string())?
+                .lines()
+                .filter_map(|line| parse_snapshot(line.to_string(), &scope)),
+        );
+    }
     items.sort_by(|left, right| {
         right
             .created
@@ -376,6 +388,34 @@ pub async fn restore_turn_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_opencode_snapshots_taken_under_the_native_thread_id() {
+        let root =
+            std::env::temp_dir().join(format!("sail-snapshot-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        git(&root, &["init", "--quiet"], None).unwrap();
+        fs::write(root.join("file.txt"), "one").unwrap();
+        let native = snapshot(&root, "opencode:ses_1", "turn").unwrap();
+        let acp = snapshot(&root, "acp:opencode:ses_1", "turn").unwrap();
+        snapshot(&root, "opencode:ses_2", "turn").unwrap();
+
+        let ids = |thread: &str| -> Vec<String> {
+            let mut ids: Vec<_> = list(&root, thread)
+                .unwrap()
+                .into_iter()
+                .map(|item| item.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        let mut both = vec![native.id.clone(), acp.id.clone()];
+        both.sort();
+        assert_eq!(ids("acp:opencode:ses_1"), both);
+        assert_eq!(ids("opencode:ses_1"), vec![native.id]);
+        assert!(ids("acp:claude:ses_1").is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn restores_created_edited_and_deleted_files_without_changing_index() {

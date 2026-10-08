@@ -8,7 +8,7 @@ import {
   groupSidebarThreads,
   openedFailedChildren,
   listSidebarAcpThreads,
-  listSidebarOpenCodeThreads,
+  listOpenCodeChildSessionIds,
   recordSidebarOpenCodeOutcome,
   sidebarThreadRows,
   sidebarThreadStatus,
@@ -359,64 +359,39 @@ await test('OpenCode children nest under their parent', () => {
   );
 });
 
-await test('sidebar inventory follows every OpenCode page and excludes child and foreign sessions', async () => {
+await test('OpenCode child session ids come from every native page', async () => {
   const calls: Array<string | undefined> = [];
+  const pages: Record<string, Awaited<ReturnType<SidebarSessionSource['session']['list']>>> = {
+    first: {
+      data: [
+        { id: 'root', location: { directory: '/repo/a' }, time: { updated: 1 } },
+        { id: 'child', parentID: 'root', location: { directory: '/repo/a' }, time: { updated: 2 } },
+      ],
+      cursor: { next: 'page-2' },
+    },
+    'page-2': {
+      data: [
+        {
+          id: 'grandchild',
+          parentID: 'child',
+          location: { directory: '/repo/a' },
+          time: { updated: 3 },
+        },
+      ],
+      cursor: { next: 'page-2' },
+    },
+  };
   const source: SidebarSessionSource = {
     session: {
-      list: async ({ cursor }: { cursor?: string }) => {
+      list: ({ cursor }) => {
         calls.push(cursor);
-        return cursor
-          ? {
-              data: [
-                {
-                  id: 'second',
-                  title: 'Second agent',
-                  location: { directory: '/repo/a' },
-                  time: { updated: 2 },
-                  outcome: 'failed',
-                },
-                {
-                  id: 'interrupted',
-                  location: { directory: '/repo/a' },
-                  time: { updated: 3 },
-                  outcome: 'interrupted',
-                },
-                {
-                  id: 'foreign',
-                  location: { directory: '/repo/b' },
-                  time: { updated: 3 },
-                },
-              ],
-              cursor: { next: null },
-            }
-          : {
-              data: [
-                {
-                  id: 'first',
-                  location: { directory: '/repo/a' },
-                  time: { updated: 1 },
-                  outcome: 'succeeded',
-                },
-                {
-                  id: 'child',
-                  parentID: 'first',
-                  location: { directory: '/repo/a' },
-                  time: { updated: 2 },
-                },
-              ],
-              cursor: { next: 'page-2' },
-            };
+        return Promise.resolve(pages[cursor ?? 'first']);
       },
     },
   };
-  const result = await listSidebarOpenCodeThreads(source, '/repo/a');
+  const children = await listOpenCodeChildSessionIds(source, '/repo/a');
   assert.deepEqual(calls, [undefined, 'page-2']);
-  assert.deepEqual(
-    result.threads.map((thread) => thread.sessionId),
-    ['first', 'second', 'interrupted'],
-  );
-  assert.equal(result.threads[0].title, 'Untitled session');
-  assert.deepEqual(Object.values(result.outcomes), ['done', 'failed', 'interrupted']);
+  assert.deepEqual([...children].toSorted(), ['child', 'grandchild']);
 });
 
 const parentThread = {
