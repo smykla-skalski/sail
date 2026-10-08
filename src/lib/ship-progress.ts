@@ -1571,27 +1571,46 @@ const shipRunSchema = z.object({
   unarchivedAt: z.number().int().nonnegative().optional(),
 });
 
-export function loadShipRuns(raw: string | null): ShipRun[] {
+/** Runs Sail can use, plus stored entries it cannot parse and must write back unchanged. */
+export type ShipRunStore = { runs: ShipRun[]; unparsed: unknown[] };
+
+export function loadShipRunStore(raw: string | null): ShipRunStore {
+  let value: unknown;
   try {
-    const value: unknown = JSON.parse(raw ?? '[]');
-    if (!Array.isArray(value)) return [];
-    return value.flatMap((item) => {
-      const parsed = shipRunSchema.safeParse(item);
-      if (!parsed.success) return [];
-      for (const issue of parsed.data.issues)
-        issue.contextHandoffs = issue.contextHandoffs?.map((handoff) =>
-          handoff.outcome === 'pending' &&
-          !handoff.toThreadId &&
-          handoff.fromThreadId !== issue.threadId
-            ? Object.assign({}, handoff, {
-                outcome: 'failed' as const,
-                error: 'Retired stale handoff offer during recovery.',
-              })
-            : handoff,
-        );
-      return [parsed.data];
-    });
+    value = JSON.parse(raw ?? '[]');
   } catch {
-    return [];
+    return { runs: [], unparsed: raw?.trim() ? [raw] : [] };
   }
+  if (!Array.isArray(value)) return { runs: [], unparsed: value == null ? [] : [value] };
+  const runs: ShipRun[] = [];
+  const unparsed: unknown[] = [];
+  for (const item of value) {
+    const parsed = shipRunSchema.safeParse(item);
+    if (!parsed.success) {
+      unparsed.push(item);
+      continue;
+    }
+    for (const issue of parsed.data.issues)
+      issue.contextHandoffs = issue.contextHandoffs?.map((handoff) =>
+        handoff.outcome === 'pending' &&
+        !handoff.toThreadId &&
+        handoff.fromThreadId !== issue.threadId
+          ? Object.assign({}, handoff, {
+              outcome: 'failed' as const,
+              error: 'Retired stale handoff offer during recovery.',
+            })
+          : handoff,
+      );
+    runs.push(parsed.data);
+  }
+  return { runs, unparsed };
+}
+
+export function loadShipRuns(raw: string | null): ShipRun[] {
+  return loadShipRunStore(raw).runs;
+}
+
+/** Serializes runs for storage, keeping entries an older or newer Sail wrote that this one cannot parse. */
+export function serializeShipRuns(runs: ShipRun[], unparsed: readonly unknown[]): string {
+  return JSON.stringify([...runs, ...unparsed]);
 }
