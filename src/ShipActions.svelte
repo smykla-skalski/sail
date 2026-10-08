@@ -95,6 +95,7 @@
     border: 1px solid var(--shell-divider);
     border-radius: 6px;
     padding: 5px 10px;
+    white-space: nowrap;
     cursor: pointer;
   }
   button:disabled {

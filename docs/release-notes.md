@@ -14,6 +14,14 @@ There is no automatic updater. To update, download the next package for your pla
 - The Inbox groups items by repository. You can dismiss a Ship or subagent item until its next state change, or snooze it for an hour or until tomorrow at 08:00. Items clear when their state resolves.
 - Cmd+J (Ctrl+J elsewhere) goes to the next item needing attention. Cmd+Shift+J still opens the side chat.
 
+## Ship queue, archive and actions
+
+- **Ship queue** (More actions, Ship queue) lists the issues of every run in one full-width table. Issues that need you come first, merged and closed issues stay hidden until you show them, and a Run filter narrows the table to one run. The header shows worker usage against the run limits; a ship-it coordinator itself starts at most 3 workers and keeps a slot free for gates.
+- Direct `/ship-it` runs now show the real issue title instead of "Issue #N".
+- **Archive.** A run archives after all its issues are merged or closed, its claims are released and its checkpoints are complete. Choose Off, Immediately, 1 day (default) or 7 days under Settings, Ship archive. Archiving only hides the run: checkpoints, evidence, branches and worktrees stay, so a repository's branch cleanup policy is unaffected. The Archived filter in the queue and the Ship panel lists archived runs, and Unarchive brings one back and keeps it out of auto-archive. On upgrade Sail archives the runs that already qualify and shows "N runs archived · Show".
+- **Actions** ask for confirmation and name their target. **Merge** follows the repository's release policy (`.sai/ship-it-release.json` or its instructions): a bot comment such as `squash`, or a GitHub merge pinned to the head SHA. It refuses when the pull request head differs from the checkpoint revision or the evidence is not ready, and it never uses an admin override. **Retry** restarts a failed issue from its checkpoint with a fresh worker. **Stop run** stops unfinished issues and releases their claims as cancelled. **Archive** and **Unarchive** apply to a whole run.
+- Task checkpoints accept `cancelled` and `failed` statuses, matching the ship-it checkpoint contract.
+
 ## Subagent navigation and control
 
 - A subagent's breadcrumb shows its parent thread, with **Parent** and previous/next sibling buttons. The keys are Cmd+[ (Ctrl+[ elsewhere) for the parent and Cmd+Shift+[ and Cmd+Shift+] for the previous and next sibling. Cmd+Alt+Arrows still moves pane focus.

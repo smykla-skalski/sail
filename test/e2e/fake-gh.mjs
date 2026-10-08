@@ -30,6 +30,29 @@ const fixture = state();
 if (fixture.pulls) {
   if (args[0] === 'repo' && args[1] === 'view')
     answer({ nameWithOwner: fixture.repository ?? 'fixture/repo', isFork: false });
+  if (args[0] === 'pr' && args[1] === 'list') {
+    const wanted = args[args.indexOf('--head') + 1] ?? '';
+    answer(
+      Object.entries(fixture.pulls)
+        .filter(([, found]) => wanted.endsWith(`:${found.branch}`) || wanted === found.branch)
+        .map(([key, found]) => ({
+          number: Number(key.split('#')[1]),
+          url: `https://github.com/${key.replace('#', '/pull/')}`,
+          state: 'OPEN',
+          mergedAt: null,
+          headRefOid: found.head,
+          statusCheckRollup: [],
+        })),
+    );
+  }
+  if (
+    args[0] === 'api' &&
+    /^repos\/[^/]+\/[^/]+\/issues\/\d+$/.test(endpoint) &&
+    args.includes('--jq')
+  ) {
+    const filter = args[args.indexOf('--jq') + 1];
+    answer(filter === '.title' ? 'Fixture issue' : 'open');
+  }
   if (args[0] === 'api' && method === 'GET' && pull) {
     const found = fixture.pulls[`${pull[1]}#${pull[2]}`];
     if (!found) {
@@ -40,7 +63,9 @@ if (fixture.pulls) {
       state: found.state,
       merged: found.merged,
       draft: found.draft,
-      head: { sha: found.head },
+      mergeable: true,
+      head: { sha: found.head, ref: found.branch, repo: { full_name: pull[1] } },
+      base: { ref: 'main', repo: { full_name: pull[1] } },
     });
   }
   if (args[0] === 'api' && method === 'POST' && /\/issues\/\d+\/comments$/.test(endpoint)) {

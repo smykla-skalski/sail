@@ -36,6 +36,13 @@ const calls = (): { method: string; endpoint: string; fields: string[] }[] => {
   }
 };
 
+const selectRun = (value: string) =>
+  browser.execute((next) => {
+    const select = document.querySelector<HTMLSelectElement>('.queue-filters select')!;
+    select.value = next;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  }, value);
+
 const row = (id: string) => $(`.ship-queue tr[data-ship-issue-id="${id}"]`);
 
 const confirm = async (title: RegExp) => {
@@ -58,11 +65,19 @@ function readyIssue(id: string, number: number, pullRequest: number): ShipIssue 
   const issue = JSON.parse(
     JSON.stringify({ ...evidence, id, number }).replaceAll('revision-one', head),
   );
+  issue.checkpoint.revision = head;
   return Object.assign(issue, {
     url: `https://github.com/fixture/repo/issues/${number}`,
     title: `Ready fixture ${number}`,
     branch: id,
     path: null,
+    shippingTarget: {
+      repository: 'fixture/repo',
+      remote: 'origin',
+      baseBranch: 'main',
+      baseRef: 'refs/heads/main',
+      baseRevision: head,
+    },
     state: 'awaiting_merge',
     stage: 'awaiting_merge',
     pullRequest: `https://github.com/fixture/repo/pull/${pullRequest}`,
@@ -129,6 +144,16 @@ describe('Ship queue, archive and actions', () => {
 
   before(async () => {
     execFileSync('git', ['init', '-q', repository]);
+    execFileSync('git', [
+      '-C',
+      repository,
+      'remote',
+      'add',
+      'origin',
+      'https://github.com/fixture/repo.git',
+    ]);
+    for (const branch of ['ready', 'moved'])
+      execFileSync('git', ['-C', repository, 'config', `branch.${branch}.remote`, 'origin']);
     writeFileSync(
       join(repository, 'AGENTS.md'),
       'Merge by posting a PR comment with exact body `squash`; the bot merges.\n',
@@ -138,8 +163,8 @@ describe('Ship queue, archive and actions', () => {
       JSON.stringify({
         repository: 'fixture/repo',
         pulls: {
-          'fixture/repo#7': { state: 'open', merged: false, draft: false, head },
-          'fixture/repo#8': { state: 'open', merged: false, draft: false, head: moved },
+          'fixture/repo#7': { state: 'open', merged: false, draft: false, head, branch: 'ready' },
+          'fixture/repo#8': { state: 'open', merged: false, draft: false, head, branch: 'moved' },
         },
       }),
     );
@@ -258,7 +283,7 @@ describe('Ship queue, archive and actions', () => {
     expect(finished.issues).toHaveLength(2);
     expect(finished.issues[0].checkpoint?.status).toBe('completed');
     await expect($('.ship-queue')).not.toHaveText(expect.stringContaining('Old issue 1'));
-    await $('[data-ship-archive-notice] button=Show').click();
+    await $('[data-ship-archive-notice]').$('button=Show').click();
     await expect($('.ship-queue')).toHaveText(expect.stringContaining('Old issue 1'));
     await expect($('[data-ship-archive-notice]')).not.toExist();
   });
@@ -266,7 +291,7 @@ describe('Ship queue, archive and actions', () => {
   it('unarchive returns the run to the list and keeps it there', async () => {
     await $('.ship-queue [data-ship-action="unarchive"]').click();
     await expect($('[data-ship-result]')).toHaveText(expect.stringContaining('Run restored'));
-    await $('.queue-filters button*=Active').click();
+    await $('.queue-filters').$('button*=Active').click();
     await $('.queue-check input').click();
     await expect(row('old-0')).toBeDisplayed();
     await browser.pause(1500);
@@ -285,9 +310,9 @@ describe('Ship queue, archive and actions', () => {
     expect(ids).not.toContain('old-0');
     expect(ids.indexOf('failed')).toBeLessThan(ids.indexOf('queued'));
     await expect($('[data-testid="ship-pool"]')).toHaveText(expect.stringContaining('workers'));
-    await $('.queue-filters select').selectByVisibleText('Stoppable fixture · fixture/repo');
+    await selectRun('stoppable-run');
     await expect($$('.ship-queue tbody tr')).toBeElementsArrayOfSize(2);
-    await $('.queue-filters select').selectByIndex(0);
+    await selectRun('');
     await setTheme('light');
     await capture('ship-queue-light');
     await setTheme('dark');
@@ -311,6 +336,9 @@ describe('Ship queue, archive and actions', () => {
   });
 
   it('merge refuses when the pull request head moved past the checkpoint revision', async () => {
+    const fixtureState = JSON.parse(readFileSync(join(fakeGh, 'state.json'), 'utf8'));
+    fixtureState.pulls['fixture/repo#8'].head = moved;
+    writeFileSync(join(fakeGh, 'state.json'), JSON.stringify(fixtureState));
     await row('moved').$('[data-ship-action="merge"]').click();
     await confirm(/Merge #14 Ready fixture 14\?/);
     await expect($('[data-ship-result]')).toHaveText(
@@ -348,7 +376,7 @@ describe('Ship queue, archive and actions', () => {
   });
 
   it('stop run cancels every unfinished issue, then archive hides the run', async () => {
-    await $('.queue-filters select').selectByVisibleText('Stoppable fixture · fixture/repo');
+    await selectRun('stoppable-run');
     await expect($('.queue-run-actions [data-ship-action="archive"]')).toBeDisabled();
     await $('.queue-run-actions [data-ship-action="stop"]').click();
     const dialog = $('.confirmation-dialog');
@@ -370,7 +398,7 @@ describe('Ship queue, archive and actions', () => {
     expect((await storedRuns()).find((item) => item.id === 'stoppable-run')?.archivedBy).toBe(
       'user',
     );
-    await $('.queue-filters button*=Archived').click();
+    await $('.queue-filters').$('button*=Archived').click();
     await expect(row('stop-a')).toBeDisplayed();
     await $('.ship-queue tbody [data-ship-action="unarchive"]').click();
     await expect($('[data-ship-result]')).toHaveText(expect.stringContaining('Run restored'));
@@ -384,9 +412,13 @@ describe('Ship queue, archive and actions', () => {
       ),
     );
     await expect($('.ship-panel')).toBeDisplayed();
-    await $('.ship-scope button*=Archived').click();
-    await expect($('.ship-panel')).toHaveText(expect.stringContaining('No archived runs'));
-    await $('.ship-scope button*=Active').click();
-    await expect($('.ship-panel [data-ship-action="stop"]')).toBeDisplayed();
+    await $('.ship-scope').$('button*=All repositories').click();
+    await $('.ship-run-option*=Stoppable fixture').click();
+    await $('.ship-summary [data-ship-action="archive"]').click();
+    await confirm(/Archive Stoppable fixture\?/);
+    await $('[aria-label="Run state"]').$('button*=Archived').click();
+    await expect($('.ship-summary')).toHaveText(expect.stringContaining('Stoppable fixture'));
+    await $('.ship-summary [data-ship-action="unarchive"]').click();
+    await expect($('[data-ship-result]')).toHaveText(expect.stringContaining('Run restored'));
   });
 });

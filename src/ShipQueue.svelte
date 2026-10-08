@@ -179,9 +179,11 @@
                   rel="noreferrer">Open PR</a
                 >{:else}<small>None</small>{/if}</td
             >
-            <td class="queue-actions"
-              ><ShipActions run={row.run} issue={row.issue} {onaction} onresult={result} /></td
-            >
+            <td>
+              <div class="queue-action-list">
+                <ShipActions run={row.run} issue={row.issue} {onaction} onresult={result} />
+              </div>
+            </td>
           </tr>
         {/each}
       </tbody>
@@ -300,7 +302,7 @@
   .queue-line[data-kind='blocker'] {
     color: var(--sui-danger);
   }
-  .queue-actions {
+  .queue-action-list {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;

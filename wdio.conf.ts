@@ -16,7 +16,7 @@ process.env.SAIL_E2E_OPEN_URL_LOG = attach
 process.env.SAIL_ACP_TEST_AGENT = resolve('test/e2e/acp-agent.mjs');
 
 const fakeGhDirectory = join(state, 'fake-gh');
-if (!attach && process.platform !== 'win32') {
+if (!attach && process.platform !== 'win32' && !process.env.SAIL_E2E_FAKE_GH_DIR) {
   mkdirSync(join(state, 'bin'), { recursive: true });
   mkdirSync(fakeGhDirectory, { recursive: true });
   const shim = join(state, 'bin', 'gh');
