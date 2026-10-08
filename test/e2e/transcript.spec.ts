@@ -34,7 +34,7 @@ describe('shared transcript view', () => {
     await expect(card).not.toHaveText(expect.stringContaining('Always'));
     await expect($('.agent-tool-group, .agent-tool-current')).toBeDisplayed();
     await $('.permission-card .permission-link').click();
-    await $('.permission-card button=Allow once').click();
+    await $('.permission-card .permission-actions button').click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Done: Do a small thing'),
     );

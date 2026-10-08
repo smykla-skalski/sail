@@ -71,9 +71,6 @@
   {#if files.length}<ul class="permission-files">
       {#each files as file, index (`${file}:${index}`)}<li><code>{file}</code></li>{/each}
     </ul>{/if}
-  {#if toolCallId}<button type="button" class="permission-link" onclick={showAction}
-      >Show action</button
-    >{/if}
   {#if children}{@render children()}{/if}
   <div class="permission-actions">
     {#each choices as choice (choice.id)}
@@ -85,6 +82,9 @@
       >
     {/each}
   </div>
+  {#if toolCallId}<button type="button" class="permission-link" onclick={showAction}
+      >Show action</button
+    >{/if}
 </div>
 
 <style>
