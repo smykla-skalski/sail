@@ -330,6 +330,7 @@
     handoffPromptNeedsRecovery,
     loadSpawnReceipts,
     openCodePromptHasBackendEvidence,
+    openCodePromptHasHistoryEvidence,
     receiptForSource,
     receiptNeedsRefresh,
     receiptIsSettled,
@@ -4012,14 +4013,25 @@
     const sessionId = receipt.targetId.slice('opencode:'.length);
     activeSpawnRequests.add(receipt.receiptId);
     try {
-      const [session, page, inbox] = await Promise.all([
+      const [session, inbox, active] = await Promise.all([
         source.session.get({ sessionID: sessionId }),
-        source.message.list({ sessionID: sessionId, limit: 50, order: 'desc' }),
         source.session.inbox.list({ sessionID: sessionId }),
+        source.session.active(),
       ]);
       if (session.location.directory !== receipt.targetDirectory)
         throw new Error('Target session moved to another worktree.');
-      if (openCodePromptHasBackendEvidence(receipt, page.data, inbox)) return;
+      if (
+        active[sessionId]?.type === 'running' ||
+        session.outcome ||
+        (await openCodePromptHasHistoryEvidence(receipt, inbox, (cursor) =>
+          source.message.list({
+            sessionID: sessionId,
+            limit: 50,
+            ...(cursor ? { cursor } : { order: 'desc' }),
+          }),
+        ))
+      )
+        return;
       const turnId = receipt.turnId ?? crypto.randomUUID();
       if (!receipt.turnId) {
         updateSpawnReceipt(receipt.receiptId, { turnId });

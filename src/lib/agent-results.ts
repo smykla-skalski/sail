@@ -290,6 +290,27 @@ export function openCodePromptHasBackendEvidence(
   );
 }
 
+export async function openCodePromptHasHistoryEvidence(
+  receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
+  inbox: Array<{ id: string }>,
+  loadPage: (cursor?: string) => Promise<{
+    data: Array<{ type: string; text?: string }>;
+    cursor: { next?: string | null };
+  }>,
+): Promise<boolean> {
+  const seen = new Set<string>();
+  async function search(cursor?: string): Promise<boolean> {
+    const page = await loadPage(cursor);
+    if (openCodePromptHasBackendEvidence(receipt, page.data, inbox)) return true;
+    const next = page.cursor.next ?? undefined;
+    if (!next) return false;
+    if (seen.has(next)) throw new Error('OpenCode message history cursor did not advance.');
+    seen.add(next);
+    return search(next);
+  }
+  return search();
+}
+
 export function acpTurnEvidenceState(evidence: AcpTurnEvidence | null): SpawnState | null {
   if (!evidence) return null;
   if (evidence.status === 'done') return 'completed';

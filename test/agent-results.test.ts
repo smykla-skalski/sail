@@ -16,6 +16,7 @@ import {
   isSubagentThread,
   loadSpawnReceipts,
   openCodePromptHasBackendEvidence,
+  openCodePromptHasHistoryEvidence,
   receiptForSource,
   receiptNeedsRefresh,
   receiptIsSettled,
@@ -470,6 +471,33 @@ await test('OpenCode handoff dispatch ignores unrelated session activity', () =>
     true,
   );
   assert.equal(openCodePromptHasBackendEvidence(handoff, [], [{ id: 'handoff-turn' }]), true);
+});
+
+await test('OpenCode handoff recovery finds a durable prompt beyond the newest 50 messages', async () => {
+  const handoff = {
+    prompt: 'Continue from the canonical checkpoint',
+    turnId: 'handoff-turn',
+  };
+  const newerMessages = Array.from({ length: 50 }, (_, index) => ({
+    type: 'assistant',
+    text: `Newer message ${index}`,
+  }));
+  const pages = new Map([
+    [undefined, { data: newerMessages, cursor: { next: 'older' } }],
+    [
+      'older',
+      {
+        data: [{ type: 'user', text: 'Continue from the canonical checkpoint' }],
+        cursor: { next: null },
+      },
+    ],
+  ]);
+
+  const dispatched = await openCodePromptHasHistoryEvidence(handoff, [], async (cursor) =>
+    pages.get(cursor)!,
+  );
+
+  assert.equal(dispatched, true);
 });
 
 await test('owned handoff prompts recover across every unsettled restart window', () => {
