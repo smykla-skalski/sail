@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  paletteActions,
   searchCommandPalette,
   type PaletteOpenCodeSession,
   type PaletteSearch,
@@ -9,6 +10,7 @@ import {
 import type { AgentAvailability, AgentThread } from '../src/lib/acp.ts';
 import type { ProjectCatalog } from '../src/lib/projects.ts';
 import { loadSavedCommands } from '../src/lib/saved-commands.ts';
+import { shortcutFor } from '../src/lib/shortcuts.ts';
 
 const catalog: ProjectCatalog = {
   repositories: ['/work/alpha', '/other/alpha', '/work/bravo'],
@@ -203,4 +205,95 @@ void test('saved commands remain searchable at the root only', () => {
       (entry) => entry.kind === 'command',
     ),
   );
+});
+
+void test('root search offers app actions with their shortcut hints', () => {
+  const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
+  const entries = search({ kind: 'projects' }, '', { actions }).filter(
+    (entry) => entry.kind === 'action',
+  );
+
+  assert.deepEqual(
+    entries.map((entry) => entry.actionId),
+    actions.map((action) => action.id),
+  );
+  assert.equal(entries.find((entry) => entry.actionId === 'chat.side')?.shortcut, 'chat.side');
+  assert.equal(
+    entries.find((entry) => entry.actionId === 'changes.toggle')?.shortcut,
+    'details.toggle',
+  );
+  assert.equal(entries.find((entry) => entry.actionId === 'inbox.open')?.shortcut, undefined);
+  for (const entry of entries)
+    if (entry.shortcut) assert.equal(entry.label, shortcutFor(entry.shortcut).label);
+});
+
+void test('action entries are searchable by label', () => {
+  const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
+
+  assert.equal(search({ kind: 'projects' }, 'split pane', { actions })[0]?.actionId, 'pane.split');
+  assert.equal(
+    search({ kind: 'projects' }, 'next attention', { actions })[0]?.actionId,
+    'attention.next',
+  );
+  assert.equal(search({ kind: 'projects' }, 'inbox', { actions })[0]?.actionId, 'inbox.open');
+  assert.equal(
+    search({ kind: 'projects' }, 'shortcuts', { actions })[0]?.actionId,
+    'shortcuts.help',
+  );
+  assert.equal(search({ kind: 'projects' }, 'zzzz', { actions }).length, 0);
+});
+
+const byId = (context: Parameters<typeof paletteActions>[0]) =>
+  new Map(paletteActions(context).map((action) => [action.id, action]));
+
+void test('action entries follow the theme, overview and project state', () => {
+  assert.equal(
+    byId({ dark: false, overview: false, hasDirectory: true }).get('theme.toggle')?.label,
+    'Switch to dark theme',
+  );
+  assert.equal(
+    byId({ dark: true, overview: true, hasDirectory: true }).get('theme.toggle')?.label,
+    'Switch to light theme',
+  );
+  assert.equal(
+    byId({ dark: true, overview: true, hasDirectory: true }).get('overview.toggle')?.label,
+    'Back to workspace',
+  );
+  const noProject = byId({ dark: false, overview: false, hasDirectory: false });
+  assert.equal(noProject.get('pane.split')?.disabled, true);
+  assert.equal(noProject.get('settings.open')?.disabled, false);
+  const entries = search({ kind: 'projects' }, 'split', { actions: [...noProject.values()] });
+  assert.equal(entries.find((entry) => entry.actionId === 'pane.split')?.disabled, true);
+});
+
+void test('worktree, agent and session steps show no app actions', () => {
+  const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
+  for (const step of [
+    { kind: 'worktrees', repository: '/work/alpha' },
+    { kind: 'agents', repository: '/work/alpha', directory: '/work/alpha' },
+    {
+      kind: 'sessions',
+      repository: '/work/alpha',
+      directory: '/work/alpha-feature',
+      agent: 'claude',
+    },
+  ] as PaletteStep[])
+    assert.equal(search(step, '', { actions }).filter((e) => e.kind === 'action').length, 0);
+});
+
+void test('an exact thread title outranks actions whose detail mentions it', () => {
+  const actions = paletteActions({ dark: false, overview: false, hasDirectory: true });
+  const first = search({ kind: 'projects' }, 'Newest', { actions })[0];
+  assert.equal(first?.thread?.sessionId, 'new');
+  assert.equal(search({ kind: 'projects' }, 'thread', { actions })[0]?.kind !== 'action', true);
+});
+
+void test('a query that only matches a disabled action activates no other action', () => {
+  const actions = paletteActions({ dark: false, overview: false, hasDirectory: false });
+  const entries = search({ kind: 'projects' }, 'side chat', { actions });
+  assert.deepEqual(
+    entries.map((entry) => entry.actionId),
+    ['chat.side'],
+  );
+  assert.equal(entries[0]?.disabled, true);
 });

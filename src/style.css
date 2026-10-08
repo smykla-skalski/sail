@@ -58,6 +58,12 @@
   border-radius: 999px;
   background: transparent;
 }
+*:hover {
+  scrollbar-color: color-mix(in srgb, var(--sui-muted) 55%, transparent) transparent;
+}
+*:hover::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--sui-muted) 55%, transparent);
+}
 *.sail-scrollbar-active {
   scrollbar-color: color-mix(in srgb, var(--sui-muted) 55%, transparent) transparent;
 }
@@ -368,9 +374,20 @@ button:disabled {
 .project-agent-list[hidden] {
   display: none;
 }
+.project-agent-line {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.project-agent-menu {
+  flex-basis: 24px;
+  min-height: 24px;
+}
 .project-agent-row {
   display: grid;
+  flex: 1;
   grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
   width: 100%;
   min-height: 32px;
   gap: 1px 5px;
@@ -1081,6 +1098,9 @@ button:disabled {
   min-width: 0;
   min-height: 0;
 }
+.workspace-pane-host[hidden] {
+  display: none;
+}
 .ship-fallback {
   display: flex;
   flex-direction: column;
@@ -1501,7 +1521,10 @@ button:disabled {
   flex: 1;
   min-height: 0;
 }
-.native-details .side-tabs button:last-child {
+.side-tabs-list {
+  display: contents;
+}
+.native-details .side-tabs .side-tabs-close {
   margin-left: auto;
 }
 .terminal-pane {
@@ -2723,6 +2746,53 @@ button:disabled {
 }
 .palette-error {
   color: var(--sui-danger);
+}
+.shortcuts-list {
+  display: grid;
+  gap: 2px;
+  margin: 12px 0 0;
+}
+.shortcuts-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--shell-divider);
+}
+.shortcuts-row dt {
+  min-width: 0;
+}
+.shortcuts-row dd {
+  margin: 0;
+}
+.shortcuts-row kbd {
+  color: var(--shell-muted);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.copy-status {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 50;
+  pointer-events: none;
+}
+.copy-status span {
+  display: inline-block;
+  padding: 6px 12px;
+  border: 1px solid var(--shell-divider);
+  border-radius: 999px;
+  color: var(--shell-selected-ink);
+  background: var(--shell-selected);
+  font-size: 12px;
+  font-weight: 600;
+}
+.composer-send-hint {
+  margin: 4px 16px 0;
+  color: var(--shell-muted);
+  font-size: 12px;
 }
 .commands-dialog {
   width: min(520px, calc(100vw - 32px));

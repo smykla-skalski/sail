@@ -324,9 +324,9 @@ describe('shared attention items', () => {
     await browser.refresh();
     await expect($('.app-shell')).toBeDisplayed();
 
-    await expect($('[aria-label="Pending requests"]')).toHaveText('Inbox (2)');
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (2)');
     await expect($('.agent-status-bar')).toHaveText(expect.stringContaining('2 need attention'));
-    await $('[aria-label="Pending requests"]').click();
+    await $('[data-topbar-inbox]').click();
     await expect($('.inbox-header span')).toHaveText('2');
     await expect($$('.inbox-attention')).toBeElementsArrayOfSize(2);
     await expect($('.inbox-group-heading')).toHaveText(path.split('/').at(-1)!);
@@ -358,9 +358,9 @@ describe('shared attention items', () => {
     );
     await browser.waitUntil(async () => (await focusedIssue()) === 'second');
 
-    await $('[aria-label="Pending requests"]').click();
+    await $('[data-topbar-inbox]').click();
     await $('.inbox-attention').$('button=Dismiss').click();
-    await expect($('[aria-label="Pending requests"]')).toHaveText('Inbox (1)');
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (1)');
     await expect($('.agent-status-bar')).toHaveText(expect.stringContaining('1 need attention'));
   });
 });

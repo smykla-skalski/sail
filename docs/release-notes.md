@@ -6,6 +6,17 @@ OpenCode v2.0.24 is a separate prerequisite; it is not bundled. Install the test
 
 There is no automatic updater. To update, download the next package for your platform and install it over the previous version after quitting the app. Verify the new manifest and run the first-project checks again.
 
+## Keyboard, shortcuts and screen readers
+
+- The command palette also runs app actions: split, terminal, side chat, Inbox, next attention item, task overview, Ship runs, Changes, settings, theme and the shortcut sheet. Each shows its shortcut when it has one. A **⌘K** button in the top bar opens the palette.
+- Cmd+/ (Ctrl+/ elsewhere) opens a sheet that lists every keyboard shortcut.
+- The composer shows "Enter to send · ⇧Enter newline" again.
+- Every sidebar thread row has a **⋯** button, so its menu opens from the keyboard.
+- **Select-to-copy stays on by default.** Settings > General > Clipboard turns it off. When it is on, each copy shows and announces "Copied".
+- Detail tabs are announced as tabs with the selected one marked. The Inbox button's accessible name now matches its label, "Inbox (N)". The command palette is a combobox with a list of options.
+- Failed tool cards no longer re-announce old errors when a thread loads; only errors that arrive while you watch interrupt a screen reader.
+- Scrollbars appear when you hover a scrollable area, not only while it scrolls.
+
 ## Attention and notifications
 
 - **Notification default changed.** OS notifications now default to "Only when Sail is in the background". Before, Sail notified whenever the thread was not the one on screen, even while you were using Sail. Choose Never, Only when Sail is in the background, or Always for each type (Needs your input, Turn completed, Ship updates) in Settings. Existing profiles move to the new default, except one that had OS notifications switched off: it keeps Never for every type.

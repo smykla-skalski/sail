@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   ariaKeyShortcutsFor,
+  detectShortcutPlatform,
   matches,
   shortcutFor,
   shortcutForEvent,
@@ -69,4 +70,28 @@ void test('labels and aria-keyshortcuts come from the registry', () => {
   assert.equal(ariaKeyShortcutsFor('chat.side'), 'Meta+Shift+J');
   assert.equal(shortcutFor('attention.next').label, 'Go to next item needing attention');
   assert.equal(new Set(shortcuts.map((shortcut) => shortcut.id)).size, shortcuts.length);
+});
+
+void test('Command slash opens the shortcut sheet with either modifier and any Shift state', () => {
+  assert.equal(shortcutForEvent(key('/', { metaKey: true }))?.id, 'shortcuts.help');
+  assert.equal(shortcutForEvent(key('/', { ctrlKey: true }))?.id, 'shortcuts.help');
+  assert.equal(shortcutForEvent(key('/', { metaKey: true, shiftKey: true }))?.id, 'shortcuts.help');
+  assert.equal(shortcutForEvent(key('/')), undefined);
+  assert.equal(shortcutLabel(shortcutFor('shortcuts.help'), 'mac'), '⌘/');
+  assert.equal(shortcutLabel(shortcutFor('shortcuts.help'), 'other'), 'Ctrl+/');
+});
+
+void test('every registry entry has a label and a sheet label on each platform', () => {
+  for (const shortcut of shortcuts) {
+    assert.ok(shortcut.label.length > 0, shortcut.id);
+    assert.ok(shortcutLabel(shortcut, 'mac').length > 1, shortcut.id);
+    assert.ok(shortcutLabel(shortcut, 'other').length > 1, shortcut.id);
+  }
+});
+
+void test('platform detection reads the platform string, then the user agent', () => {
+  assert.equal(detectShortcutPlatform({ platform: 'MacIntel', userAgent: '' }), 'mac');
+  assert.equal(detectShortcutPlatform({ platform: 'Win32', userAgent: 'Mozilla Mac' }), 'other');
+  assert.equal(detectShortcutPlatform({ platform: '', userAgent: 'X11; Linux' }), 'other');
+  assert.equal(detectShortcutPlatform({ platform: '', userAgent: 'Macintosh' }), 'mac');
 });

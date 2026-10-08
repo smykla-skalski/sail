@@ -33,6 +33,7 @@
     conversationTitle,
     inboxCount,
     oninbox,
+    onpalette,
     directory,
     agents,
     onopenagent,
@@ -72,6 +73,7 @@
     conversationTitle: string;
     inboxCount: number;
     oninbox: () => void;
+    onpalette: () => void;
     directory: string;
     agents: AgentAvailability[];
     onopenagent: (agent: AgentId) => void;
@@ -101,6 +103,7 @@
   const platform = /Mac|iPhone|iPad/.test(globalThis.navigator?.platform ?? '') ? 'mac' : 'other';
   const keyLabel = (id: 'subagent.parent' | 'subagent.previous' | 'subagent.next') =>
     shortcutLabel(shortcutFor(id), platform);
+  const paletteShortcut = shortcutLabel(shortcutFor('palette.open'), platform);
 
   const threadLabel = $derived(
     [
@@ -184,7 +187,17 @@
       <Button
         variant="ghost"
         size="sm"
-        aria-label="Pending requests"
+        class="topbar-palette"
+        aria-label={`Command palette ${paletteShortcut}`}
+        aria-keyshortcuts={ariaKeyShortcutsFor('palette.open')}
+        title={`Open command palette (${paletteShortcut})`}
+        onclick={onpalette}>{paletteShortcut}</Button
+      >
+      <Button
+        variant="ghost"
+        size="sm"
+        data-topbar-inbox
+        title="Pending requests and items needing attention"
         aria-keyshortcuts={ariaKeyShortcutsFor('attention.next')}
         onclick={oninbox}>Inbox ({inboxCount})</Button
       >
