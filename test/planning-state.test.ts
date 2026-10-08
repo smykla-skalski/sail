@@ -3,7 +3,9 @@ import test from 'node:test';
 import {
   forgetPlanningState,
   loadNativePlan,
+  loadStructuredQuestions,
   saveNativePlan,
+  saveStructuredQuestions,
   type PlanningStateScope,
 } from '../src/lib/planning-state.ts';
 
@@ -65,4 +67,30 @@ await test('forgetting a session does not clear another session', () => {
   assert.equal(loadNativePlan(parent), null);
   assert.equal(loadNativePlan(sibling)?.markdown, '# Retained');
   forgetPlanningState(sibling);
+});
+
+await test('structured questions are replayed only for their session', () => {
+  const child = { ...parent, sessionId: 'child' };
+  saveStructuredQuestions(parent, [
+    { id: 'request-1', sessionId: parent.sessionId, message: 'Parent?', schema: {} },
+  ]);
+  saveStructuredQuestions(child, [
+    { id: 'request-2', sessionId: child.sessionId, message: 'Child?', schema: {} },
+  ]);
+
+  assert.deepEqual(
+    loadStructuredQuestions(parent).map((item) => item.message),
+    ['Parent?'],
+  );
+  assert.deepEqual(
+    loadStructuredQuestions(child).map((item) => item.message),
+    ['Child?'],
+  );
+  saveStructuredQuestions(parent, []);
+  assert.deepEqual(loadStructuredQuestions(parent), []);
+  assert.deepEqual(
+    loadStructuredQuestions(child).map((item) => item.message),
+    ['Child?'],
+  );
+  forgetPlanningState(child);
 });

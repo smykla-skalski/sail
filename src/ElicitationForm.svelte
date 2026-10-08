@@ -1,12 +1,8 @@
 <script lang="ts">
   import { Button } from '@smykla-skalski/sui';
+  import type { StructuredQuestion } from './lib/planning-state';
 
-  export type Elicitation = {
-    id: string | number;
-    sessionId: string;
-    message: string;
-    schema: Record<string, unknown>;
-  };
+  export type Elicitation = StructuredQuestion;
 
   interface Props {
     elicitation: Elicitation;
