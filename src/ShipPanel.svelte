@@ -43,6 +43,7 @@
     onsettings,
     onhandoff,
     nativeSubagents = [],
+    focusRequest = null,
   }: {
     repository: string;
     active?: boolean;
@@ -55,6 +56,12 @@
     onsettings: () => Promise<void>;
     onhandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
     nativeSubagents?: NativeSubagent[];
+    focusRequest?: {
+      id: number;
+      runId: string;
+      issueId: string;
+      focus: 'issue' | 'pull-request';
+    } | null;
   } = $props();
   let error = $state('');
   let panel: HTMLDivElement;
@@ -81,6 +88,47 @@
     return item.title === `Issue #${item.number}`
       ? `#${item.number}`
       : `#${item.number} ${item.title}`;
+  }
+
+  type FocusRequest = NonNullable<typeof focusRequest>;
+  let handledFocus = 0;
+  let pendingFocus = $state<FocusRequest | null>(null);
+
+  $effect(() => {
+    const request = focusRequest;
+    if (!request || request.id === handledFocus) return;
+    handledFocus = request.id;
+    selectedRun = request.runId;
+    selectedIssue = request.issueId;
+    pendingFocus = request;
+  });
+
+  $effect(() => {
+    const request = pendingFocus;
+    if (
+      !request ||
+      !active ||
+      run?.id !== request.runId ||
+      !issues.some((item) => item.id === request.issueId)
+    )
+      return;
+    void focusPending(request);
+  });
+
+  async function focusPending(request: FocusRequest) {
+    await tick();
+    const button = panel?.querySelector<HTMLElement>(
+      `[data-ship-issue-id="${CSS.escape(request.issueId)}"]`,
+    );
+    if (!button?.getClientRects().length) return;
+    const link =
+      request.focus === 'pull-request'
+        ? panel.querySelector<HTMLElement>('.ship-issue-detail .ship-pull-request')
+        : null;
+    const target = link ?? button;
+    target.scrollIntoView({ block: 'center' });
+    target.focus();
+    if (pendingFocus === request) pendingFocus = null;
   }
 
   $effect(() => {
@@ -392,8 +440,11 @@
               onclick={() => act(() => onopen(issue!.path!, issue!.threadId))}
               >Open worker session</button
             >
-            {#if issue.pullRequest}<a href={issue.pullRequest} target="_blank" rel="noreferrer"
-                >Open PR</a
+            {#if issue.pullRequest}<a
+                class="ship-pull-request"
+                href={issue.pullRequest}
+                target="_blank"
+                rel="noreferrer">Open PR</a
               >{/if}
           </div>
           <p class="ship-path">

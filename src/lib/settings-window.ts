@@ -3,6 +3,11 @@ import type { SetupReport } from './onboarding';
 import type { ValidationSettings } from './cross-validation';
 import type { ModelRoutingSettings } from './model-routing';
 import type { MergeOwner } from './issue-shipping';
+import type {
+  NotificationPreference,
+  NotificationPrefs,
+  NotificationType,
+} from './notification-prefs';
 
 export const settingsRequest = 'sail:settings-request';
 export const settingsState = 'sail:settings-state';
@@ -23,7 +28,7 @@ export type SettingsSnapshot = {
   agentsError: string;
   crossValidation: ValidationSettings;
   modelRouting: ModelRoutingSettings;
-  notificationsEnabled: boolean;
+  notificationPrefs: NotificationPrefs;
   notificationSound: boolean;
   personalPostTurnChecks: string[];
   agentWorktreesEnabled: boolean;
@@ -38,7 +43,7 @@ export type SettingsSnapshot = {
 export type SettingsAction =
   | { type: 'theme'; value: 'light' | 'dark' }
   | { type: 'binary'; value: string }
-  | { type: 'notifications'; value: boolean }
+  | { type: 'notification-pref'; notification: NotificationType; value: NotificationPreference }
   | { type: 'notification-sound'; value: boolean }
   | { type: 'personal-post-turn-checks'; value: string[] }
   | { type: 'agent-worktrees'; value: boolean }

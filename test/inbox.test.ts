@@ -6,6 +6,9 @@ import {
   inboxPermissionProfile,
   inboxRejectedPermissionPolicy,
   inboxLocations,
+  inboxOpenRoute,
+  persistedInboxKinds,
+  repositoryName,
   inboxTurnMessageIndex,
   loadInboxOutcomes,
   loadInboxSeen,
@@ -240,4 +243,46 @@ void test('completed turn navigation stays between its user message and the next
   assert.equal(inboxTurnMessageIndex(messages, 999), 2);
   assert.equal(inboxTurnMessageIndex(messages, 1002), 4);
   assert.equal(inboxTurnMessageIndex([{ kind: 'user', created: 100 }], 101), 0);
+});
+
+void test('inbox opens each kind through its own route', () => {
+  assert.equal(inboxOpenRoute({ kind: 'acp-permission' }), 'acp-request');
+  assert.equal(inboxOpenRoute({ kind: 'opencode-permission' }), 'opencode-request');
+  assert.equal(inboxOpenRoute({ kind: 'question' }), 'opencode-request');
+  assert.equal(inboxOpenRoute({ kind: 'turn-completed' }), 'outcome');
+  assert.equal(inboxOpenRoute({ kind: 'check-failed' }), 'outcome');
+});
+
+const outcome = (kind: string) => ({
+  key: kind,
+  kind,
+  directory: '/d',
+  agentId: 'claude',
+  sessionId: 's',
+  text: 't',
+  receivedAt: 1,
+  read: false,
+});
+
+void test('only finished work is persisted, never requests or attention items', () => {
+  assert.deepEqual(persistedInboxKinds, ['turn-completed', 'check-failed']);
+  const kinds = [
+    'turn-completed',
+    'check-failed',
+    'acp-permission',
+    'question',
+    'ship-needs-input',
+    'ship-ready-to-merge',
+    'subagent-waiting',
+  ];
+  assert.deepEqual(
+    loadInboxOutcomes(JSON.stringify(kinds.map(outcome))).map((entry) => entry.kind),
+    ['turn-completed', 'check-failed'],
+  );
+});
+
+void test('repositories are named by their last path part on every platform', () => {
+  assert.equal(repositoryName('/projects/alpha/'), 'alpha');
+  assert.equal(repositoryName('C:\\projects\\gamma'), 'gamma');
+  assert.equal(repositoryName('alpha'), 'alpha');
 });
