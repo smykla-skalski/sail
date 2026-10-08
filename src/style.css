@@ -51,6 +51,12 @@
 *.sail-scrollbar-active::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, var(--sui-muted) 55%, transparent);
 }
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
 body {
   margin: 0;
   min-width: 320px;
@@ -91,7 +97,8 @@ button:disabled {
   grid-template-rows: minmax(0, 1fr) auto;
   height: 100vh;
   min-height: 0;
-  overflow: hidden;
+  /* clip, unlike hidden, blocks programmatic scrolls (focus, scrollIntoView) */
+  overflow: clip;
 }
 .app-shell[data-details-visible='true'] {
   grid-template-columns: 248px minmax(0, 1fr) 8px var(--details-width);
@@ -1076,6 +1083,7 @@ button:disabled {
   grid-template-columns: 190px minmax(0, 1fr);
   height: 100vh;
   min-height: 0;
+  overflow: clip;
   background: var(--sui-canvas);
 }
 .settings-navigation {
