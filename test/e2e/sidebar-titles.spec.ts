@@ -89,8 +89,11 @@ describe('sidebar thread titles next to the status badge', () => {
         return {
           depth: row.dataset.depth ?? '',
           title: row.getAttribute('aria-label') ?? '',
-          visible: row.querySelector<HTMLElement>('.project-agent-title')!.getBoundingClientRect()
-            .width,
+          visible:
+            Math.min(
+              name.getBoundingClientRect().right,
+              row.querySelector<HTMLElement>('.project-agent-title')!.getBoundingClientRect().right,
+            ) - name.getBoundingClientRect().left,
           needed,
           status: row.querySelector<HTMLElement>('.activity-status')?.offsetWidth ?? 0,
         };
