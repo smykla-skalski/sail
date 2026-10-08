@@ -129,10 +129,12 @@
                 checked={selected(field, option.value)}
                 aria-describedby={option.description ? `${id}-option-${index}` : undefined}
                 onfocus={() => (focused = { ...focused, [field.key]: option.value })}
-                onchange={(event) =>
-                  field.kind === 'multi'
-                    ? toggle(field.key, option.value, event.currentTarget.checked)
-                    : set(field.key, option.value)}
+                onchange={(event) => {
+                  focused = { ...focused, [field.key]: option.value };
+                  if (field.kind === 'multi')
+                    toggle(field.key, option.value, event.currentTarget.checked);
+                  else set(field.key, option.value);
+                }}
               />
               <span class="elicitation-option-body">
                 <span class="elicitation-option-title">{option.title}</span>

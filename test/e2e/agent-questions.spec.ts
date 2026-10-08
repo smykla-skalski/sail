@@ -65,7 +65,9 @@ describe('agent questions', () => {
     await $('.inbox-item .inbox-open').click();
     await expect(form).toBeDisplayed();
 
-    await storage.$('[data-option="Redis"] input').click();
+    const redis = storage.$('[data-option="Redis"] input');
+    await redis.click();
+    await browser.execute((input) => input.focus(), redis);
     await browser.keys('ArrowUp');
     await expect(storage.$('[data-option="Postgres (Recommended)"] input')).toBeSelected();
     await expect(storage.$('.elicitation-preview textarea')).toHaveValue(

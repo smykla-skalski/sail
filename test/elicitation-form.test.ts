@@ -167,4 +167,10 @@ await test('summarizes questions for the Inbox', () => {
     'Which database?',
   );
   assert.equal(elicitationSummary(undefined, null), 'Agent question');
+  assert.equal(
+    elicitationSummary('Configure deploy', {
+      properties: { name: { type: 'string', title: 'Name' }, region: { title: 'Region' } },
+    }),
+    'Configure deploy',
+  );
 });

@@ -198,6 +198,7 @@ export function missingRequired(
 /** One-line Inbox text: the message, or each question when the message only introduces several. */
 export function elicitationSummary(message: unknown, schema: unknown): string {
   const questions = elicitationFields(record(schema) ?? {})
+    .filter((entry) => entry.kind === 'single' || entry.kind === 'multi')
     .map((entry) => entry.description ?? entry.title)
     .filter((entry): entry is string => Boolean(entry));
   if (questions.length > 1) return `${questions.length} questions: ${questions.join(' · ')}`;
