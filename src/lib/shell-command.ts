@@ -24,6 +24,20 @@ export type ShellResult = {
 
 export type ShellSegment = { type: 'text'; text: string } | { type: 'shell'; shell: ShellOutcome };
 
+// Agent panes are rebuilt when the agent changes; undelivered runs outlive them here.
+const keptRuns = new Map<string, ShellRun[]>();
+
+export function keepShellRuns(key: string, runs: ShellRun[]): void {
+  if (runs.length) keptRuns.set(key, runs);
+  else keptRuns.delete(key);
+}
+
+export function takeShellRuns(key: string): ShellRun[] {
+  const runs = keptRuns.get(key) ?? [];
+  keptRuns.delete(key);
+  return runs;
+}
+
 /** Characters of command output sent to the agent per command. */
 export const SHELL_CONTEXT_LIMIT = 16 * 1024;
 

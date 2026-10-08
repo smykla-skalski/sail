@@ -3,12 +3,15 @@ import test from 'node:test';
 import {
   SHELL_CONTEXT_LIMIT,
   isShellDraft,
+  keepShellRuns,
   shellCommand,
   shellContext,
   shellStatusLabel,
   splitShellCommands,
+  takeShellRuns,
   withShellContext,
   type ShellOutcome,
+  type ShellRun,
 } from '../src/lib/shell-command.ts';
 
 const run = (overrides: Partial<ShellOutcome> = {}): ShellOutcome => ({
@@ -115,4 +118,15 @@ await test('status labels describe the outcome', () => {
   assert.equal(shellStatusLabel(run({ status: 'running', code: null })), 'Running');
   assert.equal(shellStatusLabel(run({ status: 'timed_out', code: null })), 'Timed out');
   assert.equal(shellStatusLabel(run({ status: 'canceled', code: null })), 'Stopped');
+});
+
+await test('undelivered runs survive a pane rebuild once', () => {
+  const kept: ShellRun = { ...run(), id: 'r1', directory: '/repo', session: 's1', created: 1 };
+  keepShellRuns('/repo\0claude', [kept]);
+  assert.deepEqual(takeShellRuns('/repo\0codex'), []);
+  assert.deepEqual(takeShellRuns('/repo\0claude'), [kept]);
+  assert.deepEqual(takeShellRuns('/repo\0claude'), []);
+  keepShellRuns('/repo\0claude', [kept]);
+  keepShellRuns('/repo\0claude', []);
+  assert.deepEqual(takeShellRuns('/repo\0claude'), []);
 });

@@ -108,8 +108,10 @@
   } from './lib/task-notification';
   import {
     isShellDraft,
+    keepShellRuns,
     shellCommand,
     splitShellCommands,
+    takeShellRuns,
     withShellContext,
     type ShellResult,
     type ShellRun,
@@ -1105,6 +1107,7 @@
   }
 
   onMount(() => {
+    if (!ephemeral) shellRuns = takeShellRuns(`${directory}\0${agent}`);
     let unlistenHookActivity: (() => void) | undefined;
     void listen<unknown>('sail:hook-activity', ({ payload }) => {
       const activity = parseHookActivity(payload);
@@ -1262,7 +1265,8 @@
       }
       images.forEach((image) => void invoke('browser_remove_capture', { path: image.imagePath }));
       clipboardAttachments.forEach((attachment) => removeClipboardAttachment(attachment));
-      shellRuns.filter((run) => run.status === 'running').forEach(stopShell);
+      if (ephemeral) shellRuns.filter((run) => run.status === 'running').forEach(stopShell);
+      else keepShellRuns(`${directory}\0${agent}`, shellRuns);
     };
   });
 
@@ -1589,7 +1593,7 @@
     }
     const finished = shellRuns.find((item) => item.id === run.id);
     if (finished) Object.assign(finished, result);
-    void follow();
+    if (!disposed) void follow();
   }
 
   function userSegments(text: string): (TaskSegment | ShellSegment)[] {
