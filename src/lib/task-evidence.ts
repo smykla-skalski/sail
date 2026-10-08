@@ -1,4 +1,23 @@
 import { z } from 'zod';
+import {
+  economicsRollupSchema,
+  evidenceContentDigest,
+  evidenceIdentityDigest,
+  evidenceReferenceDigest,
+  maxEconomicsCounter,
+  mergeEconomicsRollups,
+  reconcileArchivedEconomicsEvidence,
+  rekeyArchivedEconomicsEvidence,
+  removeArchivedEconomicsEvidence,
+  removeArchivedEconomicsEvidenceSnapshot,
+  rollUpEconomics,
+  taskEconomicsSchema,
+  updateArchivedEconomicsEvidence,
+  type EconomicsRollup,
+} from './task-economics.ts';
+
+const evidenceHistoryLimit = 100;
+const evidenceStorageLimit = 200;
 
 export const evidenceResults = ['passed', 'failed', 'pending', 'blocked'] as const;
 export type EvidenceResult = (typeof evidenceResults)[number];
@@ -11,12 +30,31 @@ export const taskEvidenceSchema = z
     provider: z.string().min(1).max(200),
     model: z.string().min(1).max(500).nullable(),
     result: z.enum(evidenceResults),
-    timestamp: z.number().int().nonnegative(),
-    sequence: z.number().int().positive().optional(),
+    timestamp: z.number().int().nonnegative().max(maxEconomicsCounter),
+    sequence: z.number().int().positive().max(maxEconomicsCounter).optional(),
     outputReference: z.string().min(1).max(2000),
     criteria: z.array(z.string().min(1).max(2000)).max(100),
+    economics: taskEconomicsSchema.optional(),
+    identityUncertain: z.boolean().optional(),
+    reconciliationKey: z.string().length(16).optional(),
+    executionOrder: z
+      .tuple([z.number().int().nonnegative(), z.number().int().positive()])
+      .optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((evidence, context) => {
+    if (
+      evidence.kind === 'command' &&
+      evidence.result === 'failed' &&
+      evidence.economics !== undefined &&
+      evidence.economics.failedCommands === 0
+    )
+      context.addIssue({
+        code: 'custom',
+        path: ['economics', 'failedCommands'],
+        message: 'Failed command evidence must record at least one failed command.',
+      });
+  });
 
 export type TaskEvidence = z.infer<typeof taskEvidenceSchema>;
 
@@ -25,10 +63,11 @@ export const evidenceManifestSchema = z
     revision: z.string().min(1),
     baseRevision: z.string().min(1).nullable().default(null),
     acceptanceCriteria: z.array(z.string().min(1).max(2000)).min(1).max(100),
-    evidence: z.array(taskEvidenceSchema).max(100),
+    evidence: z.array(taskEvidenceSchema).max(evidenceStorageLimit),
     stale: z.boolean(),
-    createdAt: z.number().int().nonnegative(),
-    updatedAt: z.number().int().nonnegative(),
+    createdAt: z.number().int().nonnegative().max(maxEconomicsCounter),
+    updatedAt: z.number().int().nonnegative().max(maxEconomicsCounter),
+    economicsRollup: economicsRollupSchema.optional(),
   })
   .strict()
   .refine((manifest) => manifest.updatedAt >= manifest.createdAt, {
@@ -70,15 +109,28 @@ export type EvidenceReadiness = {
 };
 
 const manifestLimit = 20;
-const evidenceLimit = 100;
-
 function evidenceIsNewer(candidate: TaskEvidence, previous: TaskEvidence): boolean {
+  if (candidate.executionOrder && previous.executionOrder) {
+    const executionOrder =
+      candidate.executionOrder[0] - previous.executionOrder[0] ||
+      candidate.executionOrder[1] - previous.executionOrder[1];
+    if (executionOrder !== 0) return executionOrder > 0;
+  }
   if (candidate.sequence !== undefined || previous.sequence !== undefined) {
     if (candidate.sequence === undefined) return false;
     if (previous.sequence === undefined) return true;
     if (candidate.sequence !== previous.sequence) return candidate.sequence > previous.sequence;
   }
-  return candidate.timestamp >= previous.timestamp;
+  if (candidate.timestamp !== previous.timestamp) return candidate.timestamp > previous.timestamp;
+  const resultRank: Record<EvidenceResult, number> = {
+    passed: 0,
+    pending: 1,
+    blocked: 2,
+    failed: 3,
+  };
+  if (candidate.result !== previous.result)
+    return resultRank[candidate.result] > resultRank[previous.result];
+  return evidenceIdentityContent(candidate).localeCompare(evidenceIdentityContent(previous)) > 0;
 }
 
 function compareEvidence(left: TaskEvidence, right: TaskEvidence): number {
@@ -96,18 +148,49 @@ function manifestIdentity(revision: string, baseRevision: string | null | undefi
 
 function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
   const sorted = evidence.toSorted(compareEvidence);
-  if (sorted.length <= evidenceLimit) return sorted;
+  if (sorted.length <= evidenceHistoryLimit) return sorted;
+  const latest = latestOutcomeEvidence(sorted);
   const latestGates = new Map<string, TaskEvidence>();
   for (const entry of sorted) {
     if (entry.kind !== 'gate') continue;
     const previous = latestGates.get(entry.name);
     if (!previous || evidenceIsNewer(entry, previous)) latestGates.set(entry.name, entry);
   }
-  const protectedIds = new Set([...latestGates.values()].map((entry) => entry.id));
-  const retained = sorted
-    .filter((entry) => !protectedIds.has(entry.id))
-    .slice(-(evidenceLimit - protectedIds.size));
-  return [...retained, ...latestGates.values()].toSorted(compareEvidence);
+  const latestCriteria = new Map<string, TaskEvidence>();
+  for (const entry of latest) {
+    if (entry.result !== 'passed') continue;
+    for (const criterion of entry.criteria) {
+      const previous = latestCriteria.get(criterion);
+      if (!previous || evidenceIsNewer(entry, previous)) latestCriteria.set(criterion, entry);
+    }
+  }
+  const protectedIds = new Set<string>();
+  for (const entry of [...latestGates.values()].toSorted(compareEvidence).toReversed()) {
+    protectedIds.add(entry.id);
+  }
+  for (const entry of [...latestCriteria.values()].toSorted(compareEvidence).toReversed()) {
+    protectedIds.add(entry.id);
+  }
+  for (const entry of latest.toSorted(compareEvidence).toReversed()) {
+    if (
+      entry.kind === 'command' &&
+      !isCiObservation(entry) &&
+      ['failed', 'pending', 'blocked'].includes(entry.result)
+    )
+      protectedIds.add(entry.id);
+  }
+  for (const entry of latest.filter(isCiObservation).toSorted(compareEvidence).toReversed()) {
+    if (protectedIds.size >= evidenceHistoryLimit) break;
+    protectedIds.add(entry.id);
+  }
+  if (protectedIds.size > evidenceStorageLimit)
+    throw new Error('Readiness evidence exceeds the evidence storage limit.');
+  const remainingCapacity = Math.max(0, evidenceHistoryLimit - protectedIds.size);
+  const retained = remainingCapacity
+    ? sorted.filter((entry) => !protectedIds.has(entry.id)).slice(-remainingCapacity)
+    : [];
+  const protectedEvidence = sorted.filter((entry) => protectedIds.has(entry.id));
+  return [...retained, ...protectedEvidence].toSorted(compareEvidence);
 }
 
 function boundEvidenceManifests(manifests: EvidenceManifest[]): EvidenceManifest[] {
@@ -118,7 +201,300 @@ function boundEvidenceManifests(manifests: EvidenceManifest[]): EvidenceManifest
   const history = historyLimit
     ? sorted.filter((manifest) => manifest.stale).slice(-historyLimit)
     : [];
-  return [...history, ...current].toSorted((left, right) => left.createdAt - right.createdAt);
+  const retained = [...history, ...current].toSorted(
+    (left, right) => left.createdAt - right.createdAt,
+  );
+  const retainedRevisions = new Set(
+    retained.map((manifest) => manifestIdentity(manifest.revision, manifest.baseRevision)),
+  );
+  const evicted = sorted.filter(
+    (manifest) =>
+      !retainedRevisions.has(manifestIdentity(manifest.revision, manifest.baseRevision)),
+  );
+  const existingRollup = combinedRollup(sorted);
+  const rollup = rollUpEconomics(
+    existingRollup,
+    evicted.flatMap((manifest) => manifest.evidence),
+  );
+  return moveRollup(retained, rollup);
+}
+
+function combinedRollup(manifests: EvidenceManifest[]): EconomicsRollup | undefined {
+  return mergeEconomicsRollups(manifests.map((manifest) => manifest.economicsRollup));
+}
+
+function archivedSequenceHighWater(manifests: EvidenceManifest[]): number {
+  return Math.max(
+    0,
+    ...manifests.flatMap((manifest) =>
+      (manifest.economicsRollup?.archivedSequenceRanges ?? []).map((range) => range[1]),
+    ),
+  );
+}
+
+function sequenceIsArchived(manifests: EvidenceManifest[], sequence: number): boolean {
+  return manifests.some((manifest) =>
+    manifest.economicsRollup?.archivedSequenceRanges.some(
+      ([start, end]) => sequence >= start && sequence <= end,
+    ),
+  );
+}
+
+function evidenceIdentityContent(entry: TaskEvidence): string {
+  return JSON.stringify({ ...entry, sequence: undefined });
+}
+
+function ciObservationContent(entry: TaskEvidence): string {
+  return JSON.stringify({
+    ...entry,
+    result: undefined,
+    timestamp: undefined,
+    sequence: undefined,
+    outputReference: undefined,
+    executionOrder: undefined,
+    economics: entry.economics ? { ...entry.economics, failedCommands: undefined } : undefined,
+  });
+}
+
+function isCiObservation(entry: TaskEvidence): boolean {
+  return entry.id.startsWith('ci:') && entry.provider === 'github' && entry.kind === 'command';
+}
+
+function matchingReconciledCiObservation(
+  entries: TaskEvidence[],
+  fallback: TaskEvidence,
+): TaskEvidence | undefined {
+  if (
+    !isCiObservation(fallback) ||
+    fallback.identityUncertain !== true ||
+    !fallback.reconciliationKey
+  )
+    return undefined;
+  const matches = entries.filter(
+    (candidate) =>
+      isCiObservation(candidate) &&
+      candidate.id !== fallback.id &&
+      candidate.reconciliationKey === fallback.reconciliationKey &&
+      candidate.outputReference === fallback.outputReference,
+  );
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function archivedEvidenceContentMatches(entry: TaskEvidence, contentDigest: string): boolean {
+  if (evidenceContentDigest(entry) === contentDigest) return true;
+  if (!isCiObservation(entry)) return false;
+  return [true, false, undefined].some(
+    (identityUncertain) => evidenceContentDigest({ ...entry, identityUncertain }) === contentDigest,
+  );
+}
+
+function latestOutcomeEvidence(entries: TaskEvidence[]): TaskEvidence[] {
+  const grouped = new Map<string, TaskEvidence[]>();
+  for (const entry of entries) {
+    const key = `${entry.kind}:${entry.name}`;
+    const group = grouped.get(key);
+    if (group) group.push(entry);
+    else grouped.set(key, [entry]);
+  }
+  const selected: TaskEvidence[] = [];
+  for (const group of grouped.values()) {
+    const orderedCi = group.filter(
+      (entry) => isCiObservation(entry) && entry.executionOrder !== undefined,
+    );
+    if (orderedCi.length) {
+      const latestAttemptByLineage = new Map<number, number>();
+      for (const entry of orderedCi) {
+        const [lineage, attempt] = entry.executionOrder!;
+        latestAttemptByLineage.set(
+          lineage,
+          Math.max(latestAttemptByLineage.get(lineage) ?? 0, attempt),
+        );
+      }
+      const latestOrdered = orderedCi.filter((entry) => {
+        const [lineage, attempt] = entry.executionOrder!;
+        return latestAttemptByLineage.get(lineage) === attempt;
+      });
+      const unorderedCi = group.filter(
+        (entry) => isCiObservation(entry) && entry.executionOrder === undefined,
+      );
+      const other = group.filter((entry) => !isCiObservation(entry));
+      selected.push(...latestOrdered, ...unorderedCi);
+      if (other.length)
+        selected.push(
+          other.reduce((latest, entry) => (evidenceIsNewer(entry, latest) ? entry : latest)),
+        );
+      continue;
+    }
+    selected.push(
+      group.reduce((latest, entry) => (evidenceIsNewer(entry, latest) ? entry : latest)),
+    );
+  }
+  return selected;
+}
+
+function archivedIdentityContent(
+  entry: EconomicsRollup['archivedEvidence'][number],
+  identityDigest: string,
+): string | undefined {
+  if (entry.identityDigest === identityDigest) return entry.contentDigest;
+  return entry.identityAliases.find((alias) => alias.identityDigest === identityDigest)
+    ?.contentDigest;
+}
+
+function archivedEvidenceEntry(
+  rollup: EconomicsRollup | undefined,
+  evidenceId: string,
+): EconomicsRollup['archivedEvidence'][number] | undefined {
+  const identityDigest = evidenceIdentityDigest(evidenceId);
+  return [...(rollup?.archivedTombstones ?? []), ...(rollup?.archivedEvidence ?? [])].find(
+    (candidate) => archivedIdentityContent(candidate, identityDigest) !== undefined,
+  );
+}
+
+function evidenceArchivedBy(entry: TaskEvidence, rollup: EconomicsRollup | undefined): boolean {
+  const identityDigest = evidenceIdentityDigest(entry.id);
+  const archived = [
+    ...(rollup?.archivedTombstones ?? []),
+    ...(rollup?.archivedEvidence ?? []),
+  ].find((candidate) => archivedIdentityContent(candidate, identityDigest) !== undefined);
+  if (!archived) return false;
+  if (!archivedEvidenceContentMatches(entry, archivedIdentityContent(archived, identityDigest)!))
+    throw new Error(`Evidence identity ${entry.id} was reused with different content.`);
+  return (
+    archived.sequence === undefined ||
+    entry.sequence === undefined ||
+    archived.sequence >= entry.sequence
+  );
+}
+
+function ciExecutionArchived(entry: TaskEvidence, rollup: EconomicsRollup | undefined): boolean {
+  return (
+    isCiObservation(entry) &&
+    rollup?.archivedEvidence.some((candidate) => {
+      const contentDigest = archivedIdentityContent(candidate, evidenceIdentityDigest(entry.id));
+      return contentDigest !== undefined && archivedEvidenceContentMatches(entry, contentDigest);
+    }) === true
+  );
+}
+
+function mergeCiEconomics(
+  newest: TaskEvidence['economics'],
+  left: TaskEvidence['economics'],
+  right: TaskEvidence['economics'],
+  result: TaskEvidence['result'],
+): TaskEvidence['economics'] {
+  const base = newest ?? left ?? right;
+  if (!base) return undefined;
+  return {
+    ...base,
+    failedCommands: Math.max(
+      result === 'failed' ? 1 : 0,
+      left?.failedCommands ?? 0,
+      right?.failedCommands ?? 0,
+    ),
+  };
+}
+
+function normalizeGateEconomics(entry: TaskEvidence): TaskEvidence {
+  if (entry.kind !== 'gate' || !entry.economics) return entry;
+  const phase =
+    entry.name === 'test-adversary'
+      ? 'test'
+      : ['code-adversary', 'findings-adversary'].includes(entry.name)
+        ? 'review'
+        : undefined;
+  return phase ? { ...entry, economics: { ...entry.economics, role: 'validator', phase } } : entry;
+}
+
+function normalizeEvidenceSequences(manifests: EvidenceManifest[]): EvidenceManifest[] {
+  const rollup = combinedRollup(manifests);
+  let highWater = Math.max(
+    archivedSequenceHighWater(manifests),
+    ...manifests.flatMap((manifest) => manifest.evidence.map((entry) => entry.sequence ?? 0)),
+  );
+  const identities = new Map<string, string>();
+  const unique = new Map<string, TaskEvidence>();
+  for (const manifest of manifests)
+    for (const entry of manifest.evidence) {
+      const content = evidenceIdentityContent(entry);
+      const existing = identities.get(entry.id);
+      if (existing !== undefined) {
+        if (existing !== content)
+          throw new Error(`Evidence identity ${entry.id} was reused with different content.`);
+        const previous = unique.get(entry.id)!;
+        if (evidenceIsNewer(entry, previous)) unique.set(entry.id, entry);
+        continue;
+      }
+      identities.set(entry.id, content);
+      unique.set(entry.id, entry);
+    }
+  const assigned = new Map<string, number>();
+  const collisions = new Map<number, TaskEvidence[]>();
+  const unassigned: TaskEvidence[] = [];
+  for (const entry of unique.values()) {
+    if (
+      entry.sequence === undefined ||
+      (sequenceIsArchived(manifests, entry.sequence) && !ciExecutionArchived(entry, rollup))
+    ) {
+      unassigned.push(entry);
+      continue;
+    }
+    const group = collisions.get(entry.sequence) ?? [];
+    group.push(entry);
+    collisions.set(entry.sequence, group);
+  }
+  const order = (left: TaskEvidence, right: TaskEvidence) =>
+    left.timestamp - right.timestamp || left.id.localeCompare(right.id);
+  for (const [sequence, entries] of [...collisions.entries()].toSorted(
+    ([left], [right]) => left - right,
+  )) {
+    const ordered = entries.toSorted(order);
+    assigned.set(ordered[0].id, sequence);
+    unassigned.push(...ordered.slice(1));
+  }
+  for (const entry of unassigned.toSorted(order)) {
+    if (highWater >= maxEconomicsCounter) throw new Error('Evidence sequence limit reached.');
+    assigned.set(entry.id, ++highWater);
+  }
+  const emitted = new Set<string>();
+  return manifests.map((manifest) => ({
+    ...manifest,
+    evidence: manifest.evidence.flatMap((entry) => {
+      if (emitted.has(entry.id)) return [];
+      emitted.add(entry.id);
+      const selected = unique.get(entry.id)!;
+      return [{ ...selected, sequence: assigned.get(entry.id)! }];
+    }),
+  }));
+}
+
+function moveRollup(
+  manifests: EvidenceManifest[],
+  rollup: EconomicsRollup | undefined,
+  hostIndex = 0,
+): EvidenceManifest[] {
+  if (!manifests.length) return manifests;
+  return manifests.map((manifest, index) => {
+    const next = { ...manifest };
+    delete next.economicsRollup;
+    return rollup && index === hostIndex ? { ...next, economicsRollup: rollup } : next;
+  });
+}
+
+function withBoundedEvidence(
+  manifest: EvidenceManifest,
+  evidence: TaskEvidence[],
+): EvidenceManifest {
+  const sorted = evidence.toSorted(compareEvidence);
+  if (sorted.length <= evidenceHistoryLimit) return { ...manifest, evidence: sorted };
+  const retained = boundEvidence(sorted);
+  const retainedIds = new Set(retained.map((entry) => entry.id));
+  const evicted = sorted.filter((entry) => !retainedIds.has(entry.id));
+  return {
+    ...manifest,
+    evidence: retained,
+    economicsRollup: rollUpEconomics(manifest.economicsRollup, evicted),
+  };
 }
 
 export function nextTaskEvidenceSequence(manifests: EvidenceManifest[], offset = 0): number {
@@ -138,32 +514,70 @@ export function mergeEvidenceManifests(
   current: EvidenceManifest[],
   incoming: EvidenceManifest[],
 ): EvidenceManifest[] {
+  const parsedCurrent = evidenceManifestsSchema.parse(current);
+  const parsedIncoming = evidenceManifestsSchema.parse(incoming);
+  const currentRollup = combinedRollup(parsedCurrent);
+  const incomingRollup = combinedRollup(parsedIncoming);
   const merged = new Map(
-    evidenceManifestsSchema
-      .parse(current)
-      .map((manifest) => [manifestIdentity(manifest.revision, manifest.baseRevision), manifest]),
+    parsedCurrent.map((manifest) => [
+      manifestIdentity(manifest.revision, manifest.baseRevision),
+      {
+        ...manifest,
+        evidence: manifest.evidence.filter((entry) => !evidenceArchivedBy(entry, incomingRollup)),
+      },
+    ]),
   );
-  for (const candidate of evidenceManifestsSchema.parse(incoming)) {
+  for (const candidate of parsedIncoming) {
     const key = manifestIdentity(candidate.revision, candidate.baseRevision);
     const existing = merged.get(key);
     if (!existing) {
-      merged.set(key, candidate);
+      merged.set(key, {
+        ...candidate,
+        evidence: candidate.evidence.filter((entry) => !evidenceArchivedBy(entry, currentRollup)),
+      });
       continue;
     }
     const latest = candidate.updatedAt >= existing.updatedAt ? candidate : existing;
-    const evidence = new Map(existing.evidence.map((entry) => [entry.id, entry]));
+    const economicsRollup = combinedRollup([existing, candidate]);
+    const evidence = new Map(
+      existing.evidence
+        .filter((entry) => !evidenceArchivedBy(entry, incomingRollup))
+        .map((entry) => [entry.id, entry]),
+    );
     for (const entry of candidate.evidence) {
+      if (evidenceArchivedBy(entry, currentRollup)) continue;
       const previous = evidence.get(entry.id);
-      if (!previous || evidenceIsNewer(entry, previous)) evidence.set(entry.id, entry);
+      if (!previous) evidence.set(entry.id, entry);
+      else if (
+        isCiObservation(entry) &&
+        isCiObservation(previous) &&
+        ciObservationContent(entry) === ciObservationContent(previous)
+      ) {
+        const newest = evidenceIsNewer(entry, previous) ? entry : previous;
+        evidence.set(entry.id, {
+          ...newest,
+          economics: mergeCiEconomics(
+            newest.economics,
+            entry.economics,
+            previous.economics,
+            newest.result,
+          ),
+        });
+      } else if (evidenceIdentityContent(entry) !== evidenceIdentityContent(previous))
+        throw new Error(`Evidence identity ${entry.id} was reused with different content.`);
     }
     merged.set(key, {
       ...latest,
-      evidence: boundEvidence([...evidence.values()]),
+      evidence: [...evidence.values()].toSorted(compareEvidence),
+      economicsRollup,
       createdAt: Math.min(existing.createdAt, candidate.createdAt),
       updatedAt: Math.max(existing.updatedAt, candidate.updatedAt),
     });
   }
-  return evidenceManifestsSchema.parse(boundEvidenceManifests([...merged.values()]));
+  const normalized = normalizeEvidenceSequences([...merged.values()]).map((manifest) =>
+    withBoundedEvidence(manifest, manifest.evidence),
+  );
+  return evidenceManifestsSchema.parse(boundEvidenceManifests(normalized));
 }
 
 export function requireEvidenceRevision(expected: unknown, current: string): void {
@@ -290,6 +704,8 @@ export function rollbackTaskEvidenceRecord(
     const saved = committedByIdentity.get(key);
     if (!saved) return [manifest];
     const savedEntry = saved.evidence.find((entry) => entry.id === evidenceId);
+    const savedArchivedEntry = archivedEvidenceEntry(saved.economicsRollup, evidenceId);
+    const priorArchivedEntry = archivedEvidenceEntry(prior?.economicsRollup, evidenceId);
     const evidence = savedEntry
       ? manifest.evidence.filter(
           (entry) => entry.id !== evidenceId || !sameEvidenceValue(entry, savedEntry),
@@ -300,7 +716,20 @@ export function rollbackTaskEvidenceRecord(
         !saved.evidence.some((candidate) => candidate.id === entry.id) &&
         !evidence.some((candidate) => candidate.id === entry.id),
     );
-    const withoutRecord = { ...manifest, evidence: boundEvidence([...evidence, ...evicted]) };
+    const withoutRecord = {
+      ...manifest,
+      evidence: boundEvidence([...evidence, ...evicted]),
+      economicsRollup:
+        savedEntry && manifest.economicsRollup
+          ? removeArchivedEconomicsEvidence(manifest.economicsRollup, savedEntry)
+          : savedArchivedEntry && !priorArchivedEntry && manifest.economicsRollup
+            ? removeArchivedEconomicsEvidenceSnapshot(
+                manifest.economicsRollup,
+                evidenceId,
+                savedArchivedEntry,
+              )
+            : manifest.economicsRollup,
+    };
     if (
       prior &&
       sameEvidenceValue(withoutRecord.evidence, prior.evidence) &&
@@ -382,59 +811,436 @@ export function recordTaskEvidence(
   evidence: TaskEvidence,
   baseRevision?: string,
 ): EvidenceManifest[] {
-  const parsedEntry = taskEvidenceSchema.parse(evidence);
-  const nextSequence = nextTaskEvidenceSequence(manifests);
-  const entry = {
-    ...parsedEntry,
-    sequence: parsedEntry.sequence ?? nextSequence,
-  };
-  const unknown = entry.criteria.filter((criterion) => !acceptanceCriteria.includes(criterion));
-  if (unknown.length)
-    throw new Error(`Evidence references unknown acceptance criteria: ${unknown.join(', ')}`);
+  const parsedEntry = normalizeGateEconomics(taskEvidenceSchema.parse(evidence));
   const synced = syncEvidenceManifest(
     manifests,
     revision,
     acceptanceCriteria,
-    entry.timestamp,
+    parsedEntry.timestamp,
     baseRevision,
   );
+  const existingIdentity = synced
+    .flatMap((manifest) => manifest.evidence)
+    .find((candidate) => candidate.id === parsedEntry.id);
+  if (existingIdentity) {
+    if (evidenceIdentityContent(existingIdentity) === evidenceIdentityContent(parsedEntry))
+      return synced;
+    throw new Error(`Evidence identity ${parsedEntry.id} was reused with different content.`);
+  }
+  const rollup = combinedRollup(synced);
+  const archivedIdentity = [
+    ...(rollup?.archivedTombstones ?? []),
+    ...(rollup?.archivedEvidence ?? []),
+  ].find(
+    (candidate) =>
+      archivedIdentityContent(candidate, evidenceIdentityDigest(parsedEntry.id)) !== undefined,
+  );
+  if (
+    archivedIdentity &&
+    !archivedEvidenceContentMatches(
+      parsedEntry,
+      archivedIdentityContent(archivedIdentity, evidenceIdentityDigest(parsedEntry.id))!,
+    )
+  )
+    throw new Error(`Evidence identity ${parsedEntry.id} was reused with different content.`);
+  if (
+    archivedIdentity &&
+    (!isCiObservation(parsedEntry) ||
+      archivedIdentity.identityDigest !== evidenceIdentityDigest(parsedEntry.id))
+  )
+    return synced;
+  const highWater = Math.max(
+    archivedSequenceHighWater(synced),
+    ...synced.flatMap((manifest) => manifest.evidence.map((candidate) => candidate.sequence ?? 0)),
+  );
+  if (highWater >= maxEconomicsCounter && parsedEntry.sequence === undefined)
+    throw new Error('Evidence sequence limit reached.');
+  const entry = { ...parsedEntry, sequence: parsedEntry.sequence ?? highWater + 1 };
+  const unknown = entry.criteria.filter((criterion) => !acceptanceCriteria.includes(criterion));
+  if (unknown.length)
+    throw new Error(`Evidence references unknown acceptance criteria: ${unknown.join(', ')}`);
   const index = synced.findIndex(
     (manifest) =>
       manifest.revision === revision && manifest.baseRevision === (baseRevision ?? null),
   );
-  const manifest = synced[index];
-  const previousIndex = manifest.evidence.findIndex((candidate) => candidate.id === entry.id);
-  const previous = manifest.evidence[previousIndex];
-  const equivalent = (candidate: TaskEvidence) =>
-    candidate.provider === entry.provider &&
-    candidate.model === entry.model &&
-    candidate.result === entry.result &&
-    candidate.outputReference === entry.outputReference &&
-    JSON.stringify(candidate.criteria) === JSON.stringify(entry.criteria);
-  if (
-    previous &&
-    equivalent(previous) &&
-    (parsedEntry.sequence === undefined || previous.sequence === entry.sequence)
-  )
-    return synced;
-  const previousAttempt = manifest.evidence.findLast(
-    (candidate) => candidate.kind === entry.kind && candidate.name === entry.name,
+  const normalized = moveRollup(synced, combinedRollup(synced), index);
+  const manifest = normalized[index];
+  return normalized.with(
+    index,
+    withBoundedEvidence(
+      {
+        ...manifest,
+        updatedAt: Math.max(manifest.createdAt, manifest.updatedAt, entry.timestamp),
+      },
+      [...manifest.evidence, entry],
+    ),
   );
-  if (
-    !previous &&
-    parsedEntry.sequence === undefined &&
-    previousAttempt &&
-    equivalent(previousAttempt)
-  )
-    return synced;
-  const nextEvidence =
-    previousIndex < 0
-      ? [...manifest.evidence, entry]
-      : manifest.evidence.with(previousIndex, entry);
-  return synced.with(index, {
-    ...manifest,
-    evidence: boundEvidence(nextEvidence),
-    updatedAt: Math.max(manifest.createdAt, manifest.updatedAt, entry.timestamp),
+}
+
+function stableIdentity(value: string): string {
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ code, 0x85ebca6b);
+  }
+  return `${(first >>> 0).toString(16).padStart(8, '0')}${(second >>> 0)
+    .toString(16)
+    .padStart(8, '0')}`;
+}
+
+function normalizedCiRunUrl(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  try {
+    const url = new URL(trimmed);
+    url.hash = '';
+    if (url.pathname.length > 1) url.pathname = url.pathname.replace(/\/+$/, '');
+    return url.toString();
+  } catch {
+    return trimmed;
+  }
+}
+
+export type CiEvidenceIdentityInput = {
+  name: string;
+  url: string;
+  databaseId?: number;
+  runId?: number;
+  attempt?: number;
+  statusContextId?: string;
+  identityUncertain?: boolean;
+};
+
+export function ciEvidenceIdentity(
+  revision: string,
+  check: CiEvidenceIdentityInput,
+): {
+  id: string;
+  uncertain: boolean;
+  reconciliationKey: string;
+  executionOrder?: [number, number];
+} {
+  const stableRun = check.runId ?? check.databaseId;
+  const stableStatus = check.statusContextId;
+  const stableStatusRun = stableStatus === undefined ? undefined : normalizedCiRunUrl(check.url);
+  const uncertain = check.identityUncertain === true || stableRun === undefined;
+  const execution =
+    check.databaseId !== undefined
+      ? `${revision}\u0000${check.name}\u0000check\u0000${check.databaseId}`
+      : check.runId !== undefined
+        ? `${revision}\u0000${check.name}\u0000run\u0000${check.runId}\u0000${check.attempt ?? 1}`
+        : stableStatus !== undefined
+          ? `${revision}\u0000${check.name}\u0000status\u0000${stableStatusRun ?? 'no-run-url'}`
+          : `${revision}\u0000${check.name}\u0000legacy\u0000${check.url}`;
+  return {
+    id: `ci:${stableIdentity(execution)}`,
+    uncertain,
+    reconciliationKey: stableIdentity(`${revision}\u0000${check.name}`),
+    executionOrder:
+      stableRun === undefined ? undefined : [check.runId ?? check.databaseId!, check.attempt ?? 1],
+  };
+}
+
+export function recordCiEvidenceObservation(
+  manifests: EvidenceManifest[],
+  revision: string,
+  acceptanceCriteria: string[],
+  evidence: TaskEvidence,
+  baseRevision?: string,
+): EvidenceManifest[] {
+  const parsedEntry = taskEvidenceSchema.parse(evidence);
+  if (!isCiObservation(parsedEntry))
+    throw new Error('CI observations require a stable CI identity and GitHub command evidence.');
+  let synced = syncEvidenceManifest(
+    manifests,
+    revision,
+    acceptanceCriteria,
+    parsedEntry.timestamp,
+    baseRevision,
+  );
+  let rollup = combinedRollup(synced);
+  const mutableArchive = [
+    ...(rollup?.stateVersion !== undefined && rollup.stateVersion >= 3
+      ? rollup.archivedTombstones.filter((candidate) => candidate.metadataComplete)
+      : []),
+    ...(rollup?.archivedEvidence ?? []),
+  ];
+  const archivedExecution = mutableArchive.some(
+    (candidate) =>
+      archivedIdentityContent(candidate, evidenceIdentityDigest(parsedEntry.id)) !== undefined,
+  );
+  if (rollup && archivedExecution) {
+    const updated = updateArchivedEconomicsEvidence(rollup, parsedEntry);
+    const index = synced.findIndex(
+      (manifest) =>
+        manifest.revision === revision && manifest.baseRevision === (baseRevision ?? null),
+    );
+    synced = moveRollup(synced, updated, index);
+    rollup = updated;
+  }
+  if (parsedEntry.identityUncertain === true) {
+    const index = synced.findIndex(
+      (manifest) =>
+        manifest.revision === revision &&
+        manifest.baseRevision === (baseRevision ?? null) &&
+        !manifest.stale,
+    );
+    const manifest = synced[index];
+    const matching = matchingReconciledCiObservation(manifest?.evidence ?? [], parsedEntry);
+    if (matching) {
+      if (parsedEntry.timestamp < matching.timestamp) return synced;
+      return synced.with(index, {
+        ...manifest,
+        evidence: manifest.evidence.flatMap((candidate) => {
+          if (candidate.id === parsedEntry.id && candidate !== matching) return [];
+          if (candidate !== matching) return [candidate];
+          return [
+            {
+              ...matching,
+              result: parsedEntry.result,
+              timestamp: parsedEntry.timestamp,
+              outputReference: parsedEntry.outputReference,
+              criteria: parsedEntry.criteria,
+              economics: mergeCiEconomics(
+                parsedEntry.economics,
+                matching.economics,
+                parsedEntry.economics,
+                parsedEntry.result,
+              ),
+            },
+          ];
+        }),
+        updatedAt: Math.max(manifest.updatedAt, parsedEntry.timestamp),
+      });
+    }
+    if (rollup) {
+      const exact = manifest?.evidence.find((candidate) => candidate.id === parsedEntry.id);
+      if (exact) {
+        if (ciObservationContent(exact) !== ciObservationContent(parsedEntry))
+          throw new Error(`Evidence identity ${parsedEntry.id} was reused with different content.`);
+      } else {
+        const reconciled = reconcileArchivedEconomicsEvidence(
+          rollup,
+          parsedEntry.reconciliationKey!,
+          parsedEntry,
+        );
+        if (reconciled !== rollup) {
+          const moved = moveRollup(synced, reconciled, index);
+          const highWater = Math.max(
+            archivedSequenceHighWater(moved),
+            ...moved.flatMap((candidate) => candidate.evidence.map((entry) => entry.sequence ?? 0)),
+          );
+          if (highWater >= maxEconomicsCounter) throw new Error('Evidence sequence limit reached.');
+          const restored = { ...parsedEntry, sequence: highWater + 1 };
+          return moved.with(
+            index,
+            withBoundedEvidence(
+              {
+                ...moved[index],
+                updatedAt: Math.max(moved[index].updatedAt, parsedEntry.timestamp),
+              },
+              [...moved[index].evidence, restored],
+            ),
+          );
+        }
+      }
+    }
+  }
+  if (parsedEntry.identityUncertain !== true && parsedEntry.reconciliationKey) {
+    const retained = synced.flatMap((manifest, manifestIndex) =>
+      manifest.evidence.map((candidate, evidenceIndex) => ({
+        candidate,
+        manifestIndex,
+        evidenceIndex,
+      })),
+    );
+    const legacy = retained.filter(
+      ({ candidate }) =>
+        isCiObservation(candidate) &&
+        candidate.identityUncertain === true &&
+        candidate.reconciliationKey === parsedEntry.reconciliationKey,
+    );
+    const matchingLegacy = legacy.filter(
+      ({ candidate }) => candidate.outputReference === parsedEntry.outputReference,
+    );
+    if (matchingLegacy.length === 1) {
+      const previous = matchingLegacy[0];
+      const exact = retained.find(
+        ({ candidate }) => candidate.id === parsedEntry.id && candidate !== previous.candidate,
+      );
+      const competing = retained.some(
+        ({ candidate }) =>
+          isCiObservation(candidate) &&
+          candidate !== exact?.candidate &&
+          candidate.identityUncertain !== true &&
+          candidate.reconciliationKey === parsedEntry.reconciliationKey &&
+          candidate.outputReference === parsedEntry.outputReference,
+      );
+      const ambiguous =
+        competing || previous.candidate.outputReference !== parsedEntry.outputReference;
+      if (exact)
+        return synced.map((manifest) => ({
+          ...manifest,
+          evidence: manifest.evidence.flatMap((candidate) => {
+            if (candidate === previous.candidate) return [];
+            if (candidate !== exact.candidate) return [candidate];
+            return [
+              {
+                ...parsedEntry,
+                sequence: candidate.sequence,
+                economics: mergeCiEconomics(
+                  parsedEntry.economics,
+                  candidate.economics,
+                  previous.candidate.economics,
+                  parsedEntry.result,
+                ),
+                identityUncertain: ambiguous,
+              },
+            ];
+          }),
+          updatedAt: Math.max(manifest.updatedAt, parsedEntry.timestamp),
+        }));
+      return synced.with(previous.manifestIndex, {
+        ...synced[previous.manifestIndex],
+        evidence: synced[previous.manifestIndex].evidence.with(previous.evidenceIndex, {
+          ...parsedEntry,
+          sequence: previous.candidate.sequence,
+          economics: mergeCiEconomics(
+            parsedEntry.economics,
+            previous.candidate.economics,
+            parsedEntry.economics,
+            parsedEntry.result,
+          ),
+          identityUncertain: ambiguous,
+        }),
+        updatedAt: Math.max(synced[previous.manifestIndex].updatedAt, parsedEntry.timestamp),
+      });
+    }
+    const archivedEntries = [
+      ...(rollup?.stateVersion !== undefined && rollup.stateVersion >= 3
+        ? rollup.archivedTombstones.filter((candidate) => candidate.metadataComplete)
+        : []),
+      ...(rollup?.archivedEvidence ?? []),
+    ];
+    const archivedLegacy = archivedEntries.filter(
+      (candidate) =>
+        candidate.metadataComplete &&
+        candidate.reconciliationDigest === parsedEntry.reconciliationKey &&
+        candidate.identityUncertain &&
+        candidate.referenceDigest === evidenceReferenceDigest(parsedEntry),
+    );
+    if (rollup && archivedLegacy?.length === 1) {
+      const stableCollision = archivedEntries.some(
+        (candidate) =>
+          candidate.identityDigest === evidenceIdentityDigest(parsedEntry.id) &&
+          !candidate.identityUncertain,
+      );
+      const competing =
+        (!stableCollision &&
+          archivedEntries.some(
+            (candidate) =>
+              candidate.reconciliationDigest === parsedEntry.reconciliationKey &&
+              !candidate.identityUncertain &&
+              candidate.referenceDigest === evidenceReferenceDigest(parsedEntry),
+          )) ||
+        retained.some(
+          ({ candidate }) =>
+            candidate.reconciliationKey === parsedEntry.reconciliationKey &&
+            candidate.identityUncertain !== true,
+        );
+      const ambiguous =
+        !stableCollision &&
+        (competing || archivedLegacy[0].referenceDigest !== evidenceReferenceDigest(parsedEntry));
+      const reconciledEntry = { ...parsedEntry, identityUncertain: ambiguous };
+      const reconciled = rekeyArchivedEconomicsEvidence(
+        rollup,
+        parsedEntry.reconciliationKey,
+        reconciledEntry,
+        ambiguous,
+      );
+      const index = synced.findIndex(
+        (manifest) =>
+          manifest.revision === revision && manifest.baseRevision === (baseRevision ?? null),
+      );
+      return recordTaskEvidence(
+        moveRollup(synced, reconciled, index),
+        revision,
+        acceptanceCriteria,
+        reconciledEntry,
+        baseRevision,
+      );
+    }
+  }
+  for (let manifestIndex = 0; manifestIndex < synced.length; manifestIndex += 1) {
+    const evidenceIndex = synced[manifestIndex].evidence.findIndex(
+      (candidate) => candidate.id === parsedEntry.id,
+    );
+    if (evidenceIndex < 0) continue;
+    const previous = synced[manifestIndex].evidence[evidenceIndex];
+    if (ciObservationContent(previous) !== ciObservationContent(parsedEntry))
+      throw new Error(`Evidence identity ${parsedEntry.id} was reused with different content.`);
+    if (parsedEntry.timestamp < previous.timestamp) return synced;
+    if (previous.result === parsedEntry.result && previous.timestamp === parsedEntry.timestamp)
+      return synced;
+    const replacement = {
+      ...parsedEntry,
+      sequence: previous.sequence,
+      economics:
+        parsedEntry.economics && previous.economics
+          ? {
+              ...parsedEntry.economics,
+              failedCommands: Math.max(
+                parsedEntry.economics.failedCommands,
+                previous.economics.failedCommands,
+              ),
+            }
+          : parsedEntry.economics,
+    };
+    return synced.with(manifestIndex, {
+      ...synced[manifestIndex],
+      evidence: synced[manifestIndex].evidence.with(evidenceIndex, replacement),
+      updatedAt: Math.max(synced[manifestIndex].updatedAt, parsedEntry.timestamp),
+    });
+  }
+  return recordTaskEvidence(synced, revision, acceptanceCriteria, parsedEntry, baseRevision);
+}
+
+export function reconcileCiEvidenceSnapshot(
+  manifests: EvidenceManifest[],
+  revision: string,
+  observations: TaskEvidence[],
+  baseRevision?: string,
+): EvidenceManifest[] {
+  const parsed = evidenceManifestsSchema.parse(manifests);
+  const snapshot = observations.map((entry) => taskEvidenceSchema.parse(entry));
+  if (snapshot.some((entry) => !isCiObservation(entry)))
+    throw new Error('CI snapshots require GitHub command evidence.');
+  const index = parsed.findIndex(
+    (manifest) =>
+      manifest.revision === revision &&
+      manifest.baseRevision === (baseRevision ?? null) &&
+      !manifest.stale,
+  );
+  if (index < 0) return parsed;
+  const active = new Set(snapshot.map((entry) => entry.id));
+  for (const observation of snapshot) {
+    const reconciled = matchingReconciledCiObservation(parsed[index].evidence, observation);
+    if (reconciled) active.add(reconciled.id);
+  }
+  const evicted = parsed[index].evidence.filter(
+    (entry) => isCiObservation(entry) && !active.has(entry.id),
+  );
+  if (!evicted.length) return parsed;
+  const rollup = rollUpEconomics(combinedRollup(parsed), evicted);
+  const moved = moveRollup(parsed, rollup, index);
+  return moved.with(index, {
+    ...moved[index],
+    evidence: moved[index].evidence.filter(
+      (entry) => !isCiObservation(entry) || active.has(entry.id),
+    ),
+    updatedAt: Math.max(moved[index].updatedAt, ...snapshot.map((entry) => entry.timestamp)),
   });
 }
 
@@ -467,31 +1273,32 @@ export function evidenceReadiness(
         ? 'Evidence for the current revision is missing or stale.'
         : 'Revision unknown.',
     };
-  const latest = new Map<string, TaskEvidence>();
-  for (const entry of manifest.evidence) {
-    const key = `${entry.kind}:${entry.name}`;
-    const previous = latest.get(key);
-    if (!previous || evidenceIsNewer(entry, previous)) latest.set(key, entry);
-  }
+  const latest = latestOutcomeEvidence(manifest.evidence);
   const missingGates: string[] = [];
   const failedGates: string[] = [];
   const pendingGates: string[] = [];
   for (const gate of requiredGates) {
-    const entry = latest.get(`gate:${gate}`);
+    const entry = latest.find((candidate) => candidate.kind === 'gate' && candidate.name === gate);
     if (!entry) missingGates.push(gate);
     else if (['failed', 'blocked'].includes(entry.result)) failedGates.push(gate);
     else if (entry.result !== 'passed') pendingGates.push(gate);
   }
-  const failedCommands = [...latest.values()]
-    .filter((entry) => entry.kind === 'command' && ['failed', 'blocked'].includes(entry.result))
-    .map((entry) => entry.name);
-  const pendingCommands = [...latest.values()]
-    .filter((entry) => entry.kind === 'command' && entry.result === 'pending')
-    .map((entry) => entry.name);
+  const failedCommands = [
+    ...new Set(
+      latest
+        .filter((entry) => entry.kind === 'command' && ['failed', 'blocked'].includes(entry.result))
+        .map((entry) => entry.name),
+    ),
+  ];
+  const pendingCommands = [
+    ...new Set(
+      latest
+        .filter((entry) => entry.kind === 'command' && entry.result === 'pending')
+        .map((entry) => entry.name),
+    ),
+  ];
   const verified = new Set(
-    [...latest.values()]
-      .filter((entry) => entry.result === 'passed')
-      .flatMap((entry) => entry.criteria),
+    latest.filter((entry) => entry.result === 'passed').flatMap((entry) => entry.criteria),
   );
   const unverifiedCriteria = acceptanceCriteria.filter((criterion) => !verified.has(criterion));
   const reason = failedCommands.length

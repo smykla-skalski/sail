@@ -14,6 +14,7 @@ e2e = ["dep:tauri-plugin-wdio", "dep:tauri-plugin-wdio-webdriver"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+serde_json = "1"
 
 [dependencies]
 tauri = { version = "2", features = ["unstable", "devtools"] }
@@ -21,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.6"
 sha2 = "0.11"
+dunce = "1.0.5"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
 tauri-plugin-wdio = { version = "1", optional = true }
 tauri-plugin-wdio-webdriver = { version = "1", optional = true }
@@ -30,9 +32,12 @@ portable-pty = "0.9.0"
 shell-words = "1.1.1"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+httpdate = "1"
 nix = { version = "0.31", features = ["signal"] }
 netstat2 = "0.11.2"
 sysinfo = { version = "0.39.0", default-features = false, features = ["system"] }
+wait-timeout = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
@@ -49,5 +54,5 @@ cairo-rs-gtk = { package = "cairo-rs", version = "0.18", features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39.1"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

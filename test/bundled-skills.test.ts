@@ -151,6 +151,15 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   );
   assert.match(handoff, /terminal delivery takeover from `claims\.md`/);
 
+  const claims = sailModeRule('Claims');
+  assert.match(claims, /Sail holds a visible claim with an exact claim ID for this task/);
+  assert.match(claims, /do not renew, take over or release Sail's claim; Sail does/);
+  assert.match(claims, /Without such a prompt, follow `claims\.md`/);
+  assert.match(
+    claims,
+    /active, unexpired `sail-claim:v1` marker on the issue is a conflicting claim/,
+  );
+
   const checkpoint = sailModeRule('Checkpoint');
   assert.match(checkpoint, /stop on a revision or delivery mismatch, except the merge handoff/);
   assert.match(checkpoint, /keeping the last phase before `complete`, with `status: blocked`/);
@@ -164,10 +173,7 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   assert.match(gateRouting, /`mechanism: inline` and `independence: not-applicable`/);
   const progress = sailModeRule('Progress');
   assert.match(progress, /NEEDS_FIXES, FAIL and CI fix rounds stay `running`/);
-  assert.match(
-    progress,
-    /when the review or test round cap stops the run, report `status: "blocked"`/,
-  );
+  assert.match(progress, /when the convergence budget stops the run, report `status: "blocked"`/);
   assert.match(shipItCore, /When they reject it because Sail does not track this thread/);
   assert.match(
     readFileSync(skillPath('sail', 'SKILL.md'), 'utf8'),

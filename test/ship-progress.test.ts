@@ -13,6 +13,7 @@ import {
   shipCleanupRequest,
   shipEvidenceReadiness,
   shipTaskThreadsSettled,
+  shipTaskReceiptIdsToProtect,
   shipActivity,
   reconciledShipGates,
   recoverValidationEvidence,
@@ -23,6 +24,7 @@ import {
   gateSnapshot,
   loadShipRuns,
   parseShipReport,
+  requireValidatorEconomics,
   refreshedIssueState,
   shipOwner,
   shipCheckpointOwner,
@@ -30,6 +32,9 @@ import {
   commitRevisionBoundValidation,
   shipIssuePresentation,
   shipMergeClaim,
+  shipOwnedThreadIds,
+  shipOwnershipQuietGeneration,
+  shipOwnershipQuietPass,
   shipStatus,
   sortShipIssues,
   validateGateVerdict,
@@ -41,6 +46,12 @@ import {
   type SpawnReceipt,
 } from '../src/lib/agent-results.ts';
 import { evidenceReadiness, recordTaskEvidence } from '../src/lib/task-evidence.ts';
+import {
+  emptyTaskEconomics,
+  summarizeTaskEconomics,
+  syntheticCiEconomics,
+} from '../src/lib/task-economics.ts';
+import { nativeSubagentReceipts, type NativeSubagentStore } from '../src/lib/native-subagents.ts';
 
 void test('reopened queued issues recover across restart without retrying worker failures', () => {
   const run = fixture();
@@ -66,6 +77,24 @@ void test('reopened queued issues recover across restart without retrying worker
     assert.equal(failed.state, 'failed');
     assert.equal(failed.issueState, 'OPEN');
   }
+});
+
+void test('status context identity survives Ship run persistence', () => {
+  const run = fixture();
+  run.issues[0].checks = [
+    {
+      name: 'external/build',
+      state: 'SUCCESS',
+      url: 'https://ci.test/build/1',
+      statusContextId: 'SC_kwDOStatusContext1',
+      identityUncertain: false,
+    },
+  ];
+
+  const restored = loadShipRuns(JSON.stringify([run]))[0];
+
+  assert.equal(restored.issues[0].checks?.[0].statusContextId, 'SC_kwDOStatusContext1');
+  assert.equal(restored.issues[0].checks?.[0].identityUncertain, false);
 });
 
 void test('validation drift leaves verdict and evidence uncommitted', async () => {
@@ -250,6 +279,10 @@ function withMergeEvidence(issue: ReturnType<typeof fixture>['issues'][number]) 
         timestamp: 10 + index,
         outputReference: `thread:${gate}`,
         criteria: issue.checkpoint!.acceptanceCriteria,
+        economics: {
+          ...emptyTaskEconomics('validator', gate === 'test-adversary' ? 'test' : 'review'),
+          checks: 1,
+        },
       }),
     issue.evidenceManifests ?? [],
   );
@@ -267,6 +300,7 @@ function withMergeEvidence(issue: ReturnType<typeof fixture>['issues'][number]) 
       timestamp: 20,
       outputReference: 'https://example.test/build',
       criteria: [],
+      economics: syntheticCiEconomics(),
     },
   );
   const requiredGates = issue.checkpoint!.requiredGates;
@@ -419,32 +453,42 @@ void test('durable gate receipts recover manifest evidence after restart', () =>
     selectedAt: 1,
     history: [],
   };
-  issue.gates = [
-    {
-      id: 'durable-receipt',
+  const economics = { ...emptyTaskEconomics('validator', 'test'), checks: 1 };
+  const receipt = validationReceipt();
+  Object.assign(receipt, {
+    receiptId: 'durable-receipt',
+    targetId: 'validator',
+    state: 'completed',
+    created: 10,
+    updated: 11,
+    validation: {
+      ...receipt.validation,
       gate: 'test-adversary',
-      requestedModel: 'test',
-      provider: 'codex',
-      model: 'test',
-      threadId: 'validator',
-      directory: '/worktree',
-      state: 'completed',
-      created: 10,
-      updated: 11,
-      error: null,
       verdict: 'PASS',
       revision: 'revision-one',
+      baseRevision: undefined,
       evidenceCriteria: issue.checkpoint!.acceptanceCriteria,
       evidenceOutputReference: 'thread:validator',
       evidenceTimestamp: 11,
+      evidenceEconomics: economics,
     },
-  ];
+  });
+  const restoredReceipt = loadSpawnReceipts(JSON.stringify(saveBoundedReceipt([], receipt)))[0];
+  issue.gates = [gateSnapshot(restoredReceipt)!];
 
   const recovered = recoverValidationEvidence(issue, undefined);
   assert.ok(recovered);
   Object.assign(issue, recovered);
+  const summary = summarizeTaskEconomics(
+    issue.evidenceManifests ?? [],
+    shipEvidenceReadiness(issue),
+    issue.evidenceRevision,
+  );
   assert.equal(issue.evidenceManifests?.[0]?.evidence[0]?.id, 'gate:durable-receipt');
+  assert.deepEqual(issue.evidenceManifests?.[0]?.evidence[0]?.economics, economics);
   assert.equal(shipEvidenceReadiness(issue).ready, true);
+  assert.equal(summary.economicsComplete, true);
+  assert.equal(summary.totals.checks, 1);
   assert.equal(recoverValidationEvidence(issue, undefined), null);
 });
 
@@ -784,6 +828,36 @@ void test('validation generation fence detects edit restore ABA', async () => {
   assert.equal(committed, false);
 });
 
+void test('restores durable coordination claims', () => {
+  const run = fixture();
+  run.issues[0].claimFencePending = true;
+  run.issues[0].claimRevalidationPending = true;
+  run.issues[0].claimHandoffPending = true;
+  run.issues[0].claim = {
+    id: 'claim-1',
+    instanceId: 'instance-a',
+    holder: 'Sail codex (run)',
+    task: 'ship:run:first',
+    acquiredAt: '2026-10-07T10:00:00.000Z',
+    heartbeatAt: '2026-10-07T10:01:00.000Z',
+    expiresAt: '2026-10-07T10:03:00.000Z',
+    status: 'active',
+    takeoverOf: 'expired-claim',
+    commentId: 99,
+    commentUpdatedAtMillis: 1_780_827_660_000,
+  };
+
+  assert.equal(loadShipRuns(JSON.stringify([run]))[0].issues[0].claimFencePending, true);
+  assert.equal(loadShipRuns(JSON.stringify([run]))[0].issues[0].claimRevalidationPending, true);
+  assert.equal(loadShipRuns(JSON.stringify([run]))[0].issues[0].claimHandoffPending, true);
+  assert.deepEqual(loadShipRuns(JSON.stringify([run]))[0].issues[0].claim, run.issues[0].claim);
+  delete run.issues[0].claim.commentUpdatedAtMillis;
+  assert.equal(
+    loadShipRuns(JSON.stringify([run]))[0].issues[0].claim?.commentUpdatedAtMillis,
+    undefined,
+  );
+});
+
 void test('persists canonical task checkpoints with Ship runs', () => {
   const run = fixture();
   run.issues[0].checkpoint!.objective = 'Concrete objective';
@@ -792,6 +866,106 @@ void test('persists canonical task checkpoints with Ship runs', () => {
   const restored = loadShipRuns(JSON.stringify([run]));
 
   assert.deepEqual(restored[0].issues[0].checkpoint, run.issues[0].checkpoint);
+});
+
+void test('persists bounded context handoff evidence with Ship runs', () => {
+  const run = fixture();
+  Object.assign(run.issues[0], {
+    contextCompactions: { codex: 2 },
+    contextEventIds: ['compaction-1'],
+    contextPercent: 86,
+    contextPercentByThread: { old: 86, child: 90 },
+    handoffRecoveryRequired: true,
+    retryCount: 1,
+    lostStateFailures: 0,
+    contextHandoffs: [
+      {
+        id: 'handoff-1',
+        provider: 'codex',
+        fromThreadId: 'old',
+        toThreadId: 'new',
+        context: 86,
+        compactions: 2,
+        checkpointSequence: 4,
+        revision: 'abc',
+        offeredAt: 10,
+        startedAt: 11,
+        retriesBefore: 1,
+        lostStateFailuresBefore: 0,
+        retriesAfter: null,
+        lostStateFailuresAfter: null,
+        outcome: 'pending',
+        error: null,
+      },
+    ],
+  });
+
+  const restored = loadShipRuns(JSON.stringify([run]))[0].issues[0];
+
+  assert.deepEqual(restored.contextCompactions, { codex: 2 });
+  assert.equal(restored.contextHandoffs?.[0].toThreadId, 'new');
+  assert.deepEqual(restored.contextPercentByThread, { old: 86, child: 90 });
+  assert.equal(restored.handoffRecoveryRequired, true);
+  assert.equal(restored.retryCount, 1);
+});
+
+void test('retires stale pending handoff offers during recovery', () => {
+  const run = fixture();
+  run.issues[0].threadId = 'current';
+  run.issues[0].contextHandoffs = [
+    {
+      id: 'stale',
+      provider: 'codex',
+      fromThreadId: 'old',
+      toThreadId: null,
+      context: 90,
+      compactions: 1,
+      checkpointSequence: 2,
+      revision: 'abc',
+      offeredAt: 10,
+      startedAt: null,
+      retriesBefore: 0,
+      lostStateFailuresBefore: 0,
+      retriesAfter: null,
+      lostStateFailuresAfter: null,
+      outcome: 'pending',
+      error: null,
+    },
+  ];
+
+  const restored = loadShipRuns(JSON.stringify([run]))[0].issues[0].contextHandoffs?.[0];
+
+  assert.equal(restored?.outcome, 'failed');
+  assert.equal(restored?.error, 'Retired stale handoff offer during recovery.');
+});
+
+void test('normalizes legacy handoff reduction claims to no regression', () => {
+  const run = fixture();
+  const legacy = JSON.parse(JSON.stringify(run));
+  legacy.issues[0].contextHandoffs = [
+    {
+      id: 'settled',
+      provider: 'codex',
+      fromThreadId: 'old',
+      toThreadId: 'new',
+      context: 90,
+      compactions: 1,
+      checkpointSequence: 2,
+      revision: 'abc',
+      offeredAt: 10,
+      startedAt: 11,
+      retriesBefore: 1,
+      lostStateFailuresBefore: 0,
+      retriesAfter: 1,
+      lostStateFailuresAfter: 0,
+      outcome: 'reduced',
+      error: null,
+    },
+  ];
+
+  const restored = loadShipRuns(JSON.stringify([legacy]));
+
+  assert.equal(restored[0].issues[0].contextHandoffs?.[0].outcome, 'no_regression');
 });
 
 void test('checkpoint ownership follows same-worktree handoff ancestry', () => {
@@ -874,6 +1048,475 @@ void test('persists the selected revision-bound validation policy', () => {
 
   assert.deepEqual(restored[0].issues[0].validationPolicy, run.issues[0].validationPolicy);
   assert.deepEqual(restored[0].issues[0].shippingTarget, run.issues[0].shippingTarget);
+});
+
+void test('late retired-worker children block cleanup without restoring retired checkpoint authority', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  issue.path = '/worktree';
+  issue.threadId = 'new';
+  issue.receiptId = 'new-receipt';
+  issue.contextHandoffs = [
+    {
+      id: 'handoff-1',
+      provider: 'codex',
+      fromThreadId: 'old',
+      toThreadId: 'new',
+      context: 86,
+      compactions: 0,
+      checkpointSequence: 2,
+      revision: 'abc',
+      offeredAt: 10,
+      startedAt: 11,
+      retriesBefore: 0,
+      lostStateFailuresBefore: 0,
+      retriesAfter: null,
+      lostStateFailuresAfter: null,
+      outcome: 'pending',
+      error: null,
+    },
+  ];
+  const receipts = [
+    { receiptId: 'old-receipt', targetId: 'old', state: 'completed' as const },
+    { receiptId: 'new-receipt', targetId: 'new', state: 'completed' as const },
+  ];
+  const lateChild = {
+    receiptId: 'native:codex:late-child',
+    sourceId: 'old',
+    sourceDirectory: '/worktree',
+    targetId: 'late-child',
+    targetDirectory: '/worktree',
+    state: 'working' as const,
+  };
+
+  assert.equal(shipCheckpointOwner([run], '/worktree', 'old'), undefined);
+  assert.equal(
+    authorizeShipCheckpointThread([run], '/worktree', 'old', '/worktree', 'late-child'),
+    false,
+  );
+  assert.equal(shipCheckpointOwner([run], '/worktree', 'late-child'), undefined);
+  assert.equal(
+    shipTaskThreadsSettled(issue, { old: 'completed', new: 'completed', 'late-child': 'working' }, [
+      ...receipts,
+      lateChild,
+    ]),
+    false,
+  );
+  assert.equal(
+    shipTaskThreadsSettled(
+      issue,
+      { old: 'completed', new: 'completed', 'late-child': 'completed' },
+      [...receipts, { ...lateChild, state: 'completed' }],
+    ),
+    true,
+  );
+});
+
+void test('post-handoff OpenCode descendants invalidate cleanup and block deletion while active', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/worktree';
+  issue.threadId = 'opencode:new';
+  issue.receiptId = 'new-receipt';
+  issue.contextHandoffs = [
+    {
+      id: 'handoff-1',
+      provider: 'opencode',
+      fromThreadId: 'opencode:old',
+      toThreadId: 'opencode:new',
+      context: 86,
+      compactions: 0,
+      checkpointSequence: 2,
+      revision: 'abc',
+      offeredAt: 10,
+      startedAt: 11,
+      retriesBefore: 0,
+      lostStateFailuresBefore: 0,
+      retriesAfter: null,
+      lostStateFailuresAfter: null,
+      outcome: 'pending',
+      error: null,
+    },
+  ];
+  const receipts = [
+    {
+      receiptId: 'old-receipt',
+      targetId: 'opencode:old',
+      state: 'completed' as const,
+    },
+    {
+      receiptId: 'new-receipt',
+      targetId: 'opencode:new',
+      state: 'completed' as const,
+    },
+  ];
+  const lateChild = 'opencode:late-child';
+
+  assert.notEqual(
+    shipOwnershipQuietGeneration(3, 5, []),
+    shipOwnershipQuietGeneration(3, 5, [lateChild]),
+  );
+  assert.equal(
+    shipTaskThreadsSettled(
+      issue,
+      {
+        'opencode:old': 'completed',
+        'opencode:new': 'completed',
+        [lateChild]: 'working',
+      },
+      receipts,
+      [lateChild],
+    ),
+    false,
+  );
+  assert.equal(
+    shipTaskThreadsSettled(
+      issue,
+      {
+        'opencode:old': 'completed',
+        'opencode:new': 'completed',
+        [lateChild]: 'completed',
+      },
+      receipts,
+      [lateChild],
+    ),
+    true,
+  );
+});
+
+void test('handoff ownership includes every authorized descendant exactly once', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/worktree';
+  issue.threadId = 'owner';
+  issue.checkpointThreadIds = ['authorized', 'authorized'];
+  const receipts = [
+    {
+      sourceId: 'owner',
+      sourceDirectory: '/worktree',
+      targetId: 'child',
+      targetDirectory: '/worktree',
+    },
+    {
+      sourceId: 'child',
+      sourceDirectory: '/worktree',
+      targetId: 'grandchild',
+      targetDirectory: '/worktree',
+    },
+  ];
+
+  assert.deepEqual(shipOwnedThreadIds(issue, receipts), [
+    'owner',
+    'authorized',
+    'child',
+    'grandchild',
+  ]);
+});
+
+void test('handoff ownership includes provider-native descendants', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/worktree';
+  issue.threadId = 'acp:codex:owner';
+  const native: NativeSubagentStore = {
+    'codex:child': {
+      id: 'codex:child',
+      agent: 'codex',
+      directory: '/worktree',
+      sessionId: 'child',
+      parentSessionId: 'owner',
+      rootSessionId: 'owner',
+      name: 'Child',
+      task: 'Continue delegated work',
+      outcome: 'working',
+      activity: 'Working…',
+      transcript: [],
+      created: 1,
+      updated: 2,
+      restored: false,
+    },
+  };
+
+  const owned = shipOwnedThreadIds(issue, nativeSubagentReceipts(native));
+
+  assert.deepEqual(owned, ['acp:codex:owner', 'acp:codex:child']);
+});
+
+void test('provider-native descendants inherit checkpoint authorization', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  issue.path = '/worktree';
+  issue.threadId = 'acp:codex:owner';
+  const native: NativeSubagentStore = {
+    'codex:child': {
+      id: 'codex:child',
+      agent: 'codex',
+      directory: '/worktree',
+      sessionId: 'child',
+      parentSessionId: 'owner',
+      rootSessionId: 'owner',
+      name: 'Child',
+      task: 'Continue delegated work',
+      outcome: 'working',
+      activity: 'Working…',
+      transcript: [],
+      created: 1,
+      updated: 2,
+      restored: false,
+    },
+  };
+  const receipt = nativeSubagentReceipts(native)[0];
+
+  assert.equal(
+    authorizeShipCheckpointThread(
+      [run],
+      receipt.sourceDirectory,
+      receipt.sourceId,
+      receipt.targetDirectory,
+      receipt.targetId,
+    ),
+    true,
+  );
+  assert.equal(shipCheckpointOwner([run], '/worktree', 'acp:codex:child')?.issue, issue);
+});
+
+void test('handoff ownership expands descendants of retired handoff sources', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/worktree';
+  issue.threadId = 'replacement';
+  issue.contextHandoffs = [
+    {
+      id: 'handoff-one',
+      provider: 'codex',
+      fromThreadId: 'retired-owner',
+      toThreadId: 'replacement',
+      context: 90,
+      compactions: 0,
+      checkpointSequence: 1,
+      revision: 'revision',
+      offeredAt: 1,
+      startedAt: 2,
+      retriesBefore: 0,
+      lostStateFailuresBefore: 0,
+      retriesAfter: null,
+      lostStateFailuresAfter: null,
+      outcome: 'pending',
+      error: null,
+    },
+  ];
+  const receipts = [
+    {
+      sourceId: 'retired-owner',
+      sourceDirectory: '/worktree',
+      targetId: 'late-child',
+      targetDirectory: '/worktree',
+    },
+  ];
+
+  assert.deepEqual(shipOwnedThreadIds(issue, receipts), [
+    'replacement',
+    'retired-owner',
+    'late-child',
+  ]);
+});
+
+void test('worktree cleanup waits for provider-native descendants', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/worktree';
+  issue.threadId = 'acp:codex:owner';
+  issue.receiptId = 'owner-receipt';
+  const receipts = [
+    {
+      receiptId: 'owner-receipt',
+      sourceId: 'source',
+      sourceDirectory: '/worktree',
+      targetId: 'acp:codex:owner',
+      targetDirectory: '/worktree',
+      state: 'completed' as const,
+    },
+    {
+      receiptId: 'native:codex:child',
+      sourceId: 'acp:codex:owner',
+      sourceDirectory: '/worktree',
+      targetId: 'acp:codex:child',
+      targetDirectory: '/worktree',
+      state: 'working' as const,
+    },
+  ];
+
+  assert.equal(
+    shipTaskThreadsSettled(
+      issue,
+      { 'acp:codex:owner': 'completed', 'acp:codex:child': 'working' },
+      receipts,
+    ),
+    false,
+  );
+  assert.equal(
+    shipTaskThreadsSettled(
+      issue,
+      { 'acp:codex:owner': 'completed', 'acp:codex:child': 'completed' },
+      [{ ...receipts[0] }, { ...receipts[1], state: 'completed' }],
+    ),
+    true,
+  );
+});
+
+void test('ownership needs a generation-stable quiet pass', () => {
+  assert.deepEqual(shipOwnershipQuietPass(null, 1, false), {
+    settled: false,
+    nextGeneration: 1,
+  });
+  assert.deepEqual(shipOwnershipQuietPass(1, 2, true), {
+    settled: false,
+    nextGeneration: null,
+  });
+  assert.deepEqual(shipOwnershipQuietPass(null, 2, false), {
+    settled: false,
+    nextGeneration: 2,
+  });
+  assert.deepEqual(shipOwnershipQuietPass(2, 2, false), {
+    settled: true,
+    nextGeneration: 2,
+  });
+  assert.deepEqual(shipOwnershipQuietPass(2, 3, false), {
+    settled: false,
+    nextGeneration: 3,
+  });
+});
+
+void test('task settlement waits for every durable coordination dispatch', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/repo/task';
+  issue.threadId = 'opencode:owner';
+  issue.receiptId = 'owner';
+
+  assert.equal(
+    shipTaskThreadsSettled(issue, { 'opencode:owner': 'unavailable' }, [
+      {
+        receiptId: 'owner',
+        targetId: 'opencode:owner',
+        targetDirectory: '/repo/task',
+        state: 'completed',
+      },
+      {
+        receiptId: 'coordination',
+        targetId: 'opencode:owner',
+        targetDirectory: '/repo/task',
+        state: 'working',
+        dispatchPending: true,
+      },
+    ]),
+    false,
+  );
+});
+
+void test('active task receipts and claims bypass the receipt bound', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/repo/task';
+  issue.threadId = 'opencode:owner';
+  const terminal = Array.from({ length: 250 }, (_, index) => ({
+    receiptId: `terminal-${index}`,
+    targetId: 'opencode:owner',
+    targetDirectory: '/repo/task',
+    state: 'completed' as const,
+  }));
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(issue, [
+      ...terminal,
+      {
+        receiptId: 'working',
+        targetId: 'opencode:owner',
+        targetDirectory: '/repo/task',
+        state: 'working',
+      },
+      {
+        receiptId: 'pending',
+        targetId: 'opencode:owner',
+        targetDirectory: '/repo/task',
+        state: 'failed',
+        dispatchPending: true,
+      },
+    ]),
+    ['working', 'pending'],
+  );
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(
+      { ...issue, receiptId: 'settled-owner', state: 'failed', workerSettled: true },
+      [
+        {
+          receiptId: 'settled-owner',
+          targetId: 'opencode:owner',
+          targetDirectory: '/repo/task',
+          state: 'failed',
+        },
+      ],
+    ),
+    [],
+  );
+  const activeClaim = {
+    id: 'active-claim',
+    instanceId: 'sail-a',
+    holder: 'Sail',
+    task: 'ship:run:first',
+    acquiredAt: '2026-10-07T10:00:00.000Z',
+    heartbeatAt: '2026-10-07T10:01:00.000Z',
+    expiresAt: '2026-10-07T10:03:00.000Z',
+    status: 'active' as const,
+    commentId: 99,
+  };
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(
+      {
+        ...issue,
+        receiptId: 'settled-owner',
+        state: 'failed',
+        workerSettled: true,
+        claim: activeClaim,
+      },
+      [
+        {
+          receiptId: 'settled-owner',
+          targetId: 'opencode:owner',
+          targetDirectory: '/repo/task',
+          state: 'failed',
+        },
+      ],
+    ),
+    ['settled-owner'],
+  );
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(
+      {
+        ...issue,
+        path: null,
+        receiptId: 'settled-owner',
+        state: 'merged',
+        workerSettled: true,
+        claim: activeClaim,
+      },
+      [
+        {
+          receiptId: 'settled-owner',
+          targetId: 'opencode:owner',
+          targetDirectory: '/repo/task',
+          state: 'completed',
+        },
+      ],
+    ),
+    ['settled-owner'],
+  );
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(
+      { ...issue, receiptId: 'unsettled-owner', state: 'failed', workerSettled: false },
+      [
+        {
+          receiptId: 'unsettled-owner',
+          targetId: 'opencode:owner',
+          targetDirectory: '/repo/task',
+          state: 'failed',
+        },
+      ],
+    ),
+    ['unsettled-owner'],
+  );
 });
 
 void test('dependency failure blocks only dependents and merged dependencies become queued', () => {
@@ -968,6 +1611,14 @@ void test('merge readiness rejects missing, failed, and stale revision evidence'
 
   Object.assign(issue, mergeEvidence);
   assert.equal(shipEvidenceReadiness(issue).ready, true);
+  const economics = summarizeTaskEconomics(
+    issue.evidenceManifests ?? [],
+    shipEvidenceReadiness(issue),
+    issue.evidenceRevision,
+  );
+  assert.equal(economics.accepted, true);
+  assert.equal(economics.economicsComplete, true);
+  assert.equal(economics.totals.checks, issue.checkpoint!.requiredGates.length + 1);
   assert.equal(shipIssuePresentation(run, issue).nextAction, 'Merge the pull request');
   assert.equal(shipMergeClaim(issue), 'Ready for merge');
 
@@ -1227,16 +1878,36 @@ for (const [name, report] of [
 }
 
 void test('accepts typed stage and verdict reports, with gate-specific verdicts', () => {
+  const reviewEconomics = {
+    ...emptyTaskEconomics('validator', 'review'),
+    checks: 1,
+  };
   assert.deepEqual(parseShipReport({ stage: 'ci', status: 'blocked', reason: 'Check failed' }), {
     stage: 'ci',
     status: 'blocked',
     reason: 'Check failed',
   });
-  assert.deepEqual(parseShipReport({ verdict: 'CLEAN' }), { verdict: 'CLEAN' });
-  assert.deepEqual(parseShipReport({ gate: 'code-adversary', verdict: 'CLEAN' }), {
-    gate: 'code-adversary',
+  assert.deepEqual(parseShipReport({ verdict: 'CLEAN', economics: reviewEconomics }), {
     verdict: 'CLEAN',
+    economics: reviewEconomics,
   });
+  assert.deepEqual(
+    parseShipReport({ gate: 'code-adversary', verdict: 'CLEAN', economics: reviewEconomics }),
+    {
+      gate: 'code-adversary',
+      verdict: 'CLEAN',
+      economics: reviewEconomics,
+    },
+  );
+  const legacy = parseShipReport({ verdict: 'CLEAN' });
+  assert.doesNotThrow(() => requireValidatorEconomics(legacy, true));
+  assert.throws(() => requireValidatorEconomics(legacy, false));
+  assert.throws(() =>
+    parseShipReport({
+      verdict: 'CLEAN',
+      economics: { ...emptyTaskEconomics('primary', 'review'), checks: 1 },
+    }),
+  );
   assert.throws(() => validateGateVerdict('code-adversary', 'PASS'));
   assert.throws(() => validateGateVerdict('test-adversary', 'CLEAN'));
   assert.doesNotThrow(() => validateGateVerdict('test-adversary', 'PASS'));

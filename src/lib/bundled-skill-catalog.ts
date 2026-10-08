@@ -30,6 +30,8 @@ export const bundledSkillReferences = {
     'risk-policy.json',
     'release.md',
     'release-policy.json',
+    'convergence.md',
+    'convergence-policy.json',
     'ci-triage.md',
     'ci-triage.schema.json',
     'fallbacks.md',

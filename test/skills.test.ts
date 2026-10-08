@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   matchingSkills,
@@ -10,6 +11,27 @@ import {
   skillQuery,
 } from '../src/lib/skills.ts';
 import { validationSettingsKey } from '../src/lib/cross-validation.ts';
+import { slashCommands } from '../src/lib/slash-commands.ts';
+
+const shipItCore = readFileSync(new URL('../skills/ship-it/SKILL.md', import.meta.url), 'utf8');
+const convergence = readFileSync(
+  new URL('../skills/ship-it/references/convergence.md', import.meta.url),
+  'utf8',
+);
+const convergencePolicy = JSON.parse(
+  readFileSync(
+    new URL('../skills/ship-it/references/convergence-policy.json', import.meta.url),
+    'utf8',
+  ),
+);
+const prLoop = readFileSync(
+  new URL('../skills/ship-it/references/pr-loop.md', import.meta.url),
+  'utf8',
+);
+const shipItOpenAi = readFileSync(
+  new URL('../skills/ship-it/agents/openai.yaml', import.meta.url),
+  'utf8',
+);
 
 const skills = [
   { id: 'one', name: 'ship-issue', description: 'Ship a GitHub issue' },
@@ -26,6 +48,60 @@ void test('progressive skills keep references discoverable without injecting the
   assert.match(instructions, /skill_reference/);
   assert.match(instructions, /SHA-256/);
   assert.doesNotMatch(instructions, /reference body/);
+});
+
+void test('ship-it uses one bounded convergence contract across delivery phases', () => {
+  assert.match(
+    shipItCore,
+    /Before validation, read \[references\/convergence\.md\]\(references\/convergence\.md\) and \[references\/convergence-policy\.json\]/,
+  );
+  assert.match(shipItCore, /validation exceeds the convergence budget/);
+  assert.match(prLoop, /consumes its remaining fix\/cycle budget/);
+  assert.match(prLoop, /Never reset its counters for CI or hosted feedback/);
+
+  const bounded = convergencePolicy.modes.bounded;
+  assert.equal(convergencePolicy.default_mode, 'bounded');
+  assert.equal(bounded.max_elapsed_minutes, 90);
+  assert.deepEqual(
+    [bounded.review.code_adversary_passes, bounded.review.findings_challenge_passes],
+    [1, 1],
+  );
+  assert.equal(bounded.review.max_cycles, 2);
+  assert.equal(bounded.fixes.max_passes, 1);
+  assert.equal(bounded.full_quality_gate_runs, 1);
+  assert.deepEqual(bounded.review.rereview_triggers, [
+    'security',
+    'data-loss',
+    'destructive-concurrency',
+    'unresolved-acceptance',
+  ]);
+  assert.equal(bounded.later_non_blocking_findings, 'follow-up-issue');
+
+  assert.match(
+    convergence,
+    /one Code Adversary pass followed by one independent Findings challenge/,
+  );
+  assert.match(convergence, /at most one fix pass/);
+  assert.match(
+    convergence,
+    /complete local quality gate once against the final candidate revision/,
+  );
+  assert.match(convergence, /a second review cycle or 90 elapsed minutes would be exceeded/);
+  assert.match(convergence, /convert later non-blocking findings into follow-up issues/);
+  assert.match(convergence, /repository-required check, mandatory human approval/);
+});
+
+void test('exhaustive review is explicit and Copilot is never a delivery gate', () => {
+  assert.equal(convergencePolicy.modes.exhaustive.activation, 'explicit-user-request');
+  assert.match(
+    convergence,
+    /only when the user's current request explicitly asks for exhaustive review/,
+  );
+  assert.match(convergence, /never bypasses repository checks/);
+  assert.match(convergence, /Never wait for Copilot/);
+  assert.equal(convergencePolicy.copilot.wait, false);
+  assert.doesNotMatch(shipItCore, /CI or Copilot is pending/);
+  assert.doesNotMatch(shipItOpenAi, /Copilot review/);
 });
 
 void test('slash matches names and closes after arguments begin', () => {
@@ -58,6 +134,43 @@ void test('a selected skill resolves from a prompt with arguments', () => {
   assert.equal(promptSkill(skills, 'Example:\n> /review'), undefined);
   assert.equal(promptSkill(skills, '> Example\n/review'), undefined);
   assert.equal(promptSkill(skills, '> Example\n\n/review')?.id, 'two');
+});
+
+void test('nested list fences hide code until a valid indented closing fence', () => {
+  const prompt = [
+    '- Outer item',
+    '  - ```text',
+    '    /review',
+    '    - ```',
+    '    /review',
+    '    ```js',
+    '    /review',
+    '    ```   ',
+    '  /ship-issue #42',
+  ].join('\n');
+  assert.deepEqual(
+    slashCommands(prompt).map((command) => command.name),
+    ['ship-issue'],
+  );
+  assert.equal(promptSkill(skills, prompt)?.id, 'one');
+
+  const continuation = '- Item\n  ```\n  /review\n  ```\n/review';
+  assert.deepEqual(
+    slashCommands(continuation).map((command) => command.name),
+    ['review'],
+  );
+
+  const deepList = '- Outer\n    - ```\n      /review\n      ```\n      /ship-issue';
+  assert.deepEqual(
+    slashCommands(deepList).map((command) => command.name),
+    ['ship-issue'],
+  );
+
+  const outdented = '- Item\n  ```\n  /review\n/review';
+  assert.deepEqual(
+    slashCommands(outdented).map((command) => command.name),
+    ['review'],
+  );
 });
 
 void test('bundled skills fill missing names without replacing installed skills', () => {

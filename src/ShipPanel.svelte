@@ -16,6 +16,12 @@
     shipStatus,
     sortShipIssues,
   } from './lib/ship-progress';
+  import {
+    exportTaskEconomics,
+    summarizeTaskEconomics,
+    totalEconomicsTokens,
+    type TaskEconomicsSummary,
+  } from './lib/task-economics.ts';
 
   let {
     repository,
@@ -26,6 +32,7 @@
     onrefresh,
     onopen,
     onsettings,
+    onhandoff,
     nativeSubagents = [],
   }: {
     repository: string;
@@ -36,6 +43,7 @@
     onrefresh: () => Promise<void>;
     onopen: (path: string, threadId?: string | null) => Promise<void>;
     onsettings: () => Promise<void>;
+    onhandoff: (run: ShipRun, issue: ShipIssue) => Promise<void>;
     nativeSubagents?: NativeSubagent[];
   } = $props();
   let error = $state('');
@@ -115,6 +123,48 @@
     const latest = gates.toSorted((left, right) => right.updated - left.updated)[0];
     return `${latest.gate.replaceAll('-', ' ')} · ${latest.verdict ?? latest.state}`;
   }
+  function exportEconomics(owner: ShipRun) {
+    const exported = exportTaskEconomics(
+      owner.issues.map((item) => ({
+        task: item.id,
+        acceptedRevision: item.evidenceRevision,
+        manifests: item.evidenceManifests ?? [],
+        outcomeAccepted: shipEvidenceReadiness(item).ready,
+      })),
+    );
+    const link = document.createElement('a');
+    const href = URL.createObjectURL(
+      new Blob([JSON.stringify(exported, null, 2)], { type: 'application/json' }),
+    );
+    link.href = href;
+    link.download = `sail-task-economics-${owner.id}.json`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(href), 0);
+  }
+
+  function duration(milliseconds: number): string {
+    if (milliseconds < 1_000) return `${milliseconds} ms`;
+    if (milliseconds < 60_000) return `${(milliseconds / 1_000).toFixed(1)} s`;
+    return `${(milliseconds / 60_000).toFixed(1)} min`;
+  }
+
+  function incompleteEconomicsReason(economics: TaskEconomicsSummary): string {
+    const reasons: string[] = [];
+    if (economics.missingSamples > 0)
+      reasons.push(`${economics.missingSamples} evidence records lack metrics`);
+    if (!economics.identityCoverageComplete)
+      reasons.push('archived identity coverage was truncated');
+    if (!economics.attributionCoverageComplete)
+      reasons.push('provider/model attribution was compacted into overflow buckets');
+    if (economics.overflowed) reasons.push('one or more totals exceeded the safe integer limit');
+    return `Lifetime economics are incomplete: ${reasons.join('; ')}.`;
+  }
+
+  function coordinationClaim(item: ShipIssue): string {
+    if (!item.claim) return item.state === 'pending' ? 'Not acquired' : 'Unavailable';
+    if (item.claim.status === 'released') return 'Released';
+    return Date.parse(item.claim.expiresAt) > Date.now() ? 'Active' : 'Expired';
+  }
 </script>
 
 {#snippet dependencies(owner: ShipRun, item: ShipIssue)}
@@ -144,6 +194,7 @@
       <button onclick={() => act(onrefresh)} disabled={busy}
         >{busy ? 'Refreshing…' : 'Refresh'}</button
       >
+      {#if run}<button onclick={() => exportEconomics(run)}>Export task economics</button>{/if}
       <button onclick={() => act(onsettings)}>Validation settings</button>
       <button aria-label="Close Ship runs" onclick={onclose}>Close</button>
     </div>
@@ -240,6 +291,7 @@
             <span class="ship-latest"><b>Latest</b> {activity.title} · {activity.detail}</span>
             <span class="ship-next"><b>Next</b> {presentation.nextAction}</span>
             <span class="ship-claims" aria-label={`Issue ${item.number} recorded states`}>
+              <span><b>Claim</b>{coordinationClaim(item)}</span>
               <span><b>Worker</b>{workerClaim(item)}</span>
               <span><b>Review</b>{gateClaim(item)}</span>
               <span><b>CI</b>{ciStatus(item.checks)}</span>
@@ -263,9 +315,26 @@
     />
     <div class="ship-content">
       {#if issue}
+        {@const pendingHandoff = issue.contextHandoffs?.findLast(
+          (handoff) =>
+            handoff.fromThreadId === issue.threadId &&
+            !handoff.toThreadId &&
+            handoff.outcome === 'pending',
+        )}
+        {@const recoveryHandoff = issue.contextHandoffs?.findLast(
+          (handoff) =>
+            issue.handoffRecoveryRequired === true &&
+            handoff.toThreadId === issue.threadId &&
+            handoff.outcome === 'pending',
+        )}
         {@const evidence = shipEvidenceReadiness(issue)}
         {@const manifest = (issue.evidenceManifests ?? []).find(
           (candidate) => candidate.revision === issue.evidenceRevision && !candidate.stale,
+        )}
+        {@const economics = summarizeTaskEconomics(
+          issue.evidenceManifests ?? [],
+          evidence,
+          issue.evidenceRevision,
         )}
         <section
           id={detailId}
@@ -316,6 +385,20 @@
           </p>
           {#if issue.archivePath}<p class="ship-path">Archived files: {issue.archivePath}</p>{/if}
           {@render dependencies(run, issue)}
+          <h4>Coordination claim</h4>
+          {#if issue.claim}
+            <p>{issue.claim.holder} · {issue.claim.task} · {coordinationClaim(issue)}</p>
+            <p>
+              Acquired {new Date(issue.claim.acquiredAt).toLocaleString()} · heartbeat {new Date(
+                issue.claim.heartbeatAt,
+              ).toLocaleString()} · expires {new Date(issue.claim.expiresAt).toLocaleString()}
+            </p>
+            {#if issue.claim.takeoverOf}<p>Audited takeover of {issue.claim.takeoverOf}</p>{/if}
+            {#if issue.claim.releasedAt}<p>
+                Released {new Date(issue.claim.releasedAt).toLocaleString()} ·
+                {issue.claim.releaseReason}
+              </p>{/if}
+          {:else}<p class="ship-muted">No visible claim recorded.</p>{/if}
           <h4>Implementation</h4>
           <p>Worker: {run.provider} / {resolvedWorkerModel(issue) ?? 'Unknown model'}</p>
           <p>
@@ -326,6 +409,48 @@
               ? ' · Attribution uncertain'
               : ''}
           </p>
+          {#if pendingHandoff}<section class="ship-handoff" aria-label="Context handoff">
+              <h4>Context handoff</h4>
+              <p>
+                Context reached {pendingHandoff.context}% after {pendingHandoff.compactions}
+                compaction{pendingHandoff.compactions === 1 ? '' : 's'}.
+              </p>
+              <button
+                disabled={(issue.checkpoint?.sequence ?? 0) <= pendingHandoff.checkpointSequence}
+                onclick={() => act(() => onhandoff(run!, issue!))}>Start fresh worker</button
+              >
+              {#if (issue.checkpoint?.sequence ?? 0) <= pendingHandoff.checkpointSequence}<p
+                  class="ship-muted"
+                >
+                  Waiting for the current worker to update the canonical checkpoint.
+                </p>{/if}
+            </section>{/if}
+          {#if recoveryHandoff}<section class="ship-handoff" aria-label="Context handoff recovery">
+              <h4>Context handoff needs inspection</h4>
+              <p>
+                Open the worker session and inspect its transcript. Retry only if its uncertain work
+                must not be adopted.
+              </p>
+              <button onclick={() => act(() => onhandoff(run!, issue!))}
+                >Cancel inspected session and retry</button
+              >
+            </section>{/if}
+          {#if issue.contextHandoffs?.length}<details>
+              <summary>Context history</summary>
+              <p>
+                Compactions: Claude {issue.contextCompactions?.claude ?? 0} · Codex
+                {issue.contextCompactions?.codex ?? 0} · OpenCode
+                {issue.contextCompactions?.opencode ?? 0}
+              </p>
+              <ol>
+                {#each issue.contextHandoffs as handoff (handoff.id)}<li>
+                    {handoff.provider} · {handoff.context}% · {handoff.outcome.replaceAll('_', ' ')} ·
+                    retries
+                    {handoff.retriesBefore}→{handoff.retriesAfter ?? 'pending'} · lost-state
+                    {handoff.lostStateFailuresBefore}→{handoff.lostStateFailuresAfter ?? 'pending'}
+                  </li>{/each}
+              </ol>
+            </details>{/if}
           <h4>Revision evidence</h4>
           <p class:ship-error={!evidence.ready}>
             {issue.evidenceRevision ?? 'Revision unknown'} ·
@@ -374,6 +499,74 @@
               </div>
             </dl>
           {:else}<p class="ship-muted">Risk not selected. Validation cannot start.</p>{/if}
+          <h4>Accepted-task economics</h4>
+          <p class:ship-error={!economics.accepted}>
+            {economics.accepted
+              ? 'Accepted outcome with complete economics'
+              : economics.outcomeAccepted
+                ? economics.overflowed
+                  ? 'Outcome accepted · economics totals overflowed'
+                  : !economics.attributionCoverageComplete
+                    ? 'Outcome accepted · provider/model attribution compacted'
+                    : !economics.identityCoverageComplete
+                      ? 'Outcome accepted · archived identity coverage incomplete'
+                      : `Outcome accepted · economics incomplete (${economics.missingSamples} missing samples)`
+                : 'Outcome not accepted yet'} · {economics.samples} metric
+            {economics.samples === 1 ? 'sample' : 'samples'} ·
+            {totalEconomicsTokens(economics.totals.tokens).toLocaleString()} tokens ·
+            {duration(economics.totals.elapsedMs)} elapsed
+          </p>
+          <p>
+            {economics.totals.turns} turns · {economics.totals.toolCalls} tools ·
+            {economics.totals.permissionRequests} permissions · {economics.totals.compactions}
+            compactions · {economics.totals.retries} retries · {economics.totals.findings}
+            findings · {economics.totals.checks} checks ·
+            {economics.totals.humanInterventions} human interventions
+          </p>
+          {#if economics.lifetimeEconomicsComplete}<p
+              class:ship-error={economics.totals.failedCommands > 0 ||
+                economics.totals.approvalLatencyMs > 0 ||
+                economics.totals.repeatedWork > 0}
+            >
+              Cost hotspots: {economics.totals.failedCommands} failed commands ·
+              {duration(economics.totals.approvalLatencyMs)} approval latency ·
+              {economics.totals.repeatedWork} repeated work units
+            </p>{:else}<p class="ship-error">
+              Cost hotspots unavailable until lifetime economics are complete.
+            </p>{/if}
+          {#if economics.lifetimeTruncated}<p class="ship-muted">
+              Lifetime totals include compacted evidence history.
+            </p>{/if}
+          {#if !economics.lifetimeEconomicsComplete}<p class="ship-error">
+              {incompleteEconomicsReason(economics)}
+            </p>{/if}
+          {#if economics.overflowed}<p class="ship-error">
+              One or more lifetime totals reached the safe integer limit.
+            </p>{/if}
+          <details>
+            <summary>Activity by role</summary>
+            {#each Object.entries(economics.byRole) as [role, totals] (role)}<p>
+                {role} · {totals.turns} turns · {totals.toolCalls} tools ·
+                {totalEconomicsTokens(totals.tokens).toLocaleString()} tokens ·
+                {duration(totals.elapsedMs)}
+              </p>{:else}<p>No economics samples recorded for this revision.</p>{/each}
+          </details>
+          <details>
+            <summary>Economics samples</summary>
+            {#each (issue.evidenceManifests ?? []).flatMap( (candidate) => candidate.evidence.filter((item) => item.economics) ) as item (item.id)}
+              {@const metric = item.economics!}
+              <p>
+                {item.provider} / {item.model ?? 'No model'} · {metric.role} / {metric.phase} ·
+                {metric.turns} turns · {metric.toolCalls} tools · {metric.permissionRequests}
+                permissions · {metric.compactions} compactions ·
+                {totalEconomicsTokens(metric.tokens).toLocaleString()} tokens · {duration(
+                  metric.elapsedMs,
+                )} ·
+                {metric.retries} retries · {metric.findings} findings · {metric.checks} checks ·
+                {metric.humanInterventions} human interventions
+              </p>
+            {:else}<p>No economics samples recorded for this revision.</p>{/each}
+          </details>
           <h4>Validation gates</h4>
           <ol class="ship-gates">
             {#each gateNames as name (name)}

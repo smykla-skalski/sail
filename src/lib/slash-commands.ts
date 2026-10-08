@@ -19,29 +19,42 @@ function escapedTick(text: string, index: number): boolean {
 }
 
 export function visibleCommandText(text: string): string {
-  let fence: { marker: string; length: number } | null = null;
+  let fence: { marker: string; length: number; contentIndent: number } | null = null;
   let quote = false;
+  const listIndents: number[] = [];
   const unfenced = text
     .split('\n')
     .map((line) => {
-      const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
-      const closesFence =
-        fence &&
-        marker?.[0] === fence.marker &&
-        marker.length >= fence.length &&
-        line.slice(line.indexOf(marker) + marker.length).trim() === '';
       if (fence) {
-        if (closesFence) fence = null;
-        return ' '.repeat(line.length);
+        const indentation = /^ */.exec(line)![0].length;
+        if (line.trim() && indentation < fence.contentIndent) {
+          fence = null;
+        } else {
+          const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line.slice(fence.contentIndent))?.[1];
+          if (closing?.[0] === fence.marker && closing.length >= fence.length) fence = null;
+          return ' '.repeat(line.length);
+        }
       }
       if (!line.trim()) quote = false;
       if (/^ {0,3}>/.test(line)) quote = true;
       if (quote) return ' '.repeat(line.length);
-      if (marker) {
-        fence = { marker: marker[0], length: marker.length };
+
+      const indentation = /^ */.exec(line)![0].length;
+      const listMarker = /^( *)(?:[-+*]|\d{1,9}[.)])([ \t]{1,4})/.exec(line);
+      const list = listMarker && indentation <= (listIndents.at(-1) ?? 0) + 3 ? listMarker : null;
+      if (list) {
+        while (listIndents.at(-1) && indentation < listIndents.at(-1)!) listIndents.pop();
+        listIndents.push(list[0].length);
+      } else if (line.trim()) {
+        while (listIndents.at(-1) && indentation < listIndents.at(-1)!) listIndents.pop();
+      }
+      const contentIndent = list ? list[0].length : (listIndents.at(-1) ?? 0);
+      const opening = /^ {0,3}(`{3,}|~{3,})/.exec(line.slice(contentIndent))?.[1];
+      if (opening) {
+        fence = { marker: opening[0], length: opening.length, contentIndent };
         return ' '.repeat(line.length);
       }
-      if (/^(?: {4}|\t)/.test(line)) return ' '.repeat(line.length);
+      if (indentation >= contentIndent + 4 || line.startsWith('\t')) return ' '.repeat(line.length);
       return line;
     })
     .join('\n');
