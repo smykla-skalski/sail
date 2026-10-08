@@ -111,6 +111,8 @@
   import {
     acpPermissionIdentity,
     enqueueAcpPermission,
+    fencedAcpPermissionInventory,
+    reconcileRejectedAcpPermission,
     removeResolvedAcpPermission,
   } from './lib/acp-permissions';
 
@@ -197,6 +199,7 @@
     capabilityProfile = 'build',
   }: Props = $props();
   let mounted = $state(false);
+  let permissionInventoryRevision = 0;
   const activeCapabilityProfile = $derived(thread?.capabilityProfile ?? capabilityProfile);
   let hookActivities = $state<HookActivity[]>([]);
   function mergeHookActivities(items: HookActivity[]) {
@@ -904,8 +907,12 @@
         if (current === generation && Array.isArray(session.availableCommands))
           updateSkills(session.availableCommands);
         if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
-        const waiting = await acp.pendingPermissions(agent, id);
-        if (current === generation) for (const request of waiting) queuePermission(request);
+        const waiting = await fencedAcpPermissionInventory(
+          () => acp.pendingPermissions(agent, id),
+          () => permissionInventoryRevision,
+          () => current === generation && activeSessionId === id,
+        );
+        if (waiting) for (const request of waiting) queuePermission(request);
       }
       if (current === generation) ready = true;
     } catch (cause) {
@@ -1072,6 +1079,7 @@
           typeof params.sessionId !== 'string'
         )
           return;
+        permissionInventoryRevision++;
         permissions = removeResolvedAcpPermission(permissions, {
           id: params.requestId,
           sessionId: params.sessionId,
@@ -1631,18 +1639,13 @@
       permissions = permissions.filter((item) => acpPermissionIdentity(item) !== identity);
     } catch (cause) {
       error = describe(cause);
-      if (thread && lastRequest) {
-        const pending = await acp.pendingPermissions(agent, permission.sessionId).catch(() => []);
-        if (
-          pending.some((message) => {
-            const sessionId = message.params?.sessionId;
-            if (
-              (typeof message.id !== 'string' && typeof message.id !== 'number') ||
-              typeof sessionId !== 'string'
-            )
-              return false;
-            return (
-              acpPermissionIdentity({
+      const pending = await acp.pendingPermissions(agent, permission.sessionId).catch(() => null);
+      const pendingIdentities = pending?.flatMap((message) => {
+        const sessionId = message.params?.sessionId;
+        return (typeof message.id === 'string' || typeof message.id === 'number') &&
+          typeof sessionId === 'string'
+          ? [
+              {
                 id: message.id,
                 sessionId,
                 generation:
@@ -1653,12 +1656,16 @@
                   typeof message.params?.sailPermissionFingerprint === 'string'
                     ? message.params.sailPermissionFingerprint
                     : undefined,
-              }) === identity
-            );
-          })
-        )
-          onstatus(thread, 'waiting');
-      }
+              },
+            ]
+          : [];
+      });
+      const remainsPending = pendingIdentities?.some(
+        (candidate) => acpPermissionIdentity(candidate) === identity,
+      );
+      if (thread && lastRequest && remainsPending) onstatus(thread, 'waiting');
+      if (pendingIdentities)
+        permissions = reconcileRejectedAcpPermission(permissions, permission, pendingIdentities);
     }
   }
 

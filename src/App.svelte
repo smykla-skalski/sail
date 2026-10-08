@@ -6953,51 +6953,80 @@
                 );
               }
               if (optionId === 'reject')
-                await openCodePermissionRejections.reject({
-                  selected: request,
-                  list: () => openCodeSource.permission.list({ sessionID: request.sessionID }),
-                  reply: () =>
-                    openCodeSource.permission.reply({
-                      sessionID: request.sessionID,
-                      requestID: request.id,
-                      decision: 'reject',
-                    }),
-                  record: (settledRequest) => {
-                    const settledPolicy = inboxRejectedPermissionPolicy(
-                      { permissionPolicies },
-                      settledRequest.id,
-                      () =>
-                        permissionPolicy({
-                          profile: policy.profile,
-                          workspace: location.directory,
-                          title: settledRequest.action,
-                          toolCall: openCodePermissionToolCall(settledRequest),
-                          options: [
-                            { optionId: 'once', kind: 'allow_once' },
-                            { optionId: 'reject', kind: 'reject_once' },
-                          ],
+                return (
+                  (await openCodePermissionRejections.reject({
+                    selected: request,
+                    list: () => openCodeSource.permission.list({ sessionID: request.sessionID }),
+                    validate: async (pendingRequests) => {
+                      const decisions = await Promise.all(
+                        pendingRequests.map(async (pendingRequest) => {
+                          const pendingToolCall = openCodePermissionToolCall(pendingRequest);
+                          const pendingTrust = await acp.permissionResourcesTrusted(
+                            location.directory,
+                            permissionReadResources(pendingToolCall),
+                          );
+                          return automaticPermissionPolicy({
+                            profile: policy.profile,
+                            workspace: location.directory,
+                            title: pendingRequest.action,
+                            toolCall: pendingToolCall,
+                            options: [
+                              { optionId: 'once', kind: 'allow_once' },
+                              { optionId: 'reject', kind: 'reject_once' },
+                            ],
+                            resourceTrust: pendingTrust,
+                          });
                         }),
-                    );
-                    recordDecisionActivity(
-                      {
-                        agent: 'opencode',
-                        directory: location.directory,
-                        sessionId: settledRequest.sessionID,
-                        title:
-                          sessionDetails.get(settledRequest.sessionID)?.title ?? 'OpenCode session',
-                        updated: Date.now(),
-                        capabilityProfile: settledPolicy.profile,
-                      },
-                      settledRequest.id,
-                      permissionDecisionTitle(
-                        settledRequest.message?.trim() || settledRequest.action,
-                        settledPolicy,
+                      );
+                      return (
+                        decisions.length > 0 &&
+                        decisions.every((decision) => decision.recommendation === 'deny')
+                      );
+                    },
+                    reply: () =>
+                      openCodeSource.permission.reply({
+                        sessionID: request.sessionID,
+                        requestID: request.id,
+                        decision: 'reject',
+                      }),
+                    record: (settledRequest) => {
+                      const settledPolicy = inboxRejectedPermissionPolicy(
+                        { permissionPolicies },
+                        settledRequest.id,
+                        () =>
+                          permissionPolicy({
+                            profile: policy.profile,
+                            workspace: location.directory,
+                            title: settledRequest.action,
+                            toolCall: openCodePermissionToolCall(settledRequest),
+                            options: [
+                              { optionId: 'once', kind: 'allow_once' },
+                              { optionId: 'reject', kind: 'reject_once' },
+                            ],
+                          }),
+                      );
+                      recordDecisionActivity(
+                        {
+                          agent: 'opencode',
+                          directory: location.directory,
+                          sessionId: settledRequest.sessionID,
+                          title:
+                            sessionDetails.get(settledRequest.sessionID)?.title ??
+                            'OpenCode session',
+                          updated: Date.now(),
+                          capabilityProfile: settledPolicy.profile,
+                        },
+                        settledRequest.id,
+                        permissionDecisionTitle(
+                          settledRequest.message?.trim() || settledRequest.action,
+                          settledPolicy,
+                          'rejected',
+                        ),
                         'rejected',
-                      ),
-                      'rejected',
-                    );
-                  },
-                });
+                      );
+                    },
+                  })) !== null
+                );
               else
                 await openCodePermissionRejections.resolveAutomatically({
                   selected: latestRequest,

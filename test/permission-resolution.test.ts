@@ -104,6 +104,35 @@ await test('failed automatic resolution remains retryable and unaudited', async 
   assert.deepEqual(durableAudit, ['rejected']);
 });
 
+await test('skipped automatic resolution remains visible and retryable', async () => {
+  const resolver = new AutomaticPermissionResolver();
+  let safe = false;
+  let responses = 0;
+  let records = 0;
+  const request = {
+    key: 'opencode:permission:changing-inventory',
+    generation: 1,
+    policy: permissionPolicy({
+      profile: 'review' as const,
+      workspace: '/workspace',
+      title: 'Edit file',
+      toolCall: { action: 'edit', resources: ['/workspace/file.ts'] },
+      options: allowOnce,
+    }),
+    respond: async () => {
+      responses++;
+      return safe;
+    },
+    record: () => records++,
+  };
+
+  assert.equal(await resolver.resolve(request), false);
+  safe = true;
+  assert.equal(await resolver.resolve(request), true);
+  assert.equal(responses, 2);
+  assert.equal(records, 1);
+});
+
 await test('reused provider request IDs resolve again in a new generation', async () => {
   const resolver = new AutomaticPermissionResolver();
   let providerResponses = 0;

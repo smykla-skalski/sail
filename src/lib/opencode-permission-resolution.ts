@@ -3,6 +3,7 @@ import type { PermissionRequest } from '@opencode/client';
 type RejectionRequest = {
   selected: PermissionRequest;
   list: () => Promise<PermissionRequest[]>;
+  validate?: (requests: PermissionRequest[]) => Promise<boolean>;
   reply: () => Promise<void>;
   record: (request: PermissionRequest) => void;
 };
@@ -58,7 +59,7 @@ export class OpenCodePermissionRejectionCoordinator {
   readonly #active = new Map<string, ActiveRejection>();
   readonly #recent = new Map<string, RecentRejection>();
   readonly #nonRejected = new Map<string, Set<string>>();
-  readonly #inFlight = new Map<string, Promise<PermissionRequest[]>>();
+  readonly #inFlight = new Map<string, Promise<PermissionRequest[] | null>>();
   readonly #ambiguousReplies = new Map<string, Map<string, AmbiguousReply>>();
   readonly #maxSessions: number;
   readonly #maxRequests: number;
@@ -191,7 +192,7 @@ export class OpenCodePermissionRejectionCoordinator {
     );
   }
 
-  reject(request: RejectionRequest): Promise<PermissionRequest[]> {
+  reject(request: RejectionRequest): Promise<PermissionRequest[] | null> {
     const sessionID = request.selected.sessionID;
     const existing = this.#inFlight.get(sessionID);
     if (existing) return existing;
@@ -202,7 +203,7 @@ export class OpenCodePermissionRejectionCoordinator {
     return resolution;
   }
 
-  async #reject(request: RejectionRequest): Promise<PermissionRequest[]> {
+  async #reject(request: RejectionRequest): Promise<PermissionRequest[] | null> {
     const sessionID = request.selected.sessionID;
     const active: ActiveRejection = {
       requests: new Map([[request.selected.id, request.selected]]),
@@ -219,7 +220,12 @@ export class OpenCodePermissionRejectionCoordinator {
     this.#recent.delete(sessionID);
     this.#active.set(sessionID, active);
     try {
-      for (const pending of await request.list()) {
+      const pendingRequests = await request.list();
+      if (request.validate && !(await request.validate(pendingRequests))) {
+        if (this.#active.get(sessionID) === active) this.#active.delete(sessionID);
+        return null;
+      }
+      for (const pending of pendingRequests) {
         if (pending.sessionID !== sessionID || this.#wasNotRejected(sessionID, pending.id))
           continue;
         if (this.#inventoryAmbiguous(sessionID) && !active.rejectedIDs.has(pending.id)) continue;

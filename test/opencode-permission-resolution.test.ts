@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { PermissionRequest } from '@opencode/client';
+import {
+  automaticPermissionPolicy,
+  openCodePermissionToolCall,
+} from '../src/lib/capability-profiles.ts';
 import { OpenCodePermissionRejectionCoordinator } from '../src/lib/opencode-permission-resolution.ts';
 
 function permission(id: string, sessionID = 'session-1'): PermissionRequest {
@@ -31,6 +35,41 @@ await test('session rejection audits requests whose events arrive on the next ma
     ['selected', 'arrived-during-reply'],
   );
   assert.deepEqual(recorded, ['arrived-during-reply', 'selected']);
+});
+
+await test('automatic session rejection stops when a high-risk request joins the inventory', async () => {
+  const coordinator = new OpenCodePermissionRejectionCoordinator();
+  const selected = { ...permission('selected'), action: 'edit' };
+  const highRisk = { ...permission('high-risk'), action: 'npm install' };
+  const inventory = Promise.withResolvers<PermissionRequest[]>();
+  let replied = false;
+
+  const rejection = coordinator.reject({
+    selected,
+    list: () => inventory.promise,
+    validate: async (requests) =>
+      requests.every(
+        (request) =>
+          automaticPermissionPolicy({
+            profile: 'review',
+            workspace: '/workspace',
+            title: request.action,
+            toolCall: openCodePermissionToolCall(request),
+            options: [
+              { optionId: 'once', kind: 'allow_once' },
+              { optionId: 'reject', kind: 'reject_once' },
+            ],
+          }).recommendation === 'deny',
+      ),
+    reply: async () => {
+      replied = true;
+    },
+    record: () => undefined,
+  });
+  inventory.resolve([selected, highRisk]);
+
+  assert.equal(await rejection, null);
+  assert.equal(replied, false);
 });
 
 await test('manual allow records an authoritative event when the HTTP response is lost', async () => {

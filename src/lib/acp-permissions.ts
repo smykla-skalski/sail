@@ -39,3 +39,26 @@ export function removeResolvedAcpPermission(
   const identity = acpPermissionIdentity(resolved);
   return permissions.filter((permission) => acpPermissionIdentity(permission) !== identity);
 }
+
+export function reconcileRejectedAcpPermission(
+  permissions: readonly AgentPermission[],
+  rejected: AcpPermissionIdentity,
+  pending: readonly AcpPermissionIdentity[],
+): AgentPermission[] {
+  const identity = acpPermissionIdentity(rejected);
+  return pending.some((permission) => acpPermissionIdentity(permission) === identity)
+    ? [...permissions]
+    : permissions.filter((permission) => acpPermissionIdentity(permission) !== identity);
+}
+
+export async function fencedAcpPermissionInventory<T>(
+  load: () => Promise<T[]>,
+  revision: () => number,
+  active: () => boolean,
+): Promise<T[] | null> {
+  if (!active()) return null;
+  const startedAt = revision();
+  const pending = await load();
+  if (!active()) return null;
+  return startedAt === revision() ? pending : fencedAcpPermissionInventory(load, revision, active);
+}

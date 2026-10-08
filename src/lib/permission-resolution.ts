@@ -16,7 +16,7 @@ type PermissionRequestBase = {
 };
 
 export type AutomaticPermissionRequest = PermissionRequestBase & {
-  respond: (optionId: string) => Promise<void>;
+  respond: (optionId: string) => Promise<boolean | void>;
   record: (optionId: string) => void;
 };
 
@@ -39,7 +39,7 @@ export class AutomaticPermissionResolver {
 
   #resolve<Option extends string | null>(
     request: PermissionRequestBase & {
-      respond: (optionId: Option) => Promise<void>;
+      respond: (optionId: Option) => Promise<boolean | void>;
       record: (optionId: Option) => void;
     },
     optionId: Option,
@@ -50,7 +50,8 @@ export class AutomaticPermissionResolver {
     if (existing) return existing;
     const resolution = request
       .respond(optionId)
-      .then(() => {
+      .then((resolved) => {
+        if (resolved === false) return false;
         request.record(optionId);
         this.#completed.add(identity);
         if (this.#completed.size > 512) {
