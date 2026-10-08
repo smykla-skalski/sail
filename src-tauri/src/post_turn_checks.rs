@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, State};
@@ -77,7 +78,7 @@ fn save_history(app: &AppHandle, checks: &[CheckResult]) -> Result<(), String> {
     )
 }
 
-fn canonical_directory(directory: &str) -> Result<String, String> {
+pub(crate) fn canonical_directory(directory: &str) -> Result<String, String> {
     let path = Path::new(directory)
         .canonicalize()
         .map_err(|error| error.to_string())?;
@@ -304,7 +305,7 @@ pub async fn run_post_turn_check(
 }
 
 fn execute(directory: &str, command: &str) -> Result<(String, Option<i32>, String), String> {
-    execute_with_timeout(directory, command, TIMEOUT)
+    execute_with_timeout(directory, command, TIMEOUT, None)
 }
 
 fn terminate_group(child: &mut std::process::Child) {
@@ -335,10 +336,11 @@ fn collect(mut stream: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
     receiver
 }
 
-fn execute_with_timeout(
+pub(crate) fn execute_with_timeout(
     directory: &str,
     command: &str,
     timeout: Duration,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(String, Option<i32>, String), String> {
     let mut runner = Command::new(crate::terminal::shell());
     #[cfg(unix)]
@@ -347,6 +349,7 @@ fn execute_with_timeout(
     runner.args(["/C", command]);
     runner
         .current_dir(directory)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -367,6 +370,9 @@ fn execute_with_timeout(
                 exit.code(),
             );
         }
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            break ("canceled", None);
+        }
         if started.elapsed() >= timeout {
             break ("timed_out", None);
         }
@@ -376,7 +382,7 @@ fn execute_with_timeout(
     let grace = Duration::from_secs(1);
     let first = stdout.recv_timeout(grace);
     let second = stderr.recv_timeout(grace);
-    if first.is_err() || second.is_err() {
+    if (first.is_err() || second.is_err()) && status != "canceled" {
         status = "timed_out";
         code = None;
     }
@@ -418,6 +424,7 @@ mod tests {
             directory.to_str().unwrap(),
             "sh -c 'sleep 5 &'",
             Duration::from_millis(500),
+            None,
         )
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(3));

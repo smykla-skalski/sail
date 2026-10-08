@@ -10,6 +10,7 @@
   import ChatMessage from './ChatMessage.svelte';
   import SpawnActivity from './SpawnActivity.svelte';
   import PostTurnChecks from './PostTurnChecks.svelte';
+  import ShellCommandCard from './ShellCommandCard.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import SpawnResponse from './SpawnResponse.svelte';
   import ToolActivity from './ToolActivity.svelte';
@@ -103,7 +104,17 @@
     isFailedStatus,
     notificationStats,
     splitTaskNotifications,
+    type TaskSegment,
   } from './lib/task-notification';
+  import {
+    isShellDraft,
+    shellCommand,
+    splitShellCommands,
+    withShellContext,
+    type ShellResult,
+    type ShellRun,
+    type ShellSegment,
+  } from './lib/shell-command';
   import { splitKlaudiushMessage, type KlaudiushRule } from './lib/klaudiush';
   import { getSetting, removeSetting, setSetting } from './lib/settings';
   import { recordDiagnostic, type DiagnosticEvent } from './lib/diagnostics';
@@ -241,9 +252,19 @@
   const commandUpdates: Record<string, unknown[]> = {};
   let skillSelected = $state(0);
   const skillMenuId = crypto.randomUUID();
-  const skillMatches = $derived(matchingSkills(skills, draft));
+  const shellMode = $derived(isShellDraft(draft));
+  const skillMatches = $derived(shellMode ? [] : matchingSkills(skills, draft));
+  let shellRuns = $state<ShellRun[]>([]);
+  const pendingShellRuns = $derived(shellRuns.filter((run) => run.session === activeSessionId));
   $effect(() => {
-    if (skillQuery(draft) !== null && ready && directory && !activeSessionId && !creatingSession)
+    if (
+      !shellMode &&
+      skillQuery(draft) !== null &&
+      ready &&
+      directory &&
+      !activeSessionId &&
+      !creatingSession
+    )
       void ensureSession('New thread').catch((cause) => {
         error = describe(cause);
       });
@@ -1249,6 +1270,14 @@
     const text =
       (externalText ?? draft).trim() ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
+    const shell = external ? null : shellCommand(text);
+    if (shell !== null) {
+      if (shell && directory) {
+        draft = '';
+        void runShell(shell);
+      }
+      return;
+    }
     let shipIssue: ShipItIssue | null;
     try {
       shipIssue = await beginShipItRun(directory, text, promptSkill(skills, text)?.name ?? null);
@@ -1310,8 +1339,25 @@
       clearClipboardImagePreviews();
     }
     const userEntryId = crypto.randomUUID();
+    const shellSession = activeSessionId;
+    const sentShell = shellRuns.filter(
+      (run) => run.session === shellSession && run.status !== 'running',
+    );
+    shellRuns = shellRuns.filter((run) => !sentShell.includes(run));
+    const restoreShell = () => {
+      const session = deliverySessionId ?? shellSession;
+      shellRuns = [...sentShell.map((run) => ({ ...run, session })), ...shellRuns];
+    };
     flushUpdates();
-    entries = [...entries, { id: userEntryId, type: 'user', text, created: Date.now() }];
+    entries = [
+      ...entries,
+      {
+        id: userEntryId,
+        type: 'user',
+        text: withShellContext(sentShell, text),
+        created: Date.now(),
+      },
+    ];
     void follow();
     try {
       if (!activeSessionId || !activityThread)
@@ -1349,6 +1395,7 @@
         finalStatus = 'interrupted';
         notifyOnDone = false;
         if (external && !queuedMessage) throw new Error('Agent turn was cancelled.');
+        restoreShell();
         if (current === generation) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
@@ -1372,10 +1419,12 @@
         implementationModel,
         `acp:${turnAgent}:${id}`,
       );
-      const promptText =
+      const promptText = withShellContext(
+        sentShell,
         ephemeral && seedContext && entries.length === 1
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
-          : skillText + directClaim;
+          : skillText + directClaim,
+      );
       phase = 'prompt';
       if (id && sentImages.length)
         onattachmentsent?.(
@@ -1478,8 +1527,10 @@
         authNeeded = /auth|login|sign.?in/i.test(error);
         if (retryQueued) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
+          restoreShell();
         } else if (!external || queuedMessage) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
+          restoreShell();
           draft = [text, draft.trim()].filter(Boolean).join('\n\n');
           images = [...sentImages, ...images];
           clipboardAttachments = [...sentClipboard, ...clipboardAttachments];
@@ -1509,6 +1560,39 @@
         setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, false);
       }
     }
+  }
+
+  async function runShell(command: string) {
+    const run: ShellRun = {
+      id: crypto.randomUUID(),
+      directory,
+      session: activeSessionId,
+      command,
+      status: 'running',
+      code: null,
+      output: '',
+      created: Date.now(),
+    };
+    shellRuns = [...shellRuns, run];
+    void follow();
+    let result: Partial<ShellRun>;
+    try {
+      result = await invoke<ShellResult>('run_shell_command', { id: run.id, directory, command });
+    } catch (cause) {
+      result = { status: 'failed', output: describe(cause) };
+    }
+    shellRuns = shellRuns.map((item) => (item.id === run.id ? { ...item, ...result } : item));
+    void follow();
+  }
+
+  function userSegments(text: string): (TaskSegment | ShellSegment)[] {
+    return splitShellCommands(text).flatMap((part): (TaskSegment | ShellSegment)[] =>
+      part.type === 'text' ? splitTaskNotifications(part.text) : [part],
+    );
+  }
+
+  function stopShell(run: ShellRun) {
+    void invoke('cancel_shell_command', { id: run.id }).catch(() => {});
   }
 
   function withAttachedFiles(text: string, attachments: QueuedAgentMessage['attachments']) {
@@ -2029,10 +2113,12 @@
         {:else}
           {@const segments =
             entry.type === 'user'
-              ? splitTaskNotifications(entry.text)
+              ? userSegments(entry.text)
               : [{ type: 'text' as const, text: entry.text }]}
           {#each segments as segment, index (index)}
-            {#if segment.type === 'notification'}
+            {#if segment.type === 'shell'}
+              <ShellCommandCard run={segment.shell} />
+            {:else if segment.type === 'notification'}
               {@const note = segment.notification}
               <div
                 class="agent-subagent-card"
@@ -2086,6 +2172,9 @@
           {/each}
         {/if}
       {/each}
+      {#each pendingShellRuns as run (run.id)}
+        <ShellCommandCard {run} pending onstop={() => stopShell(run)} />
+      {/each}
       {#each coordinationMessages.filter((message) => !entries.some((entry) => entry.type === 'user' && entry.text.includes(coordinationPrompt(message)))) as message (message.id)}
         <ChatMessage
           kind="user"
@@ -2133,8 +2222,11 @@
     </div>
   </div>
   <div class="agent-composer composer-wrap">
-    <div class="composer">
+    <div class="composer" class:shell-mode={shellMode}>
       <TaskLocation location={promptLocation} />
+      {#if shellMode}<p class="composer-shell-hint" role="status">
+          Shell mode · Enter runs the command in this worktree
+        </p>{/if}
       {#if error}<p class="agent-error" role="alert">
           {error} <button onclick={() => void activate(activeSessionId)}>Retry</button>
         </p>{/if}
@@ -2196,7 +2288,7 @@
         }}
         onkeydown={keydown}
         rows="3"
-        placeholder={`Message ${name}…`}
+        placeholder={`Message ${name}… (start with ! to run a shell command)`}
         disabled={!directory || !!nativeEntries}></textarea>
       {#each clipboardImagePreviews as preview (preview.path)}
         <figure
@@ -2274,8 +2366,10 @@
             >{/if}
           <Button
             onclick={() => void send()}
-            disabled={!ready || !!nativeEntries || (!draft.trim() && !clipboardAttachments.length)}
-            >{isBusy ? 'Queue ↗' : 'Send ↗'}</Button
+            disabled={shellMode
+              ? !shellCommand(draft) || !directory || !!nativeEntries
+              : !ready || !!nativeEntries || (!draft.trim() && !clipboardAttachments.length)}
+            >{shellMode ? 'Run ↵' : isBusy ? 'Queue ↗' : 'Send ↗'}</Button
           >
         </div>
       </div>
