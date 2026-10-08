@@ -3740,6 +3740,13 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        // Git checks out CRLF by default on Windows, and these fixtures compare exact bytes.
+        // Best effort: `init` with a path argument creates the repository elsewhere.
+        if args.first() == Some(&"init") {
+            let _ = Command::new("git")
+                .args(["-C", root, "config", "core.autocrlf", "false"])
+                .output();
+        }
     }
 
     #[cfg(unix)]
@@ -4227,9 +4234,14 @@ mod tests {
         git(path, &["init", "-q"]);
         git(path, &["config", "user.name", "Sail Test"]);
         git(path, &["config", "user.email", "sail@example.test"]);
-        fs::write(root.join("*.txt"), "literal\n").unwrap();
+        // `*` is not a legal Windows filename, and `[` is magic to git on both platforms.
+        let magic = if cfg!(windows) { "a[1].txt" } else { "*.txt" };
+        fs::write(root.join(magic), "literal\n").unwrap();
         fs::write(root.join("other.txt"), "other\n").unwrap();
-        git(path, &["add", "--", ":(literal)*.txt", "other.txt"]);
+        git(
+            path,
+            &["add", "--", &format!(":(literal){magic}"), "other.txt"],
+        );
         git(
             path,
             &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
