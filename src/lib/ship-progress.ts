@@ -1601,3 +1601,13 @@ export function shippingWorkerGone(cause: unknown): boolean {
   const message = cause instanceof Error ? cause.message : String(cause);
   return /session is not connected|location not found/i.test(message);
 }
+
+const missingRepositoryReason = /Repository path does not exist\. Choose an existing directory\.$/;
+
+// Issues stuck before the repair persisted the raw error as their block reason.
+export function currentShipBlockedReason(reason: string | undefined | null): string {
+  if (!reason) return 'Shipping claim recovery requires worker fencing.';
+  return missingRepositoryReason.test(reason)
+    ? 'Shipping repository no longer exists. Start a new run from the project.'
+    : reason;
+}

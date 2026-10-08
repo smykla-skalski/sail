@@ -60,6 +60,7 @@
     nextValidationReservation,
     reserveInlineValidation,
     gateSnapshot,
+    currentShipBlockedReason,
     loadShipRuns,
     repositoryForRemote,
     shippingWorkerGone,
@@ -4136,7 +4137,7 @@
   }
 
   async function retryShippingClaimFence(run: ShipRun, issue: ShipIssue): Promise<void> {
-    const blockedReason = issue.blockedReason ?? 'Shipping claim recovery requires worker fencing.';
+    const blockedReason = currentShipBlockedReason(issue.blockedReason);
     await fenceRecoveredShippingWorker(run, issue, blockedReason, false);
     if (!issue.workerSettled) return;
     const claim = issue.claim;
@@ -4166,6 +4167,17 @@
         const settled = settledLostClaimFence(claim, cause);
         if (settled) {
           await updateShipIssue(run, issue, settled);
+          return;
+        }
+        if (missingRepositoryPath(cause)) {
+          await updateShipIssue(run, issue, {
+            state: 'failed',
+            claim: undefined,
+            claimFencePending: false,
+            claimRevalidationPending: false,
+            claimHandoffPending: false,
+            refreshError: null,
+          });
           return;
         }
         await updateShipIssue(run, issue, {
@@ -4613,25 +4625,29 @@
       if (!client) throw new Error('OpenCode is unavailable; stop the worker manually.');
       const source = client;
       const sessionId = threadId.slice('opencode:'.length);
-      await reconcilePersistedOpenCodeDispatches(issue, threadId, source);
-      const stopped = await confirmOpenCodeWorkerStopped(
-        () => source.session.interrupt({ sessionID: sessionId }),
-        async () => {
-          const [active, inbox] = await Promise.all([
-            source.session.active(),
-            source.session.inbox.list({ sessionID: sessionId }),
-          ]);
-          return {
-            running: active[sessionId]?.type === 'running',
-            queued: inbox.map((item) => item.id),
-          };
-        },
-        (inboxId) => source.session.inbox.cancel({ sessionID: sessionId, inboxID: inboxId }),
-        () => new Promise((resolve) => setTimeout(resolve, 100)),
-        50,
-        () => !!dispatchKey && shippingPromptDispatchPending(issue, dispatchKey),
-      );
-      if (!stopped) throw new Error('OpenCode worker did not confirm termination.');
+      try {
+        await reconcilePersistedOpenCodeDispatches(issue, threadId, source);
+        const stopped = await confirmOpenCodeWorkerStopped(
+          () => source.session.interrupt({ sessionID: sessionId }),
+          async () => {
+            const [active, inbox] = await Promise.all([
+              source.session.active(),
+              source.session.inbox.list({ sessionID: sessionId }),
+            ]);
+            return {
+              running: active[sessionId]?.type === 'running',
+              queued: inbox.map((item) => item.id),
+            };
+          },
+          (inboxId) => source.session.inbox.cancel({ sessionID: sessionId, inboxID: inboxId }),
+          () => new Promise((resolve) => setTimeout(resolve, 100)),
+          50,
+          () => !!dispatchKey && shippingPromptDispatchPending(issue, dispatchKey),
+        );
+        if (!stopped) throw new Error('OpenCode worker did not confirm termination.');
+      } catch (cause) {
+        if (!shippingWorkerGone(cause) && !isSessionNotFoundError(cause)) throw cause;
+      }
       return;
     }
     const match = /^acp:([^:]+):(.+)$/.exec(threadId);

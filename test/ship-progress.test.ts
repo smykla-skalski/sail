@@ -28,6 +28,7 @@ import {
   refreshedIssueState,
   shipOwner,
   shipCheckpointOwner,
+  currentShipBlockedReason,
   repositoryForRemote,
   shippingWorkerGone,
   authorizeShipCheckpointThread,
@@ -2398,4 +2399,15 @@ void test('treats a vanished agent session or deleted worktree as a gone worker'
   assert.equal(shippingWorkerGone(new Error('Agent session is not connected.')), true);
   assert.equal(shippingWorkerGone('Location not found: /sail/worktrees/gone'), true);
   assert.equal(shippingWorkerGone(new Error('permission denied')), false);
+});
+
+void test('replaces the persisted missing-repository block reason', () => {
+  assert.equal(
+    currentShipBlockedReason(
+      'Shipping claim recovery failed: Repository path does not exist. Choose an existing directory.',
+    ),
+    'Shipping repository no longer exists. Start a new run from the project.',
+  );
+  assert.equal(currentShipBlockedReason('Worker paused.'), 'Worker paused.');
+  assert.equal(currentShipBlockedReason(null), 'Shipping claim recovery requires worker fencing.');
 });
