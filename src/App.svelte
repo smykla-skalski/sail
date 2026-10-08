@@ -3099,7 +3099,20 @@
     });
   }
 
+  const shipMergesInFlight = new SvelteSet<string>();
+
   async function mergeShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {
+    const key = `${run.id}:${issue.id}`;
+    if (shipMergesInFlight.has(key)) throw new Error('A merge request is already in progress.');
+    shipMergesInFlight.add(key);
+    try {
+      return await requestShipMerge(run, issue);
+    } finally {
+      shipMergesInFlight.delete(key);
+    }
+  }
+
+  async function requestShipMerge(run: ShipRun, issue: ShipIssue): Promise<string> {
     const available = shipMergeAction(issue);
     if (!available.enabled) throw new Error(available.reason ?? 'This pull request cannot merge.');
     if (!(await confirmShipAction(shipMergeConfirmation(issue, run.remote)))) return '';
@@ -3118,10 +3131,31 @@
         evidenceReady: shipEvidenceReadiness(issue).ready,
       },
     });
+    if (outcome.method !== 'bot-comment') {
+      void tickShippingRuns(true);
+      return `Merged the pull request (${outcome.strategy}).`;
+    }
+    const posted = `Posted “${outcome.comment}” on the pull request. The repository's bot merges it.`;
+    // Kept in memory even if saving fails, so this session cannot post the comment again.
+    await updateShipIssue(
+      run,
+      issue,
+      {
+        mergeRequested: {
+          at: Date.now(),
+          head: issue.pullRequestHead ?? null,
+          comment: outcome.comment ?? '',
+        },
+      },
+      false,
+    );
     void tickShippingRuns(true);
-    return outcome.method === 'bot-comment'
-      ? `Posted “${outcome.comment}” on the pull request. The repository's bot merges it.`
-      : `Merged the pull request (${outcome.strategy}).`;
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      return `${posted} Sail could not save that the merge was requested: ${describe(cause)}`;
+    }
+    return posted;
   }
 
   async function retryShipIssue(run: ShipRun, issue: ShipIssue): Promise<string> {

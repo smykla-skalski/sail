@@ -20,6 +20,8 @@ export function shipMergeBlocker(issue: ShipIssue): string | null {
   if (issue.state === 'merged') return 'Already merged.';
   if (!issue.pullRequest) return 'No pull request yet.';
   if (issue.pullRequestState !== 'OPEN') return 'The pull request is not open.';
+  if (issue.mergeRequested)
+    return `Merge already requested with “${issue.mergeRequested.comment}”. Waiting for the repository's bot to merge it.`;
   const evidence = shipEvidenceReadiness(issue);
   if (!evidence.ready) return evidence.reason ?? 'Merge evidence is not ready.';
   if (!issue.pullRequestHead || issue.pullRequestHead !== issue.checkpoint?.revision)

@@ -262,6 +262,8 @@ export type CheckpointReconciliation = {
   reason: string | null;
 };
 
+export type ShipMergeRequest = { at: number; head: string | null; comment: string };
+
 export interface ShipIssue {
   id: string;
   number: number;
@@ -286,6 +288,8 @@ export interface ShipIssue {
   reportedStatus?: 'running' | 'blocked';
   pullRequestState?: string;
   pullRequestMergeable?: boolean | null;
+  /** Set after a bot-comment merge request; cleared once a refresh sees the pull request closed. */
+  mergeRequested?: ShipMergeRequest;
   blockedReason?: string | null;
   models?: string[];
   workerModel?: string;

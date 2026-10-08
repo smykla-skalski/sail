@@ -836,6 +836,7 @@ export function refreshedPullRequest(
     pullRequestHead: pr.headRefOid,
     pullRequestState: pr.state,
     pullRequestMergeable: pr.mergeable ?? null,
+    ...(pr.state !== 'OPEN' || pr.mergedAt ? { mergeRequested: undefined } : {}),
     checks: pr.checks,
     refreshError: null,
     refreshedAt: Date.now(),
@@ -1404,6 +1405,9 @@ const shipIssueSchema = z.object({
   reportedStatus: z.enum(['running', 'blocked']).optional(),
   pullRequestState: z.string().optional(),
   pullRequestMergeable: z.boolean().nullable().optional(),
+  mergeRequested: z
+    .object({ at: z.number().int().nonnegative(), head: nullableString, comment: z.string() })
+    .optional(),
   blockedReason: nullableString.optional(),
   models: z.array(z.string()).optional(),
   workerModel: z.string().optional(),
