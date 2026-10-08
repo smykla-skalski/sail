@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { agentStatusCounts, buildAgentStatusItems, resetLabel } from '../src/lib/agent-status.ts';
+import {
+  agentHeaderStatus,
+  agentStatusCounts,
+  buildAgentStatusItems,
+  openCodeHeaderStatus,
+  resetLabel,
+  type AgentHeaderInput,
+  type OpenCodeHeaderInput,
+} from '../src/lib/agent-status.ts';
 
 const threads = [
   { agent: 'claude', sessionId: 'working', directory: '/work/one', title: 'Build', updated: 2 },
@@ -50,4 +58,70 @@ void test('status bar drops read completed sessions and formats future resets', 
   assert.deepEqual(items, []);
   assert.equal(resetLabel(1_700_000_000_000 + 90 * 60_000, 1_700_000_000_000), '1h 30m');
   assert.equal(resetLabel(1_700_000_000_000, 1_700_000_000_000), null);
+});
+
+const idleHeader: AgentHeaderInput = {
+  connecting: false,
+  ready: true,
+  waiting: false,
+  sending: false,
+  hasSession: true,
+  running: false,
+  activityReady: true,
+  historyLoading: false,
+  busy: false,
+};
+
+void test('ACP thread headers report working only for turns the status bar can list', () => {
+  const cases: [string, Partial<AgentHeaderInput>, string][] = [
+    ['idle thread', {}, 'ready'],
+    ['agent process connecting', { connecting: true, busy: true }, 'connecting'],
+    ['agent offline', { ready: false }, 'offline'],
+    ['permission pending', { waiting: true, running: true, busy: true }, 'waiting'],
+    [
+      'first prompt creating a session',
+      { sending: true, hasSession: false, busy: true },
+      'connecting',
+    ],
+    ['prompt sent in an existing session', { sending: true, busy: true }, 'working'],
+    ['history replay only', { historyLoading: true, busy: true }, 'connecting'],
+    [
+      'history replay of a running turn',
+      { historyLoading: true, running: true, busy: true },
+      'working',
+    ],
+    [
+      'recovered turn before activity check',
+      { running: true, activityReady: false, busy: true },
+      'connecting',
+    ],
+    ['running turn after activity check', { running: true, busy: true }, 'working'],
+    ['other live work keeps working', { busy: true }, 'working'],
+  ];
+  for (const [name, overrides, expected] of cases)
+    assert.equal(agentHeaderStatus({ ...idleHeader, ...overrides }), expected, name);
+});
+
+const idleOpenCode: OpenCodeHeaderInput = {
+  runtime: 'connected',
+  waiting: false,
+  loading: false,
+  running: false,
+  sending: false,
+  inputReady: true,
+};
+
+void test('OpenCode headers report working only once the session runs', () => {
+  const cases: [string, Partial<OpenCodeHeaderInput>, string][] = [
+    ['idle session', {}, 'ready'],
+    ['runtime starting', { runtime: 'starting' }, 'connecting'],
+    ['runtime failed', { runtime: 'error' }, 'offline'],
+    ['question pending', { waiting: true, running: true }, 'waiting'],
+    ['history loading', { loading: true }, 'connecting'],
+    ['creating the session', { sending: true }, 'connecting'],
+    ['running turn', { sending: true, running: true }, 'working'],
+    ['no model or agent ready', { inputReady: false }, 'offline'],
+  ];
+  for (const [name, overrides, expected] of cases)
+    assert.equal(openCodeHeaderStatus({ ...idleOpenCode, ...overrides }), expected, name);
 });

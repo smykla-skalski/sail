@@ -125,49 +125,53 @@
       >{/if}
   </div>
   <div class="topbar-actions">
-    <Button variant="ghost" size="sm" aria-label="Pending requests" onclick={oninbox}
-      >Inbox ({inboxCount})</Button
-    >
-    {#if directory}<MenuButton
-        class="new-agent-menu"
-        label="New agent ▾"
-        ariaLabel="New agent"
-        menuLabel="New agent"
+    <div class="topbar-primary">
+      <Button variant="ghost" size="sm" aria-label="Pending requests" onclick={oninbox}
+        >Inbox ({inboxCount})</Button
       >
-        <div class="agent-launches" role="group" aria-label="Agents">
-          {#each agents as agent (agent.id)}
+      {#if directory}<MenuButton
+          class="new-agent-menu"
+          label="New agent ▾"
+          ariaLabel="New agent"
+          menuLabel="New agent"
+        >
+          {#snippet trigger()}New<span class="menu-trigger-extra">&nbsp;agent</span
+            >&nbsp;▾{/snippet}
+          <div class="agent-launches" role="group" aria-label="Agents">
+            {#each agents as agent (agent.id)}
+              <button
+                role="menuitem"
+                disabled={!agent.available}
+                title={agent.reason ?? `New ${agent.name} thread`}
+                onclick={() => onopenagent(agent.id)}
+                ><HarnessIcon agent={agent.id} /> {agent.name}</button
+              >
+            {/each}
             <button
               role="menuitem"
-              disabled={!agent.available}
-              title={agent.reason ?? `New ${agent.name} thread`}
-              onclick={() => onopenagent(agent.id)}
-              ><HarnessIcon agent={agent.id} /> {agent.name}</button
+              disabled={newWorkDisabled}
+              title="New OpenCode thread"
+              onclick={onnewwork}><HarnessIcon agent="opencode" /> OpenCode</button
             >
-          {/each}
+          </div>
+          <div class="menu-separator" role="separator"></div>
           <button
             role="menuitem"
-            disabled={newWorkDisabled}
-            title="New OpenCode thread"
-            onclick={onnewwork}><HarnessIcon agent="opencode" /> OpenCode</button
+            aria-label="New plan"
+            title="Start an Architect plan"
+            disabled={planDisabled}
+            onclick={onnewplan}>New plan</button
           >
-        </div>
-        <div class="menu-separator" role="separator"></div>
-        <button
-          role="menuitem"
-          aria-label="New plan"
-          title="Start an Architect plan"
-          disabled={planDisabled}
-          onclick={onnewplan}>New plan</button
-        >
-      </MenuButton>{/if}
-    <Button
-      variant="ghost"
-      size="sm"
-      onclick={ontogglechanges}
-      aria-controls="session-details"
-      aria-expanded={changesExpanded}
-      title={changesTitle}>{changesLabel}</Button
-    >
+        </MenuButton>{/if}
+      <Button
+        variant="ghost"
+        size="sm"
+        onclick={ontogglechanges}
+        aria-controls="session-details"
+        aria-expanded={changesExpanded}
+        title={changesTitle}>{changesLabel}</Button
+      >
+    </div>
     <MenuButton
       class="more-actions-menu"
       label="More actions"

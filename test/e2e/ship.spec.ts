@@ -193,6 +193,9 @@ describe('native Ship run history', () => {
     await expect($('.ship-panel')).toBeDisplayed();
     await expect($('.ship-summary')).toHaveText(expect.stringContaining('8 / 10 merged'));
     await expect($('.ship-panel')).toHaveText(expect.stringContaining('Umbrella #40'));
+    const subtitle = $('.ship-panel header .ship-repository');
+    await expect(subtitle).toHaveText(repository.split('/').at(-1)!);
+    await expect(subtitle).toHaveAttribute('title', repository);
     await expect($('.ship-run-option[aria-pressed="true"]')).toHaveText(
       expect.stringContaining('Ship dashboard fixture'),
     );

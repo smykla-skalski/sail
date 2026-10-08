@@ -662,7 +662,7 @@
   }
 
   .ship-policy dt {
-    color: var(--sui-text-muted);
+    color: var(--sui-muted);
   }
 
   .ship-policy dd {

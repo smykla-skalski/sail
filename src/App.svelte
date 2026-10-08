@@ -10587,6 +10587,7 @@
                     optionId === 'reject' ? 'rejected' : 'completed',
                   )}
                 running={!!(acpThread && runningAgentThreads[agentThreadKey(acpThread)])}
+                activityReady={acpActivityReady}
                 focused={focusedPane === 'main'}
                 oncreated={createAgentThread}
                 onactivity={saveAgentThread}
@@ -10974,6 +10975,7 @@
         focusPromptPane={promptFocusPane}
         onpromptfocused={() => (promptFocusPane = null)}
         running={(thread) => !!(thread && runningAgentThreads[agentThreadKey(thread)])}
+        activityReady={acpActivityReady}
         onstatus={updateAgentThreadStatus}
         onreplaychange={setAgentReplay}
         onchanges={(id) => {

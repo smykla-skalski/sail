@@ -24,16 +24,21 @@ async function topbarLayout() {
   return browser.execute(() => {
     const topbar = document.querySelector<HTMLElement>('.topbar')!;
     const actions = document.querySelector<HTMLElement>('.topbar-actions')!;
+    const primary = document.querySelector<HTMLElement>('.topbar-primary')!;
     const actionsBox = actions.getBoundingClientRect();
+    const more = document.querySelector('.topbar [aria-label="More actions"]')!;
     const breadcrumb = document.querySelector('.breadcrumb')!.getBoundingClientRect();
-    const controls = [...actions.querySelectorAll('.topbar-actions > button, .menu-trigger')].map(
+    const controls = [...actions.querySelectorAll('.topbar-primary > button, .menu-trigger')].map(
       (control) => control.getBoundingClientRect(),
     );
     return {
       viewport: innerWidth,
       topbarWidth: topbar.clientWidth,
+      topbarRight: topbar.getBoundingClientRect().right,
       topbarOverflow: topbar.scrollWidth - topbar.clientWidth,
       actionsOverflow: actions.scrollWidth - actions.clientWidth,
+      primaryOverflow: primary.scrollWidth - primary.clientWidth,
+      moreRight: more.getBoundingClientRect().right,
       actionsLeft: actionsBox.left,
       actionsRight: actionsBox.right,
       breadcrumbRight: breadcrumb.right,
@@ -53,10 +58,12 @@ async function topbarLayout() {
   });
 }
 
-function expectTopbarFits(layout: Awaited<ReturnType<typeof topbarLayout>>) {
-  expect(Math.abs(layout.viewport - 1280)).toBeLessThanOrEqual(2);
+function expectTopbarFits(layout: Awaited<ReturnType<typeof topbarLayout>>, width = 1280) {
+  expect(Math.abs(layout.viewport - width)).toBeLessThanOrEqual(2);
   expect(layout.topbarOverflow).toBeLessThanOrEqual(1);
   expect(layout.actionsOverflow).toBeLessThanOrEqual(1);
+  expect(layout.primaryOverflow).toBeLessThanOrEqual(1);
+  expect(layout.moreRight).toBeLessThanOrEqual(layout.topbarRight);
   expect(layout.actionsRight).toBeLessThanOrEqual(layout.viewport + 1);
   expect(layout.breadcrumbRight).toBeLessThanOrEqual(layout.actionsLeft);
   expect(layout.breadcrumbItemsRight).toBeLessThanOrEqual(layout.breadcrumbRight + 1);
@@ -120,6 +127,12 @@ describe('split agent panes', () => {
     const withDetails = await topbarLayout();
     expect(withDetails.topbarWidth).toBeLessThan(760);
     expectTopbarFits(withDetails);
+    await browser.setWindowSize(960, 850);
+    await browser.waitUntil(async () => (await topbarLayout()).viewport < 970);
+    const narrow = await topbarLayout();
+    expect(narrow.topbarWidth).toBeLessThan(420);
+    expectTopbarFits(narrow, 960);
+    await browser.setWindowSize(1280, 850);
 
     await $('.topbar-actions button[title="Toggle Changes (⌘L)"]').click();
     await expect($('.app-shell')).toHaveAttribute('data-details-visible', 'false');

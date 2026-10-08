@@ -40,6 +40,7 @@
     type ShipItIssue,
   } from './lib/implementation-models';
   import { runSerialOpenCodeTurn } from './lib/opencode-turns';
+  import { openCodeHeaderStatus } from './lib/agent-status';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
   import { withSpawnResponses, type SpawnReceipt } from './lib/agent-results';
@@ -315,21 +316,14 @@
     !!setup?.workReady || (session?.agent === 'architect' && !!setup?.planReady),
   );
   const visibleStatus = $derived(
-    runtimeState === 'starting'
-      ? 'connecting'
-      : runtimeState !== 'connected'
-        ? 'offline'
-        : pendingPermissions.length || pendingForms.length
-          ? 'waiting'
-          : loading
-            ? 'connecting'
-            : running
-              ? 'working'
-              : sending
-                ? 'connecting'
-                : inputReady
-                  ? 'ready'
-                  : 'offline',
+    openCodeHeaderStatus({
+      runtime: runtimeState,
+      waiting: pendingPermissions.length > 0 || pendingForms.length > 0,
+      loading,
+      running,
+      sending,
+      inputReady,
+    }),
   );
   const workspaceActivity = $derived(
     workspaceActivityItems({

@@ -86,6 +86,7 @@ button:disabled {
   .project-worktree-select,
   .project-agent-row,
   .breadcrumb-project,
+  .menu-trigger,
   .menu-popup [role^='menuitem'],
   .mobile-switcher button,
   .side-tabs button
@@ -1129,13 +1130,14 @@ button:disabled {
   flex: 0 0 62px;
   padding: 0 22px;
   border-bottom: 1px solid var(--shell-divider);
+  container: topbar / inline-size;
 }
 .mobile-switcher {
   display: none;
 }
 .breadcrumb {
   display: flex;
-  flex: 1 1 auto;
+  flex: 1 1 0;
   gap: 9px;
   min-width: 0;
   overflow: hidden;
@@ -1155,14 +1157,37 @@ button:disabled {
 .slash {
   color: var(--shell-muted);
 }
-.topbar-actions {
+.topbar-actions,
+.topbar-primary {
   display: flex;
-  flex: none;
+  flex: 0 1 auto;
   align-items: center;
   gap: 6px;
   min-width: 0;
-  overflow-x: auto;
   white-space: nowrap;
+}
+.topbar-primary {
+  margin-block: -5px;
+  padding: 5px 4px;
+  overflow-x: auto;
+}
+@container topbar (max-width: 640px) {
+  .topbar-actions,
+  .topbar-primary {
+    gap: 2px;
+  }
+  .topbar .topbar-actions .sui-button[data-size],
+  .topbar .menu-trigger {
+    padding-inline: 0.45rem;
+  }
+  .menu-trigger-extra {
+    display: none;
+  }
+}
+@container topbar (max-width: 420px) {
+  .breadcrumb {
+    display: none;
+  }
 }
 .session-usage {
   color: var(--sui-muted);
@@ -2230,10 +2255,14 @@ button:disabled {
   .breadcrumb {
     display: none;
   }
-  .topbar-actions {
+  .topbar-actions,
+  .topbar-primary {
     justify-content: center;
     flex-wrap: wrap;
     gap: 4px 8px;
+    overflow: visible;
+  }
+  .topbar-actions {
     flex: 0 0 100%;
     max-width: 100%;
     min-height: 32px;
@@ -2251,13 +2280,6 @@ button:disabled {
   .composer textarea {
     min-height: 56px;
     padding: 8px 12px;
-  }
-}
-@media (max-width: 360px) {
-  .topbar-actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    justify-items: center;
   }
 }
 @media (max-width: 520px) and (max-height: 600px) {
@@ -2280,12 +2302,18 @@ button:disabled {
     grid-row: 1;
     grid-column: 2;
     min-height: 0;
-    overflow-x: auto;
     flex: initial;
+  }
+  .topbar-actions,
+  .topbar-primary {
     flex-wrap: nowrap;
     justify-content: flex-start;
   }
-  .topbar-actions > * {
+  .topbar-primary {
+    flex: 0 1 auto;
+    overflow-x: auto;
+  }
+  .topbar-primary > * {
     flex: 0 0 auto;
   }
   .mobile-switcher {

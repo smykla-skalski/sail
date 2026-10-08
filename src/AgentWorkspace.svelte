@@ -16,6 +16,7 @@
   import HookActivityCard from './HookActivity.svelte';
   import { activityForSession, parseHookActivity, type HookActivity } from './lib/hook-activity';
   import { toolInput } from './lib/tool-display';
+  import { agentHeaderStatus } from './lib/agent-status';
   import {
     acpToolFailure,
     prepareAcpFailureDraft,
@@ -115,6 +116,7 @@
     thread: AgentThread | null;
     usage?: AgentUsage;
     running: boolean;
+    activityReady?: boolean;
     focused?: boolean;
     focusPrompt?: boolean;
     picked?: BrowserAttachment;
@@ -159,6 +161,7 @@
     thread,
     usage,
     running,
+    activityReady = true,
     focused = true,
     focusPrompt = false,
     picked,
@@ -480,20 +483,18 @@
   const preparedFailures = new Map<string, string>();
   const name = $derived(agentName);
   const isBusy = $derived(busy || running || historyLoading);
-  // The status bar lists a turn only once its thread exists and runs, so starting a
-  // session or replaying history reads as connecting rather than working.
   const visibleStatus = $derived(
-    connecting
-      ? 'connecting'
-      : !ready
-        ? 'offline'
-        : permissions.length
-          ? 'waiting'
-          : (busy && !activeSessionId) || (historyLoading && !busy && !running)
-            ? 'connecting'
-            : isBusy
-              ? 'working'
-              : 'ready',
+    agentHeaderStatus({
+      connecting,
+      ready,
+      waiting: permissions.length > 0,
+      sending: busy,
+      hasSession: !!activeSessionId,
+      running,
+      activityReady,
+      historyLoading,
+      busy: isBusy,
+    }),
   );
   const workspaceActivity = $derived(
     workspaceActivityItems({

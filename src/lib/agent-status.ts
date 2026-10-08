@@ -90,3 +90,55 @@ export function resetLabel(resetsAt: number | undefined, now = Date.now()): stri
   const remainingHours = hours % 24;
   return remainingHours ? `${days}d ${remainingHours}h` : `${days}d`;
 }
+
+export type AgentHeaderInput = {
+  connecting: boolean;
+  ready: boolean;
+  waiting: boolean;
+  sending: boolean;
+  hasSession: boolean;
+  running: boolean;
+  activityReady: boolean;
+  historyLoading: boolean;
+  busy: boolean;
+};
+
+/**
+ * Status shown in an ACP thread header.
+ *
+ * The status bar lists a turn only once its thread exists and Sail has confirmed it with
+ * the backend, so starting a session, replaying history or recovering a turn reads as
+ * connecting instead of working.
+ */
+export function agentHeaderStatus(input: AgentHeaderInput): string {
+  if (input.connecting) return 'connecting';
+  if (!input.ready) return 'offline';
+  if (input.waiting) return 'waiting';
+  if (
+    (input.sending && !input.hasSession) ||
+    (input.historyLoading && !input.sending && !input.running) ||
+    (input.running && !input.sending && !input.activityReady)
+  )
+    return 'connecting';
+  return input.busy ? 'working' : 'ready';
+}
+
+export type OpenCodeHeaderInput = {
+  runtime: string;
+  waiting: boolean;
+  loading: boolean;
+  running: boolean;
+  sending: boolean;
+  inputReady: boolean;
+};
+
+/** Status shown in an OpenCode pane header; a turn works only once its session runs. */
+export function openCodeHeaderStatus(input: OpenCodeHeaderInput): string {
+  if (input.runtime === 'starting') return 'connecting';
+  if (input.runtime !== 'connected') return 'offline';
+  if (input.waiting) return 'waiting';
+  if (input.loading) return 'connecting';
+  if (input.running) return 'working';
+  if (input.sending) return 'connecting';
+  return input.inputReady ? 'ready' : 'offline';
+}
