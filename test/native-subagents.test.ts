@@ -878,3 +878,25 @@ await test('OpenCode children keep their own provider on receipts', () => {
   assert.equal(receipt.state, 'completed');
   assert.equal(receipt.result, 'done');
 });
+
+await test('a resumed OpenCode child re-arms after completing and keeps failure reasons', () => {
+  const state = (value: string, error?: string) =>
+    opencode('root', {
+      sessionUpdate: 'subagent_state_update',
+      subagentSessionId: 'child',
+      state: value,
+      ...(error ? { error } : {}),
+    });
+  let store = updateNativeSubagents(
+    {},
+    opencode('root', { sessionUpdate: 'subagent_spawned', subagentSessionId: 'child' }),
+    '/worktree',
+    1,
+  );
+  store = updateNativeSubagents(store, state('completed'), '/worktree', 2);
+  assert.equal(store['opencode:child'].outcome, 'completed');
+  store = updateNativeSubagents(store, state('working'), '/worktree', 3);
+  assert.equal(store['opencode:child'].outcome, 'working');
+  store = updateNativeSubagents(store, state('failed', 'boom'), '/worktree', 4);
+  assert.equal(store['opencode:child'].error, 'boom');
+});

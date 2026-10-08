@@ -11215,14 +11215,14 @@
       ].find(
         (item) =>
           item.directory === path &&
-          (item.agent === 'opencode'
+          (item.agent === 'opencode' && !threadId.startsWith('acp:')
             ? `opencode:${item.sessionId}`
             : `acp:${item.agent}:${item.sessionId}`) === threadId,
       );
       if (!thread)
         throw new Error('Session history is unavailable. Open the worktree to inspect it.');
       if (
-        thread.agent === 'opencode'
+        thread.agent === 'opencode' && !threadId.startsWith('acp:')
           ? runtimeState !== 'connected'
           : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available)
       )

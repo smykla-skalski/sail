@@ -73,6 +73,7 @@ function duplicatesLiveChild(
 }
 
 function state(value: unknown): NativeSubagentOutcome {
+  if (value === 'working') return 'working';
   if (value === 'completed') return 'completed';
   if (value === 'failed') return 'failed';
   if (value === 'cancelled') return 'interrupted';
@@ -243,7 +244,12 @@ export function updateNativeSubagents(
               ? 'Failed'
               : outcome === 'interrupted'
                 ? 'Interrupted'
-                : 'Disconnected',
+                : outcome === 'working'
+                  ? 'Working…'
+                  : 'Disconnected',
+        ...(typeof update.error === 'string' && update.error.trim()
+          ? { error: update.error.trim() }
+          : {}),
         updated: now,
       },
     };

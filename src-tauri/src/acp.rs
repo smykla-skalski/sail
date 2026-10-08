@@ -127,7 +127,7 @@ impl NativeSubagentRegistry {
             return;
         };
         entry.outcome = match outcome {
-            "completed" | "failed" => outcome,
+            "completed" | "failed" | "working" => outcome,
             "cancelled" => "interrupted",
             _ => "unknown",
         }
@@ -2128,14 +2128,20 @@ fn opencode_child_update(message: &Value) -> Option<Option<Value>> {
                     "task":title.unwrap_or("Delegated task")
                 }),
             ),
-            Some(status @ ("completed" | "failed" | "interrupted")) => wrap(
-                parent,
-                json!({
+            Some(status @ ("running" | "completed" | "failed" | "interrupted")) => {
+                let mut update = json!({
                     "sessionUpdate":"subagent_state_update",
                     "subagentSessionId":child,
-                    "state":if status == "interrupted" { "cancelled" } else { status }
-                }),
-            ),
+                    "state":match status { "interrupted" => "cancelled", "running" => "working", other => other }
+                });
+                let reason = params
+                    .pointer("/error/message")
+                    .or_else(|| params.get("error"));
+                if let Some(reason) = reason.and_then(Value::as_str) {
+                    update["error"] = json!(reason.chars().take(500).collect::<String>());
+                }
+                wrap(parent, update)
+            }
             _ => None,
         },
         _ => None,
@@ -4294,10 +4300,19 @@ mod capability_profile_tests {
             );
             assert_eq!(done.pointer("/params/update/state"), Some(&json!(state)));
         }
+        let resumed = opencode_child_update(&with(json!({"type":"status","status":"running"})))
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            opencode_child_update(&with(json!({"type":"status","status":"running"}))),
-            Some(None)
+            resumed.pointer("/params/update/state"),
+            Some(&json!("working"))
         );
+        let failed = opencode_child_update(&with(
+            json!({"type":"status","status":"failed","error":{"message":"boom"}}),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(failed.pointer("/params/update/error"), Some(&json!("boom")));
 
         let inner =
             json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}});
