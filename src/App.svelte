@@ -9761,6 +9761,16 @@
       return true;
     } catch (cause) {
       if (current !== selection) return false;
+      if (missingRepositoryPath(cause)) {
+        const fallback = await availableFallbackDirectory(path);
+        if (current !== selection) return false;
+        if (fallback) {
+          void loadProject(fallback, false).catch((loadCause) => {
+            if (directory === fallback) error = describe(loadCause);
+          });
+          return false;
+        }
+      }
       setupError = describe(cause);
       workReady = false;
       planReady = false;
@@ -9768,6 +9778,20 @@
     } finally {
       if (current === selection) setupLoading = false;
     }
+  }
+
+  async function availableFallbackDirectory(missing: string): Promise<string | null> {
+    const parent = worktreeAt(projectCatalog, missing)?.repository;
+    const candidates = [parent, ...projectCatalog.repositories].filter(
+      (path): path is string => !!path && path !== missing,
+    );
+    const unique = [...new Set(candidates)];
+    const available = await Promise.all(
+      unique.map((path) =>
+        invoke<boolean>('repository_path_available', { path }).catch(() => false),
+      ),
+    );
+    return unique.find((_, index) => available[index]) ?? null;
   }
 
   async function restartSetup() {
