@@ -21,8 +21,7 @@
   --radius-6: 6px;
   --radius-8: 8px;
   --radius-12: 12px;
-  --transcript-measure: 512px;
-  --transcript-gutter: max(20px, calc((100% - var(--transcript-measure)) / 2));
+  --transcript-gutter: 20px;
   --shell-sidebar: #eef2f0;
   --shell-divider: #e3e8e6;
   --shell-muted: #53625c;

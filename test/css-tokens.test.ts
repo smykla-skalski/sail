@@ -400,20 +400,27 @@ for (const name of ['light', 'dark'] as const) {
   });
 }
 
-void test('all three transcript renderers share the reading column gutter', () => {
+void test('all three transcript renderers fill the width with one fixed gutter', () => {
+  const style = readFileSync(join(root, 'src/style.css'), 'utf8');
+  assert.match(style, /\n {2}--transcript-gutter: 20px;\n/);
   const containers: [string, RegExp][] = [
-    ['src/style.css', /\n\.conversation \{[^}]*padding: 28px var\(--transcript-gutter\);/],
-    [
-      'src/AgentWorkspace.svelte',
-      /\n {2}\.agent-conversation \{[^}]*padding-inline: var\(--transcript-gutter\);/,
-    ],
-    [
-      'src/OpenCodePane.svelte',
-      /\n {2}\.opencode-pane \.agent-conversation \{[^}]*padding-inline: var\(--transcript-gutter\);/,
-    ],
+    ['src/style.css', /\n\.conversation \{([^}]*)\}/],
+    ['src/AgentWorkspace.svelte', /\n {2}\.agent-conversation \{([^}]*)\}/],
+    ['src/OpenCodePane.svelte', /\n {2}\.opencode-pane \.agent-conversation \{([^}]*)\}/],
   ];
-  for (const [file, rule] of containers)
-    assert.match(readFileSync(join(root, file), 'utf8'), rule, file);
+  for (const [file, rule] of containers) {
+    const body = rule.exec(readFileSync(join(root, file), 'utf8'))?.[1];
+    assert.ok(body, file);
+    assert.match(
+      body,
+      file === 'src/style.css'
+        ? /padding: 28px var\(--transcript-gutter\);/
+        : /padding-inline: var\(--transcript-gutter\);/,
+      file,
+    );
+    assert.doesNotMatch(body, /max-width|margin[^:]*:[^;]*auto|--transcript-measure/, file);
+  }
+  for (const { file, text } of sources) assert.doesNotMatch(text, /--transcript-measure/, file);
   assert.doesNotMatch(
     readFileSync(join(root, 'src/style.css'), 'utf8'),
     /\.chat-area > (?:\.chat-body > )?\.conversation[^{]*\{[^}]*padding-inline/,
