@@ -1965,7 +1965,8 @@ fn client_capabilities(profile: CapabilityProfile) -> Value {
     json!({
         "fs":{"readTextFile":false,"writeTextFile":false},
         "terminal":profile.enables_terminal(),
-        "subagents":{}
+        "subagents":{},
+        "plan":{}
     })
 }
 
@@ -3891,6 +3892,11 @@ mod capability_profile_tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn client_advertises_plan_capability() {
+        assert_eq!(client_capabilities(CapabilityProfile::Build).get("plan"), Some(&json!({})));
     }
 
     #[test]

@@ -192,6 +192,16 @@ function configOptions(sessionId) {
         { value: 'high', name: 'High' },
       ],
     },
+    {
+      id: 'mode',
+      name: 'Mode',
+      type: 'select',
+      currentValue: config.mode ?? 'default',
+      options: [
+        { value: 'default', name: 'Default' },
+        { value: 'plan', name: 'Plan' },
+      ],
+    },
   ];
   return session?.noEffort ? options.slice(0, 1) : options;
 }
