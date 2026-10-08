@@ -29,6 +29,7 @@ export type SpawnReceipt = {
   updated: number;
   result: string | null;
   error: string | null;
+  dispatchPending?: boolean;
   activity?: string;
   model?: string;
   validation?: GateMetadata;
@@ -70,6 +71,7 @@ export function loadSpawnReceipts(raw: string | null): SpawnReceipt[] {
         typeof item.updated === 'number' &&
         (item.result === null || typeof item.result === 'string') &&
         (item.error === null || typeof item.error === 'string') &&
+        (item.dispatchPending === undefined || typeof item.dispatchPending === 'boolean') &&
         (item.activity === undefined || typeof item.activity === 'string'),
     );
     for (const receipt of receipts) {
@@ -99,6 +101,51 @@ export function saveBoundedReceipt(
   );
 }
 
+export function receiptTurnMessages<T extends { id: string; type: string; text?: string }>(
+  messagesNewestFirst: readonly T[],
+  turnId: string | null,
+  prompt: string | null,
+): T[] | null {
+  if (!turnId || prompt === null) return null;
+  const messages = messagesNewestFirst.toReversed();
+  const start = messages.findIndex(
+    (message) => message.type === 'user' && message.id === turnId && message.text === prompt,
+  );
+  if (start < 0) return null;
+  const next = messages.findIndex((message, index) => index > start && message.type === 'user');
+  return messages.slice(start, next < 0 ? undefined : next);
+}
+
+export function failedUnsubmittedDispatch(error: string): Partial<SpawnReceipt> {
+  return { state: 'failed', error, dispatchPending: false };
+}
+
+const rejectedBeforeAdmission = new Set([
+  'InvalidRequestError',
+  'LocationNotFoundError',
+  'SessionNotFoundError',
+  'UnauthorizedError',
+]);
+
+export function promptConflictTurnId(cause: unknown): string | null {
+  if (typeof cause !== 'object' || cause === null || Reflect.get(cause, '_tag') !== 'ConflictError')
+    return null;
+  const resource = Reflect.get(cause, 'resource');
+  return typeof resource === 'string' && resource.length > 0 ? resource : null;
+}
+
+export function promptRejectionProvesUnsubmitted(cause: unknown): boolean {
+  if (typeof cause !== 'object' || cause === null) return false;
+  const tag = Reflect.get(cause, '_tag');
+  return typeof tag === 'string' && rejectedBeforeAdmission.has(tag);
+}
+
+export function failedPromptDispatch(cause: unknown, error: string): Partial<SpawnReceipt> {
+  return promptRejectionProvesUnsubmitted(cause)
+    ? failedUnsubmittedDispatch(error)
+    : { state: 'failed', error };
+}
+
 export function receiptForSource(
   receipts: SpawnReceipt[],
   receiptId: string,
@@ -117,6 +164,13 @@ export function receiptForSource(
         item.sourceDirectory === sourceDirectory,
     ) ?? null
   );
+}
+
+export function receiptMatchesTurn(
+  receipt: Pick<SpawnReceipt, 'turnId'> | undefined,
+  turnId: string,
+): boolean {
+  return receipt?.turnId === turnId;
 }
 
 export function receiptIsSettled(state: SpawnState): boolean {

@@ -13,6 +13,7 @@ import {
   shipCleanupRequest,
   shipEvidenceReadiness,
   shipTaskThreadsSettled,
+  shipTaskReceiptIdsToProtect,
   shipActivity,
   reconciledShipGates,
   recoverValidationEvidence,
@@ -827,6 +828,36 @@ void test('validation generation fence detects edit restore ABA', async () => {
   assert.equal(committed, false);
 });
 
+void test('restores durable coordination claims', () => {
+  const run = fixture();
+  run.issues[0].claimFencePending = true;
+  run.issues[0].claimRevalidationPending = true;
+  run.issues[0].claimHandoffPending = true;
+  run.issues[0].claim = {
+    id: 'claim-1',
+    instanceId: 'instance-a',
+    holder: 'Sail codex (run)',
+    task: 'ship:run:first',
+    acquiredAt: '2026-10-07T10:00:00.000Z',
+    heartbeatAt: '2026-10-07T10:01:00.000Z',
+    expiresAt: '2026-10-07T10:03:00.000Z',
+    status: 'active',
+    takeoverOf: 'expired-claim',
+    commentId: 99,
+    commentUpdatedAtMillis: 1_780_827_660_000,
+  };
+
+  assert.equal(loadShipRuns(JSON.stringify([run]))[0].issues[0].claimFencePending, true);
+  assert.equal(loadShipRuns(JSON.stringify([run]))[0].issues[0].claimRevalidationPending, true);
+  assert.equal(loadShipRuns(JSON.stringify([run]))[0].issues[0].claimHandoffPending, true);
+  assert.deepEqual(loadShipRuns(JSON.stringify([run]))[0].issues[0].claim, run.issues[0].claim);
+  delete run.issues[0].claim.commentUpdatedAtMillis;
+  assert.equal(
+    loadShipRuns(JSON.stringify([run]))[0].issues[0].claim?.commentUpdatedAtMillis,
+    undefined,
+  );
+});
+
 void test('persists canonical task checkpoints with Ship runs', () => {
   const run = fixture();
   run.issues[0].checkpoint!.objective = 'Concrete objective';
@@ -1349,6 +1380,143 @@ void test('ownership needs a generation-stable quiet pass', () => {
     settled: false,
     nextGeneration: 3,
   });
+});
+
+void test('task settlement waits for every durable coordination dispatch', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/repo/task';
+  issue.threadId = 'opencode:owner';
+  issue.receiptId = 'owner';
+
+  assert.equal(
+    shipTaskThreadsSettled(issue, { 'opencode:owner': 'unavailable' }, [
+      {
+        receiptId: 'owner',
+        targetId: 'opencode:owner',
+        targetDirectory: '/repo/task',
+        state: 'completed',
+      },
+      {
+        receiptId: 'coordination',
+        targetId: 'opencode:owner',
+        targetDirectory: '/repo/task',
+        state: 'working',
+        dispatchPending: true,
+      },
+    ]),
+    false,
+  );
+});
+
+void test('active task receipts and claims bypass the receipt bound', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/repo/task';
+  issue.threadId = 'opencode:owner';
+  const terminal = Array.from({ length: 250 }, (_, index) => ({
+    receiptId: `terminal-${index}`,
+    targetId: 'opencode:owner',
+    targetDirectory: '/repo/task',
+    state: 'completed' as const,
+  }));
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(issue, [
+      ...terminal,
+      {
+        receiptId: 'working',
+        targetId: 'opencode:owner',
+        targetDirectory: '/repo/task',
+        state: 'working',
+      },
+      {
+        receiptId: 'pending',
+        targetId: 'opencode:owner',
+        targetDirectory: '/repo/task',
+        state: 'failed',
+        dispatchPending: true,
+      },
+    ]),
+    ['working', 'pending'],
+  );
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(
+      { ...issue, receiptId: 'settled-owner', state: 'failed', workerSettled: true },
+      [
+        {
+          receiptId: 'settled-owner',
+          targetId: 'opencode:owner',
+          targetDirectory: '/repo/task',
+          state: 'failed',
+        },
+      ],
+    ),
+    [],
+  );
+  const activeClaim = {
+    id: 'active-claim',
+    instanceId: 'sail-a',
+    holder: 'Sail',
+    task: 'ship:run:first',
+    acquiredAt: '2026-10-07T10:00:00.000Z',
+    heartbeatAt: '2026-10-07T10:01:00.000Z',
+    expiresAt: '2026-10-07T10:03:00.000Z',
+    status: 'active' as const,
+    commentId: 99,
+  };
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(
+      {
+        ...issue,
+        receiptId: 'settled-owner',
+        state: 'failed',
+        workerSettled: true,
+        claim: activeClaim,
+      },
+      [
+        {
+          receiptId: 'settled-owner',
+          targetId: 'opencode:owner',
+          targetDirectory: '/repo/task',
+          state: 'failed',
+        },
+      ],
+    ),
+    ['settled-owner'],
+  );
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(
+      {
+        ...issue,
+        path: null,
+        receiptId: 'settled-owner',
+        state: 'merged',
+        workerSettled: true,
+        claim: activeClaim,
+      },
+      [
+        {
+          receiptId: 'settled-owner',
+          targetId: 'opencode:owner',
+          targetDirectory: '/repo/task',
+          state: 'completed',
+        },
+      ],
+    ),
+    ['settled-owner'],
+  );
+  assert.deepEqual(
+    shipTaskReceiptIdsToProtect(
+      { ...issue, receiptId: 'unsettled-owner', state: 'failed', workerSettled: false },
+      [
+        {
+          receiptId: 'unsettled-owner',
+          targetId: 'opencode:owner',
+          targetDirectory: '/repo/task',
+          state: 'failed',
+        },
+      ],
+    ),
+    ['unsettled-owner'],
+  );
 });
 
 void test('dependency failure blocks only dependents and merged dependencies become queued', () => {

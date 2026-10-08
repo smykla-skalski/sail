@@ -22,7 +22,12 @@ import {
   openCodePromptRecoveryAction,
   openCodePromptSettlement,
   receiptForSource,
+  receiptMatchesTurn,
   receiptNeedsRefresh,
+  receiptTurnMessages,
+  promptConflictTurnId,
+  failedPromptDispatch,
+  failedUnsubmittedDispatch,
   receiptIsSettled,
   receiptNeedsLiveActivity,
   receiptSourceId,
@@ -56,6 +61,12 @@ const receipt: SpawnReceipt = {
   result: 'Done',
   error: null,
 };
+
+void test('receipt settlement is correlated to its current turn', () => {
+  assert.equal(receiptMatchesTurn(receipt, 'turn-one'), true);
+  assert.equal(receiptMatchesTurn({ ...receipt, turnId: 'turn-two' }, 'turn-one'), false);
+  assert.equal(receiptMatchesTurn(undefined, 'turn-one'), false);
+});
 
 await test('spawn receipts stay scoped to the launching source and project', () => {
   assert.deepEqual(
@@ -136,6 +147,61 @@ await test('receipts survive restart with bounded results and honest states', ()
   );
   assert.deepEqual(loadSpawnReceipts('{invalid'), []);
   assert.deepEqual(loadSpawnReceipts(JSON.stringify([{ ...receipt, targetId: 1 }])), []);
+  assert.equal(
+    loadSpawnReceipts(JSON.stringify([{ ...receipt, dispatchPending: true }]))[0].dispatchPending,
+    true,
+  );
+});
+
+await test('receipt settlement selects the exact turn in a multi-turn session', () => {
+  const messages = [
+    { id: 'idle-two', type: 'idle' },
+    { id: 'assistant-two', type: 'assistant' },
+    { id: 'turn-two', type: 'user', text: 'same prompt' },
+    { id: 'idle-one', type: 'idle' },
+    { id: 'assistant-one', type: 'assistant' },
+    { id: 'turn-one', type: 'user', text: 'same prompt' },
+  ];
+  assert.deepEqual(
+    receiptTurnMessages(messages, 'turn-one', 'same prompt')?.map((message) => message.id),
+    ['turn-one', 'assistant-one', 'idle-one'],
+  );
+  assert.deepEqual(
+    receiptTurnMessages(messages, 'turn-two', 'same prompt')?.map((message) => message.id),
+    ['turn-two', 'assistant-two', 'idle-two'],
+  );
+  assert.equal(receiptTurnMessages(messages, 'missing', 'same prompt'), null);
+});
+
+await test('known pre-dispatch failures clear the durable admission fence', () => {
+  assert.deepEqual(failedUnsubmittedDispatch('authorization expired'), {
+    state: 'failed',
+    error: 'authorization expired',
+    dispatchPending: false,
+  });
+  assert.deepEqual(failedPromptDispatch({ _tag: 'SessionNotFoundError' }, 'missing session'), {
+    state: 'failed',
+    error: 'missing session',
+    dispatchPending: false,
+  });
+  assert.deepEqual(failedPromptDispatch({ name: 'TypeError' }, 'network failed'), {
+    state: 'failed',
+    error: 'network failed',
+  });
+});
+
+await test('durable prompt ID conflicts retain the admission fence for reconciliation', () => {
+  const conflict = {
+    _tag: 'ConflictError',
+    resource: 'turn-one',
+  };
+
+  assert.equal(promptConflictTurnId(conflict), 'turn-one');
+  assert.deepEqual(failedPromptDispatch(conflict, 'already admitted'), {
+    state: 'failed',
+    error: 'already admitted',
+  });
+  assert.equal(promptConflictTurnId({ _tag: 'ConflictError' }), null);
 });
 
 await test('an active launch transaction fences an idle created session', () => {
