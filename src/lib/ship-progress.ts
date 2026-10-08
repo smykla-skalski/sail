@@ -717,10 +717,12 @@ export function shipTaskThreadsSettled(
     Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'> &
       Partial<Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetDirectory'>>
   >,
+  discoveredThreadIds: Iterable<string> = [],
 ): boolean {
   const threadIds = [
     ...new Set([
       ...shipOwnedThreadIds(issue, receipts),
+      ...discoveredThreadIds,
       ...(issue.contextHandoffs ?? []).flatMap((handoff) => [
         handoff.fromThreadId,
         handoff.toThreadId,
@@ -736,6 +738,18 @@ export function shipTaskThreadsSettled(
     if (live !== 'unavailable') return shippingWorkerSettled(live);
     return receipt !== undefined && shippingWorkerSettled(receipt.state);
   });
+}
+
+export function shipOwnershipQuietGeneration(
+  nativeSubagentGeneration: number,
+  nativeGeneration: number,
+  openCodeDescendants: Iterable<string>,
+): string {
+  return JSON.stringify([
+    nativeSubagentGeneration,
+    nativeGeneration,
+    ...[...new Set(openCodeDescendants)].toSorted(),
+  ]);
 }
 
 export function shipOwnershipQuietPass(

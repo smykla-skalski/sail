@@ -52,6 +52,7 @@
     shipCleanupRequest,
     shipEvidenceReadiness,
     shipOwnedThreadIds,
+    shipOwnershipQuietGeneration,
     shipOwnershipQuietPass,
     shipTaskThreadsSettled,
     reconciledShipGates,
@@ -3406,9 +3407,12 @@
     }
   }
 
-  async function settledShipOwnershipSnapshot(
-    issue: ShipIssue,
-  ): Promise<{ generation: number; nativeGeneration: number; receipts: SpawnReceipt[] } | null> {
+  async function settledShipOwnershipSnapshot(issue: ShipIssue): Promise<{
+    generation: number;
+    nativeGeneration: number;
+    ownershipGeneration: string;
+    receipts: SpawnReceipt[];
+  } | null> {
     const nativeGeneration = await reconcileProviderNativeSubagents(issue);
     const generation = nativeSubagentGeneration;
     const receipts = [...spawnReceipts, ...nativeChildReceipts];
@@ -3428,7 +3432,14 @@
         ])
         .toSorted(([left], [right]) => String(left).localeCompare(String(right))),
     );
-    const threadIds = shipOwnedThreadIds(issue, receipts);
+    const knownThreadIds = shipOwnedThreadIds(issue, receipts);
+    const openCodeDescendants = await reconcileProviderOpenCodeDescendants(issue, knownThreadIds);
+    const threadIds = [...new Set([...knownThreadIds, ...openCodeDescendants])];
+    const ownershipGeneration = shipOwnershipQuietGeneration(
+      generation,
+      nativeGeneration,
+      openCodeDescendants,
+    );
     const states = Object.fromEntries(
       await Promise.all(
         threadIds.map(async (threadId) => [
@@ -3457,10 +3468,10 @@
     if (
       !shipOwnershipQuietPass(generation, nativeSubagentGeneration, false).settled ||
       receiptSnapshot !== currentSnapshot ||
-      !shipTaskThreadsSettled(issue, states, receipts)
+      !shipTaskThreadsSettled(issue, states, receipts, openCodeDescendants)
     )
       return null;
-    return { generation, nativeGeneration, receipts };
+    return { generation, nativeGeneration, ownershipGeneration, receipts };
   }
 
   function missingRepositoryPath(cause: unknown): boolean {
@@ -3722,7 +3733,8 @@
           if (
             !confirmedOwnership ||
             confirmedOwnership.generation !== ownership.generation ||
-            confirmedOwnership.nativeGeneration !== ownership.nativeGeneration
+            confirmedOwnership.nativeGeneration !== ownership.nativeGeneration ||
+            confirmedOwnership.ownershipGeneration !== ownership.ownershipGeneration
           )
             return;
           const archivePath = await invoke<string | null>('delete_worktree', {

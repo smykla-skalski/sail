@@ -32,6 +32,7 @@ import {
   shipIssuePresentation,
   shipMergeClaim,
   shipOwnedThreadIds,
+  shipOwnershipQuietGeneration,
   shipOwnershipQuietPass,
   shipStatus,
   sortShipIssues,
@@ -1075,6 +1076,77 @@ void test('late retired-worker children block cleanup without restoring retired 
       issue,
       { old: 'completed', new: 'completed', 'late-child': 'completed' },
       [...receipts, { ...lateChild, state: 'completed' }],
+    ),
+    true,
+  );
+});
+
+void test('post-handoff OpenCode descendants invalidate cleanup and block deletion while active', () => {
+  const issue = fixture().issues[0];
+  issue.path = '/worktree';
+  issue.threadId = 'opencode:new';
+  issue.receiptId = 'new-receipt';
+  issue.contextHandoffs = [
+    {
+      id: 'handoff-1',
+      provider: 'opencode',
+      fromThreadId: 'opencode:old',
+      toThreadId: 'opencode:new',
+      context: 86,
+      compactions: 0,
+      checkpointSequence: 2,
+      revision: 'abc',
+      offeredAt: 10,
+      startedAt: 11,
+      retriesBefore: 0,
+      lostStateFailuresBefore: 0,
+      retriesAfter: null,
+      lostStateFailuresAfter: null,
+      outcome: 'pending',
+      error: null,
+    },
+  ];
+  const receipts = [
+    {
+      receiptId: 'old-receipt',
+      targetId: 'opencode:old',
+      state: 'completed' as const,
+    },
+    {
+      receiptId: 'new-receipt',
+      targetId: 'opencode:new',
+      state: 'completed' as const,
+    },
+  ];
+  const lateChild = 'opencode:late-child';
+
+  assert.notEqual(
+    shipOwnershipQuietGeneration(3, 5, []),
+    shipOwnershipQuietGeneration(3, 5, [lateChild]),
+  );
+  assert.equal(
+    shipTaskThreadsSettled(
+      issue,
+      {
+        'opencode:old': 'completed',
+        'opencode:new': 'completed',
+        [lateChild]: 'working',
+      },
+      receipts,
+      [lateChild],
+    ),
+    false,
+  );
+  assert.equal(
+    shipTaskThreadsSettled(
+      issue,
+      {
+        'opencode:old': 'completed',
+        'opencode:new': 'completed',
+        [lateChild]: 'completed',
+      },
+      receipts,
+      [lateChild],
     ),
     true,
   );
