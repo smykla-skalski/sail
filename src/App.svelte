@@ -2970,7 +2970,6 @@
     }>('ship_merge_pull_request', {
       request: {
         repository: run.repository,
-        policyDirectory: issue.path,
         expectedRepository: run.remote,
         pullRequest: issue.pullRequest,
         expectedHead: issue.checkpoint?.revision,
@@ -2996,6 +2995,9 @@
     if (!(await confirmShipAction(shipRetryConfirmation(issue)))) return '';
     if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
       await stopShippingWorker(issue);
+    const stillRetryable = shipRetryAction(issue);
+    if (!stillRetryable.enabled)
+      throw new Error(stillRetryable.reason ?? 'This issue changed and cannot be retried.');
     const checkpoint = issue.checkpoint;
     const resumed =
       checkpoint && (checkpoint.status === 'cancelled' || checkpoint.status === 'failed')
@@ -3037,10 +3039,13 @@
     if (run.issues.some((issue) => activeShipLaunches.has(`${run.id}:${issue.id}`)))
       throw new Error('A worker is still launching. Stop the run once it has started.');
     if (!(await confirmShipAction(shipStopConfirmation(run)))) return '';
+    if (run.issues.some((issue) => activeShipLaunches.has(`${run.id}:${issue.id}`)))
+      throw new Error('A worker is still launching. Stop the run once it has started.');
     const stopping = run.issues.filter((issue) =>
       ['pending', 'starting', 'working', 'awaiting_merge'].includes(issue.state),
     );
-    const markStopped = (issue: ShipIssue) => {
+    const markStopped = async (issue: ShipIssue) => {
+      if (issue.state === 'merged') return;
       const checkpoint = issue.checkpoint;
       return updateShipIssue(run, issue, {
         state: 'failed',

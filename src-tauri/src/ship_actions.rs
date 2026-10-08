@@ -176,7 +176,6 @@ fn valid_revision(value: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct ShipMergeRequest {
     repository: String,
-    policy_directory: Option<String>,
     expected_repository: String,
     pull_request: String,
     expected_head: String,
@@ -287,15 +286,8 @@ pub async fn ship_merge_pull_request(
     tauri::async_runtime::spawn_blocking(move || {
         let repository = PathBuf::from(crate::validate_repository(request.repository.clone())?);
         crate::github::require_target_repository(&repository, &request.expected_repository)?;
-        let policy_root = match request
-            .policy_directory
-            .as_ref()
-            .filter(|path| !path.trim().is_empty())
-        {
-            Some(path) => PathBuf::from(crate::validate_repository(path.clone())?),
-            None => repository.clone(),
-        };
-        let policy = resolve_merge_policy(&policy_root)?;
+        // The project checkout, never the pull request's own worktree, so a branch cannot rewrite its merge policy.
+        let policy = resolve_merge_policy(&repository)?;
         merge_pull_request(&request, &policy, &mut |arguments| {
             let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
             crate::github::gh_output(&repository, &arguments)
@@ -360,7 +352,6 @@ mod tests {
     fn request(head: &str, ready: bool) -> ShipMergeRequest {
         ShipMergeRequest {
             repository: "repo".to_string(),
-            policy_directory: None,
             expected_repository: "Owner/Repo".to_string(),
             pull_request: "https://github.com/owner/repo/pull/7".to_string(),
             expected_head: head.to_string(),
