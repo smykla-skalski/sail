@@ -19,8 +19,6 @@
   }
 
   let { elicitation, agent, onanswer }: Props = $props();
-  let values = $state<Record<string, unknown>>({});
-  let error = $state('');
   const properties = $derived(
     elicitation.schema.properties &&
       typeof elicitation.schema.properties === 'object' &&
@@ -28,14 +26,14 @@
       ? (elicitation.schema.properties as Record<string, Record<string, unknown>>)
       : {},
   );
-
-  $effect(() => {
-    values = Object.fromEntries(
+  let values = $state<Record<string, unknown>>(
+    Object.fromEntries(
       Object.entries(properties).flatMap(([key, property]) =>
         property.default === undefined ? [] : [[key, property.default]],
       ),
-    );
-  });
+    ),
+  );
+  let error = $state('');
 
   async function answer(action: 'accept' | 'decline' | 'cancel') {
     const required = Array.isArray(elicitation.schema.required)
