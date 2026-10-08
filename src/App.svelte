@@ -232,6 +232,7 @@
   import {
     abandonImplementationTurn,
     activeImplementationModels,
+    assertShipItIssueRepository,
     beginImplementationTurn,
     beginShipItRun,
     claimLegacyPendingImplementationTurn,
@@ -3433,6 +3434,7 @@
     knownWorkerModel?: string,
     requireClaim = false,
   ): Promise<DirectShipAuthorization | undefined> {
+    if (requireClaim) await assertShipItIssueRepository(path, issue);
     const provider: ShipRun['provider'] = threadId.startsWith('opencode:')
       ? 'opencode'
       : threadId.startsWith('acp:claude:')
