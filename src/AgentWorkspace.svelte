@@ -635,6 +635,9 @@
   // returns; the header follows that event so both settle in the same frame.
   let turnEnded = $state(false);
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
+  // What the user sees: a turn the app already marked finished no longer reads busy, so the
+  // header, the working row and the pickers settle together.
+  const shownBusy = $derived(isBusy && !turnEnded);
   const visibleStatus = $derived(
     agentHeaderStatus({
       connecting,
@@ -645,7 +648,7 @@
       running,
       activityReady,
       historyLoading,
-      busy: isBusy && !turnEnded,
+      busy: shownBusy,
     }),
   );
   const workspaceActivity = $derived(
@@ -784,7 +787,7 @@
   }
 
   $effect(() => {
-    if (isBusy) {
+    if (shownBusy) {
       pickerOpen = null;
       configPickerOpen = null;
     }
@@ -1367,7 +1370,7 @@
   }
 
   async function openPicker(kind: 'model' | 'effort') {
-    if (!ready || !directory || isBusy) return;
+    if (!ready || !directory || shownBusy) return;
     configPickerOpen = null;
     pickerOpen = kind;
     if (activeSessionId) return;
@@ -1605,7 +1608,7 @@
     if (
       !external &&
       !clipboardAttachments.length &&
-      !isBusy &&
+      !shownBusy &&
       ready &&
       directory &&
       (command === '/model' || command === '/effort')
@@ -2126,16 +2129,21 @@
     try {
       await acp.cancel(agent, sessionId, activeTurnId);
       cancelSent = true;
+      // Cancelling the session already settles its pending requests in the backend.
       await Promise.all(
         pending.map((permission) =>
-          acp.permission(
-            agent,
-            permission.id,
-            null,
-            permission.sessionId,
-            permission.generation,
-            permission.fingerprint,
-          ),
+          acp
+            .permission(
+              agent,
+              permission.id,
+              null,
+              permission.sessionId,
+              permission.generation,
+              permission.fingerprint,
+            )
+            .catch((cause: unknown) => {
+              if (!permissionAlreadyAnswered(cause)) throw cause;
+            }),
         ),
       );
       if (current !== generation || activeSessionId !== sessionId) return;
@@ -2425,7 +2433,7 @@
       {/snippet}
       <Transcript
         items={transcriptItems}
-        busy={isBusy}
+        busy={shownBusy}
         {coordinationMessages}
         onopen={onopensubagent}
         control={subagentControl}
@@ -2449,7 +2457,7 @@
                     </li>{/each}
                 </ul>{/if}
             </section>{/if}
-          {#if isBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
+          {#if shownBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
               <div class="agent-busy" role="status">
                 <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
                     size="sm"
@@ -2602,7 +2610,7 @@
             value={modelOption?.currentValue}
             options={modelOption?.options ?? []}
             open={pickerOpen === 'model'}
-            disabled={!ready || isBusy || !directory || readOnlyChild}
+            disabled={!ready || shownBusy || !directory || readOnlyChild}
             loading={!!creatingSession}
             onopen={() => void openPicker('model')}
             onclose={() => (pickerOpen = null)}
@@ -2615,7 +2623,7 @@
             value={effortOption?.currentValue}
             options={effortOption?.options ?? []}
             open={pickerOpen === 'effort'}
-            disabled={!ready || isBusy || !directory || readOnlyChild}
+            disabled={!ready || shownBusy || !directory || readOnlyChild}
             loading={!!creatingSession}
             onopen={() => void openPicker('effort')}
             onclose={() => (pickerOpen = null)}

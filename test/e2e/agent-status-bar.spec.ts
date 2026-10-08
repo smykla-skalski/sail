@@ -102,7 +102,8 @@ describe('agent status bar', () => {
     await $('.agent-composer textarea').setValue('Delayed approval');
     await startStatusSampler();
     await $(sendButton).click();
-    await expect($('.agent-permission')).toBeDisplayed();
+    // The first session of a fresh app can take a while to start the agent.
+    await expect($('.agent-permission')).toBeDisplayed({ wait: 45_000 });
     await expect(bar).toHaveText(expect.stringContaining('1 need attention'));
     expect(await statusMismatches()).toEqual([]);
 
