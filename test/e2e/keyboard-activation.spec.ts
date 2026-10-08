@@ -16,9 +16,10 @@ type Readiness = {
 
 /**
  * WebKit's WebDriver sends untrusted keys: Enter and Space never activate a
- * button and Tab never moves focus. This checks what a native key press
- * relies on instead: an enabled button in the tab order whose Enter and
- * Space no app handler cancels.
+ * button and Tab never moves focus, so native Enter and Space activation is
+ * not exercised here. This checks what it relies on instead: an enabled,
+ * visible, focusable button, and no app key handler cancelling synthetic
+ * Enter or Space on it.
  */
 function keyboardReadiness(selector: string): Promise<Readiness> {
   return browser.execute((target: string) => {
@@ -34,14 +35,16 @@ function keyboardReadiness(selector: string): Promise<Readiness> {
         element.tabIndex >= 0 &&
         !(element instanceof HTMLButtonElement && element.disabled) &&
         !element.closest('[inert], [aria-hidden="true"], [hidden]') &&
-        element.checkVisibility(),
+        element.checkVisibility({ visibilityProperty: true }),
     );
     control.focus();
     const focused = document.activeElement === control;
-    const press = (type: 'keydown' | 'keyup', key: string) =>
-      !control.dispatchEvent(new KeyboardEvent(type, { key, bubbles: true, cancelable: true }));
-    const enterBlocked = press('keydown', 'Enter');
-    const spaceBlocked = press('keydown', ' ') || press('keyup', ' ');
+    const press = (type: 'keydown' | 'keyup', key: string, code: string) =>
+      !control.dispatchEvent(
+        new KeyboardEvent(type, { key, code, bubbles: true, cancelable: true }),
+      );
+    const enterBlocked = press('keydown', 'Enter', 'Enter') || press('keyup', 'Enter', 'Enter');
+    const spaceBlocked = press('keydown', ' ', 'Space') || press('keyup', ' ', 'Space');
     return {
       button: control instanceof HTMLButtonElement && (control.type === 'button' || !control.form),
       enabled:
@@ -75,9 +78,10 @@ function activateFocused() {
 }
 
 describe('keyboard activation of the palette, thread menu and shortcut sheet', () => {
-  const repository = mkdtempSync(join(tmpdir(), 'sail-keyboard-e2e-'));
+  let repository = '';
 
   before(async () => {
+    repository = mkdtempSync(join(tmpdir(), 'sail-keyboard-e2e-'));
     execFileSync('git', ['init', '-q', repository]);
     await browser.setWindowSize(1280, 850);
     await browser.execute((path: string) => {
@@ -107,10 +111,10 @@ describe('keyboard activation of the palette, thread menu and shortcut sheet', (
 
   after(async () => {
     await browser.execute(() => localStorage.clear());
-    rmSync(repository, { recursive: true, force: true });
+    if (repository) rmSync(repository, { recursive: true, force: true });
   });
 
-  it('opens the command palette from its focused top bar button', async () => {
+  it('keeps the top bar palette button keyboard-ready and opens the palette', async () => {
     expect(await keyboardReadiness('.topbar-palette')).toEqual(ready);
     await activateFocused();
     await expect($('.command-palette[open]')).toBeDisplayed();
@@ -119,8 +123,10 @@ describe('keyboard activation of the palette, thread menu and shortcut sheet', (
     await expect($('.command-palette[open]')).not.toExist();
   });
 
-  it('opens the sidebar thread menu from its focused button with focus inside', async () => {
-    expect(await keyboardReadiness('.project-agent-menu')).toEqual(ready);
+  it('keeps the sidebar thread menu button keyboard-ready and opens the menu', async () => {
+    expect(
+      await keyboardReadiness('.project-agent-menu[aria-label="Manage thread Keyboard thread"]'),
+    ).toEqual(ready);
     await activateFocused();
     await expect($('.project-menu[role="menu"]')).toBeDisplayed();
     await browser.waitUntil(() =>
@@ -130,7 +136,7 @@ describe('keyboard activation of the palette, thread menu and shortcut sheet', (
     await expect($('.project-menu')).not.toExist();
   });
 
-  it('opens the shortcut sheet with Cmd+/ and closes it from its focused button', async () => {
+  it('opens the shortcut sheet with Cmd+/ and keeps its close button keyboard-ready', async () => {
     await browser.execute(() =>
       window.dispatchEvent(
         new KeyboardEvent('keydown', { key: '/', metaKey: true, bubbles: true, cancelable: true }),
