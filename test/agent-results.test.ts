@@ -352,14 +352,26 @@ await test('resolved handoff recovery clears only its inspection error', () => {
   assert.equal(resolvedHandoffRecoveryError(true, inspection), inspection);
 });
 
-await test('live activity stays until a settled result is preserved', () => {
-  assert.equal(receiptNeedsLiveActivity({ ...receipt, state: 'working', result: null }), true);
-  assert.equal(receiptNeedsLiveActivity({ ...receipt, state: 'completed', result: null }), true);
-  assert.equal(receiptNeedsLiveActivity(receipt), false);
-  assert.equal(
-    receiptNeedsLiveActivity({ ...receipt, state: 'failed', result: null, error: 'failed' }),
-    false,
-  );
+await test('a settled child renders once, with or without output', () => {
+  const entries = [{ id: 'after', type: 'assistant', created: 5 }];
+  for (const settled of [
+    { ...receipt, state: 'completed' as const, result: null },
+    { ...receipt, state: 'completed' as const },
+    { ...receipt, state: 'failed' as const, result: null, error: 'failed' },
+    { ...receipt, state: 'interrupted' as const, result: null },
+    { ...receipt, state: 'unavailable' as const, result: null },
+  ]) {
+    assert.equal(receiptNeedsLiveActivity(settled), false, `${settled.state} has no live card`);
+    assert.deepEqual(
+      withSpawnResponses(entries, [{ ...settled, updated: 3 }], (entry) => entry.created).map(
+        (entry) => entry.id,
+      ),
+      [`spawn:${settled.receiptId}`, 'after'],
+      `${settled.state} has one response`,
+    );
+  }
+  for (const live of ['queued', 'starting', 'working', 'waiting'] as const)
+    assert.equal(receiptNeedsLiveActivity({ ...receipt, state: live, result: null }), true);
 });
 
 await test('expanded activity output keeps a bounded meaningful tail', () => {

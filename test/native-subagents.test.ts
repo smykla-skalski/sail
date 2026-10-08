@@ -397,7 +397,7 @@ await test('late and duplicate events cannot revive a terminal child', () => {
 
   assert.equal(store['codex:done'].outcome, 'completed');
   assert.equal(store['codex:done'].transcript.at(-1)?.text, 'Late output');
-  assert.equal(nativeSubagentReceipts(store)[0].result, 'Completed');
+  assert.equal(nativeSubagentReceipts(store)[0].result, 'Late output');
 });
 
 await test('native child completion reflects its final interruption message', () => {
@@ -431,7 +431,8 @@ await test('native child completion reflects its final interruption message', ()
   ])
     store = updateNativeSubagents(store, event('child', update), '/repo', 3);
   assert.equal(nativeSubagentReceipts(store)[0].state, 'interrupted');
-  assert.equal(nativeSubagentReceipts(store)[0].result, 'Interrupted');
+  assert.equal(nativeSubagentReceipts(store)[0].result, null);
+  assert.equal(nativeSubagentReceipts(store)[0].activity, 'Interrupted');
   store = updateNativeSubagents(
     store,
     event('child', {
@@ -711,4 +712,100 @@ await test('small structured tool values stay structured', () => {
   assert.ok(tool?.type === 'tool');
   assert.deepEqual(tool.input, { path: '/repo/a.ts' });
   assert.deepEqual(tool.output, { lines: 3 });
+});
+
+function childUpdates(updates: Record<string, unknown>[]) {
+  let store = updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'Explore',
+      task: 'Map the code',
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+  );
+  for (const update of updates)
+    store = updateNativeSubagents(store, event('child', update), '/repo', 2);
+  return store;
+}
+
+const settle = (store: ReturnType<typeof childUpdates>, state: string) =>
+  updateNativeSubagents(
+    store,
+    event('parent', { sessionUpdate: 'subagent_state_update', subagentSessionId: 'child', state }),
+    '/repo',
+    9,
+  );
+
+await test('a settled child reports its final message, not its state', () => {
+  const done = settle(
+    childUpdates([
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Found 3 files.' } },
+    ]),
+    'completed',
+  );
+  const [receipt] = nativeSubagentReceipts(done);
+  assert.equal(receipt.result, 'Found 3 files.');
+  assert.equal(receipt.name, 'Explore');
+  assert.equal(receipt.activity, 'Completed');
+});
+
+await test('a settled child without output has no result text', () => {
+  for (const state of ['completed', 'failed', 'cancelled']) {
+    const [receipt] = nativeSubagentReceipts(settle(childUpdates([]), state));
+    assert.equal(receipt.result, null, state);
+  }
+  const running = childUpdates([
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Partial' } },
+  ]);
+  assert.equal(nativeSubagentReceipts(running)[0].result, null);
+});
+
+await test('an interruption notice is not a result', () => {
+  const done = settle(
+    childUpdates([
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Step interrupted' } },
+    ]),
+    'completed',
+  );
+  const [receipt] = nativeSubagentReceipts(done);
+  assert.equal(receipt.state, 'interrupted');
+  assert.equal(receipt.result, null);
+});
+
+await test('tool calls are counted once, even after the transcript evicts them', () => {
+  const calls = Array.from({ length: nativeTranscriptLimit + 5 }, (_, index) => ({
+    sessionUpdate: 'tool_call',
+    toolCallId: `tool-${index}`,
+    title: `Step ${index}`,
+  }));
+  let store = childUpdates([
+    ...calls,
+    { sessionUpdate: 'tool_call_update', toolCallId: 'tool-0', status: 'completed' },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: `tool-${calls.length - 1}`,
+      status: 'completed',
+    },
+  ]);
+  assert.equal(nativeSubagentReceipts(store)[0].toolCount, calls.length);
+  store = reconcileNativeSubagents(
+    store,
+    [
+      {
+        agent: 'codex',
+        capabilityProfile: 'build',
+        sessionId: 'child',
+        parentSessionId: 'parent',
+        directory: '/repo',
+        outcome: 'completed',
+      },
+    ],
+    10,
+  );
+  assert.equal(nativeSubagentReceipts(store)[0].toolCount, calls.length);
+  assert.equal(nativeSubagentReceipts(childUpdates([]))[0].toolCount, undefined);
 });

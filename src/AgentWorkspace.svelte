@@ -2051,7 +2051,7 @@
       {/snippet}
       {#each displayEntries as entry (entry.id)}
         {#if entry.type === 'spawn-response'}
-          <SpawnResponse receipt={entry.receipt} />
+          <SpawnResponse receipt={entry.receipt} onopen={onopensubagent} />
         {:else if entry.type === 'tool-group'}
           {#each entry.tools.filter(toolFailed) as tool (tool.id)}{@render failureCard(tool)}{/each}
           {#if isBusy && (entry.id === displayEntries.at(-1)?.id || entry.tools.some(toolRunning))}

@@ -1615,9 +1615,11 @@
   let chatMessages = $derived(
     messages.filter((message) => message.type === 'user' || message.type === 'assistant'),
   );
+  let openCodeChildReceipts = $state.raw<SpawnReceipt[]>([]);
   const mainSpawnActivity = $derived(
     spawnReceiptsForSource(spawnReceipts, sessionID ? `opencode:${sessionID}` : null, directory),
   );
+  const mainActivityChildren = $derived([...mainSpawnActivity, ...openCodeChildReceipts]);
   const mainPostTurnChecks = $derived(
     postTurnResults.filter(
       (check) => check.directory === directory && check.thread === `opencode:${sessionID}`,
@@ -1641,7 +1643,7 @@
             )
           : [],
       ),
-      children: mainSpawnActivity,
+      children: mainActivityChildren,
       decisions: [
         ...pendingPermissions.map((request) => ({
           id: request.id,
@@ -11336,7 +11338,7 @@
 
   async function selectMainWorkspaceActivity(item: WorkspaceActivityItem) {
     if (item.kind === 'child') {
-      const receipt = mainSpawnActivity.find((entry) => entry.receiptId === item.sourceId);
+      const receipt = mainActivityChildren.find((entry) => entry.receiptId === item.sourceId);
       if (receipt?.targetId && receipt.targetDirectory) {
         await openSpawnTarget(receipt);
         return;
@@ -14515,7 +14517,7 @@
                   </div>{/if}
                 {#each displayChatMessages as message (message.id)}
                   {#if message.type === 'spawn-response'}
-                    <SpawnResponse receipt={message.receipt} />
+                    <SpawnResponse receipt={message.receipt} onopen={openSpawnTarget} />
                   {:else if message.type === 'user'}
                     {@const attribution = coordinationMessageForText(
                       message.text,
@@ -14594,7 +14596,13 @@
                         </p>{/if}
                     </ChatMessage>{/if}
                 {/each}
-                <OpenCodeSubagents {client} parentID={sessionID} />
+                <OpenCodeSubagents
+                  {client}
+                  parentID={sessionID}
+                  {directory}
+                  onopen={openSpawnTarget}
+                  onchildren={(receipts) => (openCodeChildReceipts = receipts)}
+                />
                 {#each coordinationMessages.filter((message) => sessionID && message.target === coordinationKey(directory, `opencode:${sessionID}`) && !chatMessages.some((item) => item.type === 'user' && item.text.includes(coordinationPrompt(message)))) as message (message.id)}
                   <ChatMessage
                     kind="user"

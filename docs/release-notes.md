@@ -22,3 +22,11 @@ There is no automatic updater. To update, download the next package for your pla
 - Dependent issues show "Waiting on #N", or "Waiting on #N (needs input)" when that dependency has failed.
 - Settings has a new "Who merges Ship PRs" choice. "You" is the default: workers stop at a mergeable pull request and report `awaiting_merge`. "Agent, per repository release policy" leaves merging to the worker. Repository instructions that say who merges take precedence.
 - Stored `blockedReason` text from earlier fix rounds is ignored while a NEEDS_FIXES or FAIL verdict is current.
+
+## Subagent results and status
+
+- A finished subagent shows its agent type, task, duration and tool count. Its result is clamped to three lines, with Expand and Open.
+- A finished subagent no longer repeats its state as the result, and a child with no output appears once.
+- Subagent cards share one screen-reader announcement that speaks state changes only.
+- A finished OpenCode subagent reads "Finished" instead of "Queued". Running and finished children are listed apart, can be opened, and appear in workspace activity.
+- A failed subagent stays in the sidebar, and its parent shows "1 failed child" until the parent's next turn completes or you open the child.

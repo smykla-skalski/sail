@@ -156,10 +156,10 @@ function receiptRuns(receipts: readonly SpawnReceipt[]): SubagentRun[] {
     });
 }
 
-function openCodeState(child: SessionInfo, active: readonly string[]): SpawnState {
+/** A child that is not running and has no recorded outcome reads as finished, not queued. */
+export function openCodeChildState(child: SessionInfo, active: readonly string[]): SpawnState {
   if (active.includes(child.id)) return 'working';
-  if (child.outcome === 'succeeded') return 'completed';
-  return child.outcome ?? 'queued';
+  return child.outcome && child.outcome !== 'succeeded' ? child.outcome : 'completed';
 }
 
 function openCodeRuns(groups: readonly OpenCodeChildSessions[]): SubagentRun[] {
@@ -176,7 +176,7 @@ function openCodeRuns(groups: readonly OpenCodeChildSessions[]): SubagentRun[] {
       name: child.agent ?? null,
       task: child.title ?? null,
       model: child.model ? `${child.model.providerID}:${child.model.id}` : null,
-      state: openCodeState(child, active),
+      state: openCodeChildState(child, active),
       activity: null,
       result: null,
       error: null,
