@@ -9926,6 +9926,13 @@
     error = '';
   }
 
+  function needsForceDelete(message: string) {
+    return (
+      message === 'Worktree has ignored files. Move or remove them before deleting.' ||
+      message.includes('contains modified or untracked files')
+    );
+  }
+
   async function deleteProjectWorktreeOnce(
     repository: string,
     path: string,
@@ -10031,10 +10038,7 @@
     } catch (cause) {
       if (wasSelected && directory === repository) await loadProject(path);
       const deletionError = describe(cause);
-      if (
-        !force &&
-        deletionError === 'Worktree has ignored files. Move or remove them before deleting.'
-      ) {
+      if (!force && needsForceDelete(deletionError)) {
         error = '';
         retryForce = true;
       } else error = deletionError;
