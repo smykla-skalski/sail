@@ -73,11 +73,14 @@ function duplicatesLiveChild(
 }
 
 function state(value: unknown): NativeSubagentOutcome {
+  if (value === 'working') return 'working';
   if (value === 'completed') return 'completed';
   if (value === 'failed') return 'failed';
   if (value === 'cancelled') return 'interrupted';
   return 'unknown';
 }
+
+const incompleteHistory = 'Incomplete subagent history';
 
 export const nativeTranscriptLimit = 500;
 export const nativeMessageLimit = 40_000;
@@ -219,7 +222,7 @@ export function updateNativeSubagents(
           : (previous?.capabilityProfile ??
             store[nativeSubagentId(event.agent, parentSessionId)]?.capabilityProfile ??
             capabilityProfile),
-        ...(malformed ? { error: 'Incomplete subagent history' } : {}),
+        ...(malformed ? { error: incompleteHistory } : {}),
       },
     };
   }
@@ -231,10 +234,15 @@ export function updateNativeSubagents(
     const child = store[id];
     if (!child) return store;
     const outcome = state(update.state);
+    const { error: previousError, ...settledChild } = child;
+    const reason = typeof update.error === 'string' ? update.error.trim() : '';
+    const resumed = outcome === 'working' || outcome === 'completed';
+    const error = reason || (resumed && previousError !== incompleteHistory ? '' : previousError);
     return {
       ...store,
       [id]: {
-        ...child,
+        ...settledChild,
+        ...(error ? { error } : {}),
         outcome,
         activity:
           outcome === 'completed'
@@ -243,7 +251,9 @@ export function updateNativeSubagents(
               ? 'Failed'
               : outcome === 'interrupted'
                 ? 'Interrupted'
-                : 'Disconnected',
+                : outcome === 'working'
+                  ? 'Working…'
+                  : 'Disconnected',
         updated: now,
       },
     };
@@ -453,7 +463,7 @@ export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt
       turnId: null,
       targetDirectory: child.directory,
       worktreeId: null,
-      provider: child.agent === 'claude' ? 'claude' : 'codex',
+      provider: child.agent === 'claude' || child.agent === 'opencode' ? child.agent : 'codex',
       prompt: child.task,
       state: status.state,
       created: child.created,
