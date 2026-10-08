@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -2281,23 +2281,20 @@ fn connect_blocking(
     })?;
     let input = child.stdin.take().ok_or("Agent stdin unavailable.")?;
     let output = child.stdout.take().ok_or("Agent stdout unavailable.")?;
-    if let Some(mut stderr) = child.stderr.take() {
+    if let Some(stderr) = child.stderr.take() {
         let stderr_agent = agent.clone();
+        let stderr_app = app.clone();
         std::thread::spawn(move || {
-            let mut buffer = [0; 4096];
-            let mut total_bytes = 0u64;
-            loop {
-                match stderr.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(bytes) => total_bytes = total_bytes.saturating_add(bytes as u64),
-                }
-            }
-            if total_bytes > 0 {
-                crate::diagnostics::record(
-                    "agent_stderr",
-                    json!({"agent":stderr_agent,"bytes":total_bytes}),
-                );
-            }
+            crate::stderr_log::forward(
+                stderr,
+                &stderr_agent,
+                || {
+                    stderr_app
+                        .state::<crate::browser_agent::BrowserManager>()
+                        .active_tokens()
+                },
+                crate::diagnostics::record,
+            );
         });
     }
     let runtime = Arc::new(Connection {

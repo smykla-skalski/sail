@@ -216,6 +216,7 @@ mod hook_inspector;
 mod post_turn_checks;
 mod settings;
 mod shell_command;
+mod stderr_log;
 mod terminal;
 mod worktree_config;
 mod worktree_snapshots;
