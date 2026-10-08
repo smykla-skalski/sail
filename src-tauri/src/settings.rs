@@ -654,6 +654,12 @@ fn filter_legacy(key: &str, raw: &str, deleted: &Deletions) -> String {
     serde_json::to_string(&catalog).unwrap_or_else(|_| raw.to_string())
 }
 
+pub fn string_setting(app: &tauri::AppHandle, key: &str) -> Result<Option<String>, String> {
+    let path = settings_path(app)?;
+    let _lock = lock_settings(&path)?;
+    Ok(read_settings(&path)?.remove(key))
+}
+
 #[tauri::command]
 pub fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
     let path = settings_path(&app)?;

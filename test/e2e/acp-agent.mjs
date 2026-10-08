@@ -197,9 +197,11 @@ function configOptions(sessionId) {
       id: 'mode',
       name: 'Mode',
       type: 'select',
-      currentValue: config.mode ?? 'default',
+      currentValue: config.mode ?? (agent === 'opencode' ? 'build' : 'default'),
       options: [
-        { value: 'default', name: 'Default' },
+        agent === 'opencode'
+          ? { value: 'build', name: 'Build' }
+          : { value: 'default', name: 'Default' },
         { value: 'plan', name: 'Plan' },
       ],
     },
@@ -256,7 +258,10 @@ for await (const line of createInterface({ input: process.stdin })) {
           sessionCapabilities: { resume: {}, subagents: {} },
         },
         authMethods: agent === 'codex' ? [{ id: 'chat-gpt', name: 'ChatGPT' }] : [],
-        _meta: { steering: { supported: true } },
+        _meta:
+          agent === 'opencode'
+            ? { 'opencode/child-session-updates': true }
+            : { steering: { supported: true } },
       },
     });
   } else if (message.method === 'authenticate') {
@@ -267,7 +272,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, error: { code: -32000, message: 'Authentication required' } });
       continue;
     }
-    const sessionId = `${agent}-test${sessionRun}-${++nextSession}`;
+    const sessionId = `${agent === 'opencode' ? 'ses_' : `${agent}-`}test${sessionRun}-${++nextSession}`;
     sessions.set(sessionId, {
       cwd: message.params.cwd,
       history: [],
