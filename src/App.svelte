@@ -11141,6 +11141,15 @@
     return thread ? threadKey(thread) : null;
   }
 
+  // ACP OpenCode threads share the agent id with the native server's threads.
+  function usesNativeOpenCode(thread: AgentThread): boolean {
+    return (
+      thread.agent === 'opencode' &&
+      !agentThreads.includes(thread) &&
+      !nativeChildThreads.includes(thread)
+    );
+  }
+
   async function jumpToRecentThread(key: string): Promise<boolean> {
     const thread = [
       ...agentThreads,
@@ -11150,7 +11159,7 @@
     ].find((item) => threadKey(item) === key);
     if (
       !thread ||
-      (thread.agent === 'opencode'
+      (usesNativeOpenCode(thread)
         ? runtimeState !== 'connected'
         : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available))
     )
@@ -11191,7 +11200,7 @@
     if (!selected) return false;
     showSidebarThread(selected);
     focusMainPane();
-    if (selected.agent === 'opencode') {
+    if (usesNativeOpenCode(selected)) {
       if (!(await selectSession(selected.sessionId))) return false;
     } else openAgent(selected.agent, selected, true);
     focusPaneForTyping('main');
@@ -11215,14 +11224,14 @@
       ].find(
         (item) =>
           item.directory === path &&
-          (item.agent === 'opencode' && !threadId.startsWith('acp:')
+          (item.agent === 'opencode' && usesNativeOpenCode(item)
             ? `opencode:${item.sessionId}`
             : `acp:${item.agent}:${item.sessionId}`) === threadId,
       );
       if (!thread)
         throw new Error('Session history is unavailable. Open the worktree to inspect it.');
       if (
-        thread.agent === 'opencode' && !threadId.startsWith('acp:')
+        usesNativeOpenCode(thread)
           ? runtimeState !== 'connected'
           : !agentAvailability.some((agent) => agent.id === thread.agent && agent.available)
       )

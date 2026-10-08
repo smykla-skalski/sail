@@ -232,10 +232,14 @@ export function updateNativeSubagents(
     const child = store[id];
     if (!child) return store;
     const outcome = state(update.state);
+    const { error: previousError, ...settledChild } = child;
+    const reason = typeof update.error === 'string' ? update.error.trim() : '';
+    const error = reason || (outcome === 'working' || outcome === 'completed' ? '' : previousError);
     return {
       ...store,
       [id]: {
-        ...child,
+        ...settledChild,
+        ...(error ? { error } : {}),
         outcome,
         activity:
           outcome === 'completed'
@@ -247,9 +251,6 @@ export function updateNativeSubagents(
                 : outcome === 'working'
                   ? 'Working…'
                   : 'Disconnected',
-        ...(typeof update.error === 'string' && update.error.trim()
-          ? { error: update.error.trim() }
-          : {}),
         updated: now,
       },
     };

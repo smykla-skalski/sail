@@ -899,4 +899,8 @@ await test('a resumed OpenCode child re-arms after completing and keeps failure 
   assert.equal(store['opencode:child'].outcome, 'working');
   store = updateNativeSubagents(store, state('failed', 'boom'), '/worktree', 4);
   assert.equal(store['opencode:child'].error, 'boom');
+  store = updateNativeSubagents(store, state('working'), '/worktree', 5);
+  store = updateNativeSubagents(store, state('completed'), '/worktree', 6);
+  assert.equal(store['opencode:child'].error, undefined);
+  assert.equal(nativeSubagentReceipts(store)[0].error, null);
 });

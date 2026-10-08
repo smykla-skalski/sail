@@ -58,7 +58,7 @@ export function nativePlanUpdate(
     return previous;
   if (provider === 'opencode' && data.sessionUpdate === 'plan') {
     const progress = entries(data.entries);
-    if (!progress.length) return null;
+    if (!progress.length) return previous;
     return {
       provider,
       markdown: progress

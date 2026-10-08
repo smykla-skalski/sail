@@ -46,7 +46,7 @@ await test('maps OpenCode ACP plan entries and ignores Codex-only updates', () =
     { title: 'Inspect', status: 'completed' },
     { title: 'Edit', status: 'pending' },
   ]);
-  assert.equal(nativePlanUpdate('opencode', { sessionUpdate: 'plan', entries: [] }, plan), null);
+  assert.equal(nativePlanUpdate('opencode', { sessionUpdate: 'plan', entries: [] }, plan), plan);
   assert.equal(nativePlanUpdate('opencode', { sessionUpdate: 'plan_update', plan: '# x' }), null);
   assert.equal(
     nativePlanUpdate('codex', { sessionUpdate: 'plan', entries: [{ content: 'x' }] }),
