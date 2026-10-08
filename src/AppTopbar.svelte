@@ -3,7 +3,12 @@
   import HarnessIcon from './HarnessIcon.svelte';
   import MenuButton from './MenuButton.svelte';
   import type { AgentAvailability, AgentId } from './lib/acp';
-  import { ariaKeyShortcutsFor } from './lib/shortcuts';
+  import {
+    ariaKeyShortcutsFor,
+    detectShortcutPlatform,
+    shortcutFor,
+    shortcutLabel,
+  } from './lib/shortcuts';
 
   export type TopbarThreadActions =
     | { kind: 'agent'; title: string; ondelete: () => void }
@@ -26,6 +31,7 @@
     conversationTitle,
     inboxCount,
     oninbox,
+    onpalette,
     directory,
     agents,
     onopenagent,
@@ -62,6 +68,7 @@
     conversationTitle: string;
     inboxCount: number;
     oninbox: () => void;
+    onpalette: () => void;
     directory: string;
     agents: AgentAvailability[];
     onopenagent: (agent: AgentId) => void;
@@ -84,6 +91,8 @@
     changesExpanded: boolean;
     ontogglechanges: () => void;
   } = $props();
+
+  const paletteShortcut = shortcutLabel(shortcutFor('palette.open'), detectShortcutPlatform());
 
   const threadLabel = $derived(
     [
@@ -130,7 +139,17 @@
       <Button
         variant="ghost"
         size="sm"
-        aria-label="Pending requests"
+        class="topbar-palette"
+        aria-label={`Command palette ${paletteShortcut}`}
+        aria-keyshortcuts={ariaKeyShortcutsFor('palette.open')}
+        title={`Open command palette (${paletteShortcut})`}
+        onclick={onpalette}>{paletteShortcut}</Button
+      >
+      <Button
+        variant="ghost"
+        size="sm"
+        data-topbar-inbox
+        title="Pending requests and items needing attention"
         aria-keyshortcuts={ariaKeyShortcutsFor('attention.next')}
         onclick={oninbox}>Inbox ({inboxCount})</Button
       >

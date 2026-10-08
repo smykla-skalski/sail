@@ -2,6 +2,76 @@ import type { AgentAvailability, AgentId, AgentThread } from './acp';
 import type { ProjectCatalog } from './projects';
 import { threadKey } from './recent-threads.ts';
 import { commandsForDirectory, type SavedCommand } from './saved-commands.ts';
+import { shortcutFor, type ShortcutId } from './shortcuts.ts';
+
+export type PaletteActionId =
+  | 'pane.split'
+  | 'terminal.split'
+  | 'chat.side'
+  | 'inbox.open'
+  | 'attention.next'
+  | 'overview.toggle'
+  | 'ship.open'
+  | 'changes.toggle'
+  | 'settings.open'
+  | 'theme.toggle'
+  | 'shortcuts.help'
+  | 'sidebar.toggle';
+
+export type PaletteAction = {
+  id: PaletteActionId;
+  label: string;
+  detail: string;
+  /** Shown as the entry's hint; the label also comes from the registry. */
+  shortcut?: ShortcutId;
+  disabled?: boolean;
+};
+
+export type PaletteActionContext = {
+  dark: boolean;
+  overview: boolean;
+  hasDirectory: boolean;
+};
+
+function registryAction(
+  id: PaletteActionId & ShortcutId,
+  detail: string,
+  disabled = false,
+): PaletteAction {
+  return { id, label: shortcutFor(id).label, detail, shortcut: id, disabled };
+}
+
+/** App actions the palette offers; labels and hints for shortcuts come from the registry. */
+export function paletteActions({ dark, overview, hasDirectory }: PaletteActionContext) {
+  const actions: PaletteAction[] = [
+    registryAction('pane.split', 'Open another pane beside this one', !hasDirectory),
+    registryAction('terminal.split', 'Open a terminal beside this pane', !hasDirectory),
+    registryAction('chat.side', 'Ask a question without leaving this thread', !hasDirectory),
+    { id: 'inbox.open', label: 'Open Inbox', detail: 'Requests and items waiting on you' },
+    registryAction('attention.next', 'Jump to the next thread, request or Ship item'),
+    {
+      id: 'overview.toggle',
+      label: overview ? 'Back to workspace' : 'Open task overview',
+      detail: 'All worktrees at a glance',
+    },
+    { id: 'ship.open', label: 'Open Ship runs', detail: 'Issues being shipped end to end' },
+    {
+      id: 'changes.toggle',
+      label: shortcutFor('details.toggle').label,
+      detail: 'Review the diff for this worktree',
+      shortcut: 'details.toggle',
+    },
+    registryAction('settings.open', 'Theme, notifications and agents'),
+    {
+      id: 'theme.toggle',
+      label: dark ? 'Switch to light theme' : 'Switch to dark theme',
+      detail: 'Appearance',
+    },
+    registryAction('shortcuts.help', 'List every keyboard shortcut'),
+    registryAction('sidebar.toggle', 'Show or hide the project sidebar'),
+  ];
+  return actions;
+}
 
 export type PaletteStep =
   | { kind: 'projects' }
@@ -19,7 +89,8 @@ export type PaletteEntry = {
     | 'new-session'
     | 'thread'
     | 'opencode-session'
-    | 'command';
+    | 'command'
+    | 'action';
   label: string;
   detail: string;
   disabled?: boolean;
@@ -28,6 +99,8 @@ export type PaletteEntry = {
   thread?: AgentThread;
   sessionId?: string;
   command?: SavedCommand;
+  actionId?: PaletteActionId;
+  shortcut?: ShortcutId;
 };
 
 export type PaletteOpenCodeSession = {
@@ -49,6 +122,7 @@ export type PaletteSearch = {
   openCodeSessions: PaletteOpenCodeSession[];
   commands: SavedCommand[];
   runningThreadKeys: string[];
+  actions?: PaletteAction[];
 };
 
 export function locationName(path: string): string {
@@ -120,6 +194,7 @@ export function searchCommandPalette({
   openCodeSessions,
   commands,
   runningThreadKeys,
+  actions = [],
 }: PaletteSearch): PaletteEntry[] {
   if (step.kind === 'projects') {
     const repositories: PaletteEntry[] = catalog.repositories.map((repository) => {
@@ -151,6 +226,15 @@ export function searchCommandPalette({
       query,
       (entry) => `${entry.label} ${entry.detail} ${entry.command?.command ?? ''}`,
     );
+    const actionEntries: PaletteEntry[] = actions.map((action) => ({
+      id: `action:${action.id}`,
+      kind: 'action',
+      label: action.label,
+      detail: action.detail,
+      disabled: action.disabled,
+      actionId: action.id,
+      shortcut: action.shortcut,
+    }));
     if (query.trim()) {
       const worktrees: PaletteEntry[] = catalog.repositories.flatMap((repository) =>
         (catalog.worktrees[repository] ?? []).map((worktree) => ({
@@ -190,20 +274,24 @@ export function searchCommandPalette({
         },
       );
       return rank(
-        [...repositories, ...worktrees, ...sessionEntries, ...commandEntries],
+        [...repositories, ...worktrees, ...sessionEntries, ...commandEntries, ...actionEntries],
         query,
         (entry) =>
           `${entry.label} ${entry.detail} ${entry.directory ?? ''} ${entry.command?.command ?? ''}`,
         (entry) =>
           entry.thread && running.has(threadKey(entry.thread))
             ? 2
-            : entry.kind === 'command'
+            : entry.kind === 'command' || entry.kind === 'action'
               ? 1
               : 0,
       );
     }
-    const projectSlots = 50 - Math.min(saved.length, 10);
-    return [...projects.slice(0, projectSlots), ...saved.slice(0, 50 - projectSlots)];
+    const projectSlots = 50 - Math.min(saved.length, 10) - actionEntries.length;
+    return [
+      ...projects.slice(0, projectSlots),
+      ...saved.slice(0, 50 - projectSlots - actionEntries.length),
+      ...actionEntries,
+    ];
   }
 
   if (step.kind === 'worktrees') {

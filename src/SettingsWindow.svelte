@@ -354,6 +354,18 @@
             onchoose={(value) => send({ type: 'theme', value: value as 'light' | 'dark' })}
           />
         </section>
+        <section class="settings-card">
+          <h2>Clipboard</h2>
+          <label class="attention-setting">
+            <input
+              type="checkbox"
+              checked={snapshot.autoCopyEnabled}
+              onchange={(event) => send({ type: 'auto-copy', value: event.currentTarget.checked })}
+            />
+            Copy selected text automatically
+          </label>
+          <p>Selecting text outside inputs copies it and announces "Copied".</p>
+        </section>
       {:else}<p role="status">Loading settings…</p>{/if}
     {:else if selectedSection === 'opencode'}
       <h1>OpenCode</h1>

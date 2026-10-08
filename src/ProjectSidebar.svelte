@@ -804,38 +804,52 @@
           thread.agent === 'opencode'
             ? openCodeAvailable
             : agents.some((agent) => agent.id === thread.agent && agent.available)}
-        <button
-          class:active={selectedThread === key}
-          class:subagent={child}
-          class="project-agent-row"
+        <div
+          class="project-agent-line"
           style:margin-left={`${row.depth * 8}px`}
           style:width={`calc(100% - ${row.depth * 8}px)`}
-          aria-current={selectedThread === key ? 'page' : undefined}
-          aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}, ${statusLabel(status)}${childSummary ? `, subagents: ${childSummary}` : ''}`}
-          title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
-          aria-disabled={!selectable}
-          oncontextmenu={(event) => openMenu({ kind: 'agent', thread }, event)}
-          onmousedown={(event) => {
-            if (event.button === 2) void openMenu({ kind: 'agent', thread }, event);
-          }}
-          onclick={() => {
-            if (selectable) onselectthread(key);
-          }}
         >
-          <span class="project-agent-provider"
-            >{#if child}<span aria-hidden="true">↳</span>{/if}<HarnessIcon
-              agent={thread.agent}
-              size={13}
-            />{providerName(thread)}{#if child}<span class="project-subagent-tag">Subagent</span
-              >{/if}</span
+          <button
+            class:active={selectedThread === key}
+            class:subagent={child}
+            class="project-agent-row"
+            aria-current={selectedThread === key ? 'page' : undefined}
+            aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}, ${statusLabel(status)}${childSummary ? `, subagents: ${childSummary}` : ''}`}
+            title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
+            aria-disabled={!selectable}
+            oncontextmenu={(event) => openMenu({ kind: 'agent', thread }, event)}
+            onmousedown={(event) => {
+              if (event.button === 2) void openMenu({ kind: 'agent', thread }, event);
+            }}
+            onclick={() => {
+              if (selectable) onselectthread(key);
+            }}
           >
-          <span class="project-agent-title">{thread.title}</span>
-          <ActivityStatus
-            {status}
-            label={childSummary ? `${statusLabel(status)} · ${childSummary}` : statusLabel(status)}
-            compact
-          />
-        </button>
+            <span class="project-agent-provider"
+              >{#if child}<span aria-hidden="true">↳</span>{/if}<HarnessIcon
+                agent={thread.agent}
+                size={13}
+              />{providerName(thread)}{#if child}<span class="project-subagent-tag">Subagent</span
+                >{/if}</span
+            >
+            <span class="project-agent-title">{thread.title}</span>
+            <ActivityStatus
+              {status}
+              label={childSummary
+                ? `${statusLabel(status)} · ${childSummary}`
+                : statusLabel(status)}
+              compact
+            />
+          </button>
+          <button
+            class="project-icon-button project-agent-menu"
+            aria-label={`Manage ${child ? 'subagent' : 'thread'} ${thread.title}`}
+            aria-haspopup="menu"
+            aria-expanded={menu?.kind === 'agent' && threadKey(menu.thread) === key}
+            onclick={(event) => openMenu({ kind: 'agent', thread }, event, event.currentTarget)}
+            >⋯</button
+          >
+        </div>
         {#if row.historicalChildren}<button
             class="project-agent-history"
             style:margin-left={`${(row.depth + 1) * 8}px`}
@@ -866,7 +880,7 @@
       aria-label="Add repository"
       title="Add repository"
       {disabled}
-      onclick={() => onaddrepository(null)}>+ Repo</button
+      onclick={() => onaddrepository(null)}>+ Repository</button
     >
   </div>
   {#if creatingGroup}<form

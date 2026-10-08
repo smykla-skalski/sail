@@ -958,25 +958,40 @@
                 use:dockInShell={nativeDocked}
               >
                 <nav class="side-tabs" aria-label="OpenCode detail tabs">
-                  {#if nativeSnapshot.plan || nativeSnapshot.questions}<button
-                      class:active={nativeTab === 'plan'}
-                      onclick={() => (nativeTab = 'plan')}>Plan</button
-                    >{/if}<button
-                    class:active={nativeTab === 'changes'}
-                    onclick={() => (nativeTab = 'changes')}>Changes ({diffs.length})</button
-                  ><button
-                    class:active={nativeTab === 'history'}
-                    onclick={() => (nativeTab = 'history')}>Plan history</button
-                  ><button
-                    class:active={nativeTab === 'activity'}
-                    onclick={() => (nativeTab = 'activity')}>Activity</button
-                  ><button
-                    data-detail-tab="ship"
-                    class:active={nativeTab === 'ship'}
-                    aria-label={`Ship runs, ${shipNeedsInput} need input`}
-                    onclick={() => (nativeTab = 'ship')}>Ship runs ({shipNeedsInput})</button
-                  ><button aria-label="Close OpenCode details" onclick={closeNativeDetails}
-                    >×</button
+                  <div class="side-tabs-list" role="tablist" aria-label="OpenCode details">
+                    {#if nativeSnapshot.plan || nativeSnapshot.questions}<button
+                        class:active={nativeTab === 'plan'}
+                        role="tab"
+                        aria-selected={nativeTab === 'plan'}
+                        onclick={() => (nativeTab = 'plan')}>Plan</button
+                      >{/if}<button
+                      class:active={nativeTab === 'changes'}
+                      role="tab"
+                      aria-selected={nativeTab === 'changes'}
+                      onclick={() => (nativeTab = 'changes')}>Changes ({diffs.length})</button
+                    ><button
+                      class:active={nativeTab === 'history'}
+                      role="tab"
+                      aria-selected={nativeTab === 'history'}
+                      onclick={() => (nativeTab = 'history')}>Plan history</button
+                    ><button
+                      class:active={nativeTab === 'activity'}
+                      role="tab"
+                      aria-selected={nativeTab === 'activity'}
+                      onclick={() => (nativeTab = 'activity')}>Activity</button
+                    ><button
+                      data-detail-tab="ship"
+                      class:active={nativeTab === 'ship'}
+                      role="tab"
+                      aria-selected={nativeTab === 'ship'}
+                      aria-label={`Ship runs, ${shipNeedsInput} need input`}
+                      onclick={() => (nativeTab = 'ship')}>Ship runs ({shipNeedsInput})</button
+                    >
+                  </div>
+                  <button
+                    class="side-tabs-close"
+                    aria-label="Close OpenCode details"
+                    onclick={closeNativeDetails}>×</button
                   >
                 </nav>
                 {#if nativeTab === 'plan'}
@@ -1132,17 +1147,31 @@
             {#if changesPanes.includes(pane.id)}
               <section class="native-details side-area" aria-label="Agent details">
                 <nav class="side-tabs" aria-label="Agent detail tabs">
-                  <button class:active={acpTab === 'changes'} onclick={() => (acpTab = 'changes')}
-                    >Changes ({diffs.length})</button
-                  ><button
-                    class:active={acpTab === 'activity'}
-                    onclick={() => (acpTab = 'activity')}>Activity</button
-                  ><button
-                    data-detail-tab="ship"
-                    class:active={acpTab === 'ship'}
-                    aria-label={`Ship runs, ${shipNeedsInput} need input`}
-                    onclick={() => (acpTab = 'ship')}>Ship runs ({shipNeedsInput})</button
-                  ><button aria-label="Close agent details" onclick={closeAcpDetails}>×</button>
+                  <div class="side-tabs-list" role="tablist" aria-label="Agent details">
+                    <button
+                      class:active={acpTab === 'changes'}
+                      role="tab"
+                      aria-selected={acpTab === 'changes'}
+                      onclick={() => (acpTab = 'changes')}>Changes ({diffs.length})</button
+                    ><button
+                      class:active={acpTab === 'activity'}
+                      role="tab"
+                      aria-selected={acpTab === 'activity'}
+                      onclick={() => (acpTab = 'activity')}>Activity</button
+                    ><button
+                      data-detail-tab="ship"
+                      class:active={acpTab === 'ship'}
+                      role="tab"
+                      aria-selected={acpTab === 'ship'}
+                      aria-label={`Ship runs, ${shipNeedsInput} need input`}
+                      onclick={() => (acpTab = 'ship')}>Ship runs ({shipNeedsInput})</button
+                    >
+                  </div>
+                  <button
+                    class="side-tabs-close"
+                    aria-label="Close agent details"
+                    onclick={closeAcpDetails}>×</button
+                  >
                 </nav>
                 {#if acpTab === 'ship'}
                   <ShipPanel

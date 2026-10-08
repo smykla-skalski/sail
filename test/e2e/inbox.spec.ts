@@ -61,7 +61,7 @@ describe('pending requests across projects', () => {
     await expect($('.agent-permission')).toBeDisplayed();
     await $(`.project-default-worktree-select[title="${paths[0]}"]`).click();
 
-    await $('[aria-label="Pending requests"]').click();
+    await $('[data-topbar-inbox]').click();
     const entries = await $$('.inbox-item');
     await expect(entries).toBeElementsArrayOfSize(2);
     await expect(entries[0]).toHaveText(expect.stringContaining(first.split('/').at(-1)!));
@@ -74,7 +74,7 @@ describe('pending requests across projects', () => {
       browser.execute(() => document.activeElement?.classList.contains('agent-permission')),
     );
     await $('.agent-permission button').click();
-    await $('[aria-label="Pending requests"]').click();
+    await $('[data-topbar-inbox]').click();
     await expect($('.inbox-empty')).toHaveText('Nothing needs your input.');
   });
 
@@ -96,7 +96,7 @@ describe('pending requests across projects', () => {
     await $('.agent-composer textarea').setValue('Activity demo');
     await $('.agent-actions button').click();
     await browser.waitUntil(async () => (await $$('.inbox-result')).length === 1);
-    await $('[aria-label="Pending requests"]').click();
+    await $('[data-topbar-inbox]').click();
     await expect($('.inbox-result')).toHaveText(expect.stringContaining('Turn completed'));
     await expect($('.inbox-result')).toHaveAttribute('class', expect.stringContaining('unread'));
     await $('.inbox-result .inbox-open').click();
@@ -104,7 +104,7 @@ describe('pending requests across projects', () => {
     await browser.waitUntil(() =>
       browser.execute(() => document.activeElement?.classList.contains('assistant-message')),
     );
-    await $('[aria-label="Pending requests"]').click();
+    await $('[data-topbar-inbox]').click();
     await expect($('.inbox-result')).not.toHaveAttribute(
       'class',
       expect.stringContaining('unread'),
@@ -113,7 +113,7 @@ describe('pending requests across projects', () => {
     await $('.agent-composer textarea').setValue('Steer no-response follow-up');
     await $('.agent-actions button').click();
     await browser.waitUntil(async () => (await $$('.inbox-result')).length === 2);
-    await $('[aria-label="Pending requests"]').click();
+    await $('[data-topbar-inbox]').click();
     const results = await $$('.inbox-result');
     await expect(results).toBeElementsArrayOfSize(2);
     await results[1].$('.inbox-open').click();
@@ -123,7 +123,7 @@ describe('pending requests across projects', () => {
       ),
     );
     await browser.refresh();
-    await $('[aria-label="Pending requests"]').click();
+    await $('[data-topbar-inbox]').click();
     await expect($$('.inbox-result')).toBeElementsArrayOfSize(2);
   });
 
@@ -184,7 +184,7 @@ describe('pending requests across projects', () => {
         ),
       ),
     );
-    await $('[aria-label="Pending requests"]').click();
+    await $('[data-topbar-inbox]').click();
     const failedCheck = $('//li[contains(@class, "inbox-result")][contains(., "Check failed")]');
     await expect(failedCheck).toBeDisplayed();
     const before = await browser.execute(() =>

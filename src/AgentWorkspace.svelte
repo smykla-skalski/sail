@@ -26,6 +26,7 @@
   } from './lib/acp-tool-failure';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
+  import ComposerHint from './ComposerHint.svelte';
   import SkillMenu from './SkillMenu.svelte';
   import {
     matchingSkills,
@@ -2122,6 +2123,7 @@
   <div class="agent-body">
     <div
       class="agent-conversation conversation"
+      role="region"
       bind:this={scroll}
       onscroll={() => {
         autoFollow = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80;
@@ -2417,6 +2419,7 @@
         role="combobox"
         aria-autocomplete="list"
         aria-label={`Message ${name}`}
+        aria-describedby={`${skillMenuId}-hint`}
         aria-haspopup="listbox"
         aria-controls={skillMatches.length ? skillMenuId : undefined}
         aria-expanded={skillMatches.length > 0}
@@ -2433,6 +2436,7 @@
         rows="3"
         placeholder={`Message ${name}… (start with ! to run a shell command)`}
         disabled={!directory || !!nativeEntries}></textarea>
+      <ComposerHint id={`${skillMenuId}-hint`} />
       {#each clipboardImagePreviews as preview (preview.path)}
         <figure
           class="clipboard-image-preview"

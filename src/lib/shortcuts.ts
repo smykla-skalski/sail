@@ -1,7 +1,7 @@
 /**
  * One registry for the workspace keyboard shortcuts. `keydownWorkspace` matches
  * events against it, controls publish `aria-keyshortcuts` from it, and the
- * future shortcut sheet and command palette read their labels from it.
+ * shortcut sheet and command palette read their labels from it.
  */
 export type ShortcutModifier =
   /** Command on macOS, Control elsewhere. Either key is accepted. */
@@ -76,6 +76,12 @@ export const shortcuts = [
     modifier: 'primary',
     keys: ['k'],
     shift: false,
+  },
+  {
+    id: 'shortcuts.help',
+    label: 'Show keyboard shortcuts',
+    modifier: 'primary',
+    keys: ['/'],
   },
   {
     id: 'worktree.close',
@@ -163,6 +169,12 @@ function keyName(key: string): string {
 }
 
 export type ShortcutPlatform = 'mac' | 'other';
+
+export function detectShortcutPlatform(
+  agent: Pick<Navigator, 'platform' | 'userAgent'> | undefined = globalThis.navigator,
+): ShortcutPlatform {
+  return /mac/i.test(agent?.platform || agent?.userAgent || '') ? 'mac' : 'other';
+}
 
 /** Human label such as `⌘J`, `⌘⇧J` or `Ctrl+J`. */
 export function shortcutLabel(shortcut: Shortcut, platform: ShortcutPlatform = 'mac'): string {

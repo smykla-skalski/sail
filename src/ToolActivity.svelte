@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { toolCommand, toolInput } from './lib/tool-display';
   import ActivityStatus from './ActivityStatus.svelte';
 
@@ -30,6 +31,9 @@
   $effect(() => {
     if (expanded || status === 'error' || status === 'failed') open = true;
   });
+  // Errors already present on mount come from history; only errors that arrive later interrupt.
+  const mountedError = untrack(() => error);
+  const announce = $derived(!!error && error !== mountedError);
   const command = $derived(toolCommand(input));
   const formattedInput = $derived(toolInput(input));
 </script>
@@ -55,7 +59,9 @@
           <pre>{output}</pre>
         </div>
       {/if}
-      {#if error}<p class="tool-activity-error" role="alert">{error}</p>{/if}
+      {#if error}<p class="tool-activity-error" role={announce ? 'alert' : undefined}>
+          {error}
+        </p>{/if}
       {#if source}<p class="tool-activity-source">Reported by {source}</p>{/if}
       {#if onfix}<button class="tool-activity-fix" onclick={onfix}>Fix with agent</button>{/if}
       {#if children}{@render children()}{/if}
