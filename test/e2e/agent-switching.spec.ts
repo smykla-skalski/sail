@@ -27,8 +27,7 @@ describe('agent switching', () => {
       if (!path) throw new Error('Missing target repository');
       await core.invoke('acp_connect', { agent: 'claude' });
       return core.invoke<{ sessionId: string }>('acp_new_session', {
-        agent: 'claude',
-        cwd: path,
+        params: { agent: 'claude', cwd: path },
       });
     });
     await browser.execute(

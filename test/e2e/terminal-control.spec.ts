@@ -97,8 +97,12 @@ describe('owned MCP terminals', () => {
     const sessions = await browser.tauri.execute(async ({ core }, directory) => {
       await core.invoke('acp_connect', { agent: 'claude' });
       return Promise.all([
-        core.invoke<{ sessionId: string }>('acp_new_session', { agent: 'claude', cwd: directory }),
-        core.invoke<{ sessionId: string }>('acp_new_session', { agent: 'claude', cwd: directory }),
+        core.invoke<{ sessionId: string }>('acp_new_session', {
+          params: { agent: 'claude', cwd: directory },
+        }),
+        core.invoke<{ sessionId: string }>('acp_new_session', {
+          params: { agent: 'claude', cwd: directory },
+        }),
       ]);
     }, path);
     await browser.execute(

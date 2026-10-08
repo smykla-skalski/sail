@@ -513,10 +513,7 @@ export const acp = {
       configOptions?: AgentConfigOption[];
       availableCommands?: AgentCommand[];
     }>('acp_new_session', {
-      agent,
-      cwd,
-      profile,
-      nativeGeneration,
+      params: { agent, cwd, profile, nativeGeneration },
     }),
   releaseSessionFence: (agent: AgentId, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, sessionId }),

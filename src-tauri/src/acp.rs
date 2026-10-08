@@ -2532,17 +2532,29 @@ pub fn acp_pending_permissions(
         .collect())
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpNewSessionParams {
+    agent: String,
+    cwd: String,
+    native_generation: Option<u64>,
+    profile: Option<String>,
+}
+
 #[tauri::command]
 pub async fn acp_new_session(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
     fence: State<'_, AgentWorktreeFence>,
-    agent: String,
-    cwd: String,
-    native_generation: Option<u64>,
-    profile: Option<String>,
+    params: AcpNewSessionParams,
 ) -> Result<Value, String> {
+    let AcpNewSessionParams {
+        agent,
+        cwd,
+        native_generation,
+        profile,
+    } = params;
     if !PathBuf::from(&cwd).is_dir() {
         return Err("Repository directory does not exist.".into());
     }
