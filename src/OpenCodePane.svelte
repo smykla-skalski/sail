@@ -21,6 +21,7 @@
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import PathPicker from './PathPicker.svelte';
+  import ComposerHint from './ComposerHint.svelte';
   import SkillMenu from './SkillMenu.svelte';
   import {
     matchingSkills,
@@ -1101,6 +1102,7 @@
   <div class="agent-body">
     <div
       class="agent-conversation conversation"
+      role="region"
       bind:this={scroll}
       aria-label="OpenCode conversation"
       onscroll={() => {
@@ -1189,6 +1191,7 @@
         bind:this={prompt}
         data-pane-prompt
         aria-label="Message OpenCode"
+        aria-describedby={`${skillMenuId}-hint`}
         bind:value={draft}
         oninput={(event) => rememberDraft(activeID, event.currentTarget)}
         onselect={(event) => rememberDraft(activeID, event.currentTarget)}
@@ -1200,6 +1203,7 @@
         wrap="soft"
         placeholder="Message OpenCode…"
         disabled={!inputReady || loading}></textarea>
+      <ComposerHint id={`${skillMenuId}-hint`} />
       <SkillMenu
         id={skillMenuId}
         skills={skillMatches}

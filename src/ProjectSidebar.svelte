@@ -805,54 +805,68 @@
           thread.agent === 'opencode'
             ? openCodeAvailable
             : agents.some((agent) => agent.id === thread.agent && agent.available)}
-        <button
-          class:active={selectedThread === key && !row.reference}
-          class:subagent={child}
-          class="project-agent-row"
-          class:reference={row.reference}
-          class:nested={row.depth > 0}
+        <div
+          class="project-agent-line"
           style:margin-left={`${row.depth * 12}px`}
           style:width={`calc(100% - ${row.depth * 12}px)`}
-          data-depth={row.depth}
-          data-reference={row.reference || undefined}
-          aria-current={selectedThread === key && !row.reference ? 'page' : undefined}
-          aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}${row.reference ? `, in worktree ${locationName(thread.directory)}` : ''}, ${statusLabel(status)}${childSummary ? `, subagents: ${childSummary}` : ''}`}
-          title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
-          aria-disabled={!selectable}
-          oncontextmenu={(event) => openMenu({ kind: 'agent', thread }, event)}
-          onmousedown={(event) => {
-            if (event.button === 2) void openMenu({ kind: 'agent', thread }, event);
-          }}
-          onclick={() => {
-            if (selectable) onselectthread(key);
-          }}
         >
-          <span class="project-agent-provider"
-            >{#if child}<span aria-hidden="true">↳</span>{/if}<HarnessIcon
-              agent={thread.agent}
-              size={13}
-            />{providerName(thread)}{#if child}<span class="project-subagent-tag">Subagent</span
-              >{/if}</span
+          <button
+            class:active={selectedThread === key && !row.reference}
+            class:subagent={child}
+            class="project-agent-row"
+            class:reference={row.reference}
+            class:nested={row.depth > 0}
+            data-depth={row.depth}
+            data-reference={row.reference || undefined}
+            aria-current={selectedThread === key && !row.reference ? 'page' : undefined}
+            aria-label={`${providerName(thread)}${child ? ' subagent' : ''}: ${thread.title}${row.reference ? `, in worktree ${locationName(thread.directory)}` : ''}, ${statusLabel(status)}${childSummary ? `, subagents: ${childSummary}` : ''}`}
+            title={`${providerName(thread)}${child ? ' subagent' : ''} · ${thread.title} · ${statusLabel(status)}`}
+            aria-disabled={!selectable}
+            oncontextmenu={(event) => openMenu({ kind: 'agent', thread }, event)}
+            onmousedown={(event) => {
+              if (event.button === 2) void openMenu({ kind: 'agent', thread }, event);
+            }}
+            onclick={() => {
+              if (selectable) onselectthread(key);
+            }}
           >
-          <span class="project-agent-title"
-            ><span class="project-agent-name"
-              >{#if row.reference}↳ {thread.title} · in worktree {locationName(
-                  thread.directory,
-                )}{:else}{thread.title}{/if}{#if row.spawnedBy}<small class="project-agent-origin"
-                  >spawned by {row.spawnedBy}</small
+            <span class="project-agent-provider"
+              >{#if child}<span aria-hidden="true">↳</span>{/if}<HarnessIcon
+                agent={thread.agent}
+                size={13}
+              />{providerName(thread)}{#if child}<span class="project-subagent-tag">Subagent</span
                 >{/if}</span
-            >{#if row.descendants}<span
-                class="project-agent-descendants"
-                aria-label={`${row.descendants} descendant${row.descendants === 1 ? '' : 's'}`}
-                >(+{row.descendants})</span
-              >{/if}</span
+            >
+            <span class="project-agent-title"
+              ><span class="project-agent-name"
+                >{#if row.reference}↳ {thread.title} · in worktree {locationName(
+                    thread.directory,
+                  )}{:else}{thread.title}{/if}{#if row.spawnedBy}<small class="project-agent-origin"
+                    >spawned by {row.spawnedBy}</small
+                  >{/if}</span
+              >{#if row.descendants}<span
+                  class="project-agent-descendants"
+                  aria-label={`${row.descendants} descendant${row.descendants === 1 ? '' : 's'}`}
+                  >(+{row.descendants})</span
+                >{/if}</span
+            >
+            <ActivityStatus
+              {status}
+              label={childSummary
+                ? `${statusLabel(status)} · ${childSummary}`
+                : statusLabel(status)}
+              compact
+            />
+          </button>
+          <button
+            class="project-icon-button project-agent-menu"
+            aria-label={`Manage ${child ? 'subagent' : 'thread'} ${thread.title}`}
+            aria-haspopup="menu"
+            aria-expanded={menu?.kind === 'agent' && threadKey(menu.thread) === key}
+            onclick={(event) => openMenu({ kind: 'agent', thread }, event, event.currentTarget)}
+            >⋯</button
           >
-          <ActivityStatus
-            {status}
-            label={childSummary ? `${statusLabel(status)} · ${childSummary}` : statusLabel(status)}
-            compact
-          />
-        </button>
+        </div>
         {#if row.historicalChildren}<button
             class="project-agent-history"
             style:margin-left={`${(row.depth + 1) * 12}px`}
@@ -883,7 +897,7 @@
       aria-label="Add repository"
       title="Add repository"
       {disabled}
-      onclick={() => onaddrepository(null)}>+ Repo</button
+      onclick={() => onaddrepository(null)}>+ Repository</button
     >
   </div>
   {#if creatingGroup}<form

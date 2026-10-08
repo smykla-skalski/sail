@@ -619,6 +619,63 @@ for await (const line of createInterface({ input: process.stdin })) {
     const user = { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } };
     sessions.get(sessionId).history.push(user);
     update(sessionId, user);
+    if (text === 'Plan revision fixture' || text === 'Slow plan revision fixture') {
+      const plan =
+        agent === 'codex'
+          ? {
+              sessionUpdate: 'plan_update',
+              plan: { markdown: '# Initial plan\n\n- inspect the current flow' },
+            }
+          : {
+              sessionUpdate: 'tool_call',
+              toolCallId: `exit-plan-${message.id}`,
+              title: 'ExitPlanMode',
+              status: 'completed',
+              input: { plan: '# Initial plan\n\n- inspect the current flow' },
+            };
+      recordUpdate(sessionId, sessionId, plan);
+      setTimeout(
+        () => {
+          if (activePrompts.get(sessionId) === message.id)
+            send({ id: message.id, result: { stopReason: 'end_turn' } });
+        },
+        text === 'Slow plan revision fixture' ? 15_000 : 750,
+      );
+      continue;
+    }
+    if (
+      ['Add retries', 'Fail native revision', 'Cancel native revision', 'No revised plan'].includes(
+        text,
+      )
+    ) {
+      if (text === 'Fail native revision') {
+        send({ id: message.id, error: { code: -1, message: 'Fixture revision failed' } });
+        continue;
+      }
+      if (text === 'No revised plan') {
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+        continue;
+      }
+      if (text === 'Cancel native revision') {
+        continue;
+      }
+      const plan =
+        agent === 'codex'
+          ? {
+              sessionUpdate: 'plan_update',
+              plan: { markdown: '# Revised plan\n\n- add retries' },
+            }
+          : {
+              sessionUpdate: 'tool_call_update',
+              toolCallId: `exit-plan-${message.id}`,
+              title: 'ExitPlanMode',
+              status: 'completed',
+              input: { plan: '# Revised plan\n\n- add retries' },
+            };
+      recordUpdate(sessionId, sessionId, plan);
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Long turn') {
       let part = 0;
       const interval = setInterval(() => {
@@ -1001,6 +1058,11 @@ for await (const line of createInterface({ input: process.stdin })) {
       setTimeout(() => requestPermission(sessionId, text, message.id), 1500);
     else requestPermission(sessionId, text, message.id);
   } else if (message.method === 'session/cancel') {
+    const activePromptId = activePrompts.get(message.params.sessionId);
+    if (activePromptId !== undefined) {
+      send({ id: activePromptId, result: { stopReason: 'cancelled' } });
+      continue;
+    }
     for (const [id, pending] of permissions) {
       if (pending.sessionId === message.params.sessionId) {
         permissions.delete(id);

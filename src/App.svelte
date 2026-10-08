@@ -254,6 +254,7 @@
   } from './lib/post-turn-checks';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
+  import ComposerHint from './ComposerHint.svelte';
   import SkillMenu from './SkillMenu.svelte';
   import {
     matchingSkills,
@@ -337,7 +338,14 @@
     notificationPrefsKey,
     type NotificationPrefs,
   } from './lib/notification-prefs';
-  import { matches as shortcutMatches } from './lib/shortcuts';
+  import {
+    detectShortcutPlatform,
+    matches as shortcutMatches,
+    shortcutFor,
+    shortcutLabel,
+    ariaKeyShortcutsFor,
+    shortcuts as shortcutRegistry,
+  } from './lib/shortcuts';
   import { subagentNavigation } from './lib/subagent-nav';
   import {
     parentTurnStopHint,
@@ -368,7 +376,9 @@
   } from './lib/inbox';
   import {
     locationName,
+    paletteActions,
     searchCommandPalette,
+    type PaletteActionId,
     type PaletteEntry,
     type PaletteOpenCodeSession,
     type PaletteStep,
@@ -1042,6 +1052,11 @@
     parseContextHandoffThreshold(getSetting('sai-context-handoff-threshold')),
   );
   let notificationSound = $state(getSetting('sai-notification-sound') !== 'false');
+  let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
+  let copiedStatus = $state('');
+  let copiedStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  let shortcutsDialog: HTMLDialogElement;
+  const shortcutPlatform = detectShortcutPlatform();
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
   let agentTerminalsEnabled = $state(getSetting('sai-agent-terminals-enabled') === 'true');
   let agentStatusEnabled = $state(getSetting('sai-agent-status-enabled') !== 'false');
@@ -1178,7 +1193,7 @@
   const paletteRepository = $derived('repository' in paletteStep ? paletteStep.repository : '');
   const paletteLocation = $derived('directory' in paletteStep ? paletteStep.directory : '');
   const paletteAgentID = $derived('agent' in paletteStep ? paletteStep.agent : '');
-  const paletteEntries = $derived(
+  const paletteEntries = $derived.by(() =>
     searchCommandPalette({
       step: paletteStep,
       query: paletteQuery,
@@ -1189,6 +1204,11 @@
       openCodeAvailable: runtimeState === 'connected',
       openCodeSessions: paletteOpenCodeSessions,
       commands: savedCommands,
+      actions: paletteActions({
+        dark,
+        overview: workspaceView === 'overview',
+        hasDirectory: !!directory,
+      }),
       runningThreadKeys: [
         ...Object.keys(runningAgentThreads),
         ...sidebarOpenCodeThreads
@@ -1332,6 +1352,10 @@
   let messageGeneration = new SvelteMap<string, number>();
   let snapshot = $state<PlanSnapshot>({ plan: null, questions: null });
   let nativePlan = $state<NativePlan | null>(null);
+  let nativePlanFeedback = $state('');
+  let nativePlanRevision = $state<{ id: string; feedback: string } | null>(null);
+  let nativePlanRevisionPending = $state(false);
+  let nativePlanRevisionError = $state('');
   let diffs = $state<WorkingDiffInfo[]>([]);
   let diffLoading = $state(false);
   let diffError = $state('');
@@ -1342,6 +1366,25 @@
   let diffRefresh = 0;
   let diffRevision = '';
   let diffRevisionPath = '';
+
+  function requestNativePlanRevision() {
+    const feedback = nativePlanFeedback.trim();
+    if (!feedback) {
+      nativePlanRevisionError = 'Describe what should change before requesting a revision.';
+      return;
+    }
+    nativePlanRevisionError = '';
+    nativePlanRevisionPending = true;
+    nativePlanRevision = { id: crypto.randomUUID(), feedback };
+  }
+
+  function finishNativePlanRevision(id: string, failure: string | null) {
+    if (nativePlanRevision?.id !== id) return;
+    nativePlanRevisionPending = false;
+    nativePlanRevision = null;
+    nativePlanRevisionError = failure ?? '';
+    if (!failure) nativePlanFeedback = '';
+  }
   let draft = $state('');
   const failureRequests = new SvelteMap<string, string>();
   let mainPrompt = $state<HTMLTextAreaElement | undefined>();
@@ -2299,6 +2342,7 @@
       modelRouting,
       notificationPrefs,
       notificationSound,
+      autoCopyEnabled,
       personalPostTurnChecks,
       agentWorktreesEnabled,
       agentTerminalsEnabled,
@@ -2467,6 +2511,9 @@
         } else if (action.type === 'notification-sound') {
           notificationSound = action.value;
           setSetting('sai-notification-sound', String(action.value));
+        } else if (action.type === 'auto-copy') {
+          autoCopyEnabled = action.value;
+          setSetting('sai-auto-copy-enabled', String(action.value));
         } else if (action.type === 'personal-post-turn-checks') {
           personalPostTurnChecks = action.value;
           setSetting('sai-post-turn-personal', JSON.stringify(action.value));
@@ -10337,7 +10384,10 @@
     restorePaletteFocus = true;
     paletteStep = { kind: 'projects' };
     paletteQuery = '';
-    paletteIndex = 0;
+    paletteIndex = Math.max(
+      0,
+      paletteEntries.findIndex((entry) => !entry.disabled),
+    );
     paletteError = '';
     paletteOpenCodeSessions = [];
     paletteDialog.showModal();
@@ -10522,11 +10572,77 @@
     splitFocusedPane('row', 'agent-terminal', undefined, id);
   }
 
+  function runPaletteAction(id: PaletteActionId) {
+    // Actions that open a dialog or move focus must not get it pulled back to the palette trigger.
+    closeCommandPalette(id === 'theme.toggle' || id === 'sidebar.toggle');
+    switch (id) {
+      case 'pane.split':
+        splitFocusedPane('row');
+        break;
+      case 'terminal.split':
+        splitFocusedPane('row', 'terminal');
+        break;
+      case 'chat.side':
+        openSideChat();
+        break;
+      case 'inbox.open':
+        openInbox();
+        break;
+      case 'attention.next':
+        void goToNextAttention();
+        break;
+      case 'overview.toggle':
+        if (workspaceView === 'overview') showWorkspace();
+        else showTaskOverview();
+        break;
+      case 'ship.open':
+        showShipRuns();
+        break;
+      case 'changes.toggle':
+        void toggleChanges();
+        break;
+      case 'settings.open':
+        void openSettings();
+        break;
+      case 'theme.toggle':
+        setTheme(!dark);
+        break;
+      case 'shortcuts.help':
+        openShortcutSheet();
+        break;
+      case 'sidebar.toggle':
+        toggleSidebar();
+        break;
+    }
+  }
+
+  function openShortcutSheet() {
+    if (shortcutsDialog.open || document.querySelector('dialog[open]')) return;
+    shortcutsDialog.showModal();
+  }
+
+  async function announceCopied() {
+    clearTimeout(copiedStatusTimer);
+    copiedStatus = '';
+    // A cleared region makes a repeated "Copied" a new live-region change.
+    await tick();
+    copiedStatus = 'Copied';
+    copiedStatusTimer = setTimeout(() => (copiedStatus = ''), 2000);
+  }
+
+  function copySelection() {
+    copyCompletedSelection({ enabled: autoCopyEnabled, oncopied: () => void announceCopied() });
+  }
+
   async function choosePaletteEntry(entry: PaletteEntry | null) {
     if (!entry || entry.disabled || paletteBusy) return;
     const step = paletteStep;
     if (entry.kind === 'command' && entry.command) {
       runSavedCommand(entry.command);
+      return;
+    }
+    if (entry.kind === 'action' && entry.actionId) {
+      runPaletteAction(entry.actionId);
       return;
     }
     if (step.kind === 'projects' && entry.kind === 'thread' && entry.thread) {
@@ -14401,6 +14517,11 @@
       openCommandPalette();
       return;
     }
+    if (shortcutMatches(event, 'shortcuts.help')) {
+      event.preventDefault();
+      if (!event.repeat) openShortcutSheet();
+      return;
+    }
     if (shortcutMatches(event, 'worktree.close')) {
       event.preventDefault();
       if (!event.repeat && !document.querySelector('dialog[open]')) closeCurrentWorktree();
@@ -14597,9 +14718,9 @@
   onkeydown={keydownWorkspace}
   onkeyup={(event) => {
     keyupWorkspace(event);
-    copyCompletedSelection();
+    copySelection();
   }}
-  onpointerup={copyCompletedSelection}
+  onpointerup={copySelection}
   onblur={() => (recentCycleKeys = null)}
   onfocus={focusWorkspace}
   onfocusin={cancelPendingPromptFocus}
@@ -14707,6 +14828,7 @@
       conversationTitle={focusedConversationTitle}
       inboxCount={attentionCounts.inbox}
       oninbox={openInbox}
+      onpalette={openCommandPalette}
       {directory}
       agents={agentAvailability}
       onopenagent={(agent) => openAgent(agent)}
@@ -14830,7 +14952,17 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
-                onnativeplan={(plan) => (nativePlan = plan)}
+                onnativeplan={(plan) => {
+                  nativePlan = plan;
+                  if (!plan) {
+                    nativePlanFeedback = '';
+                    nativePlanRevision = null;
+                    nativePlanRevisionPending = false;
+                    nativePlanRevisionError = '';
+                  }
+                }}
+                planRevision={nativePlanRevision ?? undefined}
+                onplanrevisionresult={finishNativePlanRevision}
                 onworkspaceactivity={updateMainAgentWorkspaceActivity}
                 ondecision={(thread, permission, optionId) =>
                   recordDecisionActivity(
@@ -15028,6 +15160,7 @@
                       : undefined}
                     data-pane-prompt
                     aria-label="Message"
+                    aria-describedby={`${skillMenuId}-hint`}
                     bind:this={mainPrompt}
                     bind:value={draft}
                     onpaste={(event) => {
@@ -15040,6 +15173,7 @@
                       ? 'Describe the work or ask a question… (start with ! to run a shell command)'
                       : 'OpenCode needs a connected model…'}
                     disabled={!inputReady || sending}></textarea>
+                  <ComposerHint id={`${skillMenuId}-hint`} />
                   {#if attachedFiles.length}<div class="attachments">
                       {#each attachedFiles as path (path)}<span
                           >{clipboardAttachmentNames.get(path) ?? path.split(/[\\/]/).at(-1)}<button
@@ -15281,26 +15415,30 @@
       onfocusin={() => focusPane('main')}
       onpointerdown={() => focusPane('main')}
     >
-      <nav class="side-tabs" aria-label="Session detail tabs">
+      <div class="side-tabs" role="tablist" aria-label="Session detail tabs">
         {#if showPlanPanel && (sessionID || acpAgent)}<button
             class:active={activeSideTab === 'plan'}
-            aria-current={activeSideTab === 'plan' ? 'page' : undefined}
+            role="tab"
+            aria-selected={activeSideTab === 'plan'}
             onclick={() => switchSideTab('plan')}>Plan</button
           >{/if}{#if sessionID || acpAgent}<button
             class:active={activeSideTab === 'changes'}
-            aria-current={activeSideTab === 'changes' ? 'page' : undefined}
+            role="tab"
+            aria-selected={activeSideTab === 'changes'}
             onclick={toggleChanges}>Changes ({diffs.length})</button
           >{/if}{#if sessionID || acpAgent}<button
             class:active={activeSideTab === 'history'}
-            aria-current={activeSideTab === 'history' ? 'page' : undefined}
+            role="tab"
+            aria-selected={activeSideTab === 'history'}
             onclick={() => switchSideTab('history')}>Activity</button
           >{/if}<button
           class:active={activeSideTab === 'ship'}
-          aria-current={activeSideTab === 'ship' ? 'page' : undefined}
+          role="tab"
+          aria-selected={activeSideTab === 'ship'}
           aria-label={`Ship runs, ${attentionCounts.shipTab} need input`}
           onclick={() => switchSideTab('ship')}>Ship runs ({attentionCounts.shipTab})</button
         >
-      </nav>
+      </div>
       <div class="side-panel-body">
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
             {#if acpAgent && nativePlan}<section class="native-plan-panel" aria-label="Native plan">
@@ -15310,6 +15448,29 @@
                         {task.status}: {task.title}
                       </li>{/each}
                   </ul>{/if}
+                <div class="native-plan-revision">
+                  <label for="native-plan-feedback">Revision feedback</label>
+                  <textarea
+                    id="native-plan-feedback"
+                    bind:value={nativePlanFeedback}
+                    rows="3"
+                    placeholder="Describe what should change in this plan"
+                    disabled={nativePlanRevisionPending}></textarea>
+                  {#if nativePlanRevisionError}<p role="alert">{nativePlanRevisionError}</p>{/if}
+                  {#if nativePlanRevisionError}<Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={requestNativePlanRevision}
+                      disabled={nativePlanRevisionPending}
+                      loading={nativePlanRevisionPending}>Retry revision</Button
+                    >{:else}<Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={requestNativePlanRevision}
+                      disabled={nativePlanRevisionPending}
+                      loading={nativePlanRevisionPending}>Request revision</Button
+                    >{/if}
+                </div>
               </section>{:else}<PlanPanel
                 {snapshot}
                 client={connecting ? null : client}
@@ -15490,6 +15651,14 @@
     <input
       bind:this={paletteInput}
       value={paletteQuery}
+      role="combobox"
+      aria-autocomplete="list"
+      aria-haspopup="listbox"
+      aria-expanded={paletteEntries.length > 0}
+      aria-controls={paletteEntries.length ? 'palette-listbox' : undefined}
+      aria-activedescendant={paletteEntries.length && paletteEntries[paletteIndex]
+        ? `palette-option-${paletteIndex}`
+        : undefined}
       aria-label="Search command palette"
       placeholder={paletteStep.kind === 'projects'
         ? 'Search projects or commands…'
@@ -15504,34 +15673,45 @@
     <kbd>{paletteStep.kind === 'projects' ? 'Esc' : '⌫ back'}</kbd>
   </div>
   <div class="palette-results">
-    {#each paletteEntries as entry, index (entry.id)}
-      <button
-        class="palette-entry"
-        data-kind={entry.kind}
-        class:active={index === paletteIndex}
-        aria-current={index === paletteIndex ? 'true' : undefined}
-        disabled={entry.disabled || paletteBusy}
-        onclick={() => void choosePaletteEntry(entry)}
-      >
-        {#if entry.agent}<HarnessIcon agent={entry.agent} />{/if}
-        <span><strong>{entry.label}</strong><small>{entry.detail}</small></span>
-        <span class="palette-kind"
-          >{entry.kind === 'project'
-            ? 'Project'
-            : entry.kind === 'worktree'
-              ? 'Worktree'
-              : entry.kind === 'new-worktree'
-                ? 'Create'
-                : entry.kind === 'agent'
-                  ? 'Agent'
-                  : entry.kind === 'command'
-                    ? 'Command'
-                    : entry.kind === 'new-session'
-                      ? 'New'
-                      : 'Session'}</span
-        >
-      </button>
-    {:else}
+    {#if paletteEntries.length}<div id="palette-listbox" role="listbox" aria-label="Results">
+        {#each paletteEntries as entry, index (entry.id)}
+          <button
+            class="palette-entry"
+            id={`palette-option-${index}`}
+            role="option"
+            tabindex="-1"
+            aria-selected={index === paletteIndex}
+            data-kind={entry.kind}
+            class:active={index === paletteIndex}
+            aria-current={index === paletteIndex ? 'true' : undefined}
+            disabled={entry.disabled || paletteBusy}
+            aria-keyshortcuts={entry.shortcut ? ariaKeyShortcutsFor(entry.shortcut) : undefined}
+            onclick={() => void choosePaletteEntry(entry)}
+          >
+            {#if entry.agent}<HarnessIcon agent={entry.agent} />{/if}
+            <span><strong>{entry.label}</strong><small>{entry.detail}</small></span>
+            <span class="palette-kind"
+              >{entry.kind === 'project'
+                ? 'Project'
+                : entry.kind === 'worktree'
+                  ? 'Worktree'
+                  : entry.kind === 'new-worktree'
+                    ? 'Create'
+                    : entry.kind === 'agent'
+                      ? 'Agent'
+                      : entry.kind === 'command'
+                        ? 'Command'
+                        : entry.kind === 'new-session'
+                          ? 'New'
+                          : entry.kind === 'action'
+                            ? entry.shortcut
+                              ? shortcutLabel(shortcutFor(entry.shortcut), shortcutPlatform)
+                              : 'Action'
+                            : 'Session'}</span
+            >
+          </button>
+        {/each}
+      </div>{:else}
       <div class="palette-empty">
         <p>{paletteLoading ? 'Loading sessions…' : `No matches for “${paletteQuery}”.`}</p>
         {#if paletteStep.kind === 'projects' && !projectCatalog.repositories.length}<button
@@ -15541,13 +15721,34 @@
             }}>Add repository…</button
           >{/if}
       </div>
-    {/each}
+    {/if}
     {#if paletteLoading && paletteEntries.length}<p class="palette-status" role="status">
         Loading sessions…
       </p>{/if}
     {#if paletteError}<p class="palette-error" role="alert">{paletteError}</p>{/if}
   </div>
 </dialog>
+<dialog
+  class="commands-dialog shortcuts-dialog"
+  bind:this={shortcutsDialog}
+  aria-labelledby="shortcuts-title"
+>
+  <div class="commands-header">
+    <h2 id="shortcuts-title">Keyboard shortcuts</h2>
+    <button aria-label="Close keyboard shortcuts" onclick={() => shortcutsDialog.close()}>×</button>
+  </div>
+  <dl class="shortcuts-list">
+    {#each shortcutRegistry as shortcut (shortcut.id)}
+      <div class="shortcuts-row" data-shortcut-id={shortcut.id}>
+        <dt>{shortcut.label}</dt>
+        <dd><kbd>{shortcutLabel(shortcut, shortcutPlatform)}</kbd></dd>
+      </div>
+    {/each}
+  </dl>
+</dialog>
+<div class="copy-status" role="status" aria-live="polite" aria-atomic="true">
+  {#if copiedStatus}<span>{copiedStatus}</span>{/if}
+</div>
 <dialog class="commands-dialog" bind:this={snapshotsDialog} aria-label="Worktree restore history">
   <div class="commands-header">
     <h2>Restore worktree</h2>
