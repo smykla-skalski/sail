@@ -716,10 +716,7 @@ export function shipTaskThreadsSettled(
   receipts: Array<
     Pick<SpawnReceipt, 'receiptId' | 'targetId' | 'state'> &
       Partial<
-        Pick<
-          SpawnReceipt,
-          'sourceId' | 'sourceDirectory' | 'targetDirectory' | 'dispatchPending'
-        >
+        Pick<SpawnReceipt, 'sourceId' | 'sourceDirectory' | 'targetDirectory' | 'dispatchPending'>
       >
   >,
   discoveredThreadIds: Iterable<string> = [],

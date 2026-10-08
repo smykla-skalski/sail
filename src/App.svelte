@@ -7924,8 +7924,7 @@
         const turn = dispatchAuthorizedDirectShipPrompt(promptAuthorization, () =>
           acp.prompt(source.agent, session.sessionId, prompt, turnId),
         );
-        if (receiptId)
-          updateSpawnReceipt(receiptId, { state: 'working', dispatchPending: false });
+        if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', dispatchPending: false });
         if (receiptId)
           await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
         if (receiptId)
@@ -13394,6 +13393,7 @@
                           : 'interrupted',
                   });
                 }
+                return undefined;
               },
               () => recordImplementationModel(path, implementingModel, tracking),
             )
