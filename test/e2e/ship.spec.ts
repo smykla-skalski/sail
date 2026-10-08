@@ -56,6 +56,22 @@ describe('native Ship run history', () => {
           error: 'Manual test found a failure',
           workerModel: 'model-implementation',
           models: ['model-implementation'],
+          validationPolicy: {
+            risk: 'high',
+            requiredGates: ['code-adversary', 'findings-adversary', 'test-adversary'],
+            sources: ['path rule src-tauri/**: high (src-tauri/src/lib.rs)'],
+            revision: 'fixture-revision',
+            changedPaths: ['src-tauri/src/lib.rs'],
+            selectedAt: 1,
+            history: [
+              {
+                requestedRisk: 'medium',
+                selectedRisk: 'high',
+                sources: ['path rule src-tauri/**: high (src-tauri/src/lib.rs)'],
+                at: 1,
+              },
+            ],
+          },
           checks: [
             {
               name: 'Build',
@@ -233,6 +249,8 @@ describe('native Ship run history', () => {
     );
     await expect(validationGates()).toHaveText(expect.stringContaining('codex / model-test'));
     await expect(validationGates()).toHaveText(expect.stringContaining('FAIL'));
+    await expect($('.ship-policy')).toHaveText(expect.stringContaining('Selected risk high'));
+    await expect($('.ship-policy')).toHaveText(expect.stringContaining('src-tauri/**: high'));
     await expect($('.ship-checks summary')).toHaveText('CI: Failed');
     const listScroll = await browser.execute(() => {
       const panel = document.querySelector<HTMLElement>('.ship-panel')!;

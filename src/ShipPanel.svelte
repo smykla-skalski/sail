@@ -353,11 +353,35 @@
               </p>
             {:else}<p>No evidence recorded for this revision.</p>{/each}
           </details>
+          <h4>Validation policy</h4>
+          {#if issue.validationPolicy}
+            <dl class="ship-policy">
+              <div>
+                <dt>Selected risk</dt>
+                <dd>{issue.validationPolicy.risk}</dd>
+              </div>
+              <div>
+                <dt>Required gates</dt>
+                <dd>{issue.validationPolicy.requiredGates.join(', ') || 'None'}</dd>
+              </div>
+              <div>
+                <dt>Revision</dt>
+                <dd>{issue.validationPolicy.revision}</dd>
+              </div>
+              <div>
+                <dt>Policy source</dt>
+                <dd>{issue.validationPolicy.sources.join(' · ')}</dd>
+              </div>
+            </dl>
+          {:else}<p class="ship-muted">Risk not selected. Validation cannot start.</p>{/if}
           <h4>Validation gates</h4>
           <ol class="ship-gates">
             {#each gateNames as name (name)}
               <li>
-                <strong>{name.replaceAll('-', ' ')}</strong>
+                <strong>{name.replaceAll('-', ' ')}</strong
+                >{issue.validationPolicy?.requiredGates.includes(name)
+                  ? ' · Required'
+                  : ' · Not required'}
                 {#each (issue.gates ?? []).filter((gate) => gate.gate === name) as gate (gate.id)}
                   <div class="ship-gate">
                     <span>{gate.state} · {gate.verdict ?? 'No verdict reported'}</span>
@@ -617,6 +641,27 @@
   }
   .ship-gates > li {
     margin-bottom: 16px;
+  }
+
+  .ship-policy {
+    display: grid;
+    gap: 0.4rem;
+    margin: 0;
+  }
+
+  .ship-policy div {
+    display: grid;
+    grid-template-columns: minmax(7rem, auto) 1fr;
+    gap: 0.65rem;
+  }
+
+  .ship-policy dt {
+    color: var(--sui-text-muted);
+  }
+
+  .ship-policy dd {
+    margin: 0;
+    overflow-wrap: anywhere;
   }
   .ship-gate {
     display: grid;

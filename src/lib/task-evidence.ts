@@ -23,6 +23,7 @@ export type TaskEvidence = z.infer<typeof taskEvidenceSchema>;
 export const evidenceManifestSchema = z
   .object({
     revision: z.string().min(1),
+    baseRevision: z.string().min(1).nullable().default(null),
     acceptanceCriteria: z.array(z.string().min(1).max(2000)).min(1).max(100),
     evidence: z.array(taskEvidenceSchema).max(100),
     stale: z.boolean(),
@@ -46,9 +47,9 @@ export const evidenceManifestsSchema = z
   .transform((manifests) => {
     const byRevision = new Map<string, EvidenceManifest>();
     for (const manifest of manifests) {
-      const previous = byRevision.get(manifest.revision);
-      if (!previous || manifest.updatedAt >= previous.updatedAt)
-        byRevision.set(manifest.revision, manifest);
+      const key = manifestIdentity(manifest.revision, manifest.baseRevision);
+      const previous = byRevision.get(key);
+      if (!previous || manifest.updatedAt >= previous.updatedAt) byRevision.set(key, manifest);
     }
     return [...byRevision.values()];
   })
@@ -89,6 +90,26 @@ function compareEvidence(left: TaskEvidence, right: TaskEvidence): number {
   return left.timestamp - right.timestamp;
 }
 
+function manifestIdentity(revision: string, baseRevision: string | null | undefined): string {
+  return `${revision}\0${baseRevision ?? ''}`;
+}
+
+function boundEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
+  const sorted = evidence.toSorted(compareEvidence);
+  if (sorted.length <= evidenceLimit) return sorted;
+  const latestGates = new Map<string, TaskEvidence>();
+  for (const entry of sorted) {
+    if (entry.kind !== 'gate') continue;
+    const previous = latestGates.get(entry.name);
+    if (!previous || evidenceIsNewer(entry, previous)) latestGates.set(entry.name, entry);
+  }
+  const protectedIds = new Set([...latestGates.values()].map((entry) => entry.id));
+  const retained = sorted
+    .filter((entry) => !protectedIds.has(entry.id))
+    .slice(-(evidenceLimit - protectedIds.size));
+  return [...retained, ...latestGates.values()].toSorted(compareEvidence);
+}
+
 function boundEvidenceManifests(manifests: EvidenceManifest[]): EvidenceManifest[] {
   const sorted = manifests.toSorted((left, right) => left.createdAt - right.createdAt);
   if (sorted.length <= manifestLimit) return sorted;
@@ -100,17 +121,33 @@ function boundEvidenceManifests(manifests: EvidenceManifest[]): EvidenceManifest
   return [...history, ...current].toSorted((left, right) => left.createdAt - right.createdAt);
 }
 
+export function nextTaskEvidenceSequence(manifests: EvidenceManifest[], offset = 0): number {
+  return (
+    Math.max(
+      0,
+      ...manifests.flatMap((manifest) =>
+        manifest.evidence.map((candidate) => candidate.sequence ?? 0),
+      ),
+    ) +
+    offset +
+    1
+  );
+}
+
 export function mergeEvidenceManifests(
   current: EvidenceManifest[],
   incoming: EvidenceManifest[],
 ): EvidenceManifest[] {
   const merged = new Map(
-    evidenceManifestsSchema.parse(current).map((manifest) => [manifest.revision, manifest]),
+    evidenceManifestsSchema
+      .parse(current)
+      .map((manifest) => [manifestIdentity(manifest.revision, manifest.baseRevision), manifest]),
   );
   for (const candidate of evidenceManifestsSchema.parse(incoming)) {
-    const existing = merged.get(candidate.revision);
+    const key = manifestIdentity(candidate.revision, candidate.baseRevision);
+    const existing = merged.get(key);
     if (!existing) {
-      merged.set(candidate.revision, candidate);
+      merged.set(key, candidate);
       continue;
     }
     const latest = candidate.updatedAt >= existing.updatedAt ? candidate : existing;
@@ -119,9 +156,9 @@ export function mergeEvidenceManifests(
       const previous = evidence.get(entry.id);
       if (!previous || evidenceIsNewer(entry, previous)) evidence.set(entry.id, entry);
     }
-    merged.set(candidate.revision, {
+    merged.set(key, {
       ...latest,
-      evidence: [...evidence.values()].toSorted(compareEvidence).slice(-evidenceLimit),
+      evidence: boundEvidence([...evidence.values()]),
       createdAt: Math.min(existing.createdAt, candidate.createdAt),
       updatedAt: Math.max(existing.updatedAt, candidate.updatedAt),
     });
@@ -136,6 +173,154 @@ export function requireEvidenceRevision(expected: unknown, current: string): voi
     throw new Error('The worktree changed after execution started. Rerun the evidence.');
 }
 
+export type EvidenceExecutionBoundary = {
+  revision: string;
+  mutationGeneration: string;
+  baseRevision: string;
+};
+
+export function requireEvidenceExecutionBoundary(
+  expected: {
+    revision: unknown;
+    mutationGeneration: unknown;
+    baseRevision: unknown;
+  },
+  current: EvidenceExecutionBoundary,
+): void {
+  requireEvidenceRevision(expected.revision, current.revision);
+  if (typeof expected.mutationGeneration !== 'string' || !expected.mutationGeneration)
+    throw new Error('Evidence needs the mutation generation captured before execution.');
+  if (expected.mutationGeneration !== current.mutationGeneration)
+    throw new Error('The worktree was modified after execution started. Rerun the evidence.');
+  if (typeof expected.baseRevision !== 'string' || !expected.baseRevision)
+    throw new Error('Evidence needs the shipping base captured before execution.');
+  if (expected.baseRevision !== current.baseRevision)
+    throw new Error('The shipping base changed after execution started. Rerun the evidence.');
+}
+
+export async function readStableEvidenceBoundary(
+  readRevision: () => Promise<string>,
+  readMutationGeneration: () => Promise<string>,
+  readBaseRevision: () => Promise<string>,
+  maxAttempts = 3,
+): Promise<EvidenceExecutionBoundary> {
+  async function readAttempt(attemptsRemaining: number): Promise<EvidenceExecutionBoundary> {
+    const mutationGeneration = await readMutationGeneration();
+    const [revision, baseRevision] = await Promise.all([readRevision(), readBaseRevision()]);
+    const [currentRevision, currentMutationGeneration, currentBaseRevision] = await Promise.all([
+      readRevision(),
+      readMutationGeneration(),
+      readBaseRevision(),
+    ]);
+    if (
+      revision === currentRevision &&
+      mutationGeneration === currentMutationGeneration &&
+      baseRevision === currentBaseRevision
+    )
+      return { revision, mutationGeneration, baseRevision };
+    if (attemptsRemaining > 1) return readAttempt(attemptsRemaining - 1);
+    throw new Error('The worktree kept changing while capturing evidence. Retry when stable.');
+  }
+
+  return readAttempt(Math.max(1, maxAttempts));
+}
+
+export async function commitRevisionBoundEvidence({
+  expected,
+  readBoundary,
+  commit,
+}: {
+  expected: EvidenceExecutionBoundary;
+  readBoundary: () => Promise<EvidenceExecutionBoundary>;
+  commit: (registerRollback: (rollback: () => Promise<void>) => void) => Promise<void>;
+}): Promise<void> {
+  const verify = async () => requireEvidenceExecutionBoundary(expected, await readBoundary());
+  await verify();
+  let rollback: (() => Promise<void>) | undefined;
+  try {
+    await commit((candidate) => (rollback = candidate));
+    await verify();
+  } catch (cause) {
+    try {
+      await rollback?.();
+    } catch (rollbackCause) {
+      throw new Error(`Evidence commit failed (${String(cause)}) and rollback failed.`, {
+        cause: rollbackCause,
+      });
+    }
+    throw cause;
+  }
+}
+
+function canonicalEvidenceValue(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, item: unknown) =>
+    item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.entries(item).toSorted(([left], [right]) => left.localeCompare(right)),
+        )
+      : item,
+  );
+}
+
+function sameEvidenceValue(left: unknown, right: unknown): boolean {
+  return canonicalEvidenceValue(left) === canonicalEvidenceValue(right);
+}
+
+export function rollbackTaskEvidenceRecord(
+  current: { evidenceRevision?: string; evidenceManifests?: EvidenceManifest[] },
+  previous: { evidenceRevision?: string; evidenceManifests?: EvidenceManifest[] },
+  committed: { evidenceRevision?: string; evidenceManifests?: EvidenceManifest[] },
+  evidenceId: string,
+): { evidenceRevision?: string; evidenceManifests: EvidenceManifest[] } {
+  const previousByIdentity = new Map(
+    (previous.evidenceManifests ?? []).map((manifest) => [
+      manifestIdentity(manifest.revision, manifest.baseRevision),
+      manifest,
+    ]),
+  );
+  const committedByIdentity = new Map(
+    (committed.evidenceManifests ?? []).map((manifest) => [
+      manifestIdentity(manifest.revision, manifest.baseRevision),
+      manifest,
+    ]),
+  );
+  const evidenceManifests = (current.evidenceManifests ?? []).flatMap((manifest) => {
+    const key = manifestIdentity(manifest.revision, manifest.baseRevision);
+    const prior = previousByIdentity.get(key);
+    const saved = committedByIdentity.get(key);
+    if (!saved) return [manifest];
+    const savedEntry = saved.evidence.find((entry) => entry.id === evidenceId);
+    const evidence = savedEntry
+      ? manifest.evidence.filter(
+          (entry) => entry.id !== evidenceId || !sameEvidenceValue(entry, savedEntry),
+        )
+      : manifest.evidence;
+    const evicted = (prior?.evidence ?? []).filter(
+      (entry) =>
+        !saved.evidence.some((candidate) => candidate.id === entry.id) &&
+        !evidence.some((candidate) => candidate.id === entry.id),
+    );
+    const withoutRecord = { ...manifest, evidence: boundEvidence([...evidence, ...evicted]) };
+    if (
+      prior &&
+      sameEvidenceValue(withoutRecord.evidence, prior.evidence) &&
+      sameEvidenceValue({ ...manifest, evidence: saved.evidence }, saved)
+    )
+      return [prior];
+    if (!prior && !evidence.length && sameEvidenceValue(withoutRecord, { ...saved, evidence: [] }))
+      return [];
+    return [withoutRecord];
+  });
+  return {
+    evidenceManifests,
+    evidenceRevision:
+      current.evidenceRevision === committed.evidenceRevision &&
+      sameEvidenceValue(evidenceManifests, previous.evidenceManifests ?? [])
+        ? previous.evidenceRevision
+        : current.evidenceRevision,
+  };
+}
+
 export function requireEvidenceBaseRevision(recorded: string, current: string | undefined): void {
   if (current !== undefined && recorded !== current)
     throw new Error('Newer revision evidence was recorded concurrently. Rerun the gate.');
@@ -146,13 +331,15 @@ export function syncEvidenceManifest(
   revision: string,
   acceptanceCriteria: string[],
   now: number,
+  baseRevision?: string,
 ): EvidenceManifest[] {
   if (!revision) throw new Error('Evidence needs a source revision.');
   const criteria = z.array(z.string().min(1).max(2000)).min(1).max(100).parse(acceptanceCriteria);
   let found = false;
   const synced: EvidenceManifest[] = [];
   for (const manifest of evidenceManifestsSchema.parse(manifests)) {
-    const current = manifest.revision === revision;
+    const current =
+      manifest.revision === revision && manifest.baseRevision === (baseRevision ?? null);
     if (!current) {
       synced.push(
         manifest.stale
@@ -178,6 +365,7 @@ export function syncEvidenceManifest(
   if (!found)
     synced.push({
       revision,
+      baseRevision: baseRevision ?? null,
       acceptanceCriteria: criteria,
       evidence: [],
       stale: false,
@@ -192,37 +380,60 @@ export function recordTaskEvidence(
   revision: string,
   acceptanceCriteria: string[],
   evidence: TaskEvidence,
+  baseRevision?: string,
 ): EvidenceManifest[] {
   const parsedEntry = taskEvidenceSchema.parse(evidence);
-  const nextSequence =
-    Math.max(
-      0,
-      ...manifests.flatMap((manifest) =>
-        manifest.evidence.map((candidate) => candidate.sequence ?? 0),
-      ),
-    ) + 1;
-  const entry = { ...parsedEntry, sequence: nextSequence };
+  const nextSequence = nextTaskEvidenceSequence(manifests);
+  const entry = {
+    ...parsedEntry,
+    sequence: parsedEntry.sequence ?? nextSequence,
+  };
   const unknown = entry.criteria.filter((criterion) => !acceptanceCriteria.includes(criterion));
   if (unknown.length)
     throw new Error(`Evidence references unknown acceptance criteria: ${unknown.join(', ')}`);
-  const synced = syncEvidenceManifest(manifests, revision, acceptanceCriteria, entry.timestamp);
-  const index = synced.findIndex((manifest) => manifest.revision === revision);
+  const synced = syncEvidenceManifest(
+    manifests,
+    revision,
+    acceptanceCriteria,
+    entry.timestamp,
+    baseRevision,
+  );
+  const index = synced.findIndex(
+    (manifest) =>
+      manifest.revision === revision && manifest.baseRevision === (baseRevision ?? null),
+  );
   const manifest = synced[index];
-  const previous = manifest.evidence.findLast(
+  const previousIndex = manifest.evidence.findIndex((candidate) => candidate.id === entry.id);
+  const previous = manifest.evidence[previousIndex];
+  const equivalent = (candidate: TaskEvidence) =>
+    candidate.provider === entry.provider &&
+    candidate.model === entry.model &&
+    candidate.result === entry.result &&
+    candidate.outputReference === entry.outputReference &&
+    JSON.stringify(candidate.criteria) === JSON.stringify(entry.criteria);
+  if (
+    previous &&
+    equivalent(previous) &&
+    (parsedEntry.sequence === undefined || previous.sequence === entry.sequence)
+  )
+    return synced;
+  const previousAttempt = manifest.evidence.findLast(
     (candidate) => candidate.kind === entry.kind && candidate.name === entry.name,
   );
   if (
-    previous &&
-    previous.provider === entry.provider &&
-    previous.model === entry.model &&
-    previous.result === entry.result &&
-    previous.outputReference === entry.outputReference &&
-    JSON.stringify(previous.criteria) === JSON.stringify(entry.criteria)
+    !previous &&
+    parsedEntry.sequence === undefined &&
+    previousAttempt &&
+    equivalent(previousAttempt)
   )
     return synced;
+  const nextEvidence =
+    previousIndex < 0
+      ? [...manifest.evidence, entry]
+      : manifest.evidence.with(previousIndex, entry);
   return synced.with(index, {
     ...manifest,
-    evidence: [...manifest.evidence, entry].slice(-evidenceLimit),
+    evidence: boundEvidence(nextEvidence),
     updatedAt: Math.max(manifest.createdAt, manifest.updatedAt, entry.timestamp),
   });
 }
@@ -232,9 +443,15 @@ export function evidenceReadiness(
   revision: string | null | undefined,
   requiredGates: string[],
   acceptanceCriteria: string[],
+  baseRevision?: string,
 ): EvidenceReadiness {
   const manifest = revision
-    ? manifests.find((candidate) => candidate.revision === revision && !candidate.stale)
+    ? manifests.find(
+        (candidate) =>
+          candidate.revision === revision &&
+          candidate.baseRevision === (baseRevision ?? null) &&
+          !candidate.stale,
+      )
     : undefined;
   if (!manifest)
     return {
