@@ -25,6 +25,15 @@ There is no automatic updater. To update, download the next package for your pla
 - The Inbox groups items by repository. You can dismiss a Ship or subagent item until its next state change, or snooze it for an hour or until tomorrow at 08:00. Items clear when their state resolves.
 - Cmd+J (Ctrl+J elsewhere) goes to the next item needing attention. Cmd+Shift+J still opens the side chat.
 
+## One transcript view
+
+- Claude, Codex and OpenCode threads now render through one transcript view, so the main thread, the OpenCode pane and the agent workspace look and behave the same.
+- OpenCode tool calls are grouped like Claude and Codex tool calls, and OpenCode thinking shows as a collapsed "Show thinking" row. Thinking is collapsed for every agent.
+- Hooks, post-turn checks and the subagent group card appear in event order between the messages, with one card per turn, instead of after the last message.
+- Messages show their time. The assistant avatar is the provider's mark instead of "S.".
+- Code blocks have a **Copy** button. **Jump to latest (N new)** appears when you scroll away from the end of a live transcript.
+- Permission requests use one card. It shows the exact command and files, links back to the tool call, and never offers "Allow always" for unknown or high-risk actions.
+
 ## Ship queue, archive and actions
 
 - **Ship queue** (More actions, Ship queue) lists the issues of every run in one full-width table. Issues that need you come first, merged and closed issues stay hidden until you show them, and a Run filter narrows the table to one run. The header shows worker usage against the run limits; a ship-it coordinator itself starts at most 3 workers and keeps a slot free for gates.
