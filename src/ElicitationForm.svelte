@@ -26,13 +26,20 @@
       ? (elicitation.schema.properties as Record<string, Record<string, unknown>>)
       : {},
   );
-  let values = $state<Record<string, unknown>>(
-    Object.fromEntries(
-      Object.entries(properties).flatMap(([key, property]) =>
+  function defaults(schema: Record<string, unknown>): Record<string, unknown> {
+    const fields =
+      schema.properties &&
+      typeof schema.properties === 'object' &&
+      !Array.isArray(schema.properties)
+        ? (schema.properties as Record<string, Record<string, unknown>>)
+        : {};
+    return Object.fromEntries(
+      Object.entries(fields).flatMap(([key, property]) =>
         property.default === undefined ? [] : [[key, property.default]],
       ),
-    ),
-  );
+    );
+  }
+  let values = $state<Record<string, unknown>>(defaults(elicitation.schema));
   let error = $state('');
 
   async function answer(action: 'accept' | 'decline' | 'cancel') {
