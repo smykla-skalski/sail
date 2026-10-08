@@ -803,11 +803,10 @@ impl Drop for TemporaryIndex {
     }
 }
 
-fn index_with_intent(
-    root: &str,
-    files: &[String],
-    copy_current: bool,
-) -> Result<TemporaryIndex, String> {
+/// A private index for read-only commands. Git refreshes stat data and writes it back to the
+/// index it reads, and only some commands honour `--no-optional-locks`, so a read that must not
+/// touch the user's index runs against a copy.
+fn index_copy(root: &str, copy_current: bool) -> Result<TemporaryIndex, String> {
     let output = Command::new("git")
         .args(["-C", root, "rev-parse", "--git-path", "index"])
         .output()
@@ -827,6 +826,15 @@ fn index_with_intent(
     if copy_current && index.exists() {
         std::fs::copy(&index, &temporary.0).map_err(|error| error.to_string())?;
     }
+    Ok(temporary)
+}
+
+fn index_with_intent(
+    root: &str,
+    files: &[String],
+    copy_current: bool,
+) -> Result<TemporaryIndex, String> {
+    let temporary = index_copy(root, copy_current)?;
     let pathspecs = files
         .iter()
         .map(|file| format!(":(literal){file}"))
@@ -909,8 +917,7 @@ fn git_patches(
 async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = validate_repository(path)?;
-        // Status refreshes stat data and writes it back to the index unless optional
-        // locks are off, which rewrites the user's index on every diff refresh.
+        let snapshot = index_copy(&root, true)?;
         let output = Command::new("git")
             .args([
                 "--no-optional-locks",
@@ -922,6 +929,7 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
                 "--no-renames",
                 "--untracked-files=all",
             ])
+            .env("GIT_INDEX_FILE", &snapshot.0)
             .output()
             .map_err(|error| error.to_string())?;
         if !output.status.success() {
@@ -962,14 +970,14 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
         } else {
             Some(index_with_intent(&root, &untracked, true)?)
         };
-        let staged = git_patches(&root, "staged", None)?;
+        let staged = git_patches(&root, "staged", Some(&snapshot.0))?;
         let unstaged = git_patches(
             &root,
             "unstaged",
-            temporary.as_ref().map(|index| index.0.as_path()),
+            Some(temporary.as_ref().unwrap_or(&snapshot).0.as_path()),
         )?;
         let all = if has_head {
-            git_patches(&root, "all", None)?
+            git_patches(&root, "all", Some(&snapshot.0))?
         } else {
             let existing = records
                 .iter()
