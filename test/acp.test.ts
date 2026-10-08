@@ -2,18 +2,21 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acpDisconnectAffectsSession,
-  bufferBackgroundUpdate,
+  applyLiveTranscriptUpdate,
   forgetRecentTranscript,
+  forgetSessionState,
   groupAgentEntries,
-  invalidateBackgroundSession,
+  invalidateLiveTranscript,
   liveSessionView,
+  liveTranscriptLimit,
   loadRecentTranscript,
   rememberSessionState,
   restoreEntryTimes,
   saveRecentTranscript,
   sessionState,
-  takeBackgroundUpdates,
-  trackBackgroundSession,
+  takeLiveTranscript,
+  trackLiveTranscript,
+  tracksLiveTranscript,
   updateEntries,
   updateEntriesBatch,
   updateEntriesInPlace,
@@ -321,27 +324,42 @@ void test('consecutive ACP tools form a stable group between visible messages', 
   );
 });
 
-void test('switching back to a running session rebuilds it from the buffered updates', () => {
-  const cached: AgentEntry[] = [{ id: 'a', type: 'assistant', text: 'Working on' }];
-  trackBackgroundSession('claude', 'live');
-  bufferBackgroundUpdate('claude', 'live', {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: ' it' },
-  });
-  bufferBackgroundUpdate('claude', 'live', {
+const chunk = (text: string) => ({
+  sessionUpdate: 'agent_message_chunk',
+  content: { type: 'text', text },
+});
+
+void test('a kept transcript applies every update while the session is off screen', () => {
+  const shown: AgentEntry[] = [
+    { id: 'p', type: 'user', text: 'Fix the bug' },
+    { id: 'a', type: 'assistant', text: 'Working on' },
+  ];
+  trackLiveTranscript('claude', 'live', shown, true);
+  shown.push({ id: 'later', type: 'assistant', text: 'not kept' });
+  applyLiveTranscriptUpdate('claude', 'live', chunk(' it'));
+  applyLiveTranscriptUpdate('claude', 'live', {
     sessionUpdate: 'user_message_chunk',
-    content: { type: 'text', text: 'echo of the prompt' },
+    content: { type: 'text', text: 'Fix the bug' },
   });
-  bufferBackgroundUpdate('claude', 'live', {
+  applyLiveTranscriptUpdate('claude', 'live', {
     sessionUpdate: 'tool_call',
     toolCallId: 'read',
     title: 'Read file',
     status: 'in_progress',
   });
-  bufferBackgroundUpdate('claude', 'untracked', {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: 'ignored' },
+  for (let index = 0; index < 2500; index += 1)
+    applyLiveTranscriptUpdate('claude', 'live', {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'read',
+      status: index === 2499 ? 'completed' : 'in_progress',
+    });
+  applyLiveTranscriptUpdate('claude', 'live', {
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'text', text: 'Also add a test' },
   });
+  for (let index = 0; index < 2500; index += 1)
+    applyLiveTranscriptUpdate('claude', 'live', chunk(`${index},`));
+  applyLiveTranscriptUpdate('claude', 'untracked', chunk('ignored'));
   const configOptions = [
     {
       id: 'model',
@@ -353,46 +371,67 @@ void test('switching back to a running session rebuilds it from the buffered upd
   ];
   rememberSessionState('claude', 'live', { configOptions });
   const view = liveSessionView(
-    cached,
-    takeBackgroundUpdates('claude', 'live'),
+    [],
+    takeLiveTranscript('claude', 'live'),
     sessionState('claude', 'live'),
-    5,
   );
   assert.ok(view);
+  const flood = Array.from({ length: 2500 }, (_, index) => `${index},`).join('');
   assert.deepEqual(
-    view.entries.map((entry) => (entry.type === 'tool' ? entry.title : entry.text)),
-    ['Working on it', 'Read file'],
+    view.entries.map((entry) =>
+      entry.type === 'tool' ? `${entry.title}:${entry.status}` : `${entry.type}:${entry.text}`,
+    ),
+    ['user:Fix the bug', 'assistant:Working on it', 'Read file:completed', `assistant:${flood}`],
   );
   assert.equal(view.configOptions, configOptions);
   assert.equal(view.complete, true);
-  assert.equal(takeBackgroundUpdates('claude', 'live'), null);
-  assert.equal(takeBackgroundUpdates('claude', 'untracked'), null);
+  assert.equal(takeLiveTranscript('claude', 'live'), null);
+  assert.equal(takeLiveTranscript('claude', 'untracked'), null);
 });
 
-void test('a running session without a complete buffer keeps its cached transcript', () => {
+void test('without a complete kept transcript the capped cache is shown as incomplete', () => {
   const cached: AgentEntry[] = [{ id: 'a', type: 'assistant', text: 'Cached' }];
   rememberSessionState('claude', 'busy', { configOptions: [] });
-  trackBackgroundSession('claude', 'busy');
-  for (let index = 0; index <= 2000; index += 1)
-    bufferBackgroundUpdate('claude', 'busy', {
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: '.' },
-    });
-  const overflowed = takeBackgroundUpdates('claude', 'busy');
-  assert.equal(overflowed, null);
-  const incomplete = liveSessionView(cached, overflowed, sessionState('claude', 'busy'));
-  assert.equal(incomplete?.entries, cached);
-  assert.equal(incomplete?.complete, false);
-  trackBackgroundSession('claude', 'replayed');
-  invalidateBackgroundSession('claude', 'replayed');
-  assert.equal(takeBackgroundUpdates('claude', 'replayed'), null);
-  trackBackgroundSession('claude', 'unknown-state');
-  assert.equal(
-    liveSessionView(
-      [],
-      takeBackgroundUpdates('claude', 'unknown-state'),
-      sessionState('claude', 'unknown-state'),
-    ),
-    null,
+  const missing = liveSessionView(
+    cached,
+    takeLiveTranscript('claude', 'busy'),
+    sessionState('claude', 'busy'),
   );
+  assert.equal(missing?.entries, cached);
+  assert.equal(missing?.complete, false);
+  trackLiveTranscript('claude', 'busy', cached, false);
+  applyLiveTranscriptUpdate('claude', 'busy', chunk(' more'));
+  const partial = liveSessionView(
+    [],
+    takeLiveTranscript('claude', 'busy'),
+    sessionState('claude', 'busy'),
+  );
+  assert.equal(partial?.complete, false);
+  assert.deepEqual(
+    partial?.entries.map((entry) => entry.type !== 'tool' && entry.text),
+    ['Cached more'],
+  );
+  trackLiveTranscript('claude', 'replayed', cached, true);
+  invalidateLiveTranscript('claude', 'replayed');
+  assert.equal(takeLiveTranscript('claude', 'replayed'), null);
+  trackLiveTranscript('claude', 'unknown-state', [], true);
+  const reloaded = liveSessionView(cached, null, sessionState('claude', 'unknown-state'));
+  assert.deepEqual(reloaded, { complete: false, entries: cached, configOptions: [] });
+  takeLiveTranscript('claude', 'unknown-state');
+});
+
+void test('kept transcripts are bounded and dropped with their thread', () => {
+  for (let index = 0; index <= liveTranscriptLimit; index += 1)
+    trackLiveTranscript('codex', `s${index}`, [], true);
+  assert.equal(tracksLiveTranscript('codex', 's0'), false);
+  assert.equal(tracksLiveTranscript('codex', 's1'), true);
+  trackLiveTranscript('codex', 's1', [], true);
+  trackLiveTranscript('codex', 'extra', [], true);
+  assert.equal(tracksLiveTranscript('codex', 's1'), true);
+  assert.equal(tracksLiveTranscript('codex', 's2'), false);
+  forgetSessionState('codex', 's1');
+  assert.equal(tracksLiveTranscript('codex', 's1'), false);
+  for (let index = 0; index <= liveTranscriptLimit; index += 1)
+    takeLiveTranscript('codex', `s${index}`);
+  takeLiveTranscript('codex', 'extra');
 });
