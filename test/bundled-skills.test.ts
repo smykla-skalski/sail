@@ -218,8 +218,9 @@ void test('Sail mode names only Ship tool fields and values the tools accept', (
   assert.ok(stages, 'stage list not found');
   assert.deepEqual(
     [...[...stages[1].matchAll(/`([a-z_]+)`/g)].map(([, stage]) => stage), stages[2]],
-    quotedValues(schema[1]),
+    quotedValues(schema[1]).filter((stage) => stage !== 'awaiting_merge'),
   );
+  assert.ok(quotedValues(schema[1]).includes('awaiting_merge'));
   for (const [, status] of progress.matchAll(/status: "([a-z_]+)"/g))
     assert.ok(quotedValues(schema[2]).includes(status), status);
 });

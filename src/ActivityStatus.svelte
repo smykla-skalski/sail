@@ -46,6 +46,12 @@
   .activity-status[data-state='working'] {
     --activity-color: var(--activity-working);
   }
+  .activity-status[data-state='fixing'] {
+    --activity-color: var(--activity-fixing);
+  }
+  .activity-status[data-state='stalled'] {
+    --activity-color: var(--activity-stalled);
+  }
   .activity-status[data-state='waiting'] {
     --activity-color: var(--activity-waiting);
   }
@@ -62,7 +68,8 @@
     width: 1em;
     text-align: center;
   }
-  .activity-status[data-state='working'] .activity-status-icon {
+  .activity-status[data-state='working'] .activity-status-icon,
+  .activity-status[data-state='fixing'] .activity-status-icon {
     animation: activity-pulse 1.4s ease-in-out infinite;
   }
   @keyframes activity-pulse {
@@ -72,7 +79,8 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .activity-status[data-state='working'] .activity-status-icon {
+    .activity-status[data-state='working'] .activity-status-icon,
+    .activity-status[data-state='fixing'] .activity-status-icon {
       animation: none;
     }
   }

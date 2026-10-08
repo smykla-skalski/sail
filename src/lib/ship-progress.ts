@@ -1,5 +1,12 @@
 import { z } from 'zod';
-import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './issue-shipping.ts';
+import {
+  defaultMergeOwner,
+  resolvedWorkerModel,
+  shipDependents,
+  type MergeOwner,
+  type ShipIssue,
+  type ShipRun,
+} from './issue-shipping.ts';
 import type { SpawnReceipt, SpawnState } from './agent-results';
 import { shippingWorkerSettled } from './issue-shipping.ts';
 import { checkState } from './pull-request-checks.ts';
@@ -25,6 +32,7 @@ export const stages = [
   'pull_request',
   'ci',
   'merging',
+  'awaiting_merge',
 ] as const;
 export const verdicts = ['CLEAN', 'NEEDS_FIXES', 'PASS', 'FAIL', 'BLOCKED'] as const;
 export type GateVerdict = (typeof verdicts)[number];
@@ -45,6 +53,7 @@ export type ShippingPullRequest = {
   state: string;
   mergedAt: string | null;
   headRefOid: string;
+  mergeable?: boolean | null;
   checks: ShipCheck[];
 };
 export type ShipEvent = { at: number; stage: string; reason?: string };
@@ -59,6 +68,8 @@ export type ShipIssuePresentation = {
   label: string;
   priority: number;
   nextAction: string;
+  reason?: string;
+  link?: { label: string; url: string };
   updated: number | null;
 };
 export type GateMetadata = {
@@ -667,12 +678,7 @@ export function recoverValidationEvidence(
 export function shipMergeClaim(issue: ShipIssue): string {
   if (issue.state === 'merged') return 'Merged';
   if (!issue.pullRequest) return 'PR not opened';
-  if (
-    issue.state === 'awaiting_merge' &&
-    ciStatus(issue.checks) === 'Passed' &&
-    shipEvidenceReadiness(issue).ready
-  )
-    return 'Ready for merge';
+  if (issue.state === 'awaiting_merge' && shipPullRequestReady(issue)) return 'Ready for merge';
   return 'PR open';
 }
 
@@ -828,6 +834,8 @@ export function refreshedPullRequest(
   return {
     pullRequest: pr.url,
     pullRequestHead: pr.headRefOid,
+    pullRequestState: pr.state,
+    pullRequestMergeable: pr.mergeable ?? null,
     checks: pr.checks,
     refreshError: null,
     refreshedAt: Date.now(),
@@ -858,7 +866,8 @@ export async function persistShipRefresh(
   }
 }
 
-const closedBeforeLaunch = 'Issue closed before its worker launched.';
+export const closedBeforeLaunch = 'Issue closed before its worker launched.';
+export const closedWithoutMerge = 'Pull request closed without merging.';
 
 export function refreshedIssueState(issue: ShipIssue, closed: boolean): Partial<ShipIssue> {
   const issueState = closed ? 'CLOSED' : 'OPEN';
@@ -877,21 +886,131 @@ export function refreshedIssueState(issue: ShipIssue, closed: boolean): Partial<
   return { issueState };
 }
 
+const fixVerdicts = new Set<string>(['NEEDS_FIXES', 'FAIL']);
+
+function currentShipGates(issue: ShipIssue): ShipGate[] {
+  const gates = issue.gates ?? [];
+  return gateNames.flatMap((name) => {
+    const gate = gates
+      .filter((candidate) => candidate.gate === name)
+      .toSorted((left, right) => right.updated - left.updated)[0];
+    return gate ? [gate] : [];
+  });
+}
+
+function workerRunning(issue: ShipIssue): boolean {
+  return (
+    ['starting', 'working'].includes(issue.state) &&
+    !['waiting', 'unavailable', 'completed', 'failed', 'interrupted'].includes(
+      issue.workerState ?? '',
+    )
+  );
+}
+
+export function shipClosedBeforeLaunch(issue: ShipIssue): boolean {
+  return issue.state === 'failed' && issue.error === closedBeforeLaunch;
+}
+
+export function shipClosedWithoutMerge(issue: ShipIssue): boolean {
+  if (issue.state === 'merged') return false;
+  return (
+    issue.pullRequestState === 'CLOSED' ||
+    (issue.state === 'failed' && issue.error === closedWithoutMerge)
+  );
+}
+
+/** Gate attempts that sent the worker back to fix findings. */
+export function shipFixRounds(issue: ShipIssue): number {
+  return (issue.gates ?? []).filter((gate) => fixVerdicts.has(gate.verdict ?? '')).length;
+}
+
+function fixingGate(issue: ShipIssue): ShipGate | undefined {
+  return currentShipGates(issue).find((gate) => fixVerdicts.has(gate.verdict ?? ''));
+}
+
+/**
+ * The reason the worker needs the user, or null while it works on its own.
+ * Older Sail versions persisted the findings of NEEDS_FIXES and FAIL verdicts
+ * as `blockedReason`; those never count as a block.
+ */
+export function shipBlock(issue: ShipIssue): string | null {
+  const checkpointBlocker =
+    issue.checkpoint?.status === 'blocked' ? issue.checkpoint.blocker : null;
+  const gates = currentShipGates(issue);
+  const blockedGate = gates.find((gate) => gate.verdict === 'BLOCKED');
+  if (issue.reportedStatus === 'blocked')
+    return checkpointBlocker ?? issue.blockedReason ?? 'The worker reported a blocker.';
+  if (blockedGate)
+    return checkpointBlocker ?? blockedGate.reason ?? issue.blockedReason ?? 'A gate is blocked.';
+  const crashed = gates.find(
+    (gate) => ['failed', 'interrupted'].includes(gate.state) || !!gate.error,
+  );
+  if (crashed)
+    return (
+      checkpointBlocker ??
+      crashed.error ??
+      issue.blockedReason ??
+      `${titleCase(crashed.gate)} did not finish.`
+    );
+  if (issue.blockedReason && !fixingGate(issue)) return issue.blockedReason;
+  return null;
+}
+
+export function shipPullRequestReady(issue: ShipIssue): boolean {
+  const ci = ciStatus(issue.checks);
+  return (
+    !!issue.pullRequest &&
+    issue.pullRequestState === 'OPEN' &&
+    issue.pullRequestMergeable === true &&
+    (ci === 'Passed' || ci === 'No checks') &&
+    shipEvidenceReadiness(issue).ready &&
+    !!issue.pullRequestHead &&
+    issue.pullRequestHead === issue.checkpoint?.revision
+  );
+}
+
+function awaitingMerge(issue: ShipIssue): boolean {
+  return (
+    issue.state === 'awaiting_merge' || (issue.stage === 'awaiting_merge' && !!issue.pullRequest)
+  );
+}
+
+type DependencyWait = { number: number; url: string | undefined; failed: boolean };
+
+function dependencyWait(run: ShipRun, issue: ShipIssue): DependencyWait | null {
+  const waits: DependencyWait[] = [];
+  for (const reference of issue.dependsOn) {
+    const dependency = dependencyIssue(run, reference);
+    if (dependency?.state === 'merged') continue;
+    if (!dependency && run.externalClosed[reference]) continue;
+    const number = dependency?.number ?? Number(/(\d+)$/.exec(reference)?.[1] ?? Number.NaN);
+    if (!Number.isSafeInteger(number)) continue;
+    waits.push({
+      number,
+      url: dependency?.url ?? dependencyUrl(run.remote, reference),
+      failed: dependency?.state === 'failed',
+    });
+  }
+  return waits.find((wait) => wait.failed) ?? waits[0] ?? null;
+}
+
+export type ShipPresentationOptions = { mergeOwner?: MergeOwner };
+
 export function shipStatus(run: ShipRun, issue: ShipIssue): string {
   if (issue.state === 'merged') return 'Merged';
+  if (shipClosedBeforeLaunch(issue)) return 'Closed';
+  if (shipClosedWithoutMerge(issue)) return 'Closed without merge';
   if (issue.state === 'failed') return 'Failed';
-  if (issue.blockedReason) return 'Blocked';
+  if (shipBlock(issue)) return 'Blocked';
   if (issue.state === 'pending') {
-    const blockers = issue.dependsOn.filter((ref) => {
-      const dependency = dependencyIssue(run, ref);
-      return dependency ? dependency.state !== 'merged' : !run.externalClosed[ref];
-    });
-    if (blockers.some((ref) => dependencyIssue(run, ref)?.state === 'failed')) return 'Blocked';
-    return blockers.length ? 'Waiting' : 'Queued';
+    const wait = dependencyWait(run, issue);
+    if (wait?.failed) return 'Blocked';
+    return wait ? 'Waiting' : 'Queued';
   }
-  if (issue.state === 'awaiting_merge') return 'Awaiting merge';
+  if (awaitingMerge(issue)) return 'Awaiting merge';
   if (issue.workerState === 'waiting') return 'Waiting for input';
   if (issue.workerState === 'unavailable') return 'Reconnecting';
+  if (fixingTitle(issue)) return 'Fixing';
   return issue.state === 'starting' ? 'Starting' : 'Running';
 }
 
@@ -910,16 +1029,45 @@ function workerDetail(issue: ShipIssue): string {
   return `Worker running${worker}`;
 }
 
+function fixingTitle(issue: ShipIssue): string | null {
+  if (!workerRunning(issue)) return null;
+  if (fixingGate(issue)) return `Fixing · round ${Math.max(1, shipFixRounds(issue))}`;
+  if (ciStatus(issue.checks) === 'Failed') return 'Fixing (CI)';
+  return null;
+}
+
 export function shipActivity(run: ShipRun, issue: ShipIssue): ShipActivity {
   const latestEvent = issue.events?.at(-1);
   const activeGate = (issue.gates ?? [])
     .filter((gate) => !shippingWorkerSettled(gate.state))
     .toSorted((left, right) => right.updated - left.updated)[0];
-  if (issue.blockedReason)
+  if (issue.state === 'merged')
+    return {
+      state: 'complete',
+      title: 'Merged',
+      detail: 'Shipping complete.',
+      at: latestEvent?.at,
+    };
+  if (shipClosedBeforeLaunch(issue))
+    return {
+      state: 'complete',
+      title: 'Closed',
+      detail: 'The issue was closed before its worker launched.',
+      at: latestEvent?.at,
+    };
+  if (shipClosedWithoutMerge(issue))
+    return {
+      state: 'blocked',
+      title: 'Closed without merge',
+      detail: 'The pull request was closed without merging.',
+      at: latestEvent?.at,
+    };
+  const block = shipBlock(issue);
+  if (block)
     return {
       state: 'blocked',
       title: `Blocked during ${titleCase(issue.stage ?? 'shipping')}`,
-      detail: issue.blockedReason,
+      detail: block,
       at: latestEvent?.at,
     };
   if (issue.state === 'failed')
@@ -929,11 +1077,12 @@ export function shipActivity(run: ShipRun, issue: ShipIssue): ShipActivity {
       detail: issue.error ?? 'Inspect the worker session for the failure.',
       at: latestEvent?.at,
     };
-  if (issue.state === 'merged')
+  const fixing = fixingTitle(issue);
+  if (fixing)
     return {
-      state: 'complete',
-      title: 'Merged',
-      detail: 'Shipping complete.',
+      state: 'active',
+      title: fixing,
+      detail: workerDetail(issue),
       at: latestEvent?.at,
     };
   if (activeGate)
@@ -943,7 +1092,7 @@ export function shipActivity(run: ShipRun, issue: ShipIssue): ShipActivity {
       detail: `Validation gate · ${activeGate.provider} / ${activeGate.model ?? activeGate.requestedModel}`,
       at: activeGate.updated,
     };
-  if (issue.state === 'awaiting_merge')
+  if (awaitingMerge(issue))
     return {
       state: 'waiting',
       title: 'Awaiting merge',
@@ -964,14 +1113,14 @@ export function shipActivity(run: ShipRun, issue: ShipIssue): ShipActivity {
       detail: workerDetail(issue),
       at: latestEvent?.at,
     };
-  const status = shipStatus(run, issue);
-  if (status === 'Blocked')
+  const wait = dependencyWait(run, issue);
+  if (wait?.failed)
     return {
       state: 'blocked',
       title: 'Blocked by dependency',
-      detail: 'A required issue must recover or merge before shipping can continue.',
+      detail: `#${wait.number} needs input before shipping can continue.`,
     };
-  if (status === 'Waiting')
+  if (wait)
     return {
       state: 'waiting',
       title: 'Waiting for dependencies',
@@ -984,23 +1133,16 @@ export function shipActivity(run: ShipRun, issue: ShipIssue): ShipActivity {
   };
 }
 
-export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssuePresentation {
+export function shipIssuePresentation(
+  run: ShipRun,
+  issue: ShipIssue,
+  options: ShipPresentationOptions = {},
+): ShipIssuePresentation {
+  const mergeOwner = options.mergeOwner ?? defaultMergeOwner;
   const activity = shipActivity(run, issue);
   const gates = issue.gates ?? [];
-  const currentGates = gateNames.flatMap((name) => {
-    const gate = gates
-      .filter((candidate) => candidate.gate === name)
-      .toSorted((left, right) => right.updated - left.updated)[0];
-    return gate ? [gate] : [];
-  });
-  const failedGate = currentGates.find(
-    (gate) =>
-      ['FAIL', 'NEEDS_FIXES', 'BLOCKED'].includes(gate.verdict ?? '') ||
-      ['failed', 'interrupted'].includes(gate.state) ||
-      !!gate.error,
-  );
-  const unavailableGate = currentGates.find((gate) => gate.state === 'unavailable');
-  const waitingGate = currentGates.find((gate) => gate.state === 'waiting');
+  const unavailableGate = currentShipGates(issue).find((gate) => gate.state === 'unavailable');
+  const waitingGate = currentShipGates(issue).find((gate) => gate.state === 'waiting');
   const updated = Math.max(
     issue.refreshedAt ?? 0,
     issue.workerUpdatedAt ?? 0,
@@ -1015,6 +1157,22 @@ export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssue
       nextAction: 'No action — shipping complete',
       updated: updated || activity.at || null,
     };
+  if (shipClosedBeforeLaunch(issue))
+    return {
+      status: 'completed',
+      label: 'Closed',
+      priority: 4,
+      nextAction: 'No action — the issue was closed before launch',
+      updated: updated || null,
+    };
+  if (shipClosedWithoutMerge(issue))
+    return {
+      status: 'interrupted',
+      label: 'Closed without merge',
+      priority: 0,
+      nextAction: 'Archive the issue or reopen the pull request',
+      updated: updated || null,
+    };
   if (issue.state === 'failed')
     return {
       status: 'failed',
@@ -1023,12 +1181,14 @@ export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssue
       nextAction: 'Inspect the failure and restart shipping',
       updated: updated || null,
     };
-  if (issue.blockedReason || shipStatus(run, issue) === 'Blocked' || failedGate)
+  const block = shipBlock(issue);
+  if (block)
     return {
       status: 'waiting',
       label: 'Needs input',
       priority: 0,
-      nextAction: failedGate ? `Resolve ${titleCase(failedGate.gate)}` : 'Resolve the blocker',
+      nextAction: block,
+      reason: block,
       updated: updated || null,
     };
   if (unavailableGate)
@@ -1063,6 +1223,48 @@ export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssue
       nextAction: 'Reconnect the implementation worker',
       updated: updated || null,
     };
+  const fixing = fixingTitle(issue);
+  if (fixing)
+    return {
+      status: 'fixing',
+      label: fixing,
+      priority: 1,
+      nextAction: 'No action — the worker is fixing it',
+      updated: updated || activity.at || null,
+    };
+  if (awaitingMerge(issue) && mergeOwner === 'you' && shipPullRequestReady(issue)) {
+    const unblocks = shipDependents(run, issue).length;
+    return {
+      status: 'ready',
+      label: 'Ready to merge',
+      priority: 0,
+      nextAction: unblocks
+        ? `Merge #${issue.number} to unblock ${unblocks} ${unblocks === 1 ? 'issue' : 'issues'}`
+        : 'Merge the pull request',
+      updated: updated || activity.at || null,
+    };
+  }
+  if (awaitingMerge(issue)) {
+    const ci = ciStatus(issue.checks);
+    const ciSettled = ci === 'Passed' || ci === 'No checks';
+    const evidence = shipEvidenceReadiness(issue);
+    const ready = ciSettled && evidence.ready;
+    const failed = ci === 'Failed' || (!evidence.ready && !evidence.pendingGates.length);
+    return {
+      status: failed ? 'failed' : 'queued',
+      label: failed ? 'Recovery needed' : 'Awaiting merge',
+      priority: failed || !evidence.ready || ready ? 0 : 2,
+      nextAction:
+        ci === 'Failed'
+          ? 'Fix failing CI'
+          : !ciSettled
+            ? 'Wait for CI and review'
+            : !evidence.ready
+              ? (evidence.reason ?? 'Record required evidence')
+              : 'Merge the pull request',
+      updated: updated || activity.at || null,
+    };
+  }
   if (issue.state === 'starting' || issue.state === 'working' || activity.state === 'active')
     return {
       status: 'working',
@@ -1071,43 +1273,39 @@ export function shipIssuePresentation(run: ShipRun, issue: ShipIssue): ShipIssue
       nextAction: `${activity.title} in progress`,
       updated: updated || activity.at || null,
     };
-  if (issue.state === 'awaiting_merge') {
-    const ci = ciStatus(issue.checks);
-    const evidence = shipEvidenceReadiness(issue);
-    const ready = ci === 'Passed' && evidence.ready;
+  const wait = dependencyWait(run, issue);
+  if (wait?.failed)
     return {
-      status:
-        ci === 'Failed' || (!evidence.ready && !evidence.pendingGates.length) ? 'failed' : 'queued',
-      label:
-        ci === 'Failed' || (!evidence.ready && !evidence.pendingGates.length)
-          ? 'Recovery needed'
-          : 'Awaiting merge',
-      priority: ci === 'Failed' || !evidence.ready || ready ? 0 : 2,
-      nextAction:
-        ci === 'Failed'
-          ? 'Fix failing CI'
-          : ci !== 'Passed'
-            ? 'Wait for CI and review'
-            : !evidence.ready
-              ? (evidence.reason ?? 'Record required evidence')
-              : 'Merge the pull request',
-      updated: updated || activity.at || null,
+      status: 'waiting',
+      label: `Waiting on #${wait.number} (needs input)`,
+      priority: 0,
+      nextAction: `Resolve #${wait.number}`,
+      ...(wait.url ? { link: { label: `#${wait.number}`, url: wait.url } } : {}),
+      updated: updated || null,
     };
-  }
-  const waiting = shipStatus(run, issue) === 'Waiting';
+  if (wait)
+    return {
+      status: 'queued',
+      label: `Waiting on #${wait.number}`,
+      priority: 3,
+      nextAction: 'Wait for dependencies',
+      ...(wait.url ? { link: { label: `#${wait.number}`, url: wait.url } } : {}),
+      updated: updated || null,
+    };
   return {
     status: 'queued',
-    label: waiting ? 'Waiting' : 'Queued',
-    priority: waiting ? 3 : 2,
-    nextAction: waiting ? 'Wait for dependencies' : 'Wait for an available worker',
+    label: 'Queued',
+    priority: 2,
+    nextAction: 'Wait for an available worker',
     updated: updated || null,
   };
 }
 
-export function sortShipIssues(run: ShipRun): ShipIssue[] {
+export function sortShipIssues(run: ShipRun, options: ShipPresentationOptions = {}): ShipIssue[] {
   return run.issues.toSorted((left, right) => {
     const priority =
-      shipIssuePresentation(run, left).priority - shipIssuePresentation(run, right).priority;
+      shipIssuePresentation(run, left, options).priority -
+      shipIssuePresentation(run, right, options).priority;
     return priority || left.number - right.number;
   });
 }
@@ -1189,6 +1387,9 @@ const shipIssueSchema = z.object({
   setupCompleted: z.boolean().optional(),
   archivePath: nullableString.optional(),
   stage: z.string().optional(),
+  reportedStatus: z.enum(['running', 'blocked']).optional(),
+  pullRequestState: z.string().optional(),
+  pullRequestMergeable: z.boolean().nullable().optional(),
   blockedReason: nullableString.optional(),
   models: z.array(z.string()).optional(),
   workerModel: z.string().optional(),

@@ -12,6 +12,8 @@
   --shell-selected: #e7f5f2;
   --shell-selected-ink: #0f625b;
   --activity-working: #1d4ed8;
+  --activity-fixing: #0e7490;
+  --activity-stalled: #7e22ce;
   --activity-waiting: #a85100;
   --activity-completed: #14733b;
   --activity-failed: #b42318;
@@ -24,6 +26,8 @@
   --shell-selected: #103634;
   --shell-selected-ink: #99f6e4;
   --activity-working: #93c5fd;
+  --activity-fixing: #67e8f9;
+  --activity-stalled: #d8b4fe;
   --activity-waiting: #fbbf24;
   --activity-completed: #86efac;
   --activity-failed: #fca5a5;

@@ -2,7 +2,12 @@
   import { tick } from 'svelte';
   import ActivityStatus from './ActivityStatus.svelte';
   import WorkerDependencyMap from './WorkerDependencyMap.svelte';
-  import { resolvedWorkerModel, type ShipIssue, type ShipRun } from './lib/issue-shipping';
+  import {
+    resolvedWorkerModel,
+    type MergeOwner,
+    type ShipIssue,
+    type ShipRun,
+  } from './lib/issue-shipping';
   import type { NativeSubagent } from './lib/native-subagents';
   import {
     ciStatus,
@@ -10,6 +15,8 @@
     dependencyUrl,
     gateNames,
     shipActivity,
+    shipBlock,
+    shipClosedBeforeLaunch,
     shipEvidenceReadiness,
     shipIssuePresentation,
     shipMergeClaim,
@@ -28,6 +35,7 @@
     active = true,
     runs,
     busy,
+    mergeOwner = 'you',
     onclose,
     onrefresh,
     onopen,
@@ -39,6 +47,7 @@
     active?: boolean;
     runs: ShipRun[];
     busy: boolean;
+    mergeOwner?: MergeOwner;
     onclose: () => void;
     onrefresh: () => Promise<void>;
     onopen: (path: string, threadId?: string | null) => Promise<void>;
@@ -62,10 +71,10 @@
   const run = $derived(orderedRuns.find((item) => item.id === selectedRun) ?? orderedRuns[0]);
   const issue = $derived(
     run?.issues.find((item) => item.id === selectedIssue) ??
-      (run ? sortShipIssues(run)[0] : undefined),
+      (run ? sortShipIssues(run, { mergeOwner })[0] : undefined),
   );
   const merged = $derived(run?.issues.filter((item) => item.state === 'merged').length ?? 0);
-  const issues = $derived(run ? sortShipIssues(run) : []);
+  const issues = $derived(run ? sortShipIssues(run, { mergeOwner }) : []);
 
   function issueLabel(item: ShipIssue): string {
     return item.title === `Issue #${item.number}`
@@ -95,9 +104,9 @@
   }
 
   function runPresentation(item: ShipRun) {
-    const first = sortShipIssues(item)[0];
+    const first = sortShipIssues(item, { mergeOwner })[0];
     return first
-      ? shipIssuePresentation(item, first)
+      ? shipIssuePresentation(item, first, { mergeOwner })
       : {
           status: 'completed',
           label: 'Empty',
@@ -259,8 +268,9 @@
         ></progress>
         <p>
           {run.issues.filter((item) => ['starting', 'working'].includes(item.state)).length} active ·
-          {run.issues.filter((item) => ['Blocked', 'Failed'].includes(shipStatus(run, item)))
-            .length} need attention
+          {run.issues.filter((item) =>
+            ['Blocked', 'Failed', 'Closed without merge'].includes(shipStatus(run, item)),
+          ).length} need attention
         </p>
       </div>
     </section>
@@ -272,7 +282,7 @@
       <div class="ship-now-list">
         {#each issues as item (item.id)}
           {@const activity = shipActivity(run, item)}
-          {@const presentation = shipIssuePresentation(run, item)}
+          {@const presentation = shipIssuePresentation(run, item, { mergeOwner })}
           <button
             class="ship-now-item"
             data-state={presentation.status}
@@ -343,13 +353,19 @@
           aria-label={`Issue ${issue.number} details`}
         >
           <h3>{issueLabel(issue)}</h3>
-          {#if issue.blockedReason || issue.error}<p class="ship-error" role="status">
-              {issue.blockedReason || issue.error}
-            </p>{/if}
-          {#if issue.state === 'pending' && issue.dependsOn.some((ref) => dependencyIssue(run, ref)?.state === 'failed')}<p
+          {#if !shipClosedBeforeLaunch(issue) && (shipBlock(issue) || issue.error)}<p
               class="ship-error"
+              role="status"
             >
+              {shipBlock(issue) || issue.error}
+            </p>{/if}
+          {#if issue.state === 'pending' && issue.dependsOn.some((ref) => dependencyIssue(run, ref)?.state === 'failed')}{@const blocker =
+              shipIssuePresentation(run, issue, { mergeOwner })}
+            <p class="ship-error">
               Waiting for failed dependencies to recover. Independent issues continue.
+              {#if blocker.link}<a href={blocker.link.url} target="_blank" rel="noreferrer"
+                  >Open {blocker.link.label}</a
+                >{/if}
             </p>{/if}
           {#if issue.refreshError}<p class="ship-error" role="status">
               Refresh failed: {issue.refreshError}. Showing last known state.
