@@ -4,6 +4,7 @@
   import type { WorkingDiffInfo } from './lib/diff';
   import PaneTree from './PaneTree.svelte';
   import AgentWorkspace from './AgentWorkspace.svelte';
+  import { getSetting, setSetting } from './lib/settings';
   import OpenCodePane from './OpenCodePane.svelte';
   import DiffPanel from './DiffPanel.svelte';
   import PlanPanel from './PlanPanel.svelte';
@@ -100,6 +101,7 @@
       ready: boolean,
     ) => void;
     changesPanes: string[];
+    dockDetails: boolean;
     main: Snippet;
     mainPicker: boolean;
     canClose: boolean;
@@ -184,6 +186,7 @@
     agentRates,
     onentries,
     changesPanes,
+    dockDetails,
     main,
     mainPicker,
     canClose,
@@ -266,8 +269,33 @@
     throw new Error('The activity source is unavailable.');
   });
   let nativeDetailsGeneration = 0;
+  const NATIVE_DETAILS_SETTING = 'sai-native-details';
   const nativeDetailsVisible = $derived(nativeDetailsOpen || changesPanes.includes(pane.id));
+  const nativeDocked = $derived(dockDetails && focused === pane.id);
   let previousChangesOpen = false;
+
+  // Moves the details into the app shell so it spans the window height like the sidebar.
+  function dockInShell(node: HTMLElement, docked: boolean) {
+    const home = node.parentElement;
+    const shell = node.closest<HTMLElement>('.app-shell');
+    const apply = (value: boolean) => {
+      if (!shell || !home) return;
+      if (value) {
+        shell.append(node);
+        shell.dataset.nativeDetails = 'true';
+      } else {
+        delete shell.dataset.nativeDetails;
+        home.append(node);
+      }
+    };
+    apply(docked);
+    return {
+      update: apply,
+      destroy() {
+        if (shell && node.parentElement === shell) delete shell.dataset.nativeDetails;
+      },
+    };
+  }
   let previousAcpOpen = false;
 
   function updatePaneActivity(
@@ -354,6 +382,7 @@
 
   function closeNativeDetails() {
     nativeDetailsOpen = false;
+    setSetting(NATIVE_DETAILS_SETTING, 'closed');
     if (changesPanes.includes(pane.id)) onchanges(pane.id);
   }
 
@@ -408,7 +437,11 @@
       return;
     if (plan.status === 'fulfilled') {
       nativeSnapshot = plan.value;
-      if ((plan.value.plan || plan.value.questions) && !nativeDetailsOpen) {
+      if (
+        (plan.value.plan || plan.value.questions) &&
+        !nativeDetailsOpen &&
+        getSetting(NATIVE_DETAILS_SETTING) !== 'closed'
+      ) {
         nativeDetailsOpen = true;
         nativeTab = 'plan';
       }
@@ -426,7 +459,7 @@
     nativeSnapshot = { plan: null, questions: null };
     nativeHistory = [];
     nativeSession = undefined;
-    nativeDetailsOpen = false;
+    nativeDetailsOpen = getSetting(NATIVE_DETAILS_SETTING) === 'open';
     nativeTab = 'changes';
     const id = pane.thread?.sessionId;
     const source = client;
@@ -441,6 +474,7 @@
     if (changesOpen === previousChangesOpen) return;
     previousChangesOpen = changesOpen;
     nativeDetailsOpen = changesOpen;
+    setSetting(NATIVE_DETAILS_SETTING, changesOpen ? 'open' : 'closed');
     if (changesOpen) nativeTab = 'changes';
   });
 
@@ -587,6 +621,7 @@
       {setup}
       {onentries}
       {changesPanes}
+      {dockDetails}
       {main}
       {mainPicker}
       {canClose}
@@ -698,6 +733,7 @@
       {setup}
       {onentries}
       {changesPanes}
+      {dockDetails}
       {main}
       {mainPicker}
       {canClose}
@@ -859,7 +895,10 @@
         {/key}
       {:else if pane.agent === 'opencode'}
         {#key `${pane.id}:opencode`}
-          <div class="pane-agent-content" class:changes-open={nativeDetailsVisible}>
+          <div
+            class="pane-agent-content"
+            class:changes-open={nativeDetailsVisible && !nativeDocked}
+          >
             <OpenCodePane
               {client}
               {runtimeState}
@@ -909,7 +948,11 @@
               {ondecision}
             />
             {#if nativeDetailsVisible}
-              <section class="native-details side-area" aria-label="OpenCode session details">
+              <section
+                class="native-details side-area"
+                aria-label="OpenCode session details"
+                use:dockInShell={nativeDocked}
+              >
                 <nav class="side-tabs" aria-label="OpenCode detail tabs">
                   {#if nativeSnapshot.plan || nativeSnapshot.questions}<button
                       class:active={nativeTab === 'plan'}

@@ -14785,6 +14785,7 @@
         onentries={(id, entries, sessionId, ready) =>
           (agentEntrySnapshots = { ...agentEntrySnapshots, [id]: { entries, sessionId, ready } })}
         {changesPanes}
+        dockDetails={!mainDetailsVisible && !shipFallbackVisible && !mobileLayout}
         main={mainPaneContent}
         mainPicker={showMainPicker}
         canClose={leaves(paneLayout).length > 1 ||
