@@ -111,68 +111,74 @@
     {@const id = `${formId}-${field.key}`}
     {#if field.kind === 'single' || field.kind === 'multi'}
       {@const shown = preview(field)}
-      <fieldset class="elicitation-question" data-question={field.key}>
-        <legend>
-          {#if field.title}<span class="elicitation-header">{field.title}</span>{/if}
-          {#if field.description && choiceCount > 1}<span class="elicitation-text"
-              >{field.description}</span
-            >{:else if !field.title}<span class="elicitation-text">{field.key}</span>{/if}
-          {#if field.kind === 'multi'}<span class="elicitation-hint">Select all that apply</span
-            >{/if}
-        </legend>
-        <div class="elicitation-options">
-          {#each field.options as option, index (option.value)}
-            <label class="elicitation-option" data-option={option.value}>
-              <input
-                type={field.kind === 'multi' ? 'checkbox' : 'radio'}
-                name={id}
-                value={option.value}
-                checked={selected(field, option.value)}
-                aria-describedby={option.description ? `${id}-option-${index}` : undefined}
-                onfocus={() => (focused = { ...focused, [field.key]: option.value })}
-                onchange={(event) => {
-                  focused = { ...focused, [field.key]: option.value };
-                  if (field.kind === 'multi')
-                    toggle(field.key, option.value, event.currentTarget.checked);
-                  else set(field.key, option.value);
-                }}
-              />
-              <span class="elicitation-option-body">
-                <span class="elicitation-option-title">{option.title}</span>
-                {#if option.description}<span
-                    class="elicitation-option-description"
-                    id={`${id}-option-${index}`}>{option.description}</span
-                  >{/if}
-              </span>
-            </label>
-          {/each}
-        </div>
-        {#if shown}
-          <figure class="elicitation-preview">
-            <figcaption>Preview · {shown.title}</figcaption>
-            <textarea
-              readonly
-              rows={Math.min(12, (shown.text ?? '').split('\n').length)}
-              aria-label={`Preview of ${shown.title}`}
-              value={shown.text}></textarea>
-          </figure>
-        {/if}
-        {#if field.other}
-          {@const other = field.other}
-          <div class="elicitation-other">
-            <label for={`${id}-other`}>{other.title ?? 'Other'} <span>(optional)</span></label>
-            {#if other.description}<small id={`${id}-other-description`}>{other.description}</small
+      <section class="elicitation-question" data-question={field.key}>
+        <fieldset>
+          <legend>
+            {#if field.title}<span class="elicitation-header">{field.title}</span>{/if}
+            {#if field.description && choiceCount > 1}<span class="elicitation-text"
+                >{field.description}</span
+              >{:else if !field.title}<span class="elicitation-text">{field.key}</span>{/if}
+            {#if field.kind === 'multi'}<span class="elicitation-hint">Select all that apply</span
               >{/if}
-            <input
-              id={`${id}-other`}
-              type="text"
-              value={String(values[other.key] ?? '')}
-              aria-describedby={other.description ? `${id}-other-description` : undefined}
-              oninput={(event) => set(other.key, event.currentTarget.value)}
-            />
+          </legend>
+          <div class="elicitation-options">
+            {#each field.options as option, index (option.value)}
+              <label class="elicitation-option" data-option={option.value}>
+                <input
+                  type={field.kind === 'multi' ? 'checkbox' : 'radio'}
+                  name={id}
+                  value={option.value}
+                  checked={selected(field, option.value)}
+                  aria-describedby={option.description ? `${id}-option-${index}` : undefined}
+                  onfocus={() => (focused = { ...focused, [field.key]: option.value })}
+                  onchange={(event) => {
+                    focused = { ...focused, [field.key]: option.value };
+                    if (field.kind === 'multi')
+                      toggle(field.key, option.value, event.currentTarget.checked);
+                    else set(field.key, option.value);
+                  }}
+                />
+                <span class="elicitation-option-body">
+                  <span class="elicitation-option-title">{option.title}</span>
+                  {#if option.description}<span
+                      class="elicitation-option-description"
+                      id={`${id}-option-${index}`}>{option.description}</span
+                    >{/if}
+                </span>
+              </label>
+            {/each}
           </div>
-        {/if}
-      </fieldset>
+          {#if shown}
+            <figure class="elicitation-preview">
+              <figcaption>Preview · {shown.title}</figcaption>
+              <textarea
+                readonly
+                rows={Math.min(12, (shown.text ?? '').split('\n').length)}
+                aria-label={`Preview of ${shown.title}`}
+                value={shown.text}></textarea>
+            </figure>
+          {/if}
+          {#if field.other}
+            {@const other = field.other}
+            <div class="elicitation-other">
+              <label for={`${id}-other`}
+                >{other.title ?? 'Other'}
+                {#if !other.description}<span>(optional)</span>{/if}</label
+              >
+              {#if other.description}<small id={`${id}-other-description`}
+                  >{other.description}</small
+                >{/if}
+              <input
+                id={`${id}-other`}
+                type="text"
+                value={String(values[other.key] ?? '')}
+                aria-describedby={other.description ? `${id}-other-description` : undefined}
+                oninput={(event) => set(other.key, event.currentTarget.value)}
+              />
+            </div>
+          {/if}
+        </fieldset>
+      </section>
     {:else}
       <div class="elicitation-field" data-question={field.key}>
         <label for={id}>{field.title ?? field.key}</label>
@@ -211,7 +217,7 @@
     box-sizing: border-box;
     width: 100%;
     max-width: 60rem;
-    max-height: min(70vh, 56rem);
+    max-height: min(50vh, 40rem);
     margin: 0 0 10px;
     padding: var(--space-16);
     overflow-y: auto;
@@ -240,6 +246,9 @@
     line-height: 1.35;
   }
   .elicitation-question {
+    min-width: 0;
+  }
+  .elicitation-question fieldset {
     display: grid;
     gap: var(--space-8);
     min-width: 0;
