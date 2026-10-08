@@ -20,7 +20,7 @@ const MIN_SECRET_LEN: usize = 8;
 const REDACTED: &str = "[redacted]";
 const REDACTED_WORD: &str = "redacted";
 
-const SENSITIVE_KEYS: [&str; 11] = [
+const SENSITIVE_KEYS: [&str; 17] = [
     "token",
     "secret",
     "password",
@@ -32,6 +32,12 @@ const SENSITIVE_KEYS: [&str; 11] = [
     "credential",
     "private_key",
     "cookie",
+    "passphrase",
+    "access_key",
+    "accesskey",
+    "sessionid",
+    "session_id",
+    "session-id",
 ];
 const SECRET_PREFIXES: [&str; 12] = [
     "sk-",
@@ -92,75 +98,142 @@ fn redact_userinfo(line: &str) -> String {
     output
 }
 
-/// Remove secrets from one line of adapter output.
-///
-/// `secrets` are exact values (for example live `SAIL_BROWSER_TOKEN`s);
-/// credential-shaped words and values of sensitive keys are removed too.
-pub fn redact(line: &str, secrets: &[String]) -> String {
-    let mut text: String = line
-        .chars()
-        .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
-        .collect();
-    for secret in secrets {
-        if secret.len() >= MIN_SECRET_LEN {
-            text = text.replace(secret.as_str(), REDACTED);
-        }
+#[derive(Default)]
+pub struct Redactor {
+    pending_value: bool,
+}
+
+fn is_separator(c: char) -> bool {
+    matches!(c, ':' | '=')
+}
+
+fn value_end(chars: &[char], start: usize) -> usize {
+    let Some(&first) = chars.get(start) else {
+        return start;
+    };
+    if matches!(first, '"' | '\'') {
+        return chars[start + 1..]
+            .iter()
+            .position(|&c| c == first)
+            .map_or(chars.len(), |offset| start + 2 + offset);
     }
-    let text = redact_userinfo(&text);
-    let chars: Vec<char> = text.chars().collect();
-    let mut output = String::with_capacity(text.len());
-    let mut index = 0;
-    let mut redact_next = 0;
-    while index < chars.len() {
-        if !is_word(chars[index]) {
-            output.push(chars[index]);
-            index += 1;
-            continue;
+    chars[start..]
+        .iter()
+        .position(|&c| c.is_whitespace() || matches!(c, ',' | ';' | '}' | ']'))
+        .map_or(chars.len(), |offset| start + offset)
+}
+
+fn skip_blanks(chars: &[char], mut index: usize) -> usize {
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+impl Redactor {
+    /// Remove secrets from one line of adapter output.
+    ///
+    /// `secrets` are exact values (for example `SAIL_BROWSER_TOKEN`s);
+    /// credential-shaped words and values of sensitive keys are removed too.
+    /// A sensitive key at the end of a line redacts the start of the next one.
+    pub fn redact(&mut self, line: &str, secrets: &[String]) -> String {
+        let mut text: String = line
+            .chars()
+            .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
+            .collect();
+        for secret in secrets {
+            if secret.len() >= MIN_SECRET_LEN {
+                text = text.replace(secret.as_str(), REDACTED);
+            }
         }
-        let start = index;
-        while index < chars.len() && is_word(chars[index]) {
-            index += 1;
+        let text = redact_userinfo(&text);
+        let chars: Vec<char> = text.chars().collect();
+        let mut output = String::with_capacity(text.len());
+        let mut index = 0;
+        if std::mem::take(&mut self.pending_value) {
+            let start = skip_blanks(&chars, 0);
+            let end = value_end(&chars, start);
+            output.extend(&chars[..start]);
+            if end > start {
+                output.push_str(REDACTED);
+            }
+            index = end;
         }
-        let word: String = chars[start..index].iter().collect();
-        if word == REDACTED_WORD {
+        let mut redact_next = false;
+        while index < chars.len() {
+            if !is_word(chars[index]) {
+                output.push(chars[index]);
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < chars.len() && is_word(chars[index]) {
+                index += 1;
+            }
+            let word: String = chars[start..index].iter().collect();
+            if word == REDACTED_WORD {
+                output.push_str(&word);
+                continue;
+            }
+            let lower = word.to_ascii_lowercase();
+            if redact_next {
+                redact_next = false;
+                output.push_str(REDACTED);
+                continue;
+            }
+            if looks_like_secret(&word) {
+                output.push_str(REDACTED);
+                continue;
+            }
             output.push_str(&word);
-            continue;
-        }
-        let lower = word.to_ascii_lowercase();
-        if redact_next > 0 {
-            redact_next -= 1;
-            output.push_str(REDACTED);
-            if matches!(lower.as_str(), "bearer" | "basic" | "token") {
-                redact_next += 1;
+            if matches!(lower.as_str(), "bearer" | "basic") {
+                redact_next = true;
+                continue;
             }
-            continue;
-        }
-        if looks_like_secret(&word) {
-            output.push_str(REDACTED);
-            continue;
-        }
-        output.push_str(&word);
-        if matches!(lower.as_str(), "bearer" | "basic") {
-            redact_next = 1;
-            continue;
-        }
-        if is_sensitive_key(&word) {
-            let mut lookahead = index;
-            while lookahead < chars.len() && matches!(chars[lookahead], ' ' | '"' | '\'' | '\t') {
-                lookahead += 1;
+            if !is_sensitive_key(&word) {
+                continue;
             }
-            let separated = lookahead < chars.len() && matches!(chars[lookahead], ':' | '=');
-            if separated && lower.contains("cookie") {
-                output.push(' ');
+            let mut cursor = index;
+            while cursor < chars.len() && matches!(chars[cursor], ' ' | '"' | '\'' | '\t') {
+                cursor += 1;
+            }
+            let separated = cursor < chars.len() && is_separator(chars[cursor]);
+            if !separated && !word.starts_with("--") {
+                continue;
+            }
+            if separated {
+                cursor += 1;
+            } else {
+                cursor = index;
+            }
+            let value_start = skip_blanks(&chars, cursor);
+            output.extend(&chars[index..value_start]);
+            if lower.contains("cookie") {
                 output.push_str(REDACTED);
                 break;
             }
-            if separated || word.starts_with("--") {
-                redact_next = 1;
+            if value_start >= chars.len() {
+                self.pending_value = true;
+                break;
             }
+            let mut end = value_end(&chars, value_start);
+            let value: String = chars[value_start..end].iter().collect();
+            if matches!(
+                value.to_ascii_lowercase().as_str(),
+                "bearer" | "basic" | "token"
+            ) {
+                end = value_end(&chars, skip_blanks(&chars, end));
+            }
+            output.push_str(REDACTED);
+            index = end;
         }
+        output
     }
-    output
+}
+
+#[cfg(test)]
+fn redact(line: &str, secrets: &[String]) -> String {
+    Redactor::default().redact(line, secrets)
 }
 
 fn truncate_utf8(mut text: String, max: usize) -> String {
@@ -194,6 +267,7 @@ impl StderrSummary {
 struct LineLimiter {
     pending: Vec<u8>,
     overflowed: bool,
+    redactor: Redactor,
     summary: StderrSummary,
 }
 
@@ -221,7 +295,7 @@ impl LineLimiter {
         if text.is_empty() {
             return;
         }
-        let line = truncate_utf8(redact(text, secrets), MAX_LINE_BYTES);
+        let line = truncate_utf8(self.redactor.redact(text, secrets), MAX_LINE_BYTES);
         let within_budget = (self.summary.forwarded_lines as usize) < MAX_LINES
             && self.summary.forwarded_bytes as usize + line.len() <= MAX_FORWARDED_BYTES;
         if within_budget {
@@ -412,6 +486,36 @@ mod tests {
                 assert!(!out.contains(secret), "{case:?} -> {out:?}");
             }
         }
+    }
+
+    #[test]
+    fn redacts_whole_values_with_punctuation_and_spaces() {
+        let cases = [
+            ("password=p@ss!word", "ss!word"),
+            ("SAIL_BROWSER_TOKEN=ab$cd%ef&gh", "cd%ef"),
+            ("api_key=\"a b c d9z\" next", "d9z"),
+            ("{\"password\": \"x y/z#9\", \"user\": \"bob\"}", "y/z#9"),
+            ("--token ab!cd#ef", "cd#ef"),
+            ("passphrase: correct horse", "correct horse"),
+            ("access_key=AK/123+xyz", "123+xyz"),
+            ("sessionid=abc.def!ghi", "def!ghi"),
+        ];
+        for (case, secret) in cases {
+            let out = redact(case, &[]);
+            assert!(!out.contains(secret), "{case:?} -> {out:?}");
+        }
+        assert!(redact("{\"password\": \"x\", \"user\": \"bob\"}", &[]).contains("bob"));
+    }
+
+    #[test]
+    fn redacts_a_value_on_the_line_after_its_key() {
+        let events = run(
+            b"{\n  \"password\":\n    \"hunter2 and more\",\n  \"user\": \"bob\"\n}\n",
+            vec![],
+        );
+        let out = lines(&events).join("\n");
+        assert!(!out.contains("hunter2") && !out.contains("more"), "{out}");
+        assert!(out.contains("bob"));
     }
 
     #[test]
