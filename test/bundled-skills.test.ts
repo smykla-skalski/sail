@@ -111,6 +111,13 @@ void test('Vite loads bundled-skills.ts with each skill on its own core', async 
   );
 });
 
+void test('the bundled ship-it records which upstream release it matches', () => {
+  assert.match(
+    shipItCore,
+    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.20 with Sail mode/,
+  );
+});
+
 void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule', () => {
   const prompt = resolveSkillPrompt(mergeSkills([], bundled), '/ship-it https://x.test/o/r/1');
   assert.match(prompt, /Follow this bundled Sail skill/);
@@ -149,7 +156,9 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
     handoff,
     /delivery mismatch from `task_checkpoint_read` and a source issue closed by this pull request are the expected handoff, not stops/,
   );
+  assert.match(handoff, /you acquired your own `claims\.md` claim and it has expired/i);
   assert.match(handoff, /terminal delivery takeover from `claims\.md`/);
+  assert.match(handoff, /A claim Sail holds is never taken over or released by the worker/);
 
   const claims = sailModeRule('Claims');
   assert.match(claims, /Sail holds a visible claim with an exact claim ID for this task/);
