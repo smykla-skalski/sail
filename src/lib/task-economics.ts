@@ -456,6 +456,22 @@ function mergeSequenceRanges(ranges: Array<[number, number]>): Array<[number, nu
   return merged;
 }
 
+function removeSequenceFromRanges(
+  ranges: Array<[number, number]>,
+  sequence: number,
+): Array<[number, number]> {
+  return ranges.flatMap(([start, end]) => {
+    if (sequence < start || sequence > end) return [[start, end]];
+    if (start === end) return [];
+    if (sequence === start) return [[start + 1, end]];
+    if (sequence === end) return [[start, end - 1]];
+    return [
+      [start, sequence - 1],
+      [sequence + 1, end],
+    ];
+  });
+}
+
 type ArchivedOrderKey = { identityDigest: string; sequence?: number };
 
 function archivedEvidenceOrder(left: ArchivedOrderKey, right: ArchivedOrderKey): number {
@@ -1384,6 +1400,65 @@ export function rekeyArchivedEconomicsEvidence(
   if (!next.identityHorizonTruncated) rebuildCausalProof(next);
   else if (next.causalProofComplete) advanceCausalProof(next);
   else if (incompleteParent) advanceIncompleteCausalProof(next, incompleteParent);
+  sealRollupState(next);
+  return economicsRollupSchema.parse(next);
+}
+
+export function removeArchivedEconomicsEvidence(
+  rollup: EconomicsRollup,
+  entry: TaskEvidence,
+): EconomicsRollup {
+  const identityDigest = evidenceIdentityDigest(entry.id);
+  const matches = archivedLocations(
+    rollup,
+    (candidate) => candidate.metadataComplete && candidate.identityDigest === identityDigest,
+  );
+  if (!matches.length) return rollup;
+  if (matches.length > 1)
+    throw new Error(`Archived evidence identity ${entry.id} appears more than once.`);
+  const match = matches[0];
+  const archived = rollup[match.collection][match.index];
+  if (!evidenceContentMatches(entry, archived.contentDigest))
+    throw new Error(`Archived evidence identity ${entry.id} has conflicting content.`);
+  const next = structuredClone(rollup);
+  migrateCausalProof(next);
+  const incompleteParent = next.causalProofComplete ? null : incompleteCausalStateDigest(next);
+  const removed = next[match.collection][match.index];
+  if (match.collection === 'archivedTombstones') markTombstoneMutation(next, removed, null);
+  if (removed.economics) {
+    next.samples = decrementEconomicsCounter(next.samples, next.overflowed);
+    next.totals = subtractEconomicsTotals(next.totals, removed.economics, next.overflowed);
+    const role = next.byRole.find((item) => item.role === removed.economics!.role);
+    if (role)
+      role.totals = subtractEconomicsTotals(role.totals, removed.economics, next.overflowed);
+    const attribution = findAttribution(
+      next.byAttribution,
+      removed.provider,
+      removed.model,
+      removed.economics.role,
+      removed.economics.phase,
+    );
+    if (attribution) {
+      attribution.samples = decrementEconomicsCounter(attribution.samples, next.overflowed);
+      attribution.totals = subtractEconomicsTotals(
+        attribution.totals,
+        removed.economics,
+        next.overflowed,
+      );
+    }
+  } else next.missingSamples = decrementEconomicsCounter(next.missingSamples, next.overflowed);
+  next.archivedEntries = decrementEconomicsCounter(next.archivedEntries, next.overflowed);
+  if (removed.sequence !== undefined)
+    next.archivedSequenceRanges = removeSequenceFromRanges(
+      next.archivedSequenceRanges,
+      removed.sequence,
+    );
+  next[match.collection].splice(match.index, 1);
+  next.identityCoverageComplete = archivedIdentityCoverageComplete(next);
+  if (next.identityHorizonTruncated) {
+    if (next.causalProofComplete) advanceCausalProof(next);
+    else if (incompleteParent) advanceIncompleteCausalProof(next, incompleteParent);
+  } else rebuildCausalProof(next);
   sealRollupState(next);
   return economicsRollupSchema.parse(next);
 }

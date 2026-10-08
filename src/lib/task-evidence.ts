@@ -8,6 +8,7 @@ import {
   mergeEconomicsRollups,
   reconcileArchivedEconomicsEvidence,
   rekeyArchivedEconomicsEvidence,
+  removeArchivedEconomicsEvidence,
   rollUpEconomics,
   taskEconomicsSchema,
   updateArchivedEconomicsEvidence,
@@ -702,7 +703,14 @@ export function rollbackTaskEvidenceRecord(
         !saved.evidence.some((candidate) => candidate.id === entry.id) &&
         !evidence.some((candidate) => candidate.id === entry.id),
     );
-    const withoutRecord = { ...manifest, evidence: boundEvidence([...evidence, ...evicted]) };
+    const withoutRecord = {
+      ...manifest,
+      evidence: boundEvidence([...evidence, ...evicted]),
+      economicsRollup:
+        savedEntry && manifest.economicsRollup
+          ? removeArchivedEconomicsEvidence(manifest.economicsRollup, savedEntry)
+          : manifest.economicsRollup,
+    };
     if (
       prior &&
       sameEvidenceValue(withoutRecord.evidence, prior.evidence) &&

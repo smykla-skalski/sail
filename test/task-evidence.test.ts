@@ -46,6 +46,17 @@ function evidence(overrides: Partial<TaskEvidence> = {}): TaskEvidence {
   };
 }
 
+function measuredEvidence(id: string, timestamp: number): TaskEvidence {
+  return evidence({
+    id,
+    kind: 'command',
+    name: id,
+    timestamp,
+    criteria: [],
+    economics: { ...emptyTaskEconomics('primary', 'implement'), turns: 1 },
+  });
+}
+
 function ciEvidence(
   check: Parameters<typeof ciEvidenceIdentity>[1],
   result: TaskEvidence['result'],
@@ -1266,6 +1277,58 @@ void test('rollback restores evidence evicted by a full manifest', () => {
   const rolledBack = rollbackTaskEvidenceRecord(committed, previous, committed, 'own');
 
   assert.deepEqual(rolledBack.evidenceManifests, manifests);
+});
+
+void test('rollback removes compacted economics while preserving concurrent evidence', () => {
+  let manifests: EvidenceManifest[] = [];
+  for (let index = 0; index < 100; index += 1)
+    manifests = recordTaskEvidence(
+      manifests,
+      'revision-a',
+      criteria,
+      measuredEvidence(`prior-${index}`, index + 1),
+      'base-a',
+    );
+  const previous = { evidenceRevision: 'revision-a', evidenceManifests: manifests };
+  const committed = {
+    evidenceRevision: 'revision-a',
+    evidenceManifests: recordTaskEvidence(
+      manifests,
+      'revision-a',
+      criteria,
+      measuredEvidence('own', 101),
+      'base-a',
+    ),
+  };
+  const current = structuredClone(committed);
+  for (let index = 0; index < 100; index += 1)
+    current.evidenceManifests = recordTaskEvidence(
+      current.evidenceManifests,
+      'revision-a',
+      criteria,
+      measuredEvidence(`concurrent-${index}`, index + 102),
+      'base-a',
+    );
+  const beforeRollback = summarizeTaskEconomics(
+    current.evidenceManifests,
+    { ready: true },
+    'revision-a',
+  );
+
+  const rolledBack = rollbackTaskEvidenceRecord(current, previous, committed, 'own');
+  const summary = summarizeTaskEconomics(
+    rolledBack.evidenceManifests,
+    { ready: true },
+    'revision-a',
+  );
+
+  assert.equal(beforeRollback.samples, 201);
+  assert.equal(summary.samples, 200);
+  assert.equal(summary.totals.turns, 200);
+  assert.equal(rolledBack.evidenceManifests[0].economicsRollup?.archivedEntries, 100);
+  assert.equal(rolledBack.evidenceManifests[0].evidence.length, 100);
+  assert.equal(rolledBack.evidenceManifests[0].evidence[0].id, 'concurrent-0');
+  assert.equal(rolledBack.evidenceManifests[0].evidence.at(-1)?.id, 'concurrent-99');
 });
 
 void test('rejects a late evidence snapshot after a newer revision was stored', () => {
