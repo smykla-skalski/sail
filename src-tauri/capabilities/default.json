@@ -68,6 +68,7 @@
     "allow-acp-agents",
     "allow-acp-connect",
     "allow-acp-new-session",
+    "allow-acp-forget-session",
     "allow-acp-release-session-fence",
     "allow-acp-load-session",
     "allow-acp-resume-session",

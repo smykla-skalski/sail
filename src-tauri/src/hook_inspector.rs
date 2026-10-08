@@ -903,7 +903,7 @@ mod tests {
             root.join(".codex/config.toml"),
             format!(
                 "[hooks]\nStop = [{{ hooks = [{{ type = 'command', command = 'echo stop' }}] }}]\n[hooks.state.'{}:pre_tool_use:0:0']\ntrusted_hash = 'sha256:old'",
-                root.join(".codex/hooks.json").display()
+                root.join(".codex").join("hooks.json").display()
             ),
         )
         .unwrap();

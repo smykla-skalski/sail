@@ -350,11 +350,104 @@ struct Connection {
     alive: AtomicBool,
     capabilities: Mutex<Value>,
     session_directories: Mutex<HashMap<String, PathBuf>>,
+    session_configs: Mutex<HashMap<String, SessionConfig>>,
     native_subagents: Mutex<NativeSubagentRegistry>,
     session_profiles: Mutex<HashMap<String, CapabilityProfile>>,
     pending_directory: Mutex<Option<PathBuf>>,
     session_creation: Mutex<()>,
     ready: Condvar,
+}
+
+// The adapter fingerprints `cwd` and `mcpServers`, and recreates a live
+// session (killing its turn and background work) when they change. Each
+// session therefore keeps the exact parameters it was first sent.
+#[derive(Clone)]
+struct SessionConfig {
+    cwd: String,
+    directory: PathBuf,
+    server: Value,
+    token: String,
+}
+
+fn mcp_server(config: &crate::browser_agent::McpConfig) -> Value {
+    json!({
+        "name":"sail-browser",
+        "command":config.command,
+        "args":config.args,
+        "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()
+    })
+}
+
+fn session_request_params(cwd: &str, session_id: Option<&str>, server: &Value) -> Value {
+    let mut params = json!({"cwd":cwd,"mcpServers":[server]});
+    if let Some(session_id) = session_id {
+        params["sessionId"] = json!(session_id);
+    }
+    params
+}
+
+fn per_load_mcp() -> bool {
+    std::env::var("SAIL_ACP_PER_LOAD_MCP").as_deref() == Ok("1")
+}
+
+fn canonical_directory(cwd: &str) -> PathBuf {
+    PathBuf::from(cwd)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(cwd))
+}
+
+/// Returns the parameters to send for a restored session, reusing the ones
+/// already sent for it so the adapter keeps the live session.
+fn reuse_session_config(
+    configs: &mut HashMap<String, SessionConfig>,
+    session_id: &str,
+    cwd: &str,
+    mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
+    mut release: impl FnMut(&str),
+) -> Result<SessionConfig, String> {
+    let directory = canonical_directory(cwd);
+    if let Some(existing) = configs.get(session_id) {
+        if existing.directory == directory {
+            return Ok(existing.clone());
+        }
+    }
+    let config = mint()?;
+    let next = SessionConfig {
+        cwd: cwd.to_string(),
+        directory,
+        server: mcp_server(&config),
+        token: config.token,
+    };
+    if let Some(previous) = configs.insert(session_id.to_string(), next.clone()) {
+        release(&previous.token);
+    }
+    Ok(next)
+}
+
+/// Returns the parameters to send for a restored session. Reuse keeps the adapter's live session;
+/// `per_load` is the documented rollback switch and mints a fresh config for every load.
+fn restore_params(
+    per_load: bool,
+    configs: &mut HashMap<String, SessionConfig>,
+    session_id: &str,
+    cwd: &str,
+    mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
+    release: impl FnMut(&str),
+) -> Result<Value, String> {
+    if per_load {
+        let config = mint()?;
+        return Ok(session_request_params(
+            cwd,
+            Some(session_id),
+            &mcp_server(&config),
+        ));
+    }
+    let config = reuse_session_config(configs, session_id, cwd, mint, release)?;
+    Ok(session_request_params(
+        &config.cwd,
+        Some(session_id),
+        &config.server,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -2204,6 +2297,7 @@ fn connect_blocking(
         alive: AtomicBool::new(true),
         capabilities: Mutex::new(Value::Null),
         session_directories: Mutex::new(HashMap::new()),
+        session_configs: Mutex::new(HashMap::new()),
         native_subagents: Mutex::new(NativeSubagentRegistry::default()),
         session_profiles: Mutex::new(HashMap::new()),
         pending_directory: Mutex::new(None),
@@ -2445,6 +2539,12 @@ fn connect_blocking(
             }
         }
         reader.alive.store(false, Ordering::Release);
+        if let Ok(mut configs) = reader.session_configs.lock() {
+            let browser = app.state::<crate::browser_agent::BrowserManager>();
+            for (_, config) in configs.drain() {
+                browser.release(&config.token);
+            }
+        }
         let mut session_ids = reader
             .session_profiles
             .lock()
@@ -2565,9 +2665,9 @@ pub async fn acp_new_session(
     tauri::async_runtime::spawn_blocking(move || {
         connect_blocking(app, &manager, agent.clone(), profile)?;
         let runtime = connection_for_profile(&manager, &agent, profile)?;
-        let config = browser.config_for_profile(&cwd, None, Some(&agent), Some(profile.as_str()))?;
-        let mcp_server = json!({"name":"sail-browser","command":config.command,"args":config.args,
-            "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()});
+        let config =
+            browser.config_for_profile(&cwd, None, Some(&agent), Some(profile.as_str()))?;
+        let server = mcp_server(&config);
         let _serial = runtime
             .session_creation
             .lock()
@@ -2580,7 +2680,7 @@ pub async fn acp_new_session(
             .map_err(|error| error.to_string())? = Some(PathBuf::from(&cwd));
         let result = runtime.request(
             "session/new",
-            json!({"cwd":cwd,"mcpServers":[mcp_server]}),
+            session_request_params(&cwd, None, &server),
             Duration::from_secs(60),
         );
         *runtime
@@ -2590,14 +2690,40 @@ pub async fn acp_new_session(
         let result = match result {
             Ok(result) => result,
             Err(error) => {
+                browser.release(&config.token);
                 let _ = fence.finish_session(&directory, native_generation);
                 return Err(error);
             }
         };
         let Some(id) = result.get("sessionId").and_then(Value::as_str) else {
+            browser.release(&config.token);
             let _ = fence.finish_session(&directory, native_generation);
             return Err("Agent did not return a session ID.".into());
         };
+        if !per_load_mcp() {
+            let mut configs = runtime
+                .session_configs
+                .lock()
+                .map_err(|error| error.to_string())?;
+            // The reader drains this map when it exits, so a config stored for a stopped agent
+            // would keep its token for the life of the process.
+            if runtime.alive.load(Ordering::Acquire) {
+                let previous = configs.insert(
+                    id.to_string(),
+                    SessionConfig {
+                        cwd: cwd.clone(),
+                        directory: canonical_directory(&cwd),
+                        server,
+                        token: config.token.clone(),
+                    },
+                );
+                if let Some(previous) = previous {
+                    browser.release(&previous.token);
+                }
+            } else {
+                browser.release(&config.token);
+            }
+        }
         if let Err(error) = register_session(&manager, &agent, profile, id, directory.clone()) {
             let _ = fence.finish_session(&directory, native_generation);
             return Err(error);
@@ -2631,6 +2757,35 @@ pub fn acp_release_session_fence(
     session_id: String,
 ) -> Result<(), String> {
     fence.release_session(&agent, &session_id)
+}
+
+/// Releases the browser token a deleted thread's session still holds.
+#[tauri::command]
+pub fn acp_forget_session(
+    manager: State<'_, AgentManager>,
+    browser: State<'_, crate::browser_agent::BrowserManager>,
+    agent: String,
+    session_id: String,
+) -> Result<(), String> {
+    for profile in [
+        CapabilityProfile::Explore,
+        CapabilityProfile::Review,
+        CapabilityProfile::Build,
+        CapabilityProfile::Release,
+    ] {
+        let Ok(runtime) = connection_for_profile(&manager, &agent, profile) else {
+            continue;
+        };
+        let removed = runtime
+            .session_configs
+            .lock()
+            .map_err(|error| error.to_string())?
+            .remove(&session_id);
+        if let Some(config) = removed {
+            browser.release(&config.token);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2709,26 +2864,35 @@ async fn restore_session(
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         connect_blocking(app, &manager, agent.clone(), profile)?;
-        let runtime = register_session(
-            &manager,
-            &agent,
-            profile,
-            &session_id,
-            PathBuf::from(&cwd),
-        )?;
-        let config = browser.config_for_profile(
-            &cwd,
-            Some(&session_id),
-            Some(&agent),
-            Some(profile.as_str()),
-        )?;
-        let mcp_server = json!({"name":"sail-browser","command":config.command,"args":config.args,
-            "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()});
-        let result = runtime.request(
-            method,
-            json!({"cwd":cwd,"sessionId":session_id,"mcpServers":[mcp_server]}),
-            Duration::from_secs(60),
-        );
+        let runtime =
+            register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
+        let params = {
+            let mut configs = runtime
+                .session_configs
+                .lock()
+                .map_err(|error| error.to_string())?;
+            // The reader drains this map when it exits, so minting for a stopped agent would
+            // leak the token.
+            if !runtime.alive.load(Ordering::Acquire) {
+                return Err("Agent process stopped. Reopen the thread to reconnect.".to_string());
+            }
+            restore_params(
+                per_load_mcp(),
+                &mut configs,
+                &session_id,
+                &cwd,
+                || {
+                    browser.config_for_profile(
+                        &cwd,
+                        Some(&session_id),
+                        Some(&agent),
+                        Some(profile.as_str()),
+                    )
+                },
+                |token| browser.release(token),
+            )?
+        };
+        let result = runtime.request(method, params, Duration::from_secs(60));
         if result.is_err() {
             runtime
                 .session_directories
@@ -3309,6 +3473,233 @@ pub async fn acp_authenticate(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod session_config_tests {
+    use super::*;
+    use crate::browser_agent::McpConfig;
+    use std::collections::BTreeMap;
+
+    fn config(token: &str, env: &[(&str, &str)]) -> McpConfig {
+        McpConfig {
+            command: "/Applications/Sail.app/Contents/MacOS/sail".into(),
+            args: vec!["--browser-mcp".into()],
+            env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            token: token.into(),
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "sail-session-config-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn request_params_are_identical_whatever_the_env_insertion_order() {
+        let first = config(
+            "token",
+            &[
+                ("SAIL_BROWSER_PORT", "4100"),
+                ("SAIL_BROWSER_TOKEN", "token"),
+            ],
+        );
+        let second = config(
+            "token",
+            &[
+                ("SAIL_BROWSER_TOKEN", "token"),
+                ("SAIL_BROWSER_PORT", "4100"),
+            ],
+        );
+        let params = |config: &McpConfig| {
+            serde_json::to_string(&session_request_params(
+                "/work/repo",
+                Some("session"),
+                &mcp_server(config),
+            ))
+            .unwrap()
+        };
+        assert_eq!(params(&first), params(&second));
+        assert_eq!(params(&first), params(&first));
+        let request = session_request_params("/work/repo", None, &mcp_server(&first));
+        let env = &request["mcpServers"][0]["env"];
+        assert_eq!(env[0]["name"], "SAIL_BROWSER_PORT");
+        assert_eq!(env[1]["name"], "SAIL_BROWSER_TOKEN");
+        assert!(request.get("sessionId").is_none());
+    }
+
+    #[test]
+    fn restoring_a_session_reuses_its_first_parameters() {
+        let directory = scratch("reuse");
+        let cwd = directory.to_string_lossy().into_owned();
+        let mut configs = HashMap::new();
+        let mut minted = 0;
+        let mut released = Vec::new();
+        let first = reuse_session_config(
+            &mut configs,
+            "session",
+            &cwd,
+            || {
+                minted += 1;
+                Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
+            },
+            |token| released.push(token.to_string()),
+        )
+        .unwrap();
+        let second = reuse_session_config(
+            &mut configs,
+            "session",
+            &cwd,
+            || {
+                minted += 1;
+                Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
+            },
+            |token| released.push(token.to_string()),
+        )
+        .unwrap();
+        assert_eq!(minted, 1);
+        assert!(released.is_empty());
+        assert_eq!(first.token, "first");
+        assert_eq!(
+            session_request_params(&first.cwd, Some("session"), &first.server),
+            session_request_params(&second.cwd, Some("session"), &second.server)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_per_load_switch_mints_parameters_for_every_load() {
+        let mut configs = HashMap::new();
+        let mut minted = 0;
+        let mut released = 0;
+        let first = restore_params(
+            true,
+            &mut configs,
+            "session",
+            "/work/repo",
+            || {
+                minted += 1;
+                Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
+            },
+            |_| released += 1,
+        )
+        .unwrap();
+        let second = restore_params(
+            true,
+            &mut configs,
+            "session",
+            "/work/repo",
+            || {
+                minted += 1;
+                Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
+            },
+            |_| released += 1,
+        )
+        .unwrap();
+        assert_eq!(minted, 2);
+        assert_eq!(released, 0);
+        assert!(configs.is_empty());
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn reuse_keeps_the_parameters_the_adapter_already_saw() {
+        let directory = scratch("restore");
+        let cwd = directory.to_string_lossy().into_owned();
+        let mut configs = HashMap::new();
+        let mut minted = 0;
+        let first = restore_params(
+            false,
+            &mut configs,
+            "session",
+            &cwd,
+            || {
+                minted += 1;
+                Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
+            },
+            |_| unreachable!("a reused config releases no token"),
+        )
+        .unwrap();
+        let second = restore_params(
+            false,
+            &mut configs,
+            "session",
+            &cwd,
+            || {
+                minted += 1;
+                Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
+            },
+            |_| unreachable!("a reused config releases no token"),
+        )
+        .unwrap();
+        assert_eq!(minted, 1);
+        assert_eq!(first, second);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_to_the_same_directory_keeps_the_original_cwd() {
+        let directory = scratch("symlink");
+        let link = directory.with_extension("link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        let mut configs = HashMap::new();
+        let original = directory.to_string_lossy().into_owned();
+        reuse_session_config(
+            &mut configs,
+            "session",
+            &original,
+            || Ok(config("first", &[])),
+            |_| {},
+        )
+        .unwrap();
+        let through_link = reuse_session_config(
+            &mut configs,
+            "session",
+            &link.to_string_lossy(),
+            || Err("a symlinked path must not mint a new config".into()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(through_link.cwd, original);
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn moving_a_session_to_another_directory_mints_and_releases() {
+        let first_directory = scratch("before");
+        let second_directory = scratch("after");
+        let mut configs = HashMap::new();
+        let mut released = Vec::new();
+        reuse_session_config(
+            &mut configs,
+            "session",
+            &first_directory.to_string_lossy(),
+            || Ok(config("first", &[])),
+            |token| released.push(token.to_string()),
+        )
+        .unwrap();
+        let moved = reuse_session_config(
+            &mut configs,
+            "session",
+            &second_directory.to_string_lossy(),
+            || Ok(config("second", &[])),
+            |token| released.push(token.to_string()),
+        )
+        .unwrap();
+        assert_eq!(moved.token, "second");
+        assert_eq!(released, vec!["first".to_string()]);
+        std::fs::remove_dir_all(first_directory).unwrap();
+        std::fs::remove_dir_all(second_directory).unwrap();
+    }
 }
 
 #[cfg(test)]

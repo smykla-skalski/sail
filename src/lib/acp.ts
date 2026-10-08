@@ -481,6 +481,137 @@ function applyEntryUpdate(
   return false;
 }
 
+export interface AgentSessionState {
+  configOptions?: AgentConfigOption[];
+  availableCommands?: AgentCommand[];
+}
+
+const sessionStates = new Map<string, AgentSessionState>();
+const backgroundLimit = 2000;
+const backgroundUpdates = new Map<string, Record<string, unknown>[] | null>();
+
+function sessionKey(agent: AgentId, sessionId: string): string {
+  return JSON.stringify([agent, sessionId]);
+}
+
+export function rememberSessionState(
+  agent: AgentId,
+  sessionId: string,
+  state: AgentSessionState,
+): void {
+  const key = sessionKey(agent, sessionId);
+  sessionStates.set(key, { ...sessionStates.get(key), ...state });
+}
+
+export function sessionState(agent: AgentId, sessionId: string): AgentSessionState | undefined {
+  return sessionStates.get(sessionKey(agent, sessionId));
+}
+
+/** Keeps the updates of a session that is no longer shown, so switching back to a running turn
+ * needs no adapter restore. A restore replays history while the turn streams. */
+export function trackBackgroundSession(agent: AgentId, sessionId: string): void {
+  const key = sessionKey(agent, sessionId);
+  if (!backgroundUpdates.has(key)) backgroundUpdates.set(key, []);
+}
+
+export function bufferBackgroundUpdate(
+  agent: AgentId,
+  sessionId: string,
+  update: Record<string, unknown>,
+): void {
+  const key = sessionKey(agent, sessionId);
+  const buffer = backgroundUpdates.get(key);
+  if (!buffer) return;
+  if (buffer.length >= backgroundLimit) backgroundUpdates.set(key, null);
+  else buffer.push(update);
+}
+
+/** Drops a buffer that a history replay made unreliable; switching back then restores. */
+export function invalidateBackgroundSession(agent: AgentId, sessionId: string): void {
+  const key = sessionKey(agent, sessionId);
+  if (backgroundUpdates.has(key)) backgroundUpdates.set(key, null);
+}
+
+/** Returns the buffered updates and stops tracking, or null when the buffer is incomplete. */
+export function takeBackgroundUpdates(
+  agent: AgentId,
+  sessionId: string,
+): Record<string, unknown>[] | null {
+  const key = sessionKey(agent, sessionId);
+  const buffer = backgroundUpdates.get(key);
+  backgroundUpdates.delete(key);
+  return buffer ?? null;
+}
+
+export function forgetSessionState(agent: AgentId, sessionId: string): void {
+  const key = sessionKey(agent, sessionId);
+  sessionStates.delete(key);
+  backgroundUpdates.delete(key);
+}
+
+/** Rebuilds the view of a running session from Sail's cache, or null when a restore is needed.
+ * Without a complete buffer the cached transcript is shown until the turn ends and history
+ * reloads, because restoring a running session replays history into the live stream. */
+export function liveSessionView(
+  cached: AgentEntry[],
+  buffered: Record<string, unknown>[] | null,
+  state: AgentSessionState | undefined,
+  now = Date.now(),
+): {
+  entries: AgentEntry[];
+  complete: boolean;
+  configOptions: AgentConfigOption[];
+  availableCommands?: AgentCommand[];
+} | null {
+  if (!state?.configOptions) return null;
+  return {
+    complete: buffered !== null,
+    entries: buffered
+      ? updateEntriesBatch(
+          cached,
+          buffered.filter((update) => update.sessionUpdate !== 'user_message_chunk'),
+          now,
+        )
+      : cached,
+    configOptions: state.configOptions,
+    ...(state.availableCommands ? { availableCommands: state.availableCommands } : {}),
+  };
+}
+
+function isConfigOption(value: unknown): value is AgentConfigOption {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    'id' in value &&
+    typeof value.id === 'string' &&
+    'type' in value &&
+    typeof value.type === 'string' &&
+    'options' in value &&
+    Array.isArray(value.options)
+  );
+}
+
+function isCommand(value: unknown): value is AgentCommand {
+  return !!value && typeof value === 'object' && 'name' in value && typeof value.name === 'string';
+}
+
+function rememberRestoredState(
+  agent: AgentId,
+  sessionId: string,
+  session: { configOptions?: unknown; availableCommands?: unknown },
+): void {
+  const configOptions: unknown[] = Array.isArray(session.configOptions)
+    ? session.configOptions
+    : [];
+  const availableCommands: unknown[] | null = Array.isArray(session.availableCommands)
+    ? session.availableCommands
+    : null;
+  rememberSessionState(agent, sessionId, {
+    configOptions: configOptions.filter(isConfigOption),
+    ...(availableCommands ? { availableCommands: availableCommands.filter(isCommand) } : {}),
+  });
+}
+
 const restoringSessions = new Map<string, Promise<Record<string, unknown>>>();
 
 function restoreSession(
@@ -493,7 +624,18 @@ function restoreSession(
   const key = JSON.stringify([agent, cwd, sessionId, profile]);
   const existing = restoringSessions.get(key);
   if (existing) return existing;
-  const request = invoke<Record<string, unknown>>(method, { agent, cwd, sessionId, profile });
+  // A restore replays history, so this session's buffered updates can no longer be trusted.
+  invalidateBackgroundSession(agent, sessionId);
+  const request = invoke<Record<string, unknown>>(method, {
+    agent,
+    cwd,
+    sessionId,
+    profile,
+  }).then((session) => {
+    invalidateBackgroundSession(agent, sessionId);
+    rememberRestoredState(agent, sessionId, session);
+    return session;
+  });
   restoringSessions.set(key, request);
   void request
     .finally(() => {
@@ -514,6 +656,9 @@ export const acp = {
       availableCommands?: AgentCommand[];
     }>('acp_new_session', {
       params: { agent, cwd, profile, nativeGeneration },
+    }).then((session) => {
+      rememberRestoredState(agent, session.sessionId, session);
+      return session;
     }),
   releaseSessionFence: (agent: AgentId, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, sessionId }),
@@ -521,6 +666,10 @@ export const acp = {
     restoreSession('acp_load_session', agent, cwd, sessionId, profile),
   resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
     restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
+  forget: (agent: AgentId, sessionId: string) => {
+    forgetSessionState(agent, sessionId);
+    return invoke<void>('acp_forget_session', { agent, sessionId });
+  },
   prompt: (
     agent: AgentId,
     sessionId: string,
@@ -582,6 +731,10 @@ export const acp = {
       sessionId,
       configId,
       value,
+    }).then((result) => {
+      if (result.configOptions)
+        rememberSessionState(agent, sessionId, { configOptions: result.configOptions });
+      return result;
     }),
   authenticate: (agent: AgentId, methodId: string, profile?: CapabilityProfile) =>
     invoke<Record<string, unknown>>('acp_authenticate', { agent, methodId, profile }),

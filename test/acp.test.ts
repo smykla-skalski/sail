@@ -2,11 +2,18 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acpDisconnectAffectsSession,
+  bufferBackgroundUpdate,
   forgetRecentTranscript,
   groupAgentEntries,
+  invalidateBackgroundSession,
+  liveSessionView,
   loadRecentTranscript,
+  rememberSessionState,
   restoreEntryTimes,
   saveRecentTranscript,
+  sessionState,
+  takeBackgroundUpdates,
+  trackBackgroundSession,
   updateEntries,
   updateEntriesBatch,
   updateEntriesInPlace,
@@ -311,5 +318,81 @@ void test('consecutive ACP tools form a stable group between visible messages', 
   assert.deepEqual(
     entries.map((entry) => entry.id),
     ['message-1', 'read', 'test', 'message-2'],
+  );
+});
+
+void test('switching back to a running session rebuilds it from the buffered updates', () => {
+  const cached: AgentEntry[] = [{ id: 'a', type: 'assistant', text: 'Working on' }];
+  trackBackgroundSession('claude', 'live');
+  bufferBackgroundUpdate('claude', 'live', {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: ' it' },
+  });
+  bufferBackgroundUpdate('claude', 'live', {
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'text', text: 'echo of the prompt' },
+  });
+  bufferBackgroundUpdate('claude', 'live', {
+    sessionUpdate: 'tool_call',
+    toolCallId: 'read',
+    title: 'Read file',
+    status: 'in_progress',
+  });
+  bufferBackgroundUpdate('claude', 'untracked', {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'ignored' },
+  });
+  const configOptions = [
+    {
+      id: 'model',
+      name: 'Model',
+      type: 'select' as const,
+      currentValue: 'opus',
+      options: [{ value: 'opus', name: 'Opus' }],
+    },
+  ];
+  rememberSessionState('claude', 'live', { configOptions });
+  const view = liveSessionView(
+    cached,
+    takeBackgroundUpdates('claude', 'live'),
+    sessionState('claude', 'live'),
+    5,
+  );
+  assert.ok(view);
+  assert.deepEqual(
+    view.entries.map((entry) => (entry.type === 'tool' ? entry.title : entry.text)),
+    ['Working on it', 'Read file'],
+  );
+  assert.equal(view.configOptions, configOptions);
+  assert.equal(view.complete, true);
+  assert.equal(takeBackgroundUpdates('claude', 'live'), null);
+  assert.equal(takeBackgroundUpdates('claude', 'untracked'), null);
+});
+
+void test('a running session without a complete buffer keeps its cached transcript', () => {
+  const cached: AgentEntry[] = [{ id: 'a', type: 'assistant', text: 'Cached' }];
+  rememberSessionState('claude', 'busy', { configOptions: [] });
+  trackBackgroundSession('claude', 'busy');
+  for (let index = 0; index <= 2000; index += 1)
+    bufferBackgroundUpdate('claude', 'busy', {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: '.' },
+    });
+  const overflowed = takeBackgroundUpdates('claude', 'busy');
+  assert.equal(overflowed, null);
+  const incomplete = liveSessionView(cached, overflowed, sessionState('claude', 'busy'));
+  assert.equal(incomplete?.entries, cached);
+  assert.equal(incomplete?.complete, false);
+  trackBackgroundSession('claude', 'replayed');
+  invalidateBackgroundSession('claude', 'replayed');
+  assert.equal(takeBackgroundUpdates('claude', 'replayed'), null);
+  trackBackgroundSession('claude', 'unknown-state');
+  assert.equal(
+    liveSessionView(
+      [],
+      takeBackgroundUpdates('claude', 'unknown-state'),
+      sessionState('claude', 'unknown-state'),
+    ),
+    null,
   );
 });

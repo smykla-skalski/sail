@@ -78,6 +78,7 @@ fn main() {
             "acp_agents",
             "acp_connect",
             "acp_new_session",
+            "acp_forget_session",
             "acp_release_session_fence",
             "acp_load_session",
             "acp_resume_session",

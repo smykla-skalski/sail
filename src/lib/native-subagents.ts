@@ -42,6 +42,26 @@ function rootSession(store: NativeSubagentStore, agent: string, parentSessionId:
   return store[nativeSubagentId(agent, parentSessionId)]?.rootSessionId ?? parentSessionId;
 }
 
+function isReplaySubagent(sessionId: string): boolean {
+  return sessionId.includes(':replay-subagent:');
+}
+
+/** A replayed child the store does not know duplicates a live child of the same root, because a
+ * session's history only grows while it is live. */
+function duplicatesLiveChild(
+  store: NativeSubagentStore,
+  agent: string,
+  parentSessionId: string,
+  sessionId: string,
+): boolean {
+  if (!isReplaySubagent(sessionId) || store[nativeSubagentId(agent, sessionId)]) return false;
+  if (isReplaySubagent(parentSessionId)) return !store[nativeSubagentId(agent, parentSessionId)];
+  const root = rootSession(store, agent, parentSessionId);
+  return Object.values(store).some(
+    (child) => child.agent === agent && child.rootSessionId === root && !child.restored,
+  );
+}
+
 function state(value: unknown): NativeSubagentOutcome {
   if (value === 'completed') return 'completed';
   if (value === 'failed') return 'failed';
@@ -77,11 +97,15 @@ export function updateNativeSubagents(
     const sessionId = update.subagentSessionId;
     if (typeof sessionId !== 'string' || !sessionId.trim() || sessionId === parentSessionId)
       return store;
+    if (duplicatesLiveChild(store, event.agent, parentSessionId, sessionId)) return store;
     const id = nativeSubagentId(event.agent, sessionId);
     const previous = store[id];
     const prompt = typeof update.prompt === 'string' ? update.prompt : previous?.prompt;
+    // Only claude-agent-acp marks replayed children, so its live children stay live while a
+    // session replays. Other adapters replay under plain ids, where the replay itself decides.
+    const replayed = restored && (event.agent !== 'claude' || isReplaySubagent(sessionId));
     const malformed =
-      restored &&
+      replayed &&
       (!(typeof update.name === 'string' && update.name.trim()) ||
         !(typeof update.task === 'string' && update.task.trim()));
     const transcript = previous?.transcript ?? [];
@@ -116,8 +140,8 @@ export function updateNativeSubagents(
         transcript: nextTranscript,
         created: previous?.created ?? now,
         updated: now,
-        restored: previous?.restored || restored,
-        capabilityProfile: restored
+        restored: previous?.restored || replayed,
+        capabilityProfile: replayed
           ? capabilityProfile
           : (previous?.capabilityProfile ??
             store[nativeSubagentId(event.agent, parentSessionId)]?.capabilityProfile ??

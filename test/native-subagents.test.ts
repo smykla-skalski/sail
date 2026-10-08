@@ -103,7 +103,7 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
 await test('replayed lifecycle deduplicates and unfinished history disconnects', () => {
   const spawn = event('parent', {
     sessionUpdate: 'subagent_spawned',
-    subagentSessionId: 'child',
+    subagentSessionId: 'parent:replay-subagent:child',
     name: 'worker',
     task: 'Task',
     capabilities: {},
@@ -111,10 +111,10 @@ await test('replayed lifecycle deduplicates and unfinished history disconnects',
   let store = updateNativeSubagents({}, spawn, '/repo', 1, true);
   store = updateNativeSubagents(store, spawn, '/repo', 2, true);
   assert.equal(Object.keys(store).length, 1);
-  assert.equal(store['codex:child'].created, 1);
+  assert.equal(store['codex:parent:replay-subagent:child'].created, 1);
 
   store = finalizeNativeSubagentRestore(store, 'codex', 'parent', 3);
-  assert.equal(store['codex:child'].outcome, 'unknown');
+  assert.equal(store['codex:parent:replay-subagent:child'].outcome, 'unknown');
   assert.equal(nativeSubagentReceipts(store)[0].state, 'unavailable');
 });
 
@@ -369,7 +369,7 @@ await test('malformed and self-referential lifecycle events leave parents intact
     {},
     event('parent', {
       sessionUpdate: 'subagent_spawned',
-      subagentSessionId: 'broken-child',
+      subagentSessionId: 'parent:replay-subagent:broken',
       name: 42,
       capabilities: {},
     }),
@@ -377,5 +377,79 @@ await test('malformed and self-referential lifecycle events leave parents intact
     1,
     true,
   );
-  assert.equal(restored['codex:broken-child'].error, 'Incomplete subagent history');
+  assert.equal(
+    restored['codex:parent:replay-subagent:broken'].error,
+    'Incomplete subagent history',
+  );
+});
+
+function spawnEvent(parent: string, child: string): AgentEvent {
+  return event(parent, {
+    sessionUpdate: 'subagent_spawned',
+    subagentSessionId: child,
+    name: 'explore',
+    task: 'Map the code',
+    capabilities: {},
+  });
+}
+
+await test('a replay of a live session does not duplicate its live children', () => {
+  const live = updateNativeSubagents({}, spawnEvent('root', 'task-1'), '/repo', 1);
+  const replayed = updateNativeSubagents(
+    live,
+    spawnEvent('root', 'root:replay-subagent:toolu_1'),
+    '/repo',
+    2,
+    true,
+  );
+  assert.equal(replayed, live);
+  const nested = updateNativeSubagents(
+    replayed,
+    spawnEvent('root:replay-subagent:toolu_1', 'root:replay-subagent:toolu_2'),
+    '/repo',
+    3,
+    false,
+  );
+  assert.equal(nested, live);
+  const finalized = finalizeNativeSubagentRestore(nested, 'codex', 'root', 4);
+  assert.deepEqual(
+    Object.values(finalized).map((child) => [child.sessionId, child.outcome]),
+    [['task-1', 'working']],
+  );
+});
+
+await test('a claude child spawned while its session replays stays live', () => {
+  const live = { ...spawnEvent('root', 'root:live-child'), agent: 'claude' as const };
+  const store = updateNativeSubagents({}, live, '/repo', 1, true);
+  const child = store['claude:root:live-child'];
+  assert.equal(child?.restored, false);
+  assert.equal(child?.outcome, 'working');
+  assert.equal(finalizeNativeSubagentRestore(store, 'claude', 'root', 2), store);
+});
+
+await test('an adapter without replay markers still restores its children', () => {
+  const store = updateNativeSubagents({}, spawnEvent('root', 'thread-7'), '/repo', 1, true);
+  assert.equal(store['codex:thread-7']?.restored, true);
+  const finalized = finalizeNativeSubagentRestore(store, 'codex', 'root', 2);
+  assert.equal(finalized['codex:thread-7']?.outcome, 'unknown');
+  assert.equal(finalized['codex:thread-7']?.activity, 'Disconnected');
+});
+
+await test('a first replay still restores historical children', () => {
+  const restored = updateNativeSubagents(
+    {},
+    event('root', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'root:replay-subagent:toolu_1',
+      name: 'explore',
+      task: 'Map the code',
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+    true,
+  );
+  const child = restored['codex:root:replay-subagent:toolu_1'];
+  assert.equal(child?.restored, true);
+  assert.equal(child?.rootSessionId, 'root');
 });
