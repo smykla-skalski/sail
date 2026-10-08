@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   forgetPlanningState,
+  clearStructuredQuestions,
   loadNativePlan,
   loadStructuredQuestions,
+  removeStructuredQuestion,
   saveNativePlan,
   saveStructuredQuestions,
   type PlanningStateScope,
@@ -93,4 +95,39 @@ await test('structured questions are replayed only for their session', () => {
     ['Child?'],
   );
   forgetPlanningState(child);
+});
+
+await test('cancelling a question preserves unrelated session state', () => {
+  const child = { ...parent, sessionId: 'child' };
+  saveStructuredQuestions(parent, [
+    { id: 4, sessionId: parent.sessionId, message: 'Parent?', schema: {} },
+  ]);
+  saveStructuredQuestions(child, [
+    { id: 5, sessionId: child.sessionId, message: 'Child?', schema: {} },
+  ]);
+
+  removeStructuredQuestion('codex', 4);
+  assert.deepEqual(loadStructuredQuestions(parent), []);
+  assert.deepEqual(
+    loadStructuredQuestions(child).map((item) => item.message),
+    ['Child?'],
+  );
+  forgetPlanningState(child);
+});
+
+await test('disconnect clears questions but retains the replayable plan', () => {
+  saveNativePlan(parent, {
+    provider: 'codex',
+    markdown: '# Parent plan',
+    updated: 1,
+    tasks: [],
+  });
+  saveStructuredQuestions(parent, [
+    { id: 6, sessionId: parent.sessionId, message: 'Parent?', schema: {} },
+  ]);
+
+  clearStructuredQuestions(parent.agent, parent.sessionId);
+  assert.equal(loadNativePlan(parent)?.markdown, '# Parent plan');
+  assert.deepEqual(loadStructuredQuestions(parent), []);
+  forgetPlanningState(parent);
 });

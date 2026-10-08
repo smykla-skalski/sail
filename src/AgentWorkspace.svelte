@@ -1257,6 +1257,16 @@
         )
           steer.finish();
       }
+      if (message.method === '$/cancel_request') {
+        const id = params?.id;
+        if (typeof id === 'string' || typeof id === 'number') {
+          elicitations = elicitations.filter((item) => String(item.id) !== String(id));
+          delete elicitationDrafts[String(id)];
+          if (activeSessionId)
+            saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
+        }
+        return;
+      }
       if (!params || params.sessionId !== activeSessionId) return;
       if (message.method === 'sail/permission_resolved') {
         if (
@@ -1304,14 +1314,6 @@
         queuePermission(message);
       } else if (message.method === 'elicitation/create' && message.id != null) {
         queueElicitation(message);
-      } else if (message.method === '$/cancel_request') {
-        const id = message.params?.id;
-        if (typeof id === 'string' || typeof id === 'number') {
-          elicitations = elicitations.filter((item) => String(item.id) !== String(id));
-          delete elicitationDrafts[String(id)];
-          if (activeSessionId)
-            saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
-        }
       }
     })
       .then((unsubscribe) => {

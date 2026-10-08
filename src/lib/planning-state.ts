@@ -107,6 +107,27 @@ export function saveStructuredQuestions(
   update(scope, { questions });
 }
 
+export function removeStructuredQuestion(agent: string, requestID: string | number): void {
+  const states = savedStates().flatMap((state) => {
+    if (
+      state.agent !== agent ||
+      !state.questions?.some((item) => String(item.id) === String(requestID))
+    )
+      return [state];
+    const questions = state.questions.filter((item) => String(item.id) !== String(requestID));
+    return state.plan || questions.length ? [{ ...state, questions }] : [];
+  });
+  save(states);
+}
+
+export function clearStructuredQuestions(agent: string, sessionId: string): void {
+  const states = savedStates().flatMap((state) => {
+    if (state.agent !== agent || state.sessionId !== sessionId) return [state];
+    return state.plan ? [{ ...state, questions: [] }] : [];
+  });
+  save(states);
+}
+
 export function forgetPlanningState(scope: PlanningStateScope): void {
   save(savedStates().filter((item) => id(item) !== id(scope)));
 }
