@@ -928,7 +928,7 @@ export function ciEvidenceIdentity(
   const uncertain = check.identityUncertain === true || stableRun === undefined;
   const execution =
     check.databaseId !== undefined
-      ? `${revision}\u0000${check.name}\u0000check\u0000${check.databaseId}\u0000${check.attempt ?? 1}`
+      ? `${revision}\u0000${check.name}\u0000check\u0000${check.databaseId}`
       : check.runId !== undefined
         ? `${revision}\u0000${check.name}\u0000run\u0000${check.runId}\u0000${check.attempt ?? 1}`
         : stableStatus !== undefined

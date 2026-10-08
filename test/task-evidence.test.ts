@@ -1417,7 +1417,11 @@ void test('counts each CI execution once across polling and status changes', () 
   assert.equal(manifests[0].evidence[0].result, 'passed');
   assert.equal(summarizeTaskEconomics(manifests, { ready: false }, 'revision').totals.checks, 1);
 
-  const retry = ciEvidence({ ...firstCheck, url: firstRun, attempt: 2 }, 'passed', 40);
+  const retry = ciEvidence(
+    { ...firstCheck, url: firstRun, databaseId: 51, attempt: 2 },
+    'passed',
+    40,
+  );
   assert.notEqual(retry.id, manifests[0].evidence[0].id);
   manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, retry);
   assert.equal(manifests[0].evidence.length, 2);
@@ -1450,6 +1454,36 @@ void test('counts a CI execution once when its workflow run identity arrives lat
   assert.equal(pending.id, enriched.id);
   assert.equal(manifests[0].evidence.length, 1);
   assert.equal(manifests[0].evidence[0].result, 'passed');
+  assert.equal(summary.totals.checks, 1);
+});
+
+void test('counts a CheckRun once when its workflow attempt arrives later', () => {
+  const pending = ciEvidence(
+    { name: 'build', url: 'https://github.test/jobs/50', databaseId: 50 },
+    'pending',
+    10,
+  );
+  const enriched = ciEvidence(
+    {
+      name: 'build',
+      url: 'https://github.test/jobs/50',
+      databaseId: 50,
+      runId: 10,
+      attempt: 2,
+    },
+    'passed',
+    20,
+  );
+  let manifests = recordCiEvidenceObservation([], 'revision', criteria, pending);
+
+  manifests = reconcileCiEvidenceSnapshot(manifests, 'revision', [enriched]);
+  manifests = recordCiEvidenceObservation(manifests, 'revision', criteria, enriched);
+  const summary = summarizeTaskEconomics(manifests, { ready: true }, 'revision');
+
+  assert.equal(pending.id, enriched.id);
+  assert.equal(manifests[0].evidence.length, 1);
+  assert.equal(manifests[0].evidence[0].result, 'passed');
+  assert.deepEqual(manifests[0].evidence[0].executionOrder, [10, 2]);
   assert.equal(summary.totals.checks, 1);
 });
 
