@@ -566,3 +566,106 @@ await test('a first replay still restores historical children', () => {
   assert.equal(child?.restored, true);
   assert.equal(child?.rootSessionId, 'root');
 });
+
+function spawnedChild(prompt?: string) {
+  return updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'worker',
+      task: 'Task',
+      ...(prompt === undefined ? {} : { prompt }),
+      capabilities: {},
+    }),
+    '/repo',
+    1,
+  );
+}
+
+await test('tool output is capped even when the tool is not the newest entry', () => {
+  let store = spawnedChild();
+  for (const update of [
+    { sessionUpdate: 'tool_call', toolCallId: 'shell', title: 'Run', status: 'in_progress' },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Waiting' } },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'shell',
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: 'o'.repeat(200_000) } }],
+      rawOutput: 'r'.repeat(200_000),
+    },
+  ])
+    store = updateNativeSubagents(store, event('child', update), '/repo', 2);
+
+  const tool = store['codex:child'].transcript.find((entry) => entry.id === 'shell');
+  assert.ok(tool?.type === 'tool');
+  assert.equal(tool.status, 'completed');
+  assert.equal(tool.content.length, nativeMessageLimit);
+  assert.ok(tool.content.startsWith('…o'));
+  assert.ok(typeof tool.output !== 'string' || tool.output.length <= nativeMessageLimit);
+  assert.equal(store['codex:child'].transcript.at(-1)?.type, 'assistant');
+});
+
+await test('an update for a tool the bound evicted adds no stub entry', () => {
+  let store = spawnedChild('Start here');
+  for (let index = 0; index < nativeTranscriptLimit + 5; index++)
+    store = updateNativeSubagents(
+      store,
+      event('child', {
+        sessionUpdate: 'tool_call',
+        toolCallId: `tool-${index}`,
+        title: `Step ${index}`,
+        status: 'in_progress',
+      }),
+      '/repo',
+      index + 2,
+    );
+  const before = store['codex:child'].transcript;
+  assert.ok(!before.some((entry) => entry.id === 'tool-0'));
+
+  store = updateNativeSubagents(
+    store,
+    event('child', {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tool-0',
+      status: 'completed',
+    }),
+    '/repo',
+    999,
+  );
+
+  const after = store['codex:child'].transcript;
+  assert.equal(after, before);
+  store = updateNativeSubagents(
+    store,
+    event('child', {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: `tool-${nativeTranscriptLimit + 4}`,
+      status: 'completed',
+    }),
+    '/repo',
+    1000,
+  );
+  const last = store['codex:child'].transcript.at(-1);
+  assert.ok(last?.type === 'tool');
+  assert.equal(last.status, 'completed');
+});
+
+await test('a chunk appended to a long spawn prompt keeps the prompt start', () => {
+  const prompt = `START${'P'.repeat(nativeMessageLimit + 10_000)}`;
+  const store = updateNativeSubagents(
+    spawnedChild(prompt),
+    event('child', {
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: 'more' },
+    }),
+    '/repo',
+    2,
+  );
+
+  const first = store['codex:child'].transcript[0];
+  assert.ok(first.type === 'user');
+  assert.ok(first.text.startsWith('START'));
+  assert.ok(first.text.endsWith('more'));
+});

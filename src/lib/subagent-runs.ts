@@ -222,11 +222,13 @@ function usage({ tokens, toolUses, durationMs }: TaskNotification): SubagentUsag
 
 function notificationRuns(transcripts: readonly ParentTranscript[]): SubagentRun[] {
   return transcripts.flatMap(({ agent, sessionId, directory, entries }) => {
+    // Restored entries can lack a time; the parent's latest known one keeps them in order.
+    const latest = Math.max(0, ...entries.map((entry) => entry.created ?? 0));
     const notes = entries.flatMap((entry) =>
       entry.type === 'user'
         ? splitTaskNotifications(entry.text).flatMap((segment) =>
             segment.type === 'notification'
-              ? [{ notification: segment.notification, at: entry.created ?? 0 }]
+              ? [{ notification: segment.notification, at: entry.created ?? latest }]
               : [],
           )
         : [],
@@ -314,6 +316,11 @@ function merge(candidates: SubagentRun[]): SubagentRun {
   return run;
 }
 
+/** Creation order, with runs that carry no time at all last. */
+function order(run: SubagentRun): number {
+  return run.created ?? (run.updated || Number.POSITIVE_INFINITY);
+}
+
 /** Joins every subagent source into one run per child session. When sources overlap, the
  * higher-precedence source sets the state; others fill descriptive fields it lacks, and outcome
  * text only when they report the same state. */
@@ -339,7 +346,5 @@ export function subagentRuns({
     .map((candidates) =>
       merge(candidates.toSorted((a, b) => rank(a) - rank(b) || b.updated - a.updated)),
     )
-    .toSorted(
-      (a, b) => (a.created ?? a.updated) - (b.created ?? b.updated) || a.id.localeCompare(b.id),
-    );
+    .toSorted((a, b) => order(a) - order(b) || a.id.localeCompare(b.id));
 }

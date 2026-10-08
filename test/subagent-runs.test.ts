@@ -355,3 +355,47 @@ await test('OpenCode children are keyed by session id with live state', () => {
   assert.equal(runs[0].task, 'Search the docs');
   assert.equal(runs[0].model, 'provider-a:model-a');
 });
+
+await test('a notification from an entry without a time sorts by the parent transcript', () => {
+  const runs = subagentRuns({
+    receipts: [receipt({ created: 50, updated: 60 })],
+    transcripts: [
+      {
+        agent: 'claude',
+        sessionId: 'root',
+        directory: '/repo',
+        entries: [
+          { id: 'earlier', type: 'user', text: 'earlier', created: 100 },
+          { id: 'note', type: 'user', text: notification('task-late', 'completed', 'Done') },
+        ],
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    runs.map((run) => [run.id, run.updated]),
+    [
+      ['acp:claude:task-1', 60],
+      ['acp:claude:task-late', 100],
+    ],
+  );
+});
+
+await test('runs with no time at all sort after timed runs', () => {
+  const runs = subagentRuns({
+    receipts: [receipt({ created: 50, updated: 60 })],
+    transcripts: [
+      {
+        agent: 'claude',
+        sessionId: 'root',
+        directory: '/repo',
+        entries: [{ id: 'note', type: 'user', text: notification('task-x', 'completed', 'Done') }],
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    runs.map((run) => run.id),
+    ['acp:claude:task-1', 'acp:claude:task-x'],
+  );
+});

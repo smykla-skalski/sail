@@ -80,15 +80,31 @@ function messageTail(text: string): string {
   return `…${text.slice(code >= 0xdc00 && code <= 0xdfff ? start + 1 : start)}`;
 }
 
-/** Keeps a live child's transcript bounded after an update changed it: the spawn prompt plus the
- * newest entries. Streaming chunks only ever grow the last entry, so only that one needs
- * trimming. */
-export function boundNativeTranscript(entries: AgentEntry[]): AgentEntry[] {
-  const last = entries.at(-1);
-  const trimmed =
-    last && last.type !== 'tool' && last.text.length > nativeMessageLimit
-      ? [...entries.slice(0, -1), { ...last, text: messageTail(last.text) }]
-      : entries;
+function boundEntry(entry: AgentEntry): AgentEntry {
+  if (entry.type !== 'tool')
+    return entry.text.length > nativeMessageLimit && !entry.id.endsWith(':prompt')
+      ? { ...entry, text: messageTail(entry.text) }
+      : entry;
+  const long = (value: unknown): value is string =>
+    typeof value === 'string' && value.length > nativeMessageLimit;
+  if (!long(entry.content) && !long(entry.output)) return entry;
+  return {
+    ...entry,
+    ...(long(entry.content) ? { content: messageTail(entry.content) } : {}),
+    ...(long(entry.output) ? { output: messageTail(entry.output) } : {}),
+  };
+}
+
+/** Keeps a live child's transcript bounded after an update changed it: the spawn prompt, which
+ * stays whole, plus the newest entries. Streaming chunks only ever grow the last entry and a tool
+ * update only rewrites its own tool, so only those need trimming. */
+export function boundNativeTranscript(entries: AgentEntry[], toolCallId?: string): AgentEntry[] {
+  const index = toolCallId
+    ? entries.findIndex((entry) => entry.type === 'tool' && entry.id === toolCallId)
+    : entries.length - 1;
+  const entry = index >= 0 ? entries[index] : undefined;
+  const bounded = entry && boundEntry(entry);
+  const trimmed = bounded && bounded !== entry ? entries.with(index, bounded) : entries;
   if (trimmed.length <= nativeTranscriptLimit) return trimmed;
   const prompt = trimmed[0]?.id.endsWith(':prompt') ? [trimmed[0]] : [];
   return [...prompt, ...trimmed.slice(prompt.length - nativeTranscriptLimit)];
@@ -204,8 +220,23 @@ export function updateNativeSubagents(
   const id = nativeSubagentId(event.agent, parentSessionId);
   const child = store[id];
   if (!child) return store;
-  const next = updateEntries(child.transcript, update);
-  const transcript = next === child.transcript ? next : boundNativeTranscript(next);
+  const toolCallId = typeof update.toolCallId === 'string' ? update.toolCallId : undefined;
+  // An update for a tool the bound already evicted would come back as a blank stub.
+  const evicted =
+    update.sessionUpdate === 'tool_call_update' &&
+    toolCallId !== undefined &&
+    child.transcript.length >= nativeTranscriptLimit &&
+    !child.transcript.some((entry) => entry.type === 'tool' && entry.id === toolCallId);
+  const next = evicted ? child.transcript : updateEntries(child.transcript, update);
+  const transcript =
+    next === child.transcript
+      ? next
+      : boundNativeTranscript(
+          next,
+          update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update'
+            ? toolCallId
+            : undefined,
+        );
   const settled = ['completed', 'failed', 'interrupted'].includes(child.outcome);
   return {
     ...store,
