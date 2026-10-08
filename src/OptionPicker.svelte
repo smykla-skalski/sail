@@ -241,7 +241,7 @@
     max-height: 260px;
     overflow: auto;
     padding: 4px;
-    border: 1px solid var(--border, var(--shell-divider));
+    border: 1px solid var(--shell-divider);
     border-radius: 8px;
     background: var(--sui-surface);
     box-shadow: 0 8px 24px #0002;

@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { topbarMenuTrigger } from './topbar';
 
 describe('review evidence', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-review-evidence-e2e-'));
@@ -29,7 +30,7 @@ describe('review evidence', () => {
       );
     }, path);
     await browser.refresh();
-    await expect($('.agent-launches button')).toBeDisplayed();
+    await expect(topbarMenuTrigger('New agent')).toBeDisplayed();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
 

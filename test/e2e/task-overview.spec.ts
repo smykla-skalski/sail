@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { chooseTopbarAction } from './topbar';
 
 describe('cross-worktree task overview', () => {
   const root = mkdtempSync(join(tmpdir(), 'sail-task-overview-'));
@@ -66,7 +67,7 @@ describe('cross-worktree task overview', () => {
     await browser.refresh();
     await $('.app-shell').waitForDisplayed();
 
-    await $('button=Overview').click();
+    await chooseTopbarAction('More actions', 'Task overview');
     await expect($('main[aria-label="Task overview"]')).toBeDisplayed();
     await expect($('.workspace-pane-host')).toHaveAttribute('hidden');
     await expect($$('.task-card')).toBeElementsArrayOfSize(2);

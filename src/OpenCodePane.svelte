@@ -51,6 +51,7 @@
     runSerialOpenCodeTurn,
     waitForAuthoritativeOpenCodeSettlement,
   } from './lib/opencode-turns';
+  import { openCodeHeaderStatus } from './lib/agent-status';
   import PromptPanel from './PromptPanel.svelte';
   import type { AgentThread } from './lib/acp';
   import { withSpawnResponses, type SpawnReceipt } from './lib/agent-results';
@@ -338,19 +339,14 @@
     !!setup?.workReady || (session?.agent === 'architect' && !!setup?.planReady),
   );
   const visibleStatus = $derived(
-    runtimeState === 'starting'
-      ? 'connecting'
-      : runtimeState !== 'connected'
-        ? 'offline'
-        : pendingPermissions.length || pendingForms.length
-          ? 'waiting'
-          : loading
-            ? 'connecting'
-            : busy
-              ? 'working'
-              : inputReady
-                ? 'ready'
-                : 'offline',
+    openCodeHeaderStatus({
+      runtime: runtimeState,
+      waiting: pendingPermissions.length > 0 || pendingForms.length > 0,
+      loading,
+      running,
+      sending,
+      inputReady,
+    }),
   );
   const workspaceActivity = $derived(
     workspaceActivityItems({
@@ -1339,7 +1335,7 @@
     justify-content: space-between;
     gap: 12px;
     padding: 14px 24px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--shell-divider);
   }
   .opencode-pane .agent-heading {
     display: flex;
@@ -1399,7 +1395,7 @@
     font: inherit;
   }
   .opencode-pane .agent-error {
-    color: var(--danger, #d66);
+    color: var(--sui-danger-ink);
   }
   .opencode-pane .agent-picker-controls,
   .opencode-pane .agent-actions {

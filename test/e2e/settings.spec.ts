@@ -71,6 +71,19 @@ describe('disk-backed settings', () => {
       });
       throw cause;
     }
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(() => {
+          const button = document.querySelector('.welcome-agents .sui-button');
+          if (!button) return null;
+          const style = getComputedStyle(button);
+          return `${style.backgroundColor} ${style.color}`;
+        })) === 'rgb(21, 26, 33) rgb(243, 246, 247)',
+      {
+        timeout: 5000,
+        timeoutMsg: 'Secondary buttons kept light-theme colors after switching to dark',
+      },
+    );
     await browser.execute(() => localStorage.clear());
     await browser.refresh();
     await expect($(`.project-repository-select[title="${path}"]`)).toBeDisplayed();

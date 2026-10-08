@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { topbarMenuTrigger } from './topbar';
 import { loadProjectCatalog } from '../../src/lib/projects.ts';
 
 describe('close worktree shortcut', () => {
@@ -63,7 +64,7 @@ describe('close worktree shortcut', () => {
       second,
     );
     await browser.refresh();
-    await diagnose('Workspace load', () => expect($('.agent-launches button')).toBeDisplayed());
+    await diagnose('Workspace load', () => expect(topbarMenuTrigger('New agent')).toBeDisplayed());
   }
 
   const catalogPaths = async () => {

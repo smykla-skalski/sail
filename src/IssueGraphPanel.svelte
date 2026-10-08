@@ -374,7 +374,7 @@
 
 <style>
   .issue-graph {
-    border-top: 1px solid var(--border-color, #555);
+    border-top: 1px solid var(--shell-divider);
     padding-top: 1rem;
     margin-top: 1rem;
     display: grid;
@@ -407,6 +407,6 @@
     gap: 0.5rem;
   }
   .errors {
-    color: var(--color-danger, #d33);
+    color: var(--sui-danger-ink);
   }
 </style>

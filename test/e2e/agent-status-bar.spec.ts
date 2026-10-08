@@ -4,6 +4,15 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+function secondaryColors() {
+  return browser.execute(() =>
+    [...document.querySelectorAll('.sui-button[data-variant="secondary"]')].map((button) => {
+      const style = getComputedStyle(button);
+      return `${button.textContent?.trim()}: ${style.backgroundColor} ${style.color}`;
+    }),
+  );
+}
+
 describe('agent status bar', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-agent-status-'));
 
@@ -39,9 +48,26 @@ describe('agent status bar', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-composer textarea')).toBeEnabled();
     await $('.agent-composer textarea').setValue('Delayed approval');
+    await browser.execute(() => {
+      const disagreements: string[] = [];
+      const sample = () => {
+        const header = document.querySelector('.agent-header .activity-status')?.textContent ?? '';
+        const summary = document.querySelector('.agent-status-summary')?.textContent ?? '';
+        if (header.includes('Working') && summary.includes('No agents running'))
+          disagreements.push(header.trim());
+      };
+      Reflect.set(window, 'sailStatusDisagreements', disagreements);
+      Reflect.set(window, 'sailStatusSampler', setInterval(sample, 20));
+    });
     await $('.agent-actions button').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await expect(bar).toHaveText(expect.stringContaining('1 need input'));
+    const disagreements = await browser.execute(() => {
+      clearInterval(Reflect.get(window, 'sailStatusSampler'));
+      const samples: unknown = Reflect.get(window, 'sailStatusDisagreements');
+      return Array.isArray(samples) ? samples.map(String) : ['sampler missing'];
+    });
+    expect(disagreements).toEqual([]);
 
     await $('.agent-status-summary').click();
     const details = $('.agent-status-popover');
@@ -54,6 +80,19 @@ describe('agent status bar', () => {
     });
     expect(popoverLayout.left).toBeGreaterThanOrEqual(0);
     expect(popoverLayout.right).toBeLessThanOrEqual(popoverLayout.width);
+
+    await browser.execute(() => (document.documentElement.dataset.suiTheme = 'dark'));
+    await browser.waitUntil(
+      async () => {
+        const colors = await secondaryColors();
+        return (
+          colors.length >= 2 &&
+          colors.every((color) => color.endsWith('rgb(21, 26, 33) rgb(243, 246, 247)'))
+        );
+      },
+      { timeout: 5000, timeoutMsg: 'Dark secondary buttons kept light-theme colors' },
+    );
+    await browser.execute(() => (document.documentElement.dataset.suiTheme = 'light'));
 
     await browser.keys('Escape');
     await expect(details).not.toExist();

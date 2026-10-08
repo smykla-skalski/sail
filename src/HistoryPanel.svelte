@@ -122,7 +122,7 @@
     line-height: 1.5;
   }
   .history-error[role='alert'] {
-    color: var(--sui-destructive, #c33);
+    color: var(--sui-danger-ink);
   }
   .history-list {
     flex: 1;

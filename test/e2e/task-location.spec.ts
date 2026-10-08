@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { topbarMenuTrigger } from './topbar';
 
 describe('composer task location', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-location-repository-'));
@@ -56,7 +57,7 @@ describe('composer task location', () => {
       branch,
     );
     await browser.refresh();
-    await expect($('.agent-launches button')).toBeDisplayed();
+    await expect(topbarMenuTrigger('New agent')).toBeDisplayed();
     await $('.agent-launches button').click();
     await expect($('.agent-composer .task-location')).toHaveAttribute(
       'aria-label',
@@ -83,7 +84,7 @@ describe('composer task location', () => {
     expect(restoredLabels).toEqual(splitLabels);
 
     await $(`.project-worktree-select[title="${worktreePath}"]`).click();
-    await expect($('.agent-launches button')).toBeDisplayed();
+    await expect(topbarMenuTrigger('New agent')).toBeDisplayed();
     await $('.agent-launches button').click();
     await expect($('.agent-composer .task-location')).toHaveAttribute(
       'aria-label',

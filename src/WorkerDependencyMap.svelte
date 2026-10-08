@@ -243,7 +243,7 @@
     border: 1px solid var(--shell-divider);
     border-left: 4px solid var(--sui-primary);
     border-radius: 8px;
-    background: var(--sui-surface-raised, var(--sui-surface));
+    background: var(--sui-surface);
   }
   .map-node[data-state='blocked'],
   .map-node[data-state='failed'],
@@ -252,7 +252,7 @@
   }
   .map-node[data-state='waiting'],
   .map-node[data-state='queued'] {
-    border-left-color: var(--sui-warning, var(--sui-primary));
+    border-left-color: var(--activity-waiting);
   }
   .node-select {
     display: flex;
