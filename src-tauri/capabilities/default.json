@@ -78,6 +78,8 @@
     "allow-acp-permission",
     "allow-acp-permission-resources-trusted",
     "allow-acp-pending-permissions",
+    "allow-acp-pending-elicitations",
+    "allow-acp-elicitation",
     "allow-acp-pending-inbox",
     "allow-acp-activity",
     "allow-acp-native-subagents",
