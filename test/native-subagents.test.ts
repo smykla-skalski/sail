@@ -811,24 +811,25 @@ await test('tool calls are counted once, even after the transcript evicts them',
   assert.equal(nativeSubagentReceipts(childUpdates([]))[0].toolCount, undefined);
 });
 
-await test('a child accepts prompts only when its adapter advertises the capability', () => {
-  const spawn = (capabilities: Record<string, unknown>) =>
-    updateNativeSubagents(
-      {},
-      event('parent', {
-        sessionUpdate: 'subagent_spawned',
-        subagentSessionId: 'child',
-        name: 'worker',
-        task: 'Task',
-        capabilities,
-      }),
-      '/repo',
-      1,
-      false,
-      'build',
-    )['codex:child'];
+function spawnWithCapabilities(capabilities: Record<string, unknown>) {
+  return updateNativeSubagents(
+    {},
+    event('parent', {
+      sessionUpdate: 'subagent_spawned',
+      subagentSessionId: 'child',
+      name: 'worker',
+      task: 'Task',
+      capabilities,
+    }),
+    '/repo',
+    1,
+    false,
+    'build',
+  )['codex:child'];
+}
 
-  assert.equal(nativeSubagentAcceptsPrompts(spawn({})), false);
-  assert.equal(nativeSubagentAcceptsPrompts(spawn({ prompt: {} })), true);
+await test('a child accepts prompts only when its adapter advertises the capability', () => {
+  assert.equal(nativeSubagentAcceptsPrompts(spawnWithCapabilities({})), false);
+  assert.equal(nativeSubagentAcceptsPrompts(spawnWithCapabilities({ prompt: {} })), true);
   assert.equal(nativeSubagentAcceptsPrompts(undefined), false);
 });
