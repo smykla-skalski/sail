@@ -59,6 +59,7 @@
     removeStructuredQuestion,
     saveNativePlan,
   } from './lib/planning-state';
+  import { elicitationSummary } from './lib/elicitation-form';
   import ShipPanel from './ShipPanel.svelte';
   import AppTopbar from './AppTopbar.svelte';
   import {
@@ -9298,6 +9299,7 @@
         const nativeChild = nativeSubagents[nativeSubagentId(pending.agent, sessionId)];
         if (pending.message.method === 'elicitation/create') {
           const message = pending.message.params?.message;
+          const schema = pending.message.params?.requestedSchema;
           items.push({
             ...location,
             key: `elicitation:${pending.agent}:${sessionId}:${requestId}`,
@@ -9306,7 +9308,7 @@
             agentId: pending.agent,
             sessionId,
             requestId,
-            text: typeof message === 'string' ? message : 'Agent question',
+            text: elicitationSummary(message, schema),
             receivedAt: pending.receivedAt,
           });
           continue;

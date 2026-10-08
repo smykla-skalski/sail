@@ -25,6 +25,14 @@ There is no automatic updater. To update, download the next package for your pla
 - Failed tool cards no longer re-announce old errors when a thread loads; only errors that arrive while you watch interrupt a screen reader.
 - Scrollbars appear when you hover a scrollable area, not only while it scrolls.
 
+## Agent questions
+
+- When Claude asks a question, its answer options appear as cards with each option's title and description. Single-choice questions use radio cards (arrow keys move between them) and multi-select questions use checkboxes. Before, Sail dropped the options and showed only a blank text field.
+- The question text is the form heading, its short header sits above it as a label, and forms with several questions show each question above its options.
+- Each question keeps an optional **Other** field for your own answer or a note on the option you picked.
+- When an option comes with a preview, such as a code snippet, Sail shows it under the options for the focused or selected option.
+- The Inbox lists every question in a multi-question request instead of "Please answer the following questions."
+
 ## Attention and notifications
 
 - **Notification default changed.** OS notifications now default to "Only when Sail is in the background". Before, Sail notified whenever the thread was not the one on screen, even while you were using Sail. Choose Never, Only when Sail is in the background, or Always for each type (Needs your input, Turn completed, Ship updates) in Settings. Existing profiles move to the new default, except one that had OS notifications switched off: it keeps Never for every type.
