@@ -1325,6 +1325,10 @@
   let messageGeneration = new SvelteMap<string, number>();
   let snapshot = $state<PlanSnapshot>({ plan: null, questions: null });
   let nativePlan = $state<NativePlan | null>(null);
+  let nativePlanFeedback = $state('');
+  let nativePlanRevision = $state<{ id: string; feedback: string } | null>(null);
+  let nativePlanRevisionPending = $state(false);
+  let nativePlanRevisionError = $state('');
   let diffs = $state<WorkingDiffInfo[]>([]);
   let diffLoading = $state(false);
   let diffError = $state('');
@@ -1335,6 +1339,25 @@
   let diffRefresh = 0;
   let diffRevision = '';
   let diffRevisionPath = '';
+
+  function requestNativePlanRevision() {
+    const feedback = nativePlanFeedback.trim();
+    if (!feedback) {
+      nativePlanRevisionError = 'Describe what should change before requesting a revision.';
+      return;
+    }
+    nativePlanRevisionError = '';
+    nativePlanRevisionPending = true;
+    nativePlanRevision = { id: crypto.randomUUID(), feedback };
+  }
+
+  function finishNativePlanRevision(id: string, failure: string | null) {
+    if (nativePlanRevision?.id !== id) return;
+    nativePlanRevisionPending = false;
+    nativePlanRevision = null;
+    nativePlanRevisionError = failure ?? '';
+    if (!failure) nativePlanFeedback = '';
+  }
   let draft = $state('');
   const failureRequests = new SvelteMap<string, string>();
   let mainPrompt = $state<HTMLTextAreaElement | undefined>();
@@ -14651,7 +14674,17 @@
                     ...agentEntrySnapshots,
                     main: { entries, sessionId, ready },
                   })}
-                onnativeplan={(plan) => (nativePlan = plan)}
+                onnativeplan={(plan) => {
+                  nativePlan = plan;
+                  if (!plan) {
+                    nativePlanFeedback = '';
+                    nativePlanRevision = null;
+                    nativePlanRevisionPending = false;
+                    nativePlanRevisionError = '';
+                  }
+                }}
+                planRevision={nativePlanRevision ?? undefined}
+                onplanrevisionresult={finishNativePlanRevision}
                 onworkspaceactivity={updateMainAgentWorkspaceActivity}
                 ondecision={(thread, permission, optionId) =>
                   recordDecisionActivity(
@@ -15226,6 +15259,29 @@
                         {task.status}: {task.title}
                       </li>{/each}
                   </ul>{/if}
+                <div class="native-plan-revision">
+                  <label for="native-plan-feedback">Revision feedback</label>
+                  <textarea
+                    id="native-plan-feedback"
+                    bind:value={nativePlanFeedback}
+                    rows="3"
+                    placeholder="Describe what should change in this plan"
+                    disabled={nativePlanRevisionPending}></textarea>
+                  {#if nativePlanRevisionError}<p role="alert">{nativePlanRevisionError}</p>{/if}
+                  {#if nativePlanRevisionError}<Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={requestNativePlanRevision}
+                      disabled={nativePlanRevisionPending}
+                      loading={nativePlanRevisionPending}>Retry revision</Button
+                    >{:else}<Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={requestNativePlanRevision}
+                      disabled={nativePlanRevisionPending}
+                      loading={nativePlanRevisionPending}>Request revision</Button
+                    >{/if}
+                </div>
               </section>{:else}<PlanPanel
                 {snapshot}
                 client={connecting ? null : client}

@@ -174,6 +174,8 @@
     onterminal: (id: string) => void;
     onentrieschange?: (entries: AgentEntry[], sessionId: string | null, ready: boolean) => void;
     onnativeplan?: (plan: NativePlan | null) => void;
+    planRevision?: { id: string; feedback: string };
+    onplanrevisionresult?: (id: string, failure: string | null) => void;
     ondecision?: (thread: AgentThread, permission: AgentPermission, optionId: string) => void;
     ephemeral?: boolean;
     seedContext?: string;
@@ -222,6 +224,8 @@
     onterminal,
     onentrieschange,
     onnativeplan,
+    planRevision,
+    onplanrevisionresult,
     ondecision,
     ephemeral = false,
     seedContext = '',
@@ -477,8 +481,17 @@
   let entries = $state.raw<AgentEntry[]>([]);
   let nativePlan = $state<NativePlan | null>(null);
   let planRequested = $state(false);
+  let completedTurn = Promise.resolve();
+  let lastPlanRevisionId = '';
+  let activePlanRevision: { id: string; feedback: string; reported: boolean } | null = null;
   $effect(() => {
     if (nativeEntries) entries = nativeEntries;
+  });
+  $effect(() => {
+    const revision = planRevision;
+    if (!revision || revision.id === lastPlanRevisionId) return;
+    lastPlanRevisionId = revision.id;
+    void sendPlanRevision(revision);
   });
   let visibleCount = $state(50);
   let historyLoaded = $state(true);
@@ -1392,7 +1405,11 @@
     };
   });
 
-  async function send(externalText?: string, queuedMessage?: QueuedAgentMessage) {
+  async function send(
+    externalText?: string,
+    queuedMessage?: QueuedAgentMessage,
+    forcePlan = false,
+  ) {
     if (externalText === undefined) await pendingPaste;
     const external = externalText !== undefined;
     const text =
@@ -1447,6 +1464,8 @@
     recoveryEligible = false;
     const current = generation;
     const turnId = crypto.randomUUID();
+    let finishTurn!: () => void;
+    completedTurn = new Promise<void>((resolve) => (finishTurn = resolve));
     activeTurnId = turnId;
     let activityThread = thread;
     let finalStatus: ThreadStatus = 'done';
@@ -1506,7 +1525,7 @@
         onactivity({ ...activityThread, model: modelOption?.currentValue || activityThread.model });
       const id = activityThread?.sessionId ?? activeSessionId;
       deliverySessionId = id;
-      if (planRequested) {
+      if (planRequested || forcePlan) {
         if (!id || !planModeOption)
           throw new Error(`${name} does not expose a planning mode for this session.`);
         const result = await acp.setConfig(turnAgent, id, planModeOption.id, 'plan');
@@ -1558,6 +1577,7 @@
           ? `Read-only context from the parent thread:\n${seedContext}\n\nSide question: ${skillText}`
           : skillText + directClaim,
       );
+      if (stopRequested) throw new Error('Agent turn was cancelled.');
       phase = 'prompt';
       if (id && sentImages.length)
         onattachmentsent?.(
@@ -1680,6 +1700,7 @@
       if (activeTurnId === turnId) activeTurnId = null;
       if (activityThread) onstatus(activityThread, finalStatus, notifyOnDone);
       if (current === generation) busy = false;
+      finishTurn();
       if (
         current === generation &&
         !external &&
@@ -1692,6 +1713,30 @@
         setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, false);
       }
     }
+    return finalStatus;
+  }
+
+  async function sendPlanRevision(revision: { id: string; feedback: string }) {
+    activePlanRevision = { ...revision, reported: false };
+    try {
+      // A native plan is emitted before its prompt settles. A revision is a
+      // new ACP prompt, never a steering request into the planning turn.
+      await completedTurn;
+      if (disposed || !nativePlan) throw new Error('The native plan is no longer available.');
+      const status = await send(revision.feedback, undefined, true);
+      if (status !== 'done' || stopRequested) throw new Error('Plan revision was cancelled.');
+      reportPlanRevision(revision.id, null);
+    } catch (cause) {
+      reportPlanRevision(revision.id, describe(cause));
+    } finally {
+      if (activePlanRevision?.id === revision.id) activePlanRevision = null;
+    }
+  }
+
+  function reportPlanRevision(id: string, failure: string | null) {
+    if (!activePlanRevision || activePlanRevision.id !== id || activePlanRevision.reported) return;
+    activePlanRevision.reported = true;
+    onplanrevisionresult?.(id, failure);
   }
 
   async function runShell(command: string) {
@@ -1876,6 +1921,8 @@
 
   async function stop() {
     stopRequested = true;
+    if (activePlanRevision)
+      reportPlanRevision(activePlanRevision.id, 'Plan revision was cancelled.');
     diagnostic('stop_requested');
     if (!activeSessionId) {
       return;
