@@ -147,6 +147,31 @@ describe('type scale and reading column', () => {
     await capture('desktop-type-scale-light');
   });
 
+  it('gives Markdown headings in the transcript a size scale', async () => {
+    await browser.execute(() => {
+      const composer = document.querySelector<HTMLTextAreaElement>('.agent-composer textarea');
+      if (!composer) throw new Error('No composer');
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(
+        composer,
+        '# Heading one\n## Heading two\n### Heading three\n\nBody text',
+      );
+      composer.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await $('.agent-actions button:last-of-type').click();
+    await $('.permission-card .permission-link').click();
+    await $('.permission-card .permission-actions button').click();
+    await expect($('.agent-conversation .markdown h1')).toBeDisplayed();
+    const sizes = await browser.execute(() =>
+      ['h1', 'h2', 'h3', 'p'].map(
+        (tag) =>
+          getComputedStyle(
+            [...document.querySelectorAll(`.agent-conversation .markdown ${tag}`)].at(-1)!,
+          ).fontSize,
+      ),
+    );
+    expect(sizes).toEqual(['20px', '16px', '14px', '14px']);
+  });
+
   for (const theme of ['light', 'dark'] as const)
     for (const [width, height] of [
       [1280, 850],
