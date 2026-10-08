@@ -334,6 +334,7 @@ impl AgentWorktreeFence {
 
 struct Connection {
     agent: String,
+    profile: CapabilityProfile,
     child: Mutex<Child>,
     #[cfg(unix)]
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
@@ -1140,6 +1141,50 @@ impl PromptState {
     }
 }
 
+fn append_connection_activity(
+    activity: &mut HashMap<String, AgentActivity>,
+    agent: &str,
+    alive: bool,
+    prompts: &PromptState,
+    directories: &HashMap<String, PathBuf>,
+    permissions: &HashMap<String, PendingPermission>,
+) {
+    if !alive {
+        return;
+    }
+    let item = activity
+        .entry(agent.to_string())
+        .or_insert_with(|| AgentActivity {
+            alive: true,
+            active: Vec::new(),
+            active_turns: HashMap::new(),
+            waiting: Vec::new(),
+            sessions: Vec::new(),
+            finished: HashMap::new(),
+        });
+    item.alive = true;
+    item.active.extend(prompts.active.keys().cloned());
+    item.active_turns.extend(
+        prompts
+            .active
+            .iter()
+            .map(|(session, prompt)| (session.clone(), prompt.turn_id.clone())),
+    );
+    item.finished.extend(prompts.finished.clone());
+    item.sessions.extend(directories.keys().cloned());
+    item.waiting.extend(
+        permissions
+            .values()
+            .filter_map(|pending| {
+                pending
+                    .message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string),
+    );
+}
+
 struct ActivePrompt {
     turn_id: String,
     text: String,
@@ -1687,37 +1732,13 @@ pub fn acp_activity(
             .permission_state
             .lock()
             .map_err(|error| error.to_string())?;
-        let item = activity
-            .entry(runtime.agent.clone())
-            .or_insert_with(|| AgentActivity {
-                alive: false,
-                active: Vec::new(),
-                active_turns: HashMap::new(),
-                waiting: Vec::new(),
-                sessions: Vec::new(),
-                finished: HashMap::new(),
-            });
-        item.alive |= runtime.alive.load(Ordering::Acquire);
-        item.active.extend(prompts.active.keys().cloned());
-        item.active_turns.extend(
-            prompts
-                .active
-                .iter()
-                .map(|(session, prompt)| (session.clone(), prompt.turn_id.clone())),
-        );
-        item.finished.extend(prompts.finished.clone());
-        item.sessions.extend(directories.keys().cloned());
-        item.waiting.extend(
-            permission_state
-                .pending
-                .values()
-                .filter_map(|pending| {
-                    pending
-                        .message
-                        .pointer("/params/sessionId")
-                        .and_then(Value::as_str)
-                })
-                .map(str::to_string),
+        append_connection_activity(
+            &mut activity,
+            &runtime.agent,
+            runtime.alive.load(Ordering::Acquire),
+            &prompts,
+            &directories,
+            &permission_state.pending,
         );
     }
     Ok(activity)
@@ -1892,8 +1913,24 @@ fn connection_for_profile(
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     agents
         .get(&(id.to_string(), profile))
+        .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".into())
+}
+
+fn unique_session_owner(
+    profiles: impl IntoIterator<Item = CapabilityProfile>,
+) -> Result<Option<CapabilityProfile>, String> {
+    let mut owner = None;
+    for profile in profiles {
+        if owner.is_some_and(|current| current != profile) {
+            return Err(
+                "Agent session is connected under multiple capability profiles.".to_string(),
+            );
+        }
+        owner = Some(profile);
+    }
+    Ok(owner)
 }
 
 fn connection_for_session(
@@ -1902,17 +1939,71 @@ fn connection_for_session(
     session_id: &str,
 ) -> Result<Arc<Connection>, String> {
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
-    agents
+    let matches = agents
         .values()
-        .find(|runtime| {
+        .filter(|runtime| {
             runtime.agent == id
+                && runtime.alive.load(Ordering::Acquire)
                 && runtime
                     .session_profiles
                     .lock()
                     .is_ok_and(|profiles| profiles.contains_key(session_id))
         })
+        .collect::<Vec<_>>();
+    unique_session_owner(matches.iter().map(|runtime| runtime.profile))?;
+    matches
+        .first()
         .cloned()
-        .ok_or_else(|| "Agent session is not connected.".into())
+        .cloned()
+        .ok_or_else(|| "Agent session is not connected.".to_string())
+}
+
+fn register_session(
+    manager: &AgentManager,
+    agent: &str,
+    profile: CapabilityProfile,
+    session_id: &str,
+    directory: PathBuf,
+) -> Result<Arc<Connection>, String> {
+    let agents = manager.0.lock().map_err(|error| error.to_string())?;
+    let mut owners = Vec::new();
+    for runtime in agents
+        .values()
+        .filter(|runtime| runtime.agent == agent && runtime.alive.load(Ordering::Acquire))
+    {
+        if runtime
+            .session_profiles
+            .lock()
+            .map_err(|error| error.to_string())?
+            .contains_key(session_id)
+        {
+            owners.push(runtime.profile);
+        }
+    }
+    if let Some(owner) = unique_session_owner(owners)? {
+        if owner != profile {
+            return Err(format!(
+                "Agent session is already connected under the {} capability profile.",
+                owner.as_str()
+            ));
+        }
+    }
+    let runtime = agents
+        .get(&(agent.to_string(), profile))
+        .filter(|runtime| runtime.alive.load(Ordering::Acquire))
+        .cloned()
+        .ok_or_else(|| "Agent is not connected.".to_string())?;
+    runtime
+        .session_directories
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(session_id.to_string(), directory);
+    runtime
+        .session_profiles
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(session_id.to_string(), profile);
+    Ok(runtime)
 }
 
 #[tauri::command]
@@ -2097,6 +2188,7 @@ fn connect_blocking(
     }
     let runtime = Arc::new(Connection {
         agent: agent.clone(),
+        profile,
         child: Mutex::new(child),
         #[cfg(unix)]
         watchdog: Mutex::new(watchdog),
@@ -2119,6 +2211,7 @@ fn connect_blocking(
         ready: Condvar::new(),
     });
     let reader = Arc::clone(&runtime);
+    let reader_manager = manager.clone();
     let agent_id = agent.clone();
     let worktree_fence = app.state::<AgentWorktreeFence>().inner().clone();
     std::thread::spawn(move || {
@@ -2131,6 +2224,11 @@ fn connect_blocking(
                 );
                 continue;
             };
+            if message.get("method").is_some() {
+                if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
+                    params.insert("sailCapabilityProfile".into(), profile.as_str().into());
+                }
+            }
             if let Some(update) = message.pointer("/params/update") {
                 if let Some(session_id) =
                     message.pointer("/params/sessionId").and_then(Value::as_str)
@@ -2144,28 +2242,33 @@ fn connect_blocking(
                     let child_id = update.get("subagentSessionId").and_then(Value::as_str);
                     if let (Some(parent_id), Some(child_id)) = (parent_id, child_id) {
                         if parent_id != child_id {
-                            if let Ok(mut fence) = worktree_fence.0.lock() {
-                                let directory = reader.session_directories.lock().ok().and_then(
-                                    |mut directories| {
-                                        let directory = directories.get(parent_id).cloned()?;
-                                        directories
-                                            .entry(child_id.to_string())
-                                            .or_insert_with(|| directory.clone());
-                                        Some(directory)
-                                    },
-                                );
-                                if let (Some(directory), Ok(mut native)) =
-                                    (directory, reader.native_subagents.lock())
-                                {
-                                    native.spawn(parent_id, child_id, directory.clone());
-                                    let generation =
-                                        fence.generations.entry(directory).or_default();
-                                    *generation = generation.saturating_add(1);
-                                }
-                            }
-                            if let Ok(mut profiles) = reader.session_profiles.lock() {
-                                if let Some(profile) = profiles.get(parent_id).copied() {
-                                    profiles.entry(child_id.to_string()).or_insert(profile);
+                            let directory = reader
+                                .session_directories
+                                .lock()
+                                .ok()
+                                .and_then(|directories| directories.get(parent_id).cloned());
+                            if let Some(directory) = directory {
+                                match register_session(
+                                    &reader_manager,
+                                    &agent_id,
+                                    profile,
+                                    child_id,
+                                    directory.clone(),
+                                ) {
+                                    Ok(owner) => {
+                                        if let (Ok(mut fence), Ok(mut native)) =
+                                            (worktree_fence.0.lock(), owner.native_subagents.lock())
+                                        {
+                                            native.spawn(parent_id, child_id, directory.clone());
+                                            let generation =
+                                                fence.generations.entry(directory).or_default();
+                                            *generation = generation.saturating_add(1);
+                                        }
+                                    }
+                                    Err(error) => crate::diagnostics::record(
+                                        "acp_subagent_session_conflict",
+                                        json!({"agent":agent_id,"sessionId":child_id,"error":error}),
+                                    ),
                                 }
                             }
                         }
@@ -2248,7 +2351,13 @@ fn connect_blocking(
                                 let manager =
                                     app.state::<crate::acp_terminal::AcpTerminalManager>();
                                 let response = match crate::acp_terminal::handle(
-                                    &app, &manager, &agent, &method, params, directory,
+                                    &app,
+                                    &manager,
+                                    &agent,
+                                    runtime.profile,
+                                    &method,
+                                    params,
+                                    directory,
                                 ) {
                                     Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
                                     Err(error) => {
@@ -2347,7 +2456,7 @@ fn connect_blocking(
             json!({"agent":agent_id,"profile":profile.as_str(),"sessionIds":session_ids}),
         );
         app.state::<crate::acp_terminal::AcpTerminalManager>()
-            .stop_sessions(&agent_id, &session_ids);
+            .stop_sessions(&agent_id, profile, &session_ids);
         reader.ready.notify_all();
         if let Ok(mut state) = reader.permission_state.lock() {
             state.pending.clear();
@@ -2477,26 +2586,16 @@ pub async fn acp_new_session(
             let _ = fence.finish_session(&directory, native_generation);
             return Err("Agent did not return a session ID.".into());
         };
-        if let Some(generation) = native_generation {
-            fence.arm_session(&agent, id, &directory, generation)?;
-        } else {
-            fence.finish_session(&directory, None)?;
+        if let Err(error) = register_session(&manager, &agent, profile, id, directory.clone()) {
+            let _ = fence.finish_session(&directory, native_generation);
+            return Err(error);
         }
-        browser.identify(&config.token, id);
-        let persist = (|| -> Result<(), String> {
-            runtime
-                .session_directories
-                .lock()
-                .map_err(|error| error.to_string())?
-                .insert(id.to_string(), directory.clone());
-            runtime
-                .session_profiles
-                .lock()
-                .map_err(|error| error.to_string())?
-                .insert(id.to_string(), profile);
-            Ok(())
-        })();
-        if let Err(error) = persist {
+        let fence_result = if let Some(generation) = native_generation {
+            fence.arm_session(&agent, id, &directory, generation)
+        } else {
+            fence.finish_session(&directory, None)
+        };
+        if let Err(error) = fence_result {
             if let Ok(mut directories) = runtime.session_directories.lock() {
                 directories.remove(id);
             }
@@ -2506,6 +2605,7 @@ pub async fn acp_new_session(
             let _ = fence.release_session(&agent, id);
             return Err(error);
         }
+        browser.identify(&config.token, id);
         Ok(result)
     })
     .await
@@ -2597,7 +2697,13 @@ async fn restore_session(
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         connect_blocking(app, &manager, agent.clone(), profile)?;
-        let runtime = connection_for_profile(&manager, &agent, profile)?;
+        let runtime = register_session(
+            &manager,
+            &agent,
+            profile,
+            &session_id,
+            PathBuf::from(&cwd),
+        )?;
         let config = browser.config_for_profile(
             &cwd,
             Some(&session_id),
@@ -2606,16 +2712,6 @@ async fn restore_session(
         )?;
         let mcp_server = json!({"name":"sail-browser","command":config.command,"args":config.args,
             "env":config.env.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()});
-        runtime
-            .session_directories
-            .lock()
-            .map_err(|error| error.to_string())?
-            .insert(session_id.clone(), PathBuf::from(&cwd));
-        runtime
-            .session_profiles
-            .lock()
-            .map_err(|error| error.to_string())?
-            .insert(session_id.clone(), profile);
         let result = runtime.request(
             method,
             json!({"cwd":cwd,"sessionId":session_id,"mcpServers":[mcp_server]}),
@@ -2975,7 +3071,8 @@ pub async fn acp_prompt(
                     agent,
                     message: json!({"method":"sail/prompt_finished","params":{
                         "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
-                        "error":result.as_ref().err()
+                        "error":result.as_ref().err(),
+                        "sailCapabilityProfile":runtime.profile.as_str()
                     }}),
                 },
             );
@@ -3154,7 +3251,8 @@ pub fn acp_permission(
             message: json!({"method":"sail/permission_resolved","params":{
                 "sessionId":session_id,"requestId":request_id,
                 "sailPermissionGeneration":pending.generation,
-                "sailPermissionFingerprint":pending.fingerprint
+                "sailPermissionFingerprint":pending.fingerprint,
+                "sailCapabilityProfile":runtime.profile.as_str()
             }}),
         },
     );
@@ -3333,6 +3431,47 @@ mod native_subagent_fence_tests {
 #[cfg(test)]
 mod capability_profile_tests {
     use super::*;
+
+    #[test]
+    fn session_ids_have_only_one_live_capability_owner() {
+        assert_eq!(
+            unique_session_owner([CapabilityProfile::Build, CapabilityProfile::Build]).unwrap(),
+            Some(CapabilityProfile::Build)
+        );
+        assert_eq!(
+            unique_session_owner([CapabilityProfile::Build, CapabilityProfile::Review])
+                .unwrap_err(),
+            "Agent session is connected under multiple capability profiles."
+        );
+    }
+
+    #[test]
+    fn activity_excludes_sessions_from_dead_profile_connections() {
+        let mut activity = HashMap::new();
+        let prompts = PromptState::default();
+        let permissions = HashMap::new();
+
+        append_connection_activity(
+            &mut activity,
+            "codex",
+            false,
+            &prompts,
+            &HashMap::from([("review-session".to_string(), PathBuf::from("/review"))]),
+            &permissions,
+        );
+        append_connection_activity(
+            &mut activity,
+            "codex",
+            true,
+            &prompts,
+            &HashMap::from([("build-session".to_string(), PathBuf::from("/build"))]),
+            &permissions,
+        );
+
+        let codex = activity.get("codex").unwrap();
+        assert!(codex.alive);
+        assert_eq!(codex.sessions, vec!["build-session"]);
+    }
 
     #[test]
     fn client_terminal_capability_matches_profile() {

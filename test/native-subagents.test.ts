@@ -225,6 +225,33 @@ await test('review native child keeps medium-risk actions denied', () => {
   assert.equal(decision.optionId, 'deny');
 });
 
+await test('review replay replaces a cached build profile before permission policy runs', () => {
+  const spawn = event('parent', {
+    sessionUpdate: 'subagent_spawned',
+    subagentSessionId: 'child',
+    name: 'reviewer',
+    task: 'Review changes',
+  });
+  let store = updateNativeSubagents({}, spawn, '/repo', 1, false, 'build');
+
+  store = updateNativeSubagents(store, spawn, '/repo', 2, true, 'review');
+  const thread = nativeSubagentThreads(store)[0];
+  const decision = automaticPermissionPolicy({
+    profile: thread.capabilityProfile ?? 'build',
+    workspace: thread.directory,
+    title: 'Edit file',
+    toolCall: { command: 'apply_patch' },
+    options: [
+      { optionId: 'allow', kind: 'allow_once' },
+      { optionId: 'deny', kind: 'reject_once' },
+    ],
+  });
+
+  assert.equal(thread.capabilityProfile, 'review');
+  assert.equal(decision.recommendation, 'deny');
+  assert.equal(decision.optionId, 'deny');
+});
+
 await test('late and duplicate events cannot revive a terminal child', () => {
   const spawn = event('parent', {
     sessionUpdate: 'subagent_spawned',

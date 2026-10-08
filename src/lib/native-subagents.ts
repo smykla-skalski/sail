@@ -117,10 +117,11 @@ export function updateNativeSubagents(
         created: previous?.created ?? now,
         updated: now,
         restored: previous?.restored || restored,
-        capabilityProfile:
-          previous?.capabilityProfile ??
-          store[nativeSubagentId(event.agent, parentSessionId)]?.capabilityProfile ??
-          capabilityProfile,
+        capabilityProfile: restored
+          ? capabilityProfile
+          : (previous?.capabilityProfile ??
+            store[nativeSubagentId(event.agent, parentSessionId)]?.capabilityProfile ??
+            capabilityProfile),
         ...(malformed ? { error: 'Incomplete subagent history' } : {}),
       },
     };

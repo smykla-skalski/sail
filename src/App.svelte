@@ -10288,8 +10288,10 @@
           )
         : undefined;
     const eventDirectory = eventThread?.directory ?? directory;
-    const eventProfile =
-      eventThread?.capabilityProfile ?? capabilityProfileForDirectory(eventDirectory);
+    const eventProfile = capabilityProfileFromMetadata(
+      event.message.params,
+      eventThread?.capabilityProfile ?? capabilityProfileForDirectory(eventDirectory),
+    );
     const previousNativeSubagents = nativeSubagents;
     nativeSubagents = updateNativeSubagents(
       nativeSubagents,
