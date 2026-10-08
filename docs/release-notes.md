@@ -23,15 +23,12 @@ There is no automatic updater. To update, download the next package for your pla
 - Below about 560 px of pane width the detail replaces the list (**← All issues** or Escape returns to the row). Wider panes show the list and detail side by side. Focus moves to the detail heading when you open an issue.
 - ↑ and ↓ move between rows and Enter opens one. A **List | Graph** switch shows the dependency map. All four Ship panel mounts show the same panel, and **Close** is now **Hide panel**.
 - The empty state offers both routes: `/ship-it <issue-url>` and an issue graph from a plan.
-  \
 
 ## Adapter diagnostics
 
 - When an agent adapter writes to stderr, `sail.log` now records its lines as `agent_stderr_line` entries tagged with the agent, and the existing `agent_stderr` entry still reports the total byte count.
 - Forwarding is bounded per adapter process: the first 48 lines, at most 12 KB in total, each cut to 512 bytes. Later output is dropped, and `agent_stderr` reports `forwardedLines`, `forwardedBytes`, `droppedLines` and `droppedBytes`.
 - Secrets are redacted before writing: live `SAIL_BROWSER_TOKEN` values, `Bearer` and `Basic` credentials, values of keys such as token, password, API key and cookie, URL passwords, and common key formats (OpenAI, GitHub, Slack, AWS, Google, JWT). Redaction is best effort; do not attach `sail.log` to public reports without reading it.
-
-> > > > > > > origin/main
 
 ## Ship status
 
