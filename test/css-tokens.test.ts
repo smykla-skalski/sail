@@ -96,7 +96,7 @@ function styleChunks(source: Source): Chunk[] {
   ))
     markup(`${match[1]}: ${inlineExpressions(match[2] ?? match[4])}`, match.index);
   for (const match of source.text.matchAll(
-    /\s(fill|stroke|stop-color|flood-color|lighting-color)="([^"]*)"/g,
+    /\s(fill|stroke|stop-color|flood-color|lighting-color|font-size)="([^"]*)"/g,
   ))
     markup(`${match[1]}: ${match[2]}`, match.index);
   return chunks;
@@ -192,53 +192,124 @@ void test('literal colors stay in token files or the reviewed allowlist', () => 
 const smallTypeAllowlist: Record<string, Record<string, number>> = {
   'src/SpawnActivity.svelte': { '0': 1 },
 };
+// Reviewed font-size values the check cannot resolve to px, with exact counts.
+const unresolvedTypeAllowlist: Record<string, Record<string, number>> = {};
 const minimumFontSize = 12;
+// CSS-wide keywords keep the inherited size, which is checked where it is set.
+const inheritedSize = new Set(['inherit', 'initial', 'unset', 'revert', 'revert-layer']);
 
-function fontSize(property: string, value: string, tokens: Theme): number | null {
+type FontSize = { px: number } | { unresolved: string } | null;
+
+/** Resolves a token to its value, or a `var(--x, fallback)` fallback when the token is unknown. */
+function resolveVar(value: string, tokens: Theme): string | null {
+  const reference = /^var\(\s*(--[\w-]+)\s*(?:,\s*(.+))?\)$/.exec(value);
+  if (!reference) return value;
+  return tokens[reference[1]] ?? reference[2]?.trim() ?? null;
+}
+
+function fontSize(property: string, raw: string, tokens: Theme, depth = 0): FontSize {
+  if (property !== 'font-size' && property !== 'font') return null;
+  const value = raw.replace(/\s*!important\s*$/i, '').trim();
+  if (inheritedSize.has(value.toLowerCase())) return null;
   const size =
     property === 'font-size'
-      ? value.trim()
-      : property === 'font'
-        ? /(var\(--[\w-]+\)|\d*\.?\d+(?:px|rem)\b)/.exec(value)?.[1]
-        : undefined;
-  if (size === undefined) return null;
-  const reference = /^var\((--[\w-]+)\)$/.exec(size);
-  if (reference) {
-    const token = tokens[reference[1]];
-    return token === undefined ? null : fontSize('font-size', token, tokens);
+      ? value
+      : /(var\(--[\w-]+(?:\s*,[^)]*)?\)|\d*\.?\d+(?:px|rem)\b)/.exec(value)?.[1];
+  if (size === undefined) return { unresolved: value };
+  const resolved = resolveVar(size, tokens);
+  if (resolved === null || depth > 4) return { unresolved: value };
+  // clamp() never renders below its first argument, so that minimum is the size to check.
+  const clamp = /^clamp\(\s*([^,]+?)\s*,/.exec(resolved);
+  if (resolved !== size || clamp) {
+    const inner = fontSize('font-size', clamp ? clamp[1] : resolved, tokens, depth + 1);
+    return inner && 'unresolved' in inner ? { unresolved: value } : inner;
   }
   const length = /^(\d*\.?\d+)(px|rem)?$/.exec(size);
-  if (!length || (!length[2] && Number(length[1]) !== 0)) return null;
-  return Number(length[1]) * (length[2] === 'rem' ? 16 : 1);
+  if (!length || (!length[2] && Number(length[1]) !== 0)) return { unresolved: value };
+  return { px: Number(length[1]) * (length[2] === 'rem' ? 16 : 1) };
 }
+
+void test('font sizes resolve to px, or fail unless reviewed', () => {
+  const tokens = themeBlocks(readFileSync(join(root, 'src/style.css'), 'utf8')).light;
+  const cases: [string, string, FontSize][] = [
+    ['font-size', 'var(--type-11)', { px: 11 }],
+    ['font', '600 0.8125rem/1.125rem var(--sui-font)', { px: 13 }],
+    ['font', 'var(--type-12)/1.5 ui-monospace, monospace', { px: 12 }],
+    ['font-size', '11px !important', { px: 11 }],
+    ['font-size', 'var(--undefined-size, 12px)', { px: 12 }],
+    ['font-size', 'var(--undefined-size, 10px) !important', { px: 10 }],
+    ['font-size', 'var(--undefined-size)', { unresolved: 'var(--undefined-size)' }],
+    ['font-size', '0.9em', { unresolved: '0.9em' }],
+    ['font-size', '90%', { unresolved: '90%' }],
+    ['font-size', 'small', { unresolved: 'small' }],
+    ['font-size', 'calc(1rem - 2px)', { unresolved: 'calc(1rem - 2px)' }],
+    ['font-size', 'clamp(10px, 2vw, 14px)', { px: 10 }],
+    ['font-size', 'clamp(var(--type-12), 2vw, 3rem)', { px: 12 }],
+    ['font-size', 'clamp(1em, 2vw, 3rem)', { unresolved: 'clamp(1em, 2vw, 3rem)' }],
+    ['font', 'menu', { unresolved: 'menu' }],
+    ['font', 'inherit', null],
+    ['font-size', 'inherit', null],
+    ['color', '11px', null],
+  ];
+  for (const [property, value, expected] of cases)
+    assert.deepEqual(fontSize(property, value, tokens), expected, `${property}: ${value}`);
+});
 
 void test('font sizes stay at or above 12 px outside the reviewed allowlist', () => {
   const tokens = themeBlocks(readFileSync(join(root, 'src/style.css'), 'utf8')).light;
-  assert.equal(fontSize('font-size', 'var(--type-11)', tokens), 11);
-  assert.equal(fontSize('font', '600 0.8125rem/1.125rem var(--sui-font)', tokens), 13);
-  assert.equal(fontSize('font', 'var(--type-12)/1.5 ui-monospace, monospace', tokens), 12);
-  const found: Record<string, Record<string, number>> = {};
+  const small: Record<string, Record<string, number>> = {};
+  const unresolved: Record<string, Record<string, number>> = {};
   const locations: string[] = [];
+  const unreadable: string[] = [];
   for (const chunk of sources.flatMap(styleChunks)) {
     for (const declaration of declarations(chunk)) {
       const size = fontSize(declaration.property, declaration.value, tokens);
-      if (size === null || size >= minimumFontSize) continue;
-      const value = String(size);
-      found[chunk.file] ??= {};
-      found[chunk.file][value] = (found[chunk.file][value] ?? 0) + 1;
-      if (found[chunk.file][value] > (smallTypeAllowlist[chunk.file]?.[value] ?? 0))
-        locations.push(`${chunk.file}:${declaration.line} ${declaration.value.trim()}`);
+      if (size === null) continue;
+      const where = `${chunk.file}:${declaration.line} ${declaration.value.trim()}`;
+      if ('unresolved' in size) {
+        unresolved[chunk.file] ??= {};
+        unresolved[chunk.file][size.unresolved] =
+          (unresolved[chunk.file][size.unresolved] ?? 0) + 1;
+        if (
+          unresolved[chunk.file][size.unresolved] >
+          (unresolvedTypeAllowlist[chunk.file]?.[size.unresolved] ?? 0)
+        )
+          unreadable.push(where);
+        continue;
+      }
+      if (size.px >= minimumFontSize) continue;
+      const value = String(size.px);
+      small[chunk.file] ??= {};
+      small[chunk.file][value] = (small[chunk.file][value] ?? 0) + 1;
+      if (small[chunk.file][value] > (smallTypeAllowlist[chunk.file]?.[value] ?? 0))
+        locations.push(where);
     }
   }
   assert.deepEqual(locations, [], 'Use var(--type-12) or a larger type token from src/style.css');
-  const stale = Object.entries(smallTypeAllowlist).flatMap(([file, sizes]) =>
-    Object.entries(sizes)
-      .filter(([size, count]) => (found[file]?.[size] ?? 0) !== count)
-      .map(
-        ([size, count]) => `${file} ${size}px: allowed ${count}, found ${found[file]?.[size] ?? 0}`,
-      ),
+  assert.deepEqual(
+    unreadable,
+    [],
+    'Use a px, rem or type token size, or review the value in unresolvedTypeAllowlist',
   );
-  assert.deepEqual(stale, [], 'Update the small font size allowlist');
+  const stale = [
+    ...Object.entries(smallTypeAllowlist).flatMap(([file, sizes]) =>
+      Object.entries(sizes)
+        .filter(([size, count]) => (small[file]?.[size] ?? 0) !== count)
+        .map(
+          ([size, count]) =>
+            `${file} ${size}px: allowed ${count}, found ${small[file]?.[size] ?? 0}`,
+        ),
+    ),
+    ...Object.entries(unresolvedTypeAllowlist).flatMap(([file, values]) =>
+      Object.entries(values)
+        .filter(([value, count]) => (unresolved[file]?.[value] ?? 0) !== count)
+        .map(
+          ([value, count]) =>
+            `${file} ${value}: allowed ${count}, found ${unresolved[file]?.[value] ?? 0}`,
+        ),
+    ),
+  ];
+  assert.deepEqual(stale, [], 'Update the font size allowlists');
 });
 
 type Theme = Record<string, string>;

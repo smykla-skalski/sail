@@ -1,3 +1,4 @@
+import { browser } from '@wdio/globals';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
@@ -30,6 +31,8 @@ if (!attach && process.platform !== 'win32' && !process.env.SAIL_E2E_FAKE_GH_DIR
   process.env.PATH = `${join(state, 'bin')}${delimiter}${process.env.PATH ?? ''}`;
 }
 
+const e2eAppearance = process.env.SAIL_E2E_APPEARANCE === 'dark' ? 'dark' : 'light';
+
 const binary = resolve(
   process.env.SAIL_E2E_BINARY ??
     `src-tauri/target/debug/sail${process.platform === 'win32' ? '.exe' : ''}`,
@@ -55,6 +58,17 @@ export const config = {
   mochaOpts: { timeout: 240_000 },
   waitforTimeout: 20_000,
   connectionRetryTimeout: 90_000,
+  /** New profiles follow the OS appearance. Pin it so color and screenshot checks give the same
+   * result on light and dark machines; specs that need dark set `sai-theme` or the appearance. */
+  async before() {
+    await browser.execute(async (value) => {
+      const tauri: unknown = Reflect.get(window, '__TAURI__');
+      const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
+      const invoke: unknown = core && typeof core === 'object' ? Reflect.get(core, 'invoke') : null;
+      if (typeof invoke !== 'function') throw new Error('Tauri API missing; cannot pin appearance');
+      await invoke('plugin:window|set_theme', { label: 'main', value });
+    }, e2eAppearance);
+  },
   onComplete() {
     rmSync(state, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   },
