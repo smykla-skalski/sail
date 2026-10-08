@@ -297,6 +297,103 @@ await test('native sidebar rows preserve ancestry and collapse settled subtrees'
   );
 });
 
+await test('parents count every descendant', () => {
+  const parent = {
+    agent: 'codex',
+    directory: '/repo',
+    sessionId: 'parent',
+    title: 'Parent',
+    updated: 1,
+  };
+  const child = { ...parent, sessionId: 'child', title: 'Child', updated: 3 };
+  const grandchild = { ...parent, sessionId: 'grandchild', title: 'Grandchild', updated: 4 };
+  const rows = sidebarThreadRows(
+    [parent, child, grandchild],
+    [nativeReceipt('child', 'parent', 'working'), nativeReceipt('grandchild', 'child', 'working')],
+  );
+  assert.deepEqual(
+    rows.map((row) => [row.thread.sessionId, row.descendants]),
+    [
+      ['parent', 2],
+      ['child', 1],
+      ['grandchild', 0],
+    ],
+  );
+});
+
+await test('a child in another worktree shows as a reference row under its parent', () => {
+  const parent = { agent: 'claude', directory: '/a', sessionId: 'p', title: 'Parent', updated: 1 };
+  const remote = {
+    agent: 'claude',
+    directory: '/b',
+    sessionId: 'r',
+    title: 'Reviewer',
+    updated: 2,
+  };
+  const mcp: SpawnReceipt = {
+    ...nativeReceipt('r', 'p', 'working'),
+    receiptId: 'mcp-1',
+    sourceId: 'acp:claude:p',
+    sourceDirectory: '/a',
+    targetId: 'acp:claude:r',
+    targetDirectory: '/b',
+    provider: 'claude',
+  };
+  const everyThread = [parent, remote];
+  const parentRows = sidebarThreadRows([parent], [mcp], [], everyThread);
+  assert.deepEqual(
+    parentRows.map((row) => [row.thread.sessionId, row.reference, row.depth]),
+    [
+      ['p', false, 0],
+      ['r', true, 1],
+    ],
+  );
+  assert.equal(parentRows[0].descendants, 1);
+  assert.notEqual(parentRows[1].key, parentRows[0].key);
+  const remoteRows = sidebarThreadRows([remote], [mcp], [], everyThread);
+  assert.equal(remoteRows[0].reference, false);
+  assert.equal(remoteRows[0].spawnedBy, 'Parent');
+});
+
+await test('a settled cross-worktree child leaves no reference row', () => {
+  const parent = { agent: 'claude', directory: '/a', sessionId: 'p', title: 'Parent', updated: 1 };
+  const done: SpawnReceipt = {
+    ...nativeReceipt('r', 'p', 'completed'),
+    receiptId: 'mcp-2',
+    sourceId: 'acp:claude:p',
+    sourceDirectory: '/a',
+    targetId: 'acp:claude:r',
+    targetDirectory: '/b',
+  };
+  assert.equal(sidebarThreadRows([parent], [done]).length, 1);
+});
+
+await test('OpenCode children nest under their parent', () => {
+  const parent = {
+    agent: 'opencode',
+    directory: '/repo',
+    sessionId: 'p',
+    title: 'Parent',
+    updated: 1,
+  };
+  const child: SpawnReceipt = {
+    ...nativeReceipt('c', 'p', 'working'),
+    receiptId: 'opencode-child:c',
+    sourceId: 'opencode:p',
+    targetId: 'opencode:c',
+    provider: 'opencode',
+    prompt: 'Review',
+  };
+  const rows = sidebarThreadRows([parent], [child]);
+  assert.deepEqual(
+    rows.map((row) => [row.thread.agent, row.thread.sessionId, row.thread.title, row.depth]),
+    [
+      ['opencode', 'p', 'Parent', 0],
+      ['opencode', 'c', 'Review', 1],
+    ],
+  );
+});
+
 await test('sidebar inventory follows every OpenCode page and excludes child and foreign sessions', async () => {
   const calls: Array<string | undefined> = [];
   const source: SidebarSessionSource = {

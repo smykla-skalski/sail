@@ -26,6 +26,7 @@
   import type { DiffComment } from './lib/diff-comments';
   import { coordinationKey, type CoordinationMessage } from './lib/coordination';
   import { spawnReceiptsForSource, type SpawnReceipt } from './lib/agent-results';
+  import type { SubagentControl } from './lib/subagent-control';
   import type { ThreadStatus } from './lib/attention';
   import type { PostTurnCheck } from './lib/post-turn-checks';
   import type { ReviewCapture, ReviewPreview } from './lib/review-evidence';
@@ -76,6 +77,7 @@
     coordinationMessages: CoordinationMessage[];
     spawnReceipts: SpawnReceipt[];
     onopensubagent: (receipt: SpawnReceipt) => Promise<void>;
+    subagentControl?: SubagentControl;
     shipRuns: ShipRun[];
     shipNeedsInput: number;
     shippingBusy: boolean;
@@ -182,6 +184,7 @@
     coordinationMessages,
     spawnReceipts,
     onopensubagent,
+    subagentControl,
     shipRuns,
     shipNeedsInput,
     shippingBusy,
@@ -611,6 +614,7 @@
       {coordinationMessages}
       {spawnReceipts}
       {onopensubagent}
+      {subagentControl}
       {shipRuns}
       {shipNeedsInput}
       {shippingBusy}
@@ -728,6 +732,7 @@
       {coordinationMessages}
       {spawnReceipts}
       {onopensubagent}
+      {subagentControl}
       {shipRuns}
       {shipNeedsInput}
       {shippingBusy}
@@ -951,6 +956,7 @@
                 directory,
               )}
               {onopensubagent}
+              {subagentControl}
               focused={focused === pane.id}
               focusPrompt={focusPromptPane === pane.id}
               picked={pickedAttachments[pane.id]}
@@ -1110,6 +1116,7 @@
                 directory,
               )}
               {onopensubagent}
+              {subagentControl}
               postTurnChecks={postTurnChecks.filter(
                 (check) =>
                   pane.thread &&

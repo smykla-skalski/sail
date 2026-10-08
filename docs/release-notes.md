@@ -14,6 +14,15 @@ There is no automatic updater. To update, download the next package for your pla
 - The Inbox groups items by repository. You can dismiss a Ship or subagent item until its next state change, or snooze it for an hour or until tomorrow at 08:00. Items clear when their state resolves.
 - Cmd+J (Ctrl+J elsewhere) goes to the next item needing attention. Cmd+Shift+J still opens the side chat.
 
+## Subagent navigation and control
+
+- A subagent's breadcrumb shows its parent thread, with **Parent** and previous/next sibling buttons. The keys are Cmd+[ (Ctrl+[ elsewhere) for the parent and Cmd+Shift+[ and Cmd+Shift+] for the previous and next sibling. Cmd+Alt+Arrows still moves pane focus.
+- A permission request from a subagent is answered inline in the parent's subagent card, and it replays in the child's own view. Answering one request from two places resolves it once; the other place shows "Answered" instead of an error.
+- Native Claude subagents are read-only and have no Stop button: stop the parent turn to stop them. The composer of a native subagent turns on only when its agent advertises a prompt capability; the current Claude adapter advertises none.
+- **Stop** on a subagent card stops OpenCode and MCP-spawned subagents one at a time. **Stop all** asks for confirmation and leaves Ship workers and validation gates running; stop those with Stop run.
+- The sidebar indents subagents with guide lines and shows a (+N) descendant count on the parent. A subagent spawned in another worktree also appears under its parent as a reference row, and its own row says which thread spawned it. OpenCode subagents nest under their parent.
+- The Ship dependency map offers **Open** on subagent nodes and no longer lists "Checks: Unavailable" for them.
+
 ## Changes in this build
 
 - The top bar keeps the project and thread path, **Inbox**, **New agent ▾**, **Changes**, and a **⋯** menu. Task overview, thread switching, commands, **Run project**, agent terminals, agent browser access, and thread actions are in **⋯**, so the top bar no longer overlaps or clips at 1280 px with panes open.

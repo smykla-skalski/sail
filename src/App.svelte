@@ -362,6 +362,15 @@
     type NotificationPrefs,
   } from './lib/notification-prefs';
   import { matches as shortcutMatches } from './lib/shortcuts';
+  import { subagentNavigation } from './lib/subagent-nav';
+  import {
+    parentTurnStopHint,
+    permissionAlreadyAnswered,
+    stoppableSubagents,
+    subagentStop,
+    type AnsweredPermission,
+    type SubagentControl,
+  } from './lib/subagent-control';
   import {
     failedCheckOutcome,
     inboxLocations,
@@ -528,6 +537,7 @@
   import {
     disconnectNativeSubagents,
     finalizeNativeSubagentRestore,
+    nativeSubagentAcceptsPrompts,
     nativeSubagentId,
     nativeSubagentReceipts,
     nativeSubagentThreads as threadsForNativeSubagents,
@@ -1787,6 +1797,115 @@
     messages.filter((message) => message.type === 'user' || message.type === 'assistant'),
   );
   let openCodeChildReceipts = $state.raw<SpawnReceipt[]>([]);
+  // Opening a child replaces the live list with the child's own children, so the parent's list is
+  // kept for the breadcrumb, sibling keys and sidebar nesting.
+  let openCodeChildHistory = $state.raw<Record<string, SpawnReceipt[]>>({});
+  function rememberOpenCodeChildren(receipts: SpawnReceipt[]) {
+    openCodeChildReceipts = receipts;
+    const source = receipts[0]?.sourceId;
+    if (source) openCodeChildHistory = { ...openCodeChildHistory, [source]: receipts };
+  }
+  let navigableReceipts = $derived.by(() => {
+    const live = new Set(openCodeChildReceipts.map((receipt) => receipt.receiptId));
+    return [
+      ...visibleSpawnReceipts,
+      ...openCodeChildReceipts,
+      ...Object.values(openCodeChildHistory)
+        .flat()
+        .filter((receipt) => !live.has(receipt.receiptId)),
+    ];
+  });
+  let subagentNav = $derived.by(() => {
+    const focused = actionAgentThread
+      ? {
+          agent: actionAgentThread.agent,
+          sessionId: actionAgentThread.sessionId,
+          directory: actionAgentThread.directory,
+        }
+      : actionOpenCodeSession
+        ? { agent: 'opencode', sessionId: actionOpenCodeSession.id, directory }
+        : null;
+    return subagentNavigation(navigableReceipts, focused);
+  });
+  let subagentParentTitle = $derived.by(() => {
+    const parent = subagentNav?.parent;
+    if (!parent) return '';
+    const thread = [...agentThreads, ...nativeChildThreads, ...sidebarOpenCodeThreads].find(
+      (item) =>
+        item.directory === parent.directory &&
+        receiptSourceId(item.agent, item.sessionId) === parent.threadId,
+    );
+    return thread?.title ?? 'Parent thread';
+  });
+  function goToSubagentTarget(target: { directory: string; threadId: string } | null | undefined) {
+    if (!target) return;
+    void openShipTarget(target.directory, target.threadId).catch(
+      (cause) => (error = describe(cause)),
+    );
+  }
+  function goToSubagentSibling(direction: -1 | 1) {
+    goToSubagentTarget(direction < 0 ? subagentNav?.previous : subagentNav?.next);
+  }
+  let answeredPermissions = $state<AnsweredPermission[]>([]);
+  function recordAnsweredPermission(
+    agentId: string,
+    sessionId: string,
+    requestId: string | number,
+  ) {
+    const key = `acp:${agentId}:${sessionId}:${requestId}`;
+    if (answeredPermissions.some((item) => item.key === key)) return;
+    const title =
+      inboxItems.find((item) => item.key === key)?.permissionTitle ?? 'Permission request';
+    answeredPermissions = [...answeredPermissions, { key, agentId, sessionId, title }].slice(-50);
+  }
+  const shipOwnedThreads = $derived.by(() => {
+    const owned = new SvelteSet<string>();
+    for (const issue of shipRuns.flatMap((run) => run.issues)) {
+      if (issue.threadId) owned.add(issue.threadId);
+      for (const id of issue.checkpointThreadIds ?? []) owned.add(id);
+    }
+    return owned;
+  });
+  async function stopSubagent(receipt: SpawnReceipt) {
+    const policy = subagentStop(receipt, shipOwnedThreads);
+    if (policy === 'parent-turn') throw new Error(parentTurnStopHint);
+    if (policy !== 'stop' || !receipt.targetId)
+      throw new Error('This subagent stops through Stop run.');
+    if (receipt.targetId.startsWith('opencode:')) {
+      if (!client) throw new Error('OpenCode is unavailable, so the subagent cannot stop.');
+      await client.session.interrupt({ sessionID: receipt.targetId.slice('opencode:'.length) });
+    } else {
+      const match = /^acp:([^:]+):(.+)$/.exec(receipt.targetId);
+      if (!match) throw new Error('This subagent cannot be stopped safely.');
+      await acp.cancel(match[1]!, match[2]!, receipt.turnId);
+    }
+    updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
+  }
+  async function stopAllSubagents(receipts: SpawnReceipt[]) {
+    const targets = stoppableSubagents(receipts, shipOwnedThreads);
+    if (!targets.length) return;
+    const confirmed = await confirmInApp(
+      'Stop all subagents?',
+      `This stops ${targets.length} running subagents. Ship workers and validation gates keep running; stop them with Stop run.`,
+      'Stop all',
+      { destructive: true },
+    );
+    if (!confirmed) return;
+    const results = await Promise.allSettled(targets.map((receipt) => stopSubagent(receipt)));
+    const failed = results.filter((result) => result.status === 'rejected');
+    if (failed.length)
+      throw new Error(
+        `${failed.length} of ${targets.length} subagents did not stop: ${describe(failed[0]!.reason)}`,
+      );
+  }
+  const subagentControl = $derived<SubagentControl>({
+    permissions: inboxItems,
+    answered: answeredPermissions,
+    shipOwned: shipOwnedThreads,
+    ondecide: decideInbox,
+    onstop: stopSubagent,
+    onstopall: stopAllSubagents,
+  });
   const mainSpawnActivity = $derived(
     spawnReceiptsForSource(spawnReceipts, sessionID ? `opencode:${sessionID}` : null, directory),
   );
@@ -11190,6 +11309,18 @@
   }
 
   async function decideInbox(item: InboxItem, optionId: string | null) {
+    try {
+      await decideInboxItem(item, optionId);
+    } catch (cause) {
+      // Another surface answered first: this one reports "Answered" instead of an error.
+      if (item.kind !== 'acp-permission' || !permissionAlreadyAnswered(cause)) throw cause;
+      if (item.agentId && item.requestId != null)
+        recordAnsweredPermission(item.agentId, item.sessionId, item.requestId);
+      await refreshInbox();
+    }
+  }
+
+  async function decideInboxItem(item: InboxItem, optionId: string | null) {
     if (item.kind === 'acp-permission') {
       const thread = [...agentThreads, ...nativeChildThreads].find(
         (entry) =>
@@ -12761,6 +12892,11 @@
       )
     )
       void saveShipRuns().catch((cause) => (error = describe(cause)));
+    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
+      const resolvedId = event.message.params?.requestId;
+      if (typeof resolvedId === 'string' || typeof resolvedId === 'number')
+        recordAnsweredPermission(event.agent, eventSessionId, resolvedId);
+    }
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       nativeSubagents = setNativeSubagentWaiting(
         nativeSubagents,
@@ -14450,6 +14586,17 @@
       if (!event.repeat && !document.querySelector('dialog[open]')) void goToNextAttention();
       return;
     }
+    for (const [id, go] of [
+      ['subagent.parent', () => goToSubagentTarget(subagentNav?.parent)],
+      ['subagent.previous', () => goToSubagentSibling(-1)],
+      ['subagent.next', () => goToSubagentSibling(1)],
+    ] as const) {
+      if (shortcutMatches(event, id) && subagentNav) {
+        event.preventDefault();
+        if (!event.repeat && !document.querySelector('dialog[open]')) go();
+        return;
+      }
+    }
     if (shortcutMatches(event, 'settings.open')) {
       event.preventDefault();
       if (!event.repeat) void openSettings();
@@ -14732,7 +14879,7 @@
         threads={sidebarThreads}
         attention={threadAttention}
         openCodeOutcomes={sidebarOpenCodeOutcomes}
-        spawnReceipts={visibleSpawnReceipts}
+        spawnReceipts={navigableReceipts}
         {acpActivityReady}
         {nativeActivityReady}
         {nativeUnavailableDirectories}
@@ -14858,6 +15005,16 @@
             (mainShipFallback ||
               (sessionID ? activeSideTab === 'changes' : activeSideTab === 'ship'))}
       ontogglechanges={() => void toggleChanges()}
+      subagentNav={subagentNav
+        ? {
+            parentTitle: subagentParentTitle,
+            position: `${subagentNav.index + 1} of ${subagentNav.siblings.length}`,
+            hasPrevious: !!subagentNav.previous,
+            hasNext: !!subagentNav.next,
+          }
+        : null}
+      onsubagentparent={() => goToSubagentTarget(subagentNav?.parent)}
+      onsubagentsibling={goToSubagentSibling}
     />
     {#if $settingsError}<p class="notice error" role="alert">{$settingsError}</p>{/if}
     {#if setupError}<p class="notice error" role="alert">{setupError}</p>{/if}
@@ -14894,6 +15051,12 @@
                   directory,
                 )}
                 onopensubagent={openSpawnTarget}
+                {subagentControl}
+                childPrompts={acpThread
+                  ? nativeSubagentAcceptsPrompts(
+                      nativeSubagents[nativeSubagentId(acpThread.agent, acpThread.sessionId)],
+                    )
+                  : false}
                 nativeEntries={acpThread
                   ? nativeSubagents[nativeSubagentId(acpThread.agent, acpThread.sessionId)]
                       ?.transcript
@@ -15118,7 +15281,7 @@
                   parentID={sessionID}
                   {directory}
                   onopen={openSpawnTarget}
-                  onchildren={(receipts) => (openCodeChildReceipts = receipts)}
+                  onchildren={rememberOpenCodeChildren}
                 />
                 {#each pendingShellRuns as run (run.id)}
                   <ShellCommandCard
@@ -15154,7 +15317,11 @@
                   checks={mainPostTurnChecks}
                   onretry={(check) => void runOnePostTurnCheck(check, true)}
                 />
-                <SpawnActivity receipts={mainSpawnActivity} onopen={openSpawnTarget} />
+                <SpawnActivity
+                  receipts={mainSpawnActivity}
+                  onopen={openSpawnTarget}
+                  control={subagentControl}
+                />
                 {#if running && runtimeState === 'connected'}<div class="chat-working">
                     <ActivityStatus
                       status={pendingPermissions.length || pendingForms.length
@@ -15338,6 +15505,7 @@
         {coordinationMessages}
         spawnReceipts={visibleSpawnReceipts}
         onopensubagent={openSpawnTarget}
+        {subagentControl}
         {shipRuns}
         shipNeedsInput={attentionCounts.shipTab}
         {shippingBusy}
