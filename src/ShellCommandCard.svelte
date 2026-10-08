@@ -41,7 +41,7 @@
   .shell-command {
     margin: 8px 0;
     padding: 8px 10px;
-    border: 1px solid var(--shell-divider, var(--border));
+    border: 1px solid var(--shell-divider);
     border-radius: 8px;
     font-size: 12px;
   }
@@ -54,7 +54,7 @@
   .shell-command-line {
     flex: 1 1 auto;
     min-width: 0;
-    font-family: var(--sui-font-mono, ui-monospace, monospace);
+    font-family: ui-monospace, monospace;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }

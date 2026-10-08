@@ -1969,14 +1969,14 @@ button:disabled {
   border-color: var(--sui-primary);
 }
 .composer.shell-mode {
-  border-color: var(--sui-warning, var(--sui-primary));
+  border-color: var(--sui-warning-ink);
 }
 .composer.shell-mode textarea {
-  font-family: var(--sui-font-mono, ui-monospace, monospace);
+  font-family: ui-monospace, monospace;
 }
 .composer-shell-hint {
   margin: 10px 16px 0;
-  color: var(--sui-warning, var(--sui-primary));
+  color: var(--sui-warning-ink);
   font-size: 12px;
   font-weight: 600;
 }
