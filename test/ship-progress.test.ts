@@ -2395,6 +2395,12 @@ void test('repairs a dead run repository from the catalog checkout with the same
   assert.equal(repositoryForRemote(candidates, 'kumahq/kuma'), '/kuma');
   assert.equal(repositoryForRemote(candidates, 'kong/kong-mesh'), null);
   assert.equal(repositoryForRemote([], 'kumahq/kuma'), null);
+  const clones = [
+    { path: '/a/kuma', remote: 'kumahq/kuma' },
+    { path: '/b/kuma', remote: 'kumahq/kuma' },
+  ];
+  assert.equal(repositoryForRemote(clones, 'kumahq/kuma', '/b/kuma'), '/b/kuma');
+  assert.equal(repositoryForRemote(clones, 'kumahq/kuma', '/c/other'), '/a/kuma');
 });
 
 void test('treats a vanished agent session or deleted worktree as a gone worker', () => {
@@ -2408,7 +2414,7 @@ void test('replaces the persisted missing-repository block reason', () => {
     currentShipBlockedReason(
       'Shipping claim recovery failed: Repository path does not exist. Choose an existing directory.',
     ),
-    'Shipping repository no longer exists. Start a new run from the project.',
+    'Shipping worktree no longer exists. Start a new run from the project.',
   );
   assert.equal(currentShipBlockedReason('Worker paused.'), 'Worker paused.');
   assert.equal(currentShipBlockedReason(null), 'Shipping claim recovery requires worker fencing.');
@@ -2423,6 +2429,9 @@ void test('plans how to settle issues of a run whose repository is gone', () => 
     unrecoverableIssuePlan({ ...settled, state: 'merged', claimFencePending: true }),
     'clear',
   );
+  assert.equal(unrecoverableIssuePlan({ state: 'merged' }), 'none');
+  assert.equal(unrecoverableIssuePlan({ state: 'awaiting_merge', workerSettled: true }), 'none');
+  assert.equal(unrecoverableIssuePlan({ state: 'awaiting_merge', workerSettled: false }), 'fail');
   assert.equal(unrecoverableIssuePlan({ state: 'working', workerSettled: false }), 'fail');
   assert.equal(unrecoverableIssuePlan({ state: 'failed', workerSettled: false }), 'fail');
 });

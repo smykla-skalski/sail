@@ -5148,9 +5148,13 @@
       return;
     const worker = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
     const path = issue.path ?? worker?.targetDirectory;
+    const worktreeGone = path
+      ? !(await invoke<boolean>('repository_path_available', { path }).catch(() => true))
+      : false;
+    if (worktreeGone && !issue.worktreeUnavailable) await update({ worktreeUnavailable: true });
     let currentRevision: string | undefined;
     let currentBaseRevision: string | undefined;
-    if (path) {
+    if (path && !worktreeGone) {
       const shippingTarget = await shippingTargetFor(run, issue, path);
       const models = implementationModels(path);
       const modelUncertain = implementationAttributionUncertain(path);
@@ -5687,7 +5691,7 @@
     for (const issue of readyShipIssues(run, unsettledReceiptIds)) scheduleShipLaunch(run, issue);
   }
 
-  const shipRepairMisses = new SvelteMap<string, string>();
+  const shipRepairMisses = new SvelteMap<string, { key: string; retryAt: number }>();
   const shipRepositoryDeadSince = new SvelteMap<string, number>();
 
   // Older runs stored a worktree path as their repository; once that worktree
@@ -5704,7 +5708,11 @@
       if (available[index]) shipRepositoryDeadSince.delete(run.id);
     if (!dead.length) return new SvelteMap();
     const catalogKey = projectCatalog.repositories.join('\0');
-    const lookups = dead.filter((run) => shipRepairMisses.get(run.id) !== catalogKey);
+    const now = Date.now();
+    const lookups = dead.filter((run) => {
+      const miss = shipRepairMisses.get(run.id);
+      return !miss || miss.key !== catalogKey || miss.retryAt <= now;
+    });
     const repaired = new SvelteSet<string>();
     if (lookups.length) {
       const candidates = await Promise.all(
@@ -5722,11 +5730,23 @@
       );
       const lookupFailed = candidates.some((candidate) => candidate.failed);
       for (const run of lookups) {
-        const repository = repositoryForRemote(candidates, run.remote);
+        const repository = repositoryForRemote(
+          candidates,
+          run.remote,
+          owningRepository(projectCatalog, run.repository),
+        );
         if (repository) {
           run.repository = repository;
           repaired.add(run.id);
-        } else if (!lookupFailed) shipRepairMisses.set(run.id, catalogKey);
+          shipRepairMisses.delete(run.id);
+          continue;
+        }
+        const since = shipRepositoryDeadSince.get(run.id) ?? now;
+        const definitive = !lookupFailed || unrecoverableGraceExpired(since, now);
+        shipRepairMisses.set(run.id, {
+          key: catalogKey,
+          retryAt: definitive ? Number.POSITIVE_INFINITY : now + 60_000,
+        });
       }
       if (repaired.size) await saveShipRuns();
     }
@@ -5751,13 +5771,19 @@
         if (plan === 'none') return;
         if (plan === 'fail') await fenceRecoveredShippingWorker(run, issue, reason);
         if (plan === 'fail' && !issue.workerSettled) return;
+        const keepsState =
+          plan === 'clear' && (issue.state === 'merged' || issue.state === 'awaiting_merge');
         await updateShipIssue(run, issue, {
           claim: undefined,
           claimFencePending: false,
-          claimRevalidationPending: false,
-          claimHandoffPending: false,
           refreshError: null,
-          worktreeUnavailable: true,
+          ...(keepsState
+            ? {}
+            : {
+                claimRevalidationPending: false,
+                claimHandoffPending: false,
+                worktreeUnavailable: true,
+              }),
         });
       }),
     );

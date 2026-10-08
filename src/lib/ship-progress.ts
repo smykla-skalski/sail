@@ -1591,9 +1591,11 @@ export function loadShipRuns(raw: string | null): ShipRun[] {
 export function repositoryForRemote(
   candidates: { path: string; remote: string | null }[],
   remote: string,
+  preferred?: string | null,
 ): string | null {
   const wanted = remote.toLowerCase();
-  return candidates.find((item) => item.remote?.toLowerCase() === wanted)?.path ?? null;
+  const matches = candidates.filter((item) => item.remote?.toLowerCase() === wanted);
+  return (matches.find((item) => item.path === preferred) ?? matches[0])?.path ?? null;
 }
 
 // ACP agents report a vanished session or deleted cwd with these messages.
@@ -1611,7 +1613,7 @@ const missingRepositoryReason = /Repository path does not exist\. Choose an exis
 export function currentShipBlockedReason(reason: string | undefined | null): string {
   if (!reason) return 'Shipping claim recovery requires worker fencing.';
   return missingRepositoryReason.test(reason)
-    ? 'Shipping repository no longer exists. Start a new run from the project.'
+    ? 'Shipping worktree no longer exists. Start a new run from the project.'
     : reason;
 }
 
@@ -1627,13 +1629,14 @@ export function unrecoverableIssuePlan(
     | 'worktreeUnavailable'
   >,
 ): 'none' | 'clear' | 'fail' {
-  const dirty =
-    !!issue.claim ||
-    !!issue.claimFencePending ||
-    !!issue.refreshError ||
-    issue.worktreeUnavailable !== true;
-  if (issue.state === 'merged') return dirty ? 'clear' : 'none';
-  if (issue.state === 'failed' && issue.workerSettled === true) return dirty ? 'clear' : 'none';
+  const claimDirty = !!issue.claim || !!issue.claimFencePending || !!issue.refreshError;
+  if (
+    issue.state === 'merged' ||
+    (issue.state === 'awaiting_merge' && issue.workerSettled === true)
+  )
+    return claimDirty ? 'clear' : 'none';
+  if (issue.state === 'failed' && issue.workerSettled === true)
+    return claimDirty || issue.worktreeUnavailable !== true ? 'clear' : 'none';
   return 'fail';
 }
 
