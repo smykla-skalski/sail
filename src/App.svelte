@@ -1406,6 +1406,8 @@
     if (!side.parentThreadId && thread) sideChat = { ...side, parentThreadId: thread.sessionId };
   });
   let messages = $state<SessionMessageInfo[]>([]);
+  // Off while history (cache, first page, older pages) mounts, so its failed tools stay silent.
+  let liveTools = $state(false);
   let olderMessageCursor = $state<string | null>(null);
   let loadingOlder = $state(false);
   let restoringTimelineSelection: number | null = null;
@@ -1805,9 +1807,13 @@
     const cursor = olderMessageCursor;
     const page = await source.message.list({ sessionID: id, limit: 50, cursor });
     if (current !== selection || id !== sessionID) return;
+    const wasLive = liveTools;
+    liveTools = false;
     messages = mergeMessages(messages, page.data);
     olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
     cacheCurrentTimeline();
+    await tick();
+    if (current === selection && id === sessionID) liveTools = wasLive;
     await restoreOlderMessages(source, id, current, count, anchorID);
   }
   let client = $state<OpenCodeClient | null>(null);
@@ -13904,6 +13910,7 @@
     discardLiveText();
     ++timelineRefresh;
     timelineSession = '';
+    liveTools = false;
     messages = [];
     olderMessageCursor = null;
     loadingOlder = false;
@@ -13974,6 +13981,7 @@
       olderMessageCursor = first.cursor.next ?? null;
       cacheCurrentTimeline();
       await tick();
+      if (valid()) liveTools = true;
       scrollToLatest();
       return;
     }
@@ -13994,6 +14002,8 @@
     if (!valid()) return;
     messages = mergeMessages(messages, acceptProjectedMessages(incoming, observed));
     cacheCurrentTimeline();
+    await tick();
+    if (valid()) liveTools = true;
   }
 
   async function loadOlderMessages() {
@@ -14017,11 +14027,14 @@
     try {
       const page = await client.message.list({ sessionID: id, limit: 50, cursor });
       if (current !== selection || id !== sessionID) return;
+      const wasLive = liveTools;
+      liveTools = false;
       messages = mergeMessages(messages, acceptProjectedMessages(page.data, observed));
       olderMessageCursor = page.cursor.next === cursor ? null : (page.cursor.next ?? null);
       cacheCurrentTimeline();
       if (!underfilled) followChat = false;
       await tick();
+      if (current === selection && id === sessionID) liveTools = wasLive;
       if (chatScroll)
         chatScroll.scrollTop =
           underfilled && followChat
@@ -15508,6 +15521,7 @@
                 <Transcript
                   items={mainTranscript}
                   busy={running}
+                  live={liveTools}
                   coordinationMessages={mainCoordinationMessages}
                   onopen={openSpawnTarget}
                   control={subagentControl}
