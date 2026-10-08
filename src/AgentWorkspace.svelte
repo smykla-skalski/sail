@@ -275,7 +275,7 @@
       claimLegacyPendingImplementationTurn(path, sourceId);
     if (claimedLegacy) recordShipItOwner(path, sourceId);
     if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
-      void callback(saved, path, sourceId, model);
+      void callback(saved, path, sourceId, model).catch((cause) => (error = describe(cause)));
   });
 
   function isShipItPrompt(text: string): boolean {

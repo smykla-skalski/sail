@@ -2141,6 +2141,7 @@ pub async fn complete_predecessor_shipping_claim_fence(
 #[tauri::command]
 pub async fn acquire_shipping_claim(
     repository: String,
+    expected_repository: String,
     number: u64,
     mut claim: ShippingClaim,
 ) -> Result<ShippingClaim, String> {
@@ -2153,7 +2154,7 @@ pub async fn acquire_shipping_claim(
             return Err("Shipping claim has no Sail instance identity.".to_string());
         }
         let repository = PathBuf::from(crate::validate_repository(repository)?);
-        let target = target_repository(&repository)?;
+        let target = expected_target_repository(&repository, &expected_repository)?;
         require_claim_coordination_permission(&repository, &target)?;
         if let Some(conflict) = equivalent_shipping_work(&repository, &target, number)? {
             return Err(conflict);
@@ -2405,6 +2406,7 @@ pub async fn acquire_shipping_claim(
 #[tauri::command]
 pub async fn heartbeat_shipping_claim(
     repository: String,
+    expected_repository: String,
     number: u64,
     mut claim: ShippingClaim,
     instance_id: String,
@@ -2416,7 +2418,7 @@ pub async fn heartbeat_shipping_claim(
         }
         validated_claim_input(&claim)?;
         let repository = PathBuf::from(crate::validate_repository(repository)?);
-        let target = target_repository(&repository)?;
+        let target = expected_target_repository(&repository, &expected_repository)?;
         let authenticated_user = authenticated_github_user(&repository)?;
         let comments = issue_comments(&repository, &target, number)?;
         let observed_at = github_server_time_millis(&repository)?;
@@ -2621,6 +2623,7 @@ pub async fn heartbeat_shipping_claim(
 #[tauri::command]
 pub async fn release_shipping_claim(
     repository: String,
+    expected_repository: String,
     number: u64,
     claim: ShippingClaim,
     instance_id: String,
@@ -2637,7 +2640,7 @@ pub async fn release_shipping_claim(
             return Err("Shipping claim belongs to another Sail instance.".to_string());
         }
         let repository = PathBuf::from(crate::validate_repository(repository)?);
-        let target = target_repository(&repository)?;
+        let target = expected_target_repository(&repository, &expected_repository)?;
         let authenticated_user = authenticated_github_user(&repository)?;
         let existing = issue_comments(&repository, &target, number)?;
         let observed_at = github_server_time_millis(&repository)?;
@@ -4355,6 +4358,25 @@ pub(crate) fn target_repository(worktree: &Path) -> Result<String, String> {
     Ok(target.to_string())
 }
 
+fn require_expected_target_repository(
+    expected_repository: &str,
+    target: String,
+) -> Result<String, String> {
+    if target.eq_ignore_ascii_case(expected_repository) {
+        return Ok(target);
+    }
+    Err(format!(
+        "Shipping target changed from {expected_repository} to {target}. Refresh and retry."
+    ))
+}
+
+fn expected_target_repository(
+    worktree: &Path,
+    expected_repository: &str,
+) -> Result<String, String> {
+    require_expected_target_repository(expected_repository, target_repository(worktree)?)
+}
+
 fn issue_repository(repository: String) -> Result<(PathBuf, String), String> {
     let repository = PathBuf::from(crate::validate_repository(repository)?);
     let remotes = output_or_error(run(&repository, "git", &["remote"])?, "Cannot list remotes")?;
@@ -4898,14 +4920,16 @@ mod tests {
         predecessor_stop_lock_owner, pull_request_head, recent_equivalent_pull_request_cutoff,
         reconciled_active_revision, reconciled_claim_release, reconciled_heartbeat_revision,
         references_issue, reject_equivalent_work_after_claim, released_claim_marker,
-        renewed_claim_window, rollback_unapplied_heartbeat_fence, select_claim_lock,
-        shipping_claim_observation, shipping_claim_observation_with_current,
-        shipping_pull_request_matches, shipping_pull_request_snapshot,
-        submitted_heartbeat_still_current, transition_lock_owner, transition_lock_recoverable,
-        collect_check_rollup_pages, complete_check_rollup_or_original, parse_pull_request_checks,
-        valid_claim_time, valid_stored_claim, validate_claim_coordination_permission,
-        validate_external_url, validate_graph, validated_claim_input, with_verified_claim_takeover,
-        ClaimLock, IssueDraft, IssueGraphDraft, RepositoryLabelState, ShippingClaim,
+        renewed_claim_window, require_expected_target_repository,
+        rollback_unapplied_heartbeat_fence, select_claim_lock, shipping_claim_observation,
+        shipping_claim_observation_with_current, shipping_pull_request_matches,
+        shipping_pull_request_snapshot, submitted_heartbeat_still_current, transition_lock_owner,
+        transition_lock_recoverable, collect_check_rollup_pages,
+        complete_check_rollup_or_original, parse_pull_request_checks, valid_claim_time,
+        valid_stored_claim,
+        validate_claim_coordination_permission, validate_external_url, validate_graph,
+        validated_claim_input, with_verified_claim_takeover, ClaimLock, IssueDraft,
+        IssueGraphDraft, RepositoryLabelState, ShippingClaim,
     };
     use std::{cell::Cell, collections::HashMap, fs, process::Command, time::Duration};
 
@@ -5827,6 +5851,21 @@ mod tests {
                 "Shipping claims require write access to the upstream repository. No claim was posted."
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn claim_mutations_reject_a_changed_shipping_target() {
+        assert_eq!(
+            require_expected_target_repository("owner/repo", "other/repo".to_string()),
+            Err(
+                "Shipping target changed from owner/repo to other/repo. Refresh and retry."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            require_expected_target_repository("Owner/Repo", "owner/repo".to_string()),
+            Ok("owner/repo".to_string())
         );
     }
 

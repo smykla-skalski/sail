@@ -814,7 +814,10 @@
         claimLegacyPendingImplementationTurn(path, sourceId);
       if (claimedLegacy) recordShipItOwner(path, sourceId);
       if (!ownsPending || (savedOwner !== sourceId && !claimedLegacy)) continue;
-      if (issue) void adoptDirectShipRun(issue, path, `acp:${agent}:${sessionId}`, model);
+      if (issue)
+        void adoptDirectShipRun(issue, path, `acp:${agent}:${sessionId}`, model).catch(
+          (cause) => (error = describe(cause)),
+        );
     }
   });
   let agentUsage = $state<Record<string, AgentUsage>>({});
@@ -1794,7 +1797,7 @@
       claimLegacyPendingImplementationTurn(path, sourceId);
     if (claimedLegacy) recordShipItOwner(path, sourceId);
     if (saved && ownsPending && (savedOwner === sourceId || claimedLegacy))
-      void adoptDirectShipRun(saved, path, sourceId);
+      void adoptDirectShipRun(saved, path, sourceId).catch((cause) => (error = describe(cause)));
   });
   const displayChatMessages = $derived(
     withSpawnResponses(
@@ -3434,7 +3437,7 @@
     knownWorkerModel?: string,
     requireClaim = false,
   ): Promise<DirectShipAuthorization | undefined> {
-    if (requireClaim) await assertShipItIssueRepository(path, issue);
+    await assertShipItIssueRepository(path, issue);
     const provider: ShipRun['provider'] = threadId.startsWith('opencode:')
       ? 'opencode'
       : threadId.startsWith('acp:claude:')
@@ -3531,6 +3534,7 @@
       const acquiredAt = new Date().toISOString();
       const claim = await invoke<ShippingClaim>('acquire_shipping_claim', {
         repository: run.repository,
+        expectedRepository: run.remote,
         number: issue.number,
         claim: {
           id: crypto.randomUUID(),
@@ -3555,6 +3559,7 @@
         async (acquired) => {
           await invoke<ShippingClaim>('release_shipping_claim', {
             repository: run.repository,
+            expectedRepository: run.remote,
             number: issue.number,
             claim: acquired,
             instanceId: shippingInstanceId,
@@ -3787,6 +3792,7 @@
       try {
         const released = await invoke<ShippingClaim>('release_shipping_claim', {
           repository: run.repository,
+          expectedRepository: run.remote,
           number: issue.number,
           claim,
           instanceId: shippingInstanceId,
@@ -4056,6 +4062,7 @@
       const updated = terminal
         ? await invoke<ShippingClaim>('release_shipping_claim', {
             repository: run.repository,
+            expectedRepository: run.remote,
             number: issue.number,
             claim,
             instanceId: shippingInstanceId,
@@ -4064,6 +4071,7 @@
         : heartbeatDue
           ? await invoke<ShippingClaim>('heartbeat_shipping_claim', {
               repository: run.repository,
+              expectedRepository: run.remote,
               number: issue.number,
               claim,
               instanceId: shippingInstanceId,

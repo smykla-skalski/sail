@@ -204,7 +204,7 @@
         path,
         sourceId,
         session?.model ? `${session.model.providerID}:${session.model.id}` : undefined,
-      );
+      ).catch((cause) => (error = describe(cause)));
   });
 
   function isShipItPrompt(text: string): boolean {
