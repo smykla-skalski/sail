@@ -1,4 +1,9 @@
-import type { AgentAvailability, AgentId, AgentThread } from './acp';
+import {
+  mergeAgentThreadListing,
+  type AgentAvailability,
+  type AgentId,
+  type AgentThread,
+} from './acp.ts';
 import type { ProjectCatalog } from './projects';
 import { threadKey } from './recent-threads.ts';
 import { commandsForDirectory, type SavedCommand } from './saved-commands.ts';
@@ -184,6 +189,16 @@ function directoryContext(catalog: ProjectCatalog, directory: string) {
   return null;
 }
 
+function uniqueAgentThreads(threads: AgentThread[]): AgentThread[] {
+  const unique = new Map<string, AgentThread>();
+  for (const thread of threads) {
+    const key = threadKey(thread);
+    const previous = unique.get(key);
+    unique.set(key, previous ? mergeAgentThreadListing(previous, thread) : thread);
+  }
+  return [...unique.values()];
+}
+
 export function searchCommandPalette({
   step,
   query,
@@ -250,27 +265,25 @@ export function searchCommandPalette({
         })),
       );
       const running = new Set(runningThreadKeys);
-      const uniqueThreads = new Map(threads.map((thread) => [threadKey(thread), thread]));
-      const sessionEntries: PaletteEntry[] = [...uniqueThreads.entries()].flatMap(
-        ([key, thread]) => {
-          const context = directoryContext(catalog, thread.directory);
-          if (!context) return [];
-          const agentName = agents.find((agent) => agent.id === thread.agent)?.name ?? thread.agent;
-          const available = !!agents.find((agent) => agent.id === thread.agent)?.available;
-          return [
-            {
-              id: `global-thread:${key}`,
-              kind: 'thread' as const,
-              label: thread.title,
-              detail: `${agentName} · ${context.project} / ${context.location}${running.has(key) ? ' · Running' : ''}`,
-              directory: thread.directory,
-              agent: thread.agent,
-              thread,
-              disabled: !available,
-            },
-          ];
-        },
-      );
+      const sessionEntries: PaletteEntry[] = uniqueAgentThreads(threads).flatMap((thread) => {
+        const key = threadKey(thread);
+        const context = directoryContext(catalog, thread.directory);
+        if (!context) return [];
+        const agentName = agents.find((agent) => agent.id === thread.agent)?.name ?? thread.agent;
+        const available = !!agents.find((agent) => agent.id === thread.agent)?.available;
+        return [
+          {
+            id: `global-thread:${key}`,
+            kind: 'thread' as const,
+            label: thread.title,
+            detail: `${agentName} · ${context.project} / ${context.location}${running.has(key) ? ' · Running' : ''}`,
+            directory: thread.directory,
+            agent: thread.agent,
+            thread,
+            disabled: !available,
+          },
+        ];
+      });
       return rank(
         [...repositories, ...worktrees, ...sessionEntries, ...commandEntries, ...matchingActions],
         query,
@@ -278,7 +291,7 @@ export function searchCommandPalette({
         (entry) =>
           entry.kind === 'action'
             ? entry.label
-            : `${entry.label} ${entry.detail} ${entry.directory ?? ''} ${entry.command?.command ?? ''}`,
+            : `${entry.label} ${entry.detail} ${entry.directory ?? ''} ${entry.thread?.keywords?.join(' ') ?? ''} ${entry.command?.command ?? ''}`,
         (entry) =>
           entry.thread && running.has(threadKey(entry.thread))
             ? 2
@@ -344,16 +357,9 @@ export function searchCommandPalette({
     label: 'New session',
     detail: `Start with ${agents.find((agent) => agent.id === step.agent)?.name ?? step.agent}`,
   };
-  const seen = new Set<string>();
-  const existing: PaletteEntry[] = threads
+  const existing: PaletteEntry[] = uniqueAgentThreads(threads)
     .filter((thread) => thread.directory === step.directory && thread.agent === step.agent)
     .toSorted((a, b) => b.updated - a.updated)
-    .filter((thread) => {
-      // A saved thread and its session/list entry name one session.
-      if (seen.has(thread.sessionId)) return false;
-      seen.add(thread.sessionId);
-      return true;
-    })
     .map((thread) => ({
       id: `thread:${thread.agent}:${thread.directory}:${thread.sessionId}`,
       kind: 'thread',
@@ -362,5 +368,12 @@ export function searchCommandPalette({
       thread,
     }));
   const newSession = !query.trim() || score(create.label, query) !== null ? [create] : [];
-  return [...newSession, ...rank(existing, query)].slice(0, 50);
+  return [
+    ...newSession,
+    ...rank(
+      existing,
+      query,
+      (entry) => `${entry.label} ${entry.thread?.keywords?.join(' ') ?? ''}`,
+    ),
+  ].slice(0, 50);
 }

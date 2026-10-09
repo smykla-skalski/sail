@@ -79,6 +79,29 @@ void test('root search finds agent work by title, provider, and worktree context
   );
 });
 
+void test('thread keywords are searchable from root and session views', () => {
+  const keywordThread = { ...threads[0], keywords: ['authentication', 'session discovery'] };
+  assert.equal(
+    search({ kind: 'projects' }, 'auth', { threads: [keywordThread] }).find(
+      (entry) => entry.kind === 'thread',
+    )?.thread?.sessionId,
+    'old',
+  );
+  assert.equal(
+    search(
+      {
+        kind: 'sessions',
+        repository: '/work/alpha',
+        directory: '/work/alpha-feature',
+        agent: 'claude',
+      },
+      'ssn dsc',
+      { threads: [keywordThread] },
+    )[0]?.thread?.sessionId,
+    'old',
+  );
+});
+
 void test('root search puts running agent work first', () => {
   const matches = search({ kind: 'projects' }, 'claude feature', {
     runningThreadKeys: [JSON.stringify(['claude', '/work/alpha-feature', 'old'])],
@@ -165,6 +188,22 @@ void test('a session saved in Sail and listed by the agent appears once', () => 
     ['new-session', 'ses_both'],
   );
   assert.equal(new Set(entries.map((entry) => entry.id)).size, entries.length);
+});
+
+void test('listed sessions keep Sail keyword metadata in palette search', () => {
+  const saved: AgentThread = {
+    agent: 'opencode',
+    directory: '/work/alpha-feature',
+    sessionId: 'ses_both',
+    title: 'Saved title',
+    keywords: ['semantic indexing'],
+    updated: 5,
+  };
+  const listed = { ...saved, title: 'Listed title', keywords: undefined, updated: 6 };
+  const match = search({ kind: 'projects' }, 'semantic', { threads: [saved, listed] }).find(
+    (entry) => entry.kind === 'thread',
+  );
+  assert.equal(match?.thread?.sessionId, 'ses_both');
 });
 
 void test('OpenCode sessions list like every other ACP agent', () => {

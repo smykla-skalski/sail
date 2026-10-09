@@ -74,6 +74,11 @@ reason, and policy revision; unknown and high-risk actions require a person.
   required, launch the configured review route before treating the task as done.
 - Use `project_threads` and `thread_message` to contact another thread in the
   same project. Use `worktree_status` for a short sidebar status comment.
+- On the first substantive task turn, once you understand the work, call
+  `thread_keywords` with 5–10 concise search terms. Prefer domain nouns,
+  components, technologies, issue identifiers and the user's terminology;
+  omit generic verbs such as fix, implement and work. Replace the list when the
+  task scope materially changes.
 
 ## Plan review
 

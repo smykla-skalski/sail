@@ -16,6 +16,7 @@ const coreCapabilityTools = new Set([
   'terminal_read',
   'terminal_wait',
   'worktree_status',
+  'thread_keywords',
   'project_threads',
   'read_page',
   'screenshot',

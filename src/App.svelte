@@ -418,6 +418,10 @@
     forgetRecentTranscript,
     invalidateLiveTranscript,
     loadAgentThreads,
+    mergeAgentThreadActivity,
+    mergeAgentThreadRename,
+    mergeAgentThreadUpdate,
+    normalizeAgentThreadKeywords,
     loadInterruptedAgentTurns,
     loadRecentTranscript,
     rememberSessionState,
@@ -770,6 +774,7 @@
       | 'worktree_list'
       | 'worktree_info'
       | 'worktree_status'
+      | 'thread_keywords'
       | 'project_threads'
       | 'thread_message'
       | 'capability_check';
@@ -5940,6 +5945,18 @@
       saveProjectCatalog(setWorktreeStatus(projectCatalog, project, request.directory, comment));
       return { comment: comment.trim() };
     }
+    if (request.name === 'thread_keywords') {
+      const keywords = normalizeAgentThreadKeywords(request.arguments.keywords);
+      const thread = agentThreads.find(
+        (item) =>
+          item.agent === source.agent &&
+          item.directory === request.directory &&
+          item.sessionId === request.sessionId,
+      );
+      if (!thread) throw new Error('The source agent session is unavailable.');
+      saveAgentThread({ ...thread, keywords });
+      return { keywords };
+    }
     if (request.name === 'project_threads' || request.name === 'thread_message') {
       if (request.name === 'project_threads' && !agentThreadListEnabled)
         throw new Error('Agent thread listing is disabled in settings.');
@@ -9182,10 +9199,7 @@
 
   function saveAgentThread(thread: AgentThread) {
     const previous = agentThreads.find((item) => threadKey(item) === threadKey(thread));
-    if (previous && previous.updated > thread.updated)
-      thread = { ...thread, updated: previous.updated };
-    if (previous?.renamed && !thread.renamed)
-      thread = { ...thread, title: previous.title, renamed: true };
+    thread = mergeAgentThreadUpdate(previous, thread);
     agentThreads = [
       thread,
       ...agentThreads.filter(
@@ -9216,6 +9230,11 @@
       acpThread.directory === thread.directory
     )
       acpThread = thread;
+  }
+
+  function saveAgentActivity(thread: AgentThread) {
+    const previous = agentThreads.find((item) => threadKey(item) === threadKey(thread));
+    saveAgentThread(mergeAgentThreadActivity(previous, thread));
   }
 
   function rememberRecentThread(thread: AgentThread) {
@@ -11100,7 +11119,8 @@
   }
 
   function renameAgentThread(thread: AgentThread, title: string) {
-    const renamed = { ...thread, title, renamed: true };
+    const previous = agentThreads.find((item) => threadKey(item) === threadKey(thread));
+    const renamed = mergeAgentThreadRename(previous, thread, title);
     saveAgentThread(renamed);
     sidebarOpenCodeThreads = sidebarOpenCodeThreads.map((item) =>
       threadKey(item) === threadKey(thread)
@@ -11675,7 +11695,7 @@
                 activityReady={acpActivityReady}
                 focused={focusedPane === 'main'}
                 oncreated={createAgentThread}
-                onactivity={saveAgentThread}
+                onactivity={saveAgentActivity}
                 onstatus={updateAgentThreadStatus}
                 onreplaychange={setAgentReplay}
                 onterminal={(id) => void openAgentTerminal(id)}
@@ -11812,7 +11832,7 @@
         onpickedconsumed={markPickConsumed}
         onattachmentsent={assignReviewCaptures}
         onshortcut={keydownWorkspace}
-        onactivity={saveAgentThread}
+        onactivity={saveAgentActivity}
         activityEvents={currentActivityHistory}
         activityLoading={inboxLoading}
         activityError={inboxError}
