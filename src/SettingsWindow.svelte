@@ -1131,6 +1131,12 @@
           >
             {memoryProviderStatus.notice}
           </p>{/if}
+        {#if memoryProviderStatus?.syncError && memoryProviderKind === memoryProviderStatus.provider}<p
+            class="runtime-diagnostic"
+            role="alert"
+          >
+            Last Mem0 sync failed: {memoryProviderStatus.syncError} Local search remains active.
+          </p>{/if}
         <label for="memory-provider">Provider</label>
         <select
           id="memory-provider"

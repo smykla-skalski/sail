@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -18,6 +18,8 @@ const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const HOSTED_PAGE_SIZE: usize = 100;
 const MAX_RECONCILE_RECORDS: usize = 100_000;
 const SELF_HOSTED_SAFE_LIMIT: usize = 1_000;
+const EVENT_POLL_ATTEMPTS: usize = 25;
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +52,7 @@ pub struct ProviderStatus {
     configured: bool,
     credential_storage: Option<CredentialStorage>,
     notice: Option<String>,
+    sync_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -57,6 +60,19 @@ pub struct ProviderStatus {
 pub enum CredentialStorage {
     Keychain,
     Memory,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PendingEvent {
+    event_id: Option<String>,
+    updated_at: u64,
+}
+
+type PendingEvents = HashMap<String, PendingEvent>;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ProviderRuntimeStatus {
+    sync_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,7 +91,12 @@ pub(crate) trait MemoryProvider {
         query: &str,
         limit: usize,
     ) -> Result<Vec<RemoteMemory>, String>;
-    fn reconcile(&self, project_key: &str, memories: &[MemoryRecord]) -> Result<(), String>;
+    fn reconcile(
+        &self,
+        root: &Path,
+        project_key: &str,
+        memories: &[MemoryRecord],
+    ) -> Result<(), String>;
 }
 
 struct Mem0Provider {
@@ -150,6 +171,153 @@ fn provider_lock(root: &Path, project_key: &str) -> Result<File, String> {
             }
         }
     }
+}
+
+fn pending_events_path(root: &Path, project_key: &str) -> PathBuf {
+    root.join(format!("{project_key}.mem0-events.json"))
+}
+
+fn runtime_status_path(root: &Path, project_key: &str) -> PathBuf {
+    root.join(format!("{project_key}.provider-status.json"))
+}
+
+fn state_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, String> {
+    let contents = match fs::read(path) {
+        Ok(contents) => serde_json::from_slice(&contents)
+            .map_err(|_| "Memory provider state is corrupt.".to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let backup = state_backup_path(path);
+            match fs::read(&backup) {
+                Ok(contents) => {
+                    fs::rename(&backup, path)
+                        .map_err(|_| "Cannot recover memory provider state.".to_string())?;
+                    serde_json::from_slice(&contents)
+                        .map_err(|_| "Memory provider state is corrupt.".to_string())?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(T::default())
+                }
+                Err(_) => return Err("Cannot read memory provider state.".to_string()),
+            }
+        }
+        Err(_) => return Err("Cannot read memory provider state.".to_string()),
+    };
+    Ok(contents)
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or("Memory provider state path is invalid.")?;
+    fs::create_dir_all(parent).map_err(|_| "Cannot create memory provider state.".to_string())?;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let contents = serde_json::to_vec(value)
+        .map_err(|_| "Cannot encode memory provider state.".to_string())?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| "Cannot write memory provider state.".to_string())?;
+    if file
+        .write_all(&contents)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err("Cannot write memory provider state.".into());
+    }
+    drop(file);
+    if let Err(error) = replace_state(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_state(temporary: &Path, destination: &Path) -> Result<(), String> {
+    fs::rename(temporary, destination)
+        .map_err(|error| format!("Cannot save memory provider state: {error}"))
+}
+
+#[cfg(windows)]
+fn replace_state(temporary: &Path, destination: &Path) -> Result<(), String> {
+    let backup = state_backup_path(destination);
+    if destination.exists() {
+        if backup.exists() {
+            fs::remove_file(&backup)
+                .map_err(|error| format!("Cannot replace memory provider backup: {error}"))?;
+        }
+        fs::rename(destination, &backup)
+            .map_err(|error| format!("Cannot back up memory provider state: {error}"))?;
+    }
+    if let Err(error) = fs::rename(temporary, destination) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, destination);
+        }
+        return Err(format!("Cannot save memory provider state: {error}"));
+    }
+    if backup.exists() {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn load_pending_events(root: &Path, project_key: &str) -> Result<PendingEvents, String> {
+    read_json(&pending_events_path(root, project_key))
+}
+
+fn save_pending_events(
+    root: &Path,
+    project_key: &str,
+    events: &PendingEvents,
+) -> Result<(), String> {
+    let path = pending_events_path(root, project_key);
+    if events.is_empty() {
+        let result = match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("Cannot clear memory provider event state.".into()),
+        };
+        if result.is_ok() {
+            let _ = fs::remove_file(state_backup_path(&path));
+        }
+        result
+    } else {
+        write_json(&path, events)
+    }
+}
+
+fn load_runtime_status(root: &Path, project_key: &str) -> ProviderRuntimeStatus {
+    read_json(&runtime_status_path(root, project_key)).unwrap_or_else(|error| {
+        ProviderRuntimeStatus {
+            sync_error: Some(error),
+        }
+    })
+}
+
+fn save_runtime_error(root: &Path, project_key: &str, error: Option<&str>) {
+    let path = runtime_status_path(root, project_key);
+    if error.is_none() {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(state_backup_path(&path));
+        return;
+    }
+    let _ = write_json(
+        &path,
+        &ProviderRuntimeStatus {
+            sync_error: error.map(str::to_string),
+        },
+    );
 }
 
 fn save_config(
@@ -237,7 +405,7 @@ fn credential_storage(project_key: &str) -> Option<CredentialStorage> {
 fn notice(storage: Option<CredentialStorage>, configured: bool) -> Option<String> {
     match storage {
         Some(CredentialStorage::Memory) => Some(
-            "The OS credential store is unavailable. The API key is kept in memory for this Sail session only."
+            "The OS credential store is unavailable. The API key is kept in memory for this Sail session only. Standalone agent memory uses local search until the key can be stored in the OS credential store."
                 .to_string(),
         ),
         None if configured => Some(
@@ -403,7 +571,65 @@ impl Mem0Provider {
         Err("Hosted Mem0 pagination did not terminate safely.".into())
     }
 
-    fn add(&self, project_key: &str, memory: &MemoryRecord) -> Result<(), String> {
+    fn event_status(&self, event_id: &str) -> Result<String, String> {
+        if event_id.is_empty()
+            || !event_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            return Err("Mem0 returned an invalid event identifier.".into());
+        }
+        let value = self.send(self.request(Method::GET, &format!("/v1/event/{event_id}/"))?)?;
+        value
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "Mem0 returned an invalid event status.".to_string())
+    }
+
+    fn wait_for_event(&self, event_id: &str) -> Result<(), String> {
+        for attempt in 0..EVENT_POLL_ATTEMPTS {
+            match self.event_status(event_id)?.as_str() {
+                "SUCCEEDED" => return Ok(()),
+                "FAILED" => return Err("Mem0 failed to process the memory.".into()),
+                "PENDING" | "RUNNING" | "PROCESSING" => {}
+                _ => return Err("Mem0 returned an unknown event status.".into()),
+            }
+            if attempt + 1 < EVENT_POLL_ATTEMPTS {
+                std::thread::sleep(EVENT_POLL_INTERVAL);
+            }
+        }
+        Err("Mem0 is still processing the memory.".into())
+    }
+
+    fn wait_until_visible(
+        &self,
+        project_key: &str,
+        sail_id: &str,
+        updated_at: u64,
+    ) -> Result<Vec<RemoteMemory>, String> {
+        for attempt in 0..EVENT_POLL_ATTEMPTS {
+            let remote = self.list_all(project_key)?;
+            if remote
+                .iter()
+                .any(|item| item.sail_id == sail_id && item.updated_at == updated_at)
+            {
+                return Ok(remote);
+            }
+            if attempt + 1 < EVENT_POLL_ATTEMPTS {
+                std::thread::sleep(EVENT_POLL_INTERVAL);
+            }
+        }
+        Err("Mem0 accepted the memory but it is not visible yet.".into())
+    }
+
+    fn add(
+        &self,
+        root: &Path,
+        project_key: &str,
+        memory: &MemoryRecord,
+        pending: &mut PendingEvents,
+    ) -> Result<(), String> {
         let path = if self.kind == ProviderKind::Mem0Hosted {
             "/v3/memories/add/"
         } else {
@@ -415,7 +641,38 @@ impl Mem0Provider {
             "infer": false,
             "metadata": metadata(memory),
         });
-        self.send(self.request(Method::POST, path)?.json(&body))?;
+        if self.kind != ProviderKind::Mem0Hosted {
+            self.send(self.request(Method::POST, path)?.json(&body))?;
+            return Ok(());
+        }
+
+        pending.insert(
+            memory.id.clone(),
+            PendingEvent {
+                event_id: None,
+                updated_at: memory.updated_at,
+            },
+        );
+        save_pending_events(root, project_key, pending)?;
+        let value = self.send(self.request(Method::POST, path)?.json(&body))?;
+        let event_id = value
+            .get("event_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or("Mem0 did not return an event identifier.")?
+            .to_string();
+        pending.insert(
+            memory.id.clone(),
+            PendingEvent {
+                event_id: Some(event_id.clone()),
+                updated_at: memory.updated_at,
+            },
+        );
+        save_pending_events(root, project_key, pending)?;
+        self.wait_for_event(&event_id)?;
+        self.wait_until_visible(project_key, &memory.id, memory.updated_at)?;
+        pending.remove(&memory.id);
+        save_pending_events(root, project_key, pending)?;
         Ok(())
     }
 
@@ -462,8 +719,43 @@ impl MemoryProvider for Mem0Provider {
         Ok(remote_memories(&value))
     }
 
-    fn reconcile(&self, project_key: &str, memories: &[MemoryRecord]) -> Result<(), String> {
-        let remote = self.list_all(project_key)?;
+    fn reconcile(
+        &self,
+        root: &Path,
+        project_key: &str,
+        memories: &[MemoryRecord],
+    ) -> Result<(), String> {
+        let mut remote = self.list_all(project_key)?;
+        let mut pending = load_pending_events(root, project_key)?;
+        for (sail_id, event) in pending.clone() {
+            if remote
+                .iter()
+                .any(|item| item.sail_id == sail_id && item.updated_at == event.updated_at)
+            {
+                pending.remove(&sail_id);
+                save_pending_events(root, project_key, &pending)?;
+                continue;
+            }
+            let Some(event_id) = event.event_id else {
+                return Err(
+                    "A previous Mem0 submission has an unknown outcome. Local memory remains available; switch to local before explicitly reconnecting Mem0."
+                        .into(),
+                );
+            };
+            match self.wait_for_event(&event_id) {
+                Ok(()) => {
+                    remote = self.wait_until_visible(project_key, &sail_id, event.updated_at)?;
+                    pending.remove(&sail_id);
+                    save_pending_events(root, project_key, &pending)?;
+                }
+                Err(error) if error == "Mem0 failed to process the memory." => {
+                    pending.remove(&sail_id);
+                    save_pending_events(root, project_key, &pending)?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let mut by_sail_id: HashMap<&str, Vec<&RemoteMemory>> = HashMap::new();
         for memory in &remote {
             by_sail_id.entry(&memory.sail_id).or_default().push(memory);
@@ -485,7 +777,7 @@ impl MemoryProvider for Mem0Provider {
             for item in existing {
                 self.delete(&item.id)?;
             }
-            self.add(project_key, memory)?;
+            self.add(root, project_key, memory, &mut pending)?;
         }
         for duplicates in by_sail_id.into_values() {
             for duplicate in duplicates {
@@ -569,10 +861,21 @@ fn sync_at(root: &Path, settings: &Path, key: &str) -> Result<(), String> {
     let _lock = provider_lock(root, key)?;
     let config = load_config_at(settings, key)?;
     if config.provider == ProviderKind::Local {
+        save_runtime_error(root, key, None);
         return Ok(());
     }
     let memories = crate::memory::list_at(root, key, true)?;
-    provider(&config, load_api_key(key)?)?.reconcile(key, &memories)
+    let result = provider(&config, load_api_key(key)?)?.reconcile(root, key, &memories);
+    match result {
+        Ok(()) => {
+            save_runtime_error(root, key, None);
+            Ok(())
+        }
+        Err(error) => {
+            save_runtime_error(root, key, Some(&error));
+            Err(error)
+        }
+    }
 }
 
 fn sync(app: &tauri::AppHandle, directory: &str) -> Result<(), String> {
@@ -639,22 +942,34 @@ pub(crate) fn search_standalone(
     }
     let maximum = limit.unwrap_or(10).clamp(1, 100);
     let memories = crate::memory::list_at(root, key, true)?;
-    let canonical: HashMap<_, _> = memories
-        .iter()
-        .filter(|memory| memory.forgotten_at.is_none())
-        .cloned()
-        .map(|memory| (memory.id.clone(), memory))
-        .collect();
     let remote = load_api_key(key)
         .and_then(|api_key| provider(&config, api_key))
         .and_then(|provider| {
-            provider.reconcile(key, &memories)?;
+            provider.reconcile(root, key, &memories)?;
             provider.search(key, query, maximum)
-        })
-        .map(|remote| map_remote_results(remote, &canonical, maximum));
+        });
     match remote {
-        Ok(remote) => Ok(merge_results(remote, local()?, maximum)),
-        Err(_) => local(),
+        Ok(remote) => {
+            let local_results = local()?;
+            // Linearize returned records after all remote I/O so completed forgets win.
+            let canonical: HashMap<_, _> = crate::memory::list_at(root, key, false)?
+                .into_iter()
+                .map(|memory| (memory.id.clone(), memory))
+                .collect();
+            save_runtime_error(root, key, None);
+            Ok(merge_results(
+                map_remote_results(remote, &canonical, maximum),
+                local_results
+                    .into_iter()
+                    .filter(|result| canonical.contains_key(&result.memory.id))
+                    .collect(),
+                maximum,
+            ))
+        }
+        Err(error) => {
+            save_runtime_error(root, key, Some(&error));
+            local()
+        }
     }
 }
 
@@ -703,14 +1018,17 @@ pub fn memory_provider_status(
 ) -> Result<ProviderStatus, String> {
     let key = project_key(&directory)?;
     let config = load_config(&app, &key)?;
+    let (root, _) = crate::memory::standalone_paths(&app)?;
     let storage = credential_storage(&key);
     let configured = config.provider != ProviderKind::Local;
+    let runtime = load_runtime_status(&root, &key);
     Ok(ProviderStatus {
         configured,
         provider: config.provider,
         endpoint: config.endpoint,
         credential_storage: storage,
         notice: notice(storage, configured),
+        sync_error: runtime.sync_error,
     })
 }
 
@@ -736,6 +1054,7 @@ pub fn verify_memory_provider(
         endpoint: config.endpoint,
         credential_storage: None,
         notice: None,
+        sync_error: None,
     })
 }
 
@@ -749,15 +1068,23 @@ pub fn set_memory_provider(
     let config = normalize_config(&input)?;
     let (root, _) = crate::memory::standalone_paths(&app)?;
     let _lock = provider_lock(&root, &key)?;
+    let previous = load_config(&app, &key)?;
+    if previous != config {
+        save_pending_events(&root, &key, &PendingEvents::new())?;
+        save_runtime_error(&root, &key, None);
+    }
     if config.provider == ProviderKind::Local {
         save_config(&app, &key, None)?;
         delete_api_key(&key);
+        save_pending_events(&root, &key, &PendingEvents::new())?;
+        save_runtime_error(&root, &key, None);
         return Ok(ProviderStatus {
             provider: ProviderKind::Local,
             endpoint: None,
             configured: false,
             credential_storage: None,
             notice: None,
+            sync_error: None,
         });
     }
     crate::memory::ensure_enabled(&app, &directory)?;
@@ -769,7 +1096,7 @@ pub fn set_memory_provider(
         .ok_or("A Mem0 API key is required.")?;
     let provider = provider(&config, api_key.to_string())?;
     provider.verify(&key)?;
-    provider.reconcile(&key, &crate::memory::list(&app, &directory, true)?)?;
+    provider.reconcile(&root, &key, &crate::memory::list(&app, &directory, true)?)?;
     let storage = store_api_key(&key, api_key)?;
     save_config(&app, &key, Some(&config))?;
     Ok(ProviderStatus {
@@ -778,6 +1105,7 @@ pub fn set_memory_provider(
         configured: true,
         credential_storage: Some(storage),
         notice: notice(Some(storage), true),
+        sync_error: None,
     })
 }
 
@@ -790,12 +1118,14 @@ pub fn sync_memory_provider(app: tauri::AppHandle, directory: String) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        config_key, merge_results, normalize_config, provider_lock, remote_memories,
-        search_standalone, session_credentials, sync_at, Mem0Provider, MemoryProvider,
-        ProviderConfig, ProviderInput, ProviderKind, HOSTED_PAGE_SIZE, SELF_HOSTED_SAFE_LIMIT,
+        config_key, load_pending_events, load_runtime_status, merge_results, normalize_config,
+        notice, provider_lock, remote_memories, search_standalone, session_credentials, sync_at,
+        CredentialStorage, Mem0Provider, MemoryProvider, PendingEvents, ProviderConfig,
+        ProviderInput, ProviderKind, HOSTED_PAGE_SIZE, SELF_HOSTED_SAFE_LIMIT,
     };
     use crate::memory::{
-        remember_at, MemoryInput, MemoryKind, MemoryProvenance, MemoryRecord, MemorySearchResult,
+        forget_at, remember_at, MemoryInput, MemoryKind, MemoryProvenance, MemoryRecord,
+        MemorySearchResult,
     };
     use serde_json::json;
     use std::fs;
@@ -889,6 +1219,16 @@ mod tests {
         .unwrap();
     }
 
+    fn respond_status(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    }
+
     #[test]
     fn provider_config_never_serializes_api_key() {
         let input = ProviderInput {
@@ -899,6 +1239,12 @@ mod tests {
         let encoded = serde_json::to_string(&normalize_config(&input).unwrap()).unwrap();
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("apiKey"));
+    }
+
+    #[test]
+    fn memory_only_credentials_explain_standalone_fallback() {
+        let message = notice(Some(CredentialStorage::Memory), true).unwrap();
+        assert!(message.contains("Standalone agent memory uses local search"));
     }
 
     #[test]
@@ -964,6 +1310,7 @@ mod tests {
 
     #[test]
     fn hosted_add_uses_v3_and_token_authentication() {
+        let root = temporary();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -975,7 +1322,7 @@ mod tests {
                 .contains("authorization: token secret"));
             assert!(request.contains("\"infer\":false"));
             assert!(request.contains("\"sail_memory_id\":\"local-id\""));
-            respond(&mut stream, r#"{"results":[]}"#);
+            respond(&mut stream, r#"{"event_id":"event-1","status":"PENDING"}"#);
         });
         let provider = Mem0Provider {
             client: reqwest::blocking::Client::new(),
@@ -983,12 +1330,131 @@ mod tests {
             endpoint: reqwest::Url::parse(&endpoint).unwrap(),
             api_key: "secret".into(),
         };
-        provider.add("project", &memory()).unwrap();
+        let mut pending = PendingEvents::new();
+        let error = provider
+            .add(&root, "project", &memory(), &mut pending)
+            .unwrap_err();
+        assert_eq!(error, "Mem0 is unavailable.");
+        assert_eq!(pending["local-id"].event_id.as_deref(), Some("event-1"));
         server.join().unwrap();
     }
 
     #[test]
+    fn hosted_retry_resolves_saved_event_without_duplicate_post() {
+        let root = temporary();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let adds = Arc::new(AtomicUsize::new(0));
+        let server_adds = adds.clone();
+        let server = std::thread::spawn(move || {
+            for request_number in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                match request_number {
+                    0 => respond(&mut stream, r#"{"results":[]}"#),
+                    1 => {
+                        assert!(request.starts_with("POST /v3/memories/add/ HTTP/1.1"));
+                        server_adds.fetch_add(1, Ordering::SeqCst);
+                        respond(&mut stream, r#"{"event_id":"event-1","status":"PENDING"}"#);
+                    }
+                    2 => {
+                        assert!(request.starts_with("GET /v1/event/event-1/ HTTP/1.1"));
+                        respond_status(&mut stream, "503 Unavailable", r#"{"error":"later"}"#);
+                    }
+                    _ => respond(
+                        &mut stream,
+                        r#"{"results":[{"id":"remote-id","metadata":{"sail_memory_id":"local-id","sail_updated_at":42}}]}"#,
+                    ),
+                }
+            }
+        });
+        let provider = Mem0Provider {
+            client: reqwest::blocking::Client::new(),
+            kind: ProviderKind::Mem0Hosted,
+            endpoint: reqwest::Url::parse(&endpoint).unwrap(),
+            api_key: "secret".into(),
+        };
+        assert!(provider.reconcile(&root, "project", &[memory()]).is_err());
+        assert!(provider.reconcile(&root, "project", &[memory()]).is_ok());
+        assert!(load_pending_events(&root, "project").unwrap().is_empty());
+        server.join().unwrap();
+        assert_eq!(adds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hosted_add_polls_event_until_memory_is_visible() {
+        let root = temporary();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for request_number in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                match request_number {
+                    0 => respond(&mut stream, r#"{"results":[]}"#),
+                    1 => {
+                        assert!(request.starts_with("POST /v3/memories/add/ HTTP/1.1"));
+                        respond(&mut stream, r#"{"event_id":"event-1","status":"PENDING"}"#);
+                    }
+                    2 => respond(&mut stream, r#"{"status":"PENDING"}"#),
+                    3 => respond(&mut stream, r#"{"status":"SUCCEEDED"}"#),
+                    _ => respond(
+                        &mut stream,
+                        r#"{"results":[{"id":"remote-id","metadata":{"sail_memory_id":"local-id","sail_updated_at":42}}]}"#,
+                    ),
+                }
+            }
+        });
+        let provider = Mem0Provider {
+            client: reqwest::blocking::Client::new(),
+            kind: ProviderKind::Mem0Hosted,
+            endpoint: reqwest::Url::parse(&endpoint).unwrap(),
+            api_key: "secret".into(),
+        };
+        provider.reconcile(&root, "project", &[memory()]).unwrap();
+        assert!(load_pending_events(&root, "project").unwrap().is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn hosted_unknown_submission_is_not_automatically_reposted() {
+        let root = temporary();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let adds = Arc::new(AtomicUsize::new(0));
+        let server_adds = adds.clone();
+        let server = std::thread::spawn(move || {
+            for request_number in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                if request_number == 1 {
+                    assert!(request.starts_with("POST /v3/memories/add/ HTTP/1.1"));
+                    server_adds.fetch_add(1, Ordering::SeqCst);
+                    respond(&mut stream, r#"{"status":"PENDING"}"#);
+                } else {
+                    assert!(request.starts_with("POST /v3/memories/ HTTP/1.1"));
+                    respond(&mut stream, r#"{"results":[]}"#);
+                }
+            }
+        });
+        let provider = Mem0Provider {
+            client: reqwest::blocking::Client::new(),
+            kind: ProviderKind::Mem0Hosted,
+            endpoint: reqwest::Url::parse(&endpoint).unwrap(),
+            api_key: "secret".into(),
+        };
+        assert!(provider.reconcile(&root, "project", &[memory()]).is_err());
+        let error = provider
+            .reconcile(&root, "project", &[memory()])
+            .unwrap_err();
+        assert!(error.contains("unknown outcome"));
+        server.join().unwrap();
+        assert_eq!(adds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn reconciliation_retry_does_not_duplicate_memory() {
+        let root = temporary();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let adds = Arc::new(AtomicUsize::new(0));
@@ -1024,14 +1490,15 @@ mod tests {
             endpoint: reqwest::Url::parse(&endpoint).unwrap(),
             api_key: "secret".into(),
         };
-        provider.reconcile("project", &[memory()]).unwrap();
-        provider.reconcile("project", &[memory()]).unwrap();
+        provider.reconcile(&root, "project", &[memory()]).unwrap();
+        provider.reconcile(&root, "project", &[memory()]).unwrap();
         server.join().unwrap();
         assert_eq!(adds.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn hosted_reconciliation_pages_before_deciding_to_add() {
+        let root = temporary();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -1062,12 +1529,13 @@ mod tests {
             endpoint: reqwest::Url::parse(&endpoint).unwrap(),
             api_key: "secret".into(),
         };
-        provider.reconcile("project", &[memory()]).unwrap();
+        provider.reconcile(&root, "project", &[memory()]).unwrap();
         server.join().unwrap();
     }
 
     #[test]
     fn self_hosted_full_page_fails_before_mutating_remote() {
+        let root = temporary();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -1086,7 +1554,7 @@ mod tests {
             endpoint: reqwest::Url::parse(&endpoint).unwrap(),
             api_key: "secret".into(),
         };
-        assert!(provider.reconcile("project", &[memory()]).is_err());
+        assert!(provider.reconcile(&root, "project", &[memory()]).is_err());
         server.join().unwrap();
     }
 
@@ -1126,6 +1594,101 @@ mod tests {
         let results = search_standalone(&root, &settings, &key, "concise", Some(10)).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].memory.id, local.id);
+        server.join().unwrap();
+        session_credentials().lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn standalone_search_filters_memory_forgotten_during_remote_request() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        let key = Uuid::new_v4().to_string();
+        let local = remember_local(&root, &key);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        write_provider_settings(&settings, &key, &endpoint);
+        session_credentials()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), "secret".into());
+        let (search_started_tx, search_started_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let remote_id = local.id.clone();
+        let remote_updated_at = local.updated_at;
+        let server = std::thread::spawn(move || {
+            for request_number in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let body = json!({ "results": [{
+                    "id": "remote-id",
+                    "score": 0.9,
+                    "metadata": {
+                        "sail_memory_id": remote_id,
+                        "sail_updated_at": remote_updated_at
+                    }
+                }] })
+                .to_string();
+                if request_number == 0 {
+                    assert!(request.starts_with("GET /memories?"));
+                    respond(&mut stream, &body);
+                } else {
+                    assert!(request.starts_with("POST /search HTTP/1.1"));
+                    search_started_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                    respond(&mut stream, &body);
+                }
+            }
+        });
+        let search_root = root.clone();
+        let search_settings = settings.clone();
+        let search_key = key.clone();
+        let search = std::thread::spawn(move || {
+            search_standalone(
+                &search_root,
+                &search_settings,
+                &search_key,
+                "concise",
+                Some(10),
+            )
+        });
+        search_started_rx.recv().unwrap();
+        forget_at(&root, &key, &local.id).unwrap();
+        continue_tx.send(()).unwrap();
+        assert!(search.join().unwrap().unwrap().is_empty());
+        server.join().unwrap();
+        session_credentials().lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn self_hosted_capacity_fallback_is_visible_in_provider_status() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        let key = Uuid::new_v4().to_string();
+        let local = remember_local(&root, &key);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        write_provider_settings(&settings, &key, &endpoint);
+        session_credentials()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), "secret".into());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("GET /memories?"));
+            let results = (0..SELF_HOSTED_SAFE_LIMIT)
+                .map(|index| json!({ "id": format!("unmanaged-{index}") }))
+                .collect::<Vec<_>>();
+            respond(&mut stream, &json!({ "results": results }).to_string());
+        });
+        let results = search_standalone(&root, &settings, &key, "concise", Some(10)).unwrap();
+        assert_eq!(results[0].memory.id, local.id);
+        let status = load_runtime_status(&root, &key);
+        let sync_error = status.sync_error.unwrap();
+        assert!(
+            sync_error.contains("reconciled safely"),
+            "unexpected status: {sync_error}"
+        );
         server.join().unwrap();
         session_credentials().lock().unwrap().remove(&key);
     }

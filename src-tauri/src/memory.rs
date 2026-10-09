@@ -384,7 +384,7 @@ fn mutate_at(
     Ok(result)
 }
 
-fn forget_at(root: &Path, key: &str, id: &str) -> Result<MemoryRecord, String> {
+pub(crate) fn forget_at(root: &Path, key: &str, id: &str) -> Result<MemoryRecord, String> {
     mutate_at(root, key, id, |memory| {
         memory.content.clear();
         memory.tags.clear();

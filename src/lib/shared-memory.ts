@@ -41,6 +41,7 @@ export type MemoryProviderStatus = {
   configured: boolean;
   credentialStorage?: 'keychain' | 'memory';
   notice?: string;
+  syncError?: string;
 };
 
 export type MemoryAgentStatus = {
