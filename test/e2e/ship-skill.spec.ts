@@ -109,7 +109,7 @@ describe('bundled Ship It skill', () => {
     expect(core).toContain('## Sail mode');
     expect(core).toContain('"You merge" rule');
     const missing = await Promise.all(
-      ['replay.md', 'scripts/replay_failures.py', '../SKILL.md'].map((name) =>
+      ['missing.md', 'scripts/missing.py', '../SKILL.md'].map((name) =>
         skillReference(config, name),
       ),
     );
