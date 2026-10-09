@@ -96,7 +96,7 @@ fn now() -> u64 {
         .as_millis() as u64
 }
 
-fn project_key_for(directory: &Path) -> Result<String, String> {
+pub fn project_key_for(directory: &Path) -> Result<String, String> {
     let common = crate::git_common_directory(directory)?;
     let mut digest = Sha256::new();
     digest.update(common.to_string_lossy().as_bytes());
@@ -302,7 +302,11 @@ fn validate(mut input: MemoryInput) -> Result<MemoryInput, String> {
     Ok(input)
 }
 
-fn list_at(root: &Path, key: &str, forgotten: bool) -> Result<Vec<MemoryRecord>, String> {
+pub(crate) fn list_at(
+    root: &Path,
+    key: &str,
+    forgotten: bool,
+) -> Result<Vec<MemoryRecord>, String> {
     let paths = paths(root, key);
     if !paths.data.exists() {
         return Ok(Vec::new());
@@ -316,7 +320,21 @@ fn list_at(root: &Path, key: &str, forgotten: bool) -> Result<Vec<MemoryRecord>,
     Ok(memories)
 }
 
-fn remember_at(root: &Path, key: &str, input: MemoryInput) -> Result<MemoryRecord, String> {
+pub fn list(
+    app: &tauri::AppHandle,
+    directory: &str,
+    include_forgotten: bool,
+) -> Result<Vec<MemoryRecord>, String> {
+    ensure_enabled(app, directory)?;
+    let (root, key) = context(app, directory)?;
+    list_at(&root, &key, include_forgotten)
+}
+
+pub(crate) fn remember_at(
+    root: &Path,
+    key: &str,
+    input: MemoryInput,
+) -> Result<MemoryRecord, String> {
     let input = validate(input)?;
     let paths = paths(root, key);
     let _lock = lock_store(&paths)?;
@@ -366,7 +384,7 @@ fn mutate_at(
     Ok(result)
 }
 
-fn forget_at(root: &Path, key: &str, id: &str) -> Result<MemoryRecord, String> {
+pub(crate) fn forget_at(root: &Path, key: &str, id: &str) -> Result<MemoryRecord, String> {
     mutate_at(root, key, id, |memory| {
         memory.content.clear();
         memory.tags.clear();
@@ -389,7 +407,7 @@ fn rate_at(root: &Path, key: &str, id: &str, rating: i8) -> Result<MemoryRecord,
     })
 }
 
-fn search_at(
+pub(crate) fn search_at(
     root: &Path,
     key: &str,
     query: &str,
@@ -452,7 +470,9 @@ pub fn remember(
     input: MemoryInput,
 ) -> Result<MemoryRecord, String> {
     let (root, key) = context(app, directory)?;
-    remember_at(&root, &key, input)
+    let memory = remember_at(&root, &key, input)?;
+    crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    Ok(memory)
 }
 
 pub fn search(
@@ -461,8 +481,7 @@ pub fn search(
     query: &str,
     limit: Option<usize>,
 ) -> Result<Vec<MemorySearchResult>, String> {
-    let (root, key) = context(app, directory)?;
-    search_at(&root, &key, query, limit)
+    crate::memory_provider::search(app, directory, query, limit)
 }
 
 pub fn inspect(app: &tauri::AppHandle, directory: &str, id: &str) -> Result<MemoryRecord, String> {
@@ -472,7 +491,9 @@ pub fn inspect(app: &tauri::AppHandle, directory: &str, id: &str) -> Result<Memo
 
 pub fn forget(app: &tauri::AppHandle, directory: &str, id: &str) -> Result<MemoryRecord, String> {
     let (root, key) = context(app, directory)?;
-    forget_at(&root, &key, id)
+    let memory = forget_at(&root, &key, id)?;
+    crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    Ok(memory)
 }
 
 pub fn rate(
@@ -482,7 +503,9 @@ pub fn rate(
     rating: i8,
 ) -> Result<MemoryRecord, String> {
     let (root, key) = context(app, directory)?;
-    rate_at(&root, &key, id, rating)
+    let memory = rate_at(&root, &key, id, rating)?;
+    crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    Ok(memory)
 }
 
 #[tauri::command]
@@ -490,17 +513,23 @@ pub fn memory_project_key(directory: String) -> Result<String, String> {
     project_key_for(Path::new(&directory))
 }
 
-#[tauri::command]
-pub fn memory_status(app: tauri::AppHandle, directory: String) -> Result<MemoryStatus, String> {
-    let (root, key) = context(&app, &directory)?;
-    let memories = list_at(&root, &key, true)?;
+fn status_at(root: &Path, key: String, mode: String) -> Result<MemoryStatus, String> {
+    if mode == "off" {
+        return Ok(MemoryStatus {
+            mode,
+            enabled: false,
+            project_key: key,
+            count: 0,
+            forgotten_count: 0,
+        });
+    }
+    let memories = list_at(root, &key, true)?;
     let forgotten_count = memories
         .iter()
         .filter(|memory| memory.forgotten_at.is_some())
         .count();
-    let mode = mode(&app, &directory)?;
     Ok(MemoryStatus {
-        enabled: mode != "off",
+        enabled: true,
         mode,
         project_key: key,
         count: memories.len() - forgotten_count,
@@ -509,14 +538,19 @@ pub fn memory_status(app: tauri::AppHandle, directory: String) -> Result<MemoryS
 }
 
 #[tauri::command]
+pub fn memory_status(app: tauri::AppHandle, directory: String) -> Result<MemoryStatus, String> {
+    let (root, key) = context(&app, &directory)?;
+    let mode = mode(&app, &directory)?;
+    status_at(&root, key, mode)
+}
+
+#[tauri::command]
 pub fn memory_list(
     app: tauri::AppHandle,
     directory: String,
     include_forgotten: Option<bool>,
 ) -> Result<Vec<MemoryRecord>, String> {
-    ensure_enabled(&app, &directory)?;
-    let (root, key) = context(&app, &directory)?;
-    list_at(&root, &key, include_forgotten.unwrap_or(false))
+    list(&app, &directory, include_forgotten.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -632,8 +666,13 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
                 agent: std::env::var("SAIL_MEMORY_AGENT").ok(),
                 session_id: session.map(str::to_string),
             });
-            serde_json::to_value(remember_at(&root, &key, input)?)
-                .map_err(|error| error.to_string())
+            let memory = remember_at(&root, &key, input)?;
+            crate::memory_provider::sync_standalone_later(
+                root.clone(),
+                settings.clone(),
+                key.clone(),
+            );
+            serde_json::to_value(memory).map_err(|error| error.to_string())
         }
         "memory_search" => {
             let query = arguments
@@ -644,8 +683,10 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
                 .get("limit")
                 .and_then(Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok());
-            serde_json::to_value(search_at(&root, &key, query, limit)?)
-                .map_err(|error| error.to_string())
+            serde_json::to_value(crate::memory_provider::search_standalone(
+                &root, &settings, &key, query, limit,
+            )?)
+            .map_err(|error| error.to_string())
         }
         "memory_inspect" => serde_json::to_value(inspect_at(
             &root,
@@ -656,15 +697,22 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
                 .ok_or("id is required")?,
         )?)
         .map_err(|error| error.to_string()),
-        "memory_forget" => serde_json::to_value(forget_at(
-            &root,
-            &key,
-            arguments
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or("id is required")?,
-        )?)
-        .map_err(|error| error.to_string()),
+        "memory_forget" => {
+            let memory = forget_at(
+                &root,
+                &key,
+                arguments
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("id is required")?,
+            )?;
+            crate::memory_provider::sync_standalone_later(
+                root.clone(),
+                settings.clone(),
+                key.clone(),
+            );
+            serde_json::to_value(memory).map_err(|error| error.to_string())
+        }
         "memory_rate" => {
             let id = arguments
                 .get("id")
@@ -675,8 +723,9 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
                 .and_then(Value::as_i64)
                 .and_then(|value| i8::try_from(value).ok())
                 .ok_or("rating is required")?;
-            serde_json::to_value(rate_at(&root, &key, id, rating)?)
-                .map_err(|error| error.to_string())
+            let memory = rate_at(&root, &key, id, rating)?;
+            crate::memory_provider::sync_standalone_later(root, settings, key);
+            serde_json::to_value(memory).map_err(|error| error.to_string())
         }
         _ => Err("Unknown memory action.".into()),
     }
@@ -869,6 +918,18 @@ mod tests {
         let paths = paths(&root, "project");
         fs::write(&paths.data, "not json").unwrap();
         assert!(read_store(&paths).unwrap_err().contains("corrupt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn off_status_does_not_read_corrupt_storage() {
+        let root = temporary("off-corrupt");
+        let paths = paths(&root, "project");
+        fs::write(&paths.data, "not json").unwrap();
+        let status = status_at(&root, "project".into(), "off".into()).unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.count, 0);
+        assert_eq!(status.forgotten_count, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
