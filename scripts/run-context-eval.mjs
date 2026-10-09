@@ -216,7 +216,7 @@ async function execute(invocation) {
     child.once('exit', (code, signal) => {
       clearTimeout(timeout);
       if (escalation) clearTimeout(escalation);
-      if ((timedOut || code !== 0) && process.platform !== 'win32') killRunner('SIGKILL');
+      if (process.platform !== 'win32') killRunner('SIGKILL');
       activeRunners.delete(killRunner);
       if (timedOut)
         rejectRun(new Error(`${invocation.runId} timed out after ${config.timeoutMs} ms.`));

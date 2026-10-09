@@ -100,3 +100,4 @@ writeFileSync(
     outputReference: 'fixture-output',
   })}\n`,
 );
+if (process.argv.includes('--exit-zero-after-spawn')) process.exit(0);

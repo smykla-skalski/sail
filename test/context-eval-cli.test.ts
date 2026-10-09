@@ -331,6 +331,69 @@ void test(
   },
 );
 
+void test('successful runners stop descendants before the next trial', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
+  const childPids: number[] = [];
+  try {
+    const configPath = join(temporary, 'config.json');
+    const outputPath = join(temporary, 'output');
+    const runner = join(root, 'test/fixtures/context-eval/runner.mjs');
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...JSON.parse(contextEvalConfig(runner, false)),
+        runners: [
+          {
+            provider: 'codex',
+            command: process.execPath,
+            args: [
+              runner,
+              '--spawn-trapped-descendant',
+              '--exit-zero-after-spawn',
+              '--input',
+              '{input}',
+              '--output',
+              '{output}',
+            ],
+          },
+        ],
+      }),
+    );
+
+    await execute(
+      process.execPath,
+      [
+        join(root, 'scripts/run-context-eval.mjs'),
+        '--tasks',
+        join(root, 'test/fixtures/context-eval/tasks-v1.json'),
+        '--config',
+        configPath,
+        '--output',
+        outputPath,
+      ],
+      { cwd: root, timeout: 90_000 },
+    );
+
+    const runDirectories = await readdir(join(outputPath, 'runs'));
+    const heartbeats = runDirectories.map((directory) =>
+      join(outputPath, 'runs', directory, 'observation.json.heartbeat'),
+    );
+    const childFiles = await Promise.all(
+      runDirectories.map((directory) =>
+        readFile(join(outputPath, 'runs', directory, 'observation.json.child-pid'), 'utf8'),
+      ),
+    );
+    childPids.push(...childFiles.map(Number));
+    const before = await Promise.all(heartbeats.map((path) => readFile(path, 'utf8')));
+    await new Promise((settled) => setTimeout(settled, 200));
+    const after = await Promise.all(heartbeats.map((path) => readFile(path, 'utf8')));
+    assert.deepEqual(after, before);
+  } finally {
+    childPids.forEach(stopFixtureChild);
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 void test('failed runners stop descendants before returning an error', async () => {
   const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
   const childPids: number[] = [];

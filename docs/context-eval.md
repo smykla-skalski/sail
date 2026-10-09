@@ -80,9 +80,10 @@ gate but stay in the report.
 
 ## Runner timeouts
 
-When a runner times out or exits with an error, the harness stops its runner
-and any other active runners. On Windows, a supervisor assigns itself to a Job
-Object before launching the runner; closing the supervisor ends its descendants.
+When a runner completes, times out, or exits with an error, the harness stops
+its descendants before the next trial. A failure also stops other active
+runners. On Windows, a supervisor assigns itself to a Job Object before
+launching the runner; closing the supervisor ends its descendants.
 If the Job Object cannot be established, the runner never starts. On macOS and
 Linux, the harness stops process groups. A descendant that creates a separate
 process group can outlive that cleanup; use a host-level supervisor for adapters
