@@ -826,21 +826,7 @@
               >{#if child}<span aria-hidden="true">↳</span>{/if}<HarnessIcon
                 agent={thread.agent}
                 size={13}
-              />{providerName(thread)}{#if child}<span class="project-subagent-tag">Subagent</span
-                >{/if}</span
-            >
-            <span class="project-agent-title"
-              ><span class="project-agent-name"
-                >{#if row.reference}↳ {thread.title} · in worktree {locationName(
-                    thread.directory,
-                  )}{:else}{thread.title}{/if}{#if row.spawnedBy}<small class="project-agent-origin"
-                    >spawned by {row.spawnedBy}</small
-                  >{/if}</span
-              >{#if row.descendants}<span
-                  class="project-agent-descendants"
-                  aria-label={`${row.descendants} descendant${row.descendants === 1 ? '' : 's'}`}
-                  >(+{row.descendants})</span
-                >{/if}</span
+              /></span
             >
             <ActivityStatus
               {status}
