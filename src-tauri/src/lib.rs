@@ -223,14 +223,6 @@ mod terminal;
 mod worktree_config;
 mod worktree_snapshots;
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeInfo {
-    url: String,
-    password: String,
-    binary_path: String,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PickerEntry {
@@ -308,14 +300,6 @@ fn list_picker_directory(path: Option<String>) -> Result<PickerDirectory, String
     })
 }
 
-struct OwnedRuntime {
-    child: Child,
-    #[cfg(unix)]
-    watchdog: child_watchdog::ChildWatchdog,
-    info: RuntimeInfo,
-    binary: OsString,
-}
-
 fn stop_child(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -335,31 +319,12 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-impl Drop for OwnedRuntime {
-    fn drop(&mut self) {
-        stop_child(&mut self.child);
-        #[cfg(unix)]
-        self.watchdog.stop();
-    }
-}
-
-#[derive(Default)]
-struct RuntimeManager(Mutex<Option<OwnedRuntime>>);
-
-impl RuntimeManager {
-    fn shutdown(&self) {
-        let owned = self.0.lock().ok().and_then(|mut runtime| runtime.take());
-        drop(owned);
-    }
-}
-
 #[tauri::command]
 async fn browser_detected_servers(
     directory: String,
     terminals: State<'_, terminal::TerminalManager>,
     acp_terminals: State<'_, acp_terminal::AcpTerminalManager>,
     agents: State<'_, acp::AgentManager>,
-    runtime: State<'_, RuntimeManager>,
 ) -> Result<Vec<dev_servers::DetectedServer>, String> {
     let mut roots = terminals
         .server_roots()
@@ -373,20 +338,6 @@ async fn browser_detected_servers(
             .into_iter()
             .map(|pid| dev_servers::ServerRoot::Shared { pid }),
     );
-    if let Ok(mut runtime) = runtime.0.lock() {
-        if let Some(owned) = runtime.as_mut() {
-            if owned
-                .child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_none()
-            {
-                roots.push(dev_servers::ServerRoot::Shared {
-                    pid: owned.child.id(),
-                });
-            }
-        }
-    }
     tauri::async_runtime::spawn_blocking(move || dev_servers::detect(Path::new(&directory), &roots))
         .await
         .map_err(|error| error.to_string())?
@@ -524,199 +475,6 @@ fn resolve_binary(binary_path: Option<String>) -> Result<OsString, String> {
             "OpenCode v{OPENCODE_VERSION} was not found. Install it or choose an absolute binary path in settings."
         )
     }))
-}
-
-fn probe_runtime(info: &RuntimeInfo) -> Result<(), String> {
-    let diagnostic = format!(
-        "OpenCode did not respond with the compatible v{OPENCODE_VERSION} API. Check its configuration and retry."
-    );
-    let url = reqwest::Url::parse(&info.url).map_err(|_| diagnostic.to_string())?;
-    if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") || url.port().is_none() {
-        return Err(diagnostic.to_string());
-    }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .no_proxy()
-        .build()
-        .map_err(|_| diagnostic.to_string())?;
-    let response = client
-        .get(format!("{}/api/info", info.url.trim_end_matches('/')))
-        .basic_auth("opencode", Some(&info.password))
-        .send()
-        .map_err(|_| diagnostic.to_string())?;
-    if !response.status().is_success() {
-        return Err(diagnostic.to_string());
-    }
-    let body: serde_json::Value = response.json().map_err(|_| diagnostic.to_string())?;
-    if version_is_compatible(body.get("version").and_then(serde_json::Value::as_str)) {
-        Ok(())
-    } else {
-        Err(diagnostic.to_string())
-    }
-}
-
-fn server_args() -> Vec<&'static str> {
-    let mut args = vec![
-        "serve",
-        "--hostname",
-        "127.0.0.1",
-        "--port",
-        "0",
-        "--cors",
-        "tauri://localhost",
-        "--cors",
-        "http://tauri.localhost",
-    ];
-    if cfg!(debug_assertions) {
-        args.extend([
-            "--cors",
-            "http://localhost:1420",
-            "--cors",
-            "http://127.0.0.1:1420",
-        ]);
-    }
-    args
-}
-
-#[tauri::command]
-fn start_runtime(
-    manager: State<'_, RuntimeManager>,
-    binary_path: Option<String>,
-    restart: bool,
-) -> Result<RuntimeInfo, String> {
-    diagnostics::record(
-        "runtime_start_requested",
-        serde_json::json!({"restart":restart}),
-    );
-    let mut runtime = manager.0.lock().map_err(|error| error.to_string())?;
-    let binary = resolve_binary(binary_path)?;
-    if let Some(existing) = runtime.as_mut() {
-        if !restart
-            && existing.binary == binary
-            && existing.child.try_wait().ok().flatten().is_none()
-        {
-            diagnostics::record(
-                "runtime_reused",
-                serde_json::json!({"pid":existing.child.id()}),
-            );
-            return Ok(existing.info.clone());
-        }
-    }
-
-    let mut command = Command::new(&binary);
-    command.args(server_args());
-    command.env_remove("OPENCODE_CONFIG_DIR");
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| "Could not start OpenCode. Check the binary path and retry.".to_string())?;
-    diagnostics::record("runtime_spawned", serde_json::json!({"pid":child.id()}));
-    if let Some(mut stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut buffer = [0; 4096];
-            let mut total_bytes = 0u64;
-            loop {
-                match stderr.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(bytes) => total_bytes = total_bytes.saturating_add(bytes as u64),
-                }
-            }
-            if total_bytes > 0 {
-                diagnostics::record("runtime_stderr", serde_json::json!({"bytes":total_bytes}));
-            }
-        });
-    }
-
-    #[cfg(unix)]
-    let watchdog = child_watchdog::ChildWatchdog::start(child.id()).map_err(|error| {
-        stop_child(&mut child);
-        format!("Could not start OpenCode watchdog: {error}")
-    })?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("OpenCode did not provide startup output")?;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut url = None;
-        let mut password = None;
-        let mut sender = Some(sender);
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(value) = line.strip_prefix("server listening on ") {
-                url = Some(value.trim().to_string());
-            }
-            if let Some(value) = line.strip_prefix("server password ") {
-                password = Some(value.trim().to_string());
-            }
-            if let (Some(url), Some(password)) = (url.as_ref(), password.as_ref()) {
-                if let Some(sender) = sender.take() {
-                    let _ = sender.send(RuntimeInfo {
-                        url: url.clone(),
-                        password: password.clone(),
-                        binary_path: String::new(),
-                    });
-                }
-            }
-        }
-    });
-
-    let mut info = match receiver.recv_timeout(Duration::from_secs(15)) {
-        Ok(info) => info,
-        Err(_) => {
-            let exit = child.try_wait().ok().flatten();
-            diagnostics::record(
-                "runtime_start_failed",
-                serde_json::json!({
-                    "reason":if exit.is_some() {"early_exit"} else {"timeout"},
-                    "exitCode":exit.and_then(|status| status.code())
-                }),
-            );
-            stop_child(&mut child);
-            return Err(match exit {
-                Some(status) => format!(
-                    "OpenCode exited before becoming ready ({status}). Check its configuration and retry."
-                ),
-                None => "OpenCode did not become ready within 15 seconds. Retry or choose another binary."
-                    .to_string(),
-            });
-        }
-    };
-    info.binary_path = Path::new(&binary).to_string_lossy().into_owned();
-    let mut ready = false;
-    for _ in 0..5 {
-        if child.try_wait().ok().flatten().is_some() {
-            break;
-        }
-        if probe_runtime(&info).is_ok() {
-            ready = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    if !ready {
-        diagnostics::record(
-            "runtime_start_failed",
-            serde_json::json!({"reason":"api_probe"}),
-        );
-        stop_child(&mut child);
-        return Err(
-            "OpenCode did not respond with a compatible v2 API. Check its configuration and retry."
-                .to_string(),
-        );
-    }
-    diagnostics::record("runtime_ready", serde_json::json!({"pid":child.id()}));
-    *runtime = Some(OwnedRuntime {
-        child,
-        #[cfg(unix)]
-        watchdog,
-        info: info.clone(),
-        binary,
-    });
-    Ok(info)
 }
 
 #[tauri::command]
@@ -2027,187 +1785,7 @@ struct DeleteWorktreeRequest {
     expected_revision: Option<String>,
     expected_branch: Option<String>,
     native_generation: Option<u64>,
-    open_code_session_ids: Option<Vec<String>>,
     stop_agents: Option<bool>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenCodeCleanupSession {
-    id: String,
-    #[serde(rename = "parentID")]
-    parent_id: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenCodeCleanupCursor {
-    next: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenCodeCleanupPage {
-    data: Vec<OpenCodeCleanupSession>,
-    cursor: OpenCodeCleanupCursor,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenCodeCleanupActive {
-    data: HashMap<String, serde_json::Value>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenCodeCleanupInbox {
-    data: Vec<serde_json::Value>,
-}
-
-fn verify_open_code_cleanup_state(
-    expected: &HashSet<String>,
-    sessions: &[OpenCodeCleanupSession],
-    active: &HashSet<String>,
-    queued: &HashSet<String>,
-) -> Result<HashSet<String>, String> {
-    let mut owned = expected.clone();
-    loop {
-        let previous = owned.len();
-        for session in sessions {
-            if session
-                .parent_id
-                .as_ref()
-                .is_some_and(|parent_id| owned.contains(parent_id))
-            {
-                owned.insert(session.id.clone());
-            }
-        }
-        if owned.len() == previous {
-            break;
-        }
-    }
-    if owned.iter().any(|id| !expected.contains(id)) {
-        return Err("OpenCode task sessions changed before worktree cleanup.".into());
-    }
-    if owned
-        .iter()
-        .any(|id| active.contains(id) || queued.contains(id))
-    {
-        return Err("An OpenCode task session is active in this worktree.".into());
-    }
-    Ok(owned)
-}
-
-fn load_open_code_cleanup_sessions(
-    client: &reqwest::blocking::Client,
-    info: &RuntimeInfo,
-    directory: &str,
-) -> Result<Vec<OpenCodeCleanupSession>, String> {
-    let diagnostic = "Cannot verify OpenCode task sessions before worktree cleanup.";
-    let base = info.url.trim_end_matches('/');
-    let mut sessions = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut seen = HashSet::new();
-    loop {
-        let mut url = reqwest::Url::parse(&format!("{base}/api/session"))
-            .map_err(|_| diagnostic.to_string())?;
-        match cursor.as_ref() {
-            Some(cursor) => {
-                url.query_pairs_mut().append_pair("cursor", cursor);
-            }
-            None => {
-                url.query_pairs_mut()
-                    .append_pair("directory", directory)
-                    .append_pair("limit", "50")
-                    .append_pair("order", "asc");
-            }
-        }
-        let response = client
-            .get(url)
-            .basic_auth("opencode", Some(&info.password))
-            .send()
-            .map_err(|_| diagnostic.to_string())?;
-        if !response.status().is_success() {
-            return Err(diagnostic.into());
-        }
-        let page: OpenCodeCleanupPage = response.json().map_err(|_| diagnostic.to_string())?;
-        sessions.extend(page.data);
-        let Some(next) = page.cursor.next else {
-            break;
-        };
-        if !seen.insert(next.clone()) {
-            return Err(diagnostic.into());
-        }
-        cursor = Some(next);
-    }
-    Ok(sessions)
-}
-
-fn load_open_code_cleanup_activity<Inbox, Active>(
-    owned: &HashSet<String>,
-    sessions: &[OpenCodeCleanupSession],
-    mut load_inbox: Inbox,
-    load_active: Active,
-) -> Result<(HashSet<String>, HashSet<String>), String>
-where
-    Inbox: FnMut(&str) -> Result<bool, String>,
-    Active: FnOnce() -> Result<HashSet<String>, String>,
-{
-    let mut queued = HashSet::new();
-    for id in owned {
-        if sessions.iter().any(|session| session.id == *id) && load_inbox(id)? {
-            queued.insert(id.clone());
-        }
-    }
-    Ok((load_active()?, queued))
-}
-
-fn verify_open_code_cleanup(
-    info: &RuntimeInfo,
-    directory: &Path,
-    expected_ids: Vec<String>,
-) -> Result<(), String> {
-    let diagnostic = "Cannot verify OpenCode task sessions before worktree cleanup.";
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .no_proxy()
-        .build()
-        .map_err(|_| diagnostic.to_string())?;
-    let base = info.url.trim_end_matches('/');
-    let authorize = |request: reqwest::blocking::RequestBuilder| {
-        request.basic_auth("opencode", Some(&info.password))
-    };
-    let directory = directory.to_string_lossy().into_owned();
-    let sessions = load_open_code_cleanup_sessions(&client, info, &directory)?;
-    let expected = expected_ids.into_iter().collect::<HashSet<_>>();
-    verify_open_code_cleanup_state(&expected, &sessions, &HashSet::new(), &HashSet::new())?;
-    let sessions = load_open_code_cleanup_sessions(&client, info, &directory)?;
-    let owned =
-        verify_open_code_cleanup_state(&expected, &sessions, &HashSet::new(), &HashSet::new())?;
-    let (active, queued) = load_open_code_cleanup_activity(
-        &owned,
-        &sessions,
-        |id| {
-            let response = authorize(client.get(format!("{base}/api/session/{id}/inbox")))
-                .send()
-                .map_err(|_| diagnostic.to_string())?;
-            if !response.status().is_success() {
-                return Err(diagnostic.into());
-            }
-            let inbox: OpenCodeCleanupInbox =
-                response.json().map_err(|_| diagnostic.to_string())?;
-            Ok(!inbox.data.is_empty())
-        },
-        || {
-            let response = authorize(client.get(format!("{base}/api/session/active")))
-                .send()
-                .map_err(|_| diagnostic.to_string())?;
-            if !response.status().is_success() {
-                return Err(diagnostic.into());
-            }
-            let active: OpenCodeCleanupActive =
-                response.json().map_err(|_| diagnostic.to_string())?;
-            Ok(active.data.into_keys().collect())
-        },
-    )?;
-    let sessions = load_open_code_cleanup_sessions(&client, info, &directory)?;
-    verify_open_code_cleanup_state(&expected, &sessions, &active, &queued)?;
-    Ok(())
 }
 
 #[tauri::command]
@@ -2216,7 +1794,6 @@ async fn delete_worktree(
     operation_locks: State<'_, WorktreeOperationLocks>,
     agents: State<'_, acp::AgentManager>,
     fence: State<'_, acp::AgentWorktreeFence>,
-    runtime: State<'_, RuntimeManager>,
     request: DeleteWorktreeRequest,
 ) -> Result<Option<String>, String> {
     let DeleteWorktreeRequest {
@@ -2227,18 +1804,11 @@ async fn delete_worktree(
         expected_revision,
         expected_branch,
         native_generation,
-        open_code_session_ids,
         stop_agents,
     } = request;
     let operation_locks = operation_locks.inner().clone();
     let agents = agents.inner().clone();
     let fence = fence.inner().clone();
-    let runtime_info = runtime
-        .0
-        .lock()
-        .map_err(|error| error.to_string())?
-        .as_ref()
-        .map(|runtime| runtime.info.clone());
     tauri::async_runtime::spawn_blocking(move || {
         let checked = validate_repository(repository)?;
         let _lock = operation_locks.lock(Path::new(&checked))?;
@@ -2249,12 +1819,6 @@ async fn delete_worktree(
             fence.stop_sessions_in(&app, &agents, &directory)?;
         }
         fence.cleanup(&agents, &directory, native_generation, || {
-            if let Some(session_ids) = open_code_session_ids {
-                let info = runtime_info
-                    .as_ref()
-                    .ok_or("Cannot verify OpenCode task sessions before worktree cleanup.")?;
-                verify_open_code_cleanup(info, &directory, session_ids)?;
-            }
             if archive_ignored == Some(true) {
                 archive_ignored_and_remove(checked, worktree, expected_revision, expected_branch)
             } else {
@@ -2825,27 +2389,6 @@ where
     Ok(())
 }
 
-#[tauri::command]
-fn local_plugin_version(path: String) -> Option<String> {
-    let source = Path::new(&path);
-    let directory = if source.is_dir() {
-        source
-    } else {
-        source.parent()?
-    };
-    let package_path = directory.join("package.json");
-    let metadata = std::fs::metadata(&package_path).ok()?;
-    if !metadata.is_file() || metadata.len() > 64 * 1024 {
-        return None;
-    }
-    let package = std::fs::read_to_string(package_path).ok()?;
-    let package: serde_json::Value = serde_json::from_str(&package).ok()?;
-    if package.get("name")?.as_str()? != "@smykla-skalski/opencode-plugin-plan-review" {
-        return None;
-    }
-    package.get("version")?.as_str().map(str::to_string)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -2862,7 +2405,6 @@ pub fn run() {
             configure_pane_menu(_app.handle())?;
             Ok(())
         })
-        .manage(RuntimeManager::default())
         .manage(WorktreeOperationLocks::default())
         .manage(acp::AgentManager::default())
         .manage(acp::AgentWorktreeFence::default())
@@ -2881,7 +2423,6 @@ pub fn run() {
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,
             settings::get_acp_turn_evidence,
-            start_runtime,
             repository_path_available,
             opencode_config::opencode_plan_review_plugin,
             validate_repository,
@@ -2947,7 +2488,6 @@ pub fn run() {
             acp_terminal::acp_terminal_inspect_list,
             acp_terminal::acp_terminal_inspect_read,
             acp_terminal::acp_terminal_inspect_wait,
-            local_plugin_version,
             acp::acp_agents,
             acp::acp_connect,
             acp::acp_new_session,
@@ -3031,9 +2571,6 @@ pub fn run() {
                 if let Some(terminals) = app.try_state::<terminal::TerminalManager>() {
                     terminals.shutdown();
                 }
-                if let Some(runtime) = app.try_state::<RuntimeManager>() {
-                    runtime.shutdown();
-                }
                 if let Some(manager) = app.try_state::<hook_activity::HookActivityManager>() {
                     hook_activity::cleanup(&manager);
                 }
@@ -3048,48 +2585,17 @@ mod tests {
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
         existing_shipping_worktree, git_change_action, git_patch, git_reference,
-        load_open_code_cleanup_activity, normalize_picker_path, parse_registered_worktrees,
-        registered_worktrees, remove_worktree, remove_worktree_with_hook,
-        remove_worktree_with_hooks, repository_namespace, server_args, shipping_base_revision,
-        shipping_changed_paths, shipping_default_branch, shipping_fetch_source,
-        verify_open_code_cleanup_state, version_is_compatible, version_number, working_tree_diff,
-        worktree_overviews, OpenCodeCleanupSession, WorktreeOperationLocks,
+        normalize_picker_path, parse_registered_worktrees, registered_worktrees, remove_worktree,
+        remove_worktree_with_hook, remove_worktree_with_hooks, repository_namespace,
+        shipping_base_revision, shipping_changed_paths, shipping_default_branch,
+        shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
+        worktree_overviews, WorktreeOperationLocks,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::GitCanonical;
-    use std::collections::HashSet;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-
-    #[cfg(unix)]
-    #[test]
-    fn shutdown_reaps_runtime_child() {
-        let mut command = Command::new("sleep");
-        command.arg("30").process_group(0);
-        let child = command.spawn().unwrap();
-        let watchdog = super::child_watchdog::ChildWatchdog::start(child.id()).unwrap();
-        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
-        let runtime = super::RuntimeManager(std::sync::Mutex::new(Some(super::OwnedRuntime {
-            child,
-            watchdog,
-            info: super::RuntimeInfo {
-                url: String::new(),
-                password: String::new(),
-                binary_path: String::new(),
-            },
-            binary: "sleep".into(),
-        })));
-
-        runtime.shutdown();
-
-        assert!(matches!(
-            nix::sys::signal::kill(pid, None),
-            Err(nix::errno::Errno::ESRCH)
-        ));
-    }
 
     #[test]
     fn parses_registered_and_prunable_worktrees() {
@@ -4419,85 +3925,5 @@ mod tests {
         assert!(version_is_compatible(Some("2.0.24")));
         assert!(!version_is_compatible(Some("2.0.22")));
         assert!(!version_is_compatible(Some("2.1.0")));
-    }
-
-    #[test]
-    fn late_opencode_child_after_confirmation_blocks_cleanup() {
-        let expected = HashSet::from(["root".to_string()]);
-        let sessions = vec![
-            OpenCodeCleanupSession {
-                id: "root".into(),
-                parent_id: None,
-            },
-            OpenCodeCleanupSession {
-                id: "late-child".into(),
-                parent_id: Some("root".into()),
-            },
-        ];
-
-        let error =
-            verify_open_code_cleanup_state(&expected, &sessions, &HashSet::new(), &HashSet::new())
-                .expect_err("a provider child created after confirmation must block cleanup");
-
-        assert_eq!(
-            error,
-            "OpenCode task sessions changed before worktree cleanup."
-        );
-    }
-
-    #[test]
-    fn opencode_prompt_dequeue_during_cleanup_blocks_removal() {
-        use std::cell::Cell;
-
-        let owned = HashSet::from(["root".to_string()]);
-        let sessions = vec![OpenCodeCleanupSession {
-            id: "root".into(),
-            parent_id: None,
-        }];
-        let state = Cell::new(0);
-        let advance = || state.set(state.get() + 1);
-
-        let (active, queued) = load_open_code_cleanup_activity(
-            &owned,
-            &sessions,
-            |_| {
-                let is_queued = state.get() == 0;
-                advance();
-                Ok(is_queued)
-            },
-            || {
-                let is_active = state.get() == 1;
-                advance();
-                Ok(if is_active {
-                    HashSet::from(["root".to_string()])
-                } else {
-                    HashSet::new()
-                })
-            },
-        )
-        .unwrap();
-
-        let error = verify_open_code_cleanup_state(&owned, &sessions, &active, &queued)
-            .expect_err("a prompt transitioning from queued to active must block cleanup");
-
-        assert_eq!(
-            error,
-            "An OpenCode task session is active in this worktree."
-        );
-    }
-
-    #[test]
-    fn server_is_loopback_and_only_allows_packaged_origins_in_release() {
-        let args = server_args();
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--hostname", "127.0.0.1"]));
-        assert!(args.windows(2).any(|pair| pair == ["--port", "0"]));
-        assert!(args.contains(&"tauri://localhost"));
-        assert!(args.contains(&"http://tauri.localhost"));
-        if !cfg!(debug_assertions) {
-            assert!(!args.contains(&"http://localhost:1420"));
-            assert!(!args.contains(&"http://127.0.0.1:1420"));
-        }
     }
 }

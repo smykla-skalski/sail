@@ -52,11 +52,10 @@ When contributing to Smykla Skalski projects:
 
 ## Desktop trust boundary
 
-- Sail starts its own OpenCode v2 server on `127.0.0.1` with an ephemeral port and a generated Basic auth password. It accepts requests from the packaged Tauri origin; development builds also allow the local Vite origin. The URL and password stay in process memory and are not stored in local storage or project files.
-- Restarting the owned server stops the previous child process. Closing the app stops the owned child. The app does not connect to an independently running OpenCode server or stop one.
+- Sail runs OpenCode, Claude and Codex as ACP agent child processes over stdio. It does not start an OpenCode server or send requests to one, and the webview cannot open loopback HTTP connections. Closing the app stops the agent children it started.
 - The desktop window has a restrictive content security policy and only the dialog and app commands needed by the main window. Agent Markdown is rendered as text and safe links; raw HTML and image URLs are not inserted into the page. Mermaid runs in strict mode and its output is displayed as a data image.
-- Repository selection resolves to a Git root. Session selection checks that the session belongs to that root. Attachments can be selected outside the repository; selecting one deliberately sends that file to OpenCode with the prompt. The only direct external file read by the app is the bounded `package.json` version check for a locally configured plan-review plugin.
-- Permission requests show the action, resources, and any saved patterns before a decision. **Allow always** stores OpenCode's proposed patterns for the project; **Reject** rejects all pending permission requests in that session. OpenCode requires a separate `external_directory` approval for reads or edits outside the active location, but shell directory inference is best effort. Review broad saved approvals and shell patterns before accepting them. See [OpenCode permissions](https://opencode.ai/v2/docs/permissions).
+- Repository selection resolves to a Git root. Session selection checks that the session belongs to that root. Attachments can be selected outside the repository; selecting one deliberately sends that file to the agent with the prompt.
+- Permission requests show the tool call, its resources, and the options the agent offers before a decision. **Always** options are offered only for low and medium risk actions. OpenCode requires a separate `external_directory` approval for reads or edits outside the active location, but shell directory inference is best effort. Review broad saved approvals and shell patterns before accepting them. See [OpenCode permissions](https://opencode.ai/v2/docs/permissions).
 
 ## Acknowledgments
 

@@ -3,8 +3,9 @@ export type ValidationSettings = { choices: ValidationChoice[]; strictDifferentM
 
 export const validationSettingsKey = 'sai-cross-validation';
 
+/** Drops a `provider:` or `provider/` prefix so OpenCode's two ID forms compare equal. */
 function modelId(value: string): string {
-  return value.slice(value.indexOf(':') + 1).toLowerCase();
+  return value.replace(/^[^/:]+[:/]/, '').toLowerCase();
 }
 
 export function hasUnresolvedModelAlias(value: string): boolean {

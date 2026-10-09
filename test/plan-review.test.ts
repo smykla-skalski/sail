@@ -1,12 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
-  canExecutePlan,
-  executionSummary,
-  reviewInput,
-  skippedSteps,
-  type Plan,
-} from '../src/lib/plan.ts';
+import { canExecutePlan, executionSummary, skippedSteps, type Plan } from '../src/lib/plan.ts';
 
 const plan: Plan = {
   title: 'Plan',
@@ -57,25 +51,6 @@ await test('execution requires unfinished approved work and lists skipped steps'
   assert.equal(canExecutePlan(plan, decisions), true);
   assert.deepEqual(skippedSteps(plan, decisions), ['s2']);
   assert.equal(canExecutePlan(plan, { s1: { stepID: 's1', verdict: 'reject' } }), false);
-});
-
-await test('review RPC input includes version, edit, comments, and action', () => {
-  const input = reviewInput(
-    plan,
-    'revise',
-    [{ stepID: 's1', verdict: 'approve', edit: { title: 'Changed' }, comment: 'Reason' }],
-    'Please revise s2',
-  );
-
-  assert.deepEqual(input, {
-    sessionID: 'session',
-    version: 2,
-    action: 'revise',
-    decisions: [
-      { stepID: 's1', verdict: 'approve', comment: 'Reason', edit: { title: 'Changed' } },
-    ],
-    note: 'Please revise s2',
-  });
 });
 
 await test('execution summary keeps blocked work and failed checks visible after restart', () => {

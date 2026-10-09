@@ -16,15 +16,9 @@ import {
   handoffPromptNeedsRecovery,
   isSubagentThread,
   loadSpawnReceipts,
-  openCodeDescendantSessions,
-  openCodePromptHasBackendEvidence,
-  openCodePromptHasHistoryEvidence,
-  openCodePromptRecoveryAction,
-  openCodePromptSettlement,
   receiptForSource,
   receiptMatchesTurn,
   receiptNeedsRefresh,
-  receiptTurnMessages,
   promptConflictTurnId,
   failedPromptDispatch,
   failedUnsubmittedDispatch,
@@ -183,26 +177,6 @@ await test('receipts survive restart with bounded results and honest states', ()
     loadSpawnReceipts(JSON.stringify([{ ...receipt, dispatchPending: true }]))[0].dispatchPending,
     true,
   );
-});
-
-await test('receipt settlement selects the exact turn in a multi-turn session', () => {
-  const messages = [
-    { id: 'idle-two', type: 'idle' },
-    { id: 'assistant-two', type: 'assistant' },
-    { id: 'turn-two', type: 'user', text: 'same prompt' },
-    { id: 'idle-one', type: 'idle' },
-    { id: 'assistant-one', type: 'assistant' },
-    { id: 'turn-one', type: 'user', text: 'same prompt' },
-  ];
-  assert.deepEqual(
-    receiptTurnMessages(messages, 'turn-one', 'same prompt')?.map((message) => message.id),
-    ['turn-one', 'assistant-one', 'idle-one'],
-  );
-  assert.deepEqual(
-    receiptTurnMessages(messages, 'turn-two', 'same prompt')?.map((message) => message.id),
-    ['turn-two', 'assistant-two', 'idle-two'],
-  );
-  assert.equal(receiptTurnMessages(messages, 'missing', 'same prompt'), null);
 });
 
 await test('known pre-dispatch failures clear the durable admission fence', () => {
@@ -605,185 +579,6 @@ await test('OpenCode handoff prompt recovery requires replacement ownership', ()
     handoffPromptNeedsRecovery({ ...issue, receiptId: 'old-receipt' }, recoverable),
     false,
   );
-});
-
-await test('OpenCode handoff dispatch ignores unrelated session activity', () => {
-  const handoff = {
-    prompt: 'Continue from the canonical checkpoint',
-    turnId: 'handoff-turn',
-  };
-
-  assert.equal(
-    openCodePromptHasBackendEvidence(
-      handoff,
-      [{ type: 'user', text: 'Unrelated prompt' }],
-      [{ id: 'unrelated-turn' }],
-    ),
-    false,
-  );
-  assert.equal(
-    openCodePromptHasBackendEvidence(
-      handoff,
-      [{ type: 'user', text: 'Continue from the canonical checkpoint' }],
-      [],
-    ),
-    true,
-  );
-  assert.equal(openCodePromptHasBackendEvidence(handoff, [], [{ id: 'handoff-turn' }]), true);
-});
-
-await test('OpenCode replacement adoption finds a durable prompt beyond the newest 50 messages', async () => {
-  const handoff = {
-    prompt: 'Continue from the canonical checkpoint',
-    turnId: 'handoff-turn',
-  };
-  const newerMessages = Array.from({ length: 50 }, (_, index) => ({
-    type: 'assistant',
-    text: `Newer message ${index}`,
-  }));
-  const pages = new Map([
-    [undefined, { data: newerMessages, cursor: { next: 'older' } }],
-    [
-      'older',
-      {
-        data: [{ type: 'user', text: 'Continue from the canonical checkpoint' }],
-        cursor: { next: null },
-      },
-    ],
-  ]);
-
-  const dispatched = await openCodePromptHasHistoryEvidence(handoff, [], async (cursor) =>
-    pages.get(cursor)!,
-  );
-
-  assert.equal(dispatched, true);
-});
-
-await test('OpenCode task ownership includes paginated nested descendants', async () => {
-  const pages = new Map([
-    [
-      'root:',
-      {
-        data: [
-          { id: 'child-one', parentID: 'root', location: { directory: '/repo/task' } },
-          { id: 'other-worktree', parentID: 'root', location: { directory: '/repo/other' } },
-        ],
-        cursor: { next: 'older' },
-      },
-    ],
-    [
-      'root:older',
-      {
-        data: [{ id: 'child-two', parentID: 'root', location: { directory: '/repo/task' } }],
-        cursor: { next: null },
-      },
-    ],
-    [
-      'child-one:',
-      {
-        data: [{ id: 'grandchild', parentID: 'child-one', location: { directory: '/repo/task' } }],
-        cursor: { next: null },
-      },
-    ],
-    ['child-two:', { data: [], cursor: { next: null } }],
-    ['grandchild:', { data: [], cursor: { next: null } }],
-  ]);
-
-  const descendants = await openCodeDescendantSessions(
-    ['root'],
-    '/repo/task',
-    async (parentID, cursor) => pages.get(`${parentID}:${cursor ?? ''}`)!,
-  );
-
-  assert.deepEqual(
-    descendants.map((session) => [session.id, session.parentID]),
-    [
-      ['child-one', 'root'],
-      ['child-two', 'root'],
-      ['grandchild', 'child-one'],
-    ],
-  );
-});
-
-await test('completed OpenCode handoff settlement finds its prompt beyond the newest 50 messages', async () => {
-  const handoff = {
-    prompt: 'Continue from the canonical checkpoint',
-    turnId: 'handoff-turn',
-  };
-  const pages = new Map([
-    [
-      undefined,
-      {
-        data: [
-          { type: 'idle', outcome: 'succeeded' as const },
-          ...Array.from({ length: 49 }, (_, index) => ({
-            type: 'assistant',
-            text: `Completed output ${index}`,
-          })),
-        ],
-        cursor: { next: 'older' },
-      },
-    ],
-    [
-      'older',
-      {
-        data: [
-          {
-            id: 'handoff-turn',
-            type: 'user',
-            text: 'Continue from the canonical checkpoint',
-          },
-        ],
-        cursor: { next: null },
-      },
-    ],
-  ]);
-
-  const settled = await openCodePromptSettlement(handoff, async (cursor) => pages.get(cursor)!);
-
-  assert.deepEqual(settled, { state: 'completed', result: null });
-});
-
-await test('OpenCode handoff settlement ignores a later successful turn', async () => {
-  const handoff = {
-    prompt: 'Continue from the canonical checkpoint',
-    turnId: 'handoff-turn',
-  };
-  const page = {
-    data: [
-      { type: 'idle', outcome: 'succeeded' as const },
-      {
-        type: 'assistant',
-        time: { completed: 6 },
-        content: [{ type: 'text', text: 'Later prompt output' }],
-      },
-      { id: 'later-turn', type: 'user', text: 'Fix something else' },
-      { type: 'idle', outcome: 'failed' as const },
-      {
-        type: 'assistant',
-        time: { completed: 3 },
-        content: [{ type: 'text', text: 'Handoff failure output' }],
-      },
-      {
-        id: 'handoff-turn',
-        type: 'user',
-        text: 'Continue from the canonical checkpoint',
-      },
-    ],
-    cursor: { next: null },
-  };
-
-  const settled = await openCodePromptSettlement(handoff, async () => page);
-
-  assert.deepEqual(settled, { state: 'failed', result: 'Handoff failure output' });
-});
-
-await test('unrelated OpenCode activity after a pre-dispatch crash requires inspection', () => {
-  assert.equal(openCodePromptRecoveryAction(false, true, undefined), 'inspect');
-});
-
-await test('unrelated OpenCode outcome after a pre-dispatch crash requires inspection', () => {
-  assert.equal(openCodePromptRecoveryAction(false, false, 'succeeded'), 'inspect');
 });
 
 await test('owned handoff prompts recover across every unsettled restart window', () => {

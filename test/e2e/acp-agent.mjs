@@ -799,7 +799,8 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
-    if (text === 'Long turn') {
+    if (text === 'Long turn' || text === 'Sidebar performance turn') {
+      const intervalMs = text === 'Sidebar performance turn' ? 2000 : 400;
       let part = 0;
       const interval = setInterval(() => {
         part += 1;
@@ -812,7 +813,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         clearInterval(interval);
         send({ id: message.id, result: { stopReason: 'end_turn' } });
         // Slow enough that six thread switches still leave the turn running.
-      }, 400);
+      }, intervalMs);
       const stop = trackWork(sessionId, () => clearInterval(interval));
       continue;
     }

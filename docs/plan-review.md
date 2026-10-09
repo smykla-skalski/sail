@@ -34,7 +34,7 @@ Nothing blocks the edit. Use the agent's own permission mode if an edit must be 
 
 ## OpenCode
 
-OpenCode keeps its own plan-review plugin until the native integration is removed. When the plugin is still enabled in the user's OpenCode configuration (the global config directory, `OPENCODE_CONFIG`, or any `opencode.json` or `.opencode` directory above the worktree), Sail warns in the OpenCode ACP pane (once OpenCode runs on the ACP path; the native pane still needs the plugin) that the agent sees two plan tool sets and asks the user to remove the plugin.
+OpenCode uses the same Sail plan tools. When the old plan-review plugin is still enabled in the user's OpenCode configuration (the global config directory, `OPENCODE_CONFIG`, or any `opencode.json` or `.opencode` directory above the worktree), Sail warns in the OpenCode pane that the agent sees two plan tool sets and asks the user to remove the plugin.
 
 ## Related issues
 

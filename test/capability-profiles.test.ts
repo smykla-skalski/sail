@@ -2,20 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   automaticPermissionPolicy,
-  CapabilityProfileReservationCoordinator,
   capabilityProfileForPhase,
-  capabilityProfileForRuntime,
   capabilityProfileFromMetadata,
   classifyPermission,
-  conflictingCapabilityProfiles,
-  exploreSessionMetadata,
-  holdCapabilityProfileReservation,
-  openCodePermissionToolCall,
   permissionPolicy,
   permissionReadResources,
   permissionOutcome,
-  settledOpenCodePermissions,
-  withCapabilityProfileReservation,
 } from '../src/lib/capability-profiles.ts';
 
 const options = [
@@ -211,26 +203,6 @@ await test('keeps dependency and project code execution interactive in the build
         assert.equal(decision.optionId, undefined);
       }),
     ),
-  );
-});
-
-await test('classifies OpenCode permission metadata as security input', () => {
-  const toolCall = openCodePermissionToolCall({
-    action: 'read',
-    resources: [],
-    metadata: { command: ['rm', '-rf', 'victim'] },
-  });
-
-  assert.equal(classifyPermission(toolCall, 'read'), 'high');
-  assert.equal(
-    automaticPermissionPolicy({
-      profile: 'explore',
-      workspace: '/workspace',
-      title: 'read',
-      toolCall,
-      options,
-    }).recommendation,
-    'interactive',
   );
 });
 
@@ -582,162 +554,6 @@ await test('records provider-defined reject option IDs as rejected', () => {
   assert.equal(permissionOutcome(options, 'yes'), 'completed');
 });
 
-await test('rejects directory capability switches while another profile is active', () => {
-  assert.deepEqual(conflictingCapabilityProfiles(['review'], 'build'), ['review']);
-  assert.deepEqual(conflictingCapabilityProfiles(['review', 'build'], 'build'), ['review']);
-  assert.deepEqual(conflictingCapabilityProfiles(['build'], 'build'), []);
-});
-
-await test('OpenCode rejection settles every pending request in the selected session', () => {
-  const pending = [
-    { id: 'first', sessionID: 'selected' },
-    { id: 'second', sessionID: 'selected' },
-    { id: 'other', sessionID: 'other' },
-  ];
-
-  assert.deepEqual(
-    settledOpenCodePermissions(pending, pending[1], 'reject').map((request) => request.id),
-    ['first', 'second'],
-  );
-  assert.deepEqual(
-    settledOpenCodePermissions(pending, pending[1], 'once').map((request) => request.id),
-    ['second'],
-  );
-});
-
-await test('capability reservation stays active for the complete operation', async () => {
-  let active = false;
-  const result = await withCapabilityProfileReservation(
-    async () => {
-      active = true;
-      return () => {
-        active = false;
-      };
-    },
-    async () => {
-      assert.equal(active, true);
-      await Promise.resolve();
-      assert.equal(active, true);
-      return 'complete';
-    },
-  );
-
-  assert.equal(result, 'complete');
-  assert.equal(active, false);
-});
-
-await test('capability reservation releases when the operation fails', async () => {
-  let active = false;
-  await assert.rejects(
-    withCapabilityProfileReservation(
-      async () => {
-        active = true;
-        return () => {
-          active = false;
-        };
-      },
-      async () => {
-        throw new Error('fork failed');
-      },
-    ),
-    /fork failed/,
-  );
-  assert.equal(active, false);
-});
-
-await test('accepted prompts retain their profile reservation until provider settlement', async () => {
-  const completion = Promise.withResolvers<void>();
-  let active = true;
-  const held = holdCapabilityProfileReservation(() => {
-    active = false;
-  }, completion.promise);
-
-  await Promise.resolve();
-  assert.equal(active, true);
-  completion.resolve();
-  await held;
-  assert.equal(active, false);
-});
-
-await test('capability reservation conflicts prevent the operation', async () => {
-  let operationRan = false;
-  await assert.rejects(
-    withCapabilityProfileReservation(
-      async () => {
-        throw new Error('build profile is active');
-      },
-      async () => {
-        operationRan = true;
-      },
-    ),
-    /build profile is active/,
-  );
-  assert.equal(operationRan, false);
-});
-
-await test('directory profile switches cannot replace a reserved side chat profile', async () => {
-  const reservations = new CapabilityProfileReservationCoordinator();
-  const releaseExplore = await reservations.reserve('/workspace', 'explore', async () => {});
-
-  await assert.rejects(
-    reservations.reserve('/workspace', 'build', async () => {}),
-    /pending explore OpenCode launch/,
-  );
-  releaseExplore();
-  const releaseBuild = await reservations.reserve('/workspace', 'build', async () => {});
-
-  releaseBuild();
-});
-
-await test('same-profile reservations share one pending configuration', async () => {
-  const reservations = new CapabilityProfileReservationCoordinator();
-  const configured = Promise.withResolvers<void>();
-  let configurations = 0;
-  const configure = async () => {
-    configurations++;
-    await configured.promise;
-  };
-
-  const first = reservations.reserve('/workspace', 'build', configure);
-  await Promise.resolve();
-  const second = reservations.reserve('/workspace', 'build', configure);
-  let secondSettled = false;
-  void second.then(() => {
-    secondSettled = true;
-    return undefined;
-  });
-  await Promise.resolve();
-
-  assert.equal(configurations, 1);
-  assert.equal(secondSettled, false);
-  configured.resolve();
-  const [releaseFirst, releaseSecond] = await Promise.all([first, second]);
-  assert.equal(configurations, 1);
-  assert.equal(secondSettled, true);
-  releaseFirst();
-  releaseSecond();
-});
-
-await test('same-profile reservations reconfigure after a runtime generation change', async () => {
-  const reservations = new CapabilityProfileReservationCoordinator();
-  let configurations = 0;
-  const configure = async () => {
-    configurations++;
-  };
-
-  const releaseFirst = await reservations.reserve('/workspace', 'review', configure);
-  reservations.beginConfigurationGeneration();
-  const releaseSecond = await reservations.reserve('/workspace', 'review', configure);
-
-  assert.equal(configurations, 2);
-  await assert.rejects(
-    reservations.reserve('/workspace', 'build', configure),
-    /pending review OpenCode launch/,
-  );
-  releaseFirst();
-  releaseSecond();
-});
-
 await test('keeps unknown and high-risk actions interactive', () => {
   for (const [title, toolCall] of [
     ['Do thing', { name: 'provider-specific-action' }],
@@ -826,24 +642,9 @@ await test('maps workflow phase to capability profile', () => {
   assert.equal(capabilityProfileForPhase('pr'), 'release');
 });
 
-await test('side chat session metadata overrides a build workspace fallback', () => {
-  const metadata = exploreSessionMetadata({ inherited: 'kept' });
-
-  assert.deepEqual(metadata, {
-    inherited: 'kept',
-    saiHarness: true,
-    sailCapabilityProfile: 'explore',
-  });
-  assert.equal(capabilityProfileFromMetadata(metadata, 'build'), 'explore');
-});
-
-await test('runtime capability profile follows active session metadata after reconnect', () => {
-  const sessions = [
-    { id: 'running', metadata: { sailCapabilityProfile: 'explore' } },
-    { id: 'idle', metadata: { sailCapabilityProfile: 'build' } },
-  ];
-
-  assert.equal(capabilityProfileForRuntime(sessions, ['running'], 'build'), 'explore');
-  assert.equal(capabilityProfileForRuntime(sessions, [], 'build'), 'build');
-  assert.equal(capabilityProfileForRuntime(sessions, ['running', 'idle'], 'build'), null);
+await test('session metadata profile overrides a build workspace fallback', () => {
+  assert.equal(
+    capabilityProfileFromMetadata({ inherited: 'kept', sailCapabilityProfile: 'explore' }, 'build'),
+    'explore',
+  );
 });

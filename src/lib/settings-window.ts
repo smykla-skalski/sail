@@ -1,5 +1,4 @@
 import type { AgentAvailability } from './acp';
-import type { SetupReport } from './onboarding';
 import type { ValidationSettings } from './cross-validation';
 import type { ModelRoutingSettings } from './model-routing';
 import type { MergeOwner } from './issue-shipping';
@@ -18,14 +17,7 @@ export const settingsAction = 'sail:settings-action';
 export type SettingsSnapshot = {
   theme: ThemePreference;
   binaryPath: string;
-  activeBinary: string;
-  runtimeState: 'starting' | 'connected' | 'error';
-  runtimeError: string;
   directory: string;
-  setup: SetupReport | null;
-  setupLoading: boolean;
-  setupError: string;
-  busy: boolean;
   agents: AgentAvailability[];
   agentsError: string;
   crossValidation: ValidationSettings;
@@ -61,5 +53,4 @@ export type SettingsAction =
   | { type: 'context-handoff-threshold'; value: number }
   | { type: 'detect-agents' }
   | { type: 'cross-validation'; value: ValidationSettings }
-  | { type: 'model-routing'; value: ModelRoutingSettings }
-  | { type: 'restart-setup' };
+  | { type: 'model-routing'; value: ModelRoutingSettings };

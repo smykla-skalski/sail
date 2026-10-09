@@ -1,5 +1,3 @@
-import type { ModelInfo, SessionMessageInfo } from '@opencode/client';
-
 export type RateWindow = { label: string; remaining: number; resetsAt?: number };
 export type AgentUsage = { context?: number; rates?: RateWindow[] };
 
@@ -66,20 +64,4 @@ export function acpUsage(update: unknown, previous: AgentUsage = {}): AgentUsage
     if (window) rates.push(window);
   }
   return { context, rates };
-}
-
-export function openCodeContextUsage(
-  messages: SessionMessageInfo[],
-  models: Pick<ModelInfo, 'id' | 'providerID' | 'limit'>[],
-): number | undefined {
-  const latest = messages.findLast((message) => message.type === 'assistant');
-  if (latest?.type !== 'assistant' || !latest.tokens) return undefined;
-  const model = models.find(
-    (item) => item.providerID === latest.model.providerID && item.id === latest.model.id,
-  );
-  const tokens = latest.tokens;
-  return percentage(
-    tokens.input + tokens.cache.read + tokens.cache.write + tokens.output + tokens.reasoning,
-    model?.limit.context,
-  );
 }

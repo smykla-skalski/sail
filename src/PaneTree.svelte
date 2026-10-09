@@ -18,8 +18,6 @@
   import SideChat from './SideChat.svelte';
   import type { AgentThread, AgentAvailability, AgentEntry } from './lib/acp';
   import { acpPermissionActivitySourceId } from './lib/acp-permissions';
-  import type { OpenCodeClient } from './lib/opencode';
-  import type { SetupReport } from './lib/onboarding';
   import type { BrowserAttachment } from './lib/browser-pick';
   import type { DiffComment } from './lib/diff-comments';
   import { coordinationKey, type CoordinationMessage } from './lib/coordination';
@@ -66,13 +64,9 @@
     project: string;
     taskLocation: TaskLocation;
     capabilityProfile: CapabilityProfile;
-    onensureprofile: (directory: string, profile: CapabilityProfile) => Promise<() => void>;
     dark: boolean;
     agents: AgentAvailability[];
     sideChat: SideChatState | null;
-    client: OpenCodeClient | null;
-    runtimeState: 'starting' | 'connected' | 'error';
-    setup: SetupReport | null;
     coordinationMessages: CoordinationMessage[];
     spawnReceipts: SpawnReceipt[];
     onopensubagent: (receipt: SpawnReceipt) => Promise<void>;
@@ -139,7 +133,6 @@
     onbatchcomplete: (id: string, failure: string | null) => void;
     onshortcut: (event: KeyboardEvent) => void;
     onactivity: (thread: AgentThread) => void;
-    onhistorychange: () => void;
     activityEvents: ActivityHistoryEvent[];
     activityLoading: boolean;
     activityError: string;
@@ -147,7 +140,6 @@
     onactivityselect: (event: ActivityHistoryEvent) => void | Promise<void>;
     onactivityopen: () => void;
     ondecision: (thread: AgentThread, id: string, title: string, outcome: string) => void;
-    onusage: (sessionID: string, context: number | undefined) => void;
     focusPromptPane: string | null;
     onpromptfocused: () => void;
     running: (thread: AgentThread | null) => boolean;
@@ -175,13 +167,9 @@
     project,
     taskLocation,
     capabilityProfile,
-    onensureprofile,
     dark,
     agents,
     sideChat,
-    client,
-    runtimeState,
-    setup,
     coordinationMessages,
     spawnReceipts,
     onopensubagent,
@@ -232,7 +220,6 @@
     onbatchcomplete,
     onshortcut,
     onactivity,
-    onhistorychange,
     activityEvents,
     activityLoading,
     activityError,
@@ -240,7 +227,6 @@
     onactivityselect,
     onactivityopen,
     ondecision,
-    onusage,
     focusPromptPane,
     onpromptfocused,
     running,
@@ -544,9 +530,6 @@
       {dark}
       {agents}
       {sideChat}
-      {client}
-      {runtimeState}
-      {setup}
       {onentries}
       {changesPanes}
       {dockDetails}
@@ -575,7 +558,6 @@
       {onbatchcomplete}
       {onshortcut}
       {onactivity}
-      {onhistorychange}
       {activityEvents}
       {activityLoading}
       {activityError}
@@ -583,7 +565,6 @@
       {onactivityselect}
       {onactivityopen}
       {ondecision}
-      {onusage}
       {focusPromptPane}
       {onpromptfocused}
       {running}
@@ -602,7 +583,6 @@
       {onreviewpreview}
       {onreviewcapturephase}
       {capabilityProfile}
-      {onensureprofile}
     />
     <div
       class="pane-divider"
@@ -664,9 +644,6 @@
       {dark}
       {agents}
       {sideChat}
-      {client}
-      {runtimeState}
-      {setup}
       {onentries}
       {changesPanes}
       {dockDetails}
@@ -695,7 +672,6 @@
       {onbatchcomplete}
       {onshortcut}
       {onactivity}
-      {onhistorychange}
       {activityEvents}
       {activityLoading}
       {activityError}
@@ -703,7 +679,6 @@
       {onactivityselect}
       {onactivityopen}
       {ondecision}
-      {onusage}
       {focusPromptPane}
       {onpromptfocused}
       {running}
@@ -722,7 +697,6 @@
       {onreviewpreview}
       {onreviewcapturephase}
       {capabilityProfile}
-      {onensureprofile}
     />
   </div>
 {:else}
@@ -964,7 +938,6 @@
                 {:else if acpTab === 'history'}
                   <PlanHistoryPanel
                     events={acpPlanHistory}
-                    session={undefined}
                     loading={false}
                     error=""
                     onrefresh={() => (acpPlanTick += 1)}
@@ -1055,13 +1028,11 @@
           </div>
           <SideChat
             source={sideChat.source}
-            {client}
             {directory}
             {taskLocation}
             focused={focused === sideChat.id}
             focusPrompt={focusPromptPane === sideChat.id}
             {onpromptfocused}
-            {onensureprofile}
           />
         </section>
       {/key}

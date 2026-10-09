@@ -5,10 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { returnToWorkspace, openSettings } from './settings-window';
 
-async function openDiagnostics() {
+async function openOpenCodeSettings() {
   await openSettings();
   await $('.settings-navigation button:nth-child(2)').click();
-  return $('.repository-diagnostics');
+  return $('.settings-card');
 }
 
 describe('repository setup', () => {
@@ -99,36 +99,20 @@ describe('repository setup', () => {
     expect(result).toContain('not inside a Git repository');
   });
 
-  it('keeps setup diagnostics in settings for a repository without the plugin', async () => {
+  it('shows OpenCode availability and its binary setting in settings', async () => {
     await $(
       `.project-default-worktree-select[title="${repository}"], .project-default-worktree-select[title="${realpathSync(repository)}"]`,
     ).click();
-    const diagnostics = await openDiagnostics();
-    try {
-      await browser.waitUntil(
-        async () => (await diagnostics.getText()).includes(realpathSync(repository)),
-        { timeout: 20_000, timeoutMsg: 'App did not inspect the selected repository' },
-      );
-    } catch (cause) {
-      console.error('Repository setup diagnostic', {
-        savedDirectory: await browser.execute(() => localStorage.getItem('sai-directory')),
-        setup: await $('.repository-diagnostics').getText(),
-      });
-      throw cause;
-    }
-    await browser.tauri.switchWindow('main');
-    await expect($('.setup-panel')).not.toExist();
-    await browser.tauri.switchWindow('settings');
-    await expect(diagnostics).toHaveText(expect.stringContaining(realpathSync(repository)));
-    await expect(diagnostics).toHaveText(expect.stringContaining('Plan-review plugin: not loaded'));
-    await expect(diagnostics).toHaveText(
-      expect.stringContaining('github:smykla-skalski/opencode-plugin-plan-review'),
-    );
+    const card = await openOpenCodeSettings();
+    await browser.waitUntil(async () => !(await card.getText()).includes('Status: Loading'), {
+      timeout: 20_000,
+      timeoutMsg: 'Settings did not report OpenCode availability',
+    });
+    await expect(card).toHaveText(expect.stringMatching(/Available: |OpenCode/));
+    await expect($('#opencode-bin')).toBeDisplayed();
+    await expect($('.repository-diagnostics')).not.toExist();
     await returnToWorkspace();
-    await expect($('[aria-label="New plan"]')).toBeEnabled();
-    if ((await $('.topbar-actions').getText()).includes('Ready'))
-      await expect($('.composer textarea')).toBeEnabled();
-    else await expect($('.composer textarea')).not.toExist();
+    await expect($('.sidebar-runtime')).not.toExist();
   });
 
   it('creates and opens a worktree in the Sail workspace', async () => {
@@ -174,10 +158,6 @@ describe('repository setup', () => {
       'aria-current',
       'page',
     );
-    await expect(await openDiagnostics()).toHaveText(
-      expect.stringContaining('Plan-review plugin: not loaded'),
-    );
-    await returnToWorkspace();
   });
 
   it('creates a worktree from an explicitly selected base branch', async () => {

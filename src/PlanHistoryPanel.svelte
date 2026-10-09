@@ -1,24 +1,20 @@
 <script lang="ts">
   import { Button } from '@smykla-skalski/sui';
-  import type { SessionInfo } from './lib/opencode';
   import { historyRows } from './lib/history';
   import type { HistoryEntry } from './lib/plan';
 
   let {
     events,
-    session,
     loading,
     error,
     onrefresh,
   }: {
     events: HistoryEntry[];
-    session: SessionInfo | undefined;
     loading: boolean;
     error: string;
     onrefresh: () => void;
   } = $props();
   const rows = $derived(historyRows(events));
-  const number = new Intl.NumberFormat();
 </script>
 
 <aside class="history-panel" aria-label="Session plan history">
@@ -31,22 +27,6 @@
       >{loading ? 'Refreshing…' : 'Refresh'}</Button
     >
   </header>
-  {#if session && typeof session.cost === 'number' && session.tokens}<div
-      class="usage"
-      aria-label="Session usage"
-    >
-      <strong>Session usage</strong>
-      <span
-        >${session.cost.toFixed(4)} · {number.format(session.tokens.input)} input · {number.format(
-          session.tokens.output,
-        )} output · {number.format(session.tokens.reasoning)} reasoning tokens</span
-      >
-      <small
-        >Cache: {number.format(session.tokens.cache?.read ?? 0)} read · {number.format(
-          session.tokens.cache?.write ?? 0,
-        )} write</small
-      >
-    </div>{/if}
   {#if error}<p class="error" role="status">History unavailable: {error}</p>{/if}
   <ol>
     {#each rows as row (row.id)}<li>
@@ -91,15 +71,6 @@
     margin: 0;
     font-size: 18px;
   }
-  .usage {
-    display: grid;
-    gap: var(--space-4);
-    padding: 12px 20px;
-    border-bottom: 1px solid var(--shell-divider);
-    font-size: var(--type-12);
-  }
-  .usage span,
-  .usage small,
   .error,
   .empty {
     color: var(--sui-muted);

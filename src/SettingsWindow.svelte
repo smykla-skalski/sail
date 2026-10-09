@@ -15,7 +15,6 @@
     type ThemePreference,
   } from './lib/theme';
   import { openExternalLink } from './lib/external-link';
-  import type { SetupCheck, SetupReport } from './lib/onboarding';
   import type { ValidationChoice } from './lib/cross-validation';
   import {
     evaluateModelRouting,
@@ -46,6 +45,7 @@
   } from './lib/notification-prefs';
 
   let snapshot = $state<SettingsSnapshot | null>(null);
+  const openCodeAgent = $derived(snapshot?.agents.find((agent) => agent.id === 'opencode'));
   const notificationsOn = $derived(
     notificationTypes.some(
       (type) => (snapshot?.notificationPrefs[type] ?? defaultNotificationPrefs[type]) !== 'never',
@@ -160,22 +160,6 @@
     }
   }
 
-  function setupRows(report: SetupReport): [string, SetupCheck][] {
-    return [
-      ['OpenCode location', report.location],
-      ['Plan-review plugin', report.plugin],
-      ['Architect agent', report.architect],
-      ['Plan RPC', report.rpc],
-      ['Provider and model', report.model],
-      ['Architect model', report.planModel],
-    ];
-  }
-
-  function setupDetail(label: string, detail: string) {
-    const prefix = detail.startsWith(`${label}: `) ? `${label}: ` : `${label} `;
-    return detail.startsWith(prefix) ? detail.slice(prefix.length) : detail;
-  }
-
   function send(action: SettingsAction) {
     requestError = '';
     void emitTo('main', settingsAction, action).catch((cause: unknown) => {
@@ -216,15 +200,6 @@
 
   function validationReason(choice: ValidationChoice): string | null {
     if (!snapshot) return 'Checking availability';
-    if (choice.agent === 'opencode') {
-      if (snapshot.runtimeState !== 'connected')
-        return snapshot.runtimeError || 'OpenCode is disconnected';
-      if (
-        !snapshot.setup?.models.some((model) => `${model.providerID}:${model.id}` === choice.model)
-      )
-        return 'Model is not enabled or its provider is disconnected in this worktree';
-      return null;
-    }
     const agent = snapshot.agents.find((item) => item.id === choice.agent);
     if (!agent?.available) return agent?.reason || 'Agent is unavailable';
     return null;
@@ -391,14 +366,12 @@
     {:else if selectedSection === 'opencode'}
       <h1>OpenCode</h1>
       <section class="settings-card">
-        <h2>Runtime</h2>
-        <p class="runtime-binary">Status: {snapshot?.runtimeState ?? 'Loading'}</p>
-        {#if snapshot?.activeBinary}<p class="runtime-binary" title={snapshot.activeBinary}>
-            Detected: {snapshot.activeBinary}
-          </p>{/if}
-        {#if snapshot?.runtimeError}<p class="runtime-diagnostic" role="alert">
-            {snapshot.runtimeError}
-          </p>{/if}
+        <h2>Binary</h2>
+        {#if openCodeAgent?.available}<p class="runtime-binary" title={openCodeAgent.binaryPath}>
+            Available: {openCodeAgent.binaryPath}
+          </p>{:else if openCodeAgent}<p class="runtime-diagnostic" role="alert">
+            {openCodeAgent.reason ?? 'OpenCode is unavailable.'}
+          </p>{:else}<p class="runtime-binary">Status: Loading</p>{/if}
         <label for="opencode-bin">Binary path</label>
         <input
           id="opencode-bin"
@@ -409,52 +382,13 @@
         />
         <Button
           size="sm"
-          disabled={!snapshot || snapshot.busy}
+          disabled={!snapshot}
           onclick={() => {
             send({ type: 'binary', value: binaryPath });
             binaryDirty = false;
-          }}>Save and reconnect</Button
+          }}>Save and check</Button
         >
       </section>
-      {#if snapshot?.directory}
-        <section class="settings-card repository-diagnostics">
-          <h2>Repository diagnostics</h2>
-          <p class="runtime-binary" title={snapshot.directory}>{snapshot.directory}</p>
-          {#if snapshot.setupLoading}<p role="status">Checking repository…</p>{/if}
-          {#if snapshot.setupError}<p class="runtime-diagnostic" role="alert">
-              {snapshot.setupError}
-            </p>{/if}
-          {#if snapshot.setup}<ul>
-              {#each setupRows(snapshot.setup) as [label, item] (label)}<li>
-                  <strong>{label}:</strong>
-                  {setupDetail(label, item.detail)}
-                </li>{/each}
-            </ul>{/if}
-          {#if snapshot.setup?.plugin.state === 'action'}<p>
-              Install the tested plugin in OpenCode: <code
-                >opencode plugin add
-                github:smykla-skalski/opencode-plugin-plan-review#fdc575ba5ffccc6420ad5b3b68372f99f70290f5</code
-              >
-            </p>{/if}
-          {#if snapshot.setup?.model.state === 'action' || snapshot.setup?.planModel.state === 'action'}<p
-            >
-              In OpenCode, run <code>/connect</code> to connect a provider and <code>/models</code> to
-              enable a model.
-            </p>{/if}
-          {#if snapshot.setup?.architect.state === 'action' && snapshot.setup?.plugin.state === 'ready'}<p
-            >
-              Configure an Architect agent in OpenCode.
-            </p>{/if}
-          {#if snapshot.setup && !snapshot.setup.planReady}<p>
-              Sail checks again automatically after setup changes.
-            </p>{/if}
-          <Button
-            size="sm"
-            disabled={snapshot.busy || snapshot.setupLoading}
-            onclick={() => send({ type: 'restart-setup' })}>Restart and check</Button
-          >
-        </section>
-      {/if}
     {:else}
       <h1>Agents</h1>
       <section class="settings-card">
@@ -470,8 +404,8 @@
       <section class="settings-card">
         <h2>Ship It cross-validation</h2>
         <p>
-          Select the agents and exact models allowed to review and test changes. Claude and Codex
-          model IDs must match their model selector.
+          Select the agents and exact models allowed to review and test changes. Model IDs must
+          match the agent's model selector.
         </p>
         <label class="attention-setting">
           <input
@@ -506,23 +440,14 @@
           {#each snapshot?.agents ?? [] as agent (agent.id)}<option value={agent.id}
               >{agent.name}</option
             >{/each}
-          <option value="opencode">OpenCode</option>
         </select>
         <label for="validation-model">Model ID</label>
         <input
           id="validation-model"
           type="text"
           bind:value={validationModel}
-          list="validation-models"
-          placeholder={validationAgent === 'opencode' ? 'provider:model' : 'Exact model ID'}
+          placeholder={validationAgent === 'opencode' ? 'provider/model' : 'Exact model ID'}
         />
-        <datalist id="validation-models">
-          {#if validationAgent === 'opencode'}
-            {#each snapshot?.setup?.models ?? [] as model (`${model.providerID}:${model.id}`)}
-              <option value={`${model.providerID}:${model.id}`}>{model.name}</option>
-            {/each}
-          {/if}
-        </datalist>
         <Button
           size="sm"
           disabled={!validationAgent || !validationModel.trim()}

@@ -102,3 +102,12 @@ void test('aliases never count as verified different models', () => {
     'gpt-5.4',
   );
 });
+
+await test('strict validation treats OpenCode provider:model and provider/model as one model', () => {
+  const openCode = {
+    choices: [{ agent: 'opencode', model: 'openai:gpt-6.1-sol' }],
+    strictDifferentModel: true,
+  };
+  const selection = selectValidationChoice(openCode, openCode.choices, ['openai/gpt-6.1-sol']);
+  assert.equal(selection.choice, null);
+});

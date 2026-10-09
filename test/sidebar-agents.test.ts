@@ -8,11 +8,9 @@ import {
   groupSidebarThreads,
   openedFailedChildren,
   listSidebarAcpThreads,
-  listOpenCodeChildSessionIds,
   recordSidebarOpenCodeOutcome,
   sidebarThreadRows,
   sidebarThreadStatus,
-  type SidebarSessionSource,
 } from '../src/lib/sidebar-agents.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 
@@ -357,41 +355,6 @@ await test('OpenCode children nest under their parent', () => {
       ['opencode', 'c', 'Review', 1],
     ],
   );
-});
-
-await test('OpenCode child session ids come from every native page', async () => {
-  const calls: Array<string | undefined> = [];
-  const pages: Record<string, Awaited<ReturnType<SidebarSessionSource['session']['list']>>> = {
-    first: {
-      data: [
-        { id: 'root', location: { directory: '/repo/a' }, time: { updated: 1 } },
-        { id: 'child', parentID: 'root', location: { directory: '/repo/a' }, time: { updated: 2 } },
-      ],
-      cursor: { next: 'page-2' },
-    },
-    'page-2': {
-      data: [
-        {
-          id: 'grandchild',
-          parentID: 'child',
-          location: { directory: '/repo/a' },
-          time: { updated: 3 },
-        },
-      ],
-      cursor: { next: 'page-2' },
-    },
-  };
-  const source: SidebarSessionSource = {
-    session: {
-      list: ({ cursor }) => {
-        calls.push(cursor);
-        return Promise.resolve(pages[cursor ?? 'first']);
-      },
-    },
-  };
-  const children = await listOpenCodeChildSessionIds(source, '/repo/a');
-  assert.deepEqual(calls, [undefined, 'page-2']);
-  assert.deepEqual([...children].toSorted(), ['child', 'grandchild']);
 });
 
 const parentThread = {

@@ -1,9 +1,5 @@
 import type { ProjectCatalog } from './projects';
-import {
-  permissionDecisionTitle,
-  type CapabilityProfile,
-  type PermissionPolicyDecision,
-} from './capability-profiles.ts';
+import { permissionDecisionTitle, type PermissionPolicyDecision } from './capability-profiles.ts';
 
 export type InboxLocation = {
   directory: string;
@@ -65,25 +61,6 @@ export type InboxCheck = {
   status: string;
   updated: number;
 };
-
-export function inboxPermissionProfile(
-  item: Pick<InboxItem, 'policy'>,
-  fallback: CapabilityProfile,
-): CapabilityProfile {
-  return item.policy?.profile ?? fallback;
-}
-
-export function inboxRejectedPermissionPolicy(
-  item: Pick<InboxItem, 'permissionPolicies' | 'policy' | 'requestId'>,
-  requestId: string,
-  fallback: () => PermissionPolicyDecision,
-): PermissionPolicyDecision {
-  return (
-    item.permissionPolicies?.[requestId] ??
-    (String(item.requestId) === requestId ? item.policy : undefined) ??
-    fallback()
-  );
-}
 
 export function failedCheckOutcome(check: InboxCheck): InboxOutcome | null {
   if (check.status !== 'failed' && check.status !== 'timed_out') return null;
@@ -176,8 +153,6 @@ export function inboxTurnMessageIndex(
   return start;
 }
 
-export const maxInboxSeen = 256;
-
 export function repositoryName(path: string): string {
   return path.split(/[\\/]/).findLast((part) => !!part) ?? path;
 }
@@ -201,37 +176,4 @@ export function sortInbox(items: InboxItem[]): InboxItem[] {
   return items.toSorted(
     (left, right) => left.receivedAt - right.receivedAt || left.key.localeCompare(right.key),
   );
-}
-
-export function openCodeRequestTime(id: string, now = Date.now()): number | null {
-  const match = /^(?:per|frm)_([0-9a-f]{12})[0-9A-Za-z]{14}$/.exec(id);
-  if (!match) return null;
-  const cycle = 2 ** 36;
-  const timeInCycle = Math.floor(Number.parseInt(match[1], 16) / 4096);
-  let timestamp = Math.floor(now / cycle) * cycle + timeInCycle;
-  if (timestamp > now) timestamp -= cycle;
-  return timestamp;
-}
-
-export function loadInboxSeen(raw: string | null): Record<string, number> {
-  try {
-    const parsed: unknown = JSON.parse(raw ?? '{}');
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    return Object.fromEntries(
-      Object.entries(parsed)
-        .filter((entry): entry is [string, number] => {
-          const [key, value] = entry;
-          return (
-            key.length > 0 &&
-            typeof value === 'number' &&
-            Number.isFinite(value) &&
-            openCodeRequestTime(key.slice(key.lastIndexOf(':') + 1)) === null
-          );
-        })
-        .toSorted((left, right) => right[1] - left[1])
-        .slice(0, maxInboxSeen),
-    );
-  } catch {
-    return {};
-  }
 }

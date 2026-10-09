@@ -1,4 +1,3 @@
-import type { FileDiffInfo } from '@opencode/client';
 import { coveredFile, type Plan } from './plan.ts';
 
 export type DiffLine = {
@@ -6,6 +5,13 @@ export type DiffLine = {
   text: string;
   oldLine?: number;
   newLine?: number;
+};
+export type FileDiffInfo = {
+  file: string;
+  patch: string;
+  additions: number;
+  deletions: number;
+  status: 'added' | 'deleted' | 'modified';
 };
 export type DiffAnnotation = { steps: string[]; drift: string[]; unattributed: boolean };
 export type WorkingDiffInfo = FileDiffInfo & {

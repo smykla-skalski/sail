@@ -11,7 +11,6 @@ import {
   claimMonotonicLeaseDeadline,
   claimRefreshRequiresFence,
   closedPullRequestRequiresFence,
-  confirmOpenCodeWorkerStopped,
   createPromptDispatchTracker,
   createShipRun,
   mergeOwnerRule,
@@ -23,20 +22,16 @@ import {
   directShipClaimPrompt,
   dispatchAuthorizedDirectShipPrompt,
   completeAuthorizedPromptRecovery,
-  compensatedOpenCodePromptReceiptChanges,
   fenceExpiredShippingLease,
   fencePredecessorWorkerBeforeTakeover,
   fenceResumedShippingClaim,
   fenceShippingTaskThreads,
   nextClaimHeartbeatDeadline,
   monotonicDeadlineExpired,
-  openCodePromptRecoveryFailure,
   persistAcquiredClaim,
   persistStartedShippingWorker,
   persistVerifiedHeartbeat,
   predecessorTakeoverChanges,
-  promptDispatchAdmissionVisible,
-  recoverOpenCodePromptAdmission,
   recoveredClaimLeaseDeadlines,
   recoveredClaimWorkerFenceRequired,
   readyShipIssues,
@@ -195,196 +190,6 @@ void test('ACP cancellation is not settled until its exact turn stops', () => {
   );
 });
 
-void test('OpenCode fencing cancels queued work when interrupt reports false', async () => {
-  const events: string[] = [];
-  let queued = ['inbox-1'];
-  let inspections = 0;
-  const stopped = await confirmOpenCodeWorkerStopped(
-    async () => {
-      events.push('interrupt:false');
-      return { interrupted: false };
-    },
-    async () => {
-      inspections++;
-      return { running: false, queued: [...queued] };
-    },
-    async (id) => {
-      events.push(`cancel:${id}`);
-      queued = queued.filter((item) => item !== id);
-    },
-    async () => undefined,
-    4,
-  );
-
-  assert.equal(stopped, true);
-  assert.equal(inspections, 3);
-  assert.deepEqual(events, ['interrupt:false', 'cancel:inbox-1']);
-});
-
-void test('OpenCode fencing does not settle while execution stays active', async () => {
-  let interruptions = 0;
-  const stopped = await confirmOpenCodeWorkerStopped(
-    async () => {
-      interruptions++;
-      return { interrupted: false };
-    },
-    async () => ({ running: true, queued: [] }),
-    async () => undefined,
-    async () => undefined,
-    2,
-  );
-
-  assert.equal(stopped, false);
-  assert.equal(interruptions, 3);
-});
-
-void test('OpenCode fencing waits for a late prompt dispatch before trusting idle state', async () => {
-  const dispatches = createPromptDispatchTracker();
-  let acknowledgePrompt!: () => void;
-  void dispatches.track(
-    'run:issue',
-    () =>
-      new Promise<void>((resolve) => {
-        acknowledgePrompt = resolve;
-      }),
-  );
-  let running = false;
-  let pauses = 0;
-  let inspections = 0;
-  let interruptions = 0;
-  const stopped = await confirmOpenCodeWorkerStopped(
-    async () => {
-      interruptions++;
-      const interrupted = running;
-      if (running) running = false;
-      return { interrupted };
-    },
-    async () => {
-      inspections++;
-      return { running, queued: [] };
-    },
-    async () => undefined,
-    async () => {
-      pauses++;
-      if (pauses === 2) {
-        running = true;
-        acknowledgePrompt();
-        await Promise.resolve();
-      }
-    },
-    6,
-    () => dispatches.pending('run:issue'),
-  );
-
-  assert.equal(stopped, true);
-  assert.equal(inspections, 2);
-  assert.equal(interruptions, 2);
-  assert.equal(pauses, 3);
-});
-
-void test('OpenCode fencing fails closed while prompt dispatch remains unacknowledged', async () => {
-  let inspections = 0;
-  const stopped = await confirmOpenCodeWorkerStopped(
-    async () => ({ interrupted: false }),
-    async () => {
-      inspections++;
-      return { running: false, queued: [] };
-    },
-    async () => undefined,
-    async () => undefined,
-    3,
-    () => true,
-  );
-
-  assert.equal(stopped, false);
-  assert.equal(inspections, 0);
-});
-
-void test('persisted dispatch admission requires its exact prompt ID', () => {
-  const unrelatedInbox = new Set(['other-turn']);
-  const unrelatedMessages = new Set(['old-identical-prompt']);
-  assert.equal(
-    promptDispatchAdmissionVisible('delayed-turn', unrelatedInbox, unrelatedMessages),
-    false,
-  );
-  assert.equal(
-    promptDispatchAdmissionVisible('delayed-turn', new Set(['delayed-turn']), unrelatedMessages),
-    true,
-  );
-  assert.equal(
-    promptDispatchAdmissionVisible('delayed-turn', unrelatedInbox, new Set(['delayed-turn'])),
-    true,
-  );
-});
-
-void test('parked OpenCode prompts resume before their admission fence clears', async () => {
-  let delivery: 'parked' | 'steered' = 'parked';
-  let running = false;
-  let persisted: 'queued' | 'working' | null = null;
-  const authorization = {
-    ...stalePaneAuthorization(),
-    authorized: () => true,
-  };
-
-  await recoverOpenCodePromptAdmission(
-    'queued',
-    authorization,
-    async () => {
-      delivery = 'steered';
-    },
-    async () => {
-      assert.equal(delivery, 'steered');
-      running = true;
-    },
-    async () => {
-      delivery = 'parked';
-    },
-    async (state) => {
-      assert.equal(running, true);
-      persisted = state;
-    },
-  );
-
-  assert.equal(delivery, 'steered');
-  assert.equal(running, true);
-  assert.equal(persisted, 'queued');
-});
-
-void test('parked OpenCode prompts stay fenced when ownership expires during activation', async () => {
-  let authorized = true;
-  let running = false;
-  let persisted = false;
-  let compensated = false;
-  const authorization = {
-    ...stalePaneAuthorization(),
-    authorized: () => authorized,
-  };
-
-  await assert.rejects(
-    recoverOpenCodePromptAdmission(
-      'queued',
-      authorization,
-      async () => {
-        authorized = false;
-      },
-      async () => {
-        running = true;
-      },
-      async () => {
-        compensated = true;
-      },
-      async () => {
-        persisted = true;
-      },
-    ),
-    /authorization expired before prompt dispatch/,
-  );
-
-  assert.equal(running, false);
-  assert.equal(persisted, false);
-  assert.equal(compensated, true);
-});
-
 void test('ACP coordination preserves its worker when the claim expired during the wait', async () => {
   let worker = 'original worker';
 
@@ -428,39 +233,6 @@ void test('ACP coordination restores its worker when the claim expires before di
   );
 
   assert.equal(worker, 'original worker');
-});
-
-for (const scenario of [
-  {
-    name: 'queued steer remains visible',
-    admission: 'queued' as const,
-    expected: { state: 'queued', dispatchPending: false },
-  },
-  {
-    name: 'delivered steer remains visible',
-    admission: 'working' as const,
-    expected: { state: 'working', dispatchPending: false },
-  },
-  {
-    name: 'cancelled steer is absent',
-    admission: null,
-    expected: { state: 'starting', turnId: null, dispatchPending: false },
-  },
-]) {
-  void test(`OpenCode compensation ${scenario.name}`, () => {
-    assert.deepEqual(
-      compensatedOpenCodePromptReceiptChanges(scenario.admission),
-      scenario.expected,
-    );
-  });
-}
-
-void test('OpenCode recovery rejects receipts without a persisted prompt', () => {
-  assert.equal(
-    openCodePromptRecoveryFailure('opencode:session-one', null),
-    'Recovered OpenCode worker has no persisted prompt.',
-  );
-  assert.equal(openCodePromptRecoveryFailure('opencode:session-one', 'ship it'), null);
 });
 
 void test('stale recovery completion cannot restore a fenced shipping issue', async () => {
@@ -1325,50 +1097,6 @@ void test('stalled prompt recovery does not block heartbeats beyond the original
   fireTimeout();
   assert.deepEqual(await recovery, { status: 'timed_out' });
   finishPrompt();
-});
-
-void test('timed out recovery aborts transport and cancels a late parked prompt', async () => {
-  const dispatches = createPromptDispatchTracker();
-  const controller = new AbortController();
-  const prompt = dispatches.track(
-    'run:issue',
-    () =>
-      new Promise<void>((_resolve, reject) => {
-        controller.signal.addEventListener('abort', () => reject(new Error('aborted')), {
-          once: true,
-        });
-      }),
-  );
-  let fireTimeout!: () => void;
-  const timeout = new Promise<void>((resolve) => {
-    fireTimeout = resolve;
-  });
-  const recovery = boundedPromptDispatch(prompt, timeout, () => controller.abort());
-
-  fireTimeout();
-  assert.deepEqual(await recovery, { status: 'timed_out' });
-  await Promise.resolve();
-  assert.equal(dispatches.pending('run:issue'), false);
-
-  let queued: string[] = [];
-  let pauses = 0;
-  const cancelled: string[] = [];
-  const stopped = await confirmOpenCodeWorkerStopped(
-    async () => ({ interrupted: false }),
-    async () => ({ running: false, queued: [...queued] }),
-    async (id) => {
-      cancelled.push(id);
-      queued = queued.filter((item) => item !== id);
-    },
-    async () => {
-      pauses++;
-      if (pauses === 1) queued = ['late-parked-post'];
-    },
-    8,
-  );
-
-  assert.equal(stopped, true);
-  assert.deepEqual(cancelled, ['late-parked-post']);
 });
 
 void test('handoff lease uses server duration on a monotonic clock', async () => {

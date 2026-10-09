@@ -8,7 +8,6 @@ import {
   updateNativeSubagents,
   type NativeSubagentStore,
 } from '../src/lib/native-subagents.ts';
-import type { SessionInfo } from '../src/lib/opencode.ts';
 import { subagentRuns, taskNotificationSessionIds } from '../src/lib/subagent-runs.ts';
 
 function update(sessionId: string, value: Record<string, unknown>): AgentEvent {
@@ -77,22 +76,6 @@ function receipt(changes: Partial<SpawnReceipt> = {}): SpawnReceipt {
     result: null,
     error: null,
     model: 'opus',
-    ...changes,
-  };
-}
-
-function openCodeChild(changes: Partial<SessionInfo> = {}): SessionInfo {
-  return {
-    id: 'ses-child',
-    parentID: 'ses-parent',
-    projectID: 'project',
-    agent: 'general',
-    model: { id: 'model-a', providerID: 'provider-a' },
-    cost: 0,
-    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    time: { created: 10, updated: 20 },
-    title: 'Search the docs',
-    location: { directory: '/repo' },
     ...changes,
   };
 }
@@ -322,38 +305,6 @@ await test('native children are read-only because the adapter accepts no child p
   const [run] = subagentRuns({ native: nativeStore(spawned('task-1')) });
 
   assert.deepEqual(run.controls, { prompt: false, cancel: false });
-});
-
-await test('OpenCode children are keyed by session id with live state', () => {
-  const runs = subagentRuns({
-    openCode: [
-      {
-        parentSessionId: 'ses-parent',
-        directory: '/repo',
-        children: [
-          openCodeChild({ id: 'ses-a', time: { created: 1, updated: 5 } }),
-          openCodeChild({ id: 'ses-b', outcome: 'succeeded', time: { created: 2, updated: 5 } }),
-          openCodeChild({ id: 'ses-c', outcome: 'failed', time: { created: 3, updated: 5 } }),
-          openCodeChild({ id: 'ses-d', time: { created: 4, updated: 5 } }),
-        ],
-        active: ['ses-a'],
-      },
-    ],
-  });
-
-  assert.deepEqual(
-    runs.map((run) => [run.id, run.state]),
-    [
-      ['acp:opencode:ses-a', 'working'],
-      ['acp:opencode:ses-b', 'completed'],
-      ['acp:opencode:ses-c', 'failed'],
-      ['acp:opencode:ses-d', 'completed'],
-    ],
-  );
-  assert.equal(runs[0].parentId, 'acp:opencode:ses-parent');
-  assert.equal(runs[0].name, 'general');
-  assert.equal(runs[0].task, 'Search the docs');
-  assert.equal(runs[0].model, 'provider-a:model-a');
 });
 
 await test('a notification from an entry without a time sorts by the parent transcript', () => {

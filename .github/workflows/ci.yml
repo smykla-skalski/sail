@@ -58,46 +58,6 @@ jobs:
           npm test
           npm run build
 
-  contract:
-    name: OpenCode contract (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-15, windows-2022]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: smykla-skalski/opencode-plugin-plan-review
-          ref: fdc575ba5ffccc6420ad5b3b68372f99f70290f5
-          path: plugin-under-test
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: '26'
-          cache: npm
-
-      - name: Install pinned contracts
-        run: |
-          npm ci
-          npm ci --prefix plugin-under-test
-          npm install --global @opencode/cli@2.0.24
-
-      - name: Select native OpenCode binary
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $packageRoot = npm root --global
-          "SAIL_OPENCODE_BIN=$packageRoot/@opencode/cli/bin/opencode.exe" >> $env:GITHUB_ENV
-
-      - name: Probe live server and plugin RPC
-        run: npm run test:contract
-        env:
-          SAIL_PLUGIN_PATH: ${{ github.workspace }}/plugin-under-test
-
   rust:
     name: Rust (${{ matrix.os }})
     needs: changes

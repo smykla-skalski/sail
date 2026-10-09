@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  acpModelId,
   evaluateModelRouting,
   parseModelRoutingSettings,
   selectModelRoute,
@@ -119,4 +120,42 @@ void test('evaluates accepted tasks and known routing failures', () => {
     failuresPrevented: 3,
     failureTotal: 3,
   });
+});
+
+void test('OpenCode routes use the provider/model ID its ACP selector lists', () => {
+  assert.equal(acpModelId('opencode', 'openai:gpt-6.1-sol'), 'openai/gpt-6.1-sol');
+  assert.equal(acpModelId('opencode', 'opencode/big-pickle'), 'opencode/big-pickle');
+  assert.equal(acpModelId('codex', 'provider:model'), 'provider:model');
+  assert.equal(
+    acpModelId('opencode', 'openrouter:anthropic/claude-sonnet-4'),
+    'openrouter/anthropic/claude-sonnet-4',
+  );
+  for (const [model, accepted] of [
+    ['openai/gpt-6.1-sol', true],
+    ['openai:gpt-6.1-sol', true],
+    ['gpt-6.1-sol', false],
+  ] as const) {
+    const selection = selectModelRoute(
+      {
+        routes: [{ role: 'debugging', risk: 'low', provider: 'opencode', model }],
+        independentReviewRisks: [],
+      },
+      { role: 'debugging', risk: 'low' },
+    );
+    assert.equal(!!selection.route, accepted, model);
+  }
+});
+
+void test('independent review rejects the same OpenCode model in either ID form', () => {
+  const selection = selectModelRoute(
+    {
+      routes: [
+        { role: 'implementation', risk: 'high', provider: 'opencode', model: 'openai/gpt-6.1-sol' },
+        { role: 'review', risk: 'high', provider: 'opencode', model: 'openai:gpt-6.1-sol' },
+      ],
+      independentReviewRisks: ['high'],
+    },
+    { role: 'implementation', risk: 'high' },
+  );
+  assert.equal(selection.route, null);
 });
