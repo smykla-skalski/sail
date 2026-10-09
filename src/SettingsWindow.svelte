@@ -52,6 +52,8 @@
     type MemoryAgentStatus,
     type MemoryKind,
     type MemoryMode,
+    type MemoryProviderKind,
+    type MemoryProviderStatus,
     type MemoryRecord,
     type MemorySearchResult,
     type MemoryStatus,
@@ -127,6 +129,13 @@
   let previewRequest = 0;
   let memoryModeRequest = 0;
   const serializeMemoryMode = createSerialExecutor();
+  let memoryProviderStatus = $state<MemoryProviderStatus | null>(null);
+  let memoryProviderKind = $state<MemoryProviderKind>('local');
+  let memoryProviderEndpoint = $state('');
+  let memoryProviderApiKey = $state('');
+  let memoryProviderMessage = $state('');
+  let memoryProviderError = $state('');
+  let memoryProviderLoading = $state(false);
 
   async function refreshMemory(directory: string, query = memoryQuery.trim()) {
     const request = ++memoryRequest;
@@ -137,6 +146,12 @@
       pendingForget = '';
       agentPreview = null;
       previewRequest += 1;
+      memoryProviderStatus = null;
+      memoryProviderKind = 'local';
+      memoryProviderEndpoint = '';
+      memoryProviderApiKey = '';
+      memoryProviderMessage = '';
+      memoryProviderError = '';
       query = '';
     }
     memoryDirectory = directory;
@@ -172,6 +187,72 @@
     } catch (cause) {
       if (request === memoryRequest && memoryDirectory === directory)
         memoryAgentError = `Agents: ${String(cause)}`;
+    }
+    try {
+      memoryProviderError = '';
+      const providerStatus = await invoke<MemoryProviderStatus>('memory_provider_status', {
+        directory,
+      });
+      if (request === memoryRequest && memoryDirectory === directory) {
+        memoryProviderStatus = providerStatus;
+        memoryProviderKind = providerStatus.provider;
+        memoryProviderEndpoint = providerStatus.endpoint ?? '';
+      }
+    } catch (cause) {
+      if (request === memoryRequest && memoryDirectory === directory)
+        memoryProviderError = `Provider: ${String(cause)}`;
+    }
+  }
+
+  function memoryProviderInput() {
+    return {
+      provider: memoryProviderKind,
+      endpoint: memoryProviderKind === 'mem0SelfHosted' ? memoryProviderEndpoint.trim() : null,
+      apiKey: memoryProviderKind === 'local' ? null : memoryProviderApiKey.trim(),
+    };
+  }
+
+  async function verifyMemoryProvider() {
+    const directory = snapshot?.directory;
+    if (!directory || memoryProviderKind === 'local') return;
+    memoryProviderLoading = true;
+    memoryProviderError = '';
+    memoryProviderMessage = '';
+    try {
+      await invoke<MemoryProviderStatus>('verify_memory_provider', {
+        directory,
+        input: memoryProviderInput(),
+      });
+      memoryProviderMessage = 'Connection verified. Enable it to backfill existing memories.';
+    } catch (cause) {
+      memoryProviderError = `Provider: ${String(cause)}`;
+    } finally {
+      memoryProviderLoading = false;
+    }
+  }
+
+  async function saveMemoryProvider() {
+    const directory = snapshot?.directory;
+    if (!directory) return;
+    memoryProviderLoading = true;
+    memoryProviderError = '';
+    memoryProviderMessage = '';
+    try {
+      memoryProviderStatus = await invoke<MemoryProviderStatus>('set_memory_provider', {
+        directory,
+        input: memoryProviderInput(),
+      });
+      memoryProviderApiKey = '';
+      memoryProviderKind = memoryProviderStatus.provider;
+      memoryProviderEndpoint = memoryProviderStatus.endpoint ?? '';
+      memoryProviderMessage =
+        memoryProviderStatus.provider === 'local'
+          ? 'Local search is active. Canonical project memories were preserved.'
+          : 'Mem0 is active and existing memories are synchronized.';
+    } catch (cause) {
+      memoryProviderError = `Provider: ${String(cause)}`;
+    } finally {
+      memoryProviderLoading = false;
     }
   }
 
@@ -1029,6 +1110,94 @@
             {memoryStatus.count} active {memoryStatus.count === 1 ? 'memory' : 'memories'} ·
             {memoryStatus.forgottenCount} forgotten
           </p>
+        {/if}
+      </section>
+
+      <section class="settings-card">
+        <h2>Search provider</h2>
+        <p>
+          Local project memory remains canonical. Mem0 adds semantic search; an outage falls back to
+          local search and never blocks memory writes.
+        </p>
+        {#if memoryProviderError}<p class="runtime-diagnostic" role="alert">
+            {memoryProviderError}
+          </p>{/if}
+        {#if memoryProviderMessage}<p class="runtime-binary" role="status">
+            {memoryProviderMessage}
+          </p>{/if}
+        {#if memoryProviderStatus?.notice && memoryProviderKind === memoryProviderStatus.provider}<p
+            class="runtime-diagnostic"
+            role="status"
+          >
+            {memoryProviderStatus.notice}
+          </p>{/if}
+        {#if memoryProviderStatus?.syncError && memoryProviderKind === memoryProviderStatus.provider}<p
+            class="runtime-diagnostic"
+            role="alert"
+          >
+            Last Mem0 sync failed: {memoryProviderStatus.syncError} Local search remains active.
+          </p>{/if}
+        <label for="memory-provider">Provider</label>
+        <select
+          id="memory-provider"
+          bind:value={memoryProviderKind}
+          disabled={!snapshot?.directory || memoryProviderLoading}
+          onchange={() => {
+            memoryProviderMessage = '';
+            memoryProviderError = '';
+          }}
+        >
+          <option value="local">Local search</option>
+          <option value="mem0Hosted">Mem0 hosted</option>
+          <option value="mem0SelfHosted">Mem0 self-hosted</option>
+        </select>
+        {#if memoryProviderKind === 'mem0SelfHosted'}
+          <label for="memory-provider-endpoint">Endpoint</label>
+          <input
+            id="memory-provider-endpoint"
+            type="url"
+            placeholder="https://mem0.example.com"
+            bind:value={memoryProviderEndpoint}
+            disabled={memoryProviderLoading}
+          />
+          <p class="runtime-binary">HTTPS is required except for localhost development servers.</p>
+        {/if}
+        {#if memoryProviderKind !== 'local'}
+          <label for="memory-provider-api-key">API key</label>
+          <input
+            id="memory-provider-api-key"
+            type="password"
+            autocomplete="off"
+            bind:value={memoryProviderApiKey}
+            disabled={memoryProviderLoading}
+          />
+          <p class="runtime-binary">
+            The key is stored in the OS credential store, never in Sail settings, exports, logs, or
+            agent configuration.
+          </p>
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={!memoryStatus?.enabled ||
+              !memoryProviderApiKey.trim() ||
+              (memoryProviderKind === 'mem0SelfHosted' && !memoryProviderEndpoint.trim()) ||
+              memoryProviderLoading}
+            onclick={() => void verifyMemoryProvider()}>Verify connection</Button
+          >
+        {/if}
+        <Button
+          size="sm"
+          disabled={!snapshot?.directory ||
+            memoryProviderLoading ||
+            (memoryProviderKind !== 'local' &&
+              (!memoryStatus?.enabled ||
+                !memoryProviderApiKey.trim() ||
+                (memoryProviderKind === 'mem0SelfHosted' && !memoryProviderEndpoint.trim())))}
+          onclick={() => void saveMemoryProvider()}
+          >{memoryProviderKind === 'local' ? 'Use local search' : 'Enable Mem0'}</Button
+        >
+        {#if !memoryStatus?.enabled && memoryProviderKind !== 'local'}
+          <p class="memory-empty" role="status">Enable shared memory before connecting Mem0.</p>
         {/if}
       </section>
 

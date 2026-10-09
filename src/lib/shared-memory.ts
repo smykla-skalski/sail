@@ -33,6 +33,17 @@ export type MemoryStatus = {
   forgottenCount: number;
 };
 
+export type MemoryProviderKind = 'local' | 'mem0Hosted' | 'mem0SelfHosted';
+
+export type MemoryProviderStatus = {
+  provider: MemoryProviderKind;
+  endpoint?: string;
+  configured: boolean;
+  credentialStorage?: 'keychain' | 'memory';
+  notice?: string;
+  syncError?: string;
+};
+
 export type MemoryAgentStatus = {
   id: 'claude' | 'codex' | 'opencode';
   name: string;
