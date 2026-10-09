@@ -215,6 +215,7 @@ pub mod hook_activity;
 mod hook_inspector;
 pub mod memory;
 mod memory_install;
+mod memory_provider;
 mod opencode_config;
 mod post_turn_checks;
 mod settings;
@@ -2433,6 +2434,10 @@ pub fn run() {
             memory::memory_inspect,
             memory::memory_forget,
             memory::memory_rate,
+            memory_provider::memory_provider_status,
+            memory_provider::verify_memory_provider,
+            memory_provider::set_memory_provider,
+            memory_provider::sync_memory_provider,
             repository_path_available,
             opencode_config::opencode_plan_review_plugin,
             validate_repository,
