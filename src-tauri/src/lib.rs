@@ -64,7 +64,7 @@ impl GitCanonical for Path {
     }
 }
 
-fn git_common_directory(repository: &Path) -> Result<PathBuf, String> {
+pub(crate) fn git_common_directory(repository: &Path) -> Result<PathBuf, String> {
     let repository = repository
         .git_canonical()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
@@ -214,6 +214,8 @@ mod diagnostics;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
+pub mod memory;
+mod memory_capture;
 mod opencode_config;
 mod post_turn_checks;
 mod settings;
@@ -2424,6 +2426,14 @@ pub fn run() {
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,
             settings::get_acp_turn_evidence,
+            memory::memory_project_key,
+            memory::memory_status,
+            memory::memory_list,
+            memory::memory_search,
+            memory::memory_remember,
+            memory::memory_inspect,
+            memory::memory_forget,
+            memory::memory_rate,
             repository_path_available,
             opencode_config::opencode_plan_review_plugin,
             validate_repository,
