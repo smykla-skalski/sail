@@ -9,5 +9,9 @@ fn main() {
         sail_lib::browser_agent::run_mcp_stdio();
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("--memory-mcp") {
+        sail_lib::memory::run_mcp_stdio();
+        return;
+    }
     sail_lib::run();
 }
