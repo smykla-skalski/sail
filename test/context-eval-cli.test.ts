@@ -10,6 +10,14 @@ import test from 'node:test';
 const execute = promisify(execFile);
 const root = resolve(import.meta.dirname, '..');
 
+function stopFixtureChild(pid: number): void {
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) throw error;
+  }
+}
+
 function contextEvalConfig(runner: string, unsafe: boolean): string {
   return JSON.stringify({
     matrix: {
@@ -201,7 +209,7 @@ void test('CLI bounds a trapped runner timeout', async () => {
 });
 
 void test(
-  'timed-out runners leave no active descendants',
+  'timed-out runners stop same-group descendants',
   { skip: process.platform === 'win32' },
   async () => {
     const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
@@ -262,13 +270,7 @@ void test(
       await new Promise((settled) => setTimeout(settled, 200));
       assert.equal(await readFile(heartbeat, 'utf8'), before);
     } finally {
-      for (const pid of childPids) {
-        try {
-          process.kill(pid, 'SIGKILL');
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
-        }
-      }
+      childPids.forEach(stopFixtureChild);
       await rm(temporary, { recursive: true, force: true });
     }
   },
