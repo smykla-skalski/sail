@@ -168,8 +168,8 @@ function delay(milliseconds) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
-async function settleList(binary, project, environment, expectedNames, attempts = 15) {
-  const result = run(binary, ['mcp', 'list'], { cwd: project, environment, timeout: 60_000 });
+async function settleList(binary, project, environment, expectedNames, attempts = 10) {
+  const result = run(binary, ['mcp', 'list'], { cwd: project, environment, timeout: 20_000 });
   if (expectedNames.every((name) => result.stdout.includes(name))) return result;
   if (attempts <= 1) return undefined;
   await delay(1000);
@@ -182,9 +182,12 @@ async function probe(binary) {
   mkdirSync(project, { recursive: true });
   const environment = {
     HOME: join(scratch, 'home'),
+    USERPROFILE: join(scratch, 'home'),
     XDG_CONFIG_HOME: join(scratch, 'xdg-config'),
     XDG_DATA_HOME: join(scratch, 'xdg-data'),
     XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
+    APPDATA: join(scratch, 'appdata'),
+    LOCALAPPDATA: join(scratch, 'appdata-local'),
   };
   try {
     writeFileSync(join(project, 'opencode.json'), '{}\n');
@@ -365,17 +368,23 @@ async function probe(binary) {
       environment,
       timeout: 20_000,
     });
+    const headlessAuthOutput = `${authHeadless.stdout} ${authHeadless.stderr}`;
+    const headlessAuthCompleted =
+      authHeadless.status === 0 &&
+      !authHeadless.timedOut &&
+      /authenticat/i.test(headlessAuthOutput);
     findings.push(
       finding(
         'auth-is-interactive',
         'mcp auth is an interactive OAuth flow, not usable headless',
-        'without a terminal and a browser the command cannot complete authentication',
+        'the headless run does not complete authentication: nonzero exit, timeout, or no authentication success output',
         JSON.stringify({
           exitCode: authHeadless.status,
           timedOut: authHeadless.timedOut,
+          stdout: authHeadless.stdout.slice(0, 200),
           stderr: authHeadless.stderr.slice(0, 200),
         }),
-        true,
+        !headlessAuthCompleted,
       ),
     );
     const logout = run(binary, ['mcp', 'logout', 'authed'], {

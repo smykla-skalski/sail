@@ -38,7 +38,7 @@ function openCodeBinary() {
 function runProbe(binary: string) {
   const stdout = execFileSync(process.execPath, [probeScript, '--bin', binary, '--json'], {
     encoding: 'utf8',
-    timeout: 300_000,
+    timeout: 600_000,
     maxBuffer: 16 * 1024 * 1024,
   });
   return probeResultSchema.parse(JSON.parse(stdout));

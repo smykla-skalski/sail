@@ -83,7 +83,7 @@
 
 ## Reproducing the registration evidence
 
-- Run `node scripts/opencode-remote-mcp-probe.mjs` with the pinned OpenCode on `PATH` (or pass `--bin <path>`). The probe isolates `HOME` and the XDG directories in a temporary root, sets a unique managed-service port, starts a local MCP server that requires a bearer token, and records the client's observed behavior as structured findings.
+- Run `node scripts/opencode-remote-mcp-probe.mjs` with the pinned OpenCode on `PATH` (or pass `--bin <path>`). The probe isolates `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, and the XDG directories in a temporary root, sets a unique managed-service port, starts a local MCP server that requires a bearer token, and records the client's observed behavior as structured findings.
 - `--json` prints machine-readable findings; `--keep` preserves the scratch root for inspection. Exit codes: 0 survey completed, 1 probe infrastructure failure, 2 no OpenCode binary found.
 - `npm test` includes `test/opencode-remote-mcp.test.ts`, which runs the probe and asserts the contract above. It skips when no OpenCode binary is on `PATH` or the binary is not the pinned `2.0.24`, so CI without the pinned client stays green while a desktop run with the pinned client re-verifies the contract.
 - Re-run the probe whenever the OpenCode pin in `src-tauri/src/lib.rs` changes and update this record and `docs/validation.md` together with the pin.
