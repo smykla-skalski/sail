@@ -290,7 +290,7 @@ pub fn finish_interrupted_agent_turn(
     clear_interrupted_turn(&app, &agent, &session_id, &turn_id)
 }
 
-fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(feature = "e2e")]
     if let Some(root) = std::env::var_os("SAIL_E2E_CONFIG_DIR") {
         return Ok(PathBuf::from(root).join("settings.json"));

@@ -658,6 +658,16 @@ impl BrowserManager {
                 json!({"tool":&request.name}),
             )?;
         }
+        if request.name.starts_with("memory_") {
+            return memory_action(
+                app,
+                &directory,
+                source_agent.as_deref(),
+                &session,
+                &request.name,
+                request.arguments,
+            );
+        }
         if matches!(
             request.name.as_str(),
             "worktree_create"
@@ -912,6 +922,58 @@ impl BrowserManager {
         self.blocked_navigation(&page.pane_id)?;
         result
     }
+}
+
+fn memory_action(
+    app: &AppHandle,
+    directory: &Path,
+    agent: Option<&str>,
+    session: &str,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    let directory = directory.to_string_lossy();
+    crate::memory::ensure_enabled(app, &directory)?;
+    let value = match name {
+        "memory_remember" => {
+            let mut input: crate::memory::MemoryInput =
+                serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+            input.provenance = Some(crate::memory::MemoryProvenance {
+                agent: agent.map(str::to_string),
+                session_id: Some(session.to_string()),
+            });
+            serde_json::to_value(crate::memory::remember(app, &directory, input)?)
+        }
+        "memory_search" => {
+            let query = required(&arguments, "query")?;
+            let limit = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok());
+            serde_json::to_value(crate::memory::search(app, &directory, query, limit)?)
+        }
+        "memory_inspect" => serde_json::to_value(crate::memory::inspect(
+            app,
+            &directory,
+            required(&arguments, "id")?,
+        )?),
+        "memory_forget" => serde_json::to_value(crate::memory::forget(
+            app,
+            &directory,
+            required(&arguments, "id")?,
+        )?),
+        "memory_rate" => {
+            let id = required(&arguments, "id")?;
+            let rating = arguments
+                .get("rating")
+                .and_then(Value::as_i64)
+                .and_then(|value| i8::try_from(value).ok())
+                .ok_or("rating is required")?;
+            serde_json::to_value(crate::memory::rate(app, &directory, id, rating)?)
+        }
+        _ => return Err("Unknown memory action.".into()),
+    };
+    value.map_err(|error| error.to_string())
 }
 
 fn required<'a>(value: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -1410,6 +1472,31 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "skill",
     ),
     (
+        "memory_remember",
+        "Store one concise durable project fact. Never store raw transcripts, complete tool output, secrets, or temporary progress.",
+        "content",
+    ),
+    (
+        "memory_search",
+        "Search durable memories shared by this Git project and its linked worktrees.",
+        "query",
+    ),
+    (
+        "memory_inspect",
+        "Inspect one project memory by ID.",
+        "id",
+    ),
+    (
+        "memory_forget",
+        "Forget one project memory by ID and remove its stored content.",
+        "id",
+    ),
+    (
+        "memory_rate",
+        "Rate one project memory as unhelpful (-1), unrated (0), or helpful (1).",
+        "id,rating",
+    ),
+    (
         "worktree_list",
         "List this project's main checkout and known worktrees with their live state and known agent threads.",
         "",
@@ -1698,6 +1785,41 @@ fn economics_input_schema() -> Value {
     })
 }
 
+fn memory_tool_schema(name: &str) -> Option<Value> {
+    let kind = json!({"type":"string","enum":["decision","constraint","discovery","preference","handoff","other"]});
+    match name {
+        "memory_remember" => Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "content":{"type":"string","minLength":1,"maxLength":4000},
+                "kind":kind,
+                "tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16}
+            },
+            "required":["content"]
+        })),
+        "memory_search" => Some(json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "query":{"type":"string","maxLength":1000},
+                "limit":{"type":"integer","minimum":1,"maximum":100}
+            },
+            "required":["query"]
+        })),
+        "memory_inspect" | "memory_forget" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{"id":{"type":"string","format":"uuid"}},"required":["id"]
+        })),
+        "memory_rate" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{"id":{"type":"string","format":"uuid"},"rating":{"type":"integer","enum":[-1,0,1]}},
+            "required":["id","rating"]
+        })),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum CapabilityProfile {
@@ -1739,6 +1861,11 @@ impl CapabilityProfile {
         const CORE: &[&str] = &[
             "sail_skill",
             "skill_reference",
+            "memory_remember",
+            "memory_search",
+            "memory_inspect",
+            "memory_forget",
+            "memory_rate",
             "worktree_list",
             "worktree_info",
             "agent_status",
@@ -1827,6 +1954,9 @@ pub fn run_mcp_stdio() {
             "ping" => json!({}),
             "tools/list" => {
                 json!({"tools": TOOLS.iter().filter(|(name, _, _)| tool_listed(profile, name, plan_tools)).map(|(name, description, fields)| {
+                if let Some(schema) = memory_tool_schema(name) {
+                    return json!({"name":name,"description":description,"inputSchema":schema});
+                }
                 if let Some(schema) = plan_tool_schema(name) {
                     return json!({"name":name,"description":description,"inputSchema":schema});
                 }
@@ -2061,7 +2191,7 @@ mod picker_tests {
 #[cfg(test)]
 mod skill_tests {
     use super::{
-        call_bridge, economics_input_schema, mcp_initialize, plan_tool_schema,
+        call_bridge, economics_input_schema, mcp_initialize, memory_tool_schema, plan_tool_schema,
         requires_phase_lease, skill_text, thread_keywords_schema, tool_listed, BrowserManager,
         CapabilityProfile, CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
     };
@@ -2183,6 +2313,16 @@ mod skill_tests {
     fn skill_is_announced_and_readable_without_a_browser_bridge() {
         assert_eq!(mcp_initialize()["instructions"], SAIL_SKILL);
         assert!(TOOLS.iter().any(|(name, _, _)| *name == "sail_skill"));
+        for name in [
+            "memory_remember",
+            "memory_search",
+            "memory_inspect",
+            "memory_forget",
+            "memory_rate",
+        ] {
+            assert!(TOOLS.iter().any(|(tool, _, _)| *tool == name));
+            assert!(memory_tool_schema(name).is_some());
+        }
         assert!(TOOLS
             .iter()
             .any(|(name, _, _)| *name == "task_checkpoint_read"));
