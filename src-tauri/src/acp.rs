@@ -2078,6 +2078,83 @@ fn find_executable(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+fn observe_agent_with_reef(agent: &str, pid: u32) {
+    let Some(reef) = find_executable("reef") else {
+        return;
+    };
+    let _ = spawn_reef_registration(reef, agent.to_owned(), pid);
+}
+
+fn spawn_reef_registration(
+    reef: PathBuf,
+    agent: String,
+    pid: u32,
+) -> std::io::Result<std::thread::JoinHandle<Option<i32>>> {
+    std::thread::Builder::new()
+        .name("reef-agent-registration".to_owned())
+        .spawn(move || {
+        let outcome = Command::new(reef)
+            .args(["agents", "observe", &agent, "--pid"])
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .and_then(|mut child| child.wait());
+        let code = outcome
+            .as_ref()
+            .ok()
+            .and_then(std::process::ExitStatus::code);
+        crate::diagnostics::record(
+            "reef_agent_registration",
+            json!({"agent": agent, "status": if outcome.as_ref().is_ok_and(std::process::ExitStatus::success) { "registered" } else { "failed" }, "exitCode": code}),
+        );
+        code
+        })
+}
+
+#[cfg(all(test, unix))]
+mod reef_observation_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn registration_is_best_effort_and_does_not_wrap_the_agent() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sail-reef-registration-{}-{nonce}",
+            std::process::id(),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let reef = dir.join("reef");
+        std::fs::write(&reef, b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.out\"\n").unwrap();
+        std::fs::set_permissions(&reef, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            spawn_reef_registration(reef.clone(), "opencode".to_owned(), 42)
+                .unwrap()
+                .join()
+                .unwrap(),
+            Some(0)
+        );
+
+        let args = std::fs::read_to_string(dir.join("reef.out")).unwrap();
+        assert_eq!(args, "agents\nobserve\nopencode\n--pid\n42\n");
+        std::fs::write(&reef, b"#!/bin/sh\nexit 2\n").unwrap();
+        assert_eq!(
+            spawn_reef_registration(reef, "codex".to_owned(), 42)
+                .unwrap()
+                .join()
+                .unwrap(),
+            Some(2)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 fn node_major(node: &PathBuf) -> Option<u32> {
     let output = Command::new(node).arg("--version").output().ok()?;
     if !output.status.success() {
@@ -2485,6 +2562,7 @@ fn connect_blocking(
     #[cfg(not(feature = "e2e"))]
     let test_agent: Option<std::ffi::OsString> = None;
     let mut paths = Vec::new();
+    let is_test_agent = test_agent.is_some();
     let mut command = if let Some(path) = test_agent {
         let node = find_executable("node").ok_or("Node.js not found.")?;
         paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
@@ -2535,6 +2613,9 @@ fn connect_blocking(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Could not start {}: {error}", definition.name))?;
+    if !is_test_agent {
+        observe_agent_with_reef(&agent, child.id());
+    }
     #[cfg(unix)]
     let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id()).map_err(|error| {
         stop_process(&mut child);
