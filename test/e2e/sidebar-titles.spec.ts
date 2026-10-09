@@ -77,12 +77,14 @@ describe('sidebar agent rows', () => {
     const rows = await browser.execute(() =>
       [...document.querySelectorAll<HTMLElement>('.project-agent-row')].map((row) => ({
         provider: row.querySelector('.project-agent-provider')?.textContent?.trim() ?? '',
+        subagent: !!row.querySelector('.project-subagent-tag'),
         title: row.querySelector('.project-agent-title')?.textContent?.trim() ?? '',
         status: row.querySelector<HTMLElement>('.activity-status')?.offsetWidth ?? 0,
       })),
     );
     expect(rows.length).toBe(2);
-    expect(rows.map((row) => row.provider)).toEqual(['', '↳']);
+    expect(rows.map((row) => row.provider)).toEqual(['', '↳Subagent']);
+    expect(rows.map((row) => row.subagent)).toEqual([false, true]);
     expect(rows.map((row) => row.title)).toEqual(['', '']);
     expect(rows.map((row) => row.status > 0)).toEqual([true, true]);
   });

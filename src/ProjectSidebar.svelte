@@ -826,7 +826,7 @@
               >{#if child}<span aria-hidden="true">↳</span>{/if}<HarnessIcon
                 agent={thread.agent}
                 size={13}
-              /></span
+              />{#if child}<span class="project-subagent-tag">Subagent</span>{/if}</span
             >
             <ActivityStatus
               {status}
