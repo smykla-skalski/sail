@@ -1,3 +1,4 @@
+import type { ActivityHistoryEvent } from './activity-history.ts';
 import type { SessionMessageInfo, PromptFileAttachment } from '@opencode/client';
 import type { AgentDisplayEntry, AgentTool } from './acp';
 import {
@@ -50,7 +51,15 @@ export type TranscriptItem =
   | { kind: 'shell'; id: string; run: ShellRun }
   | { kind: 'hook'; id: string; created: number; activity: HookActivity }
   | { kind: 'checks'; id: string; created: number; checks: PostTurnCheck[] }
-  | { kind: 'subagents'; id: string; created: number; receipts: SpawnReceipt[] };
+  | { kind: 'subagents'; id: string; created: number; receipts: SpawnReceipt[] }
+  | {
+      kind: 'decision';
+      id: string;
+      created: number;
+      title: string;
+      outcome: 'allowed' | 'rejected';
+      reason: string;
+    };
 
 export type TranscriptKind = TranscriptItem['kind'];
 
@@ -98,6 +107,33 @@ export function hookItems(activities: HookActivity[]): TranscriptItem[] {
     created: activity.created,
     activity,
   }));
+}
+
+/** Permissions Sail settled by policy for one session, shown where they happened. */
+export function decisionItems(
+  events: readonly ActivityHistoryEvent[],
+  thread: { agent: string; directory: string; sessionId: string },
+): TranscriptItem[] {
+  const { agent, directory, sessionId } = thread;
+  return events
+    .filter(
+      (event) =>
+        event.kind === 'decision' &&
+        event.workspace === directory &&
+        event.automatic === true &&
+        event.agent === agent &&
+        event.sessionId === sessionId,
+    )
+    .toSorted((left, right) => left.at - right.at)
+    .map((event) => ({
+      kind: 'decision',
+      id: `decision:${event.id}`,
+      created: event.at,
+      title: event.title,
+      outcome: event.outcome === 'rejected' ? 'rejected' : 'allowed',
+      // Policy decision titles already quote the reason; repeat it only when they do not.
+      reason: event.reason && !event.title.includes(event.reason) ? event.reason : '',
+    }));
 }
 
 /** One card per turn; a check's own update time places the card after the turn it ran for. */
@@ -408,4 +444,25 @@ export function formatMessageTime(created: number | undefined, now = new Date())
   return at.toDateString() === now.toDateString()
     ? clock
     : `${at.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${clock}`;
+}
+
+/** Changes whenever the newest message or tool group grows, such as a streaming message or a
+ * running tool's output, so Jump to latest can tell new output from a new item. Rows placed by
+ * time, such as hooks and decisions, are skipped. */
+export function latestRevision(items: readonly TranscriptItem[]): string {
+  const last = items.findLast((item) => item.kind === 'message' || item.kind === 'tools');
+  if (!last) return '';
+  const size =
+    last.kind === 'message'
+      ? last.text.length
+      : last.kind === 'tools'
+        ? last.tools.map((tool) => tool.output.length).join(',')
+        : '';
+  return `${last.id}:${size}`;
+}
+
+/** Jump to latest label: new items are counted; growth of the newest one reads "new output". */
+export function jumpLabel(newItems: number, grew: boolean): string {
+  if (newItems > 0) return `Jump to latest (${newItems} new)`;
+  return grew ? 'Jump to latest (new output)' : 'Jump to latest';
 }

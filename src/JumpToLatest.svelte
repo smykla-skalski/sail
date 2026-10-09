@@ -1,18 +1,27 @@
 <script lang="ts">
-  let { following, count, onjump }: { following: boolean; count: number; onjump: () => void } =
-    $props();
+  import { jumpLabel } from './lib/transcript';
+
+  let {
+    following,
+    count,
+    revision = '',
+    onjump,
+  }: { following: boolean; count: number; revision?: string; onjump: () => void } = $props();
 
   let baseline = $state(0);
+  let seenRevision = $state('');
   $effect(() => {
-    if (following) baseline = count;
+    if (following) {
+      baseline = count;
+      seenRevision = revision;
+    }
   });
   const fresh = $derived(Math.max(0, count - baseline));
 </script>
 
 {#if !following}
   <button type="button" class="jump-latest" onclick={onjump}>
-    Jump to latest{#if fresh}
-      ({fresh} new){/if}
+    {jumpLabel(fresh, revision !== seenRevision)}
   </button>
 {/if}
 

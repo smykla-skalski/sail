@@ -269,5 +269,29 @@ describe('live subagent activity', () => {
       withResult: { active: 1, responses: 2, result: 'Preserved result' },
     });
     checkpoint('handoff verified');
+
+    const card = '.spawn-response[data-spawn-id="missing"]';
+    await browser.execute(() =>
+      document.querySelector<HTMLButtonElement>('button[aria-label="Result of 3 lines"]')!.click(),
+    );
+    await browser.pause(100);
+    expect(
+      await browser.execute(
+        (selector) => !document.querySelector(`${selector} .spawn-expand`),
+        card,
+      ),
+    ).toBe(true);
+    await browser.execute(() =>
+      document.querySelector<HTMLButtonElement>('button[aria-label="Result of 10 lines"]')!.click(),
+    );
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (selector) =>
+            document.querySelector(`${selector} .spawn-expand`)?.textContent?.trim() === 'Expand',
+          card,
+        ),
+      { timeout: 5_000, timeoutMsg: 'Expand did not appear for a result that grew' },
+    );
   });
 });

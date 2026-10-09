@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { SessionMessageInfo } from '@opencode/client';
 import type { AgentDisplayEntry } from '../src/lib/acp.ts';
+import type { ActivityHistoryEvent } from '../src/lib/activity-history.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 import {
   buildTranscript,
@@ -16,6 +17,9 @@ import {
   streamingItems,
   subagentItems,
   type TranscriptItem,
+  jumpLabel,
+  latestRevision,
+  decisionItems,
 } from '../src/lib/transcript.ts';
 import {
   acpPermissionChoices,
@@ -391,4 +395,121 @@ await test('permission details show the exact command, files and tool call', () 
     command: null,
     files: ['/p/a.ts'],
   });
+});
+
+const growing = (text: string): TranscriptItem => ({
+  kind: 'message',
+  id: 'm1',
+  role: 'assistant',
+  author: 'Claude',
+  text,
+  provider: 'claude',
+});
+
+const running = (status: string, output: string): TranscriptItem => ({
+  kind: 'tools',
+  id: 't1',
+  tools: [{ id: 'a', title: 'Run', status, output, error: '', source: 'claude', terminalIds: [] }],
+});
+
+void test('Jump to latest tells streaming growth apart from new items', () => {
+  assert.equal(latestRevision([]), '');
+  assert.notEqual(latestRevision([growing('Hel')]), latestRevision([growing('Hello')]));
+  assert.notEqual(
+    latestRevision([running('in_progress', '')]),
+    latestRevision([running('in_progress', 'line')]),
+  );
+  assert.equal(
+    latestRevision([running('in_progress', 'x')]),
+    latestRevision([running('completed', 'x')]),
+  );
+  const note: TranscriptItem = {
+    kind: 'decision',
+    id: 'd1',
+    created: 5,
+    title: 'Format',
+    outcome: 'allowed',
+    reason: '',
+  };
+  assert.notEqual(latestRevision([growing('Hel'), note]), latestRevision([growing('Hello'), note]));
+  assert.equal(latestRevision([growing('same')]), latestRevision([growing('same')]));
+  assert.equal(jumpLabel(0, false), 'Jump to latest');
+  assert.equal(jumpLabel(0, true), 'Jump to latest (new output)');
+  assert.equal(jumpLabel(2, true), 'Jump to latest (2 new)');
+});
+
+void test('automatic permission decisions of one session become transcript notes', () => {
+  const base = { workspace: '/repo', source: 'claude', sourceId: 's', title: 'Read .env' };
+  const events: ActivityHistoryEvent[] = [
+    {
+      ...base,
+      id: 'b',
+      kind: 'decision',
+      outcome: 'rejected',
+      at: 20,
+      agent: 'claude',
+      sessionId: 'one',
+      automatic: true,
+      reason: 'Secrets stay private.',
+    },
+    {
+      ...base,
+      id: 'a',
+      kind: 'decision',
+      outcome: 'completed',
+      at: 10,
+      agent: 'claude',
+      sessionId: 'one',
+      automatic: true,
+      reason: 'Read-only access.',
+    },
+    {
+      ...base,
+      id: 'c',
+      kind: 'decision',
+      outcome: 'completed',
+      at: 30,
+      agent: 'claude',
+      sessionId: 'one',
+    },
+    {
+      ...base,
+      id: 'd',
+      kind: 'decision',
+      outcome: 'completed',
+      at: 40,
+      agent: 'claude',
+      sessionId: 'two',
+      automatic: true,
+    },
+    {
+      ...base,
+      id: 'e',
+      kind: 'tool',
+      outcome: 'completed',
+      at: 50,
+      agent: 'claude',
+      sessionId: 'one',
+      automatic: true,
+    },
+  ];
+  const quoted = decisionItems(
+    [
+      {
+        ...events[1],
+        title: 'build · medium risk — Allowed by policy: Read-only access. — Read .env',
+      },
+    ],
+    { agent: 'claude', directory: '/repo', sessionId: 'one' },
+  );
+  assert.equal(quoted[0].kind === 'decision' && quoted[0].reason, '');
+  assert.deepEqual(
+    decisionItems(events, { agent: 'claude', directory: '/repo', sessionId: 'one' }).map((item) =>
+      item.kind === 'decision' ? [item.id, item.outcome, item.reason, item.created] : item.kind,
+    ),
+    [
+      ['decision:a', 'allowed', 'Read-only access.', 10],
+      ['decision:b', 'rejected', 'Secrets stay private.', 20],
+    ],
+  );
 });

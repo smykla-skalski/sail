@@ -40,6 +40,7 @@
 
   $effect(() => {
     const element = result;
+    void receipt.result;
     if (!element) {
       overflowing = false;
       return;

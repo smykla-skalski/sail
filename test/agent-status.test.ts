@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   agentHeaderStatus,
+  statusBarAttentionCount,
   agentStatusCounts,
   buildAgentStatusItems,
   openCodeHeaderStatus,
@@ -95,6 +96,11 @@ void test('ACP thread headers report working only for turns the status bar can l
       { running: true, activityReady: false, busy: true },
       'connecting',
     ],
+    [
+      'prompt sent before activity check',
+      { sending: true, activityReady: false, busy: true },
+      'connecting',
+    ],
     ['running turn after activity check', { running: true, busy: true }, 'working'],
     ['other live work keeps working', { busy: true }, 'working'],
   ];
@@ -124,4 +130,14 @@ void test('OpenCode headers report working only once the session runs', () => {
   ];
   for (const [name, overrides, expected] of cases)
     assert.equal(openCodeHeaderStatus({ ...idleOpenCode, ...overrides }), expected, name);
+});
+
+void test('the status bar counts a waiting thread before its Inbox request arrives', () => {
+  const waiting = { key: JSON.stringify(['claude', '/repo', 's1']), status: 'waiting' as const };
+  const working = { key: JSON.stringify(['claude', '/repo', 's2']), status: 'working' as const };
+  const listed = new Set([JSON.stringify(['/repo', 'claude', 's1'])]);
+  assert.equal(statusBarAttentionCount(0, [waiting, working], new Set()), 1);
+  assert.equal(statusBarAttentionCount(1, [waiting, working], listed), 1);
+  assert.equal(statusBarAttentionCount(2, [working], new Set()), 2);
+  assert.equal(statusBarAttentionCount(0, [{ key: 'bad', status: 'waiting' }], new Set()), 0);
 });

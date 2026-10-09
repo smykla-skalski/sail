@@ -20,9 +20,12 @@
     shellItems,
     subagentItems,
     type TranscriptTool,
+    decisionItems,
+    latestRevision,
   } from './lib/transcript';
   import { acpPermissionChoices, acpPermissionDetails } from './lib/permission-card';
   import JumpToLatest from './JumpToLatest.svelte';
+  import { sharedActivityHistory } from './lib/activity-history';
   import PermissionCard from './PermissionCard.svelte';
   import Transcript from './Transcript.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
@@ -83,8 +86,8 @@
     restoreEntryTimes,
     saveRecentTranscript,
     sessionState,
-    takeBackgroundUpdates,
-    trackBackgroundSession,
+    takeLiveTranscript,
+    trackLiveTranscript,
     updateEntriesBatch,
     updateEntriesInPlace,
     type AgentEntry,
@@ -102,6 +105,9 @@
   import {
     parentTurnStopHint,
     permissionAlreadyAnswered,
+    permissionResolution,
+    permissionResolutionLabel,
+    type PermissionResolution,
     type SubagentControl,
   } from './lib/subagent-control';
   import type { BrowserAttachment } from './lib/browser-pick';
@@ -490,6 +496,7 @@
   }
   let error = $state('');
   let entries = $state.raw<AgentEntry[]>([]);
+  let showingNativeChild = false;
   let nativePlan = $state<NativePlan | null>(null);
   let planRequested = $state(false);
   let completedTurn = Promise.resolve();
@@ -504,7 +511,8 @@
     reported: boolean;
   } | null = null;
   $effect(() => {
-    if (nativeEntries) entries = nativeEntries;
+    // Until activate() switches sessions, entries still belong to the parent being left.
+    if (nativeEntries && activeSessionId === thread?.sessionId) entries = nativeEntries;
   });
   $effect(() => {
     const revision = planRevision;
@@ -541,12 +549,18 @@
     untrack(() => onentrieschange?.(snapshot, activeSessionId, available));
   });
   let permissions = $state<AgentPermission[]>([]);
-  let answeredNotes = $state<{ identity: string; title: string }[]>([]);
+  let answeredNotes = $state<{ identity: string; title: string; outcome: PermissionResolution }[]>(
+    [],
+  );
 
-  function noteAnswered(permission: AgentPermission) {
+  // Requests this surface dropped after "no longer pending", kept until their resolution event
+  // says how they were settled. The event and the rejection arrive in either order.
+  let settledElsewhere: AgentPermission[] = [];
+
+  function noteAnswered(permission: AgentPermission, outcome: PermissionResolution) {
     const identity = acpPermissionIdentity(permission);
     if (answeredNotes.some((note) => note.identity === identity)) return;
-    answeredNotes = [...answeredNotes, { identity, title: permission.title }];
+    answeredNotes = [...answeredNotes, { identity, title: permission.title, outcome }];
   }
   let elicitations = $state<Elicitation[]>([]);
   let elicitationDrafts = $state<Record<string, Record<string, unknown>>>({});
@@ -595,6 +609,9 @@
       timed: [
         ...hookItems(visibleHookActivities),
         ...checkItems(postTurnChecks),
+        ...(activeSessionId && !ephemeral
+          ? decisionItems($sharedActivityHistory, { agent, directory, sessionId: activeSessionId })
+          : []),
         ...subagentItems(spawnReceipts),
         ...shellItems(pendingShellRuns),
       ],
@@ -620,18 +637,24 @@
     }),
   );
   let liveTurn = $state(false);
+  // The app marks a thread done from the turn-finished event, before this pane's prompt call
+  // returns; the header follows that event so both settle in the same frame.
+  let turnEnded = $state(false);
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
+  // What the user sees: a turn the app already marked finished no longer reads busy, so the
+  // header, the working row and the pickers settle together.
+  const shownBusy = $derived(isBusy && !turnEnded);
   const visibleStatus = $derived(
     agentHeaderStatus({
       connecting,
       ready,
       waiting: permissions.length > 0,
-      sending: busy,
+      sending: busy && !turnEnded,
       hasSession: !!activeSessionId,
       running,
       activityReady,
       historyLoading,
-      busy: isBusy,
+      busy: shownBusy,
     }),
   );
   const workspaceActivity = $derived(
@@ -770,15 +793,21 @@
   }
 
   $effect(() => {
-    if (isBusy) {
+    if (shownBusy) {
       pickerOpen = null;
       configPickerOpen = null;
     }
   });
 
-  async function focusPromptWhenReady() {
+  // A busy agent still accepts typing; a prefill focuses so the reply can be queued.
+  async function focusPromptWhenReady(whileBusy = false) {
     await tick();
-    if (!focusPrompt || !focused || isBusy || activeSessionId !== (thread?.sessionId ?? null))
+    if (
+      !focusPrompt ||
+      !focused ||
+      (isBusy && !whileBusy) ||
+      activeSessionId !== (thread?.sessionId ?? null)
+    )
       return;
     prompt.focus();
     onpromptfocused?.();
@@ -798,11 +827,13 @@
   });
 
   $effect(() => {
-    if (!prefill || prefill.id === lastPrefill) return;
+    // Wait for the thread switch: activating a session restores its saved draft over the prefill.
+    if (!prefill || prefill.id === lastPrefill || activeSessionId !== (thread?.sessionId ?? null))
+      return;
     lastPrefill = prefill.id;
     draft = [draft.trim(), prefill.text].filter(Boolean).join('\n\n');
     onprefillconsumed?.(prefill.id);
-    void focusPromptWhenReady();
+    void focusPromptWhenReady(true);
   });
 
   $effect(() => {
@@ -916,8 +947,10 @@
     setReplaying(true);
     replayEntries = [];
     try {
-      await acp.load(agent, directory, id, activeCapabilityProfile);
+      const session = await acp.load(agent, directory, id, activeCapabilityProfile);
       if (current !== generation) return;
+      if (!configOptions.length && Array.isArray(session.configOptions))
+        configOptions = session.configOptions as AgentConfigOption[];
       entries = restoreEntryTimes(replayEntries, entries);
       visibleCount = 50;
       historyLoaded = true;
@@ -1075,9 +1108,10 @@
   async function activate(id: string | null) {
     rememberTranscript();
     const previousSessionId = activeSessionId;
-    // Opening a native child leaves the parent running too, so its updates still need buffering.
-    if (previousSessionId && previousSessionId !== id && !ephemeral)
-      trackBackgroundSession(agent, previousSessionId);
+    // Opening a native child leaves the parent running too, so its transcript keeps updating.
+    if (previousSessionId && previousSessionId !== id && !ephemeral && !showingNativeChild)
+      trackLiveTranscript(agent, previousSessionId, entries, historyLoaded);
+    showingNativeChild = !!nativeEntries;
     rememberDraft(previousSessionId);
     const savedDraft = recallComposerDraft(composerDraftKey(directory, agent, id));
     draft = savedDraft?.text ?? '';
@@ -1092,6 +1126,7 @@
     replayEntries = [];
     permissions = [];
     answeredNotes = [];
+    settledElsewhere = [];
     selectedThreadId = id;
     activeSessionId = id;
     nativePlan = id ? loadNativePlan({ agent, directory, sessionId: id }) : null;
@@ -1099,19 +1134,9 @@
     elicitationDrafts = {};
     onnativeplan?.(nativePlan);
     entries = id && thread ? loadRecentTranscript(thread) : [];
-    const backgroundUpdates = id && !nativeEntries ? takeBackgroundUpdates(agent, id) : null;
+    const kept = id && !nativeEntries ? takeLiveTranscript(agent, id) : null;
     const liveView =
-      id && !nativeEntries
-        ? liveSessionView(entries, backgroundUpdates, sessionState(agent, id))
-        : null;
-    if (backgroundUpdates && id) {
-      for (const update of backgroundUpdates) {
-        nativePlan = nativePlanUpdate(agent, update, nativePlan);
-        acpPlans().observe({ agent, directory, sessionId: id }, update);
-      }
-      if (nativePlan) saveNativePlan({ agent, directory, sessionId: id }, nativePlan);
-      onnativeplan?.(nativePlan);
-    }
+      id && !nativeEntries ? liveSessionView(entries, kept, sessionState(agent, id)) : null;
     if (liveView) entries = liveView.entries;
     visibleCount = 50;
     historyLoaded = !id;
@@ -1141,6 +1166,7 @@
     liveTurn = false;
     stopRequested = false;
     activeTurnId = null;
+    turnEnded = false;
     error = '';
     ready = false;
     connecting = true;
@@ -1178,6 +1204,7 @@
         if (liveView && runningTurn !== undefined) {
           liveTurn = true;
           activeTurnId = runningTurn;
+          historyLoaded = liveView.complete;
           configOptions = liveView.configOptions;
           const liveModel = configOptions.find(
             (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
@@ -1334,6 +1361,8 @@
       if (commandUpdates[session.sessionId]) updateSkills(commandUpdates[session.sessionId]);
       selectedThreadId = session.sessionId;
       oncreated(created);
+      // The header turns Working with the session, so the app learns of the turn in that flush.
+      if (forTurn) onstatus(created, 'working');
       return created;
     })();
     creatingSession = task;
@@ -1347,7 +1376,7 @@
   }
 
   async function openPicker(kind: 'model' | 'effort') {
-    if (!ready || !directory || isBusy) return;
+    if (!ready || !directory || shownBusy) return;
     configPickerOpen = null;
     pickerOpen = kind;
     if (activeSessionId) return;
@@ -1415,6 +1444,13 @@
       }
       if (message.method === 'sail/prompt_finished' && typeof params?.sessionId === 'string') {
         if (
+          busy &&
+          params.sessionId === activeSessionId &&
+          typeof params.turnId === 'string' &&
+          params.turnId === activeTurnId
+        )
+          turnEnded = true;
+        if (
           liveTurn &&
           params.sessionId === activeSessionId &&
           (typeof params.turnId !== 'string' || params.turnId === activeTurnId)
@@ -1449,7 +1485,7 @@
           return;
         permissionInventoryRevision++;
         const shown = permissions;
-        permissions = removeResolvedAcpPermission(permissions, {
+        const resolvedIdentity = {
           id: params.requestId,
           sessionId: params.sessionId,
           generation:
@@ -1460,8 +1496,14 @@
             typeof params.sailPermissionFingerprint === 'string'
               ? params.sailPermissionFingerprint
               : undefined,
-        });
-        for (const gone of shown) if (!permissions.includes(gone)) noteAnswered(gone);
+        };
+        permissions = removeResolvedAcpPermission(permissions, resolvedIdentity);
+        const outcome = permissionResolution(params);
+        for (const gone of shown) if (!permissions.includes(gone)) noteAnswered(gone, outcome);
+        const waiting = settledElsewhere;
+        settledElsewhere = removeResolvedAcpPermission(waiting, resolvedIdentity);
+        for (const gone of waiting)
+          if (!settledElsewhere.includes(gone)) noteAnswered(gone, outcome);
         if (thread && running && permissions.length === 0) onstatus(thread, 'working');
       } else if (message.method === 'session/update') {
         const update = params.update;
@@ -1517,7 +1559,7 @@
       setReplaying(false);
       rememberTranscript();
       if (activeSessionId && !nativeEntries && !ephemeral)
-        trackBackgroundSession(agent, activeSessionId);
+        trackLiveTranscript(agent, activeSessionId, entries, historyLoaded);
       generation++;
       clearTimeout(updateTimer);
       unlisten?.();
@@ -1572,7 +1614,7 @@
     if (
       !external &&
       !clipboardAttachments.length &&
-      !isBusy &&
+      !shownBusy &&
       ready &&
       directory &&
       (command === '/model' || command === '/effort')
@@ -1605,6 +1647,7 @@
     let finishTurn!: () => void;
     completedTurn = new Promise<void>((resolve) => (finishTurn = resolve));
     activeTurnId = turnId;
+    turnEnded = false;
     let activityThread = thread;
     let finalStatus: ThreadStatus = 'done';
     let notifyOnDone = true;
@@ -1839,8 +1882,12 @@
       if (!keepImages) discardAttachments(sentImages, sentClipboard);
       if (deliverySessionId) discardSteeredAttachments(deliverySessionId);
       if (activeTurnId === turnId) activeTurnId = null;
+      // Clear busy first so the header and the status bar settle in the same frame.
+      if (current === generation) {
+        busy = false;
+        turnEnded = false;
+      }
       if (activityThread) onstatus(activityThread, finalStatus, notifyOnDone);
-      if (current === generation) busy = false;
       finishTurn();
       if (
         current === generation &&
@@ -2088,16 +2135,21 @@
     try {
       await acp.cancel(agent, sessionId, activeTurnId);
       cancelSent = true;
+      // Cancelling the session already settles its pending requests in the backend.
       await Promise.all(
         pending.map((permission) =>
-          acp.permission(
-            agent,
-            permission.id,
-            null,
-            permission.sessionId,
-            permission.generation,
-            permission.fingerprint,
-          ),
+          acp
+            .permission(
+              agent,
+              permission.id,
+              null,
+              permission.sessionId,
+              permission.generation,
+              permission.fingerprint,
+            )
+            .catch((cause: unknown) => {
+              if (!permissionAlreadyAnswered(cause)) throw cause;
+            }),
         ),
       );
       if (current !== generation || activeSessionId !== sessionId) return;
@@ -2145,11 +2197,13 @@
         },
       });
       permissions = permissions.filter((item) => acpPermissionIdentity(item) !== identity);
-      noteAnswered(permission);
+      noteAnswered(permission, 'answered');
     } catch (cause) {
       if (permissionAlreadyAnswered(cause)) {
+        // Settled elsewhere; its resolution event records whether it was answered or cancelled.
+        if (permissions.some((item) => acpPermissionIdentity(item) === identity))
+          settledElsewhere = [...settledElsewhere, permission].slice(-20);
         permissions = permissions.filter((item) => acpPermissionIdentity(item) !== identity);
-        noteAnswered(permission);
         if (thread && lastRequest) onstatus(thread, 'working');
         return;
       }
@@ -2185,7 +2239,7 @@
   }
 
   function setConfig(configId: string, value: string) {
-    if (!activeSessionId || isBusy) return;
+    if (!activeSessionId || shownBusy) return;
     configFailure = '';
     const sessionId = activeSessionId;
     const previous = settingConfig;
@@ -2342,7 +2396,7 @@
       }}
       aria-label={`${name} conversation`}
     >
-      {#if entries.length === 0 && !connecting && !historyLoading}
+      {#if entries.length === 0 && !connecting && !historyLoading && !liveTurn}
         <div class="agent-welcome">
           <h1>Work with {name}</h1>
           <p>Describe the work. Sail will show messages, tools, and approvals here.</p>
@@ -2350,6 +2404,11 @@
       {/if}
       {#if historyLoading}<div class="agent-history-status" role="status">
           Loading history…
+        </div>{:else if liveTurn && !historyLoaded && !nativeEntries}<div
+          class="agent-history-status agent-history-gap"
+          role="note"
+        >
+          Earlier messages load when this turn ends.
         </div>{/if}
       {#snippet failureTool(item: TranscriptTool)}
         {@const tool = item.raw as AgentTool}
@@ -2380,7 +2439,7 @@
       {/snippet}
       <Transcript
         items={transcriptItems}
-        busy={isBusy}
+        busy={shownBusy}
         {coordinationMessages}
         onopen={onopensubagent}
         control={subagentControl}
@@ -2404,7 +2463,7 @@
                     </li>{/each}
                 </ul>{/if}
             </section>{/if}
-          {#if isBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
+          {#if shownBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
               <div class="agent-busy" role="status">
                 <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
                     size="sm"
@@ -2418,6 +2477,7 @@
       <JumpToLatest
         following={autoFollow}
         count={transcriptItems.length}
+        revision={latestRevision(transcriptItems)}
         onjump={() => {
           autoFollow = true;
           void follow();
@@ -2469,7 +2529,7 @@
       {/each}
       {#each answeredNotes as note (note.identity)}
         <p class="agent-permission-answered" role="status" data-answered-id={note.identity}>
-          Answered · {note.title}
+          {permissionResolutionLabel(note.outcome)} · {note.title}
         </p>
       {/each}
       {#if nativeEntries}
@@ -2557,7 +2617,7 @@
             value={modelOption?.currentValue}
             options={modelOption?.options ?? []}
             open={pickerOpen === 'model'}
-            disabled={!ready || isBusy || !directory || readOnlyChild}
+            disabled={!ready || shownBusy || !directory || readOnlyChild}
             loading={!!creatingSession}
             onopen={() => void openPicker('model')}
             onclose={() => (pickerOpen = null)}
@@ -2570,7 +2630,7 @@
             value={effortOption?.currentValue}
             options={effortOption?.options ?? []}
             open={pickerOpen === 'effort'}
-            disabled={!ready || isBusy || !directory || readOnlyChild}
+            disabled={!ready || shownBusy || !directory || readOnlyChild}
             loading={!!creatingSession}
             onopen={() => void openPicker('effort')}
             onclose={() => (pickerOpen = null)}

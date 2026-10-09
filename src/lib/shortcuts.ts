@@ -178,6 +178,15 @@ export function matchesShortcut(event: KeyEventLike, shortcut: Shortcut): boolea
   );
 }
 
+/** Ctrl+[ is Escape in a terminal, so it stays there. Cmd on macOS and the shifted sibling
+ * shortcuts still work from a terminal. */
+export function terminalOwnsKey(
+  event: Pick<KeyboardEvent, 'ctrlKey' | 'metaKey' | 'shiftKey'>,
+  target: { closest?: (selector: string) => unknown } | null,
+): boolean {
+  return event.ctrlKey && !event.metaKey && !event.shiftKey && !!target?.closest?.('.xterm');
+}
+
 /** The registered shortcut that matches the event, if any. */
 export function shortcutForEvent(event: KeyEventLike): Shortcut | undefined {
   return shortcuts.find((shortcut) => matchesShortcut(event, shortcut));

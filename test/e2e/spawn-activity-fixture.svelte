@@ -91,6 +91,15 @@
 <button aria-label="Preserve result" onclick={() => settleMissing('Preserved result')}>
   Preserve result
 </button>
+{#each [3, 10] as count (count)}
+  <button
+    aria-label={`Result of ${count} lines`}
+    onclick={() =>
+      settleMissing(Array.from({ length: count }, (_, index) => `Line ${index + 1}`).join('  \n'))}
+  >
+    {count} lines
+  </button>
+{/each}
 <output aria-label="Opened thread">{opened}</output>
 <output aria-label="Open count">{openCount}</output>
 <output aria-label="Response opened">{responseOpened}</output>

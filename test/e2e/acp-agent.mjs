@@ -32,6 +32,29 @@ function send(message) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
 }
 
+const externalSessionsFile = '.acp-external-sessions.json';
+
+function externalSessions(cwd) {
+  const file = join(cwd, externalSessionsFile);
+  if (!existsSync(file)) return [];
+  return JSON.parse(readFileSync(file, 'utf8')).map((item) => Object.assign({}, item, { cwd }));
+}
+
+function adoptExternalSession(sessionId, cwd) {
+  if (sessions.has(sessionId) || typeof cwd !== 'string') return;
+  const external = externalSessions(cwd).find((item) => item.sessionId === sessionId);
+  if (!external) return;
+  sessions.set(sessionId, {
+    cwd,
+    history: [],
+    config: { model: 'test', effort: 'medium' },
+    fingerprint: sessionFingerprint({ cwd, mcpServers: [] }),
+    mcpServers: [],
+    title: external.title,
+    updated: Date.parse(external.updatedAt) || Date.now(),
+  });
+}
+
 function update(sessionId, value) {
   send({ method: 'session/update', params: { sessionId, update: value } });
 }
@@ -224,15 +247,15 @@ const availableCommands = [
   })),
 ];
 
-function requestPermission(sessionId, text, promptId, parent) {
+function requestPermission(sessionId, text, promptId, parent, toolCallId = 'review') {
   const id = ++nextPermission;
-  permissions.set(id, { sessionId, text, promptId, parent });
+  permissions.set(id, { sessionId, text, promptId, parent, toolCallId });
   send({
     id,
     method: 'session/request_permission',
     params: {
       sessionId,
-      toolCall: { toolCallId: 'review', title: 'Run test action' },
+      toolCall: { toolCallId, title: 'Run test action' },
       options: [
         { optionId: 'allow', name: 'Allow once', kind: 'allow_once' },
         { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
@@ -261,7 +284,11 @@ for await (const line of createInterface({ input: process.stdin })) {
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: true,
-          sessionCapabilities: { resume: {}, subagents: {} },
+          sessionCapabilities: {
+            resume: {},
+            subagents: {},
+            ...(agent === 'opencode' ? { list: {} } : {}),
+          },
         },
         authMethods: agent === 'codex' ? [{ id: 'chat-gpt', name: 'ChatGPT' }] : [],
         _meta:
@@ -299,7 +326,31 @@ for await (const line of createInterface({ input: process.stdin })) {
         }),
       delayFirstAttentionSession ? 3000 : 1000,
     );
+  } else if (message.method === 'session/list') {
+    const pageSize = 2;
+    const cwd = message.params.cwd;
+    const known = [...sessions.entries()]
+      .filter(([, session]) => !cwd || session.cwd === cwd)
+      .map(([sessionId, session]) => ({
+        sessionId,
+        cwd: session.cwd,
+        title: session.title ?? sessionId,
+        updatedAt: new Date(session.updated ?? Date.now()).toISOString(),
+      }));
+    const outside = cwd
+      ? externalSessions(cwd).filter((item) => !sessions.has(item.sessionId))
+      : [];
+    const all = [...known, ...outside];
+    const start = Number(message.params.cursor ?? 0);
+    send({
+      id: message.id,
+      result: {
+        sessions: all.slice(start, start + pageSize),
+        nextCursor: start + pageSize < all.length ? String(start + pageSize) : null,
+      },
+    });
   } else if (message.method === 'session/resume') {
+    adoptExternalSession(message.params.sessionId, message.params.cwd);
     const session = sessions.get(message.params.sessionId);
     if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
@@ -313,6 +364,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         },
       });
   } else if (message.method === 'session/load') {
+    adoptExternalSession(message.params.sessionId, message.params.cwd);
     const session = sessions.get(message.params.sessionId);
     if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
@@ -755,6 +807,70 @@ for await (const line of createInterface({ input: process.stdin })) {
       const stop = trackWork(sessionId, () => clearInterval(interval));
       continue;
     }
+    if (text === 'Flood turn') {
+      const { cwd } = sessions.get(sessionId);
+      const say = (value) => recordUpdate(sessionId, sessionId, value);
+      const chunk = (value) =>
+        say({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: value } });
+      const tool = (id, title) =>
+        say({
+          sessionUpdate: 'tool_call',
+          toolCallId: `${id}-${message.id}`,
+          title,
+          status: 'completed',
+        });
+      chunk('Flood waiting.');
+      let phase = 'waiting';
+      const finish = (reason) => {
+        stop();
+        clearInterval(poll);
+        chunk(` Flood ${reason}.`);
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      };
+      const started = Date.now();
+      const poll = setInterval(() => {
+        if (Date.now() - started > 120_000) return finish('timed out');
+        if (phase === 'waiting' && existsSync(join(cwd, 'flood-go.txt'))) {
+          phase = 'sent';
+          for (let index = 1; index <= 90; index += 1) {
+            chunk(`msg-${index} `);
+            tool(`flood-step-${index}`, `Flood step ${index}`);
+          }
+          for (let index = 1; index <= 40; index += 1) chunk(`long-${index} ${'x'.repeat(990)} `);
+          tool('flood-burst', 'Flood burst');
+          for (let index = 1; index <= 2600; index += 1) chunk(`f-${index} `);
+          writeFileSync(join(cwd, 'flood-sent.txt'), 'sent\n');
+        } else if (phase === 'sent' && existsSync(join(cwd, 'flood-release.txt')))
+          finish('finished');
+      }, 100);
+      const stop = trackWork(sessionId, () => clearInterval(poll));
+      continue;
+    }
+    if (text === 'Automatic policy') {
+      const toolCallId = `format-${message.id}`;
+      update(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId,
+        title: 'Format notes',
+        status: 'pending',
+      });
+      const id = ++nextPermission;
+      permissions.set(id, { sessionId, text, promptId: message.id, toolCallId });
+      send({
+        id,
+        method: 'session/request_permission',
+        params: {
+          sessionId,
+          // A medium-risk action that Sail's policy settles without asking.
+          toolCall: { toolCallId, title: 'Format notes', action: 'format' },
+          options: [
+            { optionId: 'allow', name: 'Allow once', kind: 'allow_once' },
+            { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+          ],
+        },
+      });
+      continue;
+    }
     if (text === 'Background task') {
       recordUpdate(sessionId, sessionId, {
         sessionUpdate: 'agent_message_chunk',
@@ -1110,18 +1226,24 @@ for await (const line of createInterface({ input: process.stdin })) {
       }, 4200);
       continue;
     }
+    // Each turn gets its own tool call id, as real agents do.
+    const toolCallId = `review-${message.id}`;
     update(sessionId, {
       sessionUpdate: 'tool_call',
-      toolCallId: 'review',
+      toolCallId,
       title: 'Run test action',
       status: 'pending',
     });
     if (text.startsWith('Delayed'))
-      setTimeout(() => requestPermission(sessionId, text, message.id), 1500);
-    else requestPermission(sessionId, text, message.id);
+      setTimeout(() => requestPermission(sessionId, text, message.id, undefined, toolCallId), 1500);
+    else requestPermission(sessionId, text, message.id, undefined, toolCallId);
   } else if (message.method === 'session/cancel') {
     const activePromptId = activePrompts.get(message.params.sessionId);
-    if (activePromptId !== undefined) {
+    const awaitingPermission = [...permissions.values()].some(
+      (pending) => pending.sessionId === message.params.sessionId,
+    );
+    // A turn waiting on a permission ends through that permission's cancel handling below.
+    if (activePromptId !== undefined && !awaitingPermission) {
       send({ id: activePromptId, result: { stopReason: 'cancelled' } });
       continue;
     }
@@ -1161,7 +1283,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     permissions.delete(message.id);
     update(pending.sessionId, {
       sessionUpdate: 'tool_call_update',
-      toolCallId: 'review',
+      toolCallId: pending.toolCallId,
       status: 'completed',
     });
     if (pending.parent) {

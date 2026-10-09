@@ -59,11 +59,8 @@
     openCodeOutcomes: Record<string, ThreadStatus>;
     spawnReceipts: SpawnReceipt[];
     acpActivityReady: boolean;
-    nativeActivityReady: boolean;
-    nativeUnavailableDirectories: string[];
     compact?: boolean;
     selectedThread: string | null;
-    openCodeAvailable: boolean;
     worktreeDialogRequest: { id: string; path: string; fromPalette: boolean } | null;
     worktreeCreations: WorktreeCreation[];
     worktreeDeletions: Record<string, string>;
@@ -123,10 +120,7 @@
     openCodeOutcomes,
     spawnReceipts,
     acpActivityReady,
-    nativeActivityReady,
-    nativeUnavailableDirectories,
     selectedThread,
-    openCodeAvailable,
     worktreeDialogRequest,
     worktreeCreations,
     worktreeDeletions,
@@ -175,13 +169,6 @@
   let worktreeAgentTouched = $state(false);
   let worktreeAgentOptions = $derived([
     { value: '', name: 'Later', detail: 'Choose after creation', icon: '', available: true },
-    {
-      value: 'opencode',
-      name: 'OpenCode',
-      detail: openCodeAvailable ? 'Ready' : 'Unavailable',
-      icon: 'opencode',
-      available: openCodeAvailable,
-    },
     ...agents.map((agent) => ({
       value: agent.id,
       name: agent.name,
@@ -267,8 +254,6 @@
       attention,
       openCodeOutcomes,
       acpActivityReady,
-      nativeActivityReady,
-      nativeUnavailableDirectories,
       spawnReceipts,
     );
   }
@@ -533,11 +518,9 @@
     worktreeBase = '';
     worktreeAgentTouched = false;
     const savedAgent = getSetting('sai-worktree-agent') ?? '';
-    worktreeAgent =
-      (savedAgent === 'opencode' && openCodeAvailable) ||
-      agents.some((agent) => agent.id === savedAgent && agent.available)
-        ? savedAgent
-        : '';
+    worktreeAgent = agents.some((agent) => agent.id === savedAgent && agent.available)
+      ? savedAgent
+      : '';
     worktreeError = '';
     selectedIssue = null;
     issueURL = '';
@@ -600,9 +583,7 @@
   function chooseIssue(issue: GitHubIssue) {
     selectedIssue = issue;
     worktreeName = issueBranch(issue);
-    if (!worktreeAgentTouched)
-      worktreeAgent =
-        agents.find((agent) => agent.available)?.id ?? (openCodeAvailable ? 'opencode' : '');
+    if (!worktreeAgentTouched) worktreeAgent = agents.find((agent) => agent.available)?.id ?? '';
   }
 
   function chooseWorktreeDestination() {
@@ -815,10 +796,7 @@
         ]
           .filter(Boolean)
           .join(', ')}
-        {@const selectable =
-          thread.agent === 'opencode'
-            ? openCodeAvailable
-            : agents.some((agent) => agent.id === thread.agent && agent.available)}
+        {@const selectable = agents.some((agent) => agent.id === thread.agent && agent.available)}
         <div
           class="project-agent-line"
           style:margin-left={`${row.depth * 12}px`}

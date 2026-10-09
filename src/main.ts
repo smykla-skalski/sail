@@ -1,7 +1,14 @@
 import '@smykla-skalski/sui/styles.css';
 import './style.css';
 import { mount } from 'svelte';
-import { initializeSettings } from './lib/settings';
+import {
+  getSetting,
+  initializeSettings,
+  removeSetting,
+  setSetting,
+  settingKeys,
+} from './lib/settings';
+import { migrateOpenCodeSettings } from './lib/opencode-migration';
 import { installFrontendDiagnostics, recordDiagnostic } from './lib/diagnostics';
 import { installScrollbarVisibility } from './lib/scrollbars';
 import { installThemeTransitionGuard } from './lib/theme-transitions';
@@ -71,6 +78,12 @@ async function start() {
     mount(SettingsWindow, { target: document.getElementById('root')! });
   } else {
     await initializeSettings();
+    migrateOpenCodeSettings({
+      get: getSetting,
+      set: setSetting,
+      remove: removeSetting,
+      keys: settingKeys,
+    });
     const { default: App } = await import('./App.svelte');
     mount(App, { target: document.getElementById('root')! });
   }

@@ -117,7 +117,8 @@ export function agentHeaderStatus(input: AgentHeaderInput): string {
   if (
     (input.sending && !input.hasSession) ||
     (input.historyLoading && !input.sending && !input.running) ||
-    (input.running && !input.sending && !input.activityReady)
+    // The status bar counts no working thread until the first activity poll; match it.
+    ((input.running || input.sending) && !input.activityReady)
   )
     return 'connecting';
   return input.busy ? 'working' : 'ready';
@@ -141,4 +142,23 @@ export function openCodeHeaderStatus(input: OpenCodeHeaderInput): string {
   if (input.running) return 'working';
   if (input.sending) return 'connecting';
   return input.inputReady ? 'ready' : 'offline';
+}
+
+/** Status bar attention count. A thread that reports waiting counts at once, before the Inbox
+ * refresh that lists its request arrives, so the bar and the thread header agree. */
+export function statusBarAttentionCount(
+  attentionTotal: number,
+  items: readonly Pick<AgentStatusItem, 'key' | 'status'>[],
+  listedThreads: ReadonlySet<string>,
+): number {
+  const unlisted = items.filter((item) => {
+    if (item.status !== 'waiting') return false;
+    try {
+      const [agent, directory, sessionId]: unknown[] = JSON.parse(item.key);
+      return !listedThreads.has(JSON.stringify([directory, agent, sessionId]));
+    } catch {
+      return false;
+    }
+  });
+  return attentionTotal + unlisted.length;
 }

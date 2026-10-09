@@ -207,3 +207,27 @@ await test('sequential ACP decisions retain reused provider request IDs', () => 
     ['Read second file', 'Read first file'],
   );
 });
+
+void test('automatic decisions keep their reason through save and load', () => {
+  const saved = saveActivityHistory(
+    recentActivityEvents([
+      {
+        workspace: '/repo',
+        kind: 'decision',
+        source: 'claude',
+        sourceId: 'req-1',
+        title: 'Read .env',
+        outcome: 'rejected',
+        at: 5,
+        agent: 'claude',
+        sessionId: 's',
+        automatic: true,
+        reason: `Secrets ${'x'.repeat(300)}`,
+      },
+    ]),
+  );
+  const [loaded] = loadActivityHistory(saved);
+  assert.equal(loaded.automatic, true);
+  assert.equal(loaded.reason?.length, 240);
+  assert.deepEqual(loadActivityHistory(JSON.stringify([{ ...loaded, reason: 3 }])), []);
+});

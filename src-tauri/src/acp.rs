@@ -739,7 +739,7 @@ impl PermissionState {
 fn resolve_session_permissions(
     permissions: &mut HashMap<String, PendingPermission>,
     session_id: &str,
-    mut resolve: impl FnMut(&Value) -> Result<(), String>,
+    mut resolve: impl FnMut(&Value, &PendingPermission) -> Result<(), String>,
 ) -> Result<(), String> {
     let ids = permissions
         .iter()
@@ -753,14 +753,13 @@ fn resolve_session_permissions(
         })
         .collect::<Vec<_>>();
     for key in ids {
-        let Some(request_id) = permissions
-            .get(&key)
-            .and_then(|pending| pending.message.get("id"))
-            .cloned()
-        else {
+        let Some(pending) = permissions.get(&key) else {
             continue;
         };
-        resolve(&request_id)?;
+        let Some(request_id) = pending.message.get("id") else {
+            continue;
+        };
+        resolve(request_id, pending)?;
         permissions.remove(&key);
     }
     Ok(())
@@ -1546,7 +1545,7 @@ mod interruption_report_tests {
         ]);
 
         let mut ids = Vec::new();
-        resolve_session_permissions(&mut permissions, "target", |id| {
+        resolve_session_permissions(&mut permissions, "target", |id, _| {
             ids.push(id.clone());
             Ok(())
         })
@@ -1581,8 +1580,9 @@ mod interruption_report_tests {
             ),
         ]);
 
-        let result =
-            resolve_session_permissions(&mut permissions, "target", |_| Err("write failed".into()));
+        let result = resolve_session_permissions(&mut permissions, "target", |_, _| {
+            Err("write failed".into())
+        });
 
         assert_eq!(result, Err("write failed".into()));
         assert_eq!(permissions.len(), 2);
@@ -2279,15 +2279,11 @@ fn register_session(
 }
 
 #[tauri::command]
-pub async fn acp_agents(
-    app: AppHandle,
-    include_opencode: Option<bool>,
-) -> Result<Vec<AgentAvailability>, String> {
-    let include_opencode = include_opencode.unwrap_or(false);
+pub async fn acp_agents(app: AppHandle) -> Result<Vec<AgentAvailability>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         agent_availability(
             crate::settings::string_setting(&app, OPENCODE_BINARY_SETTING),
-            |id| include_opencode || id != "opencode",
+            |_| true,
         )
     })
     .await
@@ -2785,7 +2781,8 @@ fn connect_blocking(
                                     message: json!({"method":"sail/permission_resolved","params":{
                                         "sessionId":session_id,"requestId":request_id,
                                         "sailPermissionGeneration":generation,
-                                        "sailPermissionFingerprint":event_fingerprint
+                                        "sailPermissionFingerprint":event_fingerprint,
+                                        "sailPermissionOutcome":"cancelled"
                                     }}),
                                 },
                             );
@@ -3184,6 +3181,37 @@ pub async fn acp_resume_session(
         },
     )
     .await
+}
+
+/// One page of the agent's own session history for a working directory.
+#[tauri::command]
+pub async fn acp_list_sessions(
+    app: AppHandle,
+    manager: State<'_, AgentManager>,
+    agent: String,
+    cwd: String,
+    cursor: Option<String>,
+    profile: Option<String>,
+) -> Result<Value, String> {
+    let profile = parse_profile(profile.as_deref())?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let capabilities = connect_blocking(app, &manager, agent.clone(), profile)?;
+        if capabilities
+            .pointer("/agentCapabilities/sessionCapabilities/list")
+            .is_none()
+        {
+            return Ok(json!({"sessions": []}));
+        }
+        let runtime = connection_for_profile(&manager, &agent, profile)?;
+        let mut params = json!({"cwd": cwd});
+        if let Some(cursor) = cursor {
+            params["cursor"] = json!(cursor);
+        }
+        runtime.request("session/list", params, Duration::from_secs(30))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 struct RestoreSessionParams {
@@ -3713,23 +3741,30 @@ pub fn acp_cancel(
         }
         return result;
     }
-    resolve_session_permissions(&mut permission_state.pending, &session_id, |request_id| {
-        runtime.write(&json!({
-            "jsonrpc":"2.0",
-            "id":request_id,
-            "result":{"outcome":{"outcome":"cancelled"}}
-        }))?;
-        let _ = app.emit(
-            "acp-event",
-            AgentEvent {
-                agent: agent.clone(),
-                message: json!({"method":"sail/permission_resolved","params":{
-                    "sessionId":session_id,"requestId":request_id
-                }}),
-            },
-        );
-        Ok(())
-    })
+    resolve_session_permissions(
+        &mut permission_state.pending,
+        &session_id,
+        |request_id, pending| {
+            runtime.write(&json!({
+                "jsonrpc":"2.0",
+                "id":request_id,
+                "result":{"outcome":{"outcome":"cancelled"}}
+            }))?;
+            let _ = app.emit(
+                "acp-event",
+                AgentEvent {
+                    agent: agent.clone(),
+                    message: json!({"method":"sail/permission_resolved","params":{
+                        "sessionId":session_id,"requestId":request_id,
+                        "sailPermissionGeneration":pending.generation,
+                        "sailPermissionFingerprint":pending.fingerprint,
+                        "sailPermissionOutcome":"cancelled"
+                    }}),
+                },
+            );
+            Ok(())
+        },
+    )
 }
 
 #[derive(Deserialize)]
@@ -3757,6 +3792,11 @@ pub fn acp_permission(
         request_generation,
         request_fingerprint,
     } = params;
+    let resolution = if option_id.is_some() {
+        "selected"
+    } else {
+        "cancelled"
+    };
     let outcome = option_id
         .map(|id| json!({"outcome":"selected","optionId":id}))
         .unwrap_or_else(|| json!({"outcome":"cancelled"}));
@@ -3779,7 +3819,8 @@ pub fn acp_permission(
                 "sessionId":session_id,"requestId":request_id,
                 "sailPermissionGeneration":pending.generation,
                 "sailPermissionFingerprint":pending.fingerprint,
-                "sailCapabilityProfile":runtime.profile.as_str()
+                "sailCapabilityProfile":runtime.profile.as_str(),
+                "sailPermissionOutcome":resolution
             }}),
         },
     );
