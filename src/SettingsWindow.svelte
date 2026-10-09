@@ -138,15 +138,17 @@
     memoryAgentError = '';
     try {
       const status = await invoke<MemoryStatus>('memory_status', { directory });
-      const records = query
-        ? (
-            await invoke<MemorySearchResult[]>('memory_search', {
-              directory,
-              query,
-              limit: 100,
-            })
-          ).map((result) => result.memory)
-        : await invoke<MemoryRecord[]>('memory_list', { directory, includeForgotten: false });
+      const records = status.enabled
+        ? query
+          ? (
+              await invoke<MemorySearchResult[]>('memory_search', {
+                directory,
+                query,
+                limit: 100,
+              })
+            ).map((result) => result.memory)
+          : await invoke<MemoryRecord[]>('memory_list', { directory, includeForgotten: false })
+        : [];
       if (request === memoryRequest && memoryDirectory === directory) {
         memoryStatus = status;
         memoryRecords = records;
@@ -216,7 +218,7 @@
 
   async function downloadMemoryExport() {
     const directory = snapshot?.directory;
-    if (!directory) return;
+    if (!directory || !memoryStatus?.enabled) return;
     memoryStorageError = '';
     try {
       const records = await invoke<MemoryRecord[]>('memory_list', {
@@ -988,6 +990,10 @@
           Memory is off by default. Sail only shares this project's memory between agents opened in
           Sail. System-wide also makes it available when supported agents run elsewhere.
         </p>
+        <p class="runtime-binary">
+          Mode changes apply to new or reconnected agent sessions. Reopen an existing live session
+          to add or remove its memory tools.
+        </p>
         <label for="memory-mode">Availability</label>
         <select
           id="memory-mode"
@@ -1154,7 +1160,7 @@
               <li>
                 <div class="memory-record-meta">
                   <strong>{record.kind}</strong>
-                  <time datetime={record.updatedAt}
+                  <time datetime={new Date(record.updatedAt).toISOString()}
                     >{new Date(record.updatedAt).toLocaleString()}</time
                   >
                 </div>
@@ -1180,7 +1186,7 @@
         <Button
           size="sm"
           variant="secondary"
-          disabled={!memoryStatus?.count}
+          disabled={!memoryStatus?.enabled || !memoryStatus.count}
           onclick={() => void downloadMemoryExport()}>Export all memories</Button
         >
       </section>

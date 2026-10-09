@@ -16,11 +16,11 @@ export type MemoryRecord = {
   content: string;
   kind: MemoryKind;
   tags: string[];
-  createdAt: string;
-  updatedAt: string;
+  createdAt: number;
+  updatedAt: number;
   provenance: { agent?: string; sessionId?: string };
-  rating?: { value: -1 | 0 | 1; updatedAt: string };
-  forgottenAt?: string;
+  rating?: { value: -1 | 0 | 1; updatedAt: number };
+  forgottenAt?: number;
 };
 
 export type MemorySearchResult = { memory: MemoryRecord; score: number };

@@ -28,8 +28,8 @@ void test('memory export is a versioned JSON document containing canonical recor
     content: 'Use SQLite for canonical storage.',
     kind: 'decision',
     tags: ['storage'],
-    createdAt: '2026-10-09T08:00:00.000Z',
-    updatedAt: '2026-10-09T08:00:00.000Z',
+    createdAt: 1_791_529_200_000,
+    updatedAt: 1_791_529_200_000,
     provenance: { agent: 'codex', sessionId: 'session-1' },
   };
   const exported: unknown = JSON.parse(exportMemories([record]));
