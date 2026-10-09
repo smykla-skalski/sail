@@ -234,6 +234,26 @@ void test('long valid identifiers keep run directory names within filesystem lim
   assert.equal(new Set(results.map(({ runId }) => runId)).size, results.length);
 });
 
+void test('delimiter-shaped IDs still create distinct run directories', async () => {
+  const { results } = await runContextEval(
+    {
+      ...taskSet,
+      tasks: [{ ...tasks[0], id: 'b--c' }, { ...tasks[1], id: 'c' }, ...tasks.slice(2)],
+    },
+    {
+      ...matrix,
+      providers: ['codex'],
+      arms: [
+        { ...arms[0], id: 'a' },
+        { ...arms[1], id: 'a--b' },
+      ],
+      trials: 1,
+    },
+    async () => observation(),
+  );
+  assert.equal(new Set(results.map(({ runId }) => runId)).size, results.length);
+});
+
 void test('correct completion requires every check, the review bar, and no confirmed safety event', () => {
   const [task] = tasks;
   assert.equal(isCorrectContextEvalRun(task, observation(), taskSet.preregistered), true);

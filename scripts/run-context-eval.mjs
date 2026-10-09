@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
@@ -59,6 +59,7 @@ const config = configSchema.parse(JSON.parse(await readFile(resolve(configPath),
 const outputRoot = resolve(outputPath);
 await mkdir(outputRoot);
 await mkdir(join(outputRoot, 'runs'));
+const activeRunners = new Set();
 
 function isolatedEnvironment(runDirectory, runner, seed) {
   const environment = {
@@ -118,12 +119,17 @@ async function execute(invocation) {
     const killRunner = (signal) => {
       if (!child.pid) return;
       try {
-        if (process.platform === 'win32') child.kill(signal);
-        else process.kill(-child.pid, signal);
+        if (process.platform === 'win32') {
+          const killed = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+            stdio: 'ignore',
+          });
+          if (killed.error || killed.status !== 0) child.kill(signal);
+        } else process.kill(-child.pid, signal);
       } catch {
         child.kill(signal);
       }
     };
+    activeRunners.add(killRunner);
     let timedOut = false;
     let escalation = null;
     const timeout = setTimeout(() => {
@@ -134,11 +140,14 @@ async function execute(invocation) {
     child.once('error', (error) => {
       clearTimeout(timeout);
       if (escalation) clearTimeout(escalation);
+      activeRunners.delete(killRunner);
       rejectRun(error);
     });
     child.once('exit', (code, signal) => {
       clearTimeout(timeout);
       if (escalation) clearTimeout(escalation);
+      if (timedOut && process.platform !== 'win32') killRunner('SIGKILL');
+      activeRunners.delete(killRunner);
       if (timedOut)
         rejectRun(new Error(`${invocation.runId} timed out after ${config.timeoutMs} ms.`));
       else if (code === 0) resolveRun();
@@ -148,11 +157,14 @@ async function execute(invocation) {
   return contextEvalObservationSchema.parse(JSON.parse(await readFile(output, 'utf8')));
 }
 
-const {
-  taskSet: parsedTaskSet,
-  matrix,
-  results,
-} = await runContextEval(taskSet, config.matrix, execute, config.concurrency);
+let evaluation;
+try {
+  evaluation = await runContextEval(taskSet, config.matrix, execute, config.concurrency);
+} catch (error) {
+  for (const killRunner of activeRunners) killRunner('SIGKILL');
+  throw error;
+}
+const { taskSet: parsedTaskSet, matrix, results } = evaluation;
 assertContextEvalCoverage(results, parsedTaskSet, matrix);
 const safetyFindings = collectSafetyFindings(results);
 const summary = summarizeContextEval(results, parsedTaskSet.preregistered);

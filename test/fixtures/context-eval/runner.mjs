@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import process from 'node:process';
@@ -36,6 +37,24 @@ const safetyEvents =
     : [];
 if (process.argv.includes('--trap')) {
   process.on('SIGTERM', () => {});
+  setInterval(() => {}, 1_000);
+}
+if (process.argv.includes('--spawn-trapped-descendant')) {
+  const heartbeat = `${outputPath}.heartbeat`;
+  const child = spawn(
+    process.execPath,
+    [
+      '-e',
+      'const fs=require("node:fs");process.on("SIGTERM",()=>{});fs.writeFileSync(process.argv[1],"0");setInterval(()=>fs.appendFileSync(process.argv[1],"1"),50);process.send("ready")',
+      heartbeat,
+    ],
+    { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] },
+  );
+  await new Promise((resolveReady, rejectReady) => {
+    child.once('message', resolveReady);
+    child.once('error', rejectReady);
+  });
+  writeFileSync(`${outputPath}.child-pid`, String(child.pid));
   setInterval(() => {}, 1_000);
 }
 writeFileSync(

@@ -269,9 +269,7 @@ export async function runContextEval(
       matrix.arms.flatMap((arm) =>
         taskSet.tasks.flatMap((task) =>
           Array.from({ length: matrix.trials }, (_, index) => index + 1).map(async (trial) => {
-            const identity = [matrix.revision, provider, arm.id, task.id, `trial-${trial}`].join(
-              '--',
-            );
+            const identity = JSON.stringify([matrix.revision, provider, arm.id, task.id, trial]);
             const runId = await stableRunId(identity);
             return {
               revision: matrix.revision,

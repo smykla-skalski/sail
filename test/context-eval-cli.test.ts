@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
@@ -199,3 +199,77 @@ void test('CLI bounds a trapped runner timeout', async () => {
     await rm(temporary, { recursive: true, force: true });
   }
 });
+
+void test(
+  'timed-out runners leave no active descendants',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
+    const childPids: number[] = [];
+    try {
+      const configPath = join(temporary, 'config.json');
+      const outputPath = join(temporary, 'output');
+      const runner = join(root, 'test/fixtures/context-eval/runner.mjs');
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          ...JSON.parse(contextEvalConfig(runner, false)),
+          runners: [
+            {
+              provider: 'codex',
+              command: process.execPath,
+              args: [
+                runner,
+                '--spawn-trapped-descendant',
+                '--input',
+                '{input}',
+                '--output',
+                '{output}',
+              ],
+            },
+          ],
+          concurrency: 32,
+          timeoutMs: 1_000,
+        }),
+      );
+
+      await assert.rejects(
+        () =>
+          execute(
+            process.execPath,
+            [
+              join(root, 'scripts/run-context-eval.mjs'),
+              '--tasks',
+              join(root, 'test/fixtures/context-eval/tasks-v1.json'),
+              '--config',
+              configPath,
+              '--output',
+              outputPath,
+            ],
+            { cwd: root, timeout: 15_000 },
+          ),
+        /timed out after 1000 ms/,
+      );
+      const runDirectories = await readdir(join(outputPath, 'runs'));
+      const childFiles = await Promise.all(
+        runDirectories.map(async (directory) =>
+          readFile(join(outputPath, 'runs', directory, 'observation.json.child-pid'), 'utf8'),
+        ),
+      );
+      childPids.push(...childFiles.map(Number));
+      const heartbeat = join(outputPath, 'runs', runDirectories[0], 'observation.json.heartbeat');
+      const before = await readFile(heartbeat, 'utf8');
+      await new Promise((settled) => setTimeout(settled, 200));
+      assert.equal(await readFile(heartbeat, 'utf8'), before);
+    } finally {
+      for (const pid of childPids) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+        }
+      }
+      await rm(temporary, { recursive: true, force: true });
+    }
+  },
+);
