@@ -6,14 +6,24 @@ import ServiceManagement
 struct ProbeApp {
     static func main() {
         guard CommandLine.arguments.count >= 3 else {
-            fputs("usage: ProbeApp <register|unregister|status|request> <plist-or-socket> [json]\n", stderr)
+            fputs("usage: ProbeApp <register|unregister|status|request|serve> <plist-or-socket> [json]\n", stderr)
             exit(64)
         }
         let operation = CommandLine.arguments[1]
         let target = CommandLine.arguments[2]
         if operation == "crash" { _ = kill(getpid(), SIGKILL); exit(1) }
         do {
-            if operation == "request" {
+            if operation == "serve" {
+                while let line = readLine() {
+                    if let input = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: String],
+                       input["op"] == "crash-window" {
+                        _ = kill(getpid(), SIGKILL)
+                    }
+                    do { print(try request(socketPath: target, payload: line)) }
+                    catch { print("{\"error\":\"request failed\"}") }
+                    fflush(stdout)
+                }
+            } else if operation == "request" {
                 guard CommandLine.arguments.count == 4 else { throw ProbeError.input }
                 print(try request(socketPath: target, payload: CommandLine.arguments[3]))
             } else {

@@ -3,7 +3,7 @@
 // Private macOS research fixture. Never use its socket protocol for real providers.
 import { createHash, randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -33,11 +33,12 @@ const helper = join(bundle, 'Contents/Library/Helpers/ContextProbeAgent');
 const provider = join(bundle, 'Contents/Library/Helpers/ContextProbeProvider');
 const socketPath = 'agent.sock';
 const stateRoot = join(runRoot, 'state');
-const profile = join(runRoot, 'provider.sb');
+const profileA = join(runRoot, 'provider-a.sb');
+const profileB = join(runRoot, 'provider-b.sb');
 const findings = [];
 const started = Date.now();
 const deadline = started + 90 * 60_000;
-let registered = false;
+let registrationAttempted = false;
 let cleanup = 'not-started';
 let preserve = false;
 let inCleanup = false;
@@ -100,6 +101,95 @@ function request(op, scope = '', extra = {}) {
   return JSON.parse(result.stdout.trim());
 }
 
+function startAppInstance() {
+  const child = spawn(executable, ['serve', socketPath], {
+    cwd: runRoot,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const pending = [];
+  let buffer = '';
+  let stderr = '';
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk.toString();
+  });
+  child.on('error', (error) => {
+    stderr += String(error);
+    preserve = true;
+  });
+  child.stdin.on('error', (error) => {
+    stderr += String(error);
+    preserve = true;
+  });
+  child.stdout.on('data', (chunk) => {
+    buffer += chunk.toString();
+    let separator = buffer.indexOf('\n');
+    while (separator >= 0) {
+      const line = buffer.slice(0, separator);
+      buffer = buffer.slice(separator + 1);
+      const next = pending.shift();
+      if (next) {
+        clearTimeout(next.timer);
+        try {
+          next.resolve(JSON.parse(line));
+        } catch (error) {
+          next.reject(error);
+        }
+      }
+      separator = buffer.indexOf('\n');
+    }
+  });
+  child.on('exit', () => {
+    for (const entry of pending.splice(0)) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error(`app instance exited: ${stderr}`));
+    }
+  });
+  const exited = () => child.exitCode !== null || child.signalCode !== null;
+  const waitExit = () =>
+    new Promise((finish) => {
+      if (exited()) {
+        finish({ code: child.exitCode, signal: child.signalCode });
+        return;
+      }
+      const timer = setTimeout(() => finish(null), 5_000);
+      child.once('exit', (code, signal) => {
+        clearTimeout(timer);
+        finish({ code, signal });
+      });
+    });
+  return {
+    pid: child.pid,
+    send(payload) {
+      if (exited()) return Promise.reject(new Error(`app instance already exited: ${stderr}`));
+      return new Promise((finish, reject) => {
+        const entry = { resolve: finish, reject, timer: null };
+        entry.timer = setTimeout(() => {
+          const index = pending.indexOf(entry);
+          if (index >= 0) pending.splice(index, 1);
+          reject(new Error('app instance request timed out'));
+        }, 5_000);
+        pending.push(entry);
+        child.stdin.write(`${JSON.stringify(payload)}\n`);
+      });
+    },
+    async crash() {
+      const exit = waitExit();
+      child.stdin.write('{"op":"crash-window"}\n');
+      return exit;
+    },
+    async close() {
+      if (exited()) return { code: child.exitCode, signal: child.signalCode };
+      child.stdin.end();
+      const result = await waitExit();
+      if (!result) {
+        child.kill('SIGTERM');
+        preserve = true;
+      }
+      return result;
+    },
+  };
+}
+
 async function waitFor(check, timeoutMs = 10_000, until = Date.now() + timeoutMs) {
   if (Date.now() >= until) return null;
   try {
@@ -112,6 +202,15 @@ async function waitFor(check, timeoutMs = 10_000, until = Date.now() + timeoutMs
   return waitFor(check, timeoutMs, until);
 }
 
+function isNewServiceResponse(value, previousService) {
+  return (
+    value?.ok === true &&
+    typeof value.service === 'string' &&
+    value.service.length > 0 &&
+    value.service !== previousService
+  );
+}
+
 async function liveProvider(value) {
   if (!value?.provider || !value.heartbeat || !existsSync(value.heartbeat)) return null;
   const before = readFileSync(value.heartbeat, 'utf8');
@@ -122,7 +221,7 @@ async function liveProvider(value) {
   return value;
 }
 
-function build() {
+function build(project) {
   for (const path of [
     dirname(executable),
     dirname(helper),
@@ -153,9 +252,21 @@ function build() {
     join(bundle, 'Contents/Info.plist'),
     `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${bundleId}</string><key>CFBundleName</key><string>Sail Context Probe ${runId}</string><key>CFBundleExecutable</key><string>SailContextProbe</string><key>CFBundlePackageType</key><string>APPL</string><key>LSBackgroundOnly</key><false/></dict></plist>`,
   );
+  const argumentsXml = [
+    helper,
+    socketPath,
+    provider,
+    stateRoot,
+    project.exact,
+    profileA,
+    project.other,
+    profileB,
+  ]
+    .map((value) => `<string>${xml(value)}</string>`)
+    .join('');
   writeFileSync(
     join(bundle, `Contents/Library/LaunchAgents/${plistName}`),
-    `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array><string>${xml(helper)}</string><string>${xml(socketPath)}</string><string>${xml(provider)}</string><string>${xml(profile)}</string><string>${xml(stateRoot)}</string></array><key>WorkingDirectory</key><string>${xml(runRoot)}</string><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/><key>StandardOutPath</key><string>${xml(join(runRoot, 'agent.stdout'))}</string><key>StandardErrorPath</key><string>${xml(join(runRoot, 'agent.stderr'))}</string></dict></plist>`,
+    `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${argumentsXml}</array><key>WorkingDirectory</key><string>${xml(runRoot)}</string><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/><key>StandardOutPath</key><string>${xml(join(runRoot, 'agent.stdout'))}</string><key>StandardErrorPath</key><string>${xml(join(runRoot, 'agent.stderr'))}</string></dict></plist>`,
   );
   requirePass(
     'plist-valid',
@@ -220,40 +331,51 @@ function projectMatrix() {
   return { repo, sibling, exact, other: key(sibling) };
 }
 
-function seatbeltProfile(project) {
-  const privateDir = stateRoot;
-  writeFileSync(
-    profile,
-    `(version 1)\n(deny default)\n(allow file-read-data (literal "/"))\n(allow file-read* (subpath "/System") (subpath "/usr/lib") (subpath "/Library/Apple") (literal "${provider}") (subpath "${project.repo}") (subpath "${privateDir}"))\n(allow file-write* (subpath "${privateDir}"))\n(allow process-exec (literal "${provider}"))\n(allow sysctl-read (sysctl-name "kern.bootargs") (sysctl-name "security.mac.lockdown_mode_state"))\n`,
-  );
+function seatbeltProfiles(project) {
+  for (const [path, allowedProject, scope] of [
+    [profileA, project.repo, project.exact],
+    [profileB, project.sibling, project.other],
+  ]) {
+    const privateDir = join(stateRoot, scope);
+    mkdirSync(privateDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      path,
+      `(version 1)\n(deny default)\n(allow file-read-data (literal "/"))\n(allow file-read* (subpath "/System") (subpath "/usr/lib") (subpath "/Library/Apple") (literal "${provider}") (subpath "${allowedProject}") (subpath "${privateDir}"))\n(allow file-write* (subpath "${privateDir}"))\n(allow process-exec (literal "${provider}"))\n(allow sysctl-read (sysctl-name "kern.bootargs") (sysctl-name "security.mac.lockdown_mode_state"))\n`,
+    );
+  }
 }
 
 async function sandboxTrials(project) {
   const outside = join(runRoot, 'outside.txt');
   const siblingFile = join(project.sibling, 'context.txt');
   const allowedFile = join(project.repo, 'context.txt');
-  const privateFile = join(stateRoot, 'private-control.txt');
+  const privateFile = join(stateRoot, project.exact, 'private-control.txt');
+  const siblingPrivateFile = join(stateRoot, project.other, 'private-control.txt');
+  writeFileSync(siblingPrivateFile, 'sibling private state');
   writeFileSync(outside, 'outside');
   const server = createServer((stream) => stream.end());
   await new Promise((done, reject) => server.once('error', reject).listen(0, '127.0.0.1', done));
   const port = String(server.address().port);
   const cases = [
-    ['project-read', 'read', allowedFile, true],
-    ['private-write', 'write', privateFile, true],
-    ['sibling-read', 'read', siblingFile, false],
-    ['outside-write', 'write', outside, false],
-    ['outbound-tcp', 'connect', port, false],
-    ['fork', 'fork', '-', false],
-    ['posix-spawn', 'spawn', '-', false],
-    ['exec', 'exec', '-', false],
+    ['project-read', 'read', allowedFile, true, profileA],
+    ['private-write', 'write', privateFile, true, profileA],
+    ['sibling-read', 'read', siblingFile, false, profileA],
+    ['sibling-own-read', 'read', siblingFile, true, profileB],
+    ['sibling-cross-read', 'read', allowedFile, false, profileB],
+    ['sibling-private-read', 'read', siblingPrivateFile, false, profileA],
+    ['outside-write', 'write', outside, false, profileA],
+    ['outbound-tcp', 'connect', port, false, profileA],
+    ['fork', 'fork', '-', false, profileA],
+    ['posix-spawn', 'spawn', '-', false, profileA],
+    ['exec', 'exec', '-', false, profileA],
   ];
   try {
-    const trial = async ([id, operation, target, allowed]) => {
+    const trial = async ([id, operation, target, allowed, selectedProfile]) => {
       const control = run(provider, ['probe', operation, target], { timeout: 5_000 });
       finding(`${id}-control`, control.status === 0, 'unconfined positive control', control);
       const confined = run(
         '/usr/bin/sandbox-exec',
-        ['-f', profile, provider, 'probe', operation, target],
+        ['-f', selectedProfile, provider, 'probe', operation, target],
         { timeout: 5_000 },
       );
       await new Promise((done) => setTimeout(done, 300));
@@ -307,6 +429,7 @@ async function sandboxTrials(project) {
 }
 
 async function serviceTrials(project) {
+  registrationAttempted = true;
   const registration = run(executable, ['register', plistName]);
   const registeredStatus =
     registration.status === 0 ? JSON.parse(registration.stdout.trim()).status : null;
@@ -317,7 +440,6 @@ async function serviceTrials(project) {
     registration,
   );
   if (registration.status !== 0) throw new Error('ordinary approval or registration unavailable');
-  registered = true;
   const status = run(executable, ['status', plistName]);
   finding(
     'discovery',
@@ -327,105 +449,126 @@ async function serviceTrials(project) {
   );
   if (registeredStatus !== 'enabled')
     throw new Error(`ordinary approval required: ${registeredStatus}`);
-  const first = await waitFor(() => liveProvider(request('ensure', project.exact)), 15_000);
-  if (!first?.provider) throw new Error('provider did not launch');
-  const second = request('ensure', project.exact);
-  finding(
-    'two-window-reuse',
-    first.service === second.service && first.provider === second.provider,
-    'two independent signed app invocations see one service and provider',
-    { first, second },
-  );
-  const crashedWindow = run(executable, ['crash', '-']);
-  const afterWindowCrash = request('ensure', project.exact);
-  finding(
-    'window-crash',
-    crashedWindow.signal === 'SIGKILL' &&
-      afterWindowCrash.service === first.service &&
-      afterWindowCrash.provider === first.provider,
-    'one private app instance self-SIGKILL leaves service and surviving app provider unchanged',
-    { crashedWindow, afterWindowCrash },
-  );
-  const other = await waitFor(() => liveProvider(request('ensure', project.other)), 8_000);
-  finding(
-    'project-isolation',
-    Boolean(other?.provider && other.provider !== first.provider),
-    'different project uses a live fixture provider',
-    { first, other },
-  );
-  if (!other) throw new Error('other project provider did not run');
+  const windowA = startAppInstance();
+  const windowB = startAppInstance();
+  try {
+    const first = await waitFor(
+      async () => liveProvider(await windowA.send({ op: 'ensure', scope: project.exact })),
+      15_000,
+    );
+    if (!first?.provider) throw new Error('provider did not launch');
+    const second = await windowB.send({ op: 'ensure', scope: project.exact });
+    finding(
+      'two-window-reuse',
+      first.service === second.service && first.provider === second.provider,
+      'two concurrent signed app instances see one service and provider',
+      { first, second, firstAppPid: windowA.pid, secondAppPid: windowB.pid },
+    );
+    const crashedWindow = await windowA.crash();
+    const afterWindowCrash = await windowB.send({ op: 'ensure', scope: project.exact });
+    finding(
+      'window-crash',
+      crashedWindow?.signal === 'SIGKILL' &&
+        afterWindowCrash.service === first.service &&
+        afterWindowCrash.provider === first.provider &&
+        windowA.pid !== windowB.pid,
+      'one long-lived app instance self-SIGKILL leaves a second living app on the same provider',
+      { crashedWindow, afterWindowCrash, survivingAppPid: windowB.pid },
+    );
+    const other = await waitFor(() => liveProvider(request('ensure', project.other)), 8_000);
+    finding(
+      'project-isolation',
+      Boolean(other?.provider && other.provider !== first.provider),
+      'different project uses a live fixture provider',
+      { first, other },
+    );
+    if (!other) throw new Error('other project provider did not run');
 
-  request('kill-provider', project.exact);
-  const restarted = await waitFor(async () => {
-    const value = request('ensure', project.exact);
-    return value.provider !== first.provider ? liveProvider(value) : null;
-  }, 8_000);
-  finding(
-    'provider-restart',
-    Boolean(restarted),
-    'fixture provider self-SIGKILL is reaped and restarted with new generation',
-    { before: first, after: restarted },
-  );
-
-  const cancelled = request('cancel', project.other);
-  const stale = request('check-generation', project.other, { generation: other.provider });
-  const replacement = await waitFor(async () => {
-    const value = request('ensure', project.other);
-    return value.provider !== other.provider ? liveProvider(value) : null;
-  }, 8_000);
-  const fresh = replacement
-    ? request('check-generation', project.other, { generation: replacement.provider })
-    : null;
-  finding(
-    'cancellation',
-    Boolean(
-      cancelled.cancelled === other.provider &&
-      cancelled.reaped &&
-      stale.current === false &&
-      fresh?.current &&
-      replacement,
-    ),
-    'fixture-only cancellation reaps child, rejects stale queued generation, and permits a live replacement',
-    { cancelled, stale, replacement, fresh },
-  );
-
-  const beforeKill = request('ping');
-  const active = restarted ?? first;
-  request('kill-service');
-  const afterKill = await waitFor(() => {
-    const value = request('ping');
-    return value.service !== beforeKill.service ? value : null;
-  }, 15_000);
-  const firstHeartbeat = existsSync(active.heartbeat)
-    ? readFileSync(active.heartbeat, 'utf8')
-    : null;
-  await new Promise((done) => setTimeout(done, 1000));
-  const secondHeartbeat = existsSync(active.heartbeat)
-    ? readFileSync(active.heartbeat, 'utf8')
-    : null;
-  const oldProcess = run('ps', ['-p', String(active.providerPid), '-o', 'command=']);
-  const oldProcessAbsent = !oldProcess.stdout.includes(provider);
-  const stopped = Boolean(
-    afterKill && firstHeartbeat && firstHeartbeat === secondHeartbeat && oldProcessAbsent,
-  );
-  finding(
-    'service-restart-cleanup',
-    stopped,
-    'launchd restarts service and previously live provider heartbeat and owned executable disappear before new admission',
-    { beforeKill, afterKill, firstHeartbeat, secondHeartbeat, oldProcess, oldProcessAbsent },
-  );
-  if (!stopped) preserve = true;
-  if (afterKill) {
-    const resumed = await waitFor(async () => {
+    request('kill-provider', project.exact);
+    const restarted = await waitFor(async () => {
       const value = request('ensure', project.exact);
-      return value.provider !== active.provider ? liveProvider(value) : null;
+      return value.provider !== first.provider ? liveProvider(value) : null;
     }, 8_000);
     finding(
-      'survivor-resumes',
-      Boolean(resumed),
-      'surviving app invocation resumes with a live new provider',
-      { resumed },
+      'provider-restart',
+      Boolean(restarted),
+      'fixture provider self-SIGKILL is reaped and restarted with new generation',
+      { before: first, after: restarted },
     );
+
+    const queued = request('queue-work', project.other);
+    const cancelled = request('cancel', project.other);
+    const stale = request('run-queued', project.other, { id: queued.id });
+    const replacement = await waitFor(async () => {
+      const value = request('ensure', project.other);
+      return value.provider !== other.provider ? liveProvider(value) : null;
+    }, 8_000);
+    const freshQueued = replacement ? request('queue-work', project.other) : null;
+    const fresh = freshQueued ? request('run-queued', project.other, { id: freshQueued.id }) : null;
+    finding(
+      'cancellation',
+      Boolean(
+        cancelled.cancelled === other.provider &&
+        cancelled.reaped &&
+        stale.result === 'stale' &&
+        !existsSync(queued.effectFile) &&
+        fresh?.result === 'executed' &&
+        existsSync(freshQueued.effectFile) &&
+        readFileSync(freshQueued.effectFile, 'utf8') === replacement.provider &&
+        replacement,
+      ),
+      'fixture-only cancellation reaps child and rejects a real queued effect from its stale generation',
+      { queued, cancelled, stale, replacement, freshQueued, fresh },
+    );
+
+    const beforeKill = await windowB.send({ op: 'ping' });
+    const active = restarted ?? first;
+    await windowB.send({ op: 'kill-service' });
+    const invalidResponse = { error: 'request failed' };
+    finding(
+      'service-restart-negative-control',
+      !isNewServiceResponse(invalidResponse, beforeKill.service),
+      'a failed socket response cannot count as a launchd service restart',
+      { invalidResponse, beforeKill },
+    );
+    const afterKill = await waitFor(async () => {
+      const value = await windowB.send({ op: 'ping' });
+      return isNewServiceResponse(value, beforeKill.service) ? value : null;
+    }, 15_000);
+    const firstHeartbeat = existsSync(active.heartbeat)
+      ? readFileSync(active.heartbeat, 'utf8')
+      : null;
+    await new Promise((done) => setTimeout(done, 1000));
+    const secondHeartbeat = existsSync(active.heartbeat)
+      ? readFileSync(active.heartbeat, 'utf8')
+      : null;
+    const oldProcess = run('ps', ['-p', String(active.providerPid), '-o', 'command=']);
+    const oldProcessAbsent = !oldProcess.stdout.includes(provider);
+    const stopped = Boolean(
+      afterKill && firstHeartbeat && firstHeartbeat === secondHeartbeat && oldProcessAbsent,
+    );
+    finding(
+      'service-restart-cleanup',
+      stopped,
+      'launchd restarts service and previously live provider heartbeat and owned executable disappear before new admission',
+      { beforeKill, afterKill, firstHeartbeat, secondHeartbeat, oldProcess, oldProcessAbsent },
+    );
+    if (!stopped) preserve = true;
+    if (afterKill) {
+      const resumed = await waitFor(async () => {
+        const value = await windowB.send({ op: 'ensure', scope: project.exact });
+        return value.provider !== active.provider ? liveProvider(value) : null;
+      }, 8_000);
+      finding(
+        'survivor-resumes',
+        Boolean(resumed),
+        'surviving app invocation resumes with a live new provider',
+        { resumed },
+      );
+    }
+  } finally {
+    await windowA.close();
+    await windowB.close();
   }
 }
 
@@ -440,25 +583,44 @@ async function main() {
   let failure = null;
   try {
     if (process.platform !== 'darwin') throw new Error('macOS only');
-    build();
     const project = projectMatrix();
-    seatbeltProfile(project);
+    seatbeltProfiles(project);
+    build(project);
     await sandboxTrials(project);
     await serviceTrials(project);
   } catch (error) {
     failure = String(error);
   } finally {
     inCleanup = true;
-    if (registered) {
-      const result = run(executable, ['unregister', plistName]);
-      cleanup = result.status === 0 ? 'unregistered' : 'unregister-failed';
+    if (registrationAttempted) {
+      const state = run(executable, ['status', plistName]);
+      let stateName = null;
+      try {
+        if (state.status === 0) stateName = JSON.parse(state.stdout.trim()).status;
+      } catch {
+        stateName = null;
+      }
+      finding(
+        'registration-state',
+        stateName === 'enabled' || stateName === 'requiresApproval',
+        'registration state is known before cleanup',
+        { state, stateName },
+      );
+      const result =
+        stateName === 'notRegistered' ? null : run(executable, ['unregister', plistName]);
+      cleanup =
+        result?.status === 0
+          ? 'unregistered'
+          : stateName === 'notRegistered'
+            ? 'not-registered'
+            : 'unregister-failed';
       finding(
         'unregister',
-        result.status === 0,
+        result?.status === 0,
         'SMAppService.unregister() removes only this private service',
-        result,
+        { before: stateName, result },
       );
-      if (result.status !== 0) preserve = true;
+      if (result?.status !== 0 && stateName !== 'notRegistered') preserve = true;
       const heartbeatBefore = [...activeHeartbeats]
         .filter(existsSync)
         .map((path) => [path, readFileSync(path, 'utf8')]);
@@ -482,7 +644,7 @@ async function main() {
       );
       if (!stable || !unloaded || remaining.length) preserve = true;
     } else {
-      cleanup = 'not-registered';
+      cleanup = 'not-attempted';
     }
     const mandatory = [
       'build-app',
@@ -493,6 +655,7 @@ async function main() {
       'signature-valid',
       'scope-matrix',
       'registration',
+      'registration-state',
       'discovery',
       'two-window-reuse',
       'window-crash',
@@ -506,6 +669,8 @@ async function main() {
       'project-read',
       'private-write',
       'sibling-read',
+      'sibling-own-read',
+      'sibling-cross-read',
       'outside-write',
       'outbound-tcp',
       'fork',
