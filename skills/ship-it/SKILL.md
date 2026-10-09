@@ -8,7 +8,7 @@ allowed-tools: Agent Bash Edit Glob Grep Read Skill ToolSearch Write
 user-invocable: true
 metadata:
   short-description: Ship a change, issue, or Jira ticket to merge
-  upstream: smykla-skalski/sai plugins/ship-it 1.4.34 with Sail mode
+  upstream: smykla-skalski/sai plugins/ship-it 1.4.35 with Sail mode
 ---
 
 # Ship It

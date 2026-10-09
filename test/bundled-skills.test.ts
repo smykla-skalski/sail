@@ -114,7 +114,7 @@ void test('Vite loads bundled-skills.ts with each skill on its own core', async 
 void test('the bundled ship-it records which upstream release it matches', () => {
   assert.match(
     shipItCore,
-    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.34 with Sail mode/,
+    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.35 with Sail mode/,
   );
 });
 
