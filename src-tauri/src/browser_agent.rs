@@ -941,6 +941,7 @@ fn memory_action(
             input.provenance = Some(crate::memory::MemoryProvenance {
                 agent: agent.map(str::to_string),
                 session_id: Some(session.to_string()),
+                source: None,
             });
             serde_json::to_value(crate::memory::remember(app, &directory, input)?)
         }

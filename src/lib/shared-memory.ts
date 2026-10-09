@@ -18,12 +18,19 @@ export type MemoryRecord = {
   tags: string[];
   createdAt: number;
   updatedAt: number;
-  provenance: { agent?: string; sessionId?: string };
+  provenance: { agent?: string; sessionId?: string; source?: string };
   rating?: { value: -1 | 0 | 1; updatedAt: number };
   forgottenAt?: number;
 };
 
 export type MemorySearchResult = { memory: MemoryRecord; score: number };
+
+export type MemoryImportCandidate = {
+  id: string;
+  agent: 'claude';
+  source: string;
+  content: string;
+};
 
 export type MemoryStatus = {
   mode: MemoryMode;

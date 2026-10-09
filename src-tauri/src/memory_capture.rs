@@ -127,6 +127,7 @@ pub fn store_completed(app: &tauri::AppHandle, candidates: Vec<MemoryCaptureCand
                 provenance: Some(crate::memory::MemoryProvenance {
                     agent: Some(candidate.agent.clone()),
                     session_id: Some(candidate.session_id.clone()),
+                    source: None,
                 }),
             };
             if let Err(error) = crate::memory::remember(&app, &candidate.directory, input) {

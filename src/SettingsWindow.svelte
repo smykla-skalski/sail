@@ -50,6 +50,7 @@
     parseMemoryTags,
     type MemoryAgentInstallPreview,
     type MemoryAgentStatus,
+    type MemoryImportCandidate,
     type MemoryKind,
     type MemoryMode,
     type MemoryProviderKind,
@@ -111,6 +112,11 @@
   let memoryStatus = $state<MemoryStatus | null>(null);
   let memoryRecords = $state<MemoryRecord[]>([]);
   let memoryAgents = $state<MemoryAgentStatus[]>([]);
+  let memoryImportCandidates = $state<MemoryImportCandidate[]>([]);
+  let memoryImportSelection = $state<string[]>([]);
+  let memoryImportLoading = $state(false);
+  let memoryImportError = $state('');
+  let memoryImportMessage = $state('');
   let memoryQuery = $state('');
   let memoryContent = $state('');
   let memoryKind = $state<MemoryKind>('other');
@@ -143,6 +149,10 @@
     if (memoryDirectory !== directory) {
       memoryStatus = null;
       memoryRecords = [];
+      memoryImportCandidates = [];
+      memoryImportSelection = [];
+      memoryImportError = '';
+      memoryImportMessage = '';
       memoryQuery = '';
       pendingForget = '';
       agentPreview = null;
@@ -182,6 +192,23 @@
         memoryStorageError = `Storage: ${String(cause)}`;
     } finally {
       if (request === memoryRequest && memoryDirectory === directory) memoryLoading = false;
+    }
+    if (memoryStatus?.enabled && request === memoryRequest) {
+      try {
+        const candidates = await invoke<MemoryImportCandidate[]>('preview_memory_import', {
+          directory,
+        });
+        if (request === memoryRequest && memoryDirectory === directory) {
+          memoryImportCandidates = candidates;
+          memoryImportSelection = memoryImportSelection.filter((id) =>
+            candidates.some((candidate) => candidate.id === id),
+          );
+          memoryImportError = '';
+        }
+      } catch (cause) {
+        if (request === memoryRequest && memoryDirectory === directory)
+          memoryImportError = `Import: ${String(cause)}`;
+      }
     }
     try {
       const agents = await invoke<MemoryAgentStatus[]>('memory_agent_status');
@@ -359,6 +386,28 @@
       URL.revokeObjectURL(url);
     } catch (cause) {
       memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function importAgentMemories() {
+    const directory = snapshot?.directory;
+    if (!directory || !memoryImportSelection.length || memoryImportLoading) return;
+    memoryImportLoading = true;
+    memoryImportError = '';
+    memoryImportMessage = '';
+    try {
+      const imported = await invoke<MemoryRecord[]>('import_agent_memories', {
+        directory,
+        ids: memoryImportSelection,
+      });
+      if (snapshot?.directory !== directory) return;
+      memoryImportSelection = [];
+      memoryImportMessage = `Imported ${imported.length} ${imported.length === 1 ? 'memory' : 'memories'} from Claude Code.`;
+      await refreshMemory(directory);
+    } catch (cause) {
+      if (snapshot?.directory === directory) memoryImportError = `Import: ${String(cause)}`;
+    } finally {
+      memoryImportLoading = false;
     }
   }
 
@@ -1369,6 +1418,60 @@
           {/if}
         </section>
       {/if}
+
+      <section class="settings-card">
+        <h2>Import agent memories</h2>
+        <p>
+          Sail finds Claude Code's local auto-memory for this Git project. Codex and OpenCode
+          currently provide instruction files, not a separate auto-memory source. Sail never imports
+          instructions or transcripts.
+        </p>
+        {#if memoryImportError}<p class="runtime-diagnostic" role="alert">
+            {memoryImportError}
+          </p>{/if}
+        {#if memoryImportMessage}<p class="runtime-binary" role="status">
+            {memoryImportMessage}
+          </p>{/if}
+        {#if !memoryStatus?.enabled}
+          <p class="memory-empty" role="status">Enable shared memory to import agent memories.</p>
+        {:else if memoryLoading}
+          <p class="memory-empty" role="status">Checking local agent memories…</p>
+        {:else if !memoryImportCandidates.length}
+          <p class="memory-empty" role="status">
+            No new Claude Code memories found for this project.
+          </p>
+        {:else}
+          <p>Review each memory before importing. Existing content is skipped.</p>
+          <ul class="memory-record-list">
+            {#each memoryImportCandidates as candidate (candidate.id)}
+              <li>
+                <label class="memory-import-choice">
+                  <input
+                    type="checkbox"
+                    checked={memoryImportSelection.includes(candidate.id)}
+                    onchange={(event) => {
+                      memoryImportSelection = event.currentTarget.checked
+                        ? [...memoryImportSelection, candidate.id]
+                        : memoryImportSelection.filter((id) => id !== candidate.id);
+                    }}
+                  />
+                  <span>Import from Claude Code</span>
+                </label>
+                <small class="runtime-binary" title={candidate.source}
+                  >{candidate.source.split(/[\\/]/).at(-1)}</small
+                >
+                <p>{candidate.content}</p>
+              </li>
+            {/each}
+          </ul>
+          <Button
+            size="sm"
+            disabled={!memoryImportSelection.length || memoryImportLoading}
+            onclick={() => void importAgentMemories()}
+            >Import {memoryImportSelection.length} selected</Button
+          >
+        {/if}
+      </section>
 
       <section class="settings-card">
         <h2>Project memories</h2>

@@ -11,6 +11,7 @@ const { default: TauriService } = await import(serviceModule);
 const state = mkdtempSync(join(tmpdir(), 'sail-e2e-'));
 const attach = process.env.SAIL_E2E_ATTACH === '1';
 Object.assign(process.env, isolatedPaths(state, attach, process.env));
+if (!attach) process.env.CLAUDE_CONFIG_DIR = join(state, 'claude');
 process.env.SAIL_E2E_OPEN_URL_LOG = attach
   ? (process.env.SAIL_E2E_OPEN_URL_LOG ?? join(state, 'external-link.log'))
   : join(state, 'external-link.log');

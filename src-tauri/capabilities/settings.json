@@ -24,6 +24,8 @@
     "allow-memory-inspect",
     "allow-memory-forget",
     "allow-memory-rate",
+    "allow-preview-memory-import",
+    "allow-import-agent-memories",
     "allow-memory-provider-status",
     "allow-verify-memory-provider",
     "allow-set-memory-provider",

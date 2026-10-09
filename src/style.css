@@ -1462,6 +1462,15 @@ time {
 .memory-record-list p {
   white-space: pre-wrap;
 }
+.settings-card .memory-import-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-card .memory-import-choice input {
+  width: auto;
+  margin: 0;
+}
 .memory-tags {
   margin-top: -6px;
 }
