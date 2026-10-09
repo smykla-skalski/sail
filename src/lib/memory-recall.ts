@@ -1,11 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
-import { getSetting } from './settings.ts';
+import { getSetting, setSettingDurable } from './settings.ts';
 
 export const automaticRecallSettingPrefix = 'sai-memory-auto-recall';
 export const recallTokenBudgetSettingKey = 'sai-memory-recall-token-budget';
 export const defaultRecallTokenBudget = 800;
 
-const minimumTokenBudget = 128;
+const minimumTokenBudget = 512;
 const maximumTokenBudget = 4096;
 const maximumSearchQueryChars = 1000;
 const searchResultLimit = 24;
@@ -46,6 +46,12 @@ interface MemoryStatus {
   projectKey: string;
 }
 
+export interface AutomaticRecallControl {
+  available: boolean;
+  enabled: boolean;
+  projectKey: string;
+}
+
 interface RecallConfiguration {
   enabled: boolean;
   tokenBudget: number;
@@ -55,6 +61,25 @@ type LoadRecallConfiguration = (directory: string) => Promise<RecallConfiguratio
 
 export function automaticRecallSettingKey(projectKey: string): string {
   return `${automaticRecallSettingPrefix}:${projectKey}`;
+}
+
+export function automaticRecallControl(
+  status: MemoryStatus,
+  storedValue: string | null,
+): AutomaticRecallControl {
+  return {
+    available: status.enabled,
+    enabled: status.enabled && storedValue === 'true',
+    projectKey: status.projectKey,
+  };
+}
+
+export async function persistAutomaticRecall(
+  projectKey: string,
+  enabled: boolean,
+  write: (key: string, value: string) => Promise<void> = setSettingDurable,
+): Promise<void> {
+  await write(automaticRecallSettingKey(projectKey), String(enabled));
 }
 
 export function recallTokenBudget(raw = getSetting(recallTokenBudgetSettingKey)): number {
@@ -144,15 +169,17 @@ export class AutomaticMemoryRecall {
 
   async withContext(input: AutomaticRecallInput) {
     if (this.#attempted.has(input.sessionKey)) return input.prompt;
+    this.#attempted.add(input.sessionKey);
     let configuration: RecallConfiguration;
     try {
       configuration = await this.#loadConfiguration(input.directory);
     } catch {
-      this.#attempted.add(input.sessionKey);
       return input.prompt;
     }
-    if (!configuration.enabled) return input.prompt;
-    this.#attempted.add(input.sessionKey);
+    if (!configuration.enabled) {
+      this.#attempted.delete(input.sessionKey);
+      return input.prompt;
+    }
     try {
       const results = await this.#searchMemories(
         input.directory,
@@ -169,6 +196,11 @@ export class AutomaticMemoryRecall {
 
 export const automaticMemoryRecall = new AutomaticMemoryRecall();
 
-export function withAutomaticMemoryRecall(input: AutomaticRecallInput): Promise<string> {
-  return automaticMemoryRecall.withContext(input);
+export async function withAutomaticMemoryRecall(
+  input: AutomaticRecallInput,
+  cancelled: () => boolean = () => false,
+): Promise<string> {
+  const prompt = await automaticMemoryRecall.withContext(input);
+  if (cancelled()) throw new Error('Agent turn was cancelled.');
+  return prompt;
 }

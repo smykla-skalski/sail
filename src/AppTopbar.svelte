@@ -46,6 +46,10 @@
     contextUsage,
     browserAccess,
     ontogglebrowser,
+    memoryRecall,
+    memoryRecallAvailable,
+    memoryRecallBusy,
+    ontogglememoryrecall,
     onrunproject,
     agentTerminalCount,
     onagentterminals,
@@ -86,6 +90,10 @@
     contextUsage?: number;
     browserAccess: boolean;
     ontogglebrowser: () => void;
+    memoryRecall: boolean;
+    memoryRecallAvailable: boolean;
+    memoryRecallBusy: boolean;
+    ontogglememoryrecall: () => void;
     onrunproject: (() => void) | null;
     agentTerminalCount: number;
     onagentterminals: () => void;
@@ -267,6 +275,16 @@
           aria-checked={browserAccess}
           title="Toggle agent browser access for this project"
           onclick={ontogglebrowser}>Agent browser {browserAccess ? 'on' : 'off'}</button
+        ><button
+          role="menuitemcheckbox"
+          aria-checked={memoryRecall}
+          aria-label="Toggle automatic memory recall for this project"
+          disabled={!memoryRecallAvailable || memoryRecallBusy}
+          title={memoryRecallAvailable
+            ? 'Recall relevant shared memories in the first prompt of each thread'
+            : 'Enable shared memory for this project before using automatic recall'}
+          onclick={ontogglememoryrecall}
+          >Automatic memory recall {memoryRecall ? 'on' : 'off'}</button
         >{/if}
       {#if threadActions || onrestore}
         <div class="menu-separator" role="separator"></div>

@@ -31,7 +31,11 @@
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
   import { isPlanTool } from './lib/plan-engine';
   import { openCodeSessionId, sameThreadId } from './lib/thread-id';
-  import { withAutomaticMemoryRecall } from './lib/memory-recall';
+  import {
+    automaticRecallControl,
+    persistAutomaticRecall,
+    withAutomaticMemoryRecall,
+  } from './lib/memory-recall';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
   import {
     loadNativePlan,
@@ -740,6 +744,11 @@
   let browserAccessDisabled = $state(
     getSetting(`sai-browser-disabled:${savedDirectory}`) === 'true',
   );
+  let memoryRecallAvailable = $state(false);
+  let memoryRecallEnabled = $state(false);
+  let memoryRecallProjectKey = $state('');
+  let memoryRecallBusy = $state(false);
+  let memoryRecallRefresh = 0;
   type BrowserAccessRequest = { id: string; sessionId: string; directory: string; origin?: string };
   type CoordinationRequest = {
     id: string;
@@ -2280,6 +2289,44 @@
       directory,
       enabled: !browserAccessDisabled,
     }).catch((cause) => (error = describe(cause)));
+  }
+
+  async function refreshAutomaticMemoryRecall(path: string) {
+    const refresh = ++memoryRecallRefresh;
+    memoryRecallAvailable = false;
+    memoryRecallEnabled = false;
+    memoryRecallProjectKey = '';
+    try {
+      const status = await invoke<{ enabled: boolean; projectKey: string }>('memory_status', {
+        directory: path,
+      });
+      if (refresh !== memoryRecallRefresh || directory !== path) return;
+      const control = automaticRecallControl(
+        status,
+        getSetting(`sai-memory-auto-recall:${status.projectKey}`),
+      );
+      memoryRecallAvailable = control.available;
+      memoryRecallEnabled = control.enabled;
+      memoryRecallProjectKey = control.projectKey;
+    } catch (cause) {
+      if (refresh === memoryRecallRefresh && directory === path)
+        error = `Could not load automatic memory recall: ${describe(cause)}`;
+    }
+  }
+
+  async function toggleAutomaticMemoryRecall() {
+    if (!memoryRecallAvailable || memoryRecallBusy || !memoryRecallProjectKey) return;
+    const projectKey = memoryRecallProjectKey;
+    const enabled = !memoryRecallEnabled;
+    memoryRecallBusy = true;
+    try {
+      await persistAutomaticRecall(projectKey, enabled);
+      if (memoryRecallProjectKey === projectKey) memoryRecallEnabled = enabled;
+    } catch (cause) {
+      error = `Could not update automatic memory recall: ${describe(cause)}`;
+    } finally {
+      if (memoryRecallProjectKey === projectKey) memoryRecallBusy = false;
+    }
   }
 
   function saveProjectCatalog(next: ProjectCatalog) {
@@ -8584,6 +8631,7 @@
     ++diffRefresh;
     diffLoading = false;
     await canonicalizeProject(path);
+    if (directory) await refreshAutomaticMemoryRecall(directory);
   }
 
   async function selectDefaultWorktree(path: string) {
@@ -11573,6 +11621,10 @@
         : null}
       browserAccess={!browserAccessDisabled}
       ontogglebrowser={toggleAgentBrowserAccess}
+      memoryRecall={memoryRecallEnabled}
+      {memoryRecallAvailable}
+      {memoryRecallBusy}
+      ontogglememoryrecall={() => void toggleAutomaticMemoryRecall()}
       onrunproject={selectedWorktreeConfig?.run
         ? () => splitFocusedPane('row', 'terminal', selectedWorktreeConfig?.run)
         : null}

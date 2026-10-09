@@ -2,8 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   AutomaticMemoryRecall,
+  automaticRecallControl,
   formatRecalledMemories,
+  persistAutomaticRecall,
   recallTokenBudget,
+  withAutomaticMemoryRecall,
 } from '../src/lib/memory-recall.ts';
 
 const record = {
@@ -45,6 +48,13 @@ void test('keeps the complete recall block within the configured token budget in
   assert.ok(Buffer.byteLength(formatted, 'utf8') <= 800);
 });
 
+void test('the minimum budget can include a short recalled memory', () => {
+  const formatted = formatRecalledMemories([record], recallTokenBudget('1'));
+
+  assert.match(formatted, /Use the repository formatter before committing/);
+  assert.ok(Buffer.byteLength(formatted, 'utf8') <= 512);
+});
+
 void test('attempts recall once per session and fails open', async () => {
   let calls = 0;
   const recall = new AutomaticMemoryRecall(
@@ -77,6 +87,30 @@ void test('does not consume the session boundary while recall is disabled', asyn
   assert.equal(calls, 1);
 });
 
+void test('reserves a session before asynchronous configuration loads', async () => {
+  let releaseConfiguration!: (configuration: { enabled: boolean; tokenBudget: number }) => void;
+  const configuration = new Promise<{ enabled: boolean; tokenBudget: number }>((resolve) => {
+    releaseConfiguration = resolve;
+  });
+  let calls = 0;
+  const recall = new AutomaticMemoryRecall(
+    async () => {
+      calls++;
+      return [record];
+    },
+    async () => configuration,
+  );
+  const input = { directory: '/repo', prompt: 'Do the work', query: 'work', sessionKey: 'acp:1' };
+
+  const first = recall.withContext(input);
+  const second = recall.withContext(input);
+  releaseConfiguration({ enabled: true, tokenBudget: 800 });
+
+  assert.equal(await second, input.prompt);
+  assert.match(await first, /UNTRUSTED SHARED MEMORY/);
+  assert.equal(calls, 1);
+});
+
 void test('bounds search queries to the backend contract', async () => {
   let query = '';
   const recall = new AutomaticMemoryRecall(
@@ -97,6 +131,41 @@ void test('bounds search queries to the backend contract', async () => {
 
 void test('clamps configurable token budgets', () => {
   assert.equal(recallTokenBudget(null), 800);
-  assert.equal(recallTokenBudget('12'), 128);
+  assert.equal(recallTokenBudget('12'), 512);
   assert.equal(recallTokenBudget('99999'), 4096);
+});
+
+void test('automatic recall stays off until an enabled project opts in', () => {
+  assert.deepEqual(automaticRecallControl({ enabled: false, projectKey: 'project' }, 'true'), {
+    available: false,
+    enabled: false,
+    projectKey: 'project',
+  });
+  assert.deepEqual(automaticRecallControl({ enabled: true, projectKey: 'project' }, null), {
+    available: true,
+    enabled: false,
+    projectKey: 'project',
+  });
+});
+
+void test('the project control persists both automatic recall choices', async () => {
+  const values = new Map<string, string>();
+  const write = async (key: string, value: string) => {
+    values.set(key, value);
+  };
+
+  await persistAutomaticRecall('project', true, write);
+  assert.equal(values.get('sai-memory-auto-recall:project'), 'true');
+  await persistAutomaticRecall('project', false, write);
+  assert.equal(values.get('sai-memory-auto-recall:project'), 'false');
+});
+
+void test('a cancellation observed after recall prevents prompt dispatch', async () => {
+  await assert.rejects(
+    withAutomaticMemoryRecall(
+      { directory: '/repo', prompt: 'Do the work', query: 'work', sessionKey: 'cancelled' },
+      () => true,
+    ),
+    /Agent turn was cancelled/,
+  );
 });

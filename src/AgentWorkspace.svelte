@@ -1835,12 +1835,15 @@
           turnId,
         );
       const promptWithAttachments = withAttachedFiles(promptText, sentClipboard);
-      const recalledPrompt = await withAutomaticMemoryRecall({
-        directory: turnDirectory,
-        prompt: promptWithAttachments,
-        query: text,
-        sessionKey: `acp:${turnAgent}:${id}`,
-      });
+      const recalledPrompt = await withAutomaticMemoryRecall(
+        {
+          directory: turnDirectory,
+          prompt: promptWithAttachments,
+          query: text,
+          sessionKey: `acp:${turnAgent}:${id}`,
+        },
+        () => stopRequested,
+      );
       let result;
       try {
         result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
