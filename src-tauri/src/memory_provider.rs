@@ -2542,7 +2542,11 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
             let request = read_request(&mut first);
-            assert!(request.starts_with("GET /memories/page?"));
+            assert!(
+                request.starts_with("GET /memories/page?"),
+                "unexpected request: {:?}",
+                request.lines().next()
+            );
             assert!(!request.contains("cursor="));
             respond(
                 &mut first,
@@ -2588,7 +2592,12 @@ mod tests {
         .unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            assert!(read_request(&mut stream).starts_with("GET /memories/page?"));
+            let request = read_request(&mut stream);
+            assert!(
+                request.starts_with("GET /memories/page?"),
+                "unexpected request: {:?}",
+                request.lines().next()
+            );
             respond_status(
                 &mut stream,
                 "503 Unavailable",
