@@ -767,10 +767,12 @@
     options: AgentConfigOption[],
   ): Promise<AgentConfigOption[]> {
     if (agent !== 'claude' || !thread || !activeSessionId) return options;
-    return [
-      [/model/i, thread.model],
-      [/effort|reasoning|thinking/i, thread.effort],
-    ].reduce(async (previous, [pattern, value]) => {
+    const sessionId = activeSessionId;
+    const saved = [
+      { pattern: /model/i, value: thread.model },
+      { pattern: /effort|reasoning|thinking/i, value: thread.effort },
+    ];
+    return saved.reduce(async (previous, { pattern, value }) => {
       const restored = await previous;
       const option = restored.find(
         (candidate) =>
@@ -783,7 +785,7 @@
         !option.options.some((choice) => choice.value === value)
       )
         return restored;
-      const result = await acp.setConfig(agent, activeSessionId, option.id, value);
+      const result = await acp.setConfig(agent, sessionId, option.id, value);
       return (
         result.configOptions ??
         restored.map((candidate) =>
