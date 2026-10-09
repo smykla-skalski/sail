@@ -5,6 +5,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
+const claudeDefaults = { model: 'test', effort: 'medium' };
 const delayedSessionDirectories = new Set();
 const permissions = new Map();
 const elicitations = new Map();
@@ -238,6 +239,12 @@ function configOptions(sessionId) {
   return session?.noEffort ? options.slice(0, 1) : options;
 }
 
+function applyClaudeDefaults(sessionId) {
+  if (agent !== 'claude') return;
+  const session = sessions.get(sessionId);
+  if (session) session.config = { ...session.config, ...claudeDefaults };
+}
+
 const availableCommands = [
   { name: 'ship-issue', description: 'Implement and ship a GitHub issue' },
   { name: 'review', description: 'Review a change' },
@@ -351,6 +358,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     });
   } else if (message.method === 'session/resume') {
     adoptExternalSession(message.params.sessionId, message.params.cwd);
+    applyClaudeDefaults(message.params.sessionId);
     const session = sessions.get(message.params.sessionId);
     if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });
@@ -365,6 +373,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
   } else if (message.method === 'session/load') {
     adoptExternalSession(message.params.sessionId, message.params.cwd);
+    applyClaudeDefaults(message.params.sessionId);
     const session = sessions.get(message.params.sessionId);
     if (session) attachLikeClaudeAdapter(message.params.sessionId, message.params);
     if (!session) send({ id: message.id, error: { code: -1, message: 'Session missing' } });

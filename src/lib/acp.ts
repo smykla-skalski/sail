@@ -18,6 +18,7 @@ export interface AgentAvailability {
 export interface AgentThread {
   agent: AgentId;
   model?: string;
+  effort?: string;
   sessionId: string;
   directory: string;
   title: string;
@@ -335,6 +336,7 @@ export function loadAgentThreads(): AgentThread[] {
         typeof item.directory === 'string' &&
         typeof item.title === 'string' &&
         typeof item.updated === 'number' &&
+        (item.effort === undefined || typeof item.effort === 'string') &&
         (item.capabilityProfile === undefined ||
           ['explore', 'review', 'build', 'release'].includes(item.capabilityProfile)),
     );
