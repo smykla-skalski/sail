@@ -27,6 +27,7 @@
     loadActivityHistory,
     recentActivityEvents,
     saveActivityHistory,
+    sharedActivityHistory,
     type ActivityHistoryEvent,
     type ActivityHistoryInput,
   } from './lib/activity-history';
@@ -1210,6 +1211,7 @@
   let durableActivityHistory = $state<ActivityHistoryEvent[]>(
     loadActivityHistory(getSetting('sai-activity-history')),
   );
+  $effect(() => sharedActivityHistory.set(durableActivityHistory));
   let openCodeTimelineRevision = $state(0);
   let inboxLoading = $state(false);
   let inboxError = $state('');
@@ -9638,6 +9640,7 @@
               acpPermissionActivitySourceId(requestId, permissionGeneration, permissionFingerprint),
               decisionTitle,
               permissionOutcome(options, optionId),
+              policy.reason,
             ),
         });
       }
@@ -12303,6 +12306,7 @@
     sourceId: string,
     title: string,
     outcome: string,
+    automaticReason?: string,
   ) {
     durableActivityHistory = recentActivityEvents([
       ...durableActivityHistory,
@@ -12316,6 +12320,7 @@
         at: Date.now(),
         agent: thread.agent,
         sessionId: thread.sessionId,
+        ...(automaticReason === undefined ? {} : { automatic: true, reason: automaticReason }),
       },
     ]);
     setSetting('sai-activity-history', saveActivityHistory(durableActivityHistory));

@@ -846,6 +846,31 @@ for await (const line of createInterface({ input: process.stdin })) {
       const stop = trackWork(sessionId, () => clearInterval(poll));
       continue;
     }
+    if (text === 'Automatic policy') {
+      const toolCallId = `format-${message.id}`;
+      update(sessionId, {
+        sessionUpdate: 'tool_call',
+        toolCallId,
+        title: 'Format notes',
+        status: 'pending',
+      });
+      const id = ++nextPermission;
+      permissions.set(id, { sessionId, text, promptId: message.id, toolCallId });
+      send({
+        id,
+        method: 'session/request_permission',
+        params: {
+          sessionId,
+          // A medium-risk action that Sail's policy settles without asking.
+          toolCall: { toolCallId, title: 'Format notes', action: 'format' },
+          options: [
+            { optionId: 'allow', name: 'Allow once', kind: 'allow_once' },
+            { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+          ],
+        },
+      });
+      continue;
+    }
     if (text === 'Background task') {
       recordUpdate(sessionId, sessionId, {
         sessionUpdate: 'agent_message_chunk',

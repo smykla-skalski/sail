@@ -17,6 +17,7 @@
     openCodeItems,
     pendingCoordinationItems,
     subagentItems,
+    latestRevision,
   } from './lib/transcript';
   import OpenCodeSubagents from './OpenCodeSubagents.svelte';
   import HarnessIcon from './HarnessIcon.svelte';
@@ -1154,6 +1155,7 @@
       <JumpToLatest
         {following}
         count={transcriptItems.length}
+        revision={latestRevision(transcriptItems)}
         onjump={() => {
           following = true;
           scroll.scrollTop = scroll.scrollHeight;

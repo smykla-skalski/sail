@@ -1,3 +1,5 @@
+import { writable } from 'svelte/store';
+
 export type ActivityHistoryKind = 'parent' | 'subagent' | 'tool' | 'decision' | 'check';
 
 export type ActivityHistoryEvent = {
@@ -11,6 +13,9 @@ export type ActivityHistoryEvent = {
   at: number;
   agent?: string;
   sessionId?: string;
+  /** Set for a permission Sail settled by policy, with the policy's reason. */
+  automatic?: boolean;
+  reason?: string;
 };
 
 export type ActivityHistoryInput = Omit<ActivityHistoryEvent, 'id'> & { id?: string };
@@ -62,6 +67,7 @@ export function recentActivityEvents(
       source: bounded(candidate.source, 80),
       title: bounded(candidate.title, 240),
       outcome: bounded(candidate.outcome, 80),
+      ...(candidate.reason === undefined ? {} : { reason: bounded(candidate.reason, 240) }),
     };
     const previous = events.get(id);
     if (!previous || previous.at <= event.at) events.set(id, event);
@@ -93,7 +99,9 @@ export function loadActivityHistory(raw: string | null): ActivityHistoryEvent[] 
           typeof event.outcome === 'string' &&
           typeof event.at === 'number' &&
           (event.agent === undefined || typeof event.agent === 'string') &&
-          (event.sessionId === undefined || typeof event.sessionId === 'string'),
+          (event.sessionId === undefined || typeof event.sessionId === 'string') &&
+          (event.automatic === undefined || typeof event.automatic === 'boolean') &&
+          (event.reason === undefined || typeof event.reason === 'string'),
       ),
     );
   } catch {
@@ -104,3 +112,6 @@ export function loadActivityHistory(raw: string | null): ActivityHistoryEvent[] 
 export function saveActivityHistory(events: ActivityHistoryEvent[]): string {
   return JSON.stringify(recentActivityEvents(events));
 }
+
+/** The app's durable activity history, shared with panes that show part of it. */
+export const sharedActivityHistory = writable<ActivityHistoryEvent[]>([]);

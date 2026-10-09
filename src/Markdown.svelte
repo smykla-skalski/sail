@@ -42,8 +42,9 @@
   {/each}
 {/snippet}
 
-{#snippet renderBlocks(tokens: Token[])}
+{#snippet renderBlocks(tokens: Token[], path = '')}
   {#each tokens as token, index (index)}
+    {@const key = `${path}${index}`}
     {#if token.type === 'paragraph'}<p>{@render inline(token.tokens ?? [])}</p>
     {:else if token.type === 'heading'}<svelte:element this={`h${token.depth}`}
         >{@render inline(token.tokens ?? [])}</svelte:element
@@ -53,23 +54,22 @@
           type="button"
           class="code-copy"
           aria-label="Copy code"
-          onclick={() => void copy(`${index}`, token.text)}
-          >{copied === `${index}` ? 'Copied' : 'Copy'}</button
+          onclick={() => void copy(key, token.text)}>{copied === key ? 'Copied' : 'Copy'}</button
         >
         <pre><code>{token.text}</code></pre>
       </div>
     {:else if token.type === 'blockquote'}<blockquote>
-        {@render renderBlocks(token.tokens ?? [])}
+        {@render renderBlocks(token.tokens ?? [], `${key}.`)}
       </blockquote>
     {:else if token.type === 'list'}
       {#if token.ordered}<ol start={token.start || 1}>
           {#each token.items as item, itemIndex (itemIndex)}<li>
-              {@render renderBlocks(item.tokens)}
+              {@render renderBlocks(item.tokens, `${key}.${itemIndex}.`)}
             </li>{/each}
         </ol>
       {:else}<ul>
           {#each token.items as item, itemIndex (itemIndex)}<li>
-              {@render renderBlocks(item.tokens)}
+              {@render renderBlocks(item.tokens, `${key}.${itemIndex}.`)}
             </li>{/each}
         </ul>{/if}
     {:else if token.type === 'table'}<div class="table-scroll">
