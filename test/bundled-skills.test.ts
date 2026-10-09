@@ -28,9 +28,9 @@ function filesOnDisk(skill: string): string[] {
   return ['references', 'scripts'].flatMap((directory) => {
     const path = skillPath(skill, `${directory}/`);
     if (!existsSync(path)) return [];
-    return readdirSync(path)
-      .filter((name) => !name.startsWith('.'))
-      .map((name) => (directory === 'scripts' ? `scripts/${name}` : name));
+    return readdirSync(path, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
+      .map((entry) => (directory === 'scripts' ? `scripts/${entry.name}` : entry.name));
   });
 }
 

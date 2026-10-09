@@ -4,6 +4,7 @@ import { automaticPermissionPolicy, permissionPolicy } from '../src/lib/capabili
 import {
   assertAutomaticPermissionAllowed,
   AutomaticPermissionResolver,
+  permissionChoiceForPolicy,
 } from '../src/lib/permission-resolution.ts';
 
 const allowOnce = [
@@ -185,4 +186,21 @@ await test('provider-added read paths stop an already scheduled automatic approv
       ),
     /Permission resource changed before automatic approval/,
   );
+});
+
+await test('a stale allow choice becomes the live policy rejection', () => {
+  const reviewPolicy = permissionPolicy({
+    profile: 'review',
+    workspace: '/workspace',
+    title: 'Edit file',
+    toolCall: { action: 'edit', resources: ['/workspace/file.ts'] },
+    options: allowOnce,
+  });
+
+  assert.equal(reviewPolicy.recommendation, 'deny');
+  assert.equal(
+    permissionChoiceForPolicy(reviewPolicy, allowOnce, 'allow-background'),
+    'deny-background',
+  );
+  assert.equal(permissionChoiceForPolicy(reviewPolicy, [], 'allow-background'), null);
 });

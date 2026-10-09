@@ -23,6 +23,8 @@ export type InboxItem = InboxLocation & {
   policy?: PermissionPolicyDecision;
   permissionPolicies?: Record<string, PermissionPolicyDecision>;
   permissionTitle?: string;
+  permissionToolCall?: unknown;
+  permissionResourceTrust?: { trusted: boolean; canonicalResources: string[] };
   generation?: string | number;
   fingerprint?: string;
 };

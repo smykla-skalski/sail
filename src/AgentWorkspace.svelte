@@ -140,8 +140,13 @@
     type TaskLocation as TaskLocationValue,
   } from './lib/task-location';
   import { workspaceActivityItems, type WorkspaceActivityItem } from './lib/workspace-activity';
-  import { permissionPolicy, type CapabilityProfile } from './lib/capability-profiles';
-  import { permissionResolver } from './lib/permission-resolution';
+  import {
+    capabilityProfileForSession,
+    intersectCapabilityProfiles,
+    permissionPolicy,
+    type CapabilityProfile,
+  } from './lib/capability-profiles';
+  import { permissionChoiceForPolicy, permissionResolver } from './lib/permission-resolution';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
   import { acpPlans } from './lib/acp-plans';
   import { modeAfterPlan } from './lib/plan-engine';
@@ -258,7 +263,12 @@
   const readOnlyChild = $derived(!!nativeEntries && !childPrompts);
   let mounted = $state(false);
   let permissionInventoryRevision = 0;
-  const activeCapabilityProfile = $derived(thread?.capabilityProfile ?? capabilityProfile);
+  const activeCapabilityProfile = $derived(
+    capabilityProfileForSession(thread?.capabilityProfile, capabilityProfile, Boolean(thread)),
+  );
+  const permissionCapabilityProfile = $derived(
+    intersectCapabilityProfiles(thread?.capabilityProfile ?? capabilityProfile, capabilityProfile),
+  );
   let hookActivities = $state<HookActivity[]>([]);
   function mergeHookActivities(items: HookActivity[]) {
     const merged = new SvelteMap(hookActivities.map((item) => [item.id, item]));
@@ -1058,7 +1068,7 @@
         )
       : [];
     const policy = permissionPolicy({
-      profile: activeCapabilityProfile,
+      profile: permissionCapabilityProfile,
       workspace: directory,
       title,
       toolCall: tool,
@@ -1071,6 +1081,7 @@
       title,
       options,
       policy,
+      toolCall: tool,
       toolCallId: details.toolCallId,
       command: details.command,
       files: details.files,
@@ -2224,19 +2235,13 @@
       permissions.length === 1 && acpPermissionIdentity(permissions[0]!) === identity;
     if (thread && lastRequest) onstatus(thread, 'working');
     try {
+      const policy = livePermissionPolicy(permission);
+      const settledOptionId = permissionChoiceForPolicy(policy, permission.options, optionId);
       await permissionResolver.resolve({
         key: `acp:${agent}:${permission.sessionId}:${permission.id}`,
         generation: permission.fingerprint ?? permission.generation ?? permission.sessionId,
-        policy:
-          permission.policy ??
-          permissionPolicy({
-            profile: activeCapabilityProfile,
-            workspace: directory,
-            title: permission.title,
-            toolCall: {},
-            options: permission.options,
-          }),
-        optionId,
+        policy,
+        optionId: settledOptionId,
         respond: (selectedOptionId: string | null) =>
           acp.permission(
             agent,
@@ -2291,6 +2296,16 @@
       if (pendingIdentities)
         permissions = reconcileRejectedAcpPermission(permissions, permission, pendingIdentities);
     }
+  }
+
+  function livePermissionPolicy(permission: AgentPermission) {
+    return permissionPolicy({
+      profile: permissionCapabilityProfile,
+      workspace: directory,
+      title: permission.title,
+      toolCall: permission.toolCall ?? {},
+      options: permission.options,
+    });
   }
 
   function setConfig(configId: string, value: string) {
@@ -2566,16 +2581,17 @@
         </div>
       {/if}
       {#each permissions as permission (acpPermissionIdentity(permission))}
+        {@const livePolicy = livePermissionPolicy(permission)}
         <PermissionCard
           title={permission.title}
-          policy={permission.policy}
+          policy={livePolicy}
           command={permission.command}
           files={permission.files}
           toolCallId={permission.toolCallId}
           requestId={permission.id}
           sessionId={permission.sessionId}
           agentId={agent}
-          choices={acpPermissionChoices(permission.options, permission.policy)}
+          choices={acpPermissionChoices(permission.options, livePolicy)}
           onchoose={(choice) => answer(permission, choice.id)}
         />
       {/each}

@@ -110,6 +110,10 @@ pub struct McpConfig {
     pub token: String,
 }
 
+fn requires_phase_lease(tool: &str) -> bool {
+    matches!(tool, "navigate" | "click" | "type" | "run_script")
+}
+
 impl BrowserManager {
     pub fn config_for_profile(
         &self,
@@ -547,6 +551,7 @@ impl BrowserManager {
             "worktree_status" => Some("sai-agent-status-enabled"),
             "project_threads" => Some("sai-agent-thread-list-enabled"),
             "thread_message" => Some("sai-agent-messages-enabled"),
+            "capability_check" => None,
             // Progress belongs to the owning Ship run and must remain available when
             // cross-validation and other coordination actions are disabled.
             "ship_progress"
@@ -641,6 +646,16 @@ impl BrowserManager {
                 profile.as_str(),
                 CAPABILITY_POLICY_REVISION
             ));
+        }
+        if requires_phase_lease(&request.name) {
+            self.coordinate(
+                app,
+                &session,
+                source_agent.as_deref(),
+                &directory,
+                "capability_check",
+                json!({"tool":&request.name}),
+            )?;
         }
         if matches!(
             request.name.as_str(),
@@ -1637,7 +1652,7 @@ fn economics_input_schema() -> Value {
         "additionalProperties":false,
         "properties":{
             "role":{"type":"string","enum":["primary","subagent","validator","guardian","synthetic","probe"]},
-            "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","review","test","ci","pr","complete"]},
+            "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","publish","review","test","ci","pr","complete"]},
             "turns":counter(),
             "toolCalls":counter(),
             "permissionRequests":counter(),
@@ -2026,8 +2041,9 @@ mod picker_tests {
 #[cfg(test)]
 mod skill_tests {
     use super::{
-        call_bridge, mcp_initialize, plan_tool_schema, skill_text, tool_listed, BrowserManager,
-        CapabilityProfile, CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
+        call_bridge, economics_input_schema, mcp_initialize, plan_tool_schema,
+        requires_phase_lease, skill_text, tool_listed, BrowserManager, CapabilityProfile,
+        CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
     };
 
     #[test]
@@ -2040,6 +2056,23 @@ mod skill_tests {
         assert!(CapabilityProfile::Release.enables("thread_message"));
         assert!(!CapabilityProfile::Release.enables("agent_spawn"));
         assert_eq!(CapabilityProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn direct_browser_mutations_require_the_live_phase_lease() {
+        for tool in ["navigate", "click", "type", "run_script"] {
+            assert!(requires_phase_lease(tool), "{tool}");
+        }
+        for tool in ["read_page", "screenshot", "task_checkpoint_read"] {
+            assert!(!requires_phase_lease(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn economics_schema_accepts_the_publish_phase() {
+        assert!(economics_input_schema()["properties"]["phase"]["enum"]
+            .as_array()
+            .is_some_and(|phases| phases.iter().any(|phase| phase == "publish")));
     }
 
     #[test]
@@ -2171,11 +2204,15 @@ mod skill_tests {
                 fs::read_dir(skill_root.join(directory))
                     .expect("bundled skill directory is readable")
                     .filter_map(move |entry| {
-                        let name = entry
-                            .expect("bundled skill entry is readable")
-                            .file_name()
-                            .to_string_lossy()
-                            .into_owned();
+                        let entry = entry.expect("bundled skill entry is readable");
+                        if !entry
+                            .file_type()
+                            .expect("bundled skill entry type is readable")
+                            .is_file()
+                        {
+                            return None;
+                        }
+                        let name = entry.file_name().to_string_lossy().into_owned();
                         match (directory, name.starts_with('.')) {
                             (_, true) => None,
                             ("scripts", false) => Some(format!("scripts/{name}")),

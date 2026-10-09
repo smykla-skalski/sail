@@ -16,6 +16,7 @@ export const taskActivityPhases = [
   'explore',
   'branch',
   'implement',
+  'publish',
   'review',
   'test',
   'ci',

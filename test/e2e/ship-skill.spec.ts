@@ -23,11 +23,11 @@ const version = (content: string) =>
   `sha256:${createHash('sha256').update(content, 'utf8').digest('hex')}`;
 const bundledFiles = new Map(
   ['references', 'scripts'].flatMap((directory) =>
-    readdirSync(join(skillRoot, directory))
-      .filter((name) => !name.startsWith('.'))
-      .map((name) => [
-        directory === 'scripts' ? `scripts/${name}` : name,
-        readFileSync(join(skillRoot, directory, name), 'utf8'),
+    readdirSync(join(skillRoot, directory), { withFileTypes: true })
+      .filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
+      .map((entry) => [
+        directory === 'scripts' ? `scripts/${entry.name}` : entry.name,
+        readFileSync(join(skillRoot, directory, entry.name), 'utf8'),
       ]),
   ),
 );

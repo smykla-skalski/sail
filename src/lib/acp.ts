@@ -156,6 +156,7 @@ export interface AgentPermission {
   title: string;
   options: { optionId: string; name: string; kind: string }[];
   policy?: PermissionPolicyDecision;
+  toolCall?: unknown;
   toolCallId?: string | null;
   command?: string | null;
   files?: string[];

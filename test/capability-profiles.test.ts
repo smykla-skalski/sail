@@ -3,7 +3,10 @@ import test from 'node:test';
 import {
   automaticPermissionPolicy,
   capabilityProfileForPhase,
+  capabilityProfileForSession,
   capabilityProfileFromMetadata,
+  capabilityProfileEnablesTool,
+  intersectCapabilityProfiles,
   classifyPermission,
   permissionPolicy,
   permissionReadResources,
@@ -641,6 +644,47 @@ await test('maps workflow phase to capability profile', () => {
   assert.equal(capabilityProfileForPhase('implement'), 'build');
   assert.equal(capabilityProfileForPhase('publish'), 'release');
   assert.equal(capabilityProfileForPhase('pr'), 'release');
+});
+
+await test('legacy sessions keep a build envelope across phase changes', () => {
+  assert.equal(capabilityProfileForSession(undefined, 'review', true), 'build');
+  assert.equal(capabilityProfileForSession(undefined, 'release', true), 'build');
+  assert.equal(capabilityProfileForSession('review', 'release', true), 'review');
+  assert.equal(capabilityProfileForSession(undefined, 'review', false), 'review');
+});
+
+await test('a long-lived build session adopts the current phase capability lease', () => {
+  const publish = intersectCapabilityProfiles('build', capabilityProfileForPhase('publish'));
+  assert.equal(publish, 'release');
+  assert.equal(capabilityProfileEnablesTool(publish, 'terminal_create'), true);
+  assert.equal(capabilityProfileEnablesTool(publish, 'agent_spawn'), false);
+  assert.equal(capabilityProfileEnablesTool(publish, 'worktree_create'), false);
+  assert.equal(capabilityProfileEnablesTool(publish, 'validation_gate'), false);
+  assert.equal(capabilityProfileEnablesTool(publish, 'task_evidence_record'), false);
+
+  const review = intersectCapabilityProfiles('build', capabilityProfileForPhase('review'));
+  assert.equal(review, 'review');
+  assert.equal(capabilityProfileEnablesTool(review, 'validation_gate'), true);
+  assert.equal(capabilityProfileEnablesTool(review, 'agent_spawn'), false);
+  assert.equal(
+    permissionPolicy({
+      profile: review,
+      title: 'Edit file',
+      toolCall: { action: 'edit' },
+      options: [
+        { optionId: 'allow', kind: 'allow_once' },
+        { optionId: 'deny', kind: 'reject_once' },
+      ],
+    }).recommendation,
+    'deny',
+  );
+});
+
+await test('phase leases only narrow an already restricted session envelope', () => {
+  assert.equal(intersectCapabilityProfiles('review', 'release'), 'explore');
+  assert.equal(intersectCapabilityProfiles('release', 'build'), 'release');
+  assert.equal(capabilityProfileEnablesTool('explore', 'task_checkpoint_update'), true);
+  assert.equal(capabilityProfileEnablesTool('explore', 'terminal_create'), false);
 });
 
 await test('session metadata profile overrides a build workspace fallback', () => {
