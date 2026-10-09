@@ -634,7 +634,14 @@ async function main() {
       const uid = run('id', ['-u']).stdout.trim();
       const unloaded = await waitFor(() => {
         const observed = run('launchctl', ['print', `gui/${uid}/${label}`]);
-        return observed.status !== 0 ? observed : null;
+        return observed.status === 113 &&
+          observed.error === null &&
+          observed.signal === null &&
+          observed.stderr.includes(
+            `Could not find service "${label}" in domain for user gui: ${uid}`,
+          )
+          ? observed
+          : null;
       }, 5_000);
       finding(
         'cleanup-absent',
@@ -671,6 +678,7 @@ async function main() {
       'sibling-read',
       'sibling-own-read',
       'sibling-cross-read',
+      'sibling-private-read',
       'outside-write',
       'outbound-tcp',
       'fork',
