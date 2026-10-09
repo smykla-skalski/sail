@@ -40,7 +40,8 @@ rerun after a provider or agent change repeats the same work deterministically.
 
 Each runner starts with a private home, XDG directories, temp directory, and
 evaluation seed. `forwardEnvironment` passes through other named host variables;
-it does not replace these isolated values, including Windows `TEMP` and `TMP`.
+it does not replace these isolated values, including Windows `USERPROFILE`,
+`TEMP`, and `TMP`.
 
 ## Scoring
 

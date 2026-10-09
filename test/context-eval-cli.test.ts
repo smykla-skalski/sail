@@ -113,6 +113,7 @@ void test('CLI keeps run directories private when host paths are forwarded', asy
       'XDG_DATA_HOME',
       'TEMP',
       'TMP',
+      'USERPROFILE',
     ];
     await writeFile(configPath, JSON.stringify(config));
 
@@ -138,6 +139,7 @@ void test('CLI keeps run directories private when host paths are forwarded', asy
           XDG_DATA_HOME: temporary,
           TEMP: temporary,
           TMP: temporary,
+          USERPROFILE: temporary,
         },
       },
     );

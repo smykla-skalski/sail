@@ -1,6 +1,7 @@
 param([Parameter(Mandatory = $true)][string]$SpecPath)
 
 $ErrorActionPreference = 'Stop'
+[Console]::Error.WriteLine('context eval supervisor: starting')
 
 Add-Type -TypeDefinition @'
 using System;
@@ -96,10 +97,12 @@ public static class ContextEvalJob
     }
 }
 '@ -Language CSharp
+[Console]::Error.WriteLine('context eval supervisor: job support loaded')
 
 $exitCode = 1
 try {
     [ContextEvalJob]::AssignCurrentProcess()
+    [Console]::Error.WriteLine('context eval supervisor: job assigned')
     $spec = Get-Content -LiteralPath $SpecPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $start = New-Object System.Diagnostics.ProcessStartInfo
     $start.FileName = [string]$spec.command
@@ -108,8 +111,10 @@ try {
     $start.UseShellExecute = $false
     $runner = [System.Diagnostics.Process]::Start($start)
     if ($null -eq $runner) { throw 'Cannot start context evaluation runner.' }
+    [Console]::Error.WriteLine('context eval supervisor: runner started')
     try {
         $runner.WaitForExit()
+        [Console]::Error.WriteLine('context eval supervisor: runner exited')
         $exitCode = $runner.ExitCode
     } finally {
         $runner.Dispose()

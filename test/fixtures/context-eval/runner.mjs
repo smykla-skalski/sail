@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import process from 'node:process';
 
@@ -17,7 +18,9 @@ assert.equal(process.env.SAIL_CONTEXT_EVAL_SEED, String(invocation.seed));
 for (const path of [
   process.env.HOME,
   process.env.TMPDIR,
-  ...(process.platform === 'win32' ? [process.env.TEMP, process.env.TMP] : []),
+  ...(process.platform === 'win32'
+    ? [process.env.USERPROFILE, process.env.TEMP, process.env.TMP, homedir()]
+    : []),
   process.env.XDG_CONFIG_HOME,
   process.env.XDG_CACHE_HOME,
   process.env.XDG_DATA_HOME,
