@@ -1,0 +1,79 @@
+export const memoryModes = ['off', 'sail', 'system'] as const;
+export type MemoryMode = (typeof memoryModes)[number];
+
+export const memoryKinds = [
+  'decision',
+  'constraint',
+  'discovery',
+  'preference',
+  'handoff',
+  'other',
+] as const;
+export type MemoryKind = (typeof memoryKinds)[number];
+
+export type MemoryRecord = {
+  id: string;
+  content: string;
+  kind: MemoryKind;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+  provenance: { agent?: string; sessionId?: string };
+  rating?: { value: -1 | 0 | 1; updatedAt: string };
+  forgottenAt?: string;
+};
+
+export type MemorySearchResult = { memory: MemoryRecord; score: number };
+
+export type MemoryStatus = {
+  mode: MemoryMode;
+  enabled: boolean;
+  projectKey: string;
+  count: number;
+  forgottenCount: number;
+};
+
+export type MemoryAgentStatus = {
+  id: 'claude' | 'codex' | 'opencode';
+  name: string;
+  detected: boolean;
+  installed: boolean;
+  healthy: boolean;
+  detail: string;
+};
+
+export type MemoryAgentInstallPreview = {
+  agent: MemoryAgentStatus['id'];
+  path: string;
+  before: string;
+  after: string;
+  changed: boolean;
+};
+
+export function parseMemoryMode(value: string | null | undefined): MemoryMode {
+  return value === 'sail' || value === 'system' ? value : 'off';
+}
+
+export function parseMemoryTags(value: string): string[] {
+  return [
+    ...new Set(
+      value
+        .split(',')
+        .map((tag) => tag.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+export function exportMemories(records: MemoryRecord[]): string {
+  return `${JSON.stringify(
+    {
+      format: 'sail-shared-memory',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      memories: records,
+    },
+    null,
+    2,
+  )}\n`;
+}

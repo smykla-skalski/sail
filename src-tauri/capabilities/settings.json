@@ -11,6 +11,7 @@
     "allow-install-memory-agent",
     "allow-install-memory-agents",
     "allow-uninstall-memory-agent",
+    "allow-save-setting",
     "allow-inspect-agent-hooks",
     "allow-inspect-hook-integration",
     "allow-enable-hook-integration",
