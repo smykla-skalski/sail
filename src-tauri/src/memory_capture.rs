@@ -63,11 +63,12 @@ impl TurnCapture {
         &self,
         status: &str,
         stop_reason: Option<&str>,
+        explicitly_cancelled: bool,
         directory: &str,
         agent: &str,
         session_id: &str,
     ) -> Vec<MemoryCaptureCandidate> {
-        if status != "done" || stop_reason != Some("end_turn") {
+        if explicitly_cancelled || status != "done" || stop_reason != Some("end_turn") {
             return Vec::new();
         }
         self.candidates(directory, agent, session_id)
@@ -193,6 +194,83 @@ fn classify(line: &str) -> Option<(&'static str, Option<&'static str>)> {
     None
 }
 
+fn is_refusal(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "i cannot provide",
+        "i can't provide",
+        "i cannot help",
+        "i can't help",
+        "i cannot comply",
+        "i can't comply",
+        "i am unable to",
+        "i'm unable to",
+        "i’m unable to",
+        "i must refuse",
+        "i refuse",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+}
+
+fn redact_sensitive_codes(line: &str) -> String {
+    const LABELS: [&str; 7] = [
+        "pin",
+        "passcode",
+        "otp",
+        "one-time code",
+        "one time code",
+        "recovery code",
+        "verification code",
+    ];
+    let lower = line.to_ascii_lowercase();
+    let bounded_label = |label: &str| {
+        lower.match_indices(label).find_map(|(index, _)| {
+            let before = lower[..index].chars().next_back();
+            let after = lower[index + label.len()..].chars().next();
+            (!before.is_some_and(char::is_alphanumeric)
+                && !after.is_some_and(char::is_alphanumeric))
+            .then_some(index)
+        })
+    };
+    let Some(label_start) = LABELS.iter().filter_map(|label| bounded_label(label)).min() else {
+        return line.to_string();
+    };
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (index, character) in line
+        .char_indices()
+        .filter(|(index, _)| *index >= label_start)
+    {
+        if character.is_ascii_digit() {
+            start.get_or_insert(index);
+        } else if let Some(value_start) = start.take() {
+            let digits = index - value_start;
+            if (4..=12).contains(&digits) {
+                ranges.push((value_start, index));
+            }
+        }
+    }
+    if let Some(value_start) = start {
+        let digits = line.len() - value_start;
+        if (4..=12).contains(&digits) {
+            ranges.push((value_start, line.len()));
+        }
+    }
+    if ranges.is_empty() {
+        return line.to_string();
+    }
+    let mut redacted = String::with_capacity(line.len());
+    let mut copied = 0;
+    for (start, end) in ranges {
+        redacted.push_str(&line[copied..start]);
+        redacted.push_str("[redacted]");
+        copied = end;
+    }
+    redacted.push_str(&line[copied..]);
+    redacted
+}
+
 fn truncate_chars(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         return value.to_string();
@@ -211,7 +289,10 @@ fn candidates(
     let mut redactor = crate::stderr_log::Redactor::default();
     for raw in text.lines() {
         let line = strip_marker(raw);
-        let redacted = redactor.redact(line, &[]);
+        let redacted = redact_sensitive_codes(&redactor.redact(line, &[]));
+        if is_refusal(line) {
+            continue;
+        }
         let Some((kind, broader_reason)) = classify(line) else {
             continue;
         };
@@ -301,11 +382,11 @@ mod tests {
         };
         for status in ["failed", "interrupted"] {
             assert!(capture
-                .completed_candidates(status, Some("end_turn"), "/repo", "codex", "session")
+                .completed_candidates(status, Some("end_turn"), false, "/repo", "codex", "session")
                 .is_empty());
         }
         assert!(TurnCapture::default()
-            .completed_candidates("done", Some("end_turn"), "/repo", "codex", "session")
+            .completed_candidates("done", Some("end_turn"), false, "/repo", "codex", "session")
             .is_empty());
     }
 
@@ -325,7 +406,7 @@ mod tests {
         for (name, stop_reason) in cases {
             assert!(
                 capture
-                    .completed_candidates("done", stop_reason, "/repo", "codex", "session")
+                    .completed_candidates("done", stop_reason, false, "/repo", "codex", "session")
                     .is_empty(),
                 "{name}"
             );
@@ -340,9 +421,64 @@ mod tests {
         };
         assert_eq!(
             capture
-                .completed_candidates("done", Some("end_turn"), "/repo", "codex", "session")
+                .completed_candidates("done", Some("end_turn"), false, "/repo", "codex", "session")
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn explicitly_cancelled_completion_produces_nothing() {
+        let capture = TurnCapture {
+            text: "Decision: We chose SQLite.".into(),
+            overflow: false,
+        };
+
+        let candidates = capture.completed_candidates(
+            "done",
+            Some("end_turn"),
+            true,
+            "/repo",
+            "codex",
+            "session",
+        );
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn numeric_recovery_codes_are_redacted_and_require_confirmation() {
+        let capture = TurnCapture {
+            text: "Decision: Our recovery PIN is 123456.".into(),
+            overflow: false,
+        };
+
+        let candidates = capture.candidates("/repo", "codex", "session");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].confirmation_reason, Some("sensitive"));
+        assert_eq!(
+            candidates[0].content,
+            "Decision: Our recovery PIN is [redacted]."
+        );
+    }
+
+    #[test]
+    fn refusal_language_is_never_captured() {
+        let capture = TurnCapture {
+            text: "Constraint: I cannot provide that information.".into(),
+            overflow: false,
+        };
+
+        let candidates = capture.completed_candidates(
+            "done",
+            Some("end_turn"),
+            false,
+            "/repo",
+            "codex",
+            "session",
+        );
+
+        assert!(candidates.is_empty());
     }
 }

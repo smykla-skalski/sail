@@ -3549,8 +3549,8 @@ pub async fn acp_prompt(
         let explicitly_cancelled = runtime
             .cancelled_prompts
             .lock()
-            .map(|mut cancelled| cancelled.remove(&turn_id))
-            .unwrap_or(false);
+            .map(|cancelled| cancelled.contains(&turn_id))
+            .unwrap_or(true);
         let cancelled_result = result
             .as_ref()
             .ok()
@@ -3647,6 +3647,7 @@ pub async fn acp_prompt(
                     prompt.memory_capture.completed_candidates(
                         status,
                         stop_reason,
+                        explicitly_cancelled,
                         &directory.to_string_lossy(),
                         &agent,
                         &session_id,
@@ -3654,6 +3655,9 @@ pub async fn acp_prompt(
                 })
             })
             .unwrap_or_default();
+        if let Ok(mut cancelled) = runtime.cancelled_prompts.lock() {
+            cancelled.remove(&turn_id);
+        }
         crate::memory_capture::store_completed(&app, candidates);
         let latest = if let Ok(mut prompts) = runtime.prompt_state.lock() {
             if prompts
