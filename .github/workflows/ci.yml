@@ -58,6 +58,24 @@ jobs:
           npm test
           npm run build
 
+  context-eval-windows:
+    name: Context eval (windows-2022)
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test runner containment
+        run: node --test test/context-eval-cli.test.ts
+
   rust:
     name: Rust (${{ matrix.os }})
     needs: changes

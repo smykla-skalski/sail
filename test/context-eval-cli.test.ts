@@ -46,6 +46,8 @@ function contextEvalConfig(runner: string, unsafe: boolean): string {
         args: [
           runner,
           ...(unsafe ? ['--unsafe'] : []),
+          '--literal',
+          'space "quote" trailing\\',
           '--input',
           '{input}',
           '--output',
@@ -276,71 +278,67 @@ void test(
   },
 );
 
-void test(
-  'failed runners stop same-group descendants before returning an error',
-  { skip: process.platform === 'win32' },
-  async () => {
-    const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
-    const childPids: number[] = [];
-    try {
-      const configPath = join(temporary, 'config.json');
-      const outputPath = join(temporary, 'output');
-      const runner = join(root, 'test/fixtures/context-eval/runner.mjs');
-      await writeFile(
-        configPath,
-        JSON.stringify({
-          ...JSON.parse(contextEvalConfig(runner, false)),
-          runners: [
-            {
-              provider: 'codex',
-              command: process.execPath,
-              args: [
-                runner,
-                '--spawn-trapped-descendant',
-                '--exit-after-spawn',
-                '--input',
-                '{input}',
-                '--output',
-                '{output}',
-              ],
-            },
-          ],
-          concurrency: 1,
-        }),
-      );
-
-      await assert.rejects(
-        () =>
-          execute(
-            process.execPath,
-            [
-              join(root, 'scripts/run-context-eval.mjs'),
-              '--tasks',
-              join(root, 'test/fixtures/context-eval/tasks-v1.json'),
-              '--config',
-              configPath,
+void test('failed runners stop descendants before returning an error', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
+  const childPids: number[] = [];
+  try {
+    const configPath = join(temporary, 'config.json');
+    const outputPath = join(temporary, 'output');
+    const runner = join(root, 'test/fixtures/context-eval/runner.mjs');
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...JSON.parse(contextEvalConfig(runner, false)),
+        runners: [
+          {
+            provider: 'codex',
+            command: process.execPath,
+            args: [
+              runner,
+              '--spawn-trapped-descendant',
+              '--exit-after-spawn',
+              '--input',
+              '{input}',
               '--output',
-              outputPath,
+              '{output}',
             ],
-            { cwd: root, timeout: 15_000 },
-          ),
-        /exited with 1/,
-      );
-      const runDirectories = await readdir(join(outputPath, 'runs'));
-      const childPid = Number(
-        await readFile(
-          join(outputPath, 'runs', runDirectories[0], 'observation.json.child-pid'),
-          'utf8',
+          },
+        ],
+        concurrency: 1,
+      }),
+    );
+
+    await assert.rejects(
+      () =>
+        execute(
+          process.execPath,
+          [
+            join(root, 'scripts/run-context-eval.mjs'),
+            '--tasks',
+            join(root, 'test/fixtures/context-eval/tasks-v1.json'),
+            '--config',
+            configPath,
+            '--output',
+            outputPath,
+          ],
+          { cwd: root, timeout: 15_000 },
         ),
-      );
-      childPids.push(childPid);
-      const heartbeat = join(outputPath, 'runs', runDirectories[0], 'observation.json.heartbeat');
-      const before = await readFile(heartbeat, 'utf8');
-      await new Promise((settled) => setTimeout(settled, 200));
-      assert.equal(await readFile(heartbeat, 'utf8'), before);
-    } finally {
-      childPids.forEach(stopFixtureChild);
-      await rm(temporary, { recursive: true, force: true });
-    }
-  },
-);
+      /exited with 1/,
+    );
+    const runDirectories = await readdir(join(outputPath, 'runs'));
+    const childPid = Number(
+      await readFile(
+        join(outputPath, 'runs', runDirectories[0], 'observation.json.child-pid'),
+        'utf8',
+      ),
+    );
+    childPids.push(childPid);
+    const heartbeat = join(outputPath, 'runs', runDirectories[0], 'observation.json.heartbeat');
+    const before = await readFile(heartbeat, 'utf8');
+    await new Promise((settled) => setTimeout(settled, 200));
+    assert.equal(await readFile(heartbeat, 'utf8'), before);
+  } finally {
+    childPids.forEach(stopFixtureChild);
+    await rm(temporary, { recursive: true, force: true });
+  }
+});

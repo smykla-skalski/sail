@@ -76,10 +76,12 @@ gate but stay in the report.
 ## Runner timeouts
 
 When a runner times out or exits with an error, the harness stops its runner
-process group and any other active runner groups. On macOS and Linux, a
-descendant that creates a separate process group can outlive this cleanup. Use
-a host-level process supervisor for runner adapters that launch detached jobs.
-The harness does not claim containment of those jobs.
+and any other active runners. On Windows, a supervisor assigns itself to a Job
+Object before launching the runner; closing the supervisor ends its descendants.
+If the Job Object cannot be established, the runner never starts. On macOS and
+Linux, the harness stops process groups. A descendant that creates a separate
+process group can outlive that cleanup; use a host-level supervisor for adapters
+that launch detached jobs.
 
 ## Baseline coordination
 

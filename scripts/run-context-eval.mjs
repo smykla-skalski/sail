@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import {
   assertContextEvalCoverage,
@@ -60,6 +61,26 @@ const outputRoot = resolve(outputPath);
 await mkdir(outputRoot);
 await mkdir(join(outputRoot, 'runs'));
 const activeRunners = new Set();
+const windowsRunnerScript = fileURLToPath(
+  new URL('./context-eval-windows-runner.ps1', import.meta.url),
+);
+
+function quoteWindowsArgument(argument) {
+  if (argument && !/[\s"]/.test(argument)) return argument;
+  let quoted = '"';
+  let backslashes = 0;
+  for (const character of argument) {
+    if (character === '\\') {
+      backslashes += 1;
+    } else {
+      quoted += '\\'.repeat(backslashes * (character === '"' ? 2 : 1));
+      if (character === '"') quoted += '\\';
+      quoted += character;
+      backslashes = 0;
+    }
+  }
+  return `${quoted}${'\\'.repeat(backslashes * 2)}"`;
+}
 
 function isolatedEnvironment(runDirectory, runner, seed) {
   const environment = {
@@ -108,12 +129,37 @@ async function execute(invocation) {
   if (!runner.args.some((argument) => argument.includes('{output}')))
     throw new Error(`${runner.provider} runner args must include {output}.`);
 
-  const child = spawn(runner.command, args, {
+  let command = runner.command;
+  let launchArgs = args;
+  if (process.platform === 'win32') {
+    const spec = join(runDirectory, 'windows-runner.json');
+    await writeFile(
+      spec,
+      JSON.stringify({
+        command: runner.command,
+        arguments: args.map(quoteWindowsArgument).join(' '),
+        cwd: runDirectory,
+      }),
+      { flag: 'wx', mode: 0o600 },
+    );
+    command = 'powershell.exe';
+    launchArgs = [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-File',
+      windowsRunnerScript,
+      '-SpecPath',
+      spec,
+    ];
+  }
+  const child = spawn(command, launchArgs, {
     cwd: runDirectory,
     env: isolatedEnvironment(runDirectory, runner, invocation.seed),
     stdio: ['ignore', 'inherit', 'inherit'],
     shell: false,
     detached: process.platform !== 'win32',
+    windowsHide: true,
   });
   await new Promise((resolveRun, rejectRun) => {
     const killRunner = (signal) => {
