@@ -31,6 +31,7 @@
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
   import { isPlanTool } from './lib/plan-engine';
   import { openCodeSessionId, sameThreadId } from './lib/thread-id';
+  import { withAutomaticMemoryRecall } from './lib/memory-recall';
   import { nativePlanUpdate, type NativePlan } from './lib/native-plan';
   import {
     loadNativePlan,
@@ -5369,8 +5370,14 @@
       }
       if (await reconcileDurableAcpTurn(receipt, sessionId, true)) return;
       requireSpawnPromptDispatch(receipt.receiptId);
+      const recalledPrompt = await withAutomaticMemoryRecall({
+        directory: receipt.targetDirectory,
+        prompt: receipt.prompt,
+        query: receipt.prompt,
+        sessionKey: `acp:${receipt.provider}:${sessionId}`,
+      });
       const turn = dispatchAuthorizedDirectShipPrompt(authorization, () =>
-        acp.prompt(receipt.provider, sessionId, receipt.prompt!, receipt.turnId!),
+        acp.prompt(receipt.provider, sessionId, recalledPrompt, receipt.turnId!),
       );
       activeSpawnTargets.set(receipt.targetId, receipt.receiptId);
       void turn.then(
@@ -5624,6 +5631,12 @@
         const tracking = await beginImplementationTurn(thread.directory, thread.model, target.id);
         updateAgentThreadStatus(thread, 'working');
         const turnId = crypto.randomUUID();
+        const recalledText = await withAutomaticMemoryRecall({
+          directory: thread.directory,
+          prompt: text,
+          query: text,
+          sessionKey: `acp:${thread.agent}:${thread.sessionId}`,
+        });
         const owner = shippingOwnerForCoordination(target);
         let shippingReceipt: SpawnReceipt | undefined;
         if (owner) {
@@ -5659,11 +5672,11 @@
                 saveSpawnReceipt(originalReceipt);
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
-              () => acp.prompt(thread.agent, thread.sessionId, text, turnId),
+              () => acp.prompt(thread.agent, thread.sessionId, recalledText, turnId),
             );
             turn = started.turn;
             activeSpawnTargets.set(target.id, shippingReceipt.receiptId);
-          } else turn = acp.prompt(thread.agent, thread.sessionId, text, turnId);
+          } else turn = acp.prompt(thread.agent, thread.sessionId, recalledText, turnId);
         } catch {
           abandonImplementationTurn(thread.directory, tracking);
           return;
@@ -7514,8 +7527,14 @@
       }
       await beforePrompt?.();
       if (receiptId) requireSpawnPromptDispatch(receiptId);
+      const recalledPrompt = await withAutomaticMemoryRecall({
+        directory: created.path,
+        prompt,
+        query: prompt,
+        sessionKey: `acp:${source.agent}:${session.sessionId}`,
+      });
       const turn = dispatchAuthorizedDirectShipPrompt(promptAuthorization, () =>
-        acp.prompt(source.agent, session.sessionId, prompt, turnId),
+        acp.prompt(source.agent, session.sessionId, recalledPrompt, turnId),
       );
       if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', dispatchPending: false });
       if (receiptId)
@@ -10524,7 +10543,13 @@
             `Previous user request:\n${turn.text}`,
             'Inspect the current worktree and transcript before rerunning tools. Keep completed changes, rerun unfinished commands, and finish the request.',
           ].join('\n\n');
-          const continued = acp.prompt(turn.agent, turn.sessionId, prompt, turn.turnId);
+          const recalledPrompt = await withAutomaticMemoryRecall({
+            directory: turn.directory,
+            prompt,
+            query: turn.text,
+            sessionKey: `acp:${turn.agent}:${turn.sessionId}`,
+          });
+          const continued = acp.prompt(turn.agent, turn.sessionId, recalledPrompt, turn.turnId);
           void (async () => {
             try {
               const outcome = await continued;
