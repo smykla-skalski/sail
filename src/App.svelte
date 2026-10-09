@@ -10224,13 +10224,19 @@
     );
   }
 
+  function hasActiveAgentSessions(message: string) {
+    return message.startsWith('Worktree has active agent sessions');
+  }
+
   async function deleteProjectWorktreeOnce(
     repository: string,
     path: string,
     branch: string,
     force: boolean,
+    stopAgents = false,
   ) {
     let retryForce = false;
+    let retryStop = false;
     let config: WorktreeConfig | null;
     try {
       config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
@@ -10246,7 +10252,7 @@
       import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
     if (e2eAnswer) sessionStorage.removeItem('sai-e2e-delete-worktree');
     const confirmed =
-      e2eAnswer === 'Yes'
+      stopAgents || e2eAnswer === 'Yes'
         ? true
         : e2eAnswer === 'No'
           ? false
@@ -10265,7 +10271,7 @@
       [path]: config?.archive ? 'Archiving' : 'Preparing deletion',
     };
     try {
-      if (config?.archive) {
+      if (config?.archive && !stopAgents) {
         if (!wasSelected) await loadProject(path);
         const paneId = splitFocusedPane('row', 'terminal', config.archive);
         if (!paneId) return;
@@ -10299,6 +10305,7 @@
             force: force || !!config,
             expectedRevision: null,
             expectedBranch: null,
+            ...(stopAgents ? { stopAgents: true } : {}),
           },
         }),
       );
@@ -10329,7 +10336,10 @@
     } catch (cause) {
       if (wasSelected && directory === repository) await loadProject(path);
       const deletionError = describe(cause);
-      if (!force && needsForceDelete(deletionError)) {
+      if (!stopAgents && hasActiveAgentSessions(deletionError)) {
+        error = '';
+        retryStop = true;
+      } else if (!force && needsForceDelete(deletionError)) {
         error = '';
         retryForce = true;
       } else error = deletionError;
@@ -10338,7 +10348,15 @@
       delete remaining[path];
       worktreeDeletions = remaining;
     }
-    if (retryForce) await deleteProjectWorktreeOnce(repository, path, branch, true);
+    if (retryStop) {
+      const stopConfirmed = await confirmInApp(
+        'Agent is running',
+        `An agent is still running in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
+        'Stop agent and delete',
+        { destructive: true },
+      );
+      if (stopConfirmed) await deleteProjectWorktreeOnce(repository, path, branch, true, true);
+    } else if (retryForce) await deleteProjectWorktreeOnce(repository, path, branch, true);
   }
 
   let closingWorktree: string | null = null;
