@@ -129,6 +129,9 @@ void test('requires at least one measured activity counter', () => {
   );
   assert.doesNotThrow(() => taskEconomicsSchema.parse({ ...empty, failedCommands: 1 }));
   assert.doesNotThrow(() => taskEconomicsSchema.parse(syntheticCiEconomics()));
+  assert.doesNotThrow(() =>
+    taskEconomicsSchema.parse({ ...emptyTaskEconomics('primary', 'publish'), turns: 1 }),
+  );
 });
 
 void test('does not report accepted economics when acceptance evidence lacks metrics', () => {

@@ -53,9 +53,9 @@ void test('progressive skills keep references discoverable without injecting the
 void test('ship-it uses one bounded convergence contract across delivery phases', () => {
   assert.match(
     shipItCore,
-    /Before validation, read \[references\/convergence\.md\]\(references\/convergence\.md\) and \[references\/convergence-policy\.json\]/,
+    /read \[references\/convergence\.md\]\(references\/convergence\.md\) only after failure, recovery or exhaustive opt-in/,
   );
-  assert.match(shipItCore, /validation exceeds the convergence budget/);
+  assert.match(shipItCore, /delivery blocker survives the convergence budget/);
   assert.match(prLoop, /consumes its remaining fix\/cycle budget/);
   assert.match(prLoop, /Never reset its counters for CI or hosted feedback/);
 
@@ -73,29 +73,26 @@ void test('ship-it uses one bounded convergence contract across delivery phases'
     'security',
     'data-loss',
     'destructive-concurrency',
-    'unresolved-acceptance',
   ]);
   assert.equal(bounded.later_non_blocking_findings, 'follow-up-issue');
 
-  assert.match(
-    convergence,
-    /one Code Adversary pass followed by one independent Findings challenge/,
-  );
+  assert.match(convergence, /A review cycle is one clean-context Code Adversary pass/);
+  assert.match(convergence, /Findings Adversary runs only when that pass reports/);
   assert.match(convergence, /at most one fix pass/);
   assert.match(
     convergence,
     /complete local quality gate once against the final candidate revision/,
   );
-  assert.match(convergence, /a second review cycle or 90 elapsed minutes would be exceeded/);
-  assert.match(convergence, /convert later non-blocking findings into follow-up issues/);
-  assert.match(convergence, /repository-required check, mandatory human approval/);
+  assert.match(convergence, /Start the second and final review cycle only when/);
+  assert.match(convergence, /Every other finding, whatever its label, becomes a follow-up issue/);
+  assert.match(convergence, /failing repository-required check or missing mandatory human review/);
 });
 
 void test('exhaustive review is explicit and Copilot is never a delivery gate', () => {
   assert.equal(convergencePolicy.modes.exhaustive.activation, 'explicit-user-request');
   assert.match(
     convergence,
-    /only when the user's current request explicitly asks for exhaustive review/,
+    /only when the user's own message in the current request explicitly asks for exhaustive review/,
   );
   assert.match(convergence, /never bypasses repository checks/);
   assert.match(convergence, /Never wait for Copilot/);

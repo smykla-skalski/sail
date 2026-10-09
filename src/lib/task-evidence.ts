@@ -22,6 +22,19 @@ const evidenceStorageLimit = 200;
 export const evidenceResults = ['passed', 'failed', 'pending', 'blocked'] as const;
 export type EvidenceResult = (typeof evidenceResults)[number];
 
+const visibleTextPattern =
+  /[^\p{White_Space}\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Cs}\p{Cn}\u2800\u3164\uFFA0]/u;
+const concreteTextSchema = z
+  .string()
+  .min(1)
+  .max(2000)
+  .refine((value) => visibleTextPattern.test(value), 'Must contain visible text.');
+export const untestedCriterionSchema = z.object({
+  criterion: concreteTextSchema,
+  blocker: concreteTextSchema,
+});
+export type UntestedCriterion = z.infer<typeof untestedCriterionSchema>;
+
 export const taskEvidenceSchema = z
   .object({
     id: z.string().min(1).max(200),
@@ -34,6 +47,7 @@ export const taskEvidenceSchema = z
     sequence: z.number().int().positive().max(maxEconomicsCounter).optional(),
     outputReference: z.string().min(1).max(2000),
     criteria: z.array(z.string().min(1).max(2000)).max(100),
+    untestedCriteria: z.array(untestedCriterionSchema).max(100).optional(),
     economics: taskEconomicsSchema.optional(),
     identityUncertain: z.boolean().optional(),
     reconciliationKey: z.string().length(16).optional(),
@@ -43,6 +57,25 @@ export const taskEvidenceSchema = z
   })
   .strict()
   .superRefine((evidence, context) => {
+    if (evidence.untestedCriteria?.length) {
+      if (
+        evidence.kind !== 'gate' ||
+        evidence.name !== 'test-adversary' ||
+        evidence.result !== 'passed'
+      )
+        context.addIssue({
+          code: 'custom',
+          path: ['untestedCriteria'],
+          message: 'Untested criteria require a passing test-adversary gate.',
+        });
+      for (const { criterion } of evidence.untestedCriteria)
+        if (!evidence.criteria.includes(criterion))
+          context.addIssue({
+            code: 'custom',
+            path: ['untestedCriteria'],
+            message: 'Every untested criterion must appear in the gate criteria.',
+          });
+    }
     if (
       evidence.kind === 'command' &&
       evidence.result === 'failed' &&
@@ -105,6 +138,7 @@ export type EvidenceReadiness = {
   failedCommands: string[];
   pendingCommands: string[];
   unverifiedCriteria: string[];
+  untestedCriteria: UntestedCriterion[];
   reason: string | null;
 };
 
@@ -1269,6 +1303,7 @@ export function evidenceReadiness(
       failedCommands: [],
       pendingCommands: [],
       unverifiedCriteria: [...acceptanceCriteria],
+      untestedCriteria: [],
       reason: revision
         ? 'Evidence for the current revision is missing or stale.'
         : 'Revision unknown.',
@@ -1297,10 +1332,10 @@ export function evidenceReadiness(
         .map((entry) => entry.name),
     ),
   ];
-  const verified = new Set(
-    latest.filter((entry) => entry.result === 'passed').flatMap((entry) => entry.criteria),
-  );
-  const unverifiedCriteria = acceptanceCriteria.filter((criterion) => !verified.has(criterion));
+  const passing = latest.filter((entry) => entry.result === 'passed');
+  const untestedCriteria = passing.flatMap((entry) => entry.untestedCriteria ?? []);
+  const satisfied = new Set(passing.flatMap((entry) => entry.criteria));
+  const unverifiedCriteria = acceptanceCriteria.filter((criterion) => !satisfied.has(criterion));
   const reason = failedCommands.length
     ? `Command evidence failed: ${failedCommands.join(', ')}.`
     : failedGates.length
@@ -1323,6 +1358,7 @@ export function evidenceReadiness(
     failedCommands,
     pendingCommands,
     unverifiedCriteria,
+    untestedCriteria,
     reason,
   };
 }

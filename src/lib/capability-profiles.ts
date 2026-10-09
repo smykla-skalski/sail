@@ -4,6 +4,58 @@ export const capabilityProfiles = ['explore', 'review', 'build', 'release'] as c
 export type CapabilityProfile = (typeof capabilityProfiles)[number];
 export type CapabilityRisk = 'low' | 'medium' | 'high' | 'unknown';
 
+const coreCapabilityTools = new Set([
+  'sail_skill',
+  'skill_reference',
+  'worktree_list',
+  'worktree_info',
+  'agent_status',
+  'agent_wait',
+  'agent_result',
+  'terminal_list',
+  'terminal_read',
+  'terminal_wait',
+  'worktree_status',
+  'project_threads',
+  'read_page',
+  'screenshot',
+  'task_checkpoint_read',
+  'task_checkpoint_update',
+  'ship_progress',
+  'sail_plan_propose',
+  'sail_plan_ask',
+  'sail_plan_step',
+  'sail_plan_amend',
+]);
+
+export function capabilityProfileEnablesTool(profile: CapabilityProfile, tool: string): boolean {
+  if (coreCapabilityTools.has(tool)) return true;
+  if (profile === 'build') return true;
+  if (profile === 'review') return tool === 'validation_gate';
+  if (profile === 'release')
+    return [
+      'terminal_create',
+      'terminal_write',
+      'terminal_stop',
+      'thread_message',
+      'navigate',
+      'click',
+      'type',
+      'run_script',
+    ].includes(tool);
+  return false;
+}
+
+export function intersectCapabilityProfiles(
+  sessionEnvelope: CapabilityProfile,
+  phaseProfile: CapabilityProfile,
+): CapabilityProfile {
+  if (sessionEnvelope === phaseProfile) return sessionEnvelope;
+  if (sessionEnvelope === 'build') return phaseProfile;
+  if (phaseProfile === 'build') return sessionEnvelope;
+  return 'explore';
+}
+
 export const capabilityPolicyRevision = capabilityPolicy.revision;
 
 export function capabilityProfileFromMetadata(
@@ -527,8 +579,16 @@ export function automaticPermissionPolicy(
 export function capabilityProfileForPhase(phase?: string): CapabilityProfile {
   if (phase === 'explore') return 'explore';
   if (phase === 'review' || phase === 'test') return 'review';
-  if (phase === 'pr' || phase === 'complete') return 'release';
+  if (phase === 'publish' || phase === 'pr' || phase === 'complete') return 'release';
   return 'build';
+}
+
+export function capabilityProfileForSession(
+  saved: CapabilityProfile | undefined,
+  requested: CapabilityProfile,
+  existing: boolean,
+): CapabilityProfile {
+  return existing ? (saved ?? 'build') : requested;
 }
 
 export function permissionDecisionTitle(

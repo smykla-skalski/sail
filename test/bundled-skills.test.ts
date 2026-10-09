@@ -28,9 +28,9 @@ function filesOnDisk(skill: string): string[] {
   return ['references', 'scripts'].flatMap((directory) => {
     const path = skillPath(skill, `${directory}/`);
     if (!existsSync(path)) return [];
-    return readdirSync(path)
-      .filter((name) => !name.startsWith('.'))
-      .map((name) => (directory === 'scripts' ? `scripts/${name}` : name));
+    return readdirSync(path, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
+      .map((entry) => (directory === 'scripts' ? `scripts/${entry.name}` : entry.name));
   });
 }
 
@@ -114,7 +114,7 @@ void test('Vite loads bundled-skills.ts with each skill on its own core', async 
 void test('the bundled ship-it records which upstream release it matches', () => {
   assert.match(
     shipItCore,
-    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.20 with Sail mode/,
+    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.35 with Sail mode/,
   );
 });
 
@@ -126,7 +126,9 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   assert.match(prompt, /`task_checkpoint_update`/);
   assert.match(prompt, /`task_evidence_record`/);
   assert.match(prompt, /`validation_gate`/);
-  assert.match(prompt, /Available references: inputs\.md, .*scripts\/telemetry\.py\./);
+  assert.match(prompt, /Available references: inputs\.md, .*scripts\/test_telemetry\.py\./);
+  assert.match(prompt, /publish\.md/);
+  assert.match(prompt, /scripts\/bookkeeping\.py/);
   assert.doesNotMatch(prompt, /# Durable ship-it checkpoint/);
   assert.match(shipItCore, /They extend the phases, hard stops and references\./);
 
@@ -200,6 +202,7 @@ void test('Sail mode names only Ship tool fields and values the tools accept', (
       bridge,
     );
   assert.ok(schema, 'ship_progress schema not found');
+  assert.match(bridge, /"untestedCriteria":\{"type":"array"/);
   const evidenceFields = /"task_evidence_record",\s*"[^"]*",\s*"([^"]+)"/.exec(bridge);
   assert.ok(evidenceFields, 'task_evidence_record fields not found');
   const evidence = sailModeRule('Evidence');

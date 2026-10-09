@@ -26,6 +26,23 @@ export type ManualPermissionRequest = PermissionRequestBase & {
   record: (optionId: string | null) => void;
 };
 
+export function permissionChoiceForPolicy(
+  policy: PermissionPolicyDecision,
+  options: { optionId: string; kind: string }[],
+  optionId: string | null,
+): string | null {
+  const selected = options.find((option) => option.optionId === optionId);
+  if (policy.recommendation !== 'deny' || optionId === null || selected?.kind.startsWith('reject'))
+    return optionId;
+  return (
+    options.find(
+      (option) => option.optionId === policy.optionId && option.kind.startsWith('reject'),
+    )?.optionId ??
+    options.find((option) => option.kind.startsWith('reject'))?.optionId ??
+    null
+  );
+}
+
 export class AutomaticPermissionResolver {
   readonly #inFlight = new Map<string, Promise<boolean>>();
   readonly #completed = new Set<string>();

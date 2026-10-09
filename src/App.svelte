@@ -80,6 +80,7 @@
     commitRevisionBoundValidation,
     rollbackValidationIssue,
     rollbackValidationReceipt,
+    gateVerdictPassed,
     validateGateVerdict,
     validationRevisionDrifted,
   } from './lib/ship-progress';
@@ -186,8 +187,10 @@
   } from './lib/context-handoff.ts';
   import {
     automaticPermissionPolicy,
+    capabilityProfileEnablesTool,
     capabilityProfileForPhase,
     capabilityProfileFromMetadata,
+    intersectCapabilityProfiles,
     permissionDecisionTitle,
     permissionOutcome,
     permissionReadResources,
@@ -286,6 +289,7 @@
   } from './lib/implementation-models';
   import {
     assertAutomaticPermissionAllowed,
+    permissionChoiceForPolicy,
     permissionResolver,
     type AutomaticPermissionRequest,
   } from './lib/permission-resolution';
@@ -604,11 +608,14 @@
   let shipRuns = $state<ShipRun[]>(initialShipRuns);
   let shipArchiveNotice = $state(initialShipArchiveNotice);
 
-  function capabilityProfileForDirectory(path: string): CapabilityProfile {
-    const issue = shipRuns
-      .flatMap((run) => run.issues)
-      .find((candidate) => candidate.path === path);
-    return capabilityProfileForPhase(issue?.checkpoint?.phase);
+  function capabilityProfileForShipThread(path: string, threadId?: string): CapabilityProfile {
+    if (!threadId) return 'build';
+    const owner = shipCheckpointOwner(
+      shipRuns.filter((run) => !shipRunArchived(run)),
+      path,
+      threadId,
+    );
+    return capabilityProfileForPhase(owner?.issue.checkpoint?.phase);
   }
 
   function capabilityProfileForAcpSession(
@@ -622,9 +629,62 @@
         (thread) =>
           thread.agent === agent && thread.directory === path && thread.sessionId === sessionId,
       )?.capabilityProfile ??
+      nativeChildThreads.find(
+        (thread) =>
+          thread.agent === agent && thread.directory === path && thread.sessionId === sessionId,
+      )?.capabilityProfile ??
       fallback ??
-      capabilityProfileForDirectory(path)
+      'build'
     );
+  }
+
+  function effectiveCapabilityProfileForAcpSession(
+    agent: AgentId,
+    path: string,
+    sessionId: string,
+    fallback?: CapabilityProfile,
+  ): CapabilityProfile {
+    return intersectCapabilityProfiles(
+      capabilityProfileForAcpSession(agent, path, sessionId, fallback),
+      capabilityProfileForShipThread(path, receiptSourceId(agent, sessionId)),
+    );
+  }
+
+  function liveInboxPermissionPolicy(item: InboxItem, thread?: AgentThread) {
+    if (item.kind !== 'acp-permission') return item.policy;
+    const owner =
+      thread ??
+      [...agentThreads, ...nativeChildThreads].find(
+        (entry) =>
+          entry.agent === item.agentId &&
+          entry.sessionId === item.sessionId &&
+          entry.directory === item.directory,
+      );
+    if (!owner) return item.policy;
+    return automaticPermissionPolicy({
+      profile: effectiveCapabilityProfileForAcpSession(
+        owner.agent,
+        owner.directory,
+        owner.sessionId,
+        owner.capabilityProfile,
+      ),
+      workspace: owner.directory,
+      title: item.permissionTitle ?? item.text,
+      toolCall: item.permissionToolCall,
+      options: item.options ?? [],
+      resourceTrust: item.permissionResourceTrust,
+    });
+  }
+
+  function withLiveInboxPermissionPolicy(item: InboxItem): InboxItem {
+    const policy = liveInboxPermissionPolicy(item);
+    if (item.kind !== 'acp-permission' || !policy) return item;
+    return {
+      ...item,
+      policy,
+      allow: policy.recommendation !== 'deny',
+      text: permissionDecisionTitle(item.permissionTitle ?? item.text, policy),
+    };
   }
   let shippingBusy = $state(false);
   const activeShipLaunches = new SvelteSet<string>();
@@ -711,7 +771,8 @@
       | 'worktree_info'
       | 'worktree_status'
       | 'project_threads'
-      | 'thread_message';
+      | 'thread_message'
+      | 'capability_check';
     arguments: Record<string, unknown>;
     expiresAt: number;
   };
@@ -1024,6 +1085,7 @@
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
   let mergeOwner = $state<MergeOwner>(parseMergeOwner(getSetting('sai-ship-merge-owner')));
   let inboxItems = $state<InboxItem[]>([]);
+  let liveInboxItems = $derived(inboxItems.map(withLiveInboxPermissionPolicy));
   let attentionLedger = $state<AttentionLedger>(
     loadAttentionLedger(getSetting('sai-attention-ledger')),
   );
@@ -1035,7 +1097,7 @@
     issueId: string;
     focus: 'issue' | 'pull-request';
   } | null>(null);
-  let sessionAttention = $derived(sessionRequestCandidates(inboxItems));
+  let sessionAttention = $derived(sessionRequestCandidates(liveInboxItems));
   let attentionView = $derived(
     applyAttentionLifecycle(
       attentionLedger,
@@ -1558,7 +1620,7 @@
       );
   }
   const subagentControl = $derived<SubagentControl>({
-    permissions: inboxItems,
+    permissions: liveInboxItems,
     answered: answeredPermissions,
     shipOwned: shipOwnedThreads,
     ondecide: decideInbox,
@@ -5548,8 +5610,7 @@
             sessionCapabilities &&
             typeof sessionCapabilities === 'object' &&
             'resume' in sessionCapabilities;
-          const capabilityProfile =
-            thread.capabilityProfile ?? capabilityProfileForDirectory(thread.directory);
+          const capabilityProfile = thread.capabilityProfile ?? 'build';
           if (canResume)
             await acp.resume(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
           else await acp.load(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
@@ -5709,6 +5770,20 @@
     if (!project) throw new Error('This worktree is not in the Sail project catalog.');
     const source = await coordinationSource(request);
     const sourceId = `acp:${source.agent}:${request.sessionId}`;
+    const effectiveProfile = effectiveCapabilityProfileForAcpSession(
+      source.agent,
+      request.directory,
+      request.sessionId,
+    );
+    const requestedTool =
+      request.name === 'capability_check' && typeof request.arguments.tool === 'string'
+        ? request.arguments.tool
+        : request.name;
+    if (!capabilityProfileEnablesTool(effectiveProfile, requestedTool))
+      throw new Error(
+        `${requestedTool} is unavailable under the ${effectiveProfile} capability profile.`,
+      );
+    if (request.name === 'capability_check') return { profile: effectiveProfile };
     if (isPlanTool(request.name)) {
       return acpPlans().runTool(
         { agent: source.agent, directory: request.directory, sessionId: request.sessionId },
@@ -6369,6 +6444,7 @@
     provider: string,
     model: string | null,
     criteria: string[] | undefined,
+    untestedCriteria: import('./lib/task-evidence').UntestedCriterion[] | undefined,
     outputReference: string | undefined,
     fallbackReference: string,
     expectedRevision: unknown,
@@ -6384,6 +6460,15 @@
     requireEvidenceRevision(expectedRevision, revision);
     if (owner.issue.checkpoint.revision !== revision)
       throw new Error('Bind the task checkpoint to the current revision before reporting a gate.');
+    const reportedCriteria = [
+      ...(criteria ?? []),
+      ...(untestedCriteria ?? []).map(({ criterion }) => criterion),
+    ];
+    const unknownCriterion = reportedCriteria.find(
+      (criterion) => !owner.issue.checkpoint!.acceptanceCriteria.includes(criterion),
+    );
+    if (unknownCriterion)
+      throw new Error(`Gate evidence named an unknown acceptance criterion: ${unknownCriterion}`);
     const evidenceId = evidenceIdentity?.id ?? crypto.randomUUID();
     const evidenceSequence =
       evidenceIdentity?.sequence ?? nextTaskEvidenceSequence(owner.issue.evidenceManifests ?? []);
@@ -6397,11 +6482,12 @@
         name: gate,
         provider,
         model,
-        result: ['CLEAN', 'PASS'].includes(verdict) ? 'passed' : 'failed',
+        result: gateVerdictPassed(gate, verdict) ? 'passed' : 'failed',
         timestamp: evidenceIdentity?.timestamp ?? Date.now(),
         sequence: evidenceSequence,
         outputReference: outputReference ?? fallbackReference,
-        criteria: criteria ?? [],
+        criteria: [...new Set(reportedCriteria)],
+        ...(untestedCriteria?.length ? { untestedCriteria } : {}),
         economics,
       },
       baseRevision,
@@ -6506,6 +6592,7 @@
               owner.run.provider,
               model,
               report.criteria,
+              report.untestedCriteria,
               report.outputReference,
               `thread:${sourceId}`,
               report.revision,
@@ -6562,6 +6649,11 @@
                       mutationGeneration: policy?.mutationGeneration,
                       baseRevision,
                       evidenceSequence: recordedEvidenceSequence,
+                      evidenceCriteria: report.criteria ?? [],
+                      evidenceUntestedCriteria: report.untestedCriteria ?? [],
+                      evidenceOutputReference: report.outputReference ?? `thread:${sourceId}`,
+                      evidenceTimestamp: now,
+                      evidenceEconomics: report.economics,
                     },
                     now,
                   ),
@@ -6608,6 +6700,7 @@
       validateGateVerdict(validation.gate, report.verdict);
       const evidenceTimestamp = Date.now();
       const evidenceCriteria = report.criteria ?? [];
+      const evidenceUntestedCriteria = report.untestedCriteria ?? [];
       const evidenceOutputReference =
         report.outputReference ?? `thread:${receipt.targetId ?? receipt.receiptId}`;
       await commitRevisionBoundValidation({
@@ -6633,6 +6726,7 @@
                 receipt.provider,
                 receipt.model ?? null,
                 report.criteria,
+                report.untestedCriteria,
                 report.outputReference,
                 `thread:${receipt.targetId ?? receipt.receiptId}`,
                 validation.revision,
@@ -6694,6 +6788,7 @@
               verdict: report.verdict,
               reason: report.reason,
               evidenceCriteria,
+              evidenceUntestedCriteria,
               evidenceOutputReference,
               evidenceTimestamp,
               evidenceSequence,
@@ -6752,7 +6847,7 @@
       throw new Error('Choose a Ship It validation gate.');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Gate prompt must be 1–8000 characters.');
-    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, FAIL, or BLOCKED. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
+    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. A PASS (partial) must also provide untestedCriteria as exact criterion and environmental blocker pairs, disjoint from criteria. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
     if (
       !Array.isArray(implementingModels) ||
       !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
@@ -7307,7 +7402,7 @@
       ? 'review'
       : routingRole
         ? routedProfile
-        : capabilityProfileForDirectory(created.path);
+        : 'build';
     const session = await acp
       .create(source.agent, created.path, capabilityProfile, nativeGeneration)
       .catch((cause) => {
@@ -7674,7 +7769,13 @@
           : [];
         const resourceTrust = acpResourceTrust.get(pending);
         const policy = automaticPermissionPolicy({
-          profile: thread.capabilityProfile ?? capabilityProfileForDirectory(thread.directory),
+          profile: intersectCapabilityProfiles(
+            thread.capabilityProfile ?? 'build',
+            capabilityProfileForShipThread(
+              thread.directory,
+              receiptSourceId(thread.agent, thread.sessionId),
+            ),
+          ),
           workspace: thread.directory,
           title,
           toolCall: tool,
@@ -7705,6 +7806,8 @@
           allow: policy.recommendation !== 'deny',
           policy,
           permissionTitle: title,
+          permissionToolCall: tool,
+          permissionResourceTrust: resourceTrust,
           generation: permissionGeneration,
           fingerprint: permissionFingerprint,
         });
@@ -7713,23 +7816,26 @@
           generation: permissionFingerprint ?? permissionGeneration,
           policy,
           respond: async (optionId) => {
-            if (policy.recommendation === 'allow') {
-              const latestTrust = await acp.permissionResourcesTrusted(
-                thread.directory,
-                permissionReadResources(tool),
-              );
-              assertAutomaticPermissionAllowed(
-                {
-                  profile: policy.profile,
-                  workspace: thread.directory,
-                  title,
-                  toolCall: tool,
-                  options,
-                  resourceTrust: latestTrust,
-                },
-                optionId,
-              );
-            }
+            const latestTrust = await acp.permissionResourcesTrusted(
+              thread.directory,
+              permissionReadResources(tool),
+            );
+            assertAutomaticPermissionAllowed(
+              {
+                profile: effectiveCapabilityProfileForAcpSession(
+                  thread.agent,
+                  thread.directory,
+                  thread.sessionId,
+                  thread.capabilityProfile,
+                ),
+                workspace: thread.directory,
+                title,
+                toolCall: tool,
+                options,
+                resourceTrust: latestTrust,
+              },
+              optionId,
+            );
             await acp.permission(
               pending.agent,
               requestId,
@@ -9480,34 +9586,37 @@
           entry.directory === item.directory,
       );
       if (!thread) throw new Error('Thread is no longer available.');
+      const policy = liveInboxPermissionPolicy(item, thread);
+      if (!policy) throw new Error('Permission policy is no longer available.');
+      const settledOptionId = permissionChoiceForPolicy(policy, item.options ?? [], optionId);
       await permissionResolver.resolve({
         key: item.key,
         generation: item.fingerprint ?? item.generation ?? item.receivedAt,
-        policy: item.policy!,
-        optionId,
-        respond: (selectedOptionId: string | null) =>
+        policy,
+        optionId: settledOptionId,
+        respond: (resolvedOptionId: string | null) =>
           acp.permission(
             thread.agent,
             item.requestId!,
-            selectedOptionId,
+            resolvedOptionId,
             item.sessionId,
             typeof item.generation === 'number' ? item.generation : undefined,
             item.fingerprint,
           ),
-        record: (selectedOptionId: string | null) =>
+        record: (resolvedOptionId: string | null) =>
           recordDecisionActivity(
             thread,
             inboxDecisionActivitySourceId(item),
             inboxPermissionDecisionTitle(
               item,
-              selectedOptionId === null ||
-                permissionOutcome(item.options ?? [], selectedOptionId) === 'rejected'
+              resolvedOptionId === null ||
+                permissionOutcome(item.options ?? [], resolvedOptionId) === 'rejected'
                 ? 'rejected'
                 : 'completed',
             ),
-            selectedOptionId === null
+            resolvedOptionId === null
               ? 'rejected'
-              : permissionOutcome(item.options ?? [], selectedOptionId),
+              : permissionOutcome(item.options ?? [], resolvedOptionId),
           ),
       });
       await refreshInbox();
@@ -10686,7 +10795,7 @@
     const eventDirectory = eventThread?.directory ?? directory;
     const eventProfile = capabilityProfileFromMetadata(
       event.message.params,
-      eventThread?.capabilityProfile ?? capabilityProfileForDirectory(eventDirectory),
+      eventThread?.capabilityProfile ?? 'build',
     );
     const previousNativeSubagents = nativeSubagents;
     nativeSubagents = updateNativeSubagents(
@@ -10944,7 +11053,7 @@
           acpDisconnectAffectsSession(
             event.message,
             item.sessionId,
-            item.capabilityProfile ?? capabilityProfileForDirectory(item.directory),
+            item.capabilityProfile ?? 'build',
           ) &&
           ['working', 'waiting'].includes(threadAttention[threadKey(item)]?.status ?? ''),
       ))
@@ -11558,7 +11667,10 @@
                       : permission.title,
                     permissionOutcome(permission.options, optionId),
                   )}
-                capabilityProfile={capabilityProfileForDirectory(directory)}
+                capabilityProfile={capabilityProfileForShipThread(
+                  directory,
+                  acpThread ? receiptSourceId(acpThread.agent, acpThread.sessionId) : undefined,
+                )}
                 running={!!(acpThread && runningAgentThreads[agentThreadKey(acpThread)])}
                 activityReady={acpActivityReady}
                 focused={focusedPane === 'main'}
@@ -11639,7 +11751,11 @@
         {directory}
         project={coordinationProject(directory) ?? directory}
         {taskLocation}
-        capabilityProfile={capabilityProfileForDirectory(directory)}
+        capabilityProfileForThread={(thread) =>
+          capabilityProfileForShipThread(
+            directory,
+            thread ? receiptSourceId(thread.agent, thread.sessionId) : undefined,
+          )}
         {dark}
         agents={agentAvailability}
         {sideChat}
@@ -12258,7 +12374,7 @@
   </div>
   {#if inboxError}<p class="notice error" role="alert">{inboxError}</p>{/if}
   <InboxPanel
-    items={inboxItems}
+    items={liveInboxItems}
     attention={stateAttentionItems}
     total={attentionCounts.inbox}
     loading={inboxLoading}

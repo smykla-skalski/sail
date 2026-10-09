@@ -110,6 +110,10 @@ pub struct McpConfig {
     pub token: String,
 }
 
+fn requires_phase_lease(tool: &str) -> bool {
+    matches!(tool, "navigate" | "click" | "type" | "run_script")
+}
+
 impl BrowserManager {
     pub fn config_for_profile(
         &self,
@@ -547,6 +551,7 @@ impl BrowserManager {
             "worktree_status" => Some("sai-agent-status-enabled"),
             "project_threads" => Some("sai-agent-thread-list-enabled"),
             "thread_message" => Some("sai-agent-messages-enabled"),
+            "capability_check" => None,
             // Progress belongs to the owning Ship run and must remain available when
             // cross-validation and other coordination actions are disabled.
             "ship_progress"
@@ -641,6 +646,16 @@ impl BrowserManager {
                 profile.as_str(),
                 CAPABILITY_POLICY_REVISION
             ));
+        }
+        if requires_phase_lease(&request.name) {
+            self.coordinate(
+                app,
+                &session,
+                source_agent.as_deref(),
+                &directory,
+                "capability_check",
+                json!({"tool":&request.name}),
+            )?;
         }
         if matches!(
             request.name.as_str(),
@@ -1208,6 +1223,7 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         "implementation.md",
         ship_it_file!("references/implementation.md"),
     ),
+    ("publish.md", ship_it_file!("references/publish.md")),
     ("review.md", ship_it_file!("references/review.md")),
     ("test.md", ship_it_file!("references/test.md")),
     ("pr-loop.md", ship_it_file!("references/pr-loop.md")),
@@ -1253,6 +1269,15 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         "convergence-policy.json",
         ship_it_file!("references/convergence-policy.json"),
     ),
+    ("replay.md", ship_it_file!("references/replay.md")),
+    (
+        "replay-trace.schema.json",
+        ship_it_file!("references/replay-trace.schema.json"),
+    ),
+    (
+        "worker-rules.md",
+        ship_it_file!("references/worker-rules.md"),
+    ),
     ("ci-triage.md", ship_it_file!("references/ci-triage.md")),
     (
         "ci-triage.schema.json",
@@ -1260,12 +1285,28 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
     ),
     ("fallbacks.md", ship_it_file!("references/fallbacks.md")),
     (
+        "scripts/bookkeeping.py",
+        ship_it_file!("scripts/bookkeeping.py"),
+    ),
+    (
         "scripts/ci_triage.py",
         ship_it_file!("scripts/ci_triage.py"),
     ),
     (
+        "scripts/replay_failures.py",
+        ship_it_file!("scripts/replay_failures.py"),
+    ),
+    (
         "scripts/telemetry.py",
         ship_it_file!("scripts/telemetry.py"),
+    ),
+    (
+        "scripts/test_replay_failures.py",
+        ship_it_file!("scripts/test_replay_failures.py"),
+    ),
+    (
+        "scripts/test_telemetry.py",
+        ship_it_file!("scripts/test_telemetry.py"),
     ),
 ];
 const ADVERSARIAL_REVIEW_SKILL: &str = include_str!("../../skills/adversarial-review/SKILL.md");
@@ -1278,12 +1319,22 @@ const ADVERSARIAL_REVIEW_REFERENCES: &[(&str, &str)] = &[
         "findings-adversary.md",
         include_str!("../../skills/adversarial-review/references/findings-adversary.md"),
     ),
+    (
+        "workflow.md",
+        include_str!("../../skills/adversarial-review/references/workflow.md"),
+    ),
 ];
 const ADVERSARIAL_TEST_SKILL: &str = include_str!("../../skills/adversarial-test/SKILL.md");
-const ADVERSARIAL_TEST_REFERENCES: &[(&str, &str)] = &[(
-    "test-adversary.md",
-    include_str!("../../skills/adversarial-test/references/test-adversary.md"),
-)];
+const ADVERSARIAL_TEST_REFERENCES: &[(&str, &str)] = &[
+    (
+        "test-adversary.md",
+        include_str!("../../skills/adversarial-test/references/test-adversary.md"),
+    ),
+    (
+        "workflow.md",
+        include_str!("../../skills/adversarial-test/references/workflow.md"),
+    ),
+];
 
 fn bundled_skill(name: &str) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
     match name {
@@ -1601,7 +1652,7 @@ fn economics_input_schema() -> Value {
         "additionalProperties":false,
         "properties":{
             "role":{"type":"string","enum":["primary","subagent","validator","guardian","synthetic","probe"]},
-            "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","review","test","ci","pr","complete"]},
+            "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","publish","review","test","ci","pr","complete"]},
             "turns":counter(),
             "toolCalls":counter(),
             "permissionRequests":counter(),
@@ -1815,9 +1866,10 @@ pub fn run_mcp_stdio() {
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging","awaiting_merge"]},
                             "status":{"type":"string","enum":["running","blocked"]},
                             "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
-                            "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","FAIL","BLOCKED"]},
+                            "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED"]},
                             "reason":{"type":"string","maxLength":2000},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
+                            "untestedCriteria":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string","minLength":1,"maxLength":2000},"blocker":{"type":"string","minLength":1,"maxLength":2000}},"required":["criterion","blocker"],"additionalProperties":false},"maxItems":100},
                             "outputReference":{"type":"string","minLength":1,"maxLength":2000},
                             "revision":{"type":"string","minLength":1},
                             "economics":economics_input_schema()
@@ -1832,7 +1884,7 @@ pub fn run_mcp_stdio() {
                                 "properties":{
                                     "objective":{"type":"string","minLength":1},
                                     "acceptanceCriteria":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},
-                                    "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","review","test","pr","complete"]},
+                                    "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","publish","review","test","pr","complete"]},
                                     "status":{"type":"string","enum":["active","blocked","completed","cancelled","failed"]},
                                     "requiredGates":{"type":"array","items":{"type":"string","minLength":1}},
                                     "blocker":{"type":["string","null"]},
@@ -1989,8 +2041,9 @@ mod picker_tests {
 #[cfg(test)]
 mod skill_tests {
     use super::{
-        call_bridge, mcp_initialize, plan_tool_schema, skill_text, tool_listed, BrowserManager,
-        CapabilityProfile, CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
+        call_bridge, economics_input_schema, mcp_initialize, plan_tool_schema,
+        requires_phase_lease, skill_text, tool_listed, BrowserManager, CapabilityProfile,
+        CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
     };
 
     #[test]
@@ -2003,6 +2056,23 @@ mod skill_tests {
         assert!(CapabilityProfile::Release.enables("thread_message"));
         assert!(!CapabilityProfile::Release.enables("agent_spawn"));
         assert_eq!(CapabilityProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn direct_browser_mutations_require_the_live_phase_lease() {
+        for tool in ["navigate", "click", "type", "run_script"] {
+            assert!(requires_phase_lease(tool), "{tool}");
+        }
+        for tool in ["read_page", "screenshot", "task_checkpoint_read"] {
+            assert!(!requires_phase_lease(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn economics_schema_accepts_the_publish_phase() {
+        assert!(economics_input_schema()["properties"]["phase"]["enum"]
+            .as_array()
+            .is_some_and(|phases| phases.iter().any(|phase| phase == "publish")));
     }
 
     #[test]
@@ -2134,11 +2204,15 @@ mod skill_tests {
                 fs::read_dir(skill_root.join(directory))
                     .expect("bundled skill directory is readable")
                     .filter_map(move |entry| {
-                        let name = entry
-                            .expect("bundled skill entry is readable")
-                            .file_name()
-                            .to_string_lossy()
-                            .into_owned();
+                        let entry = entry.expect("bundled skill entry is readable");
+                        if !entry
+                            .file_type()
+                            .expect("bundled skill entry type is readable")
+                            .is_file()
+                        {
+                            return None;
+                        }
+                        let name = entry.file_name().to_string_lossy().into_owned();
                         match (directory, name.starts_with('.')) {
                             (_, true) => None,
                             ("scripts", false) => Some(format!("scripts/{name}")),

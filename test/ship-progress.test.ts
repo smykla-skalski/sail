@@ -379,10 +379,16 @@ void test('durable gate receipts recover manifest evidence after restart', () =>
     validation: {
       ...receipt.validation,
       gate: 'test-adversary',
-      verdict: 'PASS',
+      verdict: 'PASS (partial)',
       revision: 'revision-one',
       baseRevision: undefined,
-      evidenceCriteria: issue.checkpoint!.acceptanceCriteria,
+      evidenceCriteria: [],
+      evidenceUntestedCriteria: [
+        {
+          criterion: issue.checkpoint!.acceptanceCriteria[0],
+          blocker: 'No hardware device is attached.',
+        },
+      ],
       evidenceOutputReference: 'thread:validator',
       evidenceTimestamp: 11,
       evidenceEconomics: economics,
@@ -402,6 +408,12 @@ void test('durable gate receipts recover manifest evidence after restart', () =>
   assert.equal(issue.evidenceManifests?.[0]?.evidence[0]?.id, 'gate:durable-receipt');
   assert.deepEqual(issue.evidenceManifests?.[0]?.evidence[0]?.economics, economics);
   assert.equal(shipEvidenceReadiness(issue).ready, true);
+  assert.deepEqual(shipEvidenceReadiness(issue).untestedCriteria, [
+    {
+      criterion: issue.checkpoint!.acceptanceCriteria[0],
+      blocker: 'No hardware device is attached.',
+    },
+  ]);
   assert.equal(summary.economicsComplete, true);
   assert.equal(summary.totals.checks, 1);
   assert.equal(recoverValidationEvidence(issue, undefined), null);
@@ -1801,6 +1813,10 @@ void test('accepts typed stage and verdict reports, with gate-specific verdicts'
     ...emptyTaskEconomics('validator', 'review'),
     checks: 1,
   };
+  const testEconomics = {
+    ...emptyTaskEconomics('validator', 'test'),
+    checks: 1,
+  };
   assert.deepEqual(parseShipReport({ stage: 'ci', status: 'blocked', reason: 'Check failed' }), {
     stage: 'ci',
     status: 'blocked',
@@ -1830,6 +1846,69 @@ void test('accepts typed stage and verdict reports, with gate-specific verdicts'
   assert.throws(() => validateGateVerdict('code-adversary', 'PASS'));
   assert.throws(() => validateGateVerdict('test-adversary', 'CLEAN'));
   assert.doesNotThrow(() => validateGateVerdict('test-adversary', 'PASS'));
+  assert.doesNotThrow(() => validateGateVerdict('test-adversary', 'PASS (partial)'));
+  assert.deepEqual(
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: 'Hardware criterion', blocker: 'No device attached.' }],
+      economics: testEconomics,
+    }),
+    {
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: 'Hardware criterion', blocker: 'No device attached.' }],
+      economics: testEconomics,
+    },
+  );
+  assert.throws(() =>
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      economics: testEconomics,
+    }),
+  );
+  for (const blocker of ['\u200b', '\u2800', '\u3164', '\uFFF9', '\uFFFA', '\uFFFB'])
+    assert.throws(() =>
+      parseShipReport({
+        gate: 'test-adversary',
+        verdict: 'PASS (partial)',
+        criteria: ['Exercised criterion'],
+        untestedCriteria: [{ criterion: 'Hardware criterion', blocker }],
+        economics: testEconomics,
+      }),
+    );
+  assert.throws(() =>
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: 'Hardware criterion', blocker: '   ' }],
+      economics: testEconomics,
+    }),
+  );
+  const spacedCriterion = '  Hardware criterion  ';
+  assert.deepEqual(
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: spacedCriterion, blocker: ' No device attached. ' }],
+      economics: testEconomics,
+    }).untestedCriteria,
+    [{ criterion: spacedCriterion, blocker: ' No device attached. ' }],
+  );
+  assert.doesNotThrow(() =>
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: '硬件标准', blocker: '🧪 沙盒不可用' }],
+      economics: testEconomics,
+    }),
+  );
 });
 
 void test('validation revision drift remains sticky after the tree returns', () => {

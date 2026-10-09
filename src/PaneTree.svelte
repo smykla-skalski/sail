@@ -63,7 +63,7 @@
     directory: string;
     project: string;
     taskLocation: TaskLocation;
-    capabilityProfile: CapabilityProfile;
+    capabilityProfileForThread: (thread?: AgentThread) => CapabilityProfile;
     dark: boolean;
     agents: AgentAvailability[];
     sideChat: SideChatState | null;
@@ -166,7 +166,7 @@
     directory,
     project,
     taskLocation,
-    capabilityProfile,
+    capabilityProfileForThread,
     dark,
     agents,
     sideChat,
@@ -582,7 +582,7 @@
       {onreviewcheck}
       {onreviewpreview}
       {onreviewcapturephase}
-      {capabilityProfile}
+      {capabilityProfileForThread}
     />
     <div
       class="pane-divider"
@@ -696,7 +696,7 @@
       {onreviewcheck}
       {onreviewpreview}
       {onreviewcapturephase}
-      {capabilityProfile}
+      {capabilityProfileForThread}
     />
   </div>
 {:else}
@@ -869,7 +869,7 @@
                     : permission.title,
                   permissionOutcome(permission.options, optionId),
                 )}
-              {capabilityProfile}
+              capabilityProfile={capabilityProfileForThread(pane.thread ?? undefined)}
               {onstatus}
               {onreplaychange}
               onterminal={onagentterminal}

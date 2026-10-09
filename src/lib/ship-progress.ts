@@ -18,9 +18,11 @@ import {
   evidenceReadiness,
   nextTaskEvidenceSequence,
   recordTaskEvidence,
+  untestedCriterionSchema,
   type EvidenceManifest,
   type EvidenceReadiness,
   type TaskEvidence,
+  type UntestedCriterion,
 } from './task-evidence.ts';
 
 export const gateNames = ['code-adversary', 'findings-adversary', 'test-adversary'] as const;
@@ -34,7 +36,14 @@ export const stages = [
   'merging',
   'awaiting_merge',
 ] as const;
-export const verdicts = ['CLEAN', 'NEEDS_FIXES', 'PASS', 'FAIL', 'BLOCKED'] as const;
+export const verdicts = [
+  'CLEAN',
+  'NEEDS_FIXES',
+  'PASS',
+  'PASS (partial)',
+  'FAIL',
+  'BLOCKED',
+] as const;
 export type GateVerdict = (typeof verdicts)[number];
 export type ShipCheck = {
   name: string;
@@ -83,6 +92,7 @@ export type GateMetadata = {
   verdict?: GateVerdict;
   reason?: string;
   evidenceCriteria?: string[];
+  evidenceUntestedCriteria?: UntestedCriterion[];
   evidenceOutputReference?: string;
   evidenceTimestamp?: number;
   evidenceSequence?: number;
@@ -167,8 +177,14 @@ export function requiredValidationGatesSatisfied(
           right.item.created - left.item.created,
       )[0]?.item;
     if (!gate || gate.state !== 'completed') return false;
-    return name === 'test-adversary' ? gate.verdict === 'PASS' : gate.verdict === 'CLEAN';
+    return gateVerdictPassed(name, gate.verdict);
   });
+}
+
+export function gateVerdictPassed(gate: GateName, verdict: GateVerdict | undefined): boolean {
+  return gate === 'test-adversary'
+    ? verdict === 'PASS' || verdict === 'PASS (partial)'
+    : verdict === 'CLEAN';
 }
 
 export const gateMetadataSchema = z.object({
@@ -182,6 +198,7 @@ export const gateMetadataSchema = z.object({
   verdict: z.enum(verdicts).optional(),
   reason: z.string().optional(),
   evidenceCriteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
+  evidenceUntestedCriteria: z.array(untestedCriterionSchema).max(100).optional(),
   evidenceOutputReference: z.string().min(1).max(2000).optional(),
   evidenceTimestamp: z.number().int().nonnegative().optional(),
   evidenceSequence: z.number().int().positive().optional(),
@@ -203,6 +220,7 @@ const reportSchema = z.union([
       verdict: z.enum(verdicts),
       reason: z.string().max(2000).optional(),
       criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
+      untestedCriteria: z.array(untestedCriterionSchema).max(100).optional(),
       outputReference: z.string().min(1).max(2000).optional(),
       economics: taskEconomicsSchema.optional(),
       revision: z.string().min(1).optional(),
@@ -213,6 +231,7 @@ const reportSchema = z.union([
       verdict: z.enum(verdicts),
       reason: z.string().max(2000).optional(),
       criteria: z.array(z.string().min(1).max(2000)).max(100).optional(),
+      untestedCriteria: z.array(untestedCriterionSchema).max(100).optional(),
       outputReference: z.string().min(1).max(2000).optional(),
       economics: taskEconomicsSchema.optional(),
     })
@@ -237,6 +256,18 @@ export function parseShipReport(value: unknown) {
   ) {
     if (!report.reason?.trim()) throw new Error('A blocked or failed report needs a reason.');
   }
+  if ('verdict' in report) {
+    const untested = report.untestedCriteria ?? [];
+    if (report.verdict === 'PASS (partial)' && !untested.length)
+      throw new Error('PASS (partial) must name every untested criterion and blocker.');
+    if (report.verdict !== 'PASS (partial)' && untested.length)
+      throw new Error('Untested criteria are valid only with PASS (partial).');
+    if (new Set(untested.map(({ criterion }) => criterion)).size !== untested.length)
+      throw new Error('Each untested criterion must be named once.');
+    const tested = new Set(report.criteria ?? []);
+    if (untested.some(({ criterion }) => tested.has(criterion)))
+      throw new Error('A criterion cannot be both tested and untested.');
+  }
   return report;
 }
 
@@ -250,7 +281,9 @@ export function requireValidatorEconomics(
 
 export function validateGateVerdict(gate: GateName, verdict: GateVerdict): void {
   const allowed =
-    gate === 'test-adversary' ? ['PASS', 'FAIL', 'BLOCKED'] : ['CLEAN', 'NEEDS_FIXES', 'BLOCKED'];
+    gate === 'test-adversary'
+      ? ['PASS', 'PASS (partial)', 'FAIL', 'BLOCKED']
+      : ['CLEAN', 'NEEDS_FIXES', 'BLOCKED'];
   if (!allowed.includes(verdict)) throw new Error(`Invalid verdict for ${gate}.`);
 }
 
@@ -345,6 +378,11 @@ export function rollbackValidationReceipt(
       current.validation.evidenceCriteria,
       previous.validation.evidenceCriteria,
       committed.validation.evidenceCriteria,
+    ),
+    evidenceUntestedCriteria: restoreIfUnchanged(
+      current.validation.evidenceUntestedCriteria,
+      previous.validation.evidenceUntestedCriteria,
+      committed.validation.evidenceUntestedCriteria,
     ),
     evidenceOutputReference: restoreIfUnchanged(
       current.validation.evidenceOutputReference,
@@ -554,6 +592,7 @@ export function shipEvidenceReadiness(issue: ShipIssue): EvidenceReadiness {
       failedCommands: [],
       pendingCommands: [],
       unverifiedCriteria: [],
+      untestedCriteria: [],
       reason: 'Task checkpoint is missing.',
     };
   const readiness = evidenceReadiness(
@@ -651,6 +690,9 @@ export function recoverValidationEvidence(
     const criteria = (gate.evidenceCriteria ?? []).filter((criterion) =>
       checkpoint.acceptanceCriteria.includes(criterion),
     );
+    const untestedCriteria = (gate.evidenceUntestedCriteria ?? []).filter(({ criterion }) =>
+      checkpoint.acceptanceCriteria.includes(criterion),
+    );
     const next = recordTaskEvidence(
       manifests,
       revision,
@@ -661,10 +703,13 @@ export function recoverValidationEvidence(
         name: gate.gate,
         provider: gate.provider,
         model: gate.model,
-        result: ['CLEAN', 'PASS'].includes(gate.verdict!) ? 'passed' : 'failed',
+        result: gateVerdictPassed(gate.gate, gate.verdict) ? 'passed' : 'failed',
         timestamp: gate.evidenceTimestamp!,
         outputReference: gate.evidenceOutputReference!,
-        criteria,
+        criteria: [
+          ...new Set([...criteria, ...untestedCriteria.map(({ criterion }) => criterion)]),
+        ],
+        ...(untestedCriteria.length ? { untestedCriteria } : {}),
         economics: gate.evidenceEconomics,
         ...(gate.evidenceSequence !== undefined ? { sequence: gate.evidenceSequence } : {}),
       },

@@ -124,6 +124,7 @@ void test('a base move stales every kind of evidence without changing the worktr
       failedCommands: [],
       pendingCommands: [],
       unverifiedCriteria: criteria,
+      untestedCriteria: [],
       reason: '2 acceptance criteria remain unverified.',
     },
   );
@@ -240,8 +241,28 @@ void test('latest result for each command or gate controls readiness', () => {
     failedCommands: [],
     pendingCommands: [],
     unverifiedCriteria: [],
+    untestedCriteria: [],
     reason: null,
   });
+});
+
+void test('a partial test pass keeps environmental blockers visible and satisfies readiness', () => {
+  const untestedCriteria = [{ criterion: criteria[1], blocker: 'No hardware device is attached.' }];
+  const manifests = recordTaskEvidence(
+    [],
+    'revision',
+    criteria,
+    evidence({
+      name: 'test-adversary',
+      criteria,
+      untestedCriteria,
+    }),
+  );
+
+  const readiness = evidenceReadiness(manifests, 'revision', ['test-adversary'], criteria);
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.unverifiedCriteria, []);
+  assert.deepEqual(readiness.untestedCriteria, untestedCriteria);
 });
 
 void test('keeps repeated executions distinct and deduplicates only the same identity', () => {

@@ -659,13 +659,18 @@
               </p>{/if}
             {#if criteria.length}<ol class="ship-gates">
                 {#each criteria as criterion, index (`${index}:${criterion}`)}
+                  {@const untested = evidence.untestedCriteria.find(
+                    (entry) => entry.criterion === criterion,
+                  )}
                   <li>
                     <strong
-                      >{evidence.unverifiedCriteria.includes(criterion)
-                        ? 'Unverified'
-                        : 'Verified'}</strong
+                      >{untested
+                        ? 'Untested'
+                        : evidence.unverifiedCriteria.includes(criterion)
+                          ? 'Unverified'
+                          : 'Verified'}</strong
                     >
-                    <span>{criterion}</span>
+                    <span>{criterion}{untested ? ` — ${untested.blocker}` : ''}</span>
                   </li>
                 {/each}
               </ol>{/if}
