@@ -508,6 +508,20 @@
   } from './lib/saved-commands';
   import { annotateDiffs, repoPath, selectedDiffFile, type WorkingDiffInfo } from './lib/diff';
   import type { DiffComment } from './lib/diff-comments';
+
+  interface MemoryCaptureCandidate {
+    directory: string;
+    agent: string;
+    sessionId: string;
+    kind: 'decision' | 'constraint' | 'discovery' | 'preference' | 'handoff';
+    content: string;
+    confirmationReason: 'sensitive' | 'broader_scope' | null;
+  }
+
+  interface MemoryStatus {
+    enabled: boolean;
+    projectKey: string;
+  }
   import {
     browserReviewPreviews,
     retainCaptureMetadata,
@@ -906,6 +920,39 @@
     confirmationResolver = null;
     confirmation = null;
     resolve?.(confirmed);
+  }
+
+  async function captureProjectMemory(candidate: MemoryCaptureCandidate) {
+    try {
+      const status = await invoke<MemoryStatus>('memory_status', {
+        directory: candidate.directory,
+      });
+      if (!status.enabled || getSetting(`sai-memory-auto-capture:${status.projectKey}`) !== 'true')
+        return;
+      if (candidate.confirmationReason) {
+        const reason =
+          candidate.confirmationReason === 'sensitive'
+            ? 'Sensitive values were removed before this preview.'
+            : 'This memory may apply beyond the current task.';
+        const confirmed = await confirmInApp(
+          'Save shared memory?',
+          `${reason}\n\n${candidate.kind}: ${candidate.content}`,
+          'Save memory',
+        );
+        if (!confirmed) return;
+      }
+      await invoke('memory_remember', {
+        directory: candidate.directory,
+        input: {
+          content: candidate.content,
+          kind: candidate.kind,
+          tags: ['automatic-capture'],
+          provenance: { agent: candidate.agent, sessionId: candidate.sessionId },
+        },
+      });
+    } catch (cause) {
+      error = `Could not capture shared memory: ${describe(cause)}`;
+    }
   }
   let editingCommand = $state<string | null>(null);
   let binaryPath = $state(getSetting('sai-opencode-bin') ?? '');
@@ -2027,6 +2074,7 @@
     if (isTauri()) setTimeout(retryCoordinationDeliveries, 2_000);
     let unlistenAgentTerminals: (() => void) | undefined;
     let unlistenNotificationClick: (() => void) | undefined;
+    let unlistenMemoryCapture: (() => void) | undefined;
     let stopEmulatedClick: (() => void) | undefined;
     setTheme(themePreference);
     const stopSystemTheme = watchSystemDark((value) => (systemDark = value));
@@ -2064,6 +2112,9 @@
       void listen<CoordinationRequest>('agent:coordination-request', ({ payload }) => {
         void handleCoordinationRequest(payload);
       }).then((unlisten) => (unlistenCoordination = unlisten));
+      void listen<MemoryCaptureCandidate>('memory:capture-candidate', ({ payload }) => {
+        void captureProjectMemory(payload);
+      }).then((unlisten) => (unlistenMemoryCapture = unlisten));
       void listen<{ id: string; code: number }>('terminal:exit', ({ payload }) => {
         finishCoordinationSetup(payload.id, payload.code);
       }).then((unlisten) => (unlistenTerminalExit = unlisten));
@@ -2266,6 +2317,7 @@
       unlistenTerminalExit?.();
       unlistenAgentTerminals?.();
       unlistenNotificationClick?.();
+      unlistenMemoryCapture?.();
       stopEmulatedClick?.();
       stopSystemTheme();
     };
