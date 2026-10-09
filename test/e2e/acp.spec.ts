@@ -362,6 +362,28 @@ describe('ACP agent threads', () => {
     );
   });
 
+  it('records a permission Sail settled by policy in the transcript', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer textarea').setValue('Automatic policy');
+    await $(sendButton).click();
+    const decision = $('.transcript-decision');
+    await expect(decision).toHaveText(expect.stringMatching(/(Allowed|Rejected) automatically/));
+    await expect(decision).toHaveText(expect.stringContaining('Format notes'));
+    await expect(decision).toHaveText(expect.stringContaining('profile'));
+    await expect($('.agent-permission')).not.toBeExisting();
+  });
+
   it('revises native Claude and Codex plans after their turns settle', async () => {
     await browser.execute((path) => {
       localStorage.setItem('sai-directory', path);

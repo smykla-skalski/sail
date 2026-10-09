@@ -20,9 +20,12 @@
     shellItems,
     subagentItems,
     type TranscriptTool,
+    decisionItems,
+    latestRevision,
   } from './lib/transcript';
   import { acpPermissionChoices, acpPermissionDetails } from './lib/permission-card';
   import JumpToLatest from './JumpToLatest.svelte';
+  import { sharedActivityHistory } from './lib/activity-history';
   import PermissionCard from './PermissionCard.svelte';
   import Transcript from './Transcript.svelte';
   import type { PostTurnCheck } from './lib/post-turn-checks';
@@ -606,6 +609,9 @@
       timed: [
         ...hookItems(visibleHookActivities),
         ...checkItems(postTurnChecks),
+        ...(activeSessionId && !ephemeral
+          ? decisionItems($sharedActivityHistory, { agent, directory, sessionId: activeSessionId })
+          : []),
         ...subagentItems(spawnReceipts),
         ...shellItems(pendingShellRuns),
       ],
@@ -2471,6 +2477,7 @@
       <JumpToLatest
         following={autoFollow}
         count={transcriptItems.length}
+        revision={latestRevision(transcriptItems)}
         onjump={() => {
           autoFollow = true;
           void follow();

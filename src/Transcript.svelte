@@ -231,6 +231,14 @@
     <ShellCommandCard run={item.run} pending onstop={() => onstopshell(item.run)} />
   {:else if item.kind === 'hook'}
     <HookActivityCard activity={item.activity} />
+  {:else if item.kind === 'decision'}
+    <p class="transcript-decision" data-outcome={item.outcome} role="note">
+      <strong
+        >{item.outcome === 'rejected' ? 'Rejected automatically' : 'Allowed automatically'}</strong
+      >
+      · {item.title}{#if item.reason}<span class="transcript-decision-reason">{item.reason}</span
+        >{/if}
+    </p>
   {:else if item.kind === 'checks'}
     <PostTurnChecks checks={item.checks} onretry={onretrycheck} />
   {:else if item.kind === 'subagents'}
@@ -250,6 +258,26 @@
 {#if tail}{@render tail()}{/if}
 
 <style>
+  .transcript-decision {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px var(--space-8);
+    margin: 0 0 8px 42px;
+    padding: 6px 10px;
+    border-left: 3px solid var(--shell-divider);
+    color: var(--sui-muted);
+    font-size: var(--type-13);
+  }
+  .transcript-decision strong {
+    color: var(--sui-foreground);
+    font-weight: 600;
+  }
+  .transcript-decision[data-outcome='rejected'] {
+    border-left-color: var(--sui-danger);
+  }
+  .transcript-decision-reason {
+    flex-basis: 100%;
+  }
   .agent-tool-group,
   .agent-tool-current {
     margin: 0 0 8px 42px;
