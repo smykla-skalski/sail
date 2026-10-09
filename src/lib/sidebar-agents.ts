@@ -1,4 +1,4 @@
-import type { AgentSessionListing, AgentThread } from './acp';
+import { mergeAgentThreadListing, type AgentSessionListing, type AgentThread } from './acp.ts';
 import type { AttentionMap, ThreadStatus } from './attention';
 import { threadKey } from './recent-threads.ts';
 import { acpThreadId, sameThreadId } from './thread-id.ts';
@@ -78,9 +78,7 @@ export function groupSidebarThreads(threads: AgentThread[]): Record<string, Agen
       unique.set(key, thread);
       continue;
     }
-    const newest = previous.updated < thread.updated ? thread : previous;
-    const renamed = previous.renamed ? previous : thread.renamed ? thread : null;
-    unique.set(key, renamed ? { ...newest, title: renamed.title, renamed: true } : newest);
+    unique.set(key, mergeAgentThreadListing(previous, thread));
   }
   const grouped: Record<string, AgentThread[]> = {};
   for (const thread of unique.values()) (grouped[thread.directory] ??= []).push(thread);

@@ -46,6 +46,14 @@
     contextUsage,
     browserAccess,
     ontogglebrowser,
+    memoryRecall,
+    memoryRecallAvailable,
+    memoryRecallBusy,
+    ontogglememoryrecall,
+    memoryCapture,
+    memoryCaptureAvailable,
+    memoryCaptureBusy,
+    ontogglememorycapture,
     onrunproject,
     agentTerminalCount,
     onagentterminals,
@@ -86,6 +94,14 @@
     contextUsage?: number;
     browserAccess: boolean;
     ontogglebrowser: () => void;
+    memoryRecall: boolean;
+    memoryRecallAvailable: boolean;
+    memoryRecallBusy: boolean;
+    ontogglememoryrecall: () => void;
+    memoryCapture: boolean;
+    memoryCaptureAvailable: boolean;
+    memoryCaptureBusy: boolean;
+    ontogglememorycapture: () => void;
     onrunproject: (() => void) | null;
     agentTerminalCount: number;
     onagentterminals: () => void;
@@ -267,6 +283,25 @@
           aria-checked={browserAccess}
           title="Toggle agent browser access for this project"
           onclick={ontogglebrowser}>Agent browser {browserAccess ? 'on' : 'off'}</button
+        ><button
+          role="menuitemcheckbox"
+          aria-checked={memoryRecall}
+          aria-label="Toggle automatic memory recall for this project"
+          disabled={!memoryRecallAvailable || memoryRecallBusy}
+          title={memoryRecallAvailable
+            ? 'Recall relevant shared memories in the first prompt of each thread'
+            : 'Enable shared memory for this project before using automatic recall'}
+          onclick={ontogglememoryrecall}
+          >Automatic memory recall {memoryRecall ? 'on' : 'off'}</button
+        ><button
+          role="menuitemcheckbox"
+          aria-checked={memoryCapture}
+          disabled={!memoryCaptureAvailable || memoryCaptureBusy}
+          title={memoryCaptureAvailable
+            ? 'Toggle automatic memory capture for this project'
+            : 'Enable shared memory for this project first'}
+          onclick={ontogglememorycapture}
+          >Automatic memory capture {memoryCapture ? 'on' : 'off'}</button
         >{/if}
       {#if threadActions || onrestore}
         <div class="menu-separator" role="separator"></div>
