@@ -66,11 +66,11 @@ function isModelRoute(value: unknown): value is ModelRoute {
 
 /** OpenCode's ACP model selector uses `provider/model`; older settings stored `provider:model`. */
 export function acpModelId(agent: string, model: string): string {
-  return agent === 'opencode' && !model.includes('/') ? model.replace(':', '/') : model;
+  return agent === 'opencode' && /^[^/:]+:/.test(model) ? model.replace(':', '/') : model;
 }
 
 function normalizedModel(value: string): string {
-  return value.slice(value.indexOf(':') + 1).toLowerCase();
+  return value.replace(/^[^/:]+[:/]/, '').toLowerCase();
 }
 
 export function parseModelRoutingSettings(raw: string | null): ModelRoutingSettings {

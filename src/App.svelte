@@ -2068,8 +2068,9 @@
         if (action.type === 'theme') setTheme(action.value);
         else if (action.type === 'binary') {
           binaryPath = action.value.trim();
-          setSetting('sai-opencode-bin', binaryPath);
-          void detectAgents();
+          void setSettingDurable('sai-opencode-bin', binaryPath).then(detectAgents, (cause) => {
+            agentDetectionError = `Could not save the OpenCode binary: ${describe(cause)}`;
+          });
         } else if (action.type === 'notification-pref') {
           notificationPrefs = { ...notificationPrefs, [action.notification]: action.value };
           setSetting(notificationPrefsKey, JSON.stringify(notificationPrefs));

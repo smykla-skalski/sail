@@ -4156,6 +4156,82 @@ mod native_subagent_fence_tests {
         assert!(!cleaned);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn active_opencode_turn_blocks_worktree_cleanup() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("placeholder agent should start");
+        let input = child.stdin.take().expect("placeholder agent stdin");
+        let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
+            .expect("placeholder watchdog should start");
+        let runtime = Arc::new(Connection {
+            agent: "opencode".into(),
+            profile: CapabilityProfile::Build,
+            child: Mutex::new(child),
+            watchdog: Mutex::new(watchdog),
+            stopped: AtomicBool::new(false),
+            input: Mutex::new(input),
+            pending: Mutex::new(HashMap::new()),
+            reader_progress: ReaderProgress::default(),
+            permission_state: Mutex::new(PermissionState::default()),
+            elicitation_state: Mutex::new(HashMap::new()),
+            next_permission_generation: AtomicU64::new(1),
+            prompt_state: Mutex::new(PromptState::default()),
+            cancelled_prompts: Mutex::new(HashSet::new()),
+            next_id: AtomicU64::new(1),
+            alive: AtomicBool::new(true),
+            capabilities: Mutex::new(Value::Null),
+            session_directories: Mutex::new(HashMap::new()),
+            session_configs: Mutex::new(HashMap::new()),
+            native_subagents: Mutex::new(NativeSubagentRegistry::default()),
+            session_profiles: Mutex::new(HashMap::new()),
+            pending_directory: Mutex::new(None),
+            session_creation: Mutex::new(()),
+            ready: Condvar::new(),
+        });
+        let directory = PathBuf::from("/worktree");
+        runtime
+            .session_directories
+            .lock()
+            .unwrap()
+            .insert("ses_open".into(), directory.clone());
+        runtime.prompt_state.lock().unwrap().active.insert(
+            "ses_open".into(),
+            ActivePrompt {
+                turn_id: "turn".into(),
+                text: "task".into(),
+                last_agent_message: String::new(),
+                agent_message_open: false,
+                agent_message_overflow: false,
+                known_tool_calls: HashSet::new(),
+            },
+        );
+        let agents = AgentManager::default();
+        agents
+            .0
+            .lock()
+            .unwrap()
+            .insert(("opencode".into(), CapabilityProfile::Build), runtime);
+        let mut cleaned = false;
+
+        let error = AgentWorktreeFence::default()
+            .cleanup(&agents, &directory, None, || {
+                cleaned = true;
+                Ok(())
+            })
+            .expect_err("an active OpenCode turn must block worktree removal");
+
+        assert_eq!(
+            error,
+            "Worktree has active agent sessions: opencode:ses_open."
+        );
+        assert!(!cleaned);
+    }
+
     #[test]
     fn queued_native_spawn_waits_until_worktree_cleanup_releases_its_fence() {
         let fence = AgentWorktreeFence::default();
