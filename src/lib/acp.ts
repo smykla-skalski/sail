@@ -38,12 +38,13 @@ export function normalizeAgentThreadKeywords(value: unknown): string[] {
     if (typeof item !== 'string') throw new Error('Every thread keyword must be text.');
     const keyword = item.trim().replace(/\s+/g, ' ');
     if (!keyword) throw new Error('Thread keywords cannot be empty.');
-    if (keyword.length > 40) throw new Error('Every thread keyword must be at most 40 characters.');
+    if (Array.from(keyword).length > 40)
+      throw new Error('Every thread keyword must be at most 40 characters.');
     const key = keyword.toLocaleLowerCase();
     if (!seen.has(key)) keywords.push(keyword);
     seen.add(key);
   }
-  if (keywords.reduce((total, keyword) => total + keyword.length, 0) > 320)
+  if (keywords.reduce((total, keyword) => total + Array.from(keyword).length, 0) > 320)
     throw new Error('Thread keywords must total at most 320 characters.');
   return keywords;
 }

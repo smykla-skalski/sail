@@ -27,6 +27,8 @@ void test('thread keywords normalize whitespace and case-insensitive duplicates'
   assert.throws(() => normalizeAgentThreadKeywords(['']), /cannot be empty/);
   assert.throws(() => normalizeAgentThreadKeywords(Array(11).fill('search')), /at most 10/);
   assert.throws(() => normalizeAgentThreadKeywords(['x'.repeat(41)]), /at most 40/);
+  assert.deepEqual(normalizeAgentThreadKeywords(['𠮷'.repeat(21)]), ['𠮷'.repeat(21)]);
+  assert.throws(() => normalizeAgentThreadKeywords(['𠮷'.repeat(41)]), /at most 40/);
 });
 
 void test('thread activity updates preserve keywords unless explicitly replaced', () => {
