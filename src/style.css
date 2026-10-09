@@ -403,7 +403,7 @@ button:disabled {
 .project-agent-row {
   display: grid;
   flex: 1;
-  grid-template-columns: minmax(36px, 1fr) minmax(0, max-content);
+  grid-template-columns: minmax(0, 1fr) minmax(0, max-content);
   min-width: 0;
   width: 100%;
   min-height: 32px;
@@ -453,34 +453,6 @@ button:disabled {
   background: var(--shell-divider);
   pointer-events: none;
 }
-.project-agent-row.reference .project-agent-title {
-  color: var(--sui-muted);
-  font-style: italic;
-}
-.project-agent-origin {
-  display: block;
-  color: var(--sui-muted);
-  font-size: var(--type-12);
-  font-style: normal;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.project-agent-title:has(.project-agent-descendants) {
-  display: flex;
-  gap: var(--space-4);
-}
-.project-agent-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.project-agent-descendants {
-  flex: none;
-  font-weight: 400;
-  color: var(--sui-muted);
-  font-size: var(--type-12);
-  font-variant-numeric: tabular-nums;
-}
 .project-agent-row.subagent:hover {
   background: var(--shell-hover);
 }
@@ -489,20 +461,14 @@ button:disabled {
   box-shadow: inset 3px 0 0 var(--sui-primary);
 }
 .project-agent-row.active .project-agent-provider,
-.project-agent-row.active .project-agent-title {
+.project-agent-row.active .project-agent-provider {
   color: var(--shell-selected-ink);
 }
-.project-agent-row.active .project-agent-title {
-  font-weight: 700;
-}
-.project-agent-provider,
-.project-agent-title {
+.project-agent-provider {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.project-agent-provider {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -510,20 +476,6 @@ button:disabled {
   font-size: var(--type-12);
   font-weight: 700;
 }
-.project-subagent-tag {
-  padding: 1px 4px;
-  border-radius: 3px;
-  color: var(--shell-selected-ink);
-  background: color-mix(in srgb, var(--sui-primary) 12%, transparent);
-  font-size: var(--type-12);
-}
-.project-agent-title {
-  grid-column: 1 / -1;
-  grid-row: 2;
-  color: var(--sui-foreground);
-  font-size: var(--type-13);
-}
-/* The status shares the provider line so the title gets the full row width. */
 .project-agent-row .activity-status {
   grid-column: 2;
   grid-row: 1;

@@ -4,9 +4,7 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-type RowFit = { depth: string; title: string; visible: number; needed: number; status: number };
-
-describe('sidebar thread titles next to the status badge', () => {
+describe('sidebar agent rows', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-sidebar-titles-'));
 
   before(() => {
@@ -18,7 +16,7 @@ describe('sidebar thread titles next to the status badge', () => {
     rmSync(repository, { recursive: true, force: true });
   });
 
-  it('shows at least 12 title characters beside any status at 1280 px', async () => {
+  it('shows agent icons without provider names or thread descriptions', async () => {
     await browser.setWindowSize(1280, 850);
     await browser.execute((path: string) => {
       sessionStorage.removeItem('sail-e2e-settings');
@@ -77,33 +75,15 @@ describe('sidebar thread titles next to the status badge', () => {
     expect(await $$('.project-agent-row .activity-status').length).toBeGreaterThan(1);
 
     const rows = await browser.execute(() =>
-      [...document.querySelectorAll<HTMLElement>('.project-agent-row')].map((row): RowFit => {
-        const name = row.querySelector<HTMLElement>('.project-agent-name')!;
-        const probe = document.createElement('span');
-        probe.style.cssText = 'position:absolute;visibility:hidden;white-space:nowrap';
-        probe.style.font = getComputedStyle(name).font;
-        probe.textContent = (name.textContent ?? '').slice(0, 12);
-        document.body.append(probe);
-        const needed = probe.getBoundingClientRect().width;
-        probe.remove();
-        return {
-          depth: row.dataset.depth ?? '',
-          title: row.getAttribute('aria-label') ?? '',
-          visible:
-            Math.min(
-              name.getBoundingClientRect().right,
-              row.querySelector<HTMLElement>('.project-agent-title')!.getBoundingClientRect().right,
-            ) - name.getBoundingClientRect().left,
-          needed,
-          status: row.querySelector<HTMLElement>('.activity-status')?.offsetWidth ?? 0,
-        };
-      }),
+      [...document.querySelectorAll<HTMLElement>('.project-agent-row')].map((row) => ({
+        provider: row.querySelector('.project-agent-provider')?.textContent?.trim() ?? '',
+        title: row.querySelector('.project-agent-title')?.textContent?.trim() ?? '',
+        status: row.querySelector<HTMLElement>('.activity-status')?.offsetWidth ?? 0,
+      })),
     );
     expect(rows.length).toBe(2);
-    for (const row of rows) {
-      expect({ row, fits: row.visible >= row.needed }).toEqual({ row, fits: true });
-      expect(row.status).toBeGreaterThan(0);
-      expect(row.title).toMatch(/, [A-Z]/);
-    }
+    expect(rows.map((row) => row.provider)).toEqual(['', '↳']);
+    expect(rows.map((row) => row.title)).toEqual(['', '']);
+    expect(rows.map((row) => row.status > 0)).toEqual([true, true]);
   });
 });
