@@ -1,28 +1,16 @@
+use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 const PLUGIN_MARKER: &str = "plan-review";
 const CONFIG_NAMES: [&str; 3] = ["opencode.json", "opencode.jsonc", "config.json"];
+const PARENT_LIMIT: usize = 12;
 
-/// A private OpenCode configuration directory used by one Sail ACP process.
-///
-/// OpenCode merges plugin lists from every configuration source, so an empty plugin
-/// list cannot override a plugin inherited from the user's global configuration.
-/// Sail therefore starts OpenCode with a filtered copy of that configuration instead.
-pub struct IsolatedConfig {
-    root: PathBuf,
-}
-
-impl IsolatedConfig {
-    pub fn xdg_config_home(&self) -> &Path {
-        &self.root
-    }
-}
-
-impl Drop for IsolatedConfig {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanReviewPlugin {
+    pub source: String,
+    pub entry: String,
 }
 
 /// Removes comments so an OpenCode JSONC file parses once trailing commas are dropped.
@@ -95,9 +83,99 @@ fn strip_jsonc(text: &str) -> String {
     output
 }
 
+fn plugin_specs(config: &Value) -> Vec<String> {
+    let mut specs = Vec::new();
+    for key in ["plugin", "plugins"] {
+        let Some(entries) = config.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            match entry {
+                Value::String(spec) => specs.push(spec.clone()),
+                Value::Array(parts) => {
+                    if let Some(spec) = parts.first().and_then(Value::as_str) {
+                        specs.push(spec.to_string());
+                    }
+                }
+                Value::Object(fields) => {
+                    for field in ["package", "name", "path", "module"] {
+                        if let Some(spec) = fields.get(field).and_then(Value::as_str) {
+                            specs.push(spec.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    specs
+}
+
 fn marks_plan_review(spec: &str) -> bool {
     let spec = spec.to_lowercase();
     spec.contains(PLUGIN_MARKER) || spec.contains("plan_review")
+}
+
+fn config_plugin(path: &Path) -> Option<PlanReviewPlugin> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let config: Value = serde_json::from_str(&strip_jsonc(&text)).ok()?;
+    let entry = plugin_specs(&config)
+        .into_iter()
+        .find(|spec| marks_plan_review(spec))?;
+    Some(PlanReviewPlugin {
+        source: path.to_string_lossy().into_owned(),
+        entry,
+    })
+}
+
+fn plugin_file(directory: &Path) -> Option<PlanReviewPlugin> {
+    for name in ["plugin", "plugins"] {
+        let Ok(entries) = std::fs::read_dir(directory.join(name)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if marks_plan_review(&file) {
+                return Some(PlanReviewPlugin {
+                    source: directory.join(name).to_string_lossy().into_owned(),
+                    entry: file,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn directory_plugin(directory: &Path) -> Option<PlanReviewPlugin> {
+    CONFIG_NAMES
+        .iter()
+        .find_map(|name| config_plugin(&directory.join(name)))
+        .or_else(|| plugin_file(directory))
+}
+
+/// Where OpenCode would find the plan-review plugin for a worktree: the user's config
+/// directory, an explicit config file, and every `opencode.json`/`.opencode` up the tree.
+pub fn find_plan_review_plugin(
+    directory: &Path,
+    global: Option<&Path>,
+    explicit: Option<&Path>,
+) -> Option<PlanReviewPlugin> {
+    if let Some(found) = global.and_then(directory_plugin) {
+        return Some(found);
+    }
+    if let Some(found) = explicit.and_then(config_plugin) {
+        return Some(found);
+    }
+    for ancestor in directory.ancestors().take(PARENT_LIMIT) {
+        if let Some(found) = ["opencode.json", "opencode.jsonc"]
+            .iter()
+            .find_map(|name| config_plugin(&ancestor.join(name)))
+            .or_else(|| directory_plugin(&ancestor.join(".opencode")))
+        {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn global_config_directory() -> Option<PathBuf> {
@@ -110,78 +188,16 @@ fn global_config_directory() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("opencode"))
 }
 
-fn plugin_entry_is_plan_review(entry: &Value) -> bool {
-    match entry {
-        Value::String(spec) => marks_plan_review(spec),
-        Value::Array(parts) => parts
-            .first()
-            .and_then(Value::as_str)
-            .is_some_and(marks_plan_review),
-        Value::Object(fields) => ["package", "name", "path", "module"]
-            .iter()
-            .filter_map(|field| fields.get(*field).and_then(Value::as_str))
-            .any(marks_plan_review),
-        _ => false,
-    }
-}
-
-fn filter_plan_review_plugin(config: &mut Value) {
-    let Some(fields) = config.as_object_mut() else {
-        return;
-    };
-    for key in ["plugin", "plugins"] {
-        if let Some(entries) = fields.get_mut(key).and_then(Value::as_array_mut) {
-            entries.retain(|entry| !plugin_entry_is_plan_review(entry));
-        }
-    }
-}
-
-fn copy_config_directory(source: &Path, destination: &Path) -> Result<(), String> {
-    if !source.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(destination).map_err(|error| error.to_string())?;
-    for entry in std::fs::read_dir(source).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let path = entry.path();
-        let target = destination.join(entry.file_name());
-        if path.is_dir() {
-            copy_config_directory(&path, &target)?;
-        } else if !path.is_file() || marks_plan_review(&entry.file_name().to_string_lossy()) {
-            continue;
-        } else if CONFIG_NAMES.iter().any(|name| *name == entry.file_name()) {
-            let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
-            let mut config: Value = serde_json::from_str(&strip_jsonc(&text)).map_err(|error| {
-                format!(
-                    "Could not isolate OpenCode configuration {}: {error}",
-                    path.display()
-                )
-            })?;
-            filter_plan_review_plugin(&mut config);
-            let text = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
-            std::fs::write(target, format!("{text}\n")).map_err(|error| error.to_string())?;
-        } else {
-            std::fs::copy(&path, target).map_err(|error| error.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-/// Makes an isolated OpenCode config for a Sail-managed process.
-///
-/// The child receives this directory as `XDG_CONFIG_HOME`; its user-owned config and
-/// project-level config are never modified. Project config is disabled by the caller
-/// because OpenCode merges plugins from it after loading the global config.
-pub fn isolate_for_sail() -> Result<IsolatedConfig, String> {
-    let root = std::env::temp_dir().join(format!("sail-opencode-config-{}", uuid::Uuid::new_v4()));
-    let config = root.join("opencode");
-    if let Some(source) = global_config_directory() {
-        if let Err(error) = copy_config_directory(&source, &config) {
-            let _ = std::fs::remove_dir_all(&root);
-            return Err(error);
-        }
-    }
-    Ok(IsolatedConfig { root })
+/// Reports an enabled OpenCode plan-review plugin, which would add a second plan tool set
+/// next to Sail's own.
+#[tauri::command]
+pub fn opencode_plan_review_plugin(directory: String) -> Option<PlanReviewPlugin> {
+    let explicit = std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from);
+    find_plan_review_plugin(
+        Path::new(&directory),
+        global_config_directory().as_deref(),
+        explicit.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -198,41 +214,91 @@ mod tests {
     }
 
     #[test]
-    fn preserves_non_plan_settings_when_filtering_jsonc() {
-        let mut value: Value = serde_json::from_str(&strip_jsonc(
-            "{\n// comment\n\"url\": \"http://x//y\", /* block */ \"plugin\": [\"keep\", \"opencode-plan-review\", ],\n}",
+    fn jsonc_comments_and_trailing_commas_are_ignored() {
+        let value: Value = serde_json::from_str(&strip_jsonc(
+            "{\n// comment\n\"url\": \"http://x//y\", /* block */ \"plugin\": [\"a\", ],\n}",
         ))
         .unwrap();
+        assert_eq!(value["url"], "http://x//y");
+        assert_eq!(plugin_specs(&value), vec!["a".to_string()]);
+    }
 
-        filter_plan_review_plugin(&mut value);
-
+    #[test]
+    fn a_comment_after_a_trailing_comma_still_parses() {
+        let value: Value = serde_json::from_str(&strip_jsonc(
+            "{\n  \"plugin\": [\n    \"opencode-plan-review\", // enabled\n  ]\n}",
+        ))
+        .unwrap();
         assert_eq!(
-            value,
-            serde_json::json!({"url":"http://x//y","plugin":["keep"]})
+            plugin_specs(&value),
+            vec!["opencode-plan-review".to_string()]
         );
     }
 
     #[test]
-    fn copies_other_plugins_and_skips_plan_review_plugin_files() {
-        let source = scratch("source");
-        let destination = scratch("destination");
-        std::fs::create_dir_all(source.join("plugins")).unwrap();
+    fn plugin_entries_come_in_every_supported_shape() {
+        let config = serde_json::json!({
+            "plugin": ["one", ["two", {"gateway": "plan-review-not-a-plugin"}]],
+            "plugins": [{"package": "three"}]
+        });
+        assert_eq!(plugin_specs(&config), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn the_global_config_is_checked_and_options_are_not_plugins() {
+        let global = scratch("global");
+        let work = scratch("work");
         std::fs::write(
-            source.join("plugins").join("useful.ts"),
-            "export default {};",
+            global.join("opencode.json"),
+            r#"{"plugin": [["file:///x/kong.ts", {"note": "plan-review"}]]}"#,
         )
         .unwrap();
+        assert_eq!(find_plan_review_plugin(&work, Some(&global), None), None);
+
         std::fs::write(
-            source.join("plugins").join("plan-review.ts"),
-            "export default {};",
+            global.join("opencode.jsonc"),
+            "{\n  // enabled\n  \"plugin\": [\"opencode-plugin-plan-review@1.2.0\"],\n}",
         )
         .unwrap();
+        let found = find_plan_review_plugin(&work, Some(&global), None).unwrap();
+        assert_eq!(found.entry, "opencode-plugin-plan-review@1.2.0");
+        assert!(found.source.ends_with("opencode.jsonc"));
+    }
 
-        copy_config_directory(&source, &destination).unwrap();
+    #[test]
+    fn project_configs_and_plugin_files_are_found_up_the_tree() {
+        let root = scratch("project");
+        let nested = root.join("packages").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_plan_review_plugin(&nested, None, None), None);
 
-        assert!(destination.join("plugins").join("useful.ts").is_file());
-        assert!(!destination.join("plugins").join("plan-review.ts").exists());
-        std::fs::remove_dir_all(source).unwrap();
-        std::fs::remove_dir_all(destination).unwrap();
+        std::fs::create_dir_all(root.join(".opencode").join("plugin")).unwrap();
+        std::fs::write(
+            root.join(".opencode").join("plugin").join("plan-review.ts"),
+            "",
+        )
+        .unwrap();
+        let found = find_plan_review_plugin(&nested, None, None).unwrap();
+        assert_eq!(found.entry, "plan-review.ts");
+
+        std::fs::remove_dir_all(root.join(".opencode")).unwrap();
+        std::fs::write(
+            root.join("opencode.json"),
+            r#"{"plugin": ["smykla.plan-review"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_plan_review_plugin(&nested, None, None).unwrap().entry,
+            "smykla.plan-review"
+        );
+    }
+
+    #[test]
+    fn unreadable_configs_are_ignored() {
+        let work = scratch("broken");
+        std::fs::write(work.join("opencode.json"), "{not json").unwrap();
+        assert_eq!(find_plan_review_plugin(&work, None, None), None);
+        let explicit = work.join("missing.json");
+        assert_eq!(find_plan_review_plugin(&work, None, Some(&explicit)), None);
     }
 }

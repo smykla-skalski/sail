@@ -13,6 +13,7 @@
     "allow-finish-interrupted-agent-turn",
     "allow-start-runtime",
     "allow-repository-path-available",
+    "allow-opencode-plan-review-plugin",
     "allow-validate-repository",
     "allow-list-picker-directory",
     "dialog:allow-open",
