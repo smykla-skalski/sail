@@ -476,6 +476,13 @@ button:disabled {
   font-size: var(--type-12);
   font-weight: 700;
 }
+.project-subagent-tag {
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: var(--shell-selected-ink);
+  background: color-mix(in srgb, var(--sui-primary) 12%, transparent);
+  font-size: var(--type-12);
+}
 .project-agent-row .activity-status {
   grid-column: 2;
   grid-row: 1;
