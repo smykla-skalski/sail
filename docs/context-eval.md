@@ -38,6 +38,10 @@ the model version, the task prompt, the granted tool permissions, the source
 revision, the trial, and a stable seed derived from those identities, so a
 rerun after a provider or agent change repeats the same work deterministically.
 
+Each runner starts with a private home, XDG directories, temp directory, and
+evaluation seed. `forwardEnvironment` passes through other named host variables;
+it does not replace these isolated values, including Windows `TEMP` and `TMP`.
+
 ## Scoring
 
 - Task-specific checks: every check in the task set must pass with evidence.

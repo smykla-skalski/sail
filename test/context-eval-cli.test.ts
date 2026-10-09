@@ -98,6 +98,57 @@ void test('CLI isolates runs, pairs arms, and writes a reusable report', async (
   }
 });
 
+void test('CLI keeps run directories private when host paths are forwarded', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
+  try {
+    const configPath = join(temporary, 'config.json');
+    const outputPath = join(temporary, 'output');
+    const runner = join(root, 'test/fixtures/context-eval/runner.mjs');
+    const config = JSON.parse(contextEvalConfig(runner, false));
+    config.runners[0].forwardEnvironment = [
+      'HOME',
+      'TMPDIR',
+      'XDG_CONFIG_HOME',
+      'XDG_CACHE_HOME',
+      'XDG_DATA_HOME',
+      'TEMP',
+      'TMP',
+    ];
+    await writeFile(configPath, JSON.stringify(config));
+
+    await execute(
+      process.execPath,
+      [
+        join(root, 'scripts/run-context-eval.mjs'),
+        '--tasks',
+        join(root, 'test/fixtures/context-eval/tasks-v1.json'),
+        '--config',
+        configPath,
+        '--output',
+        outputPath,
+      ],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: temporary,
+          TMPDIR: temporary,
+          XDG_CONFIG_HOME: temporary,
+          XDG_CACHE_HOME: temporary,
+          XDG_DATA_HOME: temporary,
+          TEMP: temporary,
+          TMP: temporary,
+        },
+      },
+    );
+
+    const report = JSON.parse(await readFile(join(outputPath, 'report.json'), 'utf8'));
+    assert.equal(report.results.length, 14);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 void test('CLI fails decisively when a confirmed safety event is recorded', async () => {
   const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
   try {

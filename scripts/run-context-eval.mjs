@@ -100,6 +100,7 @@ function isolatedEnvironment(runDirectory, runner, seed) {
     environment.TMP = join(runDirectory, 'tmp');
   }
   for (const name of runner.forwardEnvironment) {
+    if (Object.hasOwn(environment, name)) continue;
     const value = process.env[name];
     if (value !== undefined) environment[name] = value;
   }
