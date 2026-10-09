@@ -549,6 +549,7 @@ impl BrowserManager {
                 Some("sai-agent-terminals-enabled")
             }
             "worktree_status" => Some("sai-agent-status-enabled"),
+            "thread_keywords" => None,
             "project_threads" => Some("sai-agent-thread-list-enabled"),
             "thread_message" => Some("sai-agent-messages-enabled"),
             "capability_check" => None,
@@ -683,6 +684,7 @@ impl BrowserManager {
                 | "terminal_write"
                 | "terminal_stop"
                 | "worktree_status"
+                | "thread_keywords"
                 | "project_threads"
                 | "thread_message"
         ) {
@@ -1528,6 +1530,11 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "comment",
     ),
     (
+        "thread_keywords",
+        "Set concise search keywords for this agent thread. Replace them when the task scope materially changes; an empty list clears them.",
+        "keywords",
+    ),
+    (
         "project_threads",
         "List other agent threads in this Git project and its worktrees.",
         "",
@@ -1567,6 +1574,15 @@ const TOOLS: &[(&str, &str, &str)] = &[
 
 fn plan_lines_schema() -> Value {
     json!({"type":["array","string"],"items":{"type":"string"}})
+}
+
+fn thread_keywords_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{"keywords":{"type":"array","items":{"type":"string","minLength":1,"maxLength":40},"maxItems":10}},
+        "required":["keywords"],
+        "additionalProperties":false
+    })
 }
 
 fn plan_step_schema() -> Value {
@@ -1732,6 +1748,7 @@ impl CapabilityProfile {
             "terminal_read",
             "terminal_wait",
             "worktree_status",
+            "thread_keywords",
             "project_threads",
             "read_page",
             "screenshot",
@@ -1841,6 +1858,9 @@ pub fn run_mcp_stdio() {
                         "required":["prompt"],
                         "anyOf":[{"required":["role","risk"]},{"required":["provider"]}]
                     }});
+                }
+                if *name == "thread_keywords" {
+                    return json!({"name":name,"description":description,"inputSchema":thread_keywords_schema()});
                 }
                 if *name == "validation_gate" {
                     return json!({"name":name,"description":description,"inputSchema":{
@@ -2042,13 +2062,14 @@ mod picker_tests {
 mod skill_tests {
     use super::{
         call_bridge, economics_input_schema, mcp_initialize, plan_tool_schema,
-        requires_phase_lease, skill_text, tool_listed, BrowserManager, CapabilityProfile,
-        CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
+        requires_phase_lease, skill_text, thread_keywords_schema, tool_listed, BrowserManager,
+        CapabilityProfile, CAPABILITY_POLICY_REVISION, SAIL_SKILL, TOOLS,
     };
 
     #[test]
     fn capability_profiles_expose_only_role_tools() {
         assert!(CapabilityProfile::Explore.enables("read_page"));
+        assert!(CapabilityProfile::Explore.enables("thread_keywords"));
         assert!(!CapabilityProfile::Explore.enables("terminal_create"));
         assert!(CapabilityProfile::Review.enables("validation_gate"));
         assert!(!CapabilityProfile::Review.enables("agent_spawn"));
@@ -2073,6 +2094,14 @@ mod skill_tests {
         assert!(economics_input_schema()["properties"]["phase"]["enum"]
             .as_array()
             .is_some_and(|phases| phases.iter().any(|phase| phase == "publish")));
+    }
+
+    #[test]
+    fn thread_keywords_schema_accepts_a_bounded_list() {
+        let schema = thread_keywords_schema();
+        assert_eq!(schema["properties"]["keywords"]["maxItems"], 10);
+        assert_eq!(schema["properties"]["keywords"]["items"]["maxLength"], 40);
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]
@@ -2174,6 +2203,7 @@ mod skill_tests {
         assert!(TOOLS
             .iter()
             .any(|(name, _, _)| *name == "validation_policy"));
+        assert!(TOOLS.iter().any(|(name, _, _)| *name == "thread_keywords"));
         assert_eq!(
             call_bridge(&json!({"name":"sail_skill","arguments":{}}))["content"][0]["text"],
             SAIL_SKILL

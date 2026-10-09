@@ -418,6 +418,8 @@
     forgetRecentTranscript,
     invalidateLiveTranscript,
     loadAgentThreads,
+    mergeAgentThreadUpdate,
+    normalizeAgentThreadKeywords,
     loadInterruptedAgentTurns,
     loadRecentTranscript,
     rememberSessionState,
@@ -770,6 +772,7 @@
       | 'worktree_list'
       | 'worktree_info'
       | 'worktree_status'
+      | 'thread_keywords'
       | 'project_threads'
       | 'thread_message'
       | 'capability_check';
@@ -5940,6 +5943,18 @@
       saveProjectCatalog(setWorktreeStatus(projectCatalog, project, request.directory, comment));
       return { comment: comment.trim() };
     }
+    if (request.name === 'thread_keywords') {
+      const keywords = normalizeAgentThreadKeywords(request.arguments.keywords);
+      const thread = agentThreads.find(
+        (item) =>
+          item.agent === source.agent &&
+          item.directory === request.directory &&
+          item.sessionId === request.sessionId,
+      );
+      if (!thread) throw new Error('The source agent session is unavailable.');
+      saveAgentThread({ ...thread, keywords });
+      return { keywords };
+    }
     if (request.name === 'project_threads' || request.name === 'thread_message') {
       if (request.name === 'project_threads' && !agentThreadListEnabled)
         throw new Error('Agent thread listing is disabled in settings.');
@@ -9182,10 +9197,7 @@
 
   function saveAgentThread(thread: AgentThread) {
     const previous = agentThreads.find((item) => threadKey(item) === threadKey(thread));
-    if (previous && previous.updated > thread.updated)
-      thread = { ...thread, updated: previous.updated };
-    if (previous?.renamed && !thread.renamed)
-      thread = { ...thread, title: previous.title, renamed: true };
+    thread = mergeAgentThreadUpdate(previous, thread);
     agentThreads = [
       thread,
       ...agentThreads.filter(

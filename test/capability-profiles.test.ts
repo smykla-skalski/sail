@@ -18,6 +18,11 @@ const options = [
   { optionId: 'no', kind: 'reject_once' },
 ];
 
+void test('every capability profile can update its own thread keywords', () => {
+  for (const profile of ['explore', 'review', 'build', 'release'] as const)
+    assert.equal(capabilityProfileEnablesTool(profile, 'thread_keywords'), true);
+});
+
 await test('classifies raw permission calls before deciding', () => {
   assert.equal(classifyPermission({ command: "cat $'/etc/'shadow" }, 'Run command'), 'unknown');
   assert.equal(

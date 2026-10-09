@@ -22,10 +22,55 @@ export interface AgentThread {
   sessionId: string;
   directory: string;
   title: string;
+  keywords?: string[];
   updated: number;
   capabilityProfile?: CapabilityProfile;
   /** The user chose this title in Sail, so agent-provided titles never replace it. */
   renamed?: boolean;
+}
+
+export function normalizeAgentThreadKeywords(value: unknown): string[] {
+  if (!Array.isArray(value)) throw new Error('Thread keywords must be an array.');
+  if (value.length > 10) throw new Error('A thread can have at most 10 keywords.');
+  const keywords: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== 'string') throw new Error('Every thread keyword must be text.');
+    const keyword = item.trim().replace(/\s+/g, ' ');
+    if (!keyword) throw new Error('Thread keywords cannot be empty.');
+    if (keyword.length > 40) throw new Error('Every thread keyword must be at most 40 characters.');
+    const key = keyword.toLocaleLowerCase();
+    if (!seen.has(key)) keywords.push(keyword);
+    seen.add(key);
+  }
+  if (keywords.reduce((total, keyword) => total + keyword.length, 0) > 320)
+    throw new Error('Thread keywords must total at most 320 characters.');
+  return keywords;
+}
+
+export function mergeAgentThreadUpdate(
+  previous: AgentThread | undefined,
+  incoming: AgentThread,
+): AgentThread {
+  if (!previous) return incoming;
+  let merged =
+    previous.updated > incoming.updated ? { ...incoming, updated: previous.updated } : incoming;
+  if (previous.renamed && !merged.renamed)
+    merged = { ...merged, title: previous.title, renamed: true };
+  if (previous.keywords !== undefined && merged.keywords === undefined)
+    merged = { ...merged, keywords: previous.keywords };
+  return merged;
+}
+
+export function mergeAgentThreadListing(previous: AgentThread, incoming: AgentThread): AgentThread {
+  const newest = previous.updated < incoming.updated ? incoming : previous;
+  const renamed = previous.renamed ? previous : incoming.renamed ? incoming : null;
+  const keywords = incoming.keywords ?? previous.keywords;
+  return {
+    ...newest,
+    ...(renamed ? { title: renamed.title, renamed: true } : {}),
+    ...(keywords === undefined ? {} : { keywords }),
+  };
 }
 
 export interface AgentSessionListing {
@@ -327,20 +372,31 @@ export function loadAgentThreads(): AgentThread[] {
   try {
     const value: unknown = JSON.parse(getSetting(storageKey) ?? '[]');
     if (!Array.isArray(value)) return [];
-    return value.filter(
-      (item): item is AgentThread =>
-        typeof item === 'object' &&
-        item !== null &&
-        typeof item.agent === 'string' &&
-        item.agent.length > 0 &&
-        typeof item.sessionId === 'string' &&
-        typeof item.directory === 'string' &&
-        typeof item.title === 'string' &&
-        typeof item.updated === 'number' &&
-        (item.effort === undefined || typeof item.effort === 'string') &&
-        (item.capabilityProfile === undefined ||
-          ['explore', 'review', 'build', 'release'].includes(item.capabilityProfile)),
-    );
+    return value
+      .filter(
+        (item): item is AgentThread =>
+          typeof item === 'object' &&
+          item !== null &&
+          typeof item.agent === 'string' &&
+          item.agent.length > 0 &&
+          typeof item.sessionId === 'string' &&
+          typeof item.directory === 'string' &&
+          typeof item.title === 'string' &&
+          typeof item.updated === 'number' &&
+          (item.effort === undefined || typeof item.effort === 'string') &&
+          (item.capabilityProfile === undefined ||
+            ['explore', 'review', 'build', 'release'].includes(item.capabilityProfile)),
+      )
+      .map((item) => {
+        if (item.keywords === undefined) return item;
+        try {
+          return Object.assign({}, item, { keywords: normalizeAgentThreadKeywords(item.keywords) });
+        } catch {
+          const thread = Object.assign({}, item);
+          delete thread.keywords;
+          return thread;
+        }
+      });
   } catch {
     return [];
   }
