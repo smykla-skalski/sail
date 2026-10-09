@@ -1,4 +1,4 @@
-import { browser, $, expect } from '@wdio/globals';
+import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,6 +13,75 @@ const waitForComposer = () =>
       ),
     { timeout: 15000, timeoutMsg: 'Agent composer did not become ready' },
   );
+
+const sendButton = () => $('.agent-actions button:last-child');
+
+const actionDiagnostics = async () =>
+  Promise.all(
+    (await $$('.agent-actions button')).map(async (button) => ({
+      text: await button.getText(),
+      enabled: await button.isEnabled(),
+    })),
+  );
+
+const submitPrompt = async (attempt = 0): Promise<void> => {
+  const textarea = $('.agent-composer textarea');
+  await sendButton().waitForEnabled();
+  await sendButton().click();
+  const accepted = await browser
+    .waitUntil(async () => (await textarea.getValue()) === '', { timeout: 3000, interval: 100 })
+    .then(() => true)
+    .catch(() => false);
+  if (accepted) return;
+  if (attempt < 2) return submitPrompt(attempt + 1);
+  console.error('Attention prompt submission diagnostic', {
+    actions: await actionDiagnostics(),
+    textarea: await textarea.getValue(),
+  });
+  throw new Error('Agent prompt was not accepted');
+};
+
+const waitForStopButton = async () => {
+  try {
+    await expect($('.agent-busy button')).toBeDisplayed();
+  } catch (cause) {
+    console.error('Attention stop diagnostic', {
+      conversation: await $('.agent-conversation').getText(),
+      actions: await actionDiagnostics(),
+      busy: await $$('.agent-busy').length,
+      permissions: await $$('.agent-permission').length,
+      textarea: await $('.agent-composer textarea').getValue(),
+    });
+    throw cause;
+  }
+};
+
+const waitForTurnIdle = async () => {
+  try {
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const send = document.querySelector<HTMLButtonElement>(
+            '.agent-actions button:last-child',
+          );
+          return Boolean(
+            !document.querySelector('.agent-busy') &&
+            send &&
+            send.textContent?.trim().startsWith('Send'),
+          );
+        }),
+      { timeout: 15000, timeoutMsg: 'Agent turn did not settle' },
+    );
+  } catch (cause) {
+    console.error('Attention turn settlement diagnostic', {
+      conversation: await $('.agent-conversation').getText(),
+      actions: await actionDiagnostics(),
+      busy: await $$('.agent-busy').length,
+      permissions: await $$('.agent-permission').length,
+    });
+    throw cause;
+  }
+};
 
 describe('agent thread attention', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-attention-'));
@@ -49,7 +118,8 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Stop during setup');
-    await $('.agent-actions button').click();
+    await submitPrompt();
+    await waitForStopButton();
     await $('.agent-busy button').click();
     const stoppedDuringSetup = $('.project-agent-row[aria-label*="Stop during setup"]');
     await expect(stoppedDuringSetup.$('.activity-status')).toHaveAttribute(
@@ -61,7 +131,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Delayed approval');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const row = $('.project-agent-row[aria-label*="Delayed approval"]');
     await expect(row).toBeDisplayed();
     await $('.agent-launches button').click();
@@ -92,9 +162,9 @@ describe('agent thread attention', () => {
     await expect(row).toHaveText(expect.stringContaining('Completed'));
     await expect(sidebarRow).toHaveText(expect.stringContaining('Completed'));
 
-    await waitForComposer();
+    await waitForTurnIdle();
     await $('.agent-composer textarea').setValue('Delayed completion');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     await expect($('.agent-permission')).toBeDisplayed();
     await $('.agent-permission button').click();
     await $('.agent-launches button').click();
@@ -104,7 +174,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Slow cancel');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const cancelled = $('.project-agent-row[aria-label*="Slow cancel"]');
     await expect($('.agent-permission')).toBeDisplayed();
     await browser.refresh();
@@ -121,7 +191,7 @@ describe('agent thread attention', () => {
 
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Cancel error');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     await expect($('.agent-permission')).toBeDisplayed();
     await $('.agent-busy button').click();
     await $('.agent-launches button').click();
@@ -134,7 +204,7 @@ describe('agent thread attention', () => {
 
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Cancel ignored');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     await expect($('.agent-permission')).toBeDisplayed();
     await $('.agent-busy button').click();
     await $('.agent-launches button').click();
@@ -147,7 +217,7 @@ describe('agent thread attention', () => {
 
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Agent interrupted');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const agentInterrupted = $('.project-agent-row[aria-label*="Agent interrupted"]');
     await expect(agentInterrupted.$('.activity-status')).toHaveAttribute(
       'data-state',
@@ -157,7 +227,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Agent error interrupted');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const errorInterrupted = $('.project-agent-row[aria-label*="Agent error interrupted"]');
     await expect(errorInterrupted.$('.activity-status')).toHaveAttribute(
       'data-state',
@@ -185,7 +255,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Agent text interrupted');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const textInterrupted = $('.project-agent-row[aria-label*="Agent text interrupted"]');
     await expect(textInterrupted.$('.activity-status')).toHaveAttribute(
       'data-state',
@@ -196,7 +266,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Agent text interrupted error');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const textInterruptedWithError = $(
       '.project-agent-row[aria-label*="Agent text interrupted error"]',
     );
@@ -209,7 +279,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Agent text interrupted unrelated error');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const unrelatedError = $(
       '.project-agent-row[aria-label*="Agent text interrupted unrelated error"]',
     );
@@ -219,7 +289,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Discuss interruption');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const discussed = $('.project-agent-row[aria-label*="Discuss interruption"]');
     await expect(discussed.$('.activity-status')).toHaveAttribute('data-state', 'completed');
     await expect(discussed).toHaveText(expect.stringContaining('Completed'));
@@ -227,7 +297,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Continue after interruption');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const continued = $('.project-agent-row[aria-label*="Continue after interruption"]');
     await expect(continued.$('.activity-status')).toHaveAttribute('data-state', 'completed');
     await expect(continued).toHaveText(expect.stringContaining('Completed'));
@@ -235,7 +305,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Native interrupted subagent');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     const nativeChildren = $('button[aria-label*="for Native interrupted subagent"]');
     await expect(nativeChildren).toHaveText(expect.stringContaining('1 historical'));
     await nativeChildren.click();
@@ -249,7 +319,7 @@ describe('agent thread attention', () => {
     await $('.agent-launches button').click();
     await waitForComposer();
     await $('.agent-composer textarea').setValue('Crash on cancel');
-    await $('.agent-actions button').click();
+    await submitPrompt();
     await expect($('.agent-permission')).toBeDisplayed();
     await $('.agent-busy button').click();
     const crashed = $('.project-agent-row[aria-label*="Crash on cancel"]');
