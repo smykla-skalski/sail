@@ -43,6 +43,21 @@
     notificationTypes,
     type NotificationPreference,
   } from './lib/notification-prefs';
+  import {
+    createSerialExecutor,
+    exportMemories,
+    memoryKinds,
+    parseMemoryTags,
+    type MemoryAgentInstallPreview,
+    type MemoryAgentStatus,
+    type MemoryKind,
+    type MemoryMode,
+    type MemoryProviderKind,
+    type MemoryProviderStatus,
+    type MemoryRecord,
+    type MemorySearchResult,
+    type MemoryStatus,
+  } from './lib/shared-memory';
 
   let snapshot = $state<SettingsSnapshot | null>(null);
   const openCodeAgent = $derived(snapshot?.agents.find((agent) => agent.id === 'opencode'));
@@ -55,7 +70,7 @@
   let personalChecks = $state('');
   let personalChecksDirty = $state(false);
   let binaryDirty = $state(false);
-  let selectedSection = $state<'general' | 'opencode' | 'agents'>('general');
+  let selectedSection = $state<'general' | 'opencode' | 'agents' | 'memory'>('general');
   let validationAgent = $state('');
   let validationModel = $state('');
   let routingRole = $state<ModelRouteRole>('implementation');
@@ -93,6 +108,261 @@
   let integrationRequest = 0;
   let integrationLoading = $state(false);
   let integrationError = $state('');
+  let memoryStatus = $state<MemoryStatus | null>(null);
+  let memoryRecords = $state<MemoryRecord[]>([]);
+  let memoryAgents = $state<MemoryAgentStatus[]>([]);
+  let memoryQuery = $state('');
+  let memoryContent = $state('');
+  let memoryKind = $state<MemoryKind>('other');
+  let memoryTags = $state('');
+  let memoryLoading = $state(false);
+  let memoryStorageError = $state('');
+  let memoryAgentError = $state('');
+  let memoryConfigError = $state('');
+  let memoryRequest = 0;
+  let memoryDirectory = '';
+  let pendingForget = $state('');
+  let agentPreview = $state<{
+    action: 'install' | 'uninstall';
+    result: MemoryAgentInstallPreview;
+  } | null>(null);
+  let previewRequest = 0;
+  let memoryModeRequest = 0;
+  const serializeMemoryMode = createSerialExecutor();
+  let memoryProviderStatus = $state<MemoryProviderStatus | null>(null);
+  let memoryProviderKind = $state<MemoryProviderKind>('local');
+  let memoryProviderEndpoint = $state('');
+  let memoryProviderApiKey = $state('');
+  let memoryProviderMessage = $state('');
+  let memoryProviderError = $state('');
+  let memoryProviderLoading = $state(false);
+
+  async function refreshMemory(directory: string, query = memoryQuery.trim()) {
+    const request = ++memoryRequest;
+    if (memoryDirectory !== directory) {
+      memoryStatus = null;
+      memoryRecords = [];
+      memoryQuery = '';
+      pendingForget = '';
+      agentPreview = null;
+      previewRequest += 1;
+      memoryProviderStatus = null;
+      memoryProviderKind = 'local';
+      memoryProviderEndpoint = '';
+      memoryProviderApiKey = '';
+      memoryProviderMessage = '';
+      memoryProviderError = '';
+      query = '';
+    }
+    memoryDirectory = directory;
+    memoryLoading = true;
+    memoryStorageError = '';
+    memoryAgentError = '';
+    try {
+      const status = await invoke<MemoryStatus>('memory_status', { directory });
+      const records = status.enabled
+        ? query
+          ? (
+              await invoke<MemorySearchResult[]>('memory_search', {
+                directory,
+                query,
+                limit: 100,
+              })
+            ).map((result) => result.memory)
+          : await invoke<MemoryRecord[]>('memory_list', { directory, includeForgotten: false })
+        : [];
+      if (request === memoryRequest && memoryDirectory === directory) {
+        memoryStatus = status;
+        memoryRecords = records;
+      }
+    } catch (cause) {
+      if (request === memoryRequest && memoryDirectory === directory)
+        memoryStorageError = `Storage: ${String(cause)}`;
+    } finally {
+      if (request === memoryRequest && memoryDirectory === directory) memoryLoading = false;
+    }
+    try {
+      const agents = await invoke<MemoryAgentStatus[]>('memory_agent_status');
+      if (request === memoryRequest && memoryDirectory === directory) memoryAgents = agents;
+    } catch (cause) {
+      if (request === memoryRequest && memoryDirectory === directory)
+        memoryAgentError = `Agents: ${String(cause)}`;
+    }
+    try {
+      memoryProviderError = '';
+      const providerStatus = await invoke<MemoryProviderStatus>('memory_provider_status', {
+        directory,
+      });
+      if (request === memoryRequest && memoryDirectory === directory) {
+        memoryProviderStatus = providerStatus;
+        memoryProviderKind = providerStatus.provider;
+        memoryProviderEndpoint = providerStatus.endpoint ?? '';
+      }
+    } catch (cause) {
+      if (request === memoryRequest && memoryDirectory === directory)
+        memoryProviderError = `Provider: ${String(cause)}`;
+    }
+  }
+
+  function memoryProviderInput() {
+    return {
+      provider: memoryProviderKind,
+      endpoint: memoryProviderKind === 'mem0SelfHosted' ? memoryProviderEndpoint.trim() : null,
+      apiKey: memoryProviderKind === 'local' ? null : memoryProviderApiKey.trim(),
+    };
+  }
+
+  async function verifyMemoryProvider() {
+    const directory = snapshot?.directory;
+    if (!directory || memoryProviderKind === 'local') return;
+    memoryProviderLoading = true;
+    memoryProviderError = '';
+    memoryProviderMessage = '';
+    try {
+      await invoke<MemoryProviderStatus>('verify_memory_provider', {
+        directory,
+        input: memoryProviderInput(),
+      });
+      memoryProviderMessage = 'Connection verified. Enable it to backfill existing memories.';
+    } catch (cause) {
+      memoryProviderError = `Provider: ${String(cause)}`;
+    } finally {
+      memoryProviderLoading = false;
+    }
+  }
+
+  async function saveMemoryProvider() {
+    const directory = snapshot?.directory;
+    if (!directory) return;
+    memoryProviderLoading = true;
+    memoryProviderError = '';
+    memoryProviderMessage = '';
+    try {
+      memoryProviderStatus = await invoke<MemoryProviderStatus>('set_memory_provider', {
+        directory,
+        input: memoryProviderInput(),
+      });
+      memoryProviderApiKey = '';
+      memoryProviderKind = memoryProviderStatus.provider;
+      memoryProviderEndpoint = memoryProviderStatus.endpoint ?? '';
+      memoryProviderMessage =
+        memoryProviderStatus.provider === 'local'
+          ? 'Local search is active. Canonical project memories were preserved.'
+          : 'Mem0 is active and existing memories are synchronized.';
+    } catch (cause) {
+      memoryProviderError = `Provider: ${String(cause)}`;
+    } finally {
+      memoryProviderLoading = false;
+    }
+  }
+
+  async function rememberMemory() {
+    const directory = snapshot?.directory;
+    const content = memoryContent.trim();
+    if (!directory || !content) return;
+    memoryStorageError = '';
+    try {
+      await invoke<MemoryRecord>('memory_remember', {
+        directory,
+        input: { content, kind: memoryKind, tags: parseMemoryTags(memoryTags) },
+      });
+      memoryContent = '';
+      memoryTags = '';
+      await refreshMemory(directory);
+    } catch (cause) {
+      memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function setMemoryMode(mode: MemoryMode) {
+    const directory = snapshot?.directory;
+    if (!directory) return;
+    const request = ++memoryModeRequest;
+    memoryStorageError = '';
+    try {
+      await serializeMemoryMode(async () => {
+        const projectKey = await invoke<string>('memory_project_key', { directory });
+        await invoke('save_setting', {
+          key: `sai-memory-mode:${projectKey}`,
+          value: mode === 'off' ? null : mode,
+        });
+      });
+      if (request === memoryModeRequest && snapshot?.directory === directory) {
+        agentPreview = null;
+        previewRequest += 1;
+        await refreshMemory(directory);
+      }
+    } catch (cause) {
+      if (request === memoryModeRequest) memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function forgetMemory(id: string) {
+    const directory = snapshot?.directory;
+    if (!directory) return;
+    memoryStorageError = '';
+    try {
+      await invoke('memory_forget', { directory, id });
+      pendingForget = '';
+      await refreshMemory(directory);
+    } catch (cause) {
+      memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function downloadMemoryExport() {
+    const directory = snapshot?.directory;
+    if (!directory || !memoryStatus?.enabled) return;
+    memoryStorageError = '';
+    try {
+      const records = await invoke<MemoryRecord[]>('memory_list', {
+        directory,
+        includeForgotten: false,
+      });
+      const blob = new Blob([exportMemories(records)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `sail-memory-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (cause) {
+      memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function previewAgentChange(
+    agent: MemoryAgentStatus['id'],
+    action: 'install' | 'uninstall',
+  ) {
+    const request = ++previewRequest;
+    memoryConfigError = '';
+    agentPreview = null;
+    try {
+      const result = await invoke<MemoryAgentInstallPreview>(
+        action === 'install' ? 'preview_memory_agent_install' : 'preview_memory_agent_uninstall',
+        { agent },
+      );
+      if (request === previewRequest) agentPreview = { action, result };
+    } catch (cause) {
+      if (request === previewRequest) memoryConfigError = `Configuration: ${String(cause)}`;
+    }
+  }
+
+  async function changeAgentInstall(
+    command: 'install_memory_agent' | 'uninstall_memory_agent',
+    agent: MemoryAgentStatus['id'],
+  ) {
+    memoryConfigError = '';
+    try {
+      await invoke(command, { agent });
+      agentPreview = null;
+      previewRequest += 1;
+      if (snapshot?.directory) await refreshMemory(snapshot.directory);
+    } catch (cause) {
+      memoryConfigError = `Configuration: ${String(cause)}`;
+    }
+  }
 
   async function inspectIntegration(directory: string) {
     const request = ++integrationRequest;
@@ -275,6 +545,8 @@
             if (snapshot.directory !== integrationDirectory)
               void inspectIntegration(snapshot.directory);
           }
+          if (selectedSection === 'memory' && snapshot.directory !== memoryDirectory)
+            void refreshMemory(snapshot.directory);
           themePreference = snapshot.theme;
           if (!binaryDirty) binaryPath = snapshot.binaryPath;
           if (!personalChecksDirty) personalChecks = snapshot.personalPostTurnChecks.join('\n');
@@ -325,6 +597,14 @@
               void inspectIntegration(snapshot.directory);
           }
         }}>Agents</button
+      >
+      <button
+        class:active={selectedSection === 'memory'}
+        aria-current={selectedSection === 'memory' ? 'page' : undefined}
+        onclick={() => {
+          selectedSection = 'memory';
+          if (snapshot?.directory) void refreshMemory(snapshot.directory);
+        }}>Memory</button
       >
     </nav>
   </aside>
@@ -389,7 +669,7 @@
           }}>Save and check</Button
         >
       </section>
-    {:else}
+    {:else if selectedSection === 'agents'}
       <h1>Agents</h1>
       <section class="settings-card">
         <h2>Detected agents</h2>
@@ -797,6 +1077,324 @@
           />
           Notification sound
         </label>
+      </section>
+    {:else}
+      <h1>Memory</h1>
+      <section class="settings-card">
+        <h2>Shared memory mode</h2>
+        <p>
+          Memory is off by default. Sail only shares this project's memory between agents opened in
+          Sail. System-wide also makes it available when supported agents run elsewhere.
+        </p>
+        <p class="runtime-binary">
+          Mode changes apply to new or reconnected agent sessions. Reopen an existing live session
+          to add or remove its memory tools.
+        </p>
+        <label for="memory-mode">Availability</label>
+        <select
+          id="memory-mode"
+          value={memoryStatus?.mode ?? 'off'}
+          onchange={(event) => void setMemoryMode(event.currentTarget.value as MemoryMode)}
+        >
+          <option value="off">Off</option>
+          <option value="sail">Sail only</option>
+          <option value="system">System-wide</option>
+        </select>
+        {#if (memoryStatus?.mode ?? 'off') === 'off'}
+          <p class="memory-empty" role="status">
+            Shared memory is off. Enabling it does not create a memory until you or an agent saves
+            one.
+          </p>
+        {:else if memoryStatus}
+          <p class="runtime-binary">
+            {memoryStatus.count} active {memoryStatus.count === 1 ? 'memory' : 'memories'} ·
+            {memoryStatus.forgottenCount} forgotten
+          </p>
+        {/if}
+      </section>
+
+      <section class="settings-card">
+        <h2>Search provider</h2>
+        <p>
+          Local project memory remains canonical. Mem0 adds semantic search; an outage falls back to
+          local search and never blocks memory writes.
+        </p>
+        {#if memoryProviderError}<p class="runtime-diagnostic" role="alert">
+            {memoryProviderError}
+          </p>{/if}
+        {#if memoryProviderMessage}<p class="runtime-binary" role="status">
+            {memoryProviderMessage}
+          </p>{/if}
+        {#if memoryProviderStatus?.notice && memoryProviderKind === memoryProviderStatus.provider}<p
+            class="runtime-diagnostic"
+            role="status"
+          >
+            {memoryProviderStatus.notice}
+          </p>{/if}
+        {#if memoryProviderStatus?.syncError && memoryProviderKind === memoryProviderStatus.provider}<p
+            class="runtime-diagnostic"
+            role="alert"
+          >
+            Last Mem0 sync failed: {memoryProviderStatus.syncError} Local search remains active.
+          </p>{/if}
+        <label for="memory-provider">Provider</label>
+        <select
+          id="memory-provider"
+          bind:value={memoryProviderKind}
+          disabled={!snapshot?.directory || memoryProviderLoading}
+          onchange={() => {
+            memoryProviderMessage = '';
+            memoryProviderError = '';
+          }}
+        >
+          <option value="local">Local search</option>
+          <option value="mem0Hosted">Mem0 hosted</option>
+          <option value="mem0SelfHosted">Mem0 self-hosted</option>
+        </select>
+        {#if memoryProviderKind === 'mem0SelfHosted'}
+          <label for="memory-provider-endpoint">Endpoint</label>
+          <input
+            id="memory-provider-endpoint"
+            type="url"
+            placeholder="https://mem0.example.com"
+            bind:value={memoryProviderEndpoint}
+            disabled={memoryProviderLoading}
+          />
+          <p class="runtime-binary">HTTPS is required except for localhost development servers.</p>
+        {/if}
+        {#if memoryProviderKind !== 'local'}
+          <label for="memory-provider-api-key">API key</label>
+          <input
+            id="memory-provider-api-key"
+            type="password"
+            autocomplete="off"
+            bind:value={memoryProviderApiKey}
+            disabled={memoryProviderLoading}
+          />
+          <p class="runtime-binary">
+            The key is stored in the OS credential store, never in Sail settings, exports, logs, or
+            agent configuration.
+          </p>
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={!memoryStatus?.enabled ||
+              !memoryProviderApiKey.trim() ||
+              (memoryProviderKind === 'mem0SelfHosted' && !memoryProviderEndpoint.trim()) ||
+              memoryProviderLoading}
+            onclick={() => void verifyMemoryProvider()}>Verify connection</Button
+          >
+        {/if}
+        <Button
+          size="sm"
+          disabled={!snapshot?.directory ||
+            memoryProviderLoading ||
+            (memoryProviderKind !== 'local' &&
+              (!memoryStatus?.enabled ||
+                !memoryProviderApiKey.trim() ||
+                (memoryProviderKind === 'mem0SelfHosted' && !memoryProviderEndpoint.trim())))}
+          onclick={() => void saveMemoryProvider()}
+          >{memoryProviderKind === 'local' ? 'Use local search' : 'Enable Mem0'}</Button
+        >
+        {#if !memoryStatus?.enabled && memoryProviderKind !== 'local'}
+          <p class="memory-empty" role="status">Enable shared memory before connecting Mem0.</p>
+        {/if}
+      </section>
+
+      {#if memoryStatus?.mode === 'system'}
+        <section class="settings-card">
+          <h2>Coding agents</h2>
+          <p>Install shared memory independently in each detected agent.</p>
+          {#if memoryAgentError}<p class="runtime-diagnostic" role="alert">
+              {memoryAgentError}
+            </p>{/if}
+          {#if memoryConfigError}<p class="runtime-diagnostic" role="alert">
+              {memoryConfigError}
+            </p>{/if}
+          <div class="memory-agent-list">
+            {#each memoryAgents as agent (agent.id)}
+              <article class="memory-agent" data-agent={agent.id}>
+                <div>
+                  <strong>{agent.name}</strong>
+                  <span class:healthy={agent.healthy}>
+                    {agent.installed
+                      ? agent.healthy
+                        ? 'Installed and healthy'
+                        : 'Installed with a problem'
+                      : agent.detected
+                        ? 'Available to install'
+                        : 'Not detected'}
+                  </span>
+                  <small>{agent.detail}</small>
+                </div>
+                {#if agent.installed}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onclick={() => void previewAgentChange(agent.id, 'uninstall')}
+                    >Preview uninstall</Button
+                  >
+                {:else}
+                  <Button
+                    size="sm"
+                    disabled={!agent.detected}
+                    onclick={() => void previewAgentChange(agent.id, 'install')}
+                    >Preview install</Button
+                  >
+                {/if}
+              </article>
+            {:else}
+              <p role="status">
+                {memoryLoading ? 'Checking agents…' : 'No supported agents found.'}
+              </p>
+            {/each}
+          </div>
+          {#if agentPreview}
+            <div class="memory-install-preview">
+              <h3>Review configuration change</h3>
+              <p><code>{agentPreview.result.path}</code></p>
+              <p class="runtime-binary">
+                The preview shows only Sail's shared-memory entry. Other configuration, including
+                credentials, is omitted.
+              </p>
+              <div class="memory-config-comparison">
+                <div>
+                  <strong>Before</strong>
+                  <pre>{agentPreview.result.before || '(empty)'}</pre>
+                </div>
+                <div>
+                  <strong>After</strong>
+                  <pre>{agentPreview.result.after}</pre>
+                </div>
+              </div>
+              <Button
+                size="sm"
+                disabled={!agentPreview.result.changed}
+                onclick={() =>
+                  agentPreview &&
+                  void changeAgentInstall(
+                    agentPreview.action === 'install'
+                      ? 'install_memory_agent'
+                      : 'uninstall_memory_agent',
+                    agentPreview.result.agent,
+                  )}
+                >{agentPreview.result.changed
+                  ? `${agentPreview.action === 'install' ? 'Install' : 'Uninstall'} reviewed change`
+                  : 'No change needed'}</Button
+              >
+              <Button
+                size="sm"
+                variant="secondary"
+                onclick={() => {
+                  previewRequest += 1;
+                  agentPreview = null;
+                }}>Cancel</Button
+              >
+            </div>
+          {/if}
+        </section>
+      {/if}
+
+      <section class="settings-card">
+        <h2>Project memories</h2>
+        <p class="runtime-binary" title={snapshot?.directory ?? ''}>
+          {snapshot?.directory || 'Select a project to manage its memory.'}
+        </p>
+        {#if memoryStorageError}<p class="runtime-diagnostic" role="alert">
+            {memoryStorageError}
+          </p>{/if}
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={!snapshot?.directory || memoryLoading}
+          onclick={() => snapshot?.directory && void refreshMemory(snapshot.directory)}
+          >Refresh</Button
+        >
+        <form
+          class="memory-search"
+          onsubmit={(event) => {
+            event.preventDefault();
+            if (snapshot?.directory) void refreshMemory(snapshot.directory);
+          }}
+        >
+          <label for="memory-search">Search memories</label>
+          <div>
+            <input id="memory-search" type="search" bind:value={memoryQuery} />
+            <Button size="sm" type="submit" disabled={!snapshot?.directory || memoryLoading}
+              >Search</Button
+            >
+            {#if memoryQuery}
+              <Button
+                size="sm"
+                variant="secondary"
+                onclick={() => {
+                  memoryQuery = '';
+                  if (snapshot?.directory) void refreshMemory(snapshot.directory, '');
+                }}>Clear</Button
+              >
+            {/if}
+          </div>
+        </form>
+        {#if memoryLoading}
+          <p role="status">Loading memories…</p>
+        {:else if !memoryRecords.length}
+          <p class="memory-empty" role="status">
+            {memoryQuery
+              ? 'No memories match this search.'
+              : 'No memories yet. Add a project decision, constraint, discovery, preference, or handoff.'}
+          </p>
+        {:else}
+          <ul class="memory-record-list">
+            {#each memoryRecords as record (record.id)}
+              <li>
+                <div class="memory-record-meta">
+                  <strong>{record.kind}</strong>
+                  <time datetime={new Date(record.updatedAt).toISOString()}
+                    >{new Date(record.updatedAt).toLocaleString()}</time
+                  >
+                </div>
+                <p>{record.content}</p>
+                {#if record.tags.length}<p class="memory-tags">{record.tags.join(' · ')}</p>{/if}
+                {#if pendingForget === record.id}
+                  <div class="memory-forget-confirm" role="group" aria-label="Confirm forget">
+                    <span>Forget this memory?</span>
+                    <Button size="sm" onclick={() => void forgetMemory(record.id)}>Forget</Button>
+                    <Button size="sm" variant="secondary" onclick={() => (pendingForget = '')}
+                      >Cancel</Button
+                    >
+                  </div>
+                {:else}
+                  <Button size="sm" variant="secondary" onclick={() => (pendingForget = record.id)}
+                    >Forget</Button
+                  >
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={!memoryStatus?.enabled || !memoryStatus.count}
+          onclick={() => void downloadMemoryExport()}>Export all memories</Button
+        >
+      </section>
+
+      <section class="settings-card">
+        <h2>Add memory</h2>
+        <label for="memory-content">What should agents remember?</label>
+        <textarea id="memory-content" rows="4" bind:value={memoryContent}></textarea>
+        <label for="memory-kind">Kind</label>
+        <select id="memory-kind" bind:value={memoryKind}>
+          {#each memoryKinds as kind (kind)}<option value={kind}>{kind}</option>{/each}
+        </select>
+        <label for="memory-tags">Tags, separated by commas</label>
+        <input id="memory-tags" bind:value={memoryTags} />
+        <Button
+          size="sm"
+          disabled={!snapshot?.directory || !memoryContent.trim() || !memoryStatus?.enabled}
+          onclick={() => void rememberMemory()}>Remember</Button
+        >
       </section>
     {/if}
   </main>
