@@ -767,11 +767,11 @@
     options: AgentConfigOption[],
   ): Promise<AgentConfigOption[]> {
     if (agent !== 'claude' || !thread || !activeSessionId) return options;
-    let restored = options;
-    for (const [pattern, value] of [
+    return [
       [/model/i, thread.model],
       [/effort|reasoning|thinking/i, thread.effort],
-    ] as const) {
+    ].reduce(async (previous, [pattern, value]) => {
+      const restored = await previous;
       const option = restored.find(
         (candidate) =>
           candidate.type === 'select' && pattern.test(`${candidate.id} ${candidate.name}`),
@@ -782,15 +782,15 @@
         option.currentValue === value ||
         !option.options.some((choice) => choice.value === value)
       )
-        continue;
+        return restored;
       const result = await acp.setConfig(agent, activeSessionId, option.id, value);
-      restored =
+      return (
         result.configOptions ??
         restored.map((candidate) =>
-          candidate.id === option.id ? { ...candidate, currentValue: value } : candidate,
-        );
-    }
-    return restored;
+          candidate.id === option.id ? Object.assign({}, candidate, { currentValue: value }) : candidate,
+        )
+      );
+    }, Promise.resolve(options));
   }
   const planModeOption = $derived(
     configOptions.find(
@@ -1558,9 +1558,10 @@
           } else
             void restoreClaudeThreadConfig(configOptions)
               .then((restored) => {
-                if (activeSessionId !== params.sessionId) return;
+                if (activeSessionId !== params.sessionId) return undefined;
                 configOptions = restored;
                 rememberThreadConfig(restored);
+                return undefined;
               })
               .catch((cause) => {
                 if (activeSessionId === params.sessionId) error = describe(cause);
