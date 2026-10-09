@@ -54,6 +54,8 @@ struct ApprovalStore {
 struct Approval {
     fingerprint: String,
     revision: String,
+    #[serde(default)]
+    command: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -260,6 +262,7 @@ fn approval_revision_valid(
         directory,
         &[
             "log",
+            "--full-history",
             "--format=%H",
             &range,
             "--",
@@ -270,7 +273,7 @@ fn approval_revision_valid(
     .is_ok_and(|changes| changes.is_empty())
 }
 
-fn project_key(directory: &Path, id: &str) -> Result<String, String> {
+fn project_key(directory: &Path) -> Result<String, String> {
     let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
     let common = String::from_utf8(git(directory, &["rev-parse", "--git-common-dir"])?)
         .map_err(|_| "Invalid Git common directory.")?;
@@ -282,7 +285,7 @@ fn project_key(directory: &Path, id: &str) -> Result<String, String> {
     };
     let common = dunce::canonicalize(common).map_err(|error| error.to_string())?;
     Ok(sha256(
-        format!("{}\0{}\0{id}", common.display(), canonical.display()).as_bytes(),
+        format!("{}\0{}", common.display(), canonical.display()).as_bytes(),
     ))
 }
 
@@ -347,7 +350,7 @@ fn status(directory: &Path, store: &ApprovalStore) -> ProviderStatus {
             return result;
         }
     };
-    let key = match project_key(directory, &provider.spec.id) {
+    let key = match project_key(directory) {
         Ok(key) => key,
         Err(error) => {
             result.state = "invalid".into();
@@ -368,6 +371,7 @@ fn status(directory: &Path, store: &ApprovalStore) -> ProviderStatus {
     );
     result.state = if store.approvals.get(&key).is_some_and(|approval| {
         approval.fingerprint == fingerprint
+            && approval.command == provider.spec.command
             && approval_revision_valid(directory, approval, &provider)
     }) {
         "approved"
@@ -392,8 +396,11 @@ fn approve(
     {
         return Err("Provider identity changed after review; inspect it again.".into());
     }
-    let id = current.id.as_deref().ok_or("Provider ID is missing.")?;
-    let key = project_key(directory, id)?;
+    let key = project_key(directory)?;
+    let command = current
+        .command
+        .clone()
+        .ok_or("Provider command is missing.")?;
     let revision = current
         .revision
         .clone()
@@ -403,10 +410,24 @@ fn approve(
         Approval {
             fingerprint: expected_fingerprint.into(),
             revision,
+            command,
         },
     );
     current.state = "approved".into();
     Ok(current)
+}
+
+fn revoke(directory: &Path, store: &mut ApprovalStore) -> Result<bool, String> {
+    Ok(store.approvals.remove(&project_key(directory)?).is_some())
+}
+
+fn register(store: &mut ApprovalStore, command: &str, executable: &Path) {
+    store
+        .approvals
+        .retain(|_, approval| approval.command != command);
+    store
+        .registry
+        .insert(command.into(), executable.to_string_lossy().into_owned());
 }
 
 fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -510,9 +531,7 @@ pub fn context_register_provider(
         dunce::canonicalize(executable).map_err(|_| "Provider executable is unavailable.")?;
     executable_hash(&executable)?;
     locked_store(&store_path(&app)?, |store| {
-        store
-            .registry
-            .insert(command, executable.to_string_lossy().into_owned());
+        register(store, &command, &executable);
         Ok(((), true))
     })
 }
@@ -531,15 +550,8 @@ pub fn context_approve_provider(
 #[tauri::command]
 pub fn context_revoke_provider(app: tauri::AppHandle, directory: String) -> Result<(), String> {
     locked_store(&store_path(&app)?, |store| {
-        let current = status(Path::new(&directory), store);
-        if let Some(id) = current.id {
-            store
-                .approvals
-                .remove(&project_key(Path::new(&directory), &id)?);
-        }
-        // A removed manifest has no ID to inspect; approvals keyed by older IDs are
-        // inert because no provider can resolve without the manifest.
-        Ok(((), true))
+        let removed = revoke(Path::new(&directory), store)?;
+        Ok(((), removed))
     })
 }
 
@@ -762,6 +774,72 @@ mod tests {
     }
 
     #[test]
+    fn approval_does_not_survive_context_change_hidden_by_merge() {
+        let repository = Repository::new("merge-history");
+        repository.configure();
+        let mut store = registered(&repository);
+        let fingerprint = status(&repository.0, &store).fingerprint.unwrap();
+        approve(&repository.0, &mut store, &fingerprint).unwrap();
+
+        repository.run(&["switch", "-c", "changed"]);
+        repository.write(
+            ".sail/context.json",
+            r#"{"version":1,"providers":[{"id":"project-files","type":"stdio","command":"fixture-provider","capabilities":["execute"]}]}"#,
+        );
+        repository.commit();
+        repository.run(&["switch", "-"]);
+        repository.write("README.md", "unrelated work");
+        repository.commit();
+        repository.run(&[
+            "merge",
+            "--no-ff",
+            "-s",
+            "ours",
+            "changed",
+            "-m",
+            "restore context",
+        ]);
+        executable(&repository.0, "provider-v1");
+
+        let current = status(&repository.0, &store);
+        assert_eq!(current.state, "approval-required", "{:?}", current.reason);
+    }
+
+    #[test]
+    fn revoking_without_a_current_manifest_does_not_restore_old_approval() {
+        let repository = Repository::new("revoke-no-manifest");
+        repository.configure();
+        let mut store = registered(&repository);
+        let fingerprint = status(&repository.0, &store).fingerprint.unwrap();
+        approve(&repository.0, &mut store, &fingerprint).unwrap();
+
+        repository.run(&["switch", "-c", "without-context"]);
+        repository.write(CONFIG, "{}");
+        repository.commit();
+        assert_eq!(status(&repository.0, &store).state, "not-configured");
+        assert!(revoke(&repository.0, &mut store).unwrap());
+        repository.run(&["switch", "-"]);
+        executable(&repository.0, "provider-v1");
+
+        let current = status(&repository.0, &store);
+        assert_eq!(current.state, "approval-required", "{:?}", current.reason);
+    }
+
+    #[test]
+    fn registering_executable_again_revokes_its_existing_approvals() {
+        let repository = Repository::new("register-revokes");
+        repository.configure();
+        let mut store = registered(&repository);
+        let fingerprint = status(&repository.0, &store).fingerprint.unwrap();
+        approve(&repository.0, &mut store, &fingerprint).unwrap();
+        let executable = repository.0.join("fixture-provider");
+
+        register(&mut store, "fixture-provider", &executable);
+
+        assert_eq!(status(&repository.0, &store).state, "approval-required");
+    }
+
+    #[test]
     fn failed_store_write_preserves_previous_approval() {
         let repository = Repository::new("store-failure");
         let path = repository.0.join("approvals.json");
@@ -771,6 +849,7 @@ mod tests {
                 Approval {
                     fingerprint: "approved".into(),
                     revision: "first".into(),
+                    command: "fixture-provider".into(),
                 },
             );
             Ok(((), true))
@@ -783,6 +862,7 @@ mod tests {
                 Approval {
                     fingerprint: "not-approved".into(),
                     revision: "second".into(),
+                    command: "fixture-provider".into(),
                 },
             );
             Ok(((), true))
@@ -813,6 +893,7 @@ mod tests {
                             Approval {
                                 fingerprint: index.to_string(),
                                 revision: "fixture".into(),
+                                command: "fixture-provider".into(),
                             },
                         );
                         Ok(((), true))
