@@ -147,9 +147,7 @@ fn copy_config_directory(source: &Path, destination: &Path) -> Result<(), String
         let target = destination.join(entry.file_name());
         if path.is_dir() {
             copy_config_directory(&path, &target)?;
-        } else if !path.is_file() {
-            continue;
-        } else if marks_plan_review(&entry.file_name().to_string_lossy()) {
+        } else if !path.is_file() || marks_plan_review(&entry.file_name().to_string_lossy()) {
             continue;
         } else if CONFIG_NAMES.iter().any(|name| *name == entry.file_name()) {
             let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
