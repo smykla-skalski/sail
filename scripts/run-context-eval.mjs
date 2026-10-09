@@ -64,6 +64,25 @@ const activeRunners = new Set();
 const windowsRunnerScript = fileURLToPath(
   new URL('./context-eval-windows-runner.ps1', import.meta.url),
 );
+const windowsJobAssembly = join(outputRoot, 'context-eval-job.dll');
+if (process.platform === 'win32') {
+  const compilation = spawnSync(
+    'powershell.exe',
+    [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-File',
+      windowsRunnerScript,
+      '-AssemblyPath',
+      windowsJobAssembly,
+      '-CompileOnly',
+    ],
+    { stdio: 'inherit', timeout: 60_000, windowsHide: true },
+  );
+  if (compilation.error) throw compilation.error;
+  if (compilation.status !== 0) throw new Error('Could not prepare Windows runner containment.');
+}
 
 function quoteWindowsArgument(argument) {
   if (argument && !/[\s"]/.test(argument)) return argument;
@@ -155,6 +174,8 @@ async function execute(invocation) {
       windowsRunnerScript,
       '-SpecPath',
       spec,
+      '-AssemblyPath',
+      windowsJobAssembly,
     ];
   }
   const child = spawn(command, launchArgs, {

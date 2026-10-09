@@ -1,9 +1,12 @@
-param([Parameter(Mandatory = $true)][string]$SpecPath)
+param(
+    [string]$SpecPath,
+    [Parameter(Mandatory = $true)][string]$AssemblyPath,
+    [switch]$CompileOnly
+)
 
 $ErrorActionPreference = 'Stop'
-[Console]::Error.WriteLine('context eval supervisor: starting')
-
-Add-Type -TypeDefinition @'
+if ($CompileOnly) {
+    Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -96,7 +99,12 @@ public static class ContextEvalJob
         // The handle stays in this process. Its closure on exit kills the whole job.
     }
 }
-'@ -Language CSharp
+'@ -Language CSharp -OutputAssembly $AssemblyPath
+    exit 0
+}
+
+[Console]::Error.WriteLine('context eval supervisor: starting')
+Add-Type -Path $AssemblyPath
 [Console]::Error.WriteLine('context eval supervisor: job support loaded')
 
 $exitCode = 1
