@@ -33,7 +33,7 @@ export type MemoryStatus = {
   forgottenCount: number;
 };
 
-export type MemoryProviderKind = 'local' | 'mem0Hosted' | 'mem0SelfHosted';
+export type MemoryProviderKind = 'local' | 'mem0Hosted' | 'mem0SelfHosted' | 'agentMemory';
 
 export type MemoryProviderStatus = {
   provider: MemoryProviderKind;

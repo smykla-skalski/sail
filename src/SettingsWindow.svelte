@@ -207,7 +207,10 @@
   function memoryProviderInput() {
     return {
       provider: memoryProviderKind,
-      endpoint: memoryProviderKind === 'mem0SelfHosted' ? memoryProviderEndpoint.trim() : null,
+      endpoint:
+        memoryProviderKind === 'mem0SelfHosted' || memoryProviderKind === 'agentMemory'
+          ? memoryProviderEndpoint.trim()
+          : null,
       apiKey: memoryProviderKind === 'local' ? null : memoryProviderApiKey.trim(),
     };
   }
@@ -247,8 +250,8 @@
       memoryProviderEndpoint = memoryProviderStatus.endpoint ?? '';
       memoryProviderMessage =
         memoryProviderStatus.provider === 'local'
-          ? 'Local search is active. Canonical project memories were preserved.'
-          : 'Mem0 is active and existing memories are synchronized.';
+          ? 'Local search is active. Canonical project memories were preserved; any active provider credential was removed.'
+          : `${memoryProviderStatus.provider === 'agentMemory' ? 'AgentMemory' : 'Mem0'} is active and existing memories are synchronized.`;
     } catch (cause) {
       memoryProviderError = `Provider: ${String(cause)}`;
     } finally {
@@ -1116,8 +1119,8 @@
       <section class="settings-card">
         <h2>Search provider</h2>
         <p>
-          Local project memory remains canonical. Mem0 adds semantic search; an outage falls back to
-          local search and never blocks memory writes.
+          Local project memory remains canonical. Mem0 or AgentMemory adds external search; an
+          outage falls back to local search and never blocks memory writes.
         </p>
         {#if memoryProviderError}<p class="runtime-diagnostic" role="alert">
             {memoryProviderError}
@@ -1135,7 +1138,7 @@
             class="runtime-diagnostic"
             role="alert"
           >
-            Last Mem0 sync failed: {memoryProviderStatus.syncError} Local search remains active.
+            Last provider sync failed: {memoryProviderStatus.syncError} Local search remains active.
           </p>{/if}
         <label for="memory-provider">Provider</label>
         <select
@@ -1150,20 +1153,25 @@
           <option value="local">Local search</option>
           <option value="mem0Hosted">Mem0 hosted</option>
           <option value="mem0SelfHosted">Mem0 self-hosted</option>
+          <option value="agentMemory">AgentMemory (local-first)</option>
         </select>
-        {#if memoryProviderKind === 'mem0SelfHosted'}
+        {#if memoryProviderKind === 'mem0SelfHosted' || memoryProviderKind === 'agentMemory'}
           <label for="memory-provider-endpoint">Endpoint</label>
           <input
             id="memory-provider-endpoint"
             type="url"
-            placeholder="https://mem0.example.com"
+            placeholder={memoryProviderKind === 'agentMemory'
+              ? 'http://127.0.0.1:8000'
+              : 'https://mem0.example.com'}
             bind:value={memoryProviderEndpoint}
             disabled={memoryProviderLoading}
           />
           <p class="runtime-binary">HTTPS is required except for localhost development servers.</p>
         {/if}
         {#if memoryProviderKind !== 'local'}
-          <label for="memory-provider-api-key">API key</label>
+          <label for="memory-provider-api-key"
+            >{memoryProviderKind === 'agentMemory' ? 'Access token (optional)' : 'API key'}</label
+          >
           <input
             id="memory-provider-api-key"
             type="password"
@@ -1172,15 +1180,17 @@
             disabled={memoryProviderLoading}
           />
           <p class="runtime-binary">
-            The key is stored in the OS credential store, never in Sail settings, exports, logs, or
-            agent configuration.
+            {memoryProviderKind === 'agentMemory'
+              ? 'Leave blank to reuse a saved token for this endpoint, or connect anonymously if none is saved. Tokens stay in the OS credential store, never in Sail settings, exports, logs, or agent configuration.'
+              : 'The key is stored in the OS credential store, never in Sail settings, exports, logs, or agent configuration.'}
           </p>
           <Button
             size="sm"
             variant="secondary"
             disabled={!memoryStatus?.enabled ||
-              !memoryProviderApiKey.trim() ||
-              (memoryProviderKind === 'mem0SelfHosted' && !memoryProviderEndpoint.trim()) ||
+              (memoryProviderKind !== 'agentMemory' && !memoryProviderApiKey.trim()) ||
+              ((memoryProviderKind === 'mem0SelfHosted' || memoryProviderKind === 'agentMemory') &&
+                !memoryProviderEndpoint.trim()) ||
               memoryProviderLoading}
             onclick={() => void verifyMemoryProvider()}>Verify connection</Button
           >
@@ -1191,13 +1201,21 @@
             memoryProviderLoading ||
             (memoryProviderKind !== 'local' &&
               (!memoryStatus?.enabled ||
-                !memoryProviderApiKey.trim() ||
-                (memoryProviderKind === 'mem0SelfHosted' && !memoryProviderEndpoint.trim())))}
+                (memoryProviderKind !== 'agentMemory' && !memoryProviderApiKey.trim()) ||
+                ((memoryProviderKind === 'mem0SelfHosted' ||
+                  memoryProviderKind === 'agentMemory') &&
+                  !memoryProviderEndpoint.trim())))}
           onclick={() => void saveMemoryProvider()}
-          >{memoryProviderKind === 'local' ? 'Use local search' : 'Enable Mem0'}</Button
+          >{memoryProviderKind === 'local'
+            ? 'Use local search'
+            : memoryProviderKind === 'agentMemory'
+              ? 'Enable AgentMemory'
+              : 'Enable Mem0'}</Button
         >
         {#if !memoryStatus?.enabled && memoryProviderKind !== 'local'}
-          <p class="memory-empty" role="status">Enable shared memory before connecting Mem0.</p>
+          <p class="memory-empty" role="status">
+            Enable shared memory before connecting a search provider.
+          </p>
         {/if}
       </section>
 
