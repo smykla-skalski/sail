@@ -1366,6 +1366,41 @@ where
     activate()
 }
 
+fn activate_mem0_after_config<C, S, R, T>(
+    configure: C,
+    store_key: S,
+    restore: R,
+) -> Result<T, String>
+where
+    C: FnOnce() -> Result<(), String>,
+    S: FnOnce() -> Result<T, String>,
+    R: FnOnce() -> Result<(), String>,
+{
+    configure()?;
+    match store_key() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            restore().map_err(|restore_error| {
+                format!(
+                    "{error} Previous Mem0 configuration could not be restored: {restore_error}"
+                )
+            })?;
+            Err(error)
+        }
+    }
+}
+
+fn clear_hosted_pending_on_local_switch(
+    root: &Path,
+    project_key: &str,
+    previous: ProviderKind,
+) -> Result<(), String> {
+    if previous == ProviderKind::Mem0Hosted {
+        save_pending_events(root, project_key, &PendingEvents::new())?;
+    }
+    Ok(())
+}
+
 fn configured_token(config: &ProviderConfig, key: &str) -> Result<String, String> {
     if config.provider == ProviderKind::AgentMemory {
         return Ok(config
@@ -1626,6 +1661,7 @@ pub fn set_memory_provider(
         } else {
             delete_api_key(&key);
         }
+        clear_hosted_pending_on_local_switch(&root, &key, previous.provider)?;
         save_runtime_error(&root, &key, None);
         return Ok(ProviderStatus {
             provider: ProviderKind::Local,
@@ -1645,19 +1681,31 @@ pub fn set_memory_provider(
     provider.verify(&key)?;
     let memories = crate::memory::list(&app, &directory, true)?;
     let result = reconcile_before_activation(provider.as_ref(), &root, &key, &memories, || {
-        let storage = if api_key.is_empty() {
-            None
-        } else if config.provider == ProviderKind::AgentMemory {
-            Some(store_agentmemory_token(
-                &key,
-                config.endpoint.as_deref().unwrap_or_default(),
-                &api_key,
-            )?)
+        if config.provider == ProviderKind::AgentMemory {
+            let storage = if api_key.is_empty() {
+                None
+            } else {
+                Some(store_agentmemory_token(
+                    &key,
+                    config.endpoint.as_deref().unwrap_or_default(),
+                    &api_key,
+                )?)
+            };
+            save_config(&app, &key, Some(&config))?;
+            Ok(storage)
         } else {
-            Some(store_api_key(&key, &api_key)?)
-        };
-        save_config(&app, &key, Some(&config))?;
-        Ok(storage)
+            activate_mem0_after_config(
+                || save_config(&app, &key, Some(&config)),
+                || store_api_key(&key, &api_key).map(Some),
+                || {
+                    save_config(
+                        &app,
+                        &key,
+                        (previous.provider != ProviderKind::Local).then_some(&previous),
+                    )
+                },
+            )
+        }
     });
     let storage = match result {
         Ok(storage) => storage,
@@ -1716,13 +1764,14 @@ pub fn resolve_memory_provider_pending(
 #[cfg(test)]
 mod tests {
     use super::{
-        agentmemory_session_key, config_key, configured_token, credential_storage,
-        load_agentmemory_pending, load_api_key_with, load_pending_events, load_runtime_status,
-        merge_results, normalize_config, notice, provider_lock, reconcile_before_activation,
-        remote_memories, resolve_agentmemory_pending_at, save_agentmemory_pending,
-        save_pending_events, search_standalone, session_credentials, sync_at, AgentMemoryProvider,
-        CredentialStorage, Mem0Provider, MemoryProvider, PendingEvents, ProviderConfig,
-        ProviderInput, ProviderKind, HOSTED_PAGE_SIZE, SELF_HOSTED_SAFE_LIMIT,
+        activate_mem0_after_config, agentmemory_session_key, clear_hosted_pending_on_local_switch,
+        config_key, configured_token, credential_storage, load_agentmemory_pending,
+        load_api_key_with, load_pending_events, load_runtime_status, merge_results,
+        normalize_config, notice, provider_lock, reconcile_before_activation, remote_memories,
+        resolve_agentmemory_pending_at, save_agentmemory_pending, save_pending_events,
+        search_standalone, session_credentials, sync_at, AgentMemoryProvider, CredentialStorage,
+        Mem0Provider, MemoryProvider, PendingEvents, ProviderConfig, ProviderInput, ProviderKind,
+        HOSTED_PAGE_SIZE, SELF_HOSTED_SAFE_LIMIT,
     };
     use crate::memory::{
         forget_at, remember_at, MemoryInput, MemoryKind, MemoryProvenance, MemoryRecord,
@@ -2846,6 +2895,48 @@ mod tests {
             assert_eq!(load_pending_events(&root, "project").unwrap().len(), 1);
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn selecting_local_explicitly_resets_only_active_hosted_pending() {
+        let root = temporary();
+        let mut pending = PendingEvents::new();
+        pending.insert(
+            "local-id".into(),
+            super::PendingEvent {
+                event_id: None,
+                updated_at: 42,
+            },
+        );
+        save_pending_events(&root, "project", &pending).unwrap();
+
+        clear_hosted_pending_on_local_switch(&root, "project", ProviderKind::AgentMemory).unwrap();
+        assert_eq!(load_pending_events(&root, "project").unwrap().len(), 1);
+        clear_hosted_pending_on_local_switch(&root, "project", ProviderKind::Mem0SelfHosted)
+            .unwrap();
+        assert_eq!(load_pending_events(&root, "project").unwrap().len(), 1);
+        clear_hosted_pending_on_local_switch(&root, "project", ProviderKind::Mem0Hosted).unwrap();
+        assert!(load_pending_events(&root, "project").unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_mem0_config_write_preserves_active_credential() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        fs::create_dir(&settings).unwrap();
+        let active_key = std::cell::RefCell::new("hosted-A".to_string());
+
+        let result = activate_mem0_after_config(
+            || fs::write(&settings, "candidate-B").map_err(|e| e.to_string()),
+            || {
+                *active_key.borrow_mut() = "candidate-B".into();
+                Ok(())
+            },
+            || Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(*active_key.borrow(), "hosted-A");
     }
 
     #[test]
