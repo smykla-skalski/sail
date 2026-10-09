@@ -275,6 +275,16 @@
   import DiffPanel from './DiffPanel.svelte';
   import PromptPanel from './PromptPanel.svelte';
   import ProjectSidebar from './ProjectSidebar.svelte';
+  import {
+    clampSidebarWidth,
+    parseSidebarWidth,
+    sidebarDefaultWidth,
+    sidebarIsRail,
+    sidebarMaxWidth,
+    sidebarMinWidth,
+    sidebarRailWidth,
+    stepSidebarWidth,
+  } from './lib/sidebar-width';
   import ShipQueue from './ShipQueue.svelte';
   import TaskOverview from './TaskOverview.svelte';
   import type { GitHubIssue, PullRequestCheck } from './ProjectSidebar.svelte';
@@ -1538,6 +1548,9 @@
     Number.isFinite(savedDetailsWidth) && savedDetailsWidth >= 320 ? savedDetailsWidth : 420,
   );
   let workspaceWidth = $state(0);
+  let shellWidth = $state(window.innerWidth);
+  let sidebarWidth = $state(parseSidebarWidth(getSetting('sai-sidebar-width')));
+  let sidebarResizeStart: { x: number; width: number } | null = null;
   let appShellElement = $state<HTMLDivElement>();
   let resizeStart: { x: number; width: number } | null = null;
   let error = $state('');
@@ -1559,7 +1572,10 @@
   $effect(() => {
     if (!appShellElement) return;
     const element = appShellElement;
-    const update = () => (workspaceWidth = element.clientWidth - sidebarElement.clientWidth);
+    const update = () => {
+      shellWidth = element.clientWidth;
+      workspaceWidth = element.clientWidth - sidebarElement.clientWidth;
+    };
     const observer = new ResizeObserver(update);
     observer.observe(element);
     observer.observe(sidebarElement);
@@ -2346,6 +2362,55 @@
     if (width === null) return;
     event.preventDefault();
     setDetailsWidth(width);
+  }
+
+  let maxSidebarWidth = $derived(
+    Math.max(sidebarMinWidth, Math.min(sidebarMaxWidth, Math.floor(shellWidth * 0.4))),
+  );
+  let visibleSidebarWidth = $derived(clampSidebarWidth(sidebarWidth, maxSidebarWidth));
+  let sidebarRail = $derived(sidebarIsRail(visibleSidebarWidth) && !mobileLayout);
+
+  function setSidebarWidth(width: number) {
+    sidebarWidth = clampSidebarWidth(width, maxSidebarWidth);
+    setSetting('sai-sidebar-width', String(sidebarWidth));
+  }
+
+  function startSidebarResize(event: PointerEvent) {
+    if (event.button !== 0) return;
+    sidebarResizeStart = { x: event.clientX, width: sidebarElement.getBoundingClientRect().width };
+    if (event.currentTarget instanceof HTMLElement)
+      event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function moveSidebarResize(event: PointerEvent) {
+    if (!sidebarResizeStart) return;
+    sidebarWidth = clampSidebarWidth(
+      sidebarResizeStart.width + event.clientX - sidebarResizeStart.x,
+      maxSidebarWidth,
+    );
+  }
+
+  function endSidebarResize() {
+    if (!sidebarResizeStart) return;
+    sidebarResizeStart = null;
+    setSetting('sai-sidebar-width', String(sidebarWidth));
+  }
+
+  function keydownSidebarResize(event: KeyboardEvent) {
+    const step = event.shiftKey ? 50 : 20;
+    const width =
+      event.key === 'ArrowRight'
+        ? stepSidebarWidth(visibleSidebarWidth, step, maxSidebarWidth)
+        : event.key === 'ArrowLeft'
+          ? stepSidebarWidth(visibleSidebarWidth, -step, maxSidebarWidth)
+          : event.key === 'Home'
+            ? sidebarRailWidth
+            : event.key === 'End'
+              ? maxSidebarWidth
+              : null;
+    if (width === null) return;
+    event.preventDefault();
+    setSidebarWidth(width);
   }
 
   function modelKey(model: ModelRef) {
@@ -15191,7 +15256,8 @@
   data-mobile-view={mobileView}
   data-sidebar-visible={sidebarVisible}
   data-details-visible={mainDetailsVisible || shipFallbackVisible}
-  style={`--topbar-height: ${topbarHeight}px; --details-width: ${visibleDetailsWidth}px`}
+  data-sidebar-rail={sidebarRail}
+  style={`--topbar-height: ${topbarHeight}px; --details-width: ${visibleDetailsWidth}px; --sidebar-width: ${visibleSidebarWidth}px`}
   bind:this={appShellElement}
 >
   <aside
@@ -15201,9 +15267,10 @@
     tabindex="-1"
     bind:this={sidebarElement}
   >
-    <div class="brand"><span class="brand-mark">S.</span><span>Sail</span></div>
+    <div class="brand"><span class="brand-mark">S.</span><span class="brand-name">Sail</span></div>
     <div class="sidebar-content">
       <ProjectSidebar
+        compact={sidebarRail}
         catalog={projectCatalog}
         {directory}
         disabled={runtimeState !== 'connected' &&
@@ -15263,11 +15330,34 @@
           /></svg
         >
       </button>
-      <span class="sidebar-runtime" role="status"
+      <span
+        class="sidebar-runtime"
+        role="status"
+        title={sidebarRail ? `OpenCode ${runtimeState}` : undefined}
         ><span class:connected={runtimeState === 'connected'} class="status-dot" aria-hidden="true"
-        ></span><span>OpenCode {runtimeState}</span></span
+        ></span><span class="sidebar-runtime-label">OpenCode {runtimeState}</span></span
       >
     </div>
+    {#if sidebarVisible && !mobileLayout}<div
+        class="sidebar-resizer"
+        role="slider"
+        tabindex="0"
+        aria-label="Sidebar width"
+        aria-orientation="horizontal"
+        aria-controls="project-sidebar"
+        aria-valuemin={sidebarRailWidth}
+        aria-valuemax={maxSidebarWidth}
+        aria-valuenow={visibleSidebarWidth}
+        aria-valuetext={sidebarRail
+          ? 'Sidebar collapsed to icons'
+          : `Sidebar ${visibleSidebarWidth} pixels wide`}
+        onpointerdown={startSidebarResize}
+        onpointermove={moveSidebarResize}
+        onpointerup={endSidebarResize}
+        onpointercancel={endSidebarResize}
+        onkeydown={keydownSidebarResize}
+        ondblclick={() => setSidebarWidth(sidebarRail ? sidebarDefaultWidth : sidebarRailWidth)}
+      ></div>{/if}
   </aside>
   <div class="main-area">
     <AppTopbar
