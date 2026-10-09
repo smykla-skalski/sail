@@ -745,6 +745,53 @@
         option.type === 'select',
     ),
   );
+  function optionValue(options: AgentConfigOption[], pattern: RegExp): string | undefined {
+    return options.find(
+      (option) => option.type === 'select' && pattern.test(`${option.id} ${option.name}`),
+    )?.currentValue;
+  }
+
+  function rememberThreadConfig(options: AgentConfigOption[]) {
+    if (!thread) return;
+    const model = optionValue(options, /model/i);
+    const effort = optionValue(options, /effort|reasoning|thinking/i);
+    if (model !== undefined || effort !== undefined)
+      onactivity({
+        ...thread,
+        ...(model === undefined ? {} : { model }),
+        ...(effort === undefined ? {} : { effort }),
+      });
+  }
+
+  async function restoreClaudeThreadConfig(
+    options: AgentConfigOption[],
+  ): Promise<AgentConfigOption[]> {
+    if (agent !== 'claude' || !thread || !activeSessionId) return options;
+    let restored = options;
+    for (const [pattern, value] of [
+      [/model/i, thread.model],
+      [/effort|reasoning|thinking/i, thread.effort],
+    ] as const) {
+      const option = restored.find(
+        (candidate) =>
+          candidate.type === 'select' && pattern.test(`${candidate.id} ${candidate.name}`),
+      );
+      if (
+        !value ||
+        !option ||
+        option.currentValue === value ||
+        !option.options.some((choice) => choice.value === value)
+      )
+        continue;
+      const result = await acp.setConfig(agent, activeSessionId, option.id, value);
+      restored =
+        result.configOptions ??
+        restored.map((candidate) =>
+          candidate.id === option.id ? { ...candidate, currentValue: value } : candidate,
+        );
+    }
+    return restored;
+  }
   const planModeOption = $derived(
     configOptions.find(
       (option) =>
@@ -1205,11 +1252,8 @@
           liveTurn = true;
           activeTurnId = runningTurn;
           historyLoaded = liveView.complete;
-          configOptions = liveView.configOptions;
-          const liveModel = configOptions.find(
-            (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
-          )?.currentValue;
-          if (thread && liveModel) onactivity({ ...thread, model: liveModel });
+          configOptions = await restoreClaudeThreadConfig(liveView.configOptions);
+          rememberThreadConfig(configOptions);
           if (liveView.availableCommands) updateSkills(liveView.availableCommands);
           if (commandUpdates[id]) updateSkills(commandUpdates[id]);
           const latest = (await acp.activity().catch(() => null))?.[agent];
@@ -1248,11 +1292,10 @@
             rememberTranscript();
           }
           if (current === generation) {
-            configOptions = (session.configOptions as AgentConfigOption[] | undefined) ?? [];
-            const selectedModel = configOptions.find(
-              (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
-            )?.currentValue;
-            if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
+            configOptions = await restoreClaudeThreadConfig(
+              (session.configOptions as AgentConfigOption[] | undefined) ?? [],
+            );
+            rememberThreadConfig(configOptions);
           }
           if (current === generation && Array.isArray(session.availableCommands))
             updateSkills(session.availableCommands);
@@ -1334,9 +1377,8 @@
       const session = await acp.create(sessionAgent, sessionDirectory, activeCapabilityProfile);
       const created: AgentThread = {
         agent: sessionAgent,
-        model: session.configOptions?.find(
-          (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
-        )?.currentValue,
+        model: optionValue(session.configOptions ?? [], /model/i),
+        effort: optionValue(session.configOptions ?? [], /effort|reasoning|thinking/i),
         sessionId: session.sessionId,
         directory: sessionDirectory,
         title,
@@ -1511,10 +1553,18 @@
         const data = update as Record<string, unknown>;
         if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions)) {
           configOptions = data.configOptions as AgentConfigOption[];
-          const selectedModel = configOptions.find(
-            (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
-          )?.currentValue;
-          if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
+          if (settingConfig) {
+            rememberThreadConfig(configOptions);
+          } else
+            void restoreClaudeThreadConfig(configOptions)
+              .then((restored) => {
+                if (activeSessionId !== params.sessionId) return;
+                configOptions = restored;
+                rememberThreadConfig(restored);
+              })
+              .catch((cause) => {
+                if (activeSessionId === params.sessionId) error = describe(cause);
+              });
         }
         if (
           data.sessionUpdate === 'available_commands_update' &&
@@ -2255,10 +2305,7 @@
           configOptions.map((option) =>
             option.id === configId ? Object.assign({}, option, { currentValue: value }) : option,
           );
-        const selectedModel = configOptions.find(
-          (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
-        )?.currentValue;
-        if (thread && selectedModel) onactivity({ ...thread, model: selectedModel });
+        rememberThreadConfig(configOptions);
       } catch (cause) {
         if (activeSessionId !== sessionId) return;
         configFailure = describe(cause);
