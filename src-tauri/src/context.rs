@@ -178,7 +178,7 @@ fn committed_provider_at(
     directory: &Path,
     revision: &str,
 ) -> Result<Option<CommittedProvider>, String> {
-    let Some(config) = committed_blob(directory, &revision, CONFIG)? else {
+    let Some(config) = committed_blob(directory, revision, CONFIG)? else {
         return Ok(None);
     };
     let pointer: WorktreePointer = serde_json::from_slice(&config)
@@ -189,7 +189,7 @@ fn committed_provider_at(
     if !valid_manifest_path(&pointer.manifest) {
         return Err("Context manifest path must stay under .sail.".into());
     }
-    let manifest = committed_blob(directory, &revision, &pointer.manifest)?
+    let manifest = committed_blob(directory, revision, &pointer.manifest)?
         .ok_or("Committed context manifest is missing.")?;
     let parsed: Manifest = serde_json::from_slice(&manifest)
         .map_err(|error| format!("Invalid committed context manifest: {error}"))?;
@@ -433,6 +433,7 @@ fn locked_store<T>(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path.with_extension("lock"))
         .map_err(|error| format!("Cannot open provider store lock: {error}"))?;
     lock.lock()
