@@ -508,6 +508,11 @@
   } from './lib/saved-commands';
   import { annotateDiffs, repoPath, selectedDiffFile, type WorkingDiffInfo } from './lib/diff';
   import type { DiffComment } from './lib/diff-comments';
+  import {
+    automaticCaptureControl,
+    persistAutomaticCapture,
+    type MemoryStatus,
+  } from './lib/memory-capture';
 
   interface MemoryCaptureCandidate {
     directory: string;
@@ -518,10 +523,6 @@
     confirmationReason: 'sensitive' | 'broader_scope' | null;
   }
 
-  interface MemoryStatus {
-    enabled: boolean;
-    projectKey: string;
-  }
   import {
     browserReviewPreviews,
     retainCaptureMetadata,
@@ -753,6 +754,11 @@
   let browserAccessDisabled = $state(
     getSetting(`sai-browser-disabled:${savedDirectory}`) === 'true',
   );
+  let memoryCaptureAvailable = $state(false);
+  let memoryCaptureEnabled = $state(false);
+  let memoryCaptureProjectKey = $state('');
+  let memoryCaptureBusy = $state(false);
+  let memoryCaptureRefresh = 0;
   type BrowserAccessRequest = { id: string; sessionId: string; directory: string; origin?: string };
   type CoordinationRequest = {
     id: string;
@@ -2331,6 +2337,42 @@
       directory,
       enabled: !browserAccessDisabled,
     }).catch((cause) => (error = describe(cause)));
+  }
+
+  async function refreshAutomaticMemoryCapture(path: string) {
+    const refresh = ++memoryCaptureRefresh;
+    memoryCaptureAvailable = false;
+    memoryCaptureEnabled = false;
+    memoryCaptureProjectKey = '';
+    try {
+      const status = await invoke<MemoryStatus>('memory_status', { directory: path });
+      if (refresh !== memoryCaptureRefresh || directory !== path) return;
+      const control = automaticCaptureControl(
+        status,
+        getSetting(`sai-memory-auto-capture:${status.projectKey}`),
+      );
+      memoryCaptureAvailable = control.available;
+      memoryCaptureEnabled = control.enabled;
+      memoryCaptureProjectKey = status.projectKey;
+    } catch (cause) {
+      if (refresh === memoryCaptureRefresh && directory === path)
+        error = `Could not load automatic memory capture: ${describe(cause)}`;
+    }
+  }
+
+  async function toggleAutomaticMemoryCapture() {
+    if (!memoryCaptureAvailable || memoryCaptureBusy || !memoryCaptureProjectKey) return;
+    const projectKey = memoryCaptureProjectKey;
+    const enabled = !memoryCaptureEnabled;
+    memoryCaptureBusy = true;
+    try {
+      await persistAutomaticCapture(projectKey, enabled);
+      if (memoryCaptureProjectKey === projectKey) memoryCaptureEnabled = enabled;
+    } catch (cause) {
+      error = `Could not update automatic memory capture: ${describe(cause)}`;
+    } finally {
+      if (memoryCaptureProjectKey === projectKey) memoryCaptureBusy = false;
+    }
   }
 
   function saveProjectCatalog(next: ProjectCatalog) {
@@ -8617,6 +8659,7 @@
     ++diffRefresh;
     diffLoading = false;
     await canonicalizeProject(path);
+    if (directory) await refreshAutomaticMemoryCapture(directory);
   }
 
   async function selectDefaultWorktree(path: string) {
@@ -11600,6 +11643,10 @@
         : null}
       browserAccess={!browserAccessDisabled}
       ontogglebrowser={toggleAgentBrowserAccess}
+      memoryCapture={memoryCaptureEnabled}
+      {memoryCaptureAvailable}
+      {memoryCaptureBusy}
+      ontogglememorycapture={() => void toggleAutomaticMemoryCapture()}
       onrunproject={selectedWorktreeConfig?.run
         ? () => splitFocusedPane('row', 'terminal', selectedWorktreeConfig?.run)
         : null}

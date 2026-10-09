@@ -46,6 +46,10 @@
     contextUsage,
     browserAccess,
     ontogglebrowser,
+    memoryCapture,
+    memoryCaptureAvailable,
+    memoryCaptureBusy,
+    ontogglememorycapture,
     onrunproject,
     agentTerminalCount,
     onagentterminals,
@@ -86,6 +90,10 @@
     contextUsage?: number;
     browserAccess: boolean;
     ontogglebrowser: () => void;
+    memoryCapture: boolean;
+    memoryCaptureAvailable: boolean;
+    memoryCaptureBusy: boolean;
+    ontogglememorycapture: () => void;
     onrunproject: (() => void) | null;
     agentTerminalCount: number;
     onagentterminals: () => void;
@@ -267,6 +275,15 @@
           aria-checked={browserAccess}
           title="Toggle agent browser access for this project"
           onclick={ontogglebrowser}>Agent browser {browserAccess ? 'on' : 'off'}</button
+        ><button
+          role="menuitemcheckbox"
+          aria-checked={memoryCapture}
+          disabled={!memoryCaptureAvailable || memoryCaptureBusy}
+          title={memoryCaptureAvailable
+            ? 'Toggle automatic memory capture for this project'
+            : 'Enable shared memory for this project first'}
+          onclick={ontogglememorycapture}
+          >Automatic memory capture {memoryCapture ? 'on' : 'off'}</button
         >{/if}
       {#if threadActions || onrestore}
         <div class="menu-separator" role="separator"></div>
