@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import type { AgentSessionListing } from '../src/lib/acp.ts';
+import type { AgentSessionListing, AgentThread } from '../src/lib/acp.ts';
 import test from 'node:test';
 import {
   advanceFailedChildNotices,
@@ -549,4 +549,17 @@ await test('a Sail title survives when the agent lists the same thread', () => {
     assert.equal(thread.updated, 5);
     assert.equal(thread.renamed, true);
   }
+});
+
+await test('Sail keywords survive a newer agent listing for the same thread', () => {
+  const saved: AgentThread = {
+    agent: 'opencode',
+    directory: '/repo/a',
+    sessionId: 'ses_a',
+    title: 'Saved',
+    keywords: ['command palette', 'fuzzy search'],
+    updated: 1,
+  };
+  const listed = { ...saved, title: 'Listed', keywords: undefined, updated: 5 };
+  assert.deepEqual(groupSidebarThreads([saved, listed])['/repo/a'][0]?.keywords, saved.keywords);
 });
