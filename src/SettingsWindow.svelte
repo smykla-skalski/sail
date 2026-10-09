@@ -136,6 +136,7 @@
   let memoryProviderMessage = $state('');
   let memoryProviderError = $state('');
   let memoryProviderLoading = $state(false);
+  let pendingProviderResolution = $state(false);
 
   async function refreshMemory(directory: string, query = memoryQuery.trim()) {
     const request = ++memoryRequest;
@@ -152,6 +153,7 @@
       memoryProviderApiKey = '';
       memoryProviderMessage = '';
       memoryProviderError = '';
+      pendingProviderResolution = false;
       query = '';
     }
     memoryDirectory = directory;
@@ -246,12 +248,38 @@
         input: memoryProviderInput(),
       });
       memoryProviderApiKey = '';
+      pendingProviderResolution = false;
       memoryProviderKind = memoryProviderStatus.provider;
       memoryProviderEndpoint = memoryProviderStatus.endpoint ?? '';
       memoryProviderMessage =
         memoryProviderStatus.provider === 'local'
           ? 'Local search is active. Canonical project memories were preserved; any active provider credential was removed.'
           : `${memoryProviderStatus.provider === 'agentMemory' ? 'AgentMemory' : 'Mem0'} is active and existing memories are synchronized.`;
+    } catch (cause) {
+      memoryProviderError = `Provider: ${String(cause)}`;
+    } finally {
+      memoryProviderLoading = false;
+    }
+  }
+
+  async function resolvePendingMemoryProvider() {
+    const directory = snapshot?.directory;
+    if (!directory || memoryProviderKind !== 'agentMemory') return;
+    memoryProviderLoading = true;
+    memoryProviderError = '';
+    memoryProviderMessage = '';
+    try {
+      await invoke('resolve_memory_provider_pending', {
+        directory,
+        input: memoryProviderInput(),
+        acknowledgeUnknown: true,
+      });
+      pendingProviderResolution = false;
+      memoryProviderMessage =
+        'Pending write cleared after a complete remote scan. Enable AgentMemory again to retry synchronization.';
+      memoryProviderStatus = await invoke<MemoryProviderStatus>('memory_provider_status', {
+        directory,
+      });
     } catch (cause) {
       memoryProviderError = `Provider: ${String(cause)}`;
     } finally {
@@ -1140,6 +1168,33 @@
           >
             Last provider sync failed: {memoryProviderStatus.syncError} Local search remains active.
           </p>{/if}
+        {#if memoryProviderKind === 'agentMemory' && (memoryProviderError.includes('unknown outcome') || (memoryProviderStatus?.provider === 'agentMemory' && memoryProviderStatus.syncError?.includes('unknown outcome')))}
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={memoryProviderLoading}
+            onclick={() => (pendingProviderResolution = true)}>Resolve pending write</Button
+          >
+        {/if}
+        {#if pendingProviderResolution && memoryProviderKind === 'agentMemory'}
+          <p class="runtime-diagnostic" role="alert">
+            AgentMemory has no idempotency key. Check its records for this project before clearing
+            the pending write. A delayed earlier write can appear later; retrying then can create a
+            duplicate. Sail will scan this endpoint again before clearing.
+          </p>
+          <Button
+            size="sm"
+            disabled={memoryProviderLoading}
+            onclick={() => void resolvePendingMemoryProvider()}
+            >I checked; clear pending write</Button
+          >
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={memoryProviderLoading}
+            onclick={() => (pendingProviderResolution = false)}>Cancel</Button
+          >
+        {/if}
         <label for="memory-provider">Provider</label>
         <select
           id="memory-provider"
@@ -1148,6 +1203,7 @@
           onchange={() => {
             memoryProviderMessage = '';
             memoryProviderError = '';
+            pendingProviderResolution = false;
           }}
         >
           <option value="local">Local search</option>
@@ -1164,6 +1220,7 @@
               ? 'http://127.0.0.1:8000'
               : 'https://mem0.example.com'}
             bind:value={memoryProviderEndpoint}
+            oninput={() => (pendingProviderResolution = false)}
             disabled={memoryProviderLoading}
           />
           <p class="runtime-binary">HTTPS is required except for localhost development servers.</p>
