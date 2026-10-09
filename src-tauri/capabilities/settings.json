@@ -28,6 +28,7 @@
     "allow-verify-memory-provider",
     "allow-set-memory-provider",
     "allow-sync-memory-provider",
+    "allow-resolve-memory-provider-pending",
     "allow-open-external-url",
     "core:event:allow-listen",
     "core:event:allow-unlisten",

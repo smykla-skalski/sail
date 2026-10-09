@@ -30,6 +30,7 @@ fn main() {
             "verify_memory_provider",
             "set_memory_provider",
             "sync_memory_provider",
+            "resolve_memory_provider_pending",
             "start_runtime",
             "repository_path_available",
             "opencode_plan_review_plugin",

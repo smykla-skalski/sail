@@ -3,6 +3,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 
 const CONFIG_PREFIX: &str = "sai-memory-provider:";
 const CREDENTIAL_SERVICE: &str = "dev.sail.shared-memory.mem0";
+const AGENTMEMORY_CREDENTIAL_SERVICE: &str = "dev.sail.shared-memory.agentmemory";
 const HOSTED_ENDPOINT: &str = "https://api.mem0.ai";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const HOSTED_PAGE_SIZE: usize = 100;
@@ -27,6 +29,7 @@ pub enum ProviderKind {
     Local,
     Mem0Hosted,
     Mem0SelfHosted,
+    AgentMemory,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -106,6 +109,12 @@ struct Mem0Provider {
     api_key: String,
 }
 
+struct AgentMemoryProvider {
+    client: Client,
+    endpoint: Url,
+    token: String,
+}
+
 fn session_credentials() -> &'static Mutex<HashMap<String, String>> {
     static CREDENTIALS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     CREDENTIALS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -175,6 +184,14 @@ fn provider_lock(root: &Path, project_key: &str) -> Result<File, String> {
 
 fn pending_events_path(root: &Path, project_key: &str) -> PathBuf {
     root.join(format!("{project_key}.mem0-events.json"))
+}
+
+fn agentmemory_pending_path(root: &Path, project_key: &str, endpoint: &str) -> PathBuf {
+    let account = agentmemory_account(project_key, endpoint);
+    root.join(format!(
+        "{}.agentmemory-events.json",
+        account.replace(':', "-")
+    ))
 }
 
 fn runtime_status_path(root: &Path, project_key: &str) -> PathBuf {
@@ -297,6 +314,36 @@ fn save_pending_events(
     }
 }
 
+fn load_agentmemory_pending(
+    root: &Path,
+    project_key: &str,
+    endpoint: &str,
+) -> Result<PendingEvents, String> {
+    read_json(&agentmemory_pending_path(root, project_key, endpoint))
+}
+
+fn save_agentmemory_pending(
+    root: &Path,
+    project_key: &str,
+    endpoint: &str,
+    events: &PendingEvents,
+) -> Result<(), String> {
+    let path = agentmemory_pending_path(root, project_key, endpoint);
+    if events.is_empty() {
+        let result = match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("Cannot clear AgentMemory sync state.".into()),
+        };
+        if result.is_ok() {
+            let _ = fs::remove_file(state_backup_path(&path));
+        }
+        result
+    } else {
+        write_json(&path, events)
+    }
+}
+
 fn load_runtime_status(root: &Path, project_key: &str) -> ProviderRuntimeStatus {
     read_json(&runtime_status_path(root, project_key)).unwrap_or_else(|error| {
         ProviderRuntimeStatus {
@@ -335,6 +382,90 @@ fn save_config(
 fn credential(project_key: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(CREDENTIAL_SERVICE, project_key)
         .map_err(|_| "Cannot access the system credential store.".to_string())
+}
+
+fn agentmemory_account(project_key: &str, endpoint: &str) -> String {
+    let hash: String = Sha256::digest(endpoint.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{project_key}:{hash}")
+}
+
+fn agentmemory_credential(project_key: &str, endpoint: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(
+        AGENTMEMORY_CREDENTIAL_SERVICE,
+        &agentmemory_account(project_key, endpoint),
+    )
+    .map_err(|_| "Cannot access the system credential store.".to_string())
+}
+
+fn agentmemory_session_key(project_key: &str, endpoint: &str) -> String {
+    format!("agentmemory:{}", agentmemory_account(project_key, endpoint))
+}
+
+fn load_agentmemory_token(project_key: &str, endpoint: &str) -> Option<String> {
+    if let Some(token) = session_credentials()
+        .lock()
+        .ok()?
+        .get(&agentmemory_session_key(project_key, endpoint))
+        .cloned()
+    {
+        return Some(token);
+    }
+    agentmemory_credential(project_key, endpoint)
+        .ok()?
+        .get_password()
+        .ok()
+}
+
+fn store_agentmemory_token(
+    project_key: &str,
+    endpoint: &str,
+    token: &str,
+) -> Result<CredentialStorage, String> {
+    let session_key = agentmemory_session_key(project_key, endpoint);
+    if agentmemory_credential(project_key, endpoint)
+        .and_then(|entry| {
+            entry
+                .set_password(token)
+                .map_err(|_| "Cannot save AgentMemory credentials.".to_string())
+        })
+        .is_ok()
+    {
+        session_credentials()
+            .lock()
+            .map_err(|_| "Cannot save AgentMemory credentials.".to_string())?
+            .remove(&session_key);
+        return Ok(CredentialStorage::Keychain);
+    }
+    session_credentials()
+        .lock()
+        .map_err(|_| "Cannot save AgentMemory credentials.".to_string())?
+        .insert(session_key, token.to_string());
+    Ok(CredentialStorage::Memory)
+}
+
+fn delete_agentmemory_token(project_key: &str, endpoint: &str) {
+    if let Ok(entry) = agentmemory_credential(project_key, endpoint) {
+        let _ = entry.delete_credential();
+    }
+    if let Ok(mut credentials) = session_credentials().lock() {
+        credentials.remove(&agentmemory_session_key(project_key, endpoint));
+    }
+}
+
+fn agentmemory_credential_storage(project_key: &str, endpoint: &str) -> Option<CredentialStorage> {
+    if session_credentials().lock().is_ok_and(|credentials| {
+        credentials.contains_key(&agentmemory_session_key(project_key, endpoint))
+    }) {
+        return Some(CredentialStorage::Memory);
+    }
+    agentmemory_credential(project_key, endpoint)
+        .ok()?
+        .get_password()
+        .ok()
+        .map(|_| CredentialStorage::Keychain)
 }
 
 fn load_api_key_with<F>(project_key: &str, load_keychain: F) -> Result<String, String>
@@ -413,22 +544,6 @@ fn credential_storage(project_key: &str) -> Option<CredentialStorage> {
     None
 }
 
-fn provider_change_resets_pending(previous: &ProviderConfig, next: &ProviderConfig) -> bool {
-    previous.provider != ProviderKind::Local && previous != next
-}
-
-fn commit_provider_switch<C, R>(switching: bool, commit: C, reset_pending: R) -> Result<(), String>
-where
-    C: FnOnce() -> Result<(), String>,
-    R: FnOnce() -> Result<(), String>,
-{
-    if switching {
-        commit()?;
-        reset_pending()?;
-    }
-    Ok(())
-}
-
 fn notice(storage: Option<CredentialStorage>, configured: bool) -> Option<String> {
     match storage {
         Some(CredentialStorage::Memory) => Some(
@@ -442,6 +557,17 @@ fn notice(storage: Option<CredentialStorage>, configured: bool) -> Option<String
     }
 }
 
+fn provider_notice(
+    provider: ProviderKind,
+    storage: Option<CredentialStorage>,
+    configured: bool,
+) -> Option<String> {
+    if provider == ProviderKind::AgentMemory && storage.is_none() {
+        return None;
+    }
+    notice(storage, configured)
+}
+
 fn normalize_config(input: &ProviderInput) -> Result<ProviderConfig, String> {
     match input.provider {
         ProviderKind::Local => Ok(ProviderConfig {
@@ -452,19 +578,24 @@ fn normalize_config(input: &ProviderInput) -> Result<ProviderConfig, String> {
             provider: ProviderKind::Mem0Hosted,
             endpoint: Some(HOSTED_ENDPOINT.to_string()),
         }),
-        ProviderKind::Mem0SelfHosted => {
+        ProviderKind::Mem0SelfHosted | ProviderKind::AgentMemory => {
+            let agentmemory = input.provider == ProviderKind::AgentMemory;
+            let label = if agentmemory { "AgentMemory" } else { "Mem0" };
             let raw = input
                 .endpoint
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .ok_or("A self-hosted Mem0 endpoint is required.")?;
-            let mut endpoint = Url::parse(raw).map_err(|_| "The Mem0 endpoint is invalid.")?;
+                .ok_or_else(|| format!("A {label} endpoint is required."))?;
+            let mut endpoint =
+                Url::parse(raw).map_err(|_| format!("The {label} endpoint is invalid."))?;
             if endpoint.username() != "" || endpoint.password().is_some() {
-                return Err("The Mem0 endpoint cannot contain credentials.".into());
+                return Err(format!("The {label} endpoint cannot contain credentials."));
             }
             if endpoint.query().is_some() || endpoint.fragment().is_some() {
-                return Err("The Mem0 endpoint cannot contain a query or fragment.".into());
+                return Err(format!(
+                    "The {label} endpoint cannot contain a query or fragment."
+                ));
             }
             let loopback = endpoint.host_str().is_some_and(|host| {
                 host.eq_ignore_ascii_case("localhost")
@@ -473,14 +604,14 @@ fn normalize_config(input: &ProviderInput) -> Result<ProviderConfig, String> {
                         .is_ok_and(|address| address.is_loopback())
             });
             if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && loopback) {
-                return Err(
-                    "The Mem0 endpoint must use HTTPS (HTTP is allowed for localhost).".into(),
-                );
+                return Err(format!(
+                    "The {label} endpoint must use HTTPS (HTTP is allowed for localhost)."
+                ));
             }
             let path = endpoint.path().trim_end_matches('/').to_string();
             endpoint.set_path(&path);
             Ok(ProviderConfig {
-                provider: ProviderKind::Mem0SelfHosted,
+                provider: input.provider,
                 endpoint: Some(endpoint.to_string().trim_end_matches('/').to_string()),
             })
         }
@@ -522,7 +653,9 @@ impl Mem0Provider {
                 request.header("Authorization", format!("Token {}", self.api_key))
             }
             ProviderKind::Mem0SelfHosted => request.header("X-API-Key", &self.api_key),
-            ProviderKind::Local => return Err("The local provider has no remote endpoint.".into()),
+            ProviderKind::Local | ProviderKind::AgentMemory => {
+                return Err("This provider has no Mem0 endpoint.".into());
+            }
         })
     }
 
@@ -535,7 +668,9 @@ impl Mem0Provider {
                 request.header("Authorization", format!("Token {}", self.api_key))
             }
             ProviderKind::Mem0SelfHosted => request.header("X-API-Key", &self.api_key),
-            ProviderKind::Local => return Err("The local provider has no remote endpoint.".into()),
+            ProviderKind::Local | ProviderKind::AgentMemory => {
+                return Err("This provider has no Mem0 endpoint.".into());
+            }
         })
     }
 
@@ -568,7 +703,7 @@ impl Mem0Provider {
                 let request = self.client.request(Method::GET, url);
                 self.send(self.authenticate(request)?)?
             }
-            ProviderKind::Local => return Ok((Vec::new(), 0)),
+            ProviderKind::Local | ProviderKind::AgentMemory => return Ok((Vec::new(), 0)),
         };
         let count = result_array(&value).len();
         Ok((remote_memories(&value), count))
@@ -741,7 +876,7 @@ impl MemoryProvider for Mem0Provider {
                     "limit": limit,
                 })))?
             }
-            ProviderKind::Local => return Ok(Vec::new()),
+            ProviderKind::Local | ProviderKind::AgentMemory => return Ok(Vec::new()),
         };
         Ok(remote_memories(&value))
     }
@@ -753,7 +888,11 @@ impl MemoryProvider for Mem0Provider {
         memories: &[MemoryRecord],
     ) -> Result<(), String> {
         let mut remote = self.list_all(project_key)?;
-        let mut pending = load_pending_events(root, project_key)?;
+        let mut pending = if self.kind == ProviderKind::Mem0Hosted {
+            load_pending_events(root, project_key)?
+        } else {
+            PendingEvents::new()
+        };
         for (sail_id, event) in pending.clone() {
             if remote
                 .iter()
@@ -813,6 +952,334 @@ impl MemoryProvider for Mem0Provider {
         }
         Ok(())
     }
+}
+
+impl AgentMemoryProvider {
+    fn new(config: &ProviderConfig, token: String) -> Result<Self, String> {
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .ok_or("The AgentMemory endpoint is missing.")?;
+        Ok(Self {
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "Cannot initialize the AgentMemory connection.".to_string())?,
+            endpoint: Url::parse(endpoint)
+                .map_err(|_| "The AgentMemory endpoint is invalid.".to_string())?,
+            token,
+        })
+    }
+
+    fn url(&self, path: &str) -> Result<Url, String> {
+        let base = self.endpoint.as_str().trim_end_matches('/');
+        Url::parse(&format!("{base}{path}"))
+            .map_err(|_| "Cannot construct the AgentMemory request.".to_string())
+    }
+
+    fn request(&self, method: Method, url: Url) -> reqwest::blocking::RequestBuilder {
+        let request = self.client.request(method, url);
+        if self.token.is_empty() {
+            request
+        } else {
+            request.bearer_auth(&self.token)
+        }
+    }
+
+    fn send(&self, request: reqwest::blocking::RequestBuilder) -> Result<Value, String> {
+        let response = request
+            .send()
+            .map_err(|_| "AgentMemory is unavailable.".to_string())?;
+        parse_agentmemory_response(response)
+    }
+
+    fn list_all(&self, project_key: &str) -> Result<Vec<RemoteMemory>, String> {
+        let mut all = Vec::new();
+        let mut total_items = 0;
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let mut url = self.url("/memories/page")?;
+            {
+                let mut query = url.query_pairs_mut();
+                query
+                    .append_pair("user_id", project_key)
+                    .append_pair("limit", &SELF_HOSTED_SAFE_LIMIT.to_string());
+                if let Some(cursor) = cursor.as_deref() {
+                    query.append_pair("cursor", cursor);
+                }
+            }
+            let value = self.send(self.request(Method::GET, url))?;
+            let items = value
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or("AgentMemory returned an invalid memory page.")?;
+            let supported = value
+                .get("pagination_supported")
+                .and_then(Value::as_bool)
+                .ok_or("AgentMemory did not report pagination support.")?;
+            if !supported && items.len() >= SELF_HOSTED_SAFE_LIMIT {
+                return Err(
+                    "AgentMemory returned more memories than can be reconciled safely.".into(),
+                );
+            }
+            total_items += items.len();
+            all.extend(remote_memories(&Value::Array(items.clone())));
+            if total_items >= MAX_RECONCILE_RECORDS {
+                return Err("AgentMemory has too many memories to reconcile safely.".into());
+            }
+            let next = value
+                .get("next_cursor")
+                .ok_or("AgentMemory returned an invalid memory page.")?;
+            match next {
+                Value::String(next)
+                    if supported && !next.is_empty() && seen.insert(next.to_string()) =>
+                {
+                    cursor = Some(next.to_string());
+                }
+                Value::Null => return Ok(all),
+                _ => return Err("AgentMemory pagination did not terminate safely.".into()),
+            }
+        }
+    }
+
+    fn add(
+        &self,
+        root: &Path,
+        project_key: &str,
+        memory: &MemoryRecord,
+        pending: &mut PendingEvents,
+    ) -> Result<(), String> {
+        pending.insert(
+            memory.id.clone(),
+            PendingEvent {
+                event_id: None,
+                updated_at: memory.updated_at,
+            },
+        );
+        save_agentmemory_pending(
+            root,
+            project_key,
+            self.endpoint.as_str().trim_end_matches('/'),
+            pending,
+        )?;
+        let request = self.request(Method::POST, self.url("/add")?).json(&json!({
+            "text": memory.content,
+            "user_id": project_key,
+            "metadata": metadata(memory),
+            "infer": false,
+        }));
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(error) if error.is_connect() => {
+                pending.remove(&memory.id);
+                save_agentmemory_pending(
+                    root,
+                    project_key,
+                    self.endpoint.as_str().trim_end_matches('/'),
+                    pending,
+                )?;
+                return Err("AgentMemory is unavailable.".into());
+            }
+            Err(_) => {
+                return Err("AgentMemory submission has an unknown outcome. Local memory remains available; inspect the remote records before resolving the pending write.".into());
+            }
+        };
+        let status = response.status();
+        if matches!(
+            status,
+            StatusCode::BAD_REQUEST
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::NOT_FOUND
+                | StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            pending.remove(&memory.id);
+            save_agentmemory_pending(
+                root,
+                project_key,
+                self.endpoint.as_str().trim_end_matches('/'),
+                pending,
+            )?;
+            return Err(parse_agentmemory_response(response).unwrap_err());
+        }
+        parse_agentmemory_response(response).map_err(|error| {
+            format!("AgentMemory submission has an unknown outcome ({error}). Local memory remains available; inspect the remote records before resolving the pending write.")
+        })?;
+        let remote = self.list_all(project_key)?;
+        if !remote
+            .iter()
+            .any(|item| item.sail_id == memory.id && item.updated_at == memory.updated_at)
+        {
+            return Err("AgentMemory accepted the memory but it is not visible yet.".into());
+        }
+        pending.remove(&memory.id);
+        save_agentmemory_pending(
+            root,
+            project_key,
+            self.endpoint.as_str().trim_end_matches('/'),
+            pending,
+        )
+    }
+
+    fn delete(&self, id: &str) -> Result<(), String> {
+        let mut url = self.url("/memories/")?;
+        url.path_segments_mut()
+            .map_err(|_| "AgentMemory returned an invalid memory identifier.")?
+            .push(id);
+        self.send(self.request(Method::DELETE, url))?;
+        Ok(())
+    }
+}
+
+impl MemoryProvider for AgentMemoryProvider {
+    fn verify(&self, project_key: &str) -> Result<(), String> {
+        let health = self.send(self.request(Method::GET, self.url("/health")?))?;
+        if health.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err("AgentMemory is not healthy.".into());
+        }
+        if health.get("provider").and_then(Value::as_str).is_none()
+            || health
+                .get("capabilities")
+                .and_then(Value::as_object)
+                .is_none()
+            || health
+                .get("provider_contract")
+                .and_then(Value::as_object)
+                .is_none()
+        {
+            return Err(if self.token.is_empty() {
+                "AgentMemory did not return the expected health contract.".into()
+            } else {
+                "AgentMemory rejected the token.".into()
+            });
+        }
+        self.list_all(project_key)?;
+        self.search(project_key, "sail-connection-check", 1)
+            .map(|_| ())
+    }
+
+    fn search(
+        &self,
+        project_key: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RemoteMemory>, String> {
+        let value = self.send(
+            self.request(Method::POST, self.url("/search")?)
+                .json(&json!({
+                    "query": query,
+                    "user_id": project_key,
+                    "limit": limit,
+                    "rerank": false,
+                })),
+        )?;
+        if !value.is_array() {
+            return Err("AgentMemory returned invalid search results.".into());
+        }
+        Ok(remote_memories(&value))
+    }
+
+    fn reconcile(
+        &self,
+        root: &Path,
+        project_key: &str,
+        memories: &[MemoryRecord],
+    ) -> Result<(), String> {
+        let remote = self.list_all(project_key)?;
+        let endpoint = self.endpoint.as_str().trim_end_matches('/');
+        let mut pending = load_agentmemory_pending(root, project_key, endpoint)?;
+        for (sail_id, event) in pending.clone() {
+            if remote
+                .iter()
+                .any(|item| item.sail_id == sail_id && item.updated_at == event.updated_at)
+            {
+                pending.remove(&sail_id);
+                save_agentmemory_pending(root, project_key, endpoint, &pending)?;
+            } else {
+                return Err(
+                    "A previous AgentMemory submission has an unknown outcome. Local memory remains available; resolve the remote record before retrying."
+                        .into(),
+                );
+            }
+        }
+        let mut by_sail_id: HashMap<&str, Vec<&RemoteMemory>> = HashMap::new();
+        for memory in &remote {
+            by_sail_id.entry(&memory.sail_id).or_default().push(memory);
+        }
+        for memory in memories {
+            let existing = by_sail_id.remove(memory.id.as_str()).unwrap_or_default();
+            if memory.forgotten_at.is_some() {
+                for item in existing {
+                    self.delete(&item.id)?;
+                }
+                continue;
+            }
+            if existing.len() == 1 && existing[0].updated_at == memory.updated_at {
+                continue;
+            }
+            for item in existing {
+                self.delete(&item.id)?;
+            }
+            self.add(root, project_key, memory, &mut pending)?;
+        }
+        for duplicates in by_sail_id.into_values() {
+            for duplicate in duplicates {
+                self.delete(&duplicate.id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_agentmemory_response(mut response: Response) -> Result<Value, String> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                "AgentMemory rejected the token.".to_string()
+            }
+            _ => format!("AgentMemory returned HTTP {}.", status.as_u16()),
+        });
+    }
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Cannot read the AgentMemory response.".to_string())?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err("The AgentMemory response is too large.".into());
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "AgentMemory returned an invalid response.".to_string())
+}
+
+fn resolve_agentmemory_pending_at(
+    root: &Path,
+    project_key: &str,
+    endpoint: &str,
+    provider: &AgentMemoryProvider,
+    acknowledge_unknown: bool,
+) -> Result<(), String> {
+    let pending = load_agentmemory_pending(root, project_key, endpoint)?;
+    if pending.is_empty() {
+        return Err("There is no pending AgentMemory write for this project and endpoint.".into());
+    }
+    let remote = provider.list_all(project_key)?;
+    let unknown = pending.iter().any(|(sail_id, event)| {
+        !remote
+            .iter()
+            .any(|item| item.sail_id == *sail_id && item.updated_at == event.updated_at)
+    });
+    if unknown && !acknowledge_unknown {
+        return Err(
+            "Confirm the duplicate risk before retrying an unknown AgentMemory write.".into(),
+        );
+    }
+    save_agentmemory_pending(root, project_key, endpoint, &PendingEvents::new())
 }
 
 fn parse_response(mut response: Response) -> Result<Value, String> {
@@ -881,7 +1348,81 @@ fn provider(config: &ProviderConfig, api_key: String) -> Result<Box<dyn MemoryPr
         ProviderKind::Mem0Hosted | ProviderKind::Mem0SelfHosted => {
             Ok(Box::new(Mem0Provider::new(config, api_key)?))
         }
+        ProviderKind::AgentMemory => Ok(Box::new(AgentMemoryProvider::new(config, api_key)?)),
     }
+}
+
+fn reconcile_before_activation<A, T>(
+    provider: &dyn MemoryProvider,
+    root: &Path,
+    project_key: &str,
+    memories: &[MemoryRecord],
+    activate: A,
+) -> Result<T, String>
+where
+    A: FnOnce() -> Result<T, String>,
+{
+    provider.reconcile(root, project_key, memories)?;
+    activate()
+}
+
+fn activate_mem0_after_config<C, S, R, T>(
+    configure: C,
+    store_key: S,
+    restore: R,
+) -> Result<T, String>
+where
+    C: FnOnce() -> Result<(), String>,
+    S: FnOnce() -> Result<T, String>,
+    R: FnOnce() -> Result<(), String>,
+{
+    configure()?;
+    match store_key() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            restore().map_err(|restore_error| {
+                format!(
+                    "{error} Previous Mem0 configuration could not be restored: {restore_error}"
+                )
+            })?;
+            Err(error)
+        }
+    }
+}
+
+fn clear_hosted_pending_on_local_switch(root: &Path, project_key: &str) -> Result<(), String> {
+    save_pending_events(root, project_key, &PendingEvents::new())
+}
+
+fn configured_token(config: &ProviderConfig, key: &str) -> Result<String, String> {
+    if config.provider == ProviderKind::AgentMemory {
+        return Ok(config
+            .endpoint
+            .as_deref()
+            .and_then(|endpoint| load_agentmemory_token(key, endpoint))
+            .unwrap_or_default());
+    }
+    load_api_key(key)
+}
+
+fn input_token(input: &ProviderInput, config: &ProviderConfig, key: &str) -> String {
+    input
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            (config.provider == ProviderKind::AgentMemory)
+                .then(|| {
+                    config
+                        .endpoint
+                        .as_deref()
+                        .and_then(|endpoint| load_agentmemory_token(key, endpoint))
+                })
+                .flatten()
+        })
+        .unwrap_or_default()
 }
 
 fn sync_at(root: &Path, settings: &Path, key: &str) -> Result<(), String> {
@@ -892,7 +1433,8 @@ fn sync_at(root: &Path, settings: &Path, key: &str) -> Result<(), String> {
         return Ok(());
     }
     let memories = crate::memory::list_at(root, key, true)?;
-    let result = provider(&config, load_api_key(key)?)?.reconcile(root, key, &memories);
+    let result =
+        provider(&config, configured_token(&config, key)?)?.reconcile(root, key, &memories);
     match result {
         Ok(()) => {
             save_runtime_error(root, key, None);
@@ -969,7 +1511,7 @@ pub(crate) fn search_standalone(
     }
     let maximum = limit.unwrap_or(10).clamp(1, 100);
     let memories = crate::memory::list_at(root, key, true)?;
-    let remote = load_api_key(key)
+    let remote = configured_token(&config, key)
         .and_then(|api_key| provider(&config, api_key))
         .and_then(|provider| {
             provider.reconcile(root, key, &memories)?;
@@ -1046,7 +1588,16 @@ pub fn memory_provider_status(
     let key = project_key(&directory)?;
     let config = load_config(&app, &key)?;
     let (root, _) = crate::memory::standalone_paths(&app)?;
-    let storage = credential_storage(&key);
+    let storage = if config.provider == ProviderKind::Local {
+        None
+    } else if config.provider == ProviderKind::AgentMemory {
+        config
+            .endpoint
+            .as_deref()
+            .and_then(|endpoint| agentmemory_credential_storage(&key, endpoint))
+    } else {
+        credential_storage(&key)
+    };
     let configured = config.provider != ProviderKind::Local;
     let runtime = load_runtime_status(&root, &key);
     Ok(ProviderStatus {
@@ -1054,7 +1605,7 @@ pub fn memory_provider_status(
         provider: config.provider,
         endpoint: config.endpoint,
         credential_storage: storage,
-        notice: notice(storage, configured),
+        notice: provider_notice(config.provider, storage, configured),
         sync_error: runtime.sync_error,
     })
 }
@@ -1067,13 +1618,11 @@ pub fn verify_memory_provider(
     let key = project_key(&directory)?;
     let config = normalize_config(&input)?;
     if config.provider != ProviderKind::Local {
-        let api_key = input
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or("A Mem0 API key is required.")?;
-        provider(&config, api_key.to_string())?.verify(&key)?;
+        let api_key = input_token(&input, &config, &key);
+        if config.provider != ProviderKind::AgentMemory && api_key.is_empty() {
+            return Err("A Mem0 API key is required.".into());
+        }
+        provider(&config, api_key)?.verify(&key)?;
     }
     Ok(ProviderStatus {
         configured: false,
@@ -1098,8 +1647,14 @@ pub fn set_memory_provider(
     let previous = load_config(&app, &key)?;
     if config.provider == ProviderKind::Local {
         save_config(&app, &key, None)?;
-        delete_api_key(&key);
-        save_pending_events(&root, &key, &PendingEvents::new())?;
+        if previous.provider == ProviderKind::AgentMemory {
+            if let Some(endpoint) = previous.endpoint.as_deref() {
+                delete_agentmemory_token(&key, endpoint);
+            }
+        } else {
+            delete_api_key(&key);
+        }
+        clear_hosted_pending_on_local_switch(&root, &key)?;
         save_runtime_error(&root, &key, None);
         return Ok(ProviderStatus {
             provider: ProviderKind::Local,
@@ -1111,43 +1666,56 @@ pub fn set_memory_provider(
         });
     }
     crate::memory::ensure_enabled(&app, &directory)?;
-    let api_key = input
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or("A Mem0 API key is required.")?;
-    let provider = provider(&config, api_key.to_string())?;
-    provider.verify(&key)?;
-    let switching = provider_change_resets_pending(&previous, &config);
-    commit_provider_switch(
-        switching,
-        || save_config(&app, &key, Some(&config)),
-        || save_pending_events(&root, &key, &PendingEvents::new()),
-    )?;
-    if switching {
-        save_runtime_error(&root, &key, None);
+    let api_key = input_token(&input, &config, &key);
+    if config.provider != ProviderKind::AgentMemory && api_key.is_empty() {
+        return Err("A Mem0 API key is required.".into());
     }
+    let provider = provider(&config, api_key.clone())?;
+    provider.verify(&key)?;
     let memories = crate::memory::list(&app, &directory, true)?;
-    let storage = if switching {
-        let storage = store_api_key(&key, api_key)?;
-        if let Err(error) = provider.reconcile(&root, &key, &memories) {
-            save_runtime_error(&root, &key, Some(&error));
+    let result = reconcile_before_activation(provider.as_ref(), &root, &key, &memories, || {
+        if config.provider == ProviderKind::AgentMemory {
+            let storage = if api_key.is_empty() {
+                None
+            } else {
+                Some(store_agentmemory_token(
+                    &key,
+                    config.endpoint.as_deref().unwrap_or_default(),
+                    &api_key,
+                )?)
+            };
+            save_config(&app, &key, Some(&config))?;
+            Ok(storage)
+        } else {
+            activate_mem0_after_config(
+                || save_config(&app, &key, Some(&config)),
+                || store_api_key(&key, &api_key).map(Some),
+                || {
+                    save_config(
+                        &app,
+                        &key,
+                        (previous.provider != ProviderKind::Local).then_some(&previous),
+                    )
+                },
+            )
+        }
+    });
+    let storage = match result {
+        Ok(storage) => storage,
+        Err(error) => {
+            if previous == config {
+                save_runtime_error(&root, &key, Some(&error));
+            }
             return Err(error);
         }
-        storage
-    } else {
-        provider.reconcile(&root, &key, &memories)?;
-        let storage = store_api_key(&key, api_key)?;
-        save_config(&app, &key, Some(&config))?;
-        storage
     };
+    save_runtime_error(&root, &key, None);
     Ok(ProviderStatus {
         provider: config.provider,
         endpoint: config.endpoint,
         configured: true,
-        credential_storage: Some(storage),
-        notice: notice(Some(storage), true),
+        credential_storage: storage,
+        notice: provider_notice(config.provider, storage, true),
         sync_error: None,
     })
 }
@@ -1158,14 +1726,44 @@ pub fn sync_memory_provider(app: tauri::AppHandle, directory: String) -> Result<
     sync(&app, &directory)
 }
 
+#[tauri::command]
+pub fn resolve_memory_provider_pending(
+    app: tauri::AppHandle,
+    directory: String,
+    input: ProviderInput,
+    acknowledge_unknown: bool,
+) -> Result<(), String> {
+    crate::memory::ensure_enabled(&app, &directory)?;
+    let config = normalize_config(&input)?;
+    if config.provider != ProviderKind::AgentMemory {
+        return Err("Only AgentMemory pending writes can be resolved here.".into());
+    }
+    let key = project_key(&directory)?;
+    let (root, _) = crate::memory::standalone_paths(&app)?;
+    let _lock = provider_lock(&root, &key)?;
+    let endpoint = config
+        .endpoint
+        .as_deref()
+        .ok_or("The AgentMemory endpoint is missing.")?;
+    let provider = AgentMemoryProvider::new(&config, input_token(&input, &config, &key))?;
+    let active = load_config(&app, &key)? == config;
+    resolve_agentmemory_pending_at(&root, &key, endpoint, &provider, acknowledge_unknown)?;
+    if active {
+        save_runtime_error(&root, &key, None);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_provider_switch, config_key, credential_storage, load_api_key_with,
-        load_pending_events, load_runtime_status, merge_results, normalize_config, notice,
-        provider_change_resets_pending, provider_lock, remote_memories, search_standalone,
-        session_credentials, sync_at, CredentialStorage, Mem0Provider, MemoryProvider,
-        PendingEvents, ProviderConfig, ProviderInput, ProviderKind, HOSTED_ENDPOINT,
+        activate_mem0_after_config, agentmemory_session_key, clear_hosted_pending_on_local_switch,
+        config_key, configured_token, credential_storage, load_agentmemory_pending,
+        load_api_key_with, load_pending_events, load_runtime_status, merge_results,
+        normalize_config, notice, provider_lock, reconcile_before_activation, remote_memories,
+        resolve_agentmemory_pending_at, save_agentmemory_pending, save_pending_events,
+        search_standalone, session_credentials, sync_at, AgentMemoryProvider, CredentialStorage,
+        Mem0Provider, MemoryProvider, PendingEvents, ProviderConfig, ProviderInput, ProviderKind,
         HOSTED_PAGE_SIZE, SELF_HOSTED_SAFE_LIMIT,
     };
     use crate::memory::{
@@ -1305,56 +1903,6 @@ mod tests {
         );
         assert_eq!(credential_storage(&key), Some(CredentialStorage::Memory));
         session_credentials().lock().unwrap().remove(&key);
-    }
-
-    #[test]
-    fn failed_first_enable_preserves_pending_submission() {
-        let local = ProviderConfig {
-            provider: ProviderKind::Local,
-            endpoint: None,
-        };
-        let hosted = ProviderConfig {
-            provider: ProviderKind::Mem0Hosted,
-            endpoint: Some(HOSTED_ENDPOINT.into()),
-        };
-        assert!(!provider_change_resets_pending(&local, &hosted));
-        assert!(!provider_change_resets_pending(&hosted, &hosted));
-
-        let self_hosted = ProviderConfig {
-            provider: ProviderKind::Mem0SelfHosted,
-            endpoint: Some("https://mem0.example".into()),
-        };
-        assert!(provider_change_resets_pending(&hosted, &self_hosted));
-    }
-
-    #[test]
-    fn failed_remote_switch_commit_does_not_clear_pending_submission() {
-        let cleared = std::cell::Cell::new(false);
-        let result = commit_provider_switch(
-            true,
-            || Err("settings failed".into()),
-            || {
-                cleared.set(true);
-                Ok(())
-            },
-        );
-        assert_eq!(result, Err("settings failed".into()));
-        assert!(!cleared.get());
-
-        let steps = std::cell::RefCell::new(Vec::new());
-        commit_provider_switch(
-            true,
-            || {
-                steps.borrow_mut().push("commit");
-                Ok(())
-            },
-            || {
-                steps.borrow_mut().push("clear");
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(*steps.borrow(), ["commit", "clear"]);
     }
 
     #[test]
@@ -1819,5 +2367,655 @@ mod tests {
         fs::write(&settings, "{}").unwrap();
         drop(lock);
         assert_eq!(sync.join().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn agentmemory_rejects_insecure_or_embedded_credential_endpoints() {
+        let cases = [
+            ("http://memory.example", false),
+            ("https://user:secret@memory.example", false),
+            ("https://memory.example?token=secret", false),
+            ("http://127.0.0.1:8000/", true),
+            ("https://memory.example/", true),
+        ];
+        for (endpoint, accepted) in cases {
+            let input = ProviderInput {
+                provider: ProviderKind::AgentMemory,
+                endpoint: Some(endpoint.into()),
+                api_key: Some("secret".into()),
+            };
+
+            assert_eq!(normalize_config(&input).is_ok(), accepted, "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn agentmemory_rejects_public_health_for_an_invalid_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("GET /health HTTP/1.1"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer wrong"));
+            respond(&mut stream, r#"{"ok":true}"#);
+        });
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint),
+        };
+        let provider = AgentMemoryProvider::new(&config, "wrong".into()).unwrap();
+
+        let error = provider.verify("project").unwrap_err();
+
+        assert_eq!(error, "AgentMemory rejected the token.");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agentmemory_search_uses_project_scope_without_reranking() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("POST /search HTTP/1.1"));
+            assert!(request.contains("\"user_id\":\"project\""));
+            assert!(request.contains("\"rerank\":false"));
+            respond(
+                &mut stream,
+                r#"[{"id":"remote","score":0.8,"metadata":{"sail_memory_id":"local-id","sail_updated_at":42}}]"#,
+            );
+        });
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint),
+        };
+        let provider = AgentMemoryProvider::new(&config, String::new()).unwrap();
+
+        let results = provider.search("project", "concise", 5).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].sail_id, "local-id");
+        assert_eq!(results[0].score, Some(0.8));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agentmemory_retry_observes_committed_add_without_reposting() {
+        let root = temporary();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            assert!(read_request(&mut first).starts_with("GET /memories/page?"));
+            respond(
+                &mut first,
+                r#"{"items":[],"next_cursor":null,"pagination_supported":true}"#,
+            );
+
+            let (mut add, _) = listener.accept().unwrap();
+            let request = read_request(&mut add);
+            assert!(request.starts_with("POST /add HTTP/1.1"));
+            assert!(request.contains("\"text\":\"Prefer concise status updates\""));
+            assert!(request.contains("\"infer\":false"));
+            assert!(request.contains("\"sail_memory_id\":\"local-id\""));
+            respond(
+                &mut add,
+                r#"{"id":"remote-id","memory":"Prefer concise status updates"}"#,
+            );
+
+            let (mut delayed, _) = listener.accept().unwrap();
+            assert!(read_request(&mut delayed).starts_with("GET /memories/page?"));
+            respond_status(
+                &mut delayed,
+                "503 Unavailable",
+                r#"{"error_type":"Unavailable"}"#,
+            );
+
+            let (mut retry, _) = listener.accept().unwrap();
+            assert!(read_request(&mut retry).starts_with("GET /memories/page?"));
+            respond(
+                &mut retry,
+                r#"{"items":[{"id":"remote-id","metadata":{"sail_memory_id":"local-id","sail_updated_at":42}}],"next_cursor":null,"pagination_supported":true}"#,
+            );
+        });
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint),
+        };
+        let provider = AgentMemoryProvider::new(&config, String::new()).unwrap();
+
+        assert!(provider.reconcile(&root, "project", &[memory()]).is_err());
+        assert!(provider.reconcile(&root, "project", &[memory()]).is_ok());
+
+        assert!(
+            load_agentmemory_pending(&root, "project", config.endpoint.as_deref().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agentmemory_nonpaginated_full_page_falls_back_before_writing() {
+        let root = temporary();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream).starts_with("GET /memories/page?"));
+            let items = (0..SELF_HOSTED_SAFE_LIMIT)
+                .map(|index| json!({ "id": format!("unmanaged-{index}") }))
+                .collect::<Vec<_>>();
+            respond(
+                &mut stream,
+                &json!({
+                    "items": items,
+                    "next_cursor": null,
+                    "pagination_supported": false
+                })
+                .to_string(),
+            );
+        });
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint),
+        };
+        let provider = AgentMemoryProvider::new(&config, String::new()).unwrap();
+
+        let error = provider
+            .reconcile(&root, "project", &[memory()])
+            .unwrap_err();
+
+        assert!(error.contains("reconciled safely"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agentmemory_reconciliation_reads_later_pages_before_writing() {
+        let root = temporary();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let request = read_request(&mut first);
+            assert!(request.starts_with("GET /memories/page?"));
+            assert!(!request.contains("cursor="));
+            respond(
+                &mut first,
+                r#"{"items":[{"id":"unmanaged"}],"next_cursor":"1","pagination_supported":true}"#,
+            );
+
+            let (mut second, _) = listener.accept().unwrap();
+            let request = read_request(&mut second);
+            assert!(request.contains("cursor=1"));
+            respond(
+                &mut second,
+                r#"{"items":[{"id":"remote-id","metadata":{"sail_memory_id":"local-id","sail_updated_at":42}}],"next_cursor":null,"pagination_supported":true}"#,
+            );
+        });
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint),
+        };
+        let provider = AgentMemoryProvider::new(&config, String::new()).unwrap();
+
+        let result = provider.reconcile(&root, "project", &[memory()]);
+
+        assert_eq!(result, Ok(()));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agentmemory_outage_keeps_local_search_and_sync_feedback() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        let key = Uuid::new_v4().to_string();
+        let local = remember_local(&root, &key);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint),
+        };
+        fs::write(
+            &settings,
+            json!({ config_key(&key): serde_json::to_string(&config).unwrap() }).to_string(),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream).starts_with("GET /memories/page?"));
+            respond_status(
+                &mut stream,
+                "503 Unavailable",
+                r#"{"error_type":"Unavailable"}"#,
+            );
+        });
+
+        let results = search_standalone(&root, &settings, &key, "concise", Some(10)).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory.id, local.id);
+        assert_eq!(
+            load_runtime_status(&root, &key).sync_error,
+            Some("AgentMemory returned HTTP 503.".into())
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agentmemory_token_never_crosses_endpoint_boundaries() {
+        let key = Uuid::new_v4().to_string();
+        let old_endpoint = "https://old.example";
+        session_credentials().lock().unwrap().insert(
+            agentmemory_session_key(&key, old_endpoint),
+            "old-secret".into(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let new_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut health, _) = listener.accept().unwrap();
+            let request = read_request(&mut health);
+            assert!(request.starts_with("GET /health HTTP/1.1"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            respond(
+                &mut health,
+                r#"{"ok":true,"provider":"localjson","capabilities":{},"provider_contract":{}}"#,
+            );
+
+            let (mut page, _) = listener.accept().unwrap();
+            let request = read_request(&mut page);
+            assert!(request.starts_with("GET /memories/page?"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            respond(
+                &mut page,
+                r#"{"items":[],"next_cursor":null,"pagination_supported":true}"#,
+            );
+
+            let (mut search, _) = listener.accept().unwrap();
+            let request = read_request(&mut search);
+            assert!(request.starts_with("POST /search HTTP/1.1"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            respond(&mut search, "[]");
+        });
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(new_endpoint),
+        };
+
+        let token = configured_token(&config, &key).unwrap();
+        let result = AgentMemoryProvider::new(&config, token)
+            .unwrap()
+            .verify(&key);
+
+        assert_eq!(result, Ok(()));
+        server.join().unwrap();
+        session_credentials()
+            .lock()
+            .unwrap()
+            .remove(&agentmemory_session_key(&key, old_endpoint));
+    }
+
+    #[test]
+    fn agentmemory_verification_rejects_unhealthy_or_unsearchable_service() {
+        for (health, search_status) in [
+            (r#"{"ok":false,"provider":"broken"}"#, None),
+            (
+                r#"{"ok":true,"provider":"broken","capabilities":{},"provider_contract":{}}"#,
+                Some("404 Not Found"),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert!(read_request(&mut stream).starts_with("GET /health"));
+                respond(&mut stream, health);
+                if let Some(status) = search_status {
+                    let (mut page, _) = listener.accept().unwrap();
+                    assert!(read_request(&mut page).starts_with("GET /memories/page?"));
+                    respond(
+                        &mut page,
+                        r#"{"items":[],"next_cursor":null,"pagination_supported":true}"#,
+                    );
+                    let (mut search, _) = listener.accept().unwrap();
+                    assert!(read_request(&mut search).starts_with("POST /search"));
+                    respond_status(&mut search, status, r#"{"error":"unsupported"}"#);
+                }
+            });
+            let config = ProviderConfig {
+                provider: ProviderKind::AgentMemory,
+                endpoint: Some(endpoint),
+            };
+            let provider = AgentMemoryProvider::new(&config, String::new()).unwrap();
+            assert!(provider.verify("project").is_err());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn agentmemory_unsent_connection_failure_does_not_block_restart() {
+        let root = temporary();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let endpoint = format!("http://{addr}");
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint.clone()),
+        };
+        let provider = AgentMemoryProvider::new(&config, String::new()).unwrap();
+        let mut pending = PendingEvents::new();
+        assert_eq!(
+            provider.add(&root, "project", &memory(), &mut pending),
+            Err("AgentMemory is unavailable.".into())
+        );
+        assert!(load_agentmemory_pending(&root, "project", &endpoint)
+            .unwrap()
+            .is_empty());
+        let listener = TcpListener::bind(addr).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut page, _) = listener.accept().unwrap();
+            assert!(read_request(&mut page).starts_with("GET /memories/page?"));
+            respond(
+                &mut page,
+                r#"{"items":[],"next_cursor":null,"pagination_supported":true}"#,
+            );
+            let (mut add, _) = listener.accept().unwrap();
+            assert!(read_request(&mut add).starts_with("POST /add"));
+            respond(
+                &mut add,
+                r#"{"id":"remote-id","memory":"Prefer concise status updates"}"#,
+            );
+            let (mut visible, _) = listener.accept().unwrap();
+            assert!(read_request(&mut visible).starts_with("GET /memories/page?"));
+            respond(
+                &mut visible,
+                r#"{"items":[{"id":"remote-id","metadata":{"sail_memory_id":"local-id","sail_updated_at":42}}],"next_cursor":null,"pagination_supported":true}"#,
+            );
+        });
+        assert_eq!(provider.reconcile(&root, "project", &[memory()]), Ok(()));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agentmemory_unknown_outcome_requires_explicit_scoped_resolution() {
+        let root = temporary();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut add, _) = listener.accept().unwrap();
+            assert!(read_request(&mut add).starts_with("POST /add"));
+            respond_status(&mut add, "503 Unavailable", r#"{"error":"down"}"#);
+            for _ in 0..2 {
+                let (mut page, _) = listener.accept().unwrap();
+                assert!(read_request(&mut page).starts_with("GET /memories/page?"));
+                respond(
+                    &mut page,
+                    r#"{"items":[],"next_cursor":null,"pagination_supported":true}"#,
+                );
+            }
+        });
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint.clone()),
+        };
+        let provider = AgentMemoryProvider::new(&config, String::new()).unwrap();
+        let mut pending = PendingEvents::new();
+        assert!(provider
+            .add(&root, "project", &memory(), &mut pending)
+            .unwrap_err()
+            .contains("unknown outcome"));
+        assert!(
+            resolve_agentmemory_pending_at(&root, "project", &endpoint, &provider, false)
+                .unwrap_err()
+                .contains("Confirm")
+        );
+        assert_eq!(
+            load_agentmemory_pending(&root, "project", &endpoint)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            resolve_agentmemory_pending_at(&root, "project", &endpoint, &provider, true),
+            Ok(())
+        );
+        assert!(load_agentmemory_pending(&root, "project", &endpoint)
+            .unwrap()
+            .is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_agentmemory_reconcile_does_not_activate_candidate() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        let key = "project";
+        write_provider_settings(&settings, key, "http://127.0.0.1:1");
+        let before = fs::read(&settings).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut page, _) = listener.accept().unwrap();
+            assert!(read_request(&mut page).starts_with("GET /memories/page?"));
+            respond(
+                &mut page,
+                r#"{"items":[],"next_cursor":null,"pagination_supported":true}"#,
+            );
+            let (mut add, _) = listener.accept().unwrap();
+            assert!(read_request(&mut add).starts_with("POST /add"));
+            respond_status(&mut add, "503 Unavailable", r#"{"error":"down"}"#);
+        });
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint.clone()),
+        };
+        let provider = AgentMemoryProvider::new(&config, String::new()).unwrap();
+        let result = reconcile_before_activation(&provider, &root, key, &[memory()], || {
+            fs::write(&settings, "activated").map_err(|e| e.to_string())
+        });
+        assert!(result.unwrap_err().contains("unknown outcome"));
+        assert_eq!(fs::read(&settings).unwrap(), before);
+        assert_eq!(
+            load_agentmemory_pending(&root, key, &endpoint)
+                .unwrap()
+                .len(),
+            1
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn hosted_pending_survives_other_provider_switches_without_blocking_them() {
+        let root = temporary();
+        let mut pending = PendingEvents::new();
+        pending.insert(
+            "local-id".into(),
+            super::PendingEvent {
+                event_id: None,
+                updated_at: 42,
+            },
+        );
+        save_pending_events(&root, "project", &pending).unwrap();
+        for kind in [
+            ProviderKind::AgentMemory,
+            ProviderKind::Mem0SelfHosted,
+            ProviderKind::Mem0Hosted,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut page, _) = listener.accept().unwrap();
+                let request = read_request(&mut page);
+                match kind {
+                    ProviderKind::AgentMemory => {
+                        assert!(request.starts_with("GET /memories/page?"));
+                        respond(
+                            &mut page,
+                            r#"{"items":[],"next_cursor":null,"pagination_supported":true}"#,
+                        );
+                    }
+                    ProviderKind::Mem0SelfHosted => {
+                        assert!(request.starts_with("GET /memories?"));
+                        respond(&mut page, "[]");
+                    }
+                    ProviderKind::Mem0Hosted => {
+                        assert!(request.starts_with("POST /v3/memories/"));
+                        respond(&mut page, "[]");
+                    }
+                    ProviderKind::Local => unreachable!(),
+                }
+            });
+            let config = ProviderConfig {
+                provider: kind,
+                endpoint: Some(endpoint),
+            };
+            let remote: Box<dyn MemoryProvider> = if kind == ProviderKind::AgentMemory {
+                Box::new(AgentMemoryProvider::new(&config, String::new()).unwrap())
+            } else {
+                Box::new(Mem0Provider::new(&config, "token".into()).unwrap())
+            };
+            let result = remote.reconcile(&root, "project", &[]);
+            assert_eq!(result.is_ok(), kind != ProviderKind::Mem0Hosted);
+            if kind == ProviderKind::Mem0Hosted {
+                assert!(result.unwrap_err().contains("unknown outcome"));
+            }
+            assert_eq!(load_pending_events(&root, "project").unwrap().len(), 1);
+            server.join().unwrap();
+        }
+        clear_hosted_pending_on_local_switch(&root, "project").unwrap();
+        assert!(load_pending_events(&root, "project").unwrap().is_empty());
+    }
+
+    #[test]
+    fn selecting_local_explicitly_resets_dormant_hosted_pending() {
+        let root = temporary();
+        let mut pending = PendingEvents::new();
+        pending.insert(
+            "local-id".into(),
+            super::PendingEvent {
+                event_id: None,
+                updated_at: 42,
+            },
+        );
+        save_pending_events(&root, "project", &pending).unwrap();
+
+        assert_eq!(load_pending_events(&root, "project").unwrap().len(), 1);
+        clear_hosted_pending_on_local_switch(&root, "project").unwrap();
+        assert!(load_pending_events(&root, "project").unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_mem0_config_write_preserves_active_credential() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        fs::create_dir(&settings).unwrap();
+        let active_key = std::cell::RefCell::new("hosted-A".to_string());
+
+        let result = activate_mem0_after_config(
+            || fs::write(&settings, "candidate-B").map_err(|e| e.to_string()),
+            || {
+                *active_key.borrow_mut() = "candidate-B".into();
+                Ok(())
+            },
+            || Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(*active_key.borrow(), "hosted-A");
+    }
+
+    #[test]
+    fn agentmemory_endpoint_change_keeps_pending_outcomes_separate() {
+        let root = temporary();
+        let old_endpoint = "https://old.example";
+        let mut pending = PendingEvents::new();
+        pending.insert(
+            "local-id".into(),
+            super::PendingEvent {
+                event_id: None,
+                updated_at: 42,
+            },
+        );
+        save_agentmemory_pending(&root, "project", old_endpoint, &pending).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let new_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut page, _) = listener.accept().unwrap();
+            assert!(read_request(&mut page).starts_with("GET /memories/page?"));
+            respond(
+                &mut page,
+                r#"{"items":[{"id":"remote-id","metadata":{"sail_memory_id":"local-id","sail_updated_at":42}}],"next_cursor":null,"pagination_supported":true}"#,
+            );
+        });
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(new_endpoint),
+        };
+        let provider = AgentMemoryProvider::new(&config, String::new()).unwrap();
+
+        let result = provider.reconcile(&root, "project", &[memory()]);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            load_agentmemory_pending(&root, "project", old_endpoint)
+                .unwrap()
+                .len(),
+            1
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agentmemory_resolved_submission_does_not_return_from_backup() {
+        let root = temporary();
+        let endpoint = "https://agentmemory.example";
+        let mut pending = PendingEvents::new();
+        pending.insert(
+            "local-id".into(),
+            super::PendingEvent {
+                event_id: None,
+                updated_at: 42,
+            },
+        );
+        save_agentmemory_pending(&root, "project", endpoint, &pending).unwrap();
+        let path = super::agentmemory_pending_path(&root, "project", endpoint);
+        fs::rename(&path, super::state_backup_path(&path)).unwrap();
+
+        save_agentmemory_pending(&root, "project", endpoint, &PendingEvents::new()).unwrap();
+
+        assert!(load_agentmemory_pending(&root, "project", endpoint)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated AgentMemory HTTP service"]
+    fn agentmemory_real_local_service_round_trip() {
+        let root = temporary();
+        let endpoint = std::env::var("SAIL_AGENTMEMORY_SMOKE_ENDPOINT").unwrap();
+        let token = std::env::var("SAIL_AGENTMEMORY_SMOKE_TOKEN").unwrap();
+        let project = format!("sail-smoke-{}", Uuid::new_v4());
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint),
+        };
+        let provider = AgentMemoryProvider::new(&config, token).unwrap();
+
+        provider.verify(&project).unwrap();
+        provider.reconcile(&root, &project, &[memory()]).unwrap();
+        let results = provider.search(&project, "concise", 10).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].sail_id, "local-id");
+        let mut forgotten = memory();
+        forgotten.forgotten_at = Some(43);
+        provider.reconcile(&root, &project, &[forgotten]).unwrap();
+        assert!(provider.search(&project, "concise", 10).unwrap().is_empty());
     }
 }

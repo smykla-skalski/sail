@@ -136,6 +136,7 @@
   let memoryProviderMessage = $state('');
   let memoryProviderError = $state('');
   let memoryProviderLoading = $state(false);
+  let pendingProviderResolution = $state(false);
 
   async function refreshMemory(directory: string, query = memoryQuery.trim()) {
     const request = ++memoryRequest;
@@ -152,6 +153,7 @@
       memoryProviderApiKey = '';
       memoryProviderMessage = '';
       memoryProviderError = '';
+      pendingProviderResolution = false;
       query = '';
     }
     memoryDirectory = directory;
@@ -207,7 +209,10 @@
   function memoryProviderInput() {
     return {
       provider: memoryProviderKind,
-      endpoint: memoryProviderKind === 'mem0SelfHosted' ? memoryProviderEndpoint.trim() : null,
+      endpoint:
+        memoryProviderKind === 'mem0SelfHosted' || memoryProviderKind === 'agentMemory'
+          ? memoryProviderEndpoint.trim()
+          : null,
       apiKey: memoryProviderKind === 'local' ? null : memoryProviderApiKey.trim(),
     };
   }
@@ -243,12 +248,38 @@
         input: memoryProviderInput(),
       });
       memoryProviderApiKey = '';
+      pendingProviderResolution = false;
       memoryProviderKind = memoryProviderStatus.provider;
       memoryProviderEndpoint = memoryProviderStatus.endpoint ?? '';
       memoryProviderMessage =
         memoryProviderStatus.provider === 'local'
-          ? 'Local search is active. Canonical project memories were preserved.'
-          : 'Mem0 is active and existing memories are synchronized.';
+          ? 'Local search is active. Canonical project memories were preserved; any active provider credential was removed.'
+          : `${memoryProviderStatus.provider === 'agentMemory' ? 'AgentMemory' : 'Mem0'} is active and existing memories are synchronized.`;
+    } catch (cause) {
+      memoryProviderError = `Provider: ${String(cause)}`;
+    } finally {
+      memoryProviderLoading = false;
+    }
+  }
+
+  async function resolvePendingMemoryProvider() {
+    const directory = snapshot?.directory;
+    if (!directory || memoryProviderKind !== 'agentMemory') return;
+    memoryProviderLoading = true;
+    memoryProviderError = '';
+    memoryProviderMessage = '';
+    try {
+      await invoke('resolve_memory_provider_pending', {
+        directory,
+        input: memoryProviderInput(),
+        acknowledgeUnknown: true,
+      });
+      pendingProviderResolution = false;
+      memoryProviderMessage =
+        'Pending write cleared after a complete remote scan. Enable AgentMemory again to retry synchronization.';
+      memoryProviderStatus = await invoke<MemoryProviderStatus>('memory_provider_status', {
+        directory,
+      });
     } catch (cause) {
       memoryProviderError = `Provider: ${String(cause)}`;
     } finally {
@@ -1116,8 +1147,8 @@
       <section class="settings-card">
         <h2>Search provider</h2>
         <p>
-          Local project memory remains canonical. Mem0 adds semantic search; an outage falls back to
-          local search and never blocks memory writes.
+          Local project memory remains canonical. Mem0 or AgentMemory adds external search; an
+          outage falls back to local search and never blocks memory writes.
         </p>
         {#if memoryProviderError}<p class="runtime-diagnostic" role="alert">
             {memoryProviderError}
@@ -1135,8 +1166,35 @@
             class="runtime-diagnostic"
             role="alert"
           >
-            Last Mem0 sync failed: {memoryProviderStatus.syncError} Local search remains active.
+            Last provider sync failed: {memoryProviderStatus.syncError} Local search remains active.
           </p>{/if}
+        {#if memoryProviderKind === 'agentMemory' && (memoryProviderError.includes('unknown outcome') || (memoryProviderStatus?.provider === 'agentMemory' && memoryProviderStatus.syncError?.includes('unknown outcome')))}
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={memoryProviderLoading}
+            onclick={() => (pendingProviderResolution = true)}>Resolve pending write</Button
+          >
+        {/if}
+        {#if pendingProviderResolution && memoryProviderKind === 'agentMemory'}
+          <p class="runtime-diagnostic" role="alert">
+            AgentMemory has no idempotency key. Check its records for this project before clearing
+            the pending write. A delayed earlier write can appear later; retrying then can create a
+            duplicate. Sail will scan this endpoint again before clearing.
+          </p>
+          <Button
+            size="sm"
+            disabled={memoryProviderLoading}
+            onclick={() => void resolvePendingMemoryProvider()}
+            >I checked; clear pending write</Button
+          >
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={memoryProviderLoading}
+            onclick={() => (pendingProviderResolution = false)}>Cancel</Button
+          >
+        {/if}
         <label for="memory-provider">Provider</label>
         <select
           id="memory-provider"
@@ -1145,25 +1203,32 @@
           onchange={() => {
             memoryProviderMessage = '';
             memoryProviderError = '';
+            pendingProviderResolution = false;
           }}
         >
           <option value="local">Local search</option>
           <option value="mem0Hosted">Mem0 hosted</option>
           <option value="mem0SelfHosted">Mem0 self-hosted</option>
+          <option value="agentMemory">AgentMemory (local-first)</option>
         </select>
-        {#if memoryProviderKind === 'mem0SelfHosted'}
+        {#if memoryProviderKind === 'mem0SelfHosted' || memoryProviderKind === 'agentMemory'}
           <label for="memory-provider-endpoint">Endpoint</label>
           <input
             id="memory-provider-endpoint"
             type="url"
-            placeholder="https://mem0.example.com"
+            placeholder={memoryProviderKind === 'agentMemory'
+              ? 'http://127.0.0.1:8000'
+              : 'https://mem0.example.com'}
             bind:value={memoryProviderEndpoint}
+            oninput={() => (pendingProviderResolution = false)}
             disabled={memoryProviderLoading}
           />
           <p class="runtime-binary">HTTPS is required except for localhost development servers.</p>
         {/if}
         {#if memoryProviderKind !== 'local'}
-          <label for="memory-provider-api-key">API key</label>
+          <label for="memory-provider-api-key"
+            >{memoryProviderKind === 'agentMemory' ? 'Access token (optional)' : 'API key'}</label
+          >
           <input
             id="memory-provider-api-key"
             type="password"
@@ -1172,15 +1237,17 @@
             disabled={memoryProviderLoading}
           />
           <p class="runtime-binary">
-            The key is stored in the OS credential store, never in Sail settings, exports, logs, or
-            agent configuration.
+            {memoryProviderKind === 'agentMemory'
+              ? 'Leave blank to reuse a saved token for this endpoint, or connect anonymously if none is saved. Tokens stay in the OS credential store, never in Sail settings, exports, logs, or agent configuration.'
+              : 'The key is stored in the OS credential store, never in Sail settings, exports, logs, or agent configuration.'}
           </p>
           <Button
             size="sm"
             variant="secondary"
             disabled={!memoryStatus?.enabled ||
-              !memoryProviderApiKey.trim() ||
-              (memoryProviderKind === 'mem0SelfHosted' && !memoryProviderEndpoint.trim()) ||
+              (memoryProviderKind !== 'agentMemory' && !memoryProviderApiKey.trim()) ||
+              ((memoryProviderKind === 'mem0SelfHosted' || memoryProviderKind === 'agentMemory') &&
+                !memoryProviderEndpoint.trim()) ||
               memoryProviderLoading}
             onclick={() => void verifyMemoryProvider()}>Verify connection</Button
           >
@@ -1191,13 +1258,21 @@
             memoryProviderLoading ||
             (memoryProviderKind !== 'local' &&
               (!memoryStatus?.enabled ||
-                !memoryProviderApiKey.trim() ||
-                (memoryProviderKind === 'mem0SelfHosted' && !memoryProviderEndpoint.trim())))}
+                (memoryProviderKind !== 'agentMemory' && !memoryProviderApiKey.trim()) ||
+                ((memoryProviderKind === 'mem0SelfHosted' ||
+                  memoryProviderKind === 'agentMemory') &&
+                  !memoryProviderEndpoint.trim())))}
           onclick={() => void saveMemoryProvider()}
-          >{memoryProviderKind === 'local' ? 'Use local search' : 'Enable Mem0'}</Button
+          >{memoryProviderKind === 'local'
+            ? 'Use local search'
+            : memoryProviderKind === 'agentMemory'
+              ? 'Enable AgentMemory'
+              : 'Enable Mem0'}</Button
         >
         {#if !memoryStatus?.enabled && memoryProviderKind !== 'local'}
-          <p class="memory-empty" role="status">Enable shared memory before connecting Mem0.</p>
+          <p class="memory-empty" role="status">
+            Enable shared memory before connecting a search provider.
+          </p>
         {/if}
       </section>
 

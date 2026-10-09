@@ -2440,6 +2440,7 @@ pub fn run() {
             memory_provider::verify_memory_provider,
             memory_provider::set_memory_provider,
             memory_provider::sync_memory_provider,
+            memory_provider::resolve_memory_provider_pending,
             repository_path_available,
             opencode_config::opencode_plan_review_plugin,
             validate_repository,
