@@ -153,6 +153,7 @@ fn json_owned(entry: &Value) -> bool {
 fn json_entry(agent: Agent, binary: &str, paths: (&str, &str)) -> CstInputValue {
     let env = CstInputValue::Object(vec![
         (OWNER.into(), "1".into()),
+        ("SAIL_MEMORY_AGENT".into(), agent.id().into()),
         ("SAIL_MEMORY_ROOT".into(), paths.0.into()),
         ("SAIL_SETTINGS_PATH".into(), paths.1.into()),
     ]);
@@ -250,6 +251,7 @@ fn render(
             entry["required"] = value(false);
             let mut env = Table::new();
             env[OWNER] = value("1");
+            env["SAIL_MEMORY_AGENT"] = value(agent.id());
             env["SAIL_MEMORY_ROOT"] = value(paths.0);
             env["SAIL_SETTINGS_PATH"] = value(paths.1);
             entry["env"] = Item::Table(env);
@@ -340,16 +342,10 @@ fn preview_entry(agent: Agent, text: &str) -> Result<String, String> {
 }
 
 fn detected(agent: Agent) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|directory| {
-        let path = directory.join(agent.executable());
-        path.is_file()
-    })
+    crate::acp::find_executable(agent.executable()).is_some()
 }
 
-fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+fn write_atomic(path: &Path, text: &str, expected: &str) -> Result<(), String> {
     let parent = path.parent().ok_or("Cannot locate configuration folder.")?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
@@ -372,6 +368,12 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
         if let Ok(metadata) = fs::metadata(path) {
             fs::set_permissions(&temporary, metadata.permissions())
                 .map_err(|error| error.to_string())?;
+        }
+        if read(path)? != expected {
+            return Err(format!(
+                "{} changed while Sail prepared its memory entry; retry the operation.",
+                path.display()
+            ));
         }
         #[cfg(windows)]
         {
@@ -411,6 +413,7 @@ fn lock(path: &Path) -> Result<File, String> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|error| format!("Cannot open {}: {error}", lock_path.display()))?;
     file.lock()
@@ -419,14 +422,36 @@ fn lock(path: &Path) -> Result<File, String> {
 }
 
 #[tauri::command]
-pub fn memory_agent_status() -> Vec<MemoryAgentStatus> {
+pub fn memory_agent_status(app: AppHandle) -> Vec<MemoryAgentStatus> {
+    let runtime = runtime_paths(&app);
+    let executable = binary();
     [Agent::Claude, Agent::Codex, Agent::OpenCode]
         .into_iter()
         .map(|agent| {
-            let status = path_for(agent)
-                .and_then(|path| read(&path).and_then(|text| installed(agent, &text)));
+            let status = (|| -> Result<(bool, bool), String> {
+                let path = path_for(agent)?;
+                let text = read(&path)?;
+                if !installed(agent, &text)? {
+                    return Ok((false, false));
+                }
+                let runtime = runtime.as_ref().map_err(Clone::clone)?;
+                let executable = executable.as_ref().map_err(Clone::clone)?;
+                let expected = render(agent, &text, executable, (&runtime.0, &runtime.1), true)?;
+                Ok((
+                    true,
+                    preview_entry(agent, &text)? == preview_entry(agent, &expected)?,
+                ))
+            })();
             let (installed, healthy, detail) = match status {
-                Ok(installed) => (installed, true, None),
+                Ok((installed, healthy)) => (
+                    installed,
+                    healthy,
+                    if installed && !healthy {
+                        Some("Sail memory entry is out of date; reinstall it.".into())
+                    } else {
+                        None
+                    },
+                ),
                 Err(error) => (false, false, Some(error)),
             };
             MemoryAgentStatus {
@@ -486,7 +511,7 @@ fn change(app: &AppHandle, agent: Agent, install: bool) -> Result<(), String> {
     let paths = runtime_paths(app)?;
     let after = render(agent, &before, &binary()?, (&paths.0, &paths.1), install)?;
     if before != after {
-        write_atomic(&path, &after)?;
+        write_atomic(&path, &after, &before)?;
     }
     Ok(())
 }
@@ -520,16 +545,24 @@ pub fn install_memory_agents(app: AppHandle, agents: Vec<String>) -> Result<(), 
         let after = render(*agent, &before, &executable, (&runtime.0, &runtime.1), true)?;
         changes.push((path.clone(), path.exists(), before, after));
     }
-    let mut applied = 0;
-    for (path, _, before, after) in &changes {
+    for (applied, (path, _, before, after)) in changes.iter().enumerate() {
         if before != after {
-            if let Err(error) = write_atomic(path, after) {
+            if let Err(error) = write_atomic(path, after, before) {
                 let mut rollback_errors = Vec::new();
-                for (old_path, existed, old_text, _) in changes[..applied].iter().rev() {
+                for (old_path, existed, old_text, applied_text) in changes[..applied].iter().rev() {
                     let result = if *existed {
-                        write_atomic(old_path, old_text)
+                        write_atomic(old_path, old_text, applied_text)
                     } else {
-                        fs::remove_file(old_path).map_err(|error| error.to_string())
+                        match read(old_path) {
+                            Ok(current) if current == *applied_text => {
+                                fs::remove_file(old_path).map_err(|error| error.to_string())
+                            }
+                            Ok(_) => Err(format!(
+                                "{} changed after Sail installed its memory entry.",
+                                old_path.display()
+                            )),
+                            Err(error) => Err(error),
+                        }
                     };
                     if let Err(rollback_error) = result {
                         rollback_errors.push(rollback_error);
@@ -544,7 +577,6 @@ pub fn install_memory_agents(app: AppHandle, agents: Vec<String>) -> Result<(), 
                 ));
             }
         }
-        applied += 1;
     }
     drop(guards);
     Ok(())
@@ -644,5 +676,19 @@ mod tests {
         assert!(after.contains("// keep this explanation"));
         assert!(after.contains("\"model\": \"fast\""));
         assert!(installed(Agent::OpenCode, &after).unwrap());
+    }
+
+    #[test]
+    fn refuses_to_replace_a_concurrent_config_change() {
+        let directory =
+            std::env::temp_dir().join(format!("sail-memory-install-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("agent.json");
+        fs::write(&path, "updated by agent").unwrap();
+        let error = write_atomic(&path, "sail update", "stale snapshot").unwrap_err();
+        assert!(error.contains("changed while Sail prepared"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "updated by agent");
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 }

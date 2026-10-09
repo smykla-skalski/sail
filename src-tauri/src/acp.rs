@@ -2042,7 +2042,7 @@ impl Drop for AgentManager {
     }
 }
 
-fn find_executable(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_executable(name: &str) -> Option<PathBuf> {
     let names = if cfg!(windows) {
         vec![
             format!("{name}.exe"),
