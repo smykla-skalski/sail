@@ -104,7 +104,7 @@ public static class ContextEvalJob
 }
 
 [Console]::Error.WriteLine('context eval supervisor: starting')
-Add-Type -Path $AssemblyPath
+[void][System.Reflection.Assembly]::LoadFrom($AssemblyPath)
 [Console]::Error.WriteLine('context eval supervisor: job support loaded')
 
 $exitCode = 1
