@@ -153,6 +153,7 @@ fn json_owned(entry: &Value) -> bool {
 fn json_entry(agent: Agent, binary: &str, paths: (&str, &str)) -> CstInputValue {
     let env = CstInputValue::Object(vec![
         (OWNER.into(), "1".into()),
+        ("SAIL_MEMORY_AGENT".into(), agent.id().into()),
         ("SAIL_MEMORY_ROOT".into(), paths.0.into()),
         ("SAIL_SETTINGS_PATH".into(), paths.1.into()),
     ]);
@@ -250,6 +251,7 @@ fn render(
             entry["required"] = value(false);
             let mut env = Table::new();
             env[OWNER] = value("1");
+            env["SAIL_MEMORY_AGENT"] = value(agent.id());
             env["SAIL_MEMORY_ROOT"] = value(paths.0);
             env["SAIL_SETTINGS_PATH"] = value(paths.1);
             entry["env"] = Item::Table(env);
@@ -340,13 +342,7 @@ fn preview_entry(agent: Agent, text: &str) -> Result<String, String> {
 }
 
 fn detected(agent: Agent) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|directory| {
-        let path = directory.join(agent.executable());
-        path.is_file()
-    })
+    crate::acp::find_executable(agent.executable()).is_some()
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
@@ -411,6 +407,7 @@ fn lock(path: &Path) -> Result<File, String> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|error| format!("Cannot open {}: {error}", lock_path.display()))?;
     file.lock()
@@ -419,14 +416,36 @@ fn lock(path: &Path) -> Result<File, String> {
 }
 
 #[tauri::command]
-pub fn memory_agent_status() -> Vec<MemoryAgentStatus> {
+pub fn memory_agent_status(app: AppHandle) -> Vec<MemoryAgentStatus> {
+    let runtime = runtime_paths(&app);
+    let executable = binary();
     [Agent::Claude, Agent::Codex, Agent::OpenCode]
         .into_iter()
         .map(|agent| {
-            let status = path_for(agent)
-                .and_then(|path| read(&path).and_then(|text| installed(agent, &text)));
+            let status = (|| -> Result<(bool, bool), String> {
+                let path = path_for(agent)?;
+                let text = read(&path)?;
+                if !installed(agent, &text)? {
+                    return Ok((false, false));
+                }
+                let runtime = runtime.as_ref().map_err(Clone::clone)?;
+                let executable = executable.as_ref().map_err(Clone::clone)?;
+                let expected = render(agent, &text, executable, (&runtime.0, &runtime.1), true)?;
+                Ok((
+                    true,
+                    preview_entry(agent, &text)? == preview_entry(agent, &expected)?,
+                ))
+            })();
             let (installed, healthy, detail) = match status {
-                Ok(installed) => (installed, true, None),
+                Ok((installed, healthy)) => (
+                    installed,
+                    healthy,
+                    if installed && !healthy {
+                        Some("Sail memory entry is out of date; reinstall it.".into())
+                    } else {
+                        None
+                    },
+                ),
                 Err(error) => (false, false, Some(error)),
             };
             MemoryAgentStatus {
@@ -520,8 +539,7 @@ pub fn install_memory_agents(app: AppHandle, agents: Vec<String>) -> Result<(), 
         let after = render(*agent, &before, &executable, (&runtime.0, &runtime.1), true)?;
         changes.push((path.clone(), path.exists(), before, after));
     }
-    let mut applied = 0;
-    for (path, _, before, after) in &changes {
+    for (applied, (path, _, before, after)) in changes.iter().enumerate() {
         if before != after {
             if let Err(error) = write_atomic(path, after) {
                 let mut rollback_errors = Vec::new();
@@ -544,7 +562,6 @@ pub fn install_memory_agents(app: AppHandle, agents: Vec<String>) -> Result<(), 
                 ));
             }
         }
-        applied += 1;
     }
     drop(guards);
     Ok(())

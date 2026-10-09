@@ -5,6 +5,12 @@
   "windows": ["settings"],
   "permissions": [
     "allow-diagnostic-event",
+    "allow-memory-agent-status",
+    "allow-preview-memory-agent-install",
+    "allow-preview-memory-agent-uninstall",
+    "allow-install-memory-agent",
+    "allow-install-memory-agents",
+    "allow-uninstall-memory-agent",
     "allow-inspect-agent-hooks",
     "allow-inspect-hook-integration",
     "allow-enable-hook-integration",
