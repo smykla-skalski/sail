@@ -418,6 +418,7 @@
     forgetRecentTranscript,
     invalidateLiveTranscript,
     loadAgentThreads,
+    mergeAgentThreadRename,
     mergeAgentThreadUpdate,
     normalizeAgentThreadKeywords,
     loadInterruptedAgentTurns,
@@ -11112,7 +11113,8 @@
   }
 
   function renameAgentThread(thread: AgentThread, title: string) {
-    const renamed = { ...thread, title, renamed: true };
+    const previous = agentThreads.find((item) => threadKey(item) === threadKey(thread));
+    const renamed = mergeAgentThreadRename(previous, thread, title);
     saveAgentThread(renamed);
     sidebarOpenCodeThreads = sidebarOpenCodeThreads.map((item) =>
       threadKey(item) === threadKey(thread)

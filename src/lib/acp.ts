@@ -62,6 +62,19 @@ export function mergeAgentThreadUpdate(
   return merged;
 }
 
+export function mergeAgentThreadRename(
+  previous: AgentThread | undefined,
+  incoming: AgentThread,
+  title: string,
+): AgentThread {
+  return mergeAgentThreadUpdate(previous, {
+    ...incoming,
+    title,
+    renamed: true,
+    keywords: undefined,
+  });
+}
+
 export function mergeAgentThreadListing(previous: AgentThread, incoming: AgentThread): AgentThread {
   const newest = previous.updated < incoming.updated ? incoming : previous;
   const renamed = previous.renamed ? previous : incoming.renamed ? incoming : null;

@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   loadAgentThreads,
   mergeAgentThreadListing,
+  mergeAgentThreadRename,
   mergeAgentThreadUpdate,
   normalizeAgentThreadKeywords,
   type AgentThread,
@@ -34,6 +35,17 @@ void test('thread activity updates preserve keywords unless explicitly replaced'
     updated: 2,
   });
   assert.deepEqual(mergeAgentThreadUpdate(previous, { ...thread, keywords: [] }).keywords, []);
+});
+
+void test('thread rename preserves keywords published after the dialog opened', () => {
+  const stale = { ...thread, keywords: ['old'] };
+  const current = mergeAgentThreadUpdate(stale, { ...stale, keywords: ['new'] });
+
+  assert.deepEqual(mergeAgentThreadRename(current, stale, 'Renamed'), {
+    ...current,
+    title: 'Renamed',
+    renamed: true,
+  });
 });
 
 void test('newer provider listings retain Sail keyword metadata', () => {
