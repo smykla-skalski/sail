@@ -3,17 +3,21 @@ use reqwest::blocking::{Client, Response};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONFIG_PREFIX: &str = "sai-memory-provider:";
 const CREDENTIAL_SERVICE: &str = "dev.sail.shared-memory.mem0";
 const HOSTED_ENDPOINT: &str = "https://api.mem0.ai";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const HOSTED_PAGE_SIZE: usize = 100;
+const MAX_RECONCILE_RECORDS: usize = 100_000;
+const SELF_HOSTED_SAFE_LIMIT: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,21 +85,9 @@ struct Mem0Provider {
     api_key: String,
 }
 
-fn sync_locks() -> &'static Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn session_credentials() -> &'static Mutex<HashMap<String, String>> {
     static CREDENTIALS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     CREDENTIALS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn sync_lock(project_key: &str) -> Result<std::sync::Arc<Mutex<()>>, String> {
-    let mut locks = sync_locks()
-        .lock()
-        .map_err(|_| "Memory provider synchronization is unavailable.".to_string())?;
-    Ok(locks.entry(project_key.to_string()).or_default().clone())
 }
 
 fn project_key(directory: &str) -> Result<String, String> {
@@ -114,6 +106,50 @@ fn load_config(app: &tauri::AppHandle, project_key: &str) -> Result<ProviderConf
         });
     };
     serde_json::from_str(&raw).map_err(|_| "Memory provider settings are invalid.".to_string())
+}
+
+fn load_config_at(settings: &Path, project_key: &str) -> Result<ProviderConfig, String> {
+    let contents = match fs::read_to_string(settings) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::from("{}"),
+        Err(_) => return Err("Cannot read memory provider settings.".into()),
+    };
+    let settings: HashMap<String, String> = serde_json::from_str(&contents)
+        .map_err(|_| "Memory provider settings are invalid.".to_string())?;
+    let Some(raw) = settings.get(&config_key(project_key)) else {
+        return Ok(ProviderConfig {
+            provider: ProviderKind::Local,
+            endpoint: None,
+        });
+    };
+    serde_json::from_str(raw).map_err(|_| "Memory provider settings are invalid.".to_string())
+}
+
+fn provider_lock(root: &Path, project_key: &str) -> Result<File, String> {
+    fs::create_dir_all(root)
+        .map_err(|_| "Cannot create memory provider synchronization lock.".to_string())?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(format!("{project_key}.provider.lock")))
+        .map_err(|_| "Cannot open memory provider synchronization lock.".to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err("Memory provider synchronization is locked.".into());
+            }
+            Err(std::fs::TryLockError::Error(_)) => {
+                return Err("Cannot lock memory provider synchronization.".into());
+            }
+        }
+    }
 }
 
 fn save_config(
@@ -315,12 +351,17 @@ impl Mem0Provider {
         parse_response(response)
     }
 
-    fn list(&self, project_key: &str, limit: usize) -> Result<Vec<RemoteMemory>, String> {
+    fn list_page(
+        &self,
+        project_key: &str,
+        page: usize,
+        limit: usize,
+    ) -> Result<(Vec<RemoteMemory>, usize), String> {
         let value = match self.kind {
             ProviderKind::Mem0Hosted => {
                 self.send(self.request(Method::POST, "/v3/memories/")?.json(&json!({
                     "filters": { "user_id": project_key },
-                    "page": 1,
+                    "page": page,
                     "page_size": limit,
                 })))?
             }
@@ -332,9 +373,34 @@ impl Mem0Provider {
                 let request = self.client.request(Method::GET, url);
                 self.send(self.authenticate(request)?)?
             }
-            ProviderKind::Local => return Ok(Vec::new()),
+            ProviderKind::Local => return Ok((Vec::new(), 0)),
         };
-        Ok(remote_memories(&value))
+        let count = result_array(&value).len();
+        Ok((remote_memories(&value), count))
+    }
+
+    fn list_all(&self, project_key: &str) -> Result<Vec<RemoteMemory>, String> {
+        if self.kind == ProviderKind::Mem0SelfHosted {
+            let (memories, count) = self.list_page(project_key, 1, SELF_HOSTED_SAFE_LIMIT)?;
+            if count >= SELF_HOSTED_SAFE_LIMIT {
+                return Err(
+                    "Self-hosted Mem0 returned more memories than can be reconciled safely.".into(),
+                );
+            }
+            return Ok(memories);
+        }
+        let mut all = Vec::new();
+        for page in 1..=(MAX_RECONCILE_RECORDS / HOSTED_PAGE_SIZE) + 1 {
+            let (mut memories, count) = self.list_page(project_key, page, HOSTED_PAGE_SIZE)?;
+            all.append(&mut memories);
+            if count < HOSTED_PAGE_SIZE {
+                return Ok(all);
+            }
+            if all.len() >= MAX_RECONCILE_RECORDS {
+                return Err("Hosted Mem0 has too many memories to reconcile safely.".into());
+            }
+        }
+        Err("Hosted Mem0 pagination did not terminate safely.".into())
     }
 
     fn add(&self, project_key: &str, memory: &MemoryRecord) -> Result<(), String> {
@@ -366,7 +432,7 @@ impl Mem0Provider {
 
 impl MemoryProvider for Mem0Provider {
     fn verify(&self, project_key: &str) -> Result<(), String> {
-        self.list(project_key, 1).map(|_| ())
+        self.list_page(project_key, 1, 1).map(|_| ())
     }
 
     fn search(
@@ -397,7 +463,7 @@ impl MemoryProvider for Mem0Provider {
     }
 
     fn reconcile(&self, project_key: &str, memories: &[MemoryRecord]) -> Result<(), String> {
-        let remote = self.list(project_key, 1_000)?;
+        let remote = self.list_all(project_key)?;
         let mut by_sail_id: HashMap<&str, Vec<&RemoteMemory>> = HashMap::new();
         for memory in &remote {
             by_sail_id.entry(&memory.sail_id).or_default().push(memory);
@@ -499,24 +565,46 @@ fn provider(config: &ProviderConfig, api_key: String) -> Result<Box<dyn MemoryPr
     }
 }
 
-fn sync(app: &tauri::AppHandle, directory: &str) -> Result<(), String> {
-    let key = project_key(directory)?;
-    let config = load_config(app, &key)?;
+fn sync_at(root: &Path, settings: &Path, key: &str) -> Result<(), String> {
+    let _lock = provider_lock(root, key)?;
+    let config = load_config_at(settings, key)?;
     if config.provider == ProviderKind::Local {
         return Ok(());
     }
-    let lock = sync_lock(&key)?;
-    let _guard = lock
-        .lock()
-        .map_err(|_| "Memory provider synchronization is unavailable.".to_string())?;
-    let memories = crate::memory::list(app, directory, true)?;
-    provider(&config, load_api_key(&key)?)?.reconcile(&key, &memories)
+    let memories = crate::memory::list_at(root, key, true)?;
+    provider(&config, load_api_key(key)?)?.reconcile(key, &memories)
+}
+
+fn sync(app: &tauri::AppHandle, directory: &str) -> Result<(), String> {
+    let (root, settings) = crate::memory::standalone_paths(app)?;
+    sync_at(&root, &settings, &project_key(directory)?)
+}
+
+fn sync_with_retry(root: &Path, settings: &Path, key: &str) {
+    for attempt in 0..3 {
+        if sync_at(root, settings, key).is_ok() {
+            return;
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(100 * (attempt + 1)));
+        }
+    }
 }
 
 pub fn sync_later(app: tauri::AppHandle, directory: String) {
+    let Ok((root, settings)) = crate::memory::standalone_paths(&app) else {
+        return;
+    };
+    let Ok(key) = project_key(&directory) else {
+        return;
+    };
     std::thread::spawn(move || {
-        let _ = sync(&app, &directory);
+        sync_with_retry(&root, &settings, &key);
     });
+}
+
+pub(crate) fn sync_standalone_later(root: PathBuf, settings: PathBuf, key: String) {
+    std::thread::spawn(move || sync_with_retry(&root, &settings, &key));
 }
 
 pub fn search(
@@ -525,9 +613,24 @@ pub fn search(
     query: &str,
     limit: Option<usize>,
 ) -> Result<Vec<MemorySearchResult>, String> {
-    let local = || crate::memory::search_local(app, directory, query, limit);
+    let (root, settings) = crate::memory::standalone_paths(app)?;
     let key = project_key(directory)?;
-    let config = match load_config(app, &key) {
+    search_standalone(&root, &settings, &key, query, limit)
+}
+
+pub(crate) fn search_standalone(
+    root: &Path,
+    settings: &Path,
+    key: &str,
+    query: &str,
+    limit: Option<usize>,
+) -> Result<Vec<MemorySearchResult>, String> {
+    let local = || crate::memory::search_at(root, key, query, limit);
+    let _lock = match provider_lock(root, key) {
+        Ok(lock) => lock,
+        Err(_) => return local(),
+    };
+    let config = match load_config_at(settings, key) {
         Ok(config) => config,
         Err(_) => return local(),
     };
@@ -535,16 +638,24 @@ pub fn search(
         return local();
     }
     let maximum = limit.unwrap_or(10).clamp(1, 100);
-    let memories = crate::memory::list(app, directory, false)?;
+    let memories = crate::memory::list_at(root, key, true)?;
     let canonical: HashMap<_, _> = memories
-        .into_iter()
+        .iter()
+        .filter(|memory| memory.forgotten_at.is_none())
+        .cloned()
         .map(|memory| (memory.id.clone(), memory))
         .collect();
-    let remote = load_api_key(&key)
+    let remote = load_api_key(key)
         .and_then(|api_key| provider(&config, api_key))
-        .and_then(|provider| provider.search(&key, query, maximum))
+        .and_then(|provider| {
+            provider.reconcile(key, &memories)?;
+            provider.search(key, query, maximum)
+        })
         .map(|remote| map_remote_results(remote, &canonical, maximum));
-    remote_or_local(remote, local)
+    match remote {
+        Ok(remote) => Ok(merge_results(remote, local()?, maximum)),
+        Err(_) => local(),
+    }
 }
 
 fn map_remote_results(
@@ -567,11 +678,22 @@ fn map_remote_results(
         .collect()
 }
 
-fn remote_or_local<T>(
-    remote: Result<T, String>,
-    local: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    remote.or_else(|_| local())
+fn merge_results(
+    mut remote: Vec<MemorySearchResult>,
+    local: Vec<MemorySearchResult>,
+    maximum: usize,
+) -> Vec<MemorySearchResult> {
+    let mut ids: HashSet<String> = remote
+        .iter()
+        .map(|result| result.memory.id.clone())
+        .collect();
+    for result in local {
+        if ids.insert(result.memory.id.clone()) {
+            remote.push(result);
+        }
+    }
+    remote.truncate(maximum);
+    remote
 }
 
 #[tauri::command]
@@ -625,6 +747,8 @@ pub fn set_memory_provider(
 ) -> Result<ProviderStatus, String> {
     let key = project_key(&directory)?;
     let config = normalize_config(&input)?;
+    let (root, _) = crate::memory::standalone_paths(&app)?;
+    let _lock = provider_lock(&root, &key)?;
     if config.provider == ProviderKind::Local {
         save_config(&app, &key, None)?;
         delete_api_key(&key);
@@ -659,21 +783,27 @@ pub fn set_memory_provider(
 
 #[tauri::command]
 pub fn sync_memory_provider(app: tauri::AppHandle, directory: String) -> Result<(), String> {
+    crate::memory::ensure_enabled(&app, &directory)?;
     sync(&app, &directory)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_config, remote_memories, remote_or_local, Mem0Provider, MemoryProvider,
-        ProviderInput, ProviderKind,
+        config_key, merge_results, normalize_config, provider_lock, remote_memories,
+        search_standalone, session_credentials, sync_at, Mem0Provider, MemoryProvider,
+        ProviderConfig, ProviderInput, ProviderKind, HOSTED_PAGE_SIZE, SELF_HOSTED_SAFE_LIMIT,
     };
-    use crate::memory::{MemoryKind, MemoryProvenance, MemoryRecord};
+    use crate::memory::{
+        remember_at, MemoryInput, MemoryKind, MemoryProvenance, MemoryRecord, MemorySearchResult,
+    };
     use serde_json::json;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn memory() -> MemoryRecord {
         MemoryRecord {
@@ -687,6 +817,38 @@ mod tests {
             rating: None,
             forgotten_at: None,
         }
+    }
+
+    fn temporary() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("sail-provider-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_provider_settings(path: &std::path::Path, key: &str, endpoint: &str) {
+        let config = ProviderConfig {
+            provider: ProviderKind::Mem0SelfHosted,
+            endpoint: Some(endpoint.into()),
+        };
+        fs::write(
+            path,
+            json!({ config_key(key): serde_json::to_string(&config).unwrap() }).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn remember_local(root: &std::path::Path, key: &str) -> MemoryRecord {
+        remember_at(
+            root,
+            key,
+            MemoryInput {
+                content: "Prefer concise status updates".into(),
+                kind: Some(MemoryKind::Preference),
+                tags: Some(vec!["communication".into()]),
+                provenance: None,
+            },
+        )
+        .unwrap()
     }
 
     fn read_request(stream: &mut std::net::TcpStream) -> String {
@@ -775,9 +937,29 @@ mod tests {
     }
 
     #[test]
-    fn provider_failure_uses_local_result() {
-        let result = remote_or_local::<Vec<u8>>(Err("outage".into()), || Ok(vec![7])).unwrap();
-        assert_eq!(result, vec![7]);
+    fn remote_results_keep_distinct_local_matches() {
+        let first = memory();
+        let mut second = memory();
+        second.id = "second".into();
+        let merged = merge_results(
+            vec![MemorySearchResult {
+                memory: first.clone(),
+                score: 900,
+            }],
+            vec![
+                MemorySearchResult {
+                    memory: first,
+                    score: 25,
+                },
+                MemorySearchResult {
+                    memory: second,
+                    score: 20,
+                },
+            ],
+            10,
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].memory.id, "second");
     }
 
     #[test]
@@ -846,5 +1028,123 @@ mod tests {
         provider.reconcile("project", &[memory()]).unwrap();
         server.join().unwrap();
         assert_eq!(adds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hosted_reconciliation_pages_before_deciding_to_add() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for page in 1..=2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                assert!(request.starts_with("POST /v3/memories/ HTTP/1.1"));
+                assert!(request.contains(&format!("\"page\":{page}")));
+                let results = if page == 1 {
+                    (0..HOSTED_PAGE_SIZE)
+                        .map(|index| json!({ "id": format!("unmanaged-{index}") }))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![json!({
+                        "id": "remote-id",
+                        "metadata": {
+                            "sail_memory_id": "local-id",
+                            "sail_updated_at": 42
+                        }
+                    })]
+                };
+                respond(&mut stream, &json!({ "results": results }).to_string());
+            }
+        });
+        let provider = Mem0Provider {
+            client: reqwest::blocking::Client::new(),
+            kind: ProviderKind::Mem0Hosted,
+            endpoint: reqwest::Url::parse(&endpoint).unwrap(),
+            api_key: "secret".into(),
+        };
+        provider.reconcile("project", &[memory()]).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn self_hosted_full_page_fails_before_mutating_remote() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("GET /memories?"));
+            assert!(request.contains(&format!("limit={SELF_HOSTED_SAFE_LIMIT}")));
+            let results = (0..SELF_HOSTED_SAFE_LIMIT)
+                .map(|index| json!({ "id": format!("unmanaged-{index}") }))
+                .collect::<Vec<_>>();
+            respond(&mut stream, &json!({ "results": results }).to_string());
+        });
+        let provider = Mem0Provider {
+            client: reqwest::blocking::Client::new(),
+            kind: ProviderKind::Mem0SelfHosted,
+            endpoint: reqwest::Url::parse(&endpoint).unwrap(),
+            api_key: "secret".into(),
+        };
+        assert!(provider.reconcile("project", &[memory()]).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn standalone_search_reconciles_then_keeps_local_match_when_remote_is_empty() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        let key = Uuid::new_v4().to_string();
+        let local = remember_local(&root, &key);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        write_provider_settings(&settings, &key, &endpoint);
+        session_credentials()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), "secret".into());
+        let server = std::thread::spawn(move || {
+            for request_number in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                match request_number {
+                    0 => {
+                        assert!(request.starts_with("GET /memories?"));
+                        respond(&mut stream, r#"{"results":[]}"#);
+                    }
+                    1 => {
+                        assert!(request.starts_with("POST /memories HTTP/1.1"));
+                        respond(&mut stream, r#"{"results":[]}"#);
+                    }
+                    _ => {
+                        assert!(request.starts_with("POST /search HTTP/1.1"));
+                        respond(&mut stream, r#"{"results":[]}"#);
+                    }
+                }
+            }
+        });
+        let results = search_standalone(&root, &settings, &key, "concise", Some(10)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory.id, local.id);
+        server.join().unwrap();
+        session_credentials().lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn sync_loads_provider_config_only_after_serialization_lock() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        let key = Uuid::new_v4().to_string();
+        remember_local(&root, &key);
+        write_provider_settings(&settings, &key, "http://127.0.0.1:1");
+        let lock = provider_lock(&root, &key).unwrap();
+        let thread_root = root.clone();
+        let thread_settings = settings.clone();
+        let thread_key = key.clone();
+        let sync = std::thread::spawn(move || sync_at(&thread_root, &thread_settings, &thread_key));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(&settings, "{}").unwrap();
+        drop(lock);
+        assert_eq!(sync.join().unwrap(), Ok(()));
     }
 }

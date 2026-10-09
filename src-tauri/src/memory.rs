@@ -302,7 +302,11 @@ fn validate(mut input: MemoryInput) -> Result<MemoryInput, String> {
     Ok(input)
 }
 
-fn list_at(root: &Path, key: &str, forgotten: bool) -> Result<Vec<MemoryRecord>, String> {
+pub(crate) fn list_at(
+    root: &Path,
+    key: &str,
+    forgotten: bool,
+) -> Result<Vec<MemoryRecord>, String> {
     let paths = paths(root, key);
     if !paths.data.exists() {
         return Ok(Vec::new());
@@ -326,7 +330,11 @@ pub fn list(
     list_at(&root, &key, include_forgotten)
 }
 
-fn remember_at(root: &Path, key: &str, input: MemoryInput) -> Result<MemoryRecord, String> {
+pub(crate) fn remember_at(
+    root: &Path,
+    key: &str,
+    input: MemoryInput,
+) -> Result<MemoryRecord, String> {
     let input = validate(input)?;
     let paths = paths(root, key);
     let _lock = lock_store(&paths)?;
@@ -399,7 +407,7 @@ fn rate_at(root: &Path, key: &str, id: &str, rating: i8) -> Result<MemoryRecord,
     })
 }
 
-fn search_at(
+pub(crate) fn search_at(
     root: &Path,
     key: &str,
     query: &str,
@@ -474,16 +482,6 @@ pub fn search(
     limit: Option<usize>,
 ) -> Result<Vec<MemorySearchResult>, String> {
     crate::memory_provider::search(app, directory, query, limit)
-}
-
-pub(crate) fn search_local(
-    app: &tauri::AppHandle,
-    directory: &str,
-    query: &str,
-    limit: Option<usize>,
-) -> Result<Vec<MemorySearchResult>, String> {
-    let (root, key) = context(app, directory)?;
-    search_at(&root, &key, query, limit)
 }
 
 pub fn inspect(app: &tauri::AppHandle, directory: &str, id: &str) -> Result<MemoryRecord, String> {
@@ -668,8 +666,13 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
                 agent: std::env::var("SAIL_MEMORY_AGENT").ok(),
                 session_id: session.map(str::to_string),
             });
-            serde_json::to_value(remember_at(&root, &key, input)?)
-                .map_err(|error| error.to_string())
+            let memory = remember_at(&root, &key, input)?;
+            crate::memory_provider::sync_standalone_later(
+                root.clone(),
+                settings.clone(),
+                key.clone(),
+            );
+            serde_json::to_value(memory).map_err(|error| error.to_string())
         }
         "memory_search" => {
             let query = arguments
@@ -680,8 +683,10 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
                 .get("limit")
                 .and_then(Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok());
-            serde_json::to_value(search_at(&root, &key, query, limit)?)
-                .map_err(|error| error.to_string())
+            serde_json::to_value(crate::memory_provider::search_standalone(
+                &root, &settings, &key, query, limit,
+            )?)
+            .map_err(|error| error.to_string())
         }
         "memory_inspect" => serde_json::to_value(inspect_at(
             &root,
@@ -692,15 +697,22 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
                 .ok_or("id is required")?,
         )?)
         .map_err(|error| error.to_string()),
-        "memory_forget" => serde_json::to_value(forget_at(
-            &root,
-            &key,
-            arguments
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or("id is required")?,
-        )?)
-        .map_err(|error| error.to_string()),
+        "memory_forget" => {
+            let memory = forget_at(
+                &root,
+                &key,
+                arguments
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("id is required")?,
+            )?;
+            crate::memory_provider::sync_standalone_later(
+                root.clone(),
+                settings.clone(),
+                key.clone(),
+            );
+            serde_json::to_value(memory).map_err(|error| error.to_string())
+        }
         "memory_rate" => {
             let id = arguments
                 .get("id")
@@ -711,8 +723,9 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
                 .and_then(Value::as_i64)
                 .and_then(|value| i8::try_from(value).ok())
                 .ok_or("rating is required")?;
-            serde_json::to_value(rate_at(&root, &key, id, rating)?)
-                .map_err(|error| error.to_string())
+            let memory = rate_at(&root, &key, id, rating)?;
+            crate::memory_provider::sync_standalone_later(root, settings, key);
+            serde_json::to_value(memory).map_err(|error| error.to_string())
         }
         _ => Err("Unknown memory action.".into()),
     }
