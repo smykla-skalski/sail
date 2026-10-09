@@ -214,6 +214,7 @@ mod github;
 pub mod hook_activity;
 mod hook_inspector;
 pub mod memory;
+mod memory_capture;
 mod opencode_config;
 mod post_turn_checks;
 mod settings;

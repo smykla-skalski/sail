@@ -1416,6 +1416,7 @@ fn append_connection_activity(
 struct ActivePrompt {
     turn_id: String,
     text: String,
+    memory_capture: crate::memory_capture::TurnCapture,
     last_agent_message: String,
     agent_message_open: bool,
     agent_message_overflow: bool,
@@ -1438,6 +1439,7 @@ impl ActivePrompt {
         match update.get("sessionUpdate").and_then(Value::as_str) {
             Some("agent_message_chunk") => {
                 if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
+                    self.memory_capture.push(text, !self.agent_message_open);
                     if !self.agent_message_open {
                         self.last_agent_message.clear();
                         self.agent_message_overflow = false;
@@ -1491,6 +1493,7 @@ mod interruption_report_tests {
         ActivePrompt {
             turn_id: "turn".into(),
             text: "task".into(),
+            memory_capture: crate::memory_capture::TurnCapture::default(),
             last_agent_message: String::new(),
             agent_message_open: false,
             agent_message_overflow: false,
@@ -3420,6 +3423,7 @@ pub async fn acp_prompt(
             ActivePrompt {
                 turn_id: turn_id.clone(),
                 text: text.clone(),
+                memory_capture: crate::memory_capture::TurnCapture::default(),
                 last_agent_message: String::new(),
                 agent_message_open: false,
                 agent_message_overflow: false,
@@ -3623,6 +3627,34 @@ pub async fn acp_prompt(
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
         let notify = !explicitly_cancelled && !interrupted;
+        let stop_reason = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("stopReason"))
+            .and_then(Value::as_str);
+        let directory = runtime
+            .session_directories
+            .lock()
+            .ok()
+            .and_then(|directories| directories.get(&session_id).cloned());
+        let candidates = runtime
+            .prompt_state
+            .lock()
+            .ok()
+            .and_then(|prompts| {
+                let directory = directory.as_ref()?;
+                prompts.active.get(&session_id).map(|prompt| {
+                    prompt.memory_capture.completed_candidates(
+                        status,
+                        stop_reason,
+                        &directory.to_string_lossy(),
+                        &agent,
+                        &session_id,
+                    )
+                })
+            })
+            .unwrap_or_default();
+        crate::memory_capture::store_completed(&app, candidates);
         let latest = if let Ok(mut prompts) = runtime.prompt_state.lock() {
             if prompts
                 .active
@@ -4242,6 +4274,7 @@ mod native_subagent_fence_tests {
             ActivePrompt {
                 turn_id: "turn".into(),
                 text: "task".into(),
+                memory_capture: crate::memory_capture::TurnCapture::default(),
                 last_agent_message: String::new(),
                 agent_message_open: false,
                 agent_message_overflow: false,
