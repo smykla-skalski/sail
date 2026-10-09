@@ -18,8 +18,7 @@ export type SideChat = {
   id: string;
   parentId: string;
   parentThreadId?: string;
-  source:
-    { kind: 'opencode'; sessionID: string } | { kind: 'acp'; agent: AgentId; context: string };
+  source: { kind: 'acp'; agent: AgentId; context: string };
 };
 
 export type BrowserTab = { id: string; history: string[]; index: number };

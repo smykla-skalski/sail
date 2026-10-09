@@ -342,17 +342,6 @@ describe('visual layout audit', () => {
         });
         expect(settingsReachable).toBe(true);
         await capture('mobile-opencode-settings');
-        await browser.execute(() =>
-          document.querySelector('.repository-diagnostics')?.scrollIntoView({ block: 'start' }),
-        );
-        await capture('mobile-repository-diagnostics');
-        const restartBottom = await browser.execute(() => {
-          const button = document.querySelector<HTMLElement>('.repository-diagnostics button')!;
-          button.scrollIntoView({ block: 'end' });
-          return { bottom: button.getBoundingClientRect().bottom, height: innerHeight };
-        });
-        expect(restartBottom.bottom).toBeLessThanOrEqual(restartBottom.height + 1);
-        await capture('mobile-repository-diagnostics-bottom');
         await returnToWorkspace();
       }
     }, Promise.resolve());
@@ -368,17 +357,6 @@ describe('visual layout audit', () => {
     await capture('desktop-general-settings');
     await $('.settings-navigation button:nth-child(2)').click();
     await capture('desktop-opencode-settings');
-    await browser.execute(() =>
-      document.querySelector('.repository-diagnostics')?.scrollIntoView({ block: 'start' }),
-    );
-    await capture('desktop-repository-diagnostics');
-    const desktopRestart = await browser.execute(() => {
-      const button = document.querySelector<HTMLElement>('.repository-diagnostics button')!;
-      button.scrollIntoView({ block: 'end' });
-      return { bottom: button.getBoundingClientRect().bottom, viewport: innerHeight };
-    });
-    expect(desktopRestart.bottom).toBeLessThanOrEqual(desktopRestart.viewport + 1);
-    await capture('desktop-repository-diagnostics-bottom');
     await $('.settings-navigation button:nth-child(3)').click();
     await capture('desktop-agent-settings');
     await returnToWorkspace();

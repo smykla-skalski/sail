@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import type { JsonValue, OpenCodeClient } from '@opencode/client';
 
 const PlanStepSchema = z.object({
   id: z.string(),
@@ -75,11 +74,6 @@ export const PlanQuestionsSchema = z.object({
   questions: z.array(PlanQuestionSchema),
 });
 
-const PlanSnapshotSchema = z.object({
-  plan: PlanSchema.nullable(),
-  questions: PlanQuestionsSchema.nullable(),
-});
-
 export const HistoryEntrySchema = z.object({
   id: z.number().int().positive(),
   at: z.number(),
@@ -106,15 +100,11 @@ export const HistoryEntrySchema = z.object({
     .optional(),
 });
 
-const HistoryOutputSchema = z.object({ events: z.array(HistoryEntrySchema) });
-
-const OutcomeSchema = z.object({ ok: z.boolean(), error: z.string().optional() });
-
 export type Plan = z.infer<typeof PlanSchema>;
 export type PlanStep = z.infer<typeof PlanStepSchema>;
 export type PlanQuestion = z.infer<typeof PlanQuestionSchema>;
 export type PlanQuestions = z.infer<typeof PlanQuestionsSchema>;
-export type PlanSnapshot = z.infer<typeof PlanSnapshotSchema>;
+export type PlanSnapshot = { plan: Plan | null; questions: PlanQuestions | null };
 export type HistoryEntry = z.infer<typeof HistoryEntrySchema>;
 
 function relativeFile(file: string, directory: string): string {
@@ -234,53 +224,6 @@ export function snapshotAnswers(answers: Record<string, string[]>): Record<strin
   return Object.fromEntries(Object.entries(answers).map(([id, values]) => [id, [...values]]));
 }
 
-async function call(
-  client: OpenCodeClient,
-  directory: string,
-  method: string,
-  input: JsonValue,
-): Promise<unknown> {
-  const response = await client.rpc.call({
-    rpcID: 'planreview',
-    method,
-    location: { directory },
-    input,
-  });
-  return response.output;
-}
-
-export async function getPlan(
-  client: OpenCodeClient,
-  directory: string,
-  sessionID: string,
-): Promise<PlanSnapshot> {
-  return PlanSnapshotSchema.parse(await call(client, directory, 'get', { sessionID }));
-}
-
-export async function getHistory(
-  client: OpenCodeClient,
-  directory: string,
-  sessionID: string,
-): Promise<HistoryEntry[]> {
-  const response = HistoryOutputSchema.parse(
-    await call(client, directory, 'history', { sessionID }),
-  );
-  return response.events.toSorted((a, b) => a.id - b.id);
-}
-
-export async function answerQuestions(
-  client: OpenCodeClient,
-  directory: string,
-  sessionID: string,
-  id: string,
-  answers: Record<string, string[]>,
-): Promise<void> {
-  const result = OutcomeSchema.parse(
-    await call(client, directory, 'answer', { sessionID, id, answers }),
-  );
-  if (!result.ok) throw new Error(result.error ?? 'The answers were not accepted.');
-}
-
 /** How a plan panel reaches whichever agent owns the session. */
 export interface PlanBackend {
   latest(sessionID: string): Promise<PlanSnapshot>;
@@ -291,47 +234,4 @@ export interface PlanBackend {
     note?: string,
   ): Promise<void>;
   answer(sessionID: string, id: string, answers: Record<string, string[]>): Promise<void>;
-}
-
-export function openCodePlanBackend(client: OpenCodeClient, directory: string): PlanBackend {
-  return {
-    latest: (sessionID) => getPlan(client, directory, sessionID),
-    review: (plan, action, decisions, note) =>
-      reviewPlan(client, directory, plan, action, decisions, note),
-    answer: (sessionID, id, answers) => answerQuestions(client, directory, sessionID, id, answers),
-  };
-}
-
-export function reviewInput(
-  plan: Plan,
-  action: 'revise' | 'execute',
-  decisions: PlanDecision[],
-  note?: string,
-): JsonValue {
-  return {
-    sessionID: plan.sessionID,
-    version: plan.version,
-    action,
-    decisions: decisions.map((decision) => ({
-      stepID: decision.stepID,
-      ...(decision.verdict ? { verdict: decision.verdict } : {}),
-      ...(decision.comment === undefined ? {} : { comment: decision.comment }),
-      ...(decision.edit === undefined ? {} : { edit: decision.edit }),
-    })),
-    ...(note === undefined ? {} : { note }),
-  };
-}
-
-export async function reviewPlan(
-  client: OpenCodeClient,
-  directory: string,
-  plan: Plan,
-  action: 'revise' | 'execute',
-  decisions: PlanDecision[],
-  note?: string,
-): Promise<void> {
-  const result = OutcomeSchema.parse(
-    await call(client, directory, 'review', reviewInput(plan, action, decisions, note)),
-  );
-  if (!result.ok) throw new Error(result.error ?? 'The review was not accepted.');
 }

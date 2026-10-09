@@ -42,19 +42,6 @@ export function acpPermissionChoices(
     }));
 }
 
-export function openCodePermissionChoices(
-  policy: PermissionPolicyDecision | undefined,
-): PermissionChoice[] {
-  const choices: PermissionChoice[] = [];
-  if (policy?.recommendation !== 'deny') {
-    choices.push({ id: 'once', label: 'Allow once', tone: 'primary', always: false });
-    if (mayAlwaysAllow(policy))
-      choices.push({ id: 'always', label: 'Allow always', tone: 'secondary', always: true });
-  }
-  choices.push({ id: 'reject', label: 'Reject', tone: 'secondary', always: false });
-  return choices;
-}
-
 function field(value: unknown, key: string): unknown {
   return value && typeof value === 'object' ? Reflect.get(value, key) : undefined;
 }
@@ -72,19 +59,6 @@ export function acpPermissionDetails(toolCall: unknown): PermissionDetails {
     files: [...new Set(permissionResourceCandidates(toolCall))].filter(
       (file) => file && file !== command,
     ),
-  };
-}
-
-export function openCodePermissionDetails(request: {
-  action: string;
-  resources: string[];
-  source?: { type: string; messageID: string; id: string };
-}): PermissionDetails {
-  const shell = request.action === 'bash' || request.action === 'shell';
-  return {
-    toolCallId: request.source ? `${request.source.messageID}:${request.source.id}` : null,
-    command: shell ? (request.resources[0] ?? null) : null,
-    files: shell ? request.resources.slice(1) : request.resources,
   };
 }
 

@@ -1,5 +1,4 @@
-import type { FileDiffInfo } from '@opencode/client';
-import { parsePatch, type DiffLine } from './diff.ts';
+import { parsePatch, type DiffLine, type FileDiffInfo } from './diff.ts';
 
 export type DiffComment = {
   id: string;

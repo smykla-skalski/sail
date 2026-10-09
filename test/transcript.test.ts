@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { SessionMessageInfo } from '@opencode/client';
 import type { AgentDisplayEntry } from '../src/lib/acp.ts';
 import type { ActivityHistoryEvent } from '../src/lib/activity-history.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
@@ -11,10 +10,8 @@ import {
   hookItems,
   nativeItems,
   pendingCoordinationItems,
-  openCodeItems,
   queuedItems,
   shellItems,
-  streamingItems,
   subagentItems,
   type TranscriptItem,
   jumpLabel,
@@ -25,8 +22,6 @@ import {
   acpPermissionChoices,
   acpPermissionDetails,
   mayAlwaysAllow,
-  openCodePermissionChoices,
-  openCodePermissionDetails,
 } from '../src/lib/permission-card.ts';
 import type { PermissionPolicyDecision } from '../src/lib/capability-profiles.ts';
 
@@ -206,111 +201,6 @@ await test('pending shell runs and queued messages trail the transcript', () => 
   );
 });
 
-type Assistant = Extract<SessionMessageInfo, { type: 'assistant' }>;
-const assistant = (
-  content: Assistant['content'],
-  extra: Partial<Assistant> = {},
-): SessionMessageInfo => ({
-  id: 'm2',
-  type: 'assistant',
-  agent: 'build',
-  model: { id: 'm', providerID: 'p' },
-  time: { created: 200 },
-  content,
-  ...extra,
-});
-const tool = (id: string, failed: boolean): Assistant['content'][number] => ({
-  type: 'tool',
-  id,
-  name: 'bash',
-  time: { created: 200 },
-  state: failed
-    ? {
-        status: 'error',
-        error: { type: 'tool', message: 'bad' },
-        input: { command: 'ls' },
-        content: [{ type: 'text', text: 'out' }],
-      }
-    : {
-        status: 'completed',
-        input: { command: 'ls' },
-        content: [{ type: 'text', text: 'out' }],
-      },
-});
-
-await test('OpenCode messages group consecutive tools and keep text, thinking and tools in order', () => {
-  const items = openCodeItems(
-    [
-      {
-        id: 'm1',
-        type: 'user',
-        time: { created: 100 },
-        text: 'go',
-        files: [
-          {
-            name: 'a.txt',
-            data: '',
-            mime: 'text/plain',
-            source: { type: 'uri', uri: 'file:///a' },
-          },
-        ],
-      },
-      { id: 'idle', type: 'idle', outcome: 'succeeded', time: { created: 120 } },
-      assistant([
-        { type: 'reasoning', text: 'plan' },
-        { type: 'text', text: 'first' },
-        tool('t1', false),
-        tool('t2', true),
-        { type: 'text', text: 'second' },
-      ]),
-    ],
-    [],
-    { liveText: { m2: { 1: 'live first' } } },
-  );
-  assert.deepEqual(
-    items.map((item) => [
-      item.kind,
-      item.kind === 'message' ? item.role : '',
-      item.kind === 'message' ? item.text : '',
-    ]),
-    [
-      ['message', 'user', 'go'],
-      ['message', 'thought', 'plan'],
-      ['message', 'assistant', 'live first'],
-      ['tools', '', ''],
-      ['message', 'assistant', 'second'],
-    ],
-  );
-  const group = items[3];
-  assert.equal(group.kind === 'tools' && group.tools.length, 2);
-  assert.deepEqual(items[0].kind === 'message' && items[0].files, ['a.txt']);
-  assert.equal(group.kind === 'tools' && group.tools[0].id, 'm2:t1');
-  assert.deepEqual(
-    items.flatMap((item) => (item.kind === 'message' ? [item.sourceId] : [])).slice(1),
-    ['m2', 'm2', 'm2'],
-  );
-});
-
-await test('OpenCode retry and error render as a status message and streaming text is labelled', () => {
-  const items = openCodeItems(
-    [
-      assistant([], {
-        retry: { attempt: 2, at: 1, error: { type: 'x', message: 'slow' } },
-        error: { type: 'x', message: 'boom' },
-      }),
-    ],
-    [],
-  );
-  assert.equal(items.length, 1);
-  assert.deepEqual(items[0].kind === 'message' && [items[0].retry, items[0].error], [
-    'Retry 2: slow',
-    'boom',
-  ]);
-  const live = streamingItems([['x', { 1: 'b', 0: 'a' }]], 'build');
-  assert.equal(live[0].kind === 'message' && live[0].text, 'a\nb');
-  assert.equal(live[0].kind === 'message' && live[0].author, 'build · streaming');
-});
-
 await test('the latest action row follows the last conversation item or a running tool', () => {
   const items: TranscriptItem[] = nativeItems(entries.slice(0, 3), [], host);
   const group = items[2];
@@ -346,17 +236,12 @@ await test('Always is offered only for low and medium risk actions', () => {
       acpPermissionChoices(options, policy(risk)).map((c) => c.id),
       ['o', 'a', 'r'],
     );
-    assert.ok(openCodePermissionChoices(policy(risk)).some((c) => c.always));
   }
   for (const risk of ['unknown', 'high'] as const) {
     assert.equal(mayAlwaysAllow(policy(risk)), false);
     assert.deepEqual(
       acpPermissionChoices(options, policy(risk)).map((c) => c.id),
       ['o', 'r'],
-    );
-    assert.deepEqual(
-      openCodePermissionChoices(policy(risk)).map((c) => c.id),
-      ['once', 'reject'],
     );
   }
   assert.deepEqual(
@@ -366,10 +251,6 @@ await test('Always is offered only for low and medium risk actions', () => {
   assert.deepEqual(
     acpPermissionChoices(options, policy('low', 'deny')).map((c) => c.id),
     ['r'],
-  );
-  assert.deepEqual(
-    openCodePermissionChoices(policy('medium', 'deny')).map((c) => c.id),
-    ['reject'],
   );
 });
 
@@ -382,19 +263,6 @@ await test('permission details show the exact command, files and tool call', () 
     }),
     { toolCallId: 'tc', command: 'git status', files: ['/p/a.ts'] },
   );
-  assert.deepEqual(
-    openCodePermissionDetails({
-      action: 'bash',
-      resources: ['rm -rf x', 'x'],
-      source: { type: 'tool', messageID: 'm', id: 'p' },
-    }),
-    { toolCallId: 'm:p', command: 'rm -rf x', files: ['x'] },
-  );
-  assert.deepEqual(openCodePermissionDetails({ action: 'edit', resources: ['/p/a.ts'] }), {
-    toolCallId: null,
-    command: null,
-    files: ['/p/a.ts'],
-  });
 });
 
 const growing = (text: string): TranscriptItem => ({

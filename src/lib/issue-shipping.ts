@@ -107,14 +107,6 @@ export type BoundedPromptDispatch<T> =
   | { status: 'failed'; cause: unknown }
   | { status: 'timed_out' };
 
-export function promptDispatchAdmissionVisible(
-  turnId: string | null,
-  inboxIds: ReadonlySet<string>,
-  messageIds: ReadonlySet<string>,
-): boolean {
-  return turnId !== null && (inboxIds.has(turnId) || messageIds.has(turnId));
-}
-
 export function boundedPromptDispatch<T>(
   prompt: Promise<T>,
   timeout: Promise<void>,
@@ -197,51 +189,6 @@ export async function beginAuthorizedCoordinationPrompt<T>(
     await restoreReceipt();
     throw cause;
   }
-}
-
-export function compensatedOpenCodePromptReceiptChanges(
-  admission: 'queued' | 'working' | null,
-):
-  | { state: 'queued' | 'working'; dispatchPending: false }
-  | { state: 'starting'; turnId: null; dispatchPending: false } {
-  return admission
-    ? { state: admission, dispatchPending: false }
-    : { state: 'starting', turnId: null, dispatchPending: false };
-}
-
-export async function recoverOpenCodePromptAdmission(
-  admission: 'queued' | 'working',
-  authorization: DirectShipAuthorization,
-  steer: () => Promise<void>,
-  resume: () => Promise<void>,
-  compensateSteer: () => Promise<void>,
-  persist: (state: 'queued' | 'working') => Promise<void>,
-): Promise<void> {
-  await dispatchAuthorizedDirectShipPrompt(authorization, async () => {
-    let steered = false;
-    try {
-      if (admission === 'queued') {
-        await steer();
-        steered = true;
-        assertDirectShipPromptAuthorization(authorization);
-        await resume();
-      }
-      assertDirectShipPromptAuthorization(authorization);
-      await persist(admission);
-    } catch (cause) {
-      if (steered) await compensateSteer();
-      throw cause;
-    }
-  });
-}
-
-export function openCodePromptRecoveryFailure(
-  targetId: string | null,
-  prompt: string | null,
-): string | null {
-  if (!targetId) return 'Recovered OpenCode worker has no target session.';
-  if (prompt === null) return 'Recovered OpenCode worker has no persisted prompt.';
-  return null;
 }
 
 export async function completeAuthorizedPromptRecovery(
@@ -724,44 +671,6 @@ export function acpWorkerTerminationConfirmed(
   return interrupted.some(
     (turn) => turn.agent === agent && turn.sessionId === sessionId && turn.turnId === turnId,
   );
-}
-
-export type OpenCodeWorkerSnapshot = {
-  running: boolean;
-  queued: string[];
-};
-
-export async function confirmOpenCodeWorkerStopped(
-  interrupt: () => Promise<{ interrupted: boolean }>,
-  inspect: () => Promise<OpenCodeWorkerSnapshot>,
-  cancelQueued: (id: string) => Promise<void>,
-  pause: () => Promise<void>,
-  maximumAttempts = 50,
-  dispatchPending: () => boolean = () => false,
-): Promise<boolean> {
-  await interrupt();
-  const confirm = async (
-    attempt: number,
-    idleObservations: number,
-    interruptAfterDispatch = false,
-  ): Promise<boolean> => {
-    if (dispatchPending()) {
-      if (attempt >= maximumAttempts) return false;
-      await pause();
-      return confirm(attempt + 1, 0, true);
-    }
-    if (interruptAfterDispatch) await interrupt();
-    const snapshot = await inspect();
-    if (snapshot.queued.length) await Promise.all(snapshot.queued.map((id) => cancelQueued(id)));
-    if (snapshot.running) await interrupt();
-    const idle = !snapshot.running && !snapshot.queued.length;
-    const observations = idle ? idleObservations + 1 : 0;
-    if (observations >= 2) return true;
-    if (attempt >= maximumAttempts) return false;
-    await pause();
-    return confirm(attempt + 1, observations);
-  };
-  return confirm(1, 0);
 }
 
 export function claimRefreshRequiresFence(

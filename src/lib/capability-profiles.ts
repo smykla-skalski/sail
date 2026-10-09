@@ -19,25 +19,6 @@ export function capabilityProfileFromMetadata(
     : fallback;
 }
 
-export function capabilityProfileForRuntime(
-  sessions: readonly { id: string; metadata?: { sailCapabilityProfile?: unknown } }[],
-  activeSessionIDs: Iterable<string>,
-  fallback: CapabilityProfile,
-): CapabilityProfile | null {
-  const active = new Set(activeSessionIDs);
-  const profiles = new Set(
-    sessions
-      .filter((session) => active.has(session.id))
-      .map((session) => capabilityProfileFromMetadata(session.metadata, fallback)),
-  );
-  if (profiles.size > 1) return null;
-  return profiles.values().next().value ?? fallback;
-}
-
-export function exploreSessionMetadata(metadata: Record<string, unknown> | undefined) {
-  return { ...metadata, saiHarness: true as const, sailCapabilityProfile: 'explore' as const };
-}
-
 export type PermissionPolicyDecision = {
   profile: CapabilityProfile;
   risk: CapabilityRisk;
@@ -120,22 +101,6 @@ const requestResourceKeys = new Set([
   'uri',
   'uris',
 ]);
-
-export function openCodePermissionToolCall(request: {
-  action: string;
-  message?: string;
-  resources: string[];
-  save?: string[];
-  metadata?: Record<string, unknown>;
-}): Record<string, unknown> {
-  return {
-    action: request.action,
-    message: request.message,
-    resources: request.resources,
-    save: request.save,
-    metadata: request.metadata,
-  };
-}
 
 function normalizedRequestKey(key: string): string {
   return key.replaceAll(/[-_]/g, '').toLowerCase();
@@ -473,101 +438,6 @@ export function permissionOutcome(
     ?.kind.startsWith('reject')
     ? 'rejected'
     : 'completed';
-}
-
-export function conflictingCapabilityProfiles(
-  active: Iterable<CapabilityProfile>,
-  requested: CapabilityProfile,
-): CapabilityProfile[] {
-  return [...new Set(active)].filter((profile) => profile !== requested).toSorted();
-}
-
-export function settledOpenCodePermissions<T extends { sessionID: string }>(
-  pending: readonly T[],
-  selected: T,
-  decision: 'once' | 'always' | 'reject',
-): T[] {
-  return decision === 'reject'
-    ? pending.filter((request) => request.sessionID === selected.sessionID)
-    : [selected];
-}
-
-export async function withCapabilityProfileReservation<T>(
-  reserve: () => Promise<() => void>,
-  action: () => Promise<T>,
-): Promise<T> {
-  const release = await reserve();
-  try {
-    return await action();
-  } finally {
-    release();
-  }
-}
-
-export async function holdCapabilityProfileReservation<T>(
-  release: () => void,
-  completion: Promise<T>,
-): Promise<T> {
-  try {
-    return await completion;
-  } finally {
-    release();
-  }
-}
-
-export class CapabilityProfileReservationCoordinator {
-  #configurationGeneration = 0;
-  readonly #active = new Map<
-    string,
-    {
-      profile: CapabilityProfile;
-      count: number;
-      configured: Promise<void>;
-      configurationGeneration: number;
-    }
-  >();
-
-  beginConfigurationGeneration(): void {
-    this.#configurationGeneration++;
-  }
-
-  async reserve(
-    path: string,
-    profile: CapabilityProfile,
-    configure: () => Promise<void>,
-  ): Promise<() => void> {
-    const reserved = this.#active.get(path);
-    if (reserved && reserved.profile !== profile)
-      throw new Error(
-        `Wait for the pending ${reserved.profile} OpenCode launch before switching to the ${profile} capability profile.`,
-      );
-    const configured =
-      reserved?.configurationGeneration === this.#configurationGeneration
-        ? reserved.configured
-        : Promise.resolve().then(configure);
-    this.#active.set(path, {
-      profile,
-      count: (reserved?.count ?? 0) + 1,
-      configured,
-      configurationGeneration: this.#configurationGeneration,
-    });
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      const current = this.#active.get(path);
-      if (!current || current.profile !== profile) return;
-      if (current.count === 1) this.#active.delete(path);
-      else this.#active.set(path, { ...current, count: current.count - 1 });
-    };
-    try {
-      await configured;
-      return release;
-    } catch (cause) {
-      release();
-      throw cause;
-    }
-  }
 }
 
 function oneShotOption(

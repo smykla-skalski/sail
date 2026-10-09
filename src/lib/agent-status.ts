@@ -23,7 +23,6 @@ export type AgentStatusInput = {
   attention: AttentionMap;
   agentNames: Record<string, string>;
   usage: Record<string, AgentUsage>;
-  openCodeUsage: Record<string, number>;
   rates: Record<string, RateWindow[]>;
 };
 
@@ -47,10 +46,7 @@ export function buildAgentStatusItems(input: AgentStatusInput): AgentStatusItem[
       const status = input.statuses[key];
       const unread = input.attention[key]?.unread ?? false;
       if (!status || (!['working', 'waiting'].includes(status) && !unread)) return [];
-      const context =
-        thread.agent === 'opencode'
-          ? input.openCodeUsage[`${thread.directory}:${thread.sessionId}`]
-          : input.usage[key]?.context;
+      const context = input.usage[key]?.context;
       return [
         {
           key,
@@ -122,26 +118,6 @@ export function agentHeaderStatus(input: AgentHeaderInput): string {
   )
     return 'connecting';
   return input.busy ? 'working' : 'ready';
-}
-
-export type OpenCodeHeaderInput = {
-  runtime: string;
-  waiting: boolean;
-  loading: boolean;
-  running: boolean;
-  sending: boolean;
-  inputReady: boolean;
-};
-
-/** Status shown in an OpenCode pane header; a turn works only once its session runs. */
-export function openCodeHeaderStatus(input: OpenCodeHeaderInput): string {
-  if (input.runtime === 'starting') return 'connecting';
-  if (input.runtime !== 'connected') return 'offline';
-  if (input.waiting) return 'waiting';
-  if (input.loading) return 'connecting';
-  if (input.running) return 'working';
-  if (input.sending) return 'connecting';
-  return input.inputReady ? 'ready' : 'offline';
 }
 
 /** Status bar attention count. A thread that reports waiting counts at once, before the Inbox

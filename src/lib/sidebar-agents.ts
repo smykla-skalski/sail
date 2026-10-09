@@ -26,22 +26,6 @@ export type SidebarThreadRow = {
   historicalExpanded: boolean;
 };
 
-export type SidebarSessionSource = {
-  session: {
-    list: (input: { directory: string; limit: number; order: 'desc'; cursor?: string }) => Promise<{
-      data: {
-        id: string;
-        parentID?: string;
-        title?: string;
-        location: { directory: string };
-        time: { updated: number };
-        outcome?: 'succeeded' | 'failed' | 'interrupted';
-      }[];
-      cursor: { next?: string | null };
-    }>;
-  };
-};
-
 function sidebarThreadIdentity(thread: AgentThread): string {
   return `${thread.directory}\0${receiptSourceId(thread.agent, thread.sessionId)}`;
 }
@@ -51,30 +35,6 @@ function recentThreadFirst(left: AgentThread, right: AgentThread): number {
 }
 
 const maxListedPages = 50;
-
-/**
- * Ids of OpenCode subagent sessions in one directory. OpenCode's ACP session/list returns them as
- * peers of their parents, so the sidebar drops them until the listing carries a parent marker.
- */
-export async function listOpenCodeChildSessionIds(
-  source: SidebarSessionSource,
-  path: string,
-  cursor?: string,
-  seen = new Set<string>(),
-  children = new Set<string>(),
-): Promise<Set<string>> {
-  const page = await source.session.list({
-    directory: path,
-    limit: 100,
-    order: 'desc',
-    ...(cursor ? { cursor } : {}),
-  });
-  for (const session of page.data) if (session.parentID) children.add(session.id);
-  const next = page.cursor.next ?? undefined;
-  if (!next || next === cursor || seen.has(next) || seen.size >= maxListedPages) return children;
-  seen.add(next);
-  return listOpenCodeChildSessionIds(source, path, next, seen, children);
-}
 
 const trimmedPath = (path: string) => path.replace(/\/+$/, '');
 

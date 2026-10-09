@@ -3,19 +3,14 @@ import test from 'node:test';
 import {
   failedCheckOutcome,
   inboxPermissionDecisionTitle,
-  inboxPermissionProfile,
-  inboxRejectedPermissionPolicy,
   inboxLocations,
   inboxOpenRoute,
   persistedInboxKinds,
   repositoryName,
   inboxTurnMessageIndex,
   loadInboxOutcomes,
-  loadInboxSeen,
   markInboxOutcomeRead,
-  maxInboxSeen,
   maxInboxOutcomes,
-  openCodeRequestTime,
   recordInboxOutcome,
   sortInbox,
   type InboxItem,
@@ -35,9 +30,6 @@ const item = (key: string, receivedAt: number): InboxItem => ({
   text: key,
 });
 
-const id = (prefix: string, timestamp: number) =>
-  `${prefix}_${((BigInt(timestamp) * 4096n) % (1n << 48n)).toString(16).padStart(12, '0')}${'a'.repeat(14)}`;
-
 void test('inbox covers repositories and worktrees with their parent project', () => {
   assert.deepEqual(
     inboxLocations({
@@ -52,45 +44,6 @@ void test('inbox covers repositories and worktrees with their parent project', (
       { directory: 'C:\\projects\\gamma', project: 'gamma', worktree: null },
     ],
   );
-});
-
-void test('inbox orders requests by arrival then stable key', () => {
-  assert.deepEqual(
-    sortInbox([item('later', 20), item('b', 10), item('a', 10)]).map((entry) => entry.key),
-    ['a', 'b', 'later'],
-  );
-  assert.deepEqual(loadInboxSeen('{"a":10,"b":"bad"}'), { a: 10 });
-  assert.deepEqual(loadInboxSeen('{broken'), {});
-  assert.deepEqual(
-    loadInboxSeen(JSON.stringify({ [`opencode:permission:${id('per', 123)}`]: 123, custom: 456 })),
-    { custom: 456 },
-  );
-  assert.equal(
-    Object.keys(
-      loadInboxSeen(
-        JSON.stringify(
-          Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`custom:${i}`, i])),
-        ),
-      ),
-    ).length,
-    maxInboxSeen,
-  );
-});
-
-void test('OpenCode request IDs preserve creation order across projects and timestamp wrap', () => {
-  const cycle = 2 ** 36;
-  const beforeWrap = cycle - 100;
-  const afterWrap = cycle + 100;
-  assert.equal(openCodeRequestTime(id('per', beforeWrap), afterWrap + 50), beforeWrap);
-  assert.equal(openCodeRequestTime(id('frm', afterWrap), afterWrap + 50), afterWrap);
-  assert.deepEqual(
-    sortInbox([
-      item('new project', openCodeRequestTime(id('frm', afterWrap), afterWrap + 50)!),
-      item('old project', openCodeRequestTime(id('per', beforeWrap), afterWrap + 50)!),
-    ]).map((entry) => entry.key),
-    ['old project', 'new project'],
-  );
-  assert.equal(openCodeRequestTime('custom-id', afterWrap + 50), null);
 });
 
 void test('recent outcomes deduplicate provider events and preserve read state', () => {
@@ -142,55 +95,6 @@ void test('failed check results stay informational and point at their thread', (
   });
   assert.equal(failedCheckOutcome({ ...check, status: 'passed' }), null);
   assert.equal(failedCheckOutcome({ ...check, thread: 'broken' }), null);
-});
-
-void test('permission settlements retain the session profile stored by the inbox', () => {
-  const permission: InboxItem = {
-    ...item('permission', 123),
-    kind: 'opencode-permission',
-    policy: {
-      profile: 'explore',
-      risk: 'low',
-      recommendation: 'allow',
-      optionId: 'once',
-      reason: 'Low-risk action is enabled for exploration.',
-      policyRevision: '2026-10-07.1',
-    },
-  };
-
-  assert.equal(inboxPermissionProfile(permission, 'build'), 'explore');
-});
-
-void test('inbox rejections retain the displayed canonical resource policy', () => {
-  const displayedPolicy = {
-    profile: 'explore' as const,
-    risk: 'low' as const,
-    recommendation: 'interactive' as const,
-    reason: 'Path-based reads require approval because the provider opens the path later.',
-    policyRevision: '2026-10-07.1',
-  };
-  const permission: InboxItem = {
-    ...item('selected', 123),
-    kind: 'opencode-permission',
-    policy: displayedPolicy,
-    permissionPolicies: {
-      selected: displayedPolicy,
-      collateral: { ...displayedPolicy, profile: 'review' },
-    },
-  };
-  let fallbacks = 0;
-  const fallback = () => {
-    fallbacks++;
-    return { ...displayedPolicy, risk: 'unknown' as const };
-  };
-
-  assert.equal(inboxRejectedPermissionPolicy(permission, 'selected', fallback), displayedPolicy);
-  assert.equal(
-    inboxRejectedPermissionPolicy(permission, 'collateral', fallback),
-    permission.permissionPolicies?.collateral,
-  );
-  assert.equal(inboxRejectedPermissionPolicy(permission, 'unseen', fallback).risk, 'unknown');
-  assert.equal(fallbacks, 1);
 });
 
 void test('rejected inbox permissions record the actual outcome', () => {
@@ -285,4 +189,11 @@ void test('repositories are named by their last path part on every platform', ()
   assert.equal(repositoryName('/projects/alpha/'), 'alpha');
   assert.equal(repositoryName('C:\\projects\\gamma'), 'gamma');
   assert.equal(repositoryName('alpha'), 'alpha');
+});
+
+void test('inbox orders requests by arrival then stable key', () => {
+  assert.deepEqual(
+    sortInbox([item('later', 20), item('b', 10), item('a', 10)]).map((entry) => entry.key),
+    ['a', 'b', 'later'],
+  );
 });

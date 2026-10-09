@@ -1,21 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { SessionMessageInfo } from '@opencode/client';
-import { acpUsage, openCodeContextUsage } from '../src/lib/agent-usage.ts';
-
-function assistant(input: number, modelId = 'a', tokens = true): SessionMessageInfo {
-  return {
-    id: String(input),
-    type: 'assistant',
-    agent: 'build',
-    time: { created: input },
-    content: [],
-    model: { providerID: 'p', id: modelId },
-    ...(tokens
-      ? { tokens: { input, output: 50, reasoning: 20, cache: { read: 100, write: 50 } } }
-      : {}),
-  };
-}
+import { acpUsage } from '../src/lib/agent-usage.ts';
 
 void test('ACP context uses reported numbers and hides invalid reports', () => {
   assert.deepEqual(acpUsage({ sessionUpdate: 'usage_update', used: 25, size: 100 }), {
@@ -90,16 +75,5 @@ void test('Claude quota appears only for reported utilization', () => {
       },
     }),
     { context: 50, rates: [] },
-  );
-});
-
-void test('OpenCode context uses latest assistant tokens and its model', () => {
-  const model = { id: 'a', providerID: 'p', limit: { context: 1000, output: 100 } };
-  assert.equal(openCodeContextUsage([assistant(200)], [model]), 42);
-  assert.equal(openCodeContextUsage([assistant(200), assistant(100)], [model]), 32);
-  assert.equal(openCodeContextUsage([assistant(200), assistant(100, 'b')], [model]), undefined);
-  assert.equal(
-    openCodeContextUsage([assistant(200), assistant(100, 'a', false)], [model]),
-    undefined,
   );
 });

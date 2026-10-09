@@ -5,7 +5,6 @@ import {
   workspaceActivityItems,
 } from '../src/lib/workspace-activity.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
-import { openCodeChildReceipts } from '../src/lib/opencode-children.ts';
 
 function child(index: number, state: SpawnReceipt['state'] = 'working'): SpawnReceipt {
   return {
@@ -166,35 +165,5 @@ await test('durable history excludes sources already shown as live activity', ()
   assert.deepEqual(
     activityHistoryWithoutLiveItems(items, events, 'codex', 'session-1').map((event) => event.id),
     ['other-tool-history', 'parent-history'],
-  );
-});
-
-const session = (id: string, outcome?: 'failed') => ({
-  id,
-  parentID: 'parent',
-  projectID: 'project',
-  cost: 0,
-  tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-  time: { created: 1, updated: id === 'live' ? 3 : 2 },
-  title: `Child ${id}`,
-  location: { directory: '/repo' },
-  ...(outcome ? { outcome } : {}),
-});
-
-await test('OpenCode children appear as live and recent activity', () => {
-  const items = workspaceActivityItems({
-    children: openCodeChildReceipts('parent', '/repo', {
-      children: [session('live'), session('done'), session('bad', 'failed')],
-      active: ['live'],
-      summaries: {},
-    }),
-  });
-  assert.deepEqual(
-    items.map((item) => [item.kind, item.title, item.section, item.status, item.detail]),
-    [
-      ['child', 'Child live', 'now', 'working', 'Thinking'],
-      ['child', 'Child bad', 'needs-input', 'failed', 'Failed'],
-      ['child', 'Child done', 'recent', 'completed', 'Finished'],
-    ],
   );
 });

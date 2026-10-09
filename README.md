@@ -1,43 +1,33 @@
 # Sail
 
-A desktop workspace for coding-agent work. Sail hosts OpenCode planning sessions and Claude or Codex threads in its own interface.
+A desktop workspace for coding-agent work. Sail hosts OpenCode, Claude and Codex threads in its own interface.
 
 ## Plan workspace
 
-- Pick a repository, start an Architect chat, and resume earlier plan sessions.
+- Pick a repository, start an agent thread, and resume earlier threads.
 - Organize repositories into named sidebar groups and switch between them without losing each repository's last session.
 - Create a Git worktree from a repository row; Sail opens the new checkout and lists it beneath its repository.
 - Resize the entire interface with Command/Ctrl + minus or plus; Command/Ctrl + 0 resets it.
-- See live OpenCode messages alongside structured questions, Mermaid diagrams, alternatives, and per-step decisions.
-- Send answers, request revisions, or approve a plan for the build agent through [opencode-plugin-plan-review](https://github.com/smykla-skalski/opencode-plugin-plan-review).
-- The desktop app starts a local, password-protected OpenCode server and stops it on exit.
+- See live agent messages alongside structured questions, Mermaid diagrams, alternatives, and per-step decisions.
+- Send answers, request revisions, or approve a plan through Sail's `sail_plan_*` tools; see [plan review for ACP agents](docs/plan-review.md).
+- Sail runs OpenCode as an ACP agent (`opencode acp`), like Claude and Codex. It never starts an OpenCode server.
 
-## Claude and Codex threads
+## Agent threads
 
 - Install Claude Code or Codex and Node.js with `npx` (Node.js 22 or newer for Claude). Sail detects the installed binaries and shows them in **Agent settings**.
-- Choose a repository, then pick Claude or Codex from **New agent ▾** in the top bar. They use the same conversation and resizable Changes workspace as OpenCode; messages, tool activity, permissions, and model or mode choices stay in Sail.
+- Choose a repository, then pick Claude or Codex from **New agent ▾** in the top bar. All agents use the same conversation and resizable Changes workspace; messages, tool activity, permissions, and model or mode choices stay in Sail.
 - Press ⇧⌘W (Ctrl+Shift+W on Windows and Linux) to close the current session and delete its worktree after confirming. On a repository's main checkout it shows an error instead.
 - Open **Changes** or press ⌘L to inspect the repository working tree while an agent runs.
 - In **Changes**, click a diff line or Shift-click a range, write a comment, and add it to the draft list. Press ⌘Enter to send all pending comments to that agent in one message. Comments follow matching lines after a refresh; removed lines appear as outdated.
 - Switch a changed file between **All**, **Staged**, and **Unstaged** to stage or unstage a file or hunk. Revert unstaged changes after confirming; Sail rejects actions when the diff has changed since it loaded.
 - Sail runs pinned ACP adapters on demand. The first launch downloads the adapter through `npx`; later launches use npm's cache. Each agent uses its own authentication and configuration. Codex can open its ChatGPT sign-in flow inside Sail when needed.
-- Threads are saved per repository and agent. Reopening a thread replays its history from the agent. Claude and Codex threads propose structured plans through Sail's `sail_plan_*` tools and use the same Plan view; see [plan review for ACP agents](docs/plan-review.md). The Architect workflow remains on OpenCode.
+- Threads are saved per repository and agent. Reopening a thread replays its history from the agent. Every agent proposes structured plans through Sail's `sail_plan_*` tools and uses the same Plan view; see [plan review for ACP agents](docs/plan-review.md).
 
 ## Development
 
 For packaged development builds, see [installation and first project](docs/install.md). The [release checklist](docs/validation.md#release-checklist) covers platform smoke tests and signing status.
 
-Prerequisites: [mise](https://mise.jdx.dev/), [OpenCode v2](https://opencode.ai/v2/docs/), and the platform dependencies required by [Tauri](https://tauri.app/start/prerequisites/). Configure [opencode-plugin-plan-review](https://github.com/smykla-skalski/opencode-plugin-plan-review) before planning. See the [tested version matrix and release smoke](docs/validation.md); the published `0.2.0` plugin lacks the history RPC required by this app. Install the tested Git revision:
-
-```sh
-opencode plugin add github:smykla-skalski/opencode-plugin-plan-review#fdc575ba5ffccc6420ad5b3b68372f99f70290f5
-```
-
-For a local checkout, add its path to the selected repository's `opencode.jsonc`:
-
-```jsonc
-{ "plugins": ["/absolute/path/to/opencode-plugin-plan-review"] }
-```
+Prerequisites: [mise](https://mise.jdx.dev/), the platform dependencies required by [Tauri](https://tauri.app/start/prerequisites/), and at least one agent: [OpenCode v2](https://opencode.ai/v2/docs/), Claude Code, or Codex. See the [tested version matrix and release smoke](docs/validation.md).
 
 Mise installs the latest stable Node.js and Rust toolchains. The development task installs JavaScript dependencies when needed.
 
@@ -45,7 +35,7 @@ Mise installs the latest stable Node.js and Rust toolchains. The development tas
 mise run dev
 ```
 
-Select the repository in the app and complete the repository setup checks, then describe the work in chat. The first message creates an Architect session. The app detects OpenCode in common installation locations. Open **OpenCode settings** to see the detected binary or set an absolute path; the app remembers an override. You can also set `SAIL_OPENCODE_BIN` before starting the app.
+Select the repository in the app, pick an agent, then describe the work in chat. The app detects OpenCode in common installation locations. Open **OpenCode settings** to see the detected binary or set an absolute path; the app remembers an override. You can also set `SAIL_OPENCODE_BIN` before starting the app.
 
 Sail connects its MCP server to each Claude, Codex, and OpenCode agent session. The server sends the bundled [Sail skill](skills/sail/SKILL.md) during initialization and exposes it through the `sail_skill` tool, so agents can discover how to use Sail's worktree, agent, terminal, thread, and embedded browser tools.
 

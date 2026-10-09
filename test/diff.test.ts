@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { FileDiffInfo } from '@opencode/client';
 import {
   annotateDiffs,
   parsePatch,
   patchUnavailableReason,
   repoPath,
   selectedDiffFile,
+  type FileDiffInfo,
 } from '../src/lib/diff.ts';
 import type { Plan } from '../src/lib/plan.ts';
 import {

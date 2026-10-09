@@ -2,7 +2,7 @@
 
 These installers are development builds. macOS artifacts use ad-hoc signing unless a Developer ID certificate and notarization secrets were configured for the workflow. Windows and Linux artifacts are unsigned. Check `release-manifest.json` for the signing mode, source commit, target, and SHA-256 of each package before installing. The tag workflow also records GitHub artifact attestations for the packages.
 
-OpenCode v2.0.24 is a separate prerequisite; it is not bundled. Install the tested plan-review plugin revision before starting an Architect plan. See [installation and first project](https://github.com/smykla-skalski/sail/blob/main/docs/install.md) and [validation limits](https://github.com/smykla-skalski/sail/blob/main/docs/validation.md).
+OpenCode v2.0.24 is a separate prerequisite; it is not bundled. See [installation and first project](https://github.com/smykla-skalski/sail/blob/main/docs/install.md) and [validation limits](https://github.com/smykla-skalski/sail/blob/main/docs/validation.md).
 
 There is no automatic updater. To update, download the next package for your platform and install it over the previous version after quitting the app. Verify the new manifest and run the first-project checks again.
 
@@ -21,6 +21,14 @@ There is no automatic updater. To update, download the next package for your pla
 - **Rename** works for every agent thread. The title is stored in Sail; the agent's own title is not changed.
 - **Delete** removes a thread from Sail only. An OpenCode session stays in OpenCode's store and stays hidden in Sail.
 - **New plan** now opens an OpenCode thread; choose the plan mode there.
+
+## OpenCode without a server
+
+- Sail no longer starts `opencode serve` or sends requests to an OpenCode server. OpenCode runs only as an ACP agent, like Claude and Codex.
+- The inline OpenCode chat, its plan-review plugin checks and the repository diagnostics in Settings are gone. Settings > OpenCode keeps the binary path and shows whether OpenCode is available.
+- Agent spawn, Ship workers, validation gates and agent messages reach OpenCode through ACP. OpenCode model routes use the `provider/model` ID from its model selector; saved `provider:model` routes still work.
+- Side chat for an OpenCode thread uses the seeded ACP side chat.
+- OpenCode subagent sessions that Sail did not see start can appear in the sidebar, because OpenCode's session list has no parent marker.
 
 ## Keyboard, shortcuts and screen readers
 

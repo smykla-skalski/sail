@@ -1,10 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
-  automaticPermissionPolicy,
-  openCodePermissionToolCall,
-  permissionPolicy,
-} from '../src/lib/capability-profiles.ts';
+import { automaticPermissionPolicy, permissionPolicy } from '../src/lib/capability-profiles.ts';
 import {
   assertAutomaticPermissionAllowed,
   AutomaticPermissionResolver,
@@ -165,7 +161,7 @@ await test('provider-added read paths stop an already scheduled automatic approv
     profile: 'explore',
     workspace: '/workspace',
     title: 'read',
-    toolCall: openCodePermissionToolCall({ action: 'read', resources: [] }),
+    toolCall: { action: 'read', resources: [] },
     options: allowOnce,
     resourceTrust: { trusted: true, canonicalResources: [] },
   });
@@ -178,10 +174,7 @@ await test('provider-added read paths stop an already scheduled automatic approv
           profile: 'explore',
           workspace: '/workspace',
           title: 'read',
-          toolCall: openCodePermissionToolCall({
-            action: 'read',
-            resources: ['README.md'],
-          }),
+          toolCall: { action: 'read', resources: ['README.md'] },
           options: allowOnce,
           resourceTrust: {
             trusted: true,

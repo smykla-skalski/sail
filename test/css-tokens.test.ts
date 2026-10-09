@@ -481,13 +481,12 @@ for (const name of ['light', 'dark'] as const) {
   });
 }
 
-void test('all three transcript renderers fill the width with one fixed gutter', () => {
+void test('both transcript renderers fill the width with one fixed gutter', () => {
   const style = readFileSync(join(root, 'src/style.css'), 'utf8');
   assert.match(style, /\n {2}--transcript-gutter: 20px;\n/);
   const containers: [string, RegExp][] = [
     ['src/style.css', /\n\.conversation \{([^}]*)\}/],
     ['src/AgentWorkspace.svelte', /\n {2}\.agent-conversation \{([^}]*)\}/],
-    ['src/OpenCodePane.svelte', /\n {2}\.opencode-pane \.agent-conversation \{([^}]*)\}/],
   ];
   for (const [file, rule] of containers) {
     const body = rule.exec(readFileSync(join(root, file), 'utf8'))?.[1];

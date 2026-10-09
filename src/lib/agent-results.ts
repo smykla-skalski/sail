@@ -147,21 +147,6 @@ export function saveBoundedReceipt(
   );
 }
 
-export function receiptTurnMessages<T extends { id: string; type: string; text?: string }>(
-  messagesNewestFirst: readonly T[],
-  turnId: string | null,
-  prompt: string | null,
-): T[] | null {
-  if (!turnId || prompt === null) return null;
-  const messages = messagesNewestFirst.toReversed();
-  const start = messages.findIndex(
-    (message) => message.type === 'user' && message.id === turnId && message.text === prompt,
-  );
-  if (start < 0) return null;
-  const next = messages.findIndex((message, index) => index > start && message.type === 'user');
-  return messages.slice(start, next < 0 ? undefined : next);
-}
-
 export function failedUnsubmittedDispatch(error: string): Partial<SpawnReceipt> {
   return { state: 'failed', error, dispatchPending: false };
 }
@@ -378,127 +363,6 @@ export function handoffReceiptForInterruptedTurn(
   );
 }
 
-export function openCodePromptHasBackendEvidence(
-  receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
-  messages: Array<{ type: string; text?: string }>,
-  inbox: Array<{ id: string }>,
-): boolean {
-  if (!receipt.prompt || !receipt.turnId) return false;
-  return (
-    messages.some((message) => message.type === 'user' && message.text === receipt.prompt) ||
-    inbox.some((item) => item.id === receipt.turnId)
-  );
-}
-
-export type OpenCodePromptRecoveryAction = 'adopt' | 'inspect' | 'dispatch';
-
-type OpenCodeHistoryMessage = {
-  id?: string;
-  type: string;
-  text?: string;
-  outcome?: 'succeeded' | 'failed' | 'interrupted';
-  time?: { created?: number; completed?: number };
-  content?: Array<{ type: string; text?: string }>;
-};
-
-type OpenCodeHistoryPage = {
-  data: OpenCodeHistoryMessage[];
-  cursor: { next?: string | null };
-};
-
-export function openCodePromptRecoveryAction(
-  hasPromptEvidence: boolean,
-  active: boolean,
-  outcome: 'succeeded' | 'failed' | 'interrupted' | undefined,
-): OpenCodePromptRecoveryAction {
-  if (hasPromptEvidence) return 'adopt';
-  if (active || outcome) return 'inspect';
-  return 'dispatch';
-}
-
-async function loadOpenCodePromptHistory(
-  receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
-  inbox: Array<{ id: string }>,
-  loadPage: (cursor?: string) => Promise<OpenCodeHistoryPage>,
-): Promise<{ hasPromptEvidence: boolean; latestMessages: OpenCodeHistoryMessage[] }> {
-  const seen = new Set<string>();
-  async function search(
-    latestMessages: OpenCodeHistoryMessage[] | undefined,
-    cursor?: string,
-  ): Promise<{ hasPromptEvidence: boolean; latestMessages: OpenCodeHistoryMessage[] }> {
-    const page = await loadPage(cursor);
-    const latest = latestMessages ?? page.data;
-    if (openCodePromptHasBackendEvidence(receipt, page.data, inbox))
-      return { hasPromptEvidence: true, latestMessages: latest };
-    const next = page.cursor.next ?? undefined;
-    if (!next) return { hasPromptEvidence: false, latestMessages: latest };
-    if (seen.has(next)) throw new Error('OpenCode message history cursor did not advance.');
-    seen.add(next);
-    return search(latest, next);
-  }
-  return search(undefined);
-}
-
-export async function openCodePromptHasHistoryEvidence(
-  receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
-  inbox: Array<{ id: string }>,
-  loadPage: (cursor?: string) => Promise<OpenCodeHistoryPage>,
-): Promise<boolean> {
-  return (await loadOpenCodePromptHistory(receipt, inbox, loadPage)).hasPromptEvidence;
-}
-
-export async function openCodePromptSettlement(
-  receipt: Pick<SpawnReceipt, 'prompt' | 'turnId'>,
-  loadPage: (cursor?: string) => Promise<OpenCodeHistoryPage>,
-): Promise<Pick<SpawnReceipt, 'state' | 'result'>> {
-  const seen = new Set<string>();
-  const messages: OpenCodeHistoryMessage[] = [];
-  async function collect(cursor?: string): Promise<void> {
-    const page = await loadPage(cursor);
-    messages.push(...page.data);
-    const next = page.cursor.next ?? undefined;
-    if (!next) return;
-    if (seen.has(next)) throw new Error('OpenCode message history cursor did not advance.');
-    seen.add(next);
-    return collect(next);
-  }
-  await collect();
-  let promptIndex = messages.findIndex(
-    (message) => message.type === 'user' && message.id === receipt.turnId,
-  );
-  if (promptIndex < 0)
-    promptIndex = messages.findIndex(
-      (message) => message.type === 'user' && message.text === receipt.prompt,
-    );
-  if (promptIndex < 0) return { state: 'unavailable', result: null };
-  let idleIndex = -1;
-  for (let index = promptIndex - 1; index >= 0; index -= 1)
-    if (messages[index].type === 'idle') {
-      idleIndex = index;
-      break;
-    }
-  const idle = messages[idleIndex];
-  const finished = idle?.outcome;
-  if (idleIndex < 0 || !finished) return { state: 'unavailable', result: null };
-  const turnMessages = messages.slice(idleIndex + 1, promptIndex).toReversed();
-  const result =
-    turnMessages
-      .flatMap((message) =>
-        message.type === 'assistant' && message.time?.completed
-          ? (message.content ?? []).flatMap((part) =>
-              part.type === 'text' ? [part.text ?? ''] : [],
-            )
-          : [],
-      )
-      .join('\n')
-      .slice(-16_000) || null;
-  return {
-    state:
-      finished === 'succeeded' ? 'completed' : finished === 'failed' ? 'failed' : 'interrupted',
-    result,
-  };
-}
-
 export function acpTurnEvidenceState(evidence: AcpTurnEvidence | null): SpawnState | null {
   if (!evidence) return null;
   if (evidence.status === 'done') return 'completed';
@@ -535,59 +399,6 @@ export function acpTurnPromptCanRetry(evidence: AcpTurnEvidence | null): boolean
 
 export function acpTurnNeedsProviderInspection(evidence: AcpTurnEvidence | null): boolean {
   return evidence?.status === 'dispatch_uncertain' || evidence?.status === 'dispatched';
-}
-
-export type OpenCodeDescendantSession = {
-  id: string;
-  parentID?: string;
-  location: { directory: string };
-};
-
-export async function openCodeDescendantSessions(
-  rootSessionIds: string[],
-  directory: string,
-  loadPage: (
-    parentID: string,
-    cursor?: string,
-  ) => Promise<{ data: OpenCodeDescendantSession[]; cursor: { next?: string | null } }>,
-): Promise<OpenCodeDescendantSession[]> {
-  const pending = [...new Set(rootSessionIds)];
-  const visitedParents = new Set<string>();
-  const descendants = new Map<string, OpenCodeDescendantSession>();
-  async function collectPages(
-    parentID: string,
-    cursor?: string,
-    seenCursors = new Set<string>(),
-  ): Promise<void> {
-    const page = await loadPage(parentID, cursor);
-    for (const child of page.data) {
-      if (
-        child.id === parentID ||
-        child.parentID !== parentID ||
-        child.location.directory !== directory
-      )
-        continue;
-      if (!descendants.has(child.id)) {
-        descendants.set(child.id, child);
-        pending.push(child.id);
-      }
-    }
-    const next = page.cursor.next ?? undefined;
-    if (!next || seenCursors.has(next)) return;
-    seenCursors.add(next);
-    return collectPages(parentID, next, seenCursors);
-  }
-  async function collectParent(index: number): Promise<void> {
-    if (index >= pending.length) return;
-    const parentID = pending[index];
-    if (!visitedParents.has(parentID)) {
-      visitedParents.add(parentID);
-      await collectPages(parentID);
-    }
-    return collectParent(index + 1);
-  }
-  await collectParent(0);
-  return [...descendants.values()];
 }
 
 export function handoffReceiptNeedsResolution(receipt: SpawnReceipt): boolean {

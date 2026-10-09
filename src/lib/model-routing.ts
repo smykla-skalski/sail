@@ -64,6 +64,11 @@ function isModelRoute(value: unknown): value is ModelRoute {
   );
 }
 
+/** OpenCode's ACP model selector uses `provider/model`; older settings stored `provider:model`. */
+export function acpModelId(agent: string, model: string): string {
+  return agent === 'opencode' && !model.includes('/') ? model.replace(':', '/') : model;
+}
+
 function normalizedModel(value: string): string {
   return value.slice(value.indexOf(':') + 1).toLowerCase();
 }
@@ -117,11 +122,11 @@ export function selectModelRoute(
       independentReviewRequired,
       reason: `The ${request.role} route must use an exact model ID, not ${route.model}.`,
     };
-  if (route.provider === 'opencode' && !route.model.includes(':'))
+  if (route.provider === 'opencode' && !/[:/]/.test(route.model))
     return {
       route: null,
       independentReviewRequired,
-      reason: 'OpenCode routes require an exact provider:model ID.',
+      reason: 'OpenCode routes require an exact provider/model ID.',
     };
   if (request.role !== 'review' && independentReviewRequired) {
     const review = settings.routes.find(

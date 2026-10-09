@@ -1,20 +1,18 @@
 import type { AgentEntry, AgentMessage } from './acp';
 import { receiptSourceId, type SpawnReceipt, type SpawnState } from './agent-results.ts';
 import { nativeSubagentStatus, type NativeSubagentStore } from './native-subagents.ts';
-import type { SessionInfo } from './opencode';
 import {
   isFailedStatus,
   splitTaskNotifications,
   type TaskNotification,
 } from './task-notification.ts';
 
-export type SubagentSource = 'native' | 'opencode' | 'mcp' | 'task-notification';
+export type SubagentSource = 'native' | 'mcp' | 'task-notification';
 
-/** Live sources first: native ACP children, then OpenCode children, MCP spawn receipts and the
- * task notifications a parent transcript carries. */
+/** Live sources first: native ACP children, then MCP spawn receipts and the task notifications a
+ * parent transcript carries. */
 export const subagentSourcePrecedence: readonly SubagentSource[] = [
   'native',
-  'opencode',
   'mcp',
   'task-notification',
 ];
@@ -30,7 +28,7 @@ export type SubagentUsage = { tokens?: number; toolUses?: number; durationMs?: n
 
 /** One child agent, whichever sources reported it. `SpawnReceipt` stays the stored record. */
 export type SubagentRun = {
-  /** Thread id of the child session (`acp:<agent>:<session>` or `opencode:<session>`). An MCP
+  /** Thread id of the child session (`acp:<agent>:<session>`). An MCP
    * child that has no session yet uses `receipt:<receiptId>`. */
   id: string;
   /** The highest-precedence source that reported this child. */
@@ -57,13 +55,6 @@ export type SubagentRun = {
   controls: SubagentControls;
 };
 
-export type OpenCodeChildSessions = {
-  parentSessionId: string;
-  directory: string;
-  children: readonly SessionInfo[];
-  active: readonly string[];
-};
-
 /** A parent session's complete transcript; the generation join counts notifications in it. */
 export type ParentTranscript = {
   agent: string;
@@ -75,7 +66,6 @@ export type ParentTranscript = {
 export type SubagentRunSources = {
   native?: NativeSubagentStore;
   receipts?: readonly SpawnReceipt[];
-  openCode?: readonly OpenCodeChildSessions[];
   transcripts?: readonly ParentTranscript[];
 };
 
@@ -154,39 +144,6 @@ function receiptRuns(receipts: readonly SpawnReceipt[]): SubagentRun[] {
         controls: { prompt: !!sessionId, cancel: !!sessionId },
       };
     });
-}
-
-/** A child that is not running and has no recorded outcome reads as finished, not queued. */
-export function openCodeChildState(child: SessionInfo, active: readonly string[]): SpawnState {
-  if (active.includes(child.id)) return 'working';
-  return child.outcome && child.outcome !== 'succeeded' ? child.outcome : 'completed';
-}
-
-function openCodeRuns(groups: readonly OpenCodeChildSessions[]): SubagentRun[] {
-  return groups.flatMap(({ parentSessionId, directory, children, active }) =>
-    children.map((child) => ({
-      id: receiptSourceId('opencode', child.id),
-      source: 'opencode',
-      sources: ['opencode'],
-      agent: 'opencode',
-      sessionId: child.id,
-      directory: child.location.directory,
-      parentId: receiptSourceId('opencode', parentSessionId),
-      parentDirectory: directory,
-      name: child.agent ?? null,
-      task: child.title ?? null,
-      model: child.model ? `${child.model.providerID}:${child.model.id}` : null,
-      state: openCodeChildState(child, active),
-      activity: null,
-      result: null,
-      error: null,
-      created: child.time.created,
-      updated: child.time.updated,
-      receiptId: null,
-      usage: null,
-      controls: { prompt: true, cancel: true },
-    })),
-  );
 }
 
 /** Child session ids for task notifications in transcript order. claude-agent-acp names a task's
@@ -327,14 +284,12 @@ function order(run: SubagentRun): number {
 export function subagentRuns({
   native = {},
   receipts = [],
-  openCode = [],
   transcripts = [],
 }: SubagentRunSources): SubagentRun[] {
   const rank = (run: SubagentRun) => subagentSourcePrecedence.indexOf(run.source);
   const byId = new Map<string, SubagentRun[]>();
   for (const run of [
     ...nativeRuns(native),
-    ...openCodeRuns(openCode),
     ...receiptRuns(receipts),
     ...notificationRuns(transcripts),
   ]) {

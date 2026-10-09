@@ -5,10 +5,8 @@ import {
   statusBarAttentionCount,
   agentStatusCounts,
   buildAgentStatusItems,
-  openCodeHeaderStatus,
   resetLabel,
   type AgentHeaderInput,
-  type OpenCodeHeaderInput,
 } from '../src/lib/agent-status.ts';
 
 const threads = [
@@ -30,8 +28,7 @@ void test('status bar keeps active and unread agents in urgency order', () => {
       [keys[2]]: { status: 'done', unread: true },
     },
     agentNames: { claude: 'Claude', opencode: 'OpenCode', codex: 'Codex' },
-    usage: { [keys[0]]: { context: 42 } },
-    openCodeUsage: { '/work/two:waiting': 73 },
+    usage: { [keys[0]]: { context: 42 }, [keys[1]]: { context: 73 } },
     rates: { claude: [{ label: '5h', remaining: 18 }] },
   });
 
@@ -53,7 +50,6 @@ void test('status bar drops read completed sessions and formats future resets', 
     attention: { [keys[2]]: { status: 'done', unread: false } },
     agentNames: {},
     usage: {},
-    openCodeUsage: {},
     rates: {},
   });
   assert.deepEqual(items, []);
@@ -106,30 +102,6 @@ void test('ACP thread headers report working only for turns the status bar can l
   ];
   for (const [name, overrides, expected] of cases)
     assert.equal(agentHeaderStatus({ ...idleHeader, ...overrides }), expected, name);
-});
-
-const idleOpenCode: OpenCodeHeaderInput = {
-  runtime: 'connected',
-  waiting: false,
-  loading: false,
-  running: false,
-  sending: false,
-  inputReady: true,
-};
-
-void test('OpenCode headers report working only once the session runs', () => {
-  const cases: [string, Partial<OpenCodeHeaderInput>, string][] = [
-    ['idle session', {}, 'ready'],
-    ['runtime starting', { runtime: 'starting' }, 'connecting'],
-    ['runtime failed', { runtime: 'error' }, 'offline'],
-    ['question pending', { waiting: true, running: true }, 'waiting'],
-    ['history loading', { loading: true }, 'connecting'],
-    ['creating the session', { sending: true }, 'connecting'],
-    ['running turn', { sending: true, running: true }, 'working'],
-    ['no model or agent ready', { inputReady: false }, 'offline'],
-  ];
-  for (const [name, overrides, expected] of cases)
-    assert.equal(openCodeHeaderStatus({ ...idleOpenCode, ...overrides }), expected, name);
 });
 
 void test('the status bar counts a waiting thread before its Inbox request arrives', () => {

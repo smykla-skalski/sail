@@ -25,7 +25,7 @@ describe('agent switching', () => {
     rmSync(targetRepository, { recursive: true, force: true });
   });
 
-  it('opens an ACP thread while OpenCode prepares its worktree', async () => {
+  it('opens an ACP thread from the sidebar without waiting', async () => {
     const current = realpathSync(currentRepository);
     const target = realpathSync(targetRepository);
     await browser.execute((path) => sessionStorage.setItem('sai-e2e-switch-target', path), target);
@@ -62,72 +62,36 @@ describe('agent switching', () => {
       { current, target, sessionId: session.sessionId },
     );
     await browser.refresh();
-    await expect($('.sidebar-footer')).toHaveText(expect.stringContaining('OpenCode connected'));
     const row = $('.project-agent-row[aria-label*="Switch target"]');
     await expect(row).toBeDisplayed();
 
     await browser.execute(() => {
-      sessionStorage.setItem('sai-e2e-browser-setup-delay', '2000');
-      sessionStorage.removeItem('sai-e2e-browser-setup-started');
-      sessionStorage.removeItem('sai-e2e-browser-setup-finished');
+      Reflect.set(window, '__switchStart', performance.now());
+      const observer = new MutationObserver(() => {
+        if (!document.querySelector('.agent-header')?.textContent?.includes('Switch target'))
+          return;
+        Reflect.set(window, '__switchVisible', performance.now());
+        observer.disconnect();
+      });
+      observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+      document
+        .querySelector<HTMLButtonElement>('.project-agent-row[aria-label*="Switch target"]')
+        ?.click();
     });
-
-    try {
-      await browser.execute(() => {
-        Reflect.set(window, '__switchStart', performance.now());
-        const observer = new MutationObserver(() => {
-          if (!document.querySelector('.agent-header')?.textContent?.includes('Switch target'))
-            return;
-          Reflect.set(window, '__switchVisible', performance.now());
-          Reflect.set(
-            window,
-            '__switchStartedAtVisible',
-            sessionStorage.getItem('sai-e2e-browser-setup-started'),
-          );
-          Reflect.set(
-            window,
-            '__switchFinishedAtVisible',
-            sessionStorage.getItem('sai-e2e-browser-setup-finished'),
-          );
-          observer.disconnect();
-        });
-        observer.observe(document.body, { subtree: true, childList: true, characterData: true });
-        document
-          .querySelector<HTMLButtonElement>('.project-agent-row[aria-label*="Switch target"]')
-          ?.click();
-      });
-      await expect($('.agent-header')).toHaveText(expect.stringContaining('Switch target'));
-      await browser.waitUntil(async () =>
-        browser.execute(() => Reflect.has(window, '__switchVisible')),
-      );
-      const result = await browser.execute(() => ({
-        elapsed:
-          Number(Reflect.get(window, '__switchVisible')) -
-          Number(Reflect.get(window, '__switchStart')),
-        started: Reflect.get(window, '__switchStartedAtVisible'),
-        finished: Reflect.get(window, '__switchFinishedAtVisible'),
-        selected: document.querySelector('.project-agent-row.active')?.getAttribute('aria-label'),
-      }));
-      console.log('ACP switch with delayed OpenCode setup', result);
-      expect(result.started).toBe(target);
-      expect(result.finished).toBeNull();
-      expect(result.selected).toContain('Switch target');
-      expect(result.elapsed).toBeLessThan(1_500);
-      await browser.waitUntil(async () =>
-        browser.execute(
-          (path) => sessionStorage.getItem('sai-e2e-browser-setup-finished') === path,
-          target,
-        ),
-      );
-      await expect($('.agent-header')).toHaveText(expect.stringContaining('Switch target'));
-      await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    } finally {
-      await browser.execute(() => {
-        sessionStorage.removeItem('sai-e2e-browser-setup-delay');
-        sessionStorage.removeItem('sai-e2e-browser-setup-started');
-        sessionStorage.removeItem('sai-e2e-browser-setup-finished');
-      });
-    }
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Switch target'));
+    await browser.waitUntil(async () =>
+      browser.execute(() => Reflect.has(window, '__switchVisible')),
+    );
+    const result = await browser.execute(() => ({
+      elapsed:
+        Number(Reflect.get(window, '__switchVisible')) -
+        Number(Reflect.get(window, '__switchStart')),
+      selected: document.querySelector('.project-agent-row.active')?.getAttribute('aria-label'),
+    }));
+    console.log('ACP switch from the sidebar', result);
+    expect(result.selected).toContain('Switch target');
+    expect(result.elapsed).toBeLessThan(1_500);
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
 
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('New thread'));

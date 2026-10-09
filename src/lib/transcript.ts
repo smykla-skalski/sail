@@ -1,5 +1,4 @@
 import type { ActivityHistoryEvent } from './activity-history.ts';
-import type { SessionMessageInfo, PromptFileAttachment } from '@opencode/client';
 import type { AgentDisplayEntry, AgentTool } from './acp';
 import {
   receiptNeedsLiveActivity,
@@ -10,7 +9,6 @@ import type { CoordinationMessage } from './coordination';
 import type { HookActivity } from './hook-activity';
 import type { PostTurnCheck } from './post-turn-checks';
 import type { ShellRun } from './shell-command';
-import { openCodeErrorDetails, reportedHookIdentity } from './tool-failure.ts';
 
 export type TranscriptTool = {
   id: string;
@@ -232,152 +230,6 @@ export function nativeItems(
       };
     },
   );
-}
-
-function fileLabel(file: PromptFileAttachment): string {
-  return file.name ?? (file.source.type === 'uri' ? file.source.uri : 'Attachment');
-}
-
-type OpenCodeContent = Extract<SessionMessageInfo, { type: 'assistant' }>['content'][number];
-
-function toolFromPart(
-  message: Extract<SessionMessageInfo, { type: 'assistant' }>,
-  part: Extract<OpenCodeContent, { type: 'tool' }>,
-): TranscriptTool {
-  return {
-    id: `${message.id}:${part.id}`,
-    title: part.name,
-    status: part.state.status,
-    input: part.state.input,
-    output:
-      part.state.status === 'completed' || part.state.status === 'error'
-        ? (part.state.content ?? [])
-            .map((item) => (item.type === 'text' ? item.text : (item.name ?? item.uri)))
-            .join('\n')
-        : '',
-    error: part.state.status === 'error' ? openCodeErrorDetails(part.state.error) : '',
-    source: part.state.status === 'error' ? (reportedHookIdentity(part.state.metadata) ?? '') : '',
-    terminalIds: [],
-    raw: { messageId: message.id, partId: part.id },
-  };
-}
-
-/** Maps OpenCode messages in event order: text, thinking and consecutive tools stay in sequence. */
-export function openCodeItems(
-  messages: SessionMessageInfo[],
-  spawn: SpawnReceipt[],
-  host: { liveText?: Record<string, Record<number, string>> } = {},
-): TranscriptItem[] {
-  const conversation = messages.filter(
-    (message) => message.type === 'user' || message.type === 'assistant',
-  );
-  const items: TranscriptItem[] = [];
-  for (const entry of withSpawnResponses(conversation, spawn, (message) => message.time.created)) {
-    if ('receipt' in entry) {
-      items.push({ kind: 'spawn-response', id: entry.id, receipt: entry.receipt });
-      continue;
-    }
-    if (entry.type === 'user') {
-      items.push({
-        kind: 'message',
-        id: entry.id,
-        role: 'user',
-        author: 'You',
-        text: entry.text,
-        created: entry.time.created,
-        provider: 'opencode',
-        sourceId: entry.id,
-        files: entry.files?.map(fileLabel),
-      });
-      continue;
-    }
-    if (entry.type !== 'assistant') continue;
-    const created = entry.time.created;
-    let tools: TranscriptTool[] = [];
-    let texts: string[] = [];
-    const flushText = (ordinal: number) => {
-      const text = texts.filter(Boolean).join('\n');
-      texts = [];
-      if (text)
-        items.push({
-          kind: 'message',
-          id: `${entry.id}:text:${ordinal}`,
-          role: 'assistant',
-          author: entry.agent,
-          text,
-          created,
-          provider: 'opencode',
-          sourceId: entry.id,
-        });
-    };
-    const flushTools = (ordinal: number) => {
-      if (tools.length)
-        items.push({ kind: 'tools', id: `${entry.id}:tools:${ordinal}`, created, tools });
-      tools = [];
-    };
-    entry.content.forEach((part, ordinal) => {
-      if (part.type === 'tool') {
-        flushText(ordinal);
-        tools.push(toolFromPart(entry, part));
-        return;
-      }
-      flushTools(ordinal);
-      if (part.type === 'reasoning') {
-        flushText(ordinal);
-        if (part.text.trim())
-          items.push({
-            kind: 'message',
-            id: `${entry.id}:thought:${ordinal}`,
-            role: 'thought',
-            author: `${entry.agent} · thinking`,
-            text: part.text,
-            created,
-            provider: 'opencode',
-            sourceId: entry.id,
-          });
-      } else if (part.type === 'text')
-        texts.push(host.liveText?.[entry.id]?.[ordinal] ?? part.text);
-    });
-    flushText(entry.content.length);
-    flushTools(entry.content.length);
-    const note = [
-      entry.retry ? `Retry ${entry.retry.attempt}: ${entry.retry.error.message}` : '',
-    ].filter(Boolean);
-    if (note.length || entry.error)
-      items.push({
-        kind: 'message',
-        id: `${entry.id}:status`,
-        role: 'assistant',
-        author: entry.agent,
-        text: '',
-        created,
-        provider: 'opencode',
-        sourceId: entry.id,
-        retry: note[0],
-        error: entry.error?.message,
-      });
-  }
-  return items;
-}
-
-/** Streaming text for messages the timeline has not delivered yet. */
-export function streamingItems(
-  live: [string, Record<string, string>][],
-  author: string,
-): TranscriptItem[] {
-  return live.map(([id, parts]) => ({
-    kind: 'message',
-    id: `live:${id}`,
-    role: 'assistant',
-    author: `${author} · streaming`,
-    text: Object.entries(parts)
-      .toSorted(([a], [b]) => Number(a) - Number(b))
-      .map(([, value]) => value)
-      .join('\n'),
-    provider: 'opencode',
-    sourceId: id,
-    streaming: true,
-  }));
 }
 
 export type QueuedLike = { author: string; text: string };
