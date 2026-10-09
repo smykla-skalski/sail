@@ -2286,7 +2286,12 @@
         else unlistenNotificationClick = unlisten;
         return undefined;
       });
-      if (directory) void canonicalizeProject(directory);
+      if (directory) {
+        const initialDirectory = directory;
+        void canonicalizeProject(initialDirectory).then(() =>
+          refreshAutomaticMemoryCapture(initialDirectory),
+        );
+      }
     }
     const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
