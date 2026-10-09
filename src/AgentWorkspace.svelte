@@ -752,10 +752,28 @@
     ),
   );
   let workingMode = $state<string | null>(null);
+  let planReviewPlugin = $state<{ source: string; entry: string } | null>(null);
 
   $effect(() => {
     const value = planModeOption?.currentValue;
     if (value && value !== 'plan') workingMode = value;
+  });
+
+  $effect(() => {
+    planReviewPlugin = null;
+    if (agent !== 'opencode' || !directory) return;
+    const path = directory;
+    void (async () => {
+      try {
+        const found = await invoke<{ source: string; entry: string } | null>(
+          'opencode_plan_review_plugin',
+          { directory: path },
+        );
+        if (path === directory) planReviewPlugin = found;
+      } catch {
+        planReviewPlugin = null;
+      }
+    })();
   });
 
   async function leavePlanMode() {
@@ -2473,6 +2491,11 @@
       {#if shellMode}<p class="composer-shell-hint" role="status">
           Shell mode · Enter runs the command in this worktree
         </p>{/if}
+      {#if planReviewPlugin}<p class="agent-warning" role="status">
+          The OpenCode plan-review plugin is still enabled ({planReviewPlugin.entry} in
+          {planReviewPlugin.source}). OpenCode sees its plan tools next to Sail's sail_plan_* tools.
+          Remove the plugin from your OpenCode config; Sail reviews plans for every agent itself.
+        </p>{/if}
       {#if error}<p class="agent-error" role="alert">
           {error} <button onclick={() => void activate(activeSessionId)}>Retry</button>
         </p>{/if}
@@ -2810,5 +2833,10 @@
   }
   .agent-error {
     color: var(--sui-danger-ink);
+  }
+  .agent-warning {
+    margin: 0;
+    color: var(--sui-warning-ink);
+    font-size: var(--type-12);
   }
 </style>
