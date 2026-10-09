@@ -39,7 +39,11 @@ if (process.argv.includes('--trap')) {
   process.on('SIGTERM', () => {});
   setInterval(() => {}, 1_000);
 }
-if (process.argv.includes('--spawn-trapped-descendant')) {
+if (
+  process.argv.includes('--spawn-trapped-descendant') &&
+  (!process.argv.includes('--exit-after-spawn') ||
+    (invocation.task.taskType === 'code-navigation' && !invocation.arm.hub))
+) {
   const heartbeat = `${outputPath}.heartbeat`;
   const child = spawn(
     process.execPath,
@@ -55,6 +59,7 @@ if (process.argv.includes('--spawn-trapped-descendant')) {
     child.once('error', rejectReady);
   });
   writeFileSync(`${outputPath}.child-pid`, String(child.pid));
+  if (process.argv.includes('--exit-after-spawn')) process.exit(1);
   setInterval(() => {}, 1_000);
 }
 writeFileSync(
