@@ -418,6 +418,7 @@
     forgetRecentTranscript,
     invalidateLiveTranscript,
     loadAgentThreads,
+    mergeAgentThreadActivity,
     mergeAgentThreadRename,
     mergeAgentThreadUpdate,
     normalizeAgentThreadKeywords,
@@ -9231,6 +9232,11 @@
       acpThread = thread;
   }
 
+  function saveAgentActivity(thread: AgentThread) {
+    const previous = agentThreads.find((item) => threadKey(item) === threadKey(thread));
+    saveAgentThread(mergeAgentThreadActivity(previous, thread));
+  }
+
   function rememberRecentThread(thread: AgentThread) {
     if (!agentThreads.some((item) => threadKey(item) === threadKey(thread)))
       saveAgentThread(thread);
@@ -11689,7 +11695,7 @@
                 activityReady={acpActivityReady}
                 focused={focusedPane === 'main'}
                 oncreated={createAgentThread}
-                onactivity={saveAgentThread}
+                onactivity={saveAgentActivity}
                 onstatus={updateAgentThreadStatus}
                 onreplaychange={setAgentReplay}
                 onterminal={(id) => void openAgentTerminal(id)}
@@ -11826,7 +11832,7 @@
         onpickedconsumed={markPickConsumed}
         onattachmentsent={assignReviewCaptures}
         onshortcut={keydownWorkspace}
-        onactivity={saveAgentThread}
+        onactivity={saveAgentActivity}
         activityEvents={currentActivityHistory}
         activityLoading={inboxLoading}
         activityError={inboxError}

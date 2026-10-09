@@ -75,6 +75,13 @@ export function mergeAgentThreadRename(
   });
 }
 
+export function mergeAgentThreadActivity(
+  previous: AgentThread | undefined,
+  incoming: AgentThread,
+): AgentThread {
+  return mergeAgentThreadUpdate(previous, { ...incoming, keywords: undefined });
+}
+
 export function mergeAgentThreadListing(previous: AgentThread, incoming: AgentThread): AgentThread {
   const newest = previous.updated < incoming.updated ? incoming : previous;
   const renamed = previous.renamed ? previous : incoming.renamed ? incoming : null;

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   loadAgentThreads,
+  mergeAgentThreadActivity,
   mergeAgentThreadListing,
   mergeAgentThreadRename,
   mergeAgentThreadUpdate,
@@ -46,6 +47,16 @@ void test('thread rename preserves keywords published after the dialog opened', 
     title: 'Renamed',
     renamed: true,
   });
+});
+
+void test('thread activity cannot restore stale keywords after replacement or clearing', () => {
+  const stale = { ...thread, updated: 1, keywords: ['old'] };
+  const activity = { ...stale, updated: 3 };
+  const replaced = mergeAgentThreadUpdate(stale, { ...stale, keywords: ['new'] });
+  const cleared = mergeAgentThreadUpdate(stale, { ...stale, keywords: [] });
+
+  assert.deepEqual(mergeAgentThreadActivity(replaced, activity).keywords, ['new']);
+  assert.deepEqual(mergeAgentThreadActivity(cleared, activity).keywords, []);
 });
 
 void test('newer provider listings retain Sail keyword metadata', () => {
