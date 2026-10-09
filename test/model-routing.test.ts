@@ -68,6 +68,49 @@ void test('parses, deduplicates, and defaults review requirements safely', () =>
   assert.deepEqual(parsed.independentReviewRisks, ['medium', 'high']);
 });
 
+void test('uses the requesting agent when no routes or review requirement are configured', () => {
+  const disabled = parseModelRoutingSettings(null);
+  assert.deepEqual(disabled, { routes: [], independentReviewRisks: [] });
+  assert.deepEqual(selectModelRoute(disabled, { role: 'implementation', risk: 'high' }), {
+    route: null,
+    independentReviewRequired: false,
+    reason: null,
+  });
+  assert.match(
+    selectModelRoute(
+      { routes: [], independentReviewRisks: ['high'] },
+      { role: 'implementation', risk: 'high' },
+    ).reason ?? '',
+    /No high-risk implementation/,
+  );
+  const malformedRoutes = parseModelRoutingSettings(
+    JSON.stringify({ routes: 'invalid', independentReviewRisks: ['high'] }),
+  );
+  assert.deepEqual(malformedRoutes, {
+    routes: [],
+    independentReviewRisks: ['low', 'medium', 'high'],
+  });
+  assert.match(
+    selectModelRoute(malformedRoutes, { role: 'implementation', risk: 'high' }).reason ?? '',
+    /No high-risk implementation/,
+  );
+  for (const raw of [
+    '{',
+    JSON.stringify({
+      routes: [{ role: 'implementation', risk: 'high', provider: 'codex', model: '' }],
+    }),
+    JSON.stringify({ routes: [], independentReviewRisks: 'high' }),
+    JSON.stringify({ routes: [], independentReviewRisks: ['bogus'] }),
+  ]) {
+    const malformed = parseModelRoutingSettings(raw);
+    assert.deepEqual(malformed.independentReviewRisks, ['low', 'medium', 'high']);
+    assert.match(
+      selectModelRoute(malformed, { role: 'implementation', risk: 'low' }).reason ?? '',
+      /No low-risk implementation/,
+    );
+  }
+});
+
 void test('evaluates accepted tasks and known routing failures', () => {
   assert.deepEqual(evaluateModelRouting(settings), {
     revision: '2026-10-08.1',

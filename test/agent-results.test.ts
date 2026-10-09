@@ -142,9 +142,22 @@ await test('spawn receipts persist requested and actual route identity', () => {
     },
   };
   assert.deepEqual(loadSpawnReceipts(JSON.stringify([routed]))[0].routing, routed.routing);
+  const defaultModel: SpawnReceipt = {
+    ...routed,
+    routing: {
+      ...routed.routing!,
+      independentReviewRequired: false,
+      requested: { provider: 'codex', model: null, variant: null },
+      actual: { provider: 'codex', model: null, variant: null },
+    },
+  };
+  assert.deepEqual(
+    loadSpawnReceipts(JSON.stringify([defaultModel]))[0].routing,
+    defaultModel.routing,
+  );
   const invalid = {
     ...routed,
-    routing: { ...routed.routing!, requested: { ...routed.routing!.requested, model: null } },
+    routing: { ...routed.routing!, requested: { ...routed.routing!.requested, model: 1 } },
   };
   assert.equal(loadSpawnReceipts(JSON.stringify([invalid]))[0].routing, undefined);
 });
