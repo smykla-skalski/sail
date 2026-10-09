@@ -14,6 +14,7 @@ await test('desktop probe uses the release content policy', () => {
   assert.equal(release.app.security.csp['object-src'], "'none'");
   assert.equal(release.app.security.csp['frame-src'], "'none'");
   assert.equal(release.app.security.csp['connect-src'].includes('http://localhost:1420'), false);
+  assert.equal(release.app.security.csp['connect-src'], 'ipc: http://ipc.localhost');
 });
 
 await test('agent Markdown cannot navigate to executable or local URLs', () => {
