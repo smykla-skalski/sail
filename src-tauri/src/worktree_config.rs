@@ -59,6 +59,13 @@ pub struct WorktreeConfig {
     #[serde(default, rename = "postTurnChecks")]
     pub post_turn_checks: Vec<String>,
     pub validation: Option<ShipValidationConfig>,
+    pub context: Option<ContextConfig>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextConfig {
+    pub manifest: String,
 }
 
 fn validate(config: &WorktreeConfig) -> Result<(), String> {
