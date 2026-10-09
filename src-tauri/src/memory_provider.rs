@@ -337,20 +337,29 @@ fn credential(project_key: &str) -> Result<keyring::Entry, String> {
         .map_err(|_| "Cannot access the system credential store.".to_string())
 }
 
-fn load_api_key(project_key: &str) -> Result<String, String> {
-    if let Ok(api_key) = credential(project_key).and_then(|entry| {
-        entry
-            .get_password()
-            .map_err(|_| "Mem0 credentials are unavailable.".to_string())
-    }) {
-        return Ok(api_key);
-    }
-    session_credentials()
+fn load_api_key_with<F>(project_key: &str, load_keychain: F) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    if let Some(api_key) = session_credentials()
         .lock()
         .map_err(|_| "Mem0 credentials are unavailable.".to_string())?
         .get(project_key)
         .cloned()
-        .ok_or_else(|| "Mem0 credentials are unavailable.".to_string())
+    {
+        return Ok(api_key);
+    }
+    load_keychain()
+}
+
+fn load_api_key(project_key: &str) -> Result<String, String> {
+    load_api_key_with(project_key, || {
+        credential(project_key).and_then(|entry| {
+            entry
+                .get_password()
+                .map_err(|_| "Mem0 credentials are unavailable.".to_string())
+        })
+    })
 }
 
 fn store_api_key(project_key: &str, api_key: &str) -> Result<CredentialStorage, String> {
@@ -385,6 +394,12 @@ fn delete_api_key(project_key: &str) {
 }
 
 fn credential_storage(project_key: &str) -> Option<CredentialStorage> {
+    if session_credentials()
+        .lock()
+        .is_ok_and(|credentials| credentials.contains_key(project_key))
+    {
+        return Some(CredentialStorage::Memory);
+    }
     if credential(project_key)
         .and_then(|entry| {
             entry
@@ -395,11 +410,11 @@ fn credential_storage(project_key: &str) -> Option<CredentialStorage> {
     {
         return Some(CredentialStorage::Keychain);
     }
-    session_credentials().lock().ok().and_then(|credentials| {
-        credentials
-            .contains_key(project_key)
-            .then_some(CredentialStorage::Memory)
-    })
+    None
+}
+
+fn provider_change_resets_pending(previous: &ProviderConfig, next: &ProviderConfig) -> bool {
+    previous.provider != ProviderKind::Local && previous != next
 }
 
 fn notice(storage: Option<CredentialStorage>, configured: bool) -> Option<String> {
@@ -1069,7 +1084,7 @@ pub fn set_memory_provider(
     let (root, _) = crate::memory::standalone_paths(&app)?;
     let _lock = provider_lock(&root, &key)?;
     let previous = load_config(&app, &key)?;
-    if previous != config {
+    if provider_change_resets_pending(&previous, &config) {
         save_pending_events(&root, &key, &PendingEvents::new())?;
         save_runtime_error(&root, &key, None);
     }
@@ -1118,10 +1133,12 @@ pub fn sync_memory_provider(app: tauri::AppHandle, directory: String) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        config_key, load_pending_events, load_runtime_status, merge_results, normalize_config,
-        notice, provider_lock, remote_memories, search_standalone, session_credentials, sync_at,
-        CredentialStorage, Mem0Provider, MemoryProvider, PendingEvents, ProviderConfig,
-        ProviderInput, ProviderKind, HOSTED_PAGE_SIZE, SELF_HOSTED_SAFE_LIMIT,
+        config_key, credential_storage, load_api_key_with, load_pending_events,
+        load_runtime_status, merge_results, normalize_config, notice,
+        provider_change_resets_pending, provider_lock, remote_memories, search_standalone,
+        session_credentials, sync_at, CredentialStorage, Mem0Provider, MemoryProvider,
+        PendingEvents, ProviderConfig, ProviderInput, ProviderKind, HOSTED_ENDPOINT,
+        HOSTED_PAGE_SIZE, SELF_HOSTED_SAFE_LIMIT,
     };
     use crate::memory::{
         forget_at, remember_at, MemoryInput, MemoryKind, MemoryProvenance, MemoryRecord,
@@ -1245,6 +1262,41 @@ mod tests {
     fn memory_only_credentials_explain_standalone_fallback() {
         let message = notice(Some(CredentialStorage::Memory), true).unwrap();
         assert!(message.contains("Standalone agent memory uses local search"));
+    }
+
+    #[test]
+    fn session_credential_overrides_stale_keychain_value() {
+        let key = Uuid::new_v4().to_string();
+        session_credentials()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), "current".into());
+        assert_eq!(
+            load_api_key_with(&key, || Ok("stale".into())).unwrap(),
+            "current"
+        );
+        assert_eq!(credential_storage(&key), Some(CredentialStorage::Memory));
+        session_credentials().lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn failed_first_enable_preserves_pending_submission() {
+        let local = ProviderConfig {
+            provider: ProviderKind::Local,
+            endpoint: None,
+        };
+        let hosted = ProviderConfig {
+            provider: ProviderKind::Mem0Hosted,
+            endpoint: Some(HOSTED_ENDPOINT.into()),
+        };
+        assert!(!provider_change_resets_pending(&local, &hosted));
+        assert!(!provider_change_resets_pending(&hosted, &hosted));
+
+        let self_hosted = ProviderConfig {
+            provider: ProviderKind::Mem0SelfHosted,
+            endpoint: Some("https://mem0.example".into()),
+        };
+        assert!(provider_change_resets_pending(&hosted, &self_hosted));
     }
 
     #[test]
