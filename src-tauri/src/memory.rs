@@ -96,7 +96,7 @@ fn now() -> u64 {
         .as_millis() as u64
 }
 
-fn project_key_for(directory: &Path) -> Result<String, String> {
+pub fn project_key_for(directory: &Path) -> Result<String, String> {
     let common = crate::git_common_directory(directory)?;
     let mut digest = Sha256::new();
     digest.update(common.to_string_lossy().as_bytes());
@@ -316,6 +316,16 @@ fn list_at(root: &Path, key: &str, forgotten: bool) -> Result<Vec<MemoryRecord>,
     Ok(memories)
 }
 
+pub fn list(
+    app: &tauri::AppHandle,
+    directory: &str,
+    include_forgotten: bool,
+) -> Result<Vec<MemoryRecord>, String> {
+    ensure_enabled(app, directory)?;
+    let (root, key) = context(app, directory)?;
+    list_at(&root, &key, include_forgotten)
+}
+
 fn remember_at(root: &Path, key: &str, input: MemoryInput) -> Result<MemoryRecord, String> {
     let input = validate(input)?;
     let paths = paths(root, key);
@@ -452,10 +462,21 @@ pub fn remember(
     input: MemoryInput,
 ) -> Result<MemoryRecord, String> {
     let (root, key) = context(app, directory)?;
-    remember_at(&root, &key, input)
+    let memory = remember_at(&root, &key, input)?;
+    crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    Ok(memory)
 }
 
 pub fn search(
+    app: &tauri::AppHandle,
+    directory: &str,
+    query: &str,
+    limit: Option<usize>,
+) -> Result<Vec<MemorySearchResult>, String> {
+    crate::memory_provider::search(app, directory, query, limit)
+}
+
+pub(crate) fn search_local(
     app: &tauri::AppHandle,
     directory: &str,
     query: &str,
@@ -472,7 +493,9 @@ pub fn inspect(app: &tauri::AppHandle, directory: &str, id: &str) -> Result<Memo
 
 pub fn forget(app: &tauri::AppHandle, directory: &str, id: &str) -> Result<MemoryRecord, String> {
     let (root, key) = context(app, directory)?;
-    forget_at(&root, &key, id)
+    let memory = forget_at(&root, &key, id)?;
+    crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    Ok(memory)
 }
 
 pub fn rate(
@@ -482,7 +505,9 @@ pub fn rate(
     rating: i8,
 ) -> Result<MemoryRecord, String> {
     let (root, key) = context(app, directory)?;
-    rate_at(&root, &key, id, rating)
+    let memory = rate_at(&root, &key, id, rating)?;
+    crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    Ok(memory)
 }
 
 #[tauri::command]
@@ -514,9 +539,7 @@ pub fn memory_list(
     directory: String,
     include_forgotten: Option<bool>,
 ) -> Result<Vec<MemoryRecord>, String> {
-    ensure_enabled(&app, &directory)?;
-    let (root, key) = context(&app, &directory)?;
-    list_at(&root, &key, include_forgotten.unwrap_or(false))
+    list(&app, &directory, include_forgotten.unwrap_or(false))
 }
 
 #[tauri::command]
