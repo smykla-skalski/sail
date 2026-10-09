@@ -417,6 +417,18 @@ fn provider_change_resets_pending(previous: &ProviderConfig, next: &ProviderConf
     previous.provider != ProviderKind::Local && previous != next
 }
 
+fn commit_provider_switch<C, R>(switching: bool, commit: C, reset_pending: R) -> Result<(), String>
+where
+    C: FnOnce() -> Result<(), String>,
+    R: FnOnce() -> Result<(), String>,
+{
+    if switching {
+        commit()?;
+        reset_pending()?;
+    }
+    Ok(())
+}
+
 fn notice(storage: Option<CredentialStorage>, configured: bool) -> Option<String> {
     match storage {
         Some(CredentialStorage::Memory) => Some(
@@ -1084,10 +1096,6 @@ pub fn set_memory_provider(
     let (root, _) = crate::memory::standalone_paths(&app)?;
     let _lock = provider_lock(&root, &key)?;
     let previous = load_config(&app, &key)?;
-    if provider_change_resets_pending(&previous, &config) {
-        save_pending_events(&root, &key, &PendingEvents::new())?;
-        save_runtime_error(&root, &key, None);
-    }
     if config.provider == ProviderKind::Local {
         save_config(&app, &key, None)?;
         delete_api_key(&key);
@@ -1111,9 +1119,29 @@ pub fn set_memory_provider(
         .ok_or("A Mem0 API key is required.")?;
     let provider = provider(&config, api_key.to_string())?;
     provider.verify(&key)?;
-    provider.reconcile(&root, &key, &crate::memory::list(&app, &directory, true)?)?;
-    let storage = store_api_key(&key, api_key)?;
-    save_config(&app, &key, Some(&config))?;
+    let switching = provider_change_resets_pending(&previous, &config);
+    commit_provider_switch(
+        switching,
+        || save_config(&app, &key, Some(&config)),
+        || save_pending_events(&root, &key, &PendingEvents::new()),
+    )?;
+    if switching {
+        save_runtime_error(&root, &key, None);
+    }
+    let memories = crate::memory::list(&app, &directory, true)?;
+    let storage = if switching {
+        let storage = store_api_key(&key, api_key)?;
+        if let Err(error) = provider.reconcile(&root, &key, &memories) {
+            save_runtime_error(&root, &key, Some(&error));
+            return Err(error);
+        }
+        storage
+    } else {
+        provider.reconcile(&root, &key, &memories)?;
+        let storage = store_api_key(&key, api_key)?;
+        save_config(&app, &key, Some(&config))?;
+        storage
+    };
     Ok(ProviderStatus {
         provider: config.provider,
         endpoint: config.endpoint,
@@ -1133,8 +1161,8 @@ pub fn sync_memory_provider(app: tauri::AppHandle, directory: String) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        config_key, credential_storage, load_api_key_with, load_pending_events,
-        load_runtime_status, merge_results, normalize_config, notice,
+        commit_provider_switch, config_key, credential_storage, load_api_key_with,
+        load_pending_events, load_runtime_status, merge_results, normalize_config, notice,
         provider_change_resets_pending, provider_lock, remote_memories, search_standalone,
         session_credentials, sync_at, CredentialStorage, Mem0Provider, MemoryProvider,
         PendingEvents, ProviderConfig, ProviderInput, ProviderKind, HOSTED_ENDPOINT,
@@ -1297,6 +1325,36 @@ mod tests {
             endpoint: Some("https://mem0.example".into()),
         };
         assert!(provider_change_resets_pending(&hosted, &self_hosted));
+    }
+
+    #[test]
+    fn failed_remote_switch_commit_does_not_clear_pending_submission() {
+        let cleared = std::cell::Cell::new(false);
+        let result = commit_provider_switch(
+            true,
+            || Err("settings failed".into()),
+            || {
+                cleared.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err("settings failed".into()));
+        assert!(!cleared.get());
+
+        let steps = std::cell::RefCell::new(Vec::new());
+        commit_provider_switch(
+            true,
+            || {
+                steps.borrow_mut().push("commit");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("clear");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*steps.borrow(), ["commit", "clear"]);
     }
 
     #[test]
