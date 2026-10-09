@@ -7,7 +7,12 @@
 | OpenCode CLI | `@opencode/cli@2.0.24`           | ACP availability check (`opencode --version`)          |
 | Tauri app    | This repository's current commit | Rust CI on Linux, macOS, Windows; desktop WDIO locally |
 
+| OpenCode CLI | `@opencode/cli@2.0.24` | ACP availability check (`opencode --version`) |
+| Tauri app | This repository's current commit | Rust CI on Linux, macOS, Windows; desktop WDIO locally |
+
 Sail starts OpenCode as `<binary> acp` and requires the exact CLI version above. Update the version pin in `src-tauri/src/lib.rs` and this table together.
+
+Remote MCP registration behavior of the pinned client is re-verified by `node scripts/opencode-remote-mcp-probe.mjs` (see `docs/provider-runtime.md`); the unit suite runs it when the pinned client is available and skips otherwise.
 
 ## Automated checks
 
