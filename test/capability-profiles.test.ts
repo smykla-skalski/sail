@@ -639,6 +639,7 @@ await test('maps workflow phase to capability profile', () => {
   assert.equal(capabilityProfileForPhase('explore'), 'explore');
   assert.equal(capabilityProfileForPhase('review'), 'review');
   assert.equal(capabilityProfileForPhase('implement'), 'build');
+  assert.equal(capabilityProfileForPhase('publish'), 'release');
   assert.equal(capabilityProfileForPhase('pr'), 'release');
 });
 

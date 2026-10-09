@@ -527,7 +527,7 @@ export function automaticPermissionPolicy(
 export function capabilityProfileForPhase(phase?: string): CapabilityProfile {
   if (phase === 'explore') return 'explore';
   if (phase === 'review' || phase === 'test') return 'review';
-  if (phase === 'pr' || phase === 'complete') return 'release';
+  if (phase === 'publish' || phase === 'pr' || phase === 'complete') return 'release';
   return 'build';
 }
 
