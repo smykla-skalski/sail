@@ -198,11 +198,17 @@ fn credential_storage(project_key: &str) -> Option<CredentialStorage> {
     })
 }
 
-fn notice(storage: Option<CredentialStorage>) -> Option<String> {
-    (storage == Some(CredentialStorage::Memory)).then(|| {
-        "The OS credential store is unavailable. The API key is kept in memory for this Sail session only."
-            .to_string()
-    })
+fn notice(storage: Option<CredentialStorage>, configured: bool) -> Option<String> {
+    match storage {
+        Some(CredentialStorage::Memory) => Some(
+            "The OS credential store is unavailable. The API key is kept in memory for this Sail session only."
+                .to_string(),
+        ),
+        None if configured => Some(
+            "The Mem0 credential is unavailable. Enter the API key again to reconnect.".to_string(),
+        ),
+        _ => None,
+    }
 }
 
 fn normalize_config(input: &ProviderInput) -> Result<ProviderConfig, String> {
@@ -521,7 +527,10 @@ pub fn search(
 ) -> Result<Vec<MemorySearchResult>, String> {
     let local = || crate::memory::search_local(app, directory, query, limit);
     let key = project_key(directory)?;
-    let config = load_config(app, &key)?;
+    let config = match load_config(app, &key) {
+        Ok(config) => config,
+        Err(_) => return local(),
+    };
     if config.provider == ProviderKind::Local {
         return local();
     }
@@ -531,12 +540,11 @@ pub fn search(
         .into_iter()
         .map(|memory| (memory.id.clone(), memory))
         .collect();
-    remote_or_local(
-        provider(&config, load_api_key(&key)?)
-            .and_then(|provider| provider.search(&key, query, maximum))
-            .map(|remote| map_remote_results(remote, &canonical, maximum)),
-        local,
-    )
+    let remote = load_api_key(&key)
+        .and_then(|api_key| provider(&config, api_key))
+        .and_then(|provider| provider.search(&key, query, maximum))
+        .map(|remote| map_remote_results(remote, &canonical, maximum));
+    remote_or_local(remote, local)
 }
 
 fn map_remote_results(
@@ -574,12 +582,13 @@ pub fn memory_provider_status(
     let key = project_key(&directory)?;
     let config = load_config(&app, &key)?;
     let storage = credential_storage(&key);
+    let configured = config.provider != ProviderKind::Local;
     Ok(ProviderStatus {
-        configured: config.provider != ProviderKind::Local,
+        configured,
         provider: config.provider,
         endpoint: config.endpoint,
         credential_storage: storage,
-        notice: notice(storage),
+        notice: notice(storage, configured),
     })
 }
 
@@ -627,22 +636,24 @@ pub fn set_memory_provider(
             notice: None,
         });
     }
+    crate::memory::ensure_enabled(&app, &directory)?;
     let api_key = input
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or("A Mem0 API key is required.")?;
-    provider(&config, api_key.to_string())?.verify(&key)?;
+    let provider = provider(&config, api_key.to_string())?;
+    provider.verify(&key)?;
+    provider.reconcile(&key, &crate::memory::list(&app, &directory, true)?)?;
     let storage = store_api_key(&key, api_key)?;
     save_config(&app, &key, Some(&config))?;
-    sync(&app, &directory)?;
     Ok(ProviderStatus {
         provider: config.provider,
         endpoint: config.endpoint,
         configured: true,
         credential_storage: Some(storage),
-        notice: notice(Some(storage)),
+        notice: notice(Some(storage), true),
     })
 }
 
