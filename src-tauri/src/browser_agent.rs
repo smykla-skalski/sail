@@ -1208,6 +1208,7 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         "implementation.md",
         ship_it_file!("references/implementation.md"),
     ),
+    ("publish.md", ship_it_file!("references/publish.md")),
     ("review.md", ship_it_file!("references/review.md")),
     ("test.md", ship_it_file!("references/test.md")),
     ("pr-loop.md", ship_it_file!("references/pr-loop.md")),
@@ -1253,6 +1254,15 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
         "convergence-policy.json",
         ship_it_file!("references/convergence-policy.json"),
     ),
+    ("replay.md", ship_it_file!("references/replay.md")),
+    (
+        "replay-trace.schema.json",
+        ship_it_file!("references/replay-trace.schema.json"),
+    ),
+    (
+        "worker-rules.md",
+        ship_it_file!("references/worker-rules.md"),
+    ),
     ("ci-triage.md", ship_it_file!("references/ci-triage.md")),
     (
         "ci-triage.schema.json",
@@ -1260,12 +1270,28 @@ const SHIP_IT_REFERENCES: &[(&str, &str)] = &[
     ),
     ("fallbacks.md", ship_it_file!("references/fallbacks.md")),
     (
+        "scripts/bookkeeping.py",
+        ship_it_file!("scripts/bookkeeping.py"),
+    ),
+    (
         "scripts/ci_triage.py",
         ship_it_file!("scripts/ci_triage.py"),
     ),
     (
+        "scripts/replay_failures.py",
+        ship_it_file!("scripts/replay_failures.py"),
+    ),
+    (
         "scripts/telemetry.py",
         ship_it_file!("scripts/telemetry.py"),
+    ),
+    (
+        "scripts/test_replay_failures.py",
+        ship_it_file!("scripts/test_replay_failures.py"),
+    ),
+    (
+        "scripts/test_telemetry.py",
+        ship_it_file!("scripts/test_telemetry.py"),
     ),
 ];
 const ADVERSARIAL_REVIEW_SKILL: &str = include_str!("../../skills/adversarial-review/SKILL.md");
@@ -1278,12 +1304,22 @@ const ADVERSARIAL_REVIEW_REFERENCES: &[(&str, &str)] = &[
         "findings-adversary.md",
         include_str!("../../skills/adversarial-review/references/findings-adversary.md"),
     ),
+    (
+        "workflow.md",
+        include_str!("../../skills/adversarial-review/references/workflow.md"),
+    ),
 ];
 const ADVERSARIAL_TEST_SKILL: &str = include_str!("../../skills/adversarial-test/SKILL.md");
-const ADVERSARIAL_TEST_REFERENCES: &[(&str, &str)] = &[(
-    "test-adversary.md",
-    include_str!("../../skills/adversarial-test/references/test-adversary.md"),
-)];
+const ADVERSARIAL_TEST_REFERENCES: &[(&str, &str)] = &[
+    (
+        "test-adversary.md",
+        include_str!("../../skills/adversarial-test/references/test-adversary.md"),
+    ),
+    (
+        "workflow.md",
+        include_str!("../../skills/adversarial-test/references/workflow.md"),
+    ),
+];
 
 fn bundled_skill(name: &str) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
     match name {

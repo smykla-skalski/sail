@@ -8,33 +8,32 @@ allowed-tools: Agent Bash Edit Glob Grep Read Skill ToolSearch Write
 user-invocable: true
 metadata:
   short-description: Ship a change, issue, or Jira ticket to merge
-  upstream: smykla-skalski/sai plugins/ship-it 1.4.20 with Sail mode
+  upstream: smykla-skalski/sai plugins/ship-it 1.4.33 with Sail mode
 ---
 
 # Ship It
 
 Take a change to a merged PR, or coordinate independently shippable issues from an approved complex plan.
 
-**Mode:** autonomous. Ask only for unresolved material ambiguity. Poll selected hosted gates until merged or a hard stop.
+**Mode:** autonomous. Ask only on material ambiguity. Use blocking waiters until merged or a hard stop; never foreground-poll.
 
-**Other agents:** Read [references/fallbacks.md](references/fallbacks.md) when not in Claude Code or an agent feature is missing.
+**Other agents:** Read [references/fallbacks.md](references/fallbacks.md) only when an agent feature is missing.
 
-Invocation: `/ship-it [--issue] [--risk low|medium|high] <task description | github-issue-url | jira-url>` (`$ship-it` in Codex). Runs only when invoked by name or asked to ship a change. Claude Code appends the arguments; if none are appended, take them from the user's request.
+Invocation: `/ship-it [--issue] [--risk low|medium|high] <task|GitHub issue|Jira URL>` (`$ship-it` in Codex). If arguments are absent, use the request.
 
 ## Workflow contract
 
-- Run phases below in order; do not skip a gate because a harness lacks a preferred tool.
-- Before each phase, read [references/capabilities.md](references/capabilities.md) and [references/capabilities.json](references/capabilities.json), select its profile and satisfy the machine-readable preflight before any side effect.
-- Read [references/roles.md](references/roles.md) and [references/roles.json](references/roles.json) before dispatch.
-- Load each phase reference immediately before that phase, not during initial skill discovery.
-- After resolving, maintain [references/checkpoint.md](references/checkpoint.md) before repository changes, GitHub [references/claims.md](references/claims.md) before branch or source changes, and [references/telemetry.md](references/telemetry.md) through completion.
-- Read [references/evidence.md](references/evidence.md) when the first task revision is committed. Evidence due at each PR or merge gate must pass for the exact current revision.
-- Read [references/risk.md](references/risk.md) after exploration. Select and report the revision's risk, policy source and required gates before validation.
-- Read [references/release.md](references/release.md) after exploration. Resolve repository, GitHub and default release policy into the checkpoint before validation.
-- Before validation, read [references/convergence.md](references/convergence.md) and [references/convergence-policy.json](references/convergence-policy.json); use its shared cross-harness budget.
+- Run phases in order; a missing preferred tool never skips a gate.
+- Read this entry once. Read each selected phase reference once, immediately before that phase, and keep its rules in the checkpoint. Do not reread a reference on phase transitions.
+- Resolve routine capabilities from current tools and the phase reference. Read [references/capabilities.md](references/capabilities.md) and [references/capabilities.json](references/capabilities.json) only on a missing/changed capability or fallback; then rerun the machine preflight.
+- Phase references name routine routes. Read [references/roles.md](references/roles.md) and [references/roles.json](references/roles.json) only for unresolved aliases or policy overrides. Give each gate its mandate by path or inline exactly once in fresh context.
+- After each subagent dispatch, use one blocking wait of at least ten minutes unless the worker returns sooner. Do not list agents or read status between waits; close the worker after its verdict.
+- Maintain the checkpoint through the helper. Read [references/checkpoint.md](references/checkpoint.md) only for migration, recovery or validation error. Claims, evidence and telemetry default off; read [references/claims.md](references/claims.md), [references/evidence.md](references/evidence.md) or [references/telemetry.md](references/telemetry.md) only when enabled.
+- Routine guidance is this entry, selected phase references, [references/risk-policy.json](references/risk-policy.json), [references/release-policy.json](references/release-policy.json) and [references/convergence-policy.json](references/convergence-policy.json): keep it under 12k input tokens. After compaction, read only the checkpoint and current phase reference.
+- Read [references/risk.md](references/risk.md) or [references/release.md](references/release.md) only on override/ambiguity; read [references/convergence.md](references/convergence.md) only after failure, recovery or exhaustive opt-in. Checkpoint gates, release policy and budget before validation.
 - Every source change invalidates completion evidence from the previous revision.
 - Never bypass hooks, suppress checks, force-push after the first push, or force-merge.
-- In Sail mode, follow [Sail mode](#sail-mode). A missing worker, or a gate session that Sail's gate rule requires, pauses the run; never replace it with inline work.
+- In Sail mode, missing worker or gate subagents pause the run; never replace them with inline work.
 
 ## Sail mode
 
@@ -45,7 +44,7 @@ These rules apply when Sail delivers this skill or its `ship_progress`, `task_ch
 - **Gate routing:** Sail's prompt gate rule selects how review and test gates run. With a configured validation pool or strict different-model routing, run each pass that `validation_policy` requires in a separate fresh `validation_gate` session, in Code Adversary, Findings Adversary, Test Adversary order. Pass every implementation model, wait for each receipt before the next pass, report each pass's actual provider and model, never substitute a model outside the pool, and pause when no allowed session can launch. Under Sail's default gate rule, run the required passes in this Ship It session with the implementation agent and model and do not call `validation_gate`. Follow the mandates in `review.md` and `test.md`, or the full ones from `skill_reference`: `code-adversary.md` and `findings-adversary.md` from `adversarial-review`, and `test-adversary.md` from `adversarial-test`. Reference lines that say Sail never runs a gate inline apply only when Sail's gate rule requires a gate session. Record those routes with `independence: degraded`, every failed strict rule as a reason, and Sail's default gate rule as the authorization. Sail workers supply the `subagent.review` and `subagent.test` capabilities that `capabilities.json` requires when `sail` is true; Sail's gate rule, not that preflight, picks the route. CI triage uses a fresh native subagent when your agent has one. Otherwise, under Sail's default gate rule, run it in this session and record its route with `mechanism: inline` and `independence: not-applicable`.
 - **Checkpoint:** Keep the portable checkpoint, claim and evidence records the references require, and mirror them into Sail's task checkpoint. Call `task_checkpoint_read` before resuming and stop on a revision or delivery mismatch, except the merge handoff below. After every phase, blocker, revision, required-gate, question or next-action change, call `task_checkpoint_update` with the sequence and revision from the last read; rebind only after inspecting worktree drift. Replace Sail's initial objective and acceptance criteria with the resolved task contract. Sail's checkpoint has no `cancelled` or `failed` status: mirror a terminal outcome by keeping the last phase before `complete`, with `status: blocked`, the reason as `blocker` and a concrete `nextAction`.
 - **Claims:** When Sail's prompt says Sail holds a visible claim with an exact claim ID for this task on behalf of this worker, that `sail-claim:v1` comment is your ownership. Do not post a `claims.md` comment, and do not renew, take over or release Sail's claim; Sail does. Record its ID in the portable checkpoint and evidence claim, and read its comment URL and expiry from the matching `sail-claim:v1` issue comment. Without such a prompt, follow `claims.md`. Either way, another holder's active, unexpired `sail-claim:v1` marker on the issue is a conflicting claim: stop. An expired one is audit history.
-- **Risk and Sail gates:** After selecting risk with `risk.md`, call `validation_policy` with that level before validation. Sail combines it with the repository's `.sail/worktree.json` defaults and changed-path rules, never lowers an earlier selection, stores the required Sail gates as the checkpoint's `requiredGates`, and returns them. Run exactly those `code-adversary`, `findings-adversary` and `test-adversary` passes and record the portable `adversarial-review` and `adversarial-test` results from them; do not set `requiredGates` yourself. Select the policy again after the worktree changes. Record `local-checks` results with `task_evidence_record`. Keep `ci` and `hosted-review` in the portable checkpoint; Sail reads pull request checks itself.
+- **Risk and Sail gates:** After selecting risk, call `validation_policy` with that level before validation. Sail combines it with the repository's `.sail/worktree.json` defaults and changed-path rules, never lowers an earlier selection, stores the required Sail gates as the checkpoint's `requiredGates`, and returns them. Run exactly those `code-adversary`, `findings-adversary` and `test-adversary` passes and record the portable `adversarial-review` and `adversarial-test` results from them; do not set `requiredGates` yourself. Select the policy again after the worktree changes. Record `local-checks` results with `task_evidence_record`. Keep `ci` and `hosted-review` in the portable checkpoint; Sail reads pull request checks itself.
 - **Evidence:** Before each quality command, read the execution boundary from `task_checkpoint_read`. Then call `task_evidence_record` with its `expectedRevision`, `expectedMutationGeneration` and `expectedBaseRevision`, the exact acceptance criterion strings the result verifies and a bounded output reference. After any source change, rebind and rerun required evidence; never reuse a stale result.
 - **Progress:** Call `ship_progress` with `{ stage, status: "running" }` before implementing, reviewing, testing, opening the pull request, waiting on CI and merging, using stages `implementing`, `reviewing`, `testing`, `pull_request`, `ci` and `merging`. When work cannot continue, report `status: "blocked"` with a concrete reason before explaining the blocker. NEEDS_FIXES, FAIL and CI fix rounds stay `running`. In Sail, a blocked report is how you reach the user: when the convergence budget stops the run, report `status: "blocked"` with the exhausted limit and the last surviving findings as the reason. A verdict reported from this session includes the checkpoint `revision` read before the pass, the exact acceptance criteria the pass verified and a bounded output reference. `validation_gate` sessions report their own verdicts.
 - **Merge owner:** Repository instructions such as `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md` or release-policy prose that state who merges take precedence over Sail's "You merge" rule in either direction. The structured release policy has no merge-owner field; like any documented merge mechanism, such as a bot comment, it says how to merge, not who merges. When the repository says nothing about who merges, Sail's prompt decides: with its "You merge" rule the user merges, and without it you merge through the resolved release policy.
@@ -53,46 +52,51 @@ These rules apply when Sail delivers this skill or its `ship_progress`, `task_ch
 
 ## Phase reference index
 
-| Phase          | Read immediately before starting                             |
-| :------------- | :----------------------------------------------------------- |
-| 1 — Resolve    | [references/inputs.md](references/inputs.md)                 |
-| 2 — Explore    | [references/explore.md](references/explore.md)               |
-| 3 — Branch     | [references/branch.md](references/branch.md)                 |
-| 4 — Implement  | [references/implementation.md](references/implementation.md) |
-| 5 — Review     | [references/review.md](references/review.md)                 |
-| 6 — Test       | [references/test.md](references/test.md)                     |
-| 7–10 — PR loop | [references/pr-loop.md](references/pr-loop.md)               |
-| 11 — Complete  | [references/completion.md](references/completion.md)         |
+| Phase             | Read immediately before starting                             |
+| :---------------- | :----------------------------------------------------------- |
+| 1 — Resolve       | [references/inputs.md](references/inputs.md)                 |
+| 2 — Explore       | [references/explore.md](references/explore.md)               |
+| 3 — Branch        | [references/branch.md](references/branch.md)                 |
+| 4 — Implement     | [references/implementation.md](references/implementation.md) |
+| 5 — Publish draft | [references/publish.md](references/publish.md)               |
+| 6 — Review        | [references/review.md](references/review.md)                 |
+| 7 — Test          | [references/test.md](references/test.md)                     |
+| 8–10 — PR loop    | [references/pr-loop.md](references/pr-loop.md)               |
+| 11 — Complete     | [references/completion.md](references/completion.md)         |
 
 ## Phase 1 — Resolve the task
 
-Classify the input, resolve its source and acceptance criteria, and create or resume its durable checkpoint outside the repository. No branch, edit or commit until resolution and checkpoint reconciliation succeed.
+Resolve the source and acceptance criteria, then create or resume the durable checkpoint before repository changes.
 
-If the input is an approved complex plan or an umbrella issue with subissues, read [references/orchestration.md](references/orchestration.md) and follow its parent coordinator workflow. The parent never implements a child issue. An ordinary implementation issue, including a worker's assigned issue, follows the single-change phases below. In Sail mode, an absent worker, or an absent gate session that Sail's gate rule requires, pauses the run; never fall back to inline gates.
+For an approved complex plan or umbrella, read [references/orchestration.md](references/orchestration.md); the parent never implements a child. Ordinary issues use the phases below. In Sail, missing workers or gates pause the run.
 
 ## Phase 2 — Explore
 
-Discover repository instructions, affected code and required quality gates. Resolve and checkpoint release policy before editing.
+Discover repository instructions, affected code and gates.
 
 ## Phase 3 — Branch
 
-Start from the current default branch in an isolated conventional branch or assigned Sail worktree.
+Use an isolated branch from the current default branch or assigned Sail worktree.
 
 ## Phase 4 — Implement
 
-Implement the smallest complete change, add behavior tests, run relevant gates and create signed conventional commits.
+Implement the smallest complete change with behavior tests and signed conventional commits.
 
-## Phase 5 — Review
+## Phase 5 — Publish draft PR
+
+After the first committed revision passes local checks, push it and open a draft PR so CI starts. The draft remains pending review and test gates.
+
+## Phase 6 — Review
 
 Run the selected review gates for the current committed revision.
 
-## Phase 6 — Test
+## Phase 7 — Test
 
-Run the selected test gates for the review-clean committed revision.
+Run each selected broad test gate once, only for the review-clean committed revision.
 
-## Phases 7–10 — PR, wait, fix, merge
+## Phases 8–10 — Wait, fix, ready, merge
 
-Push and open the PR, wait for selected hosted gates, resolve every required thread, revalidate changed revisions, then merge through the repository's documented convention. When Sail's merge-owner rule applies, stop at a mergeable pull request instead.
+Resolve hosted gates and threads, revalidate changes, mark ready only when review, test and CI pass for one head, then use the documented merge convention.
 
 ## Phase 11 — Close, report, clean up
 
@@ -100,4 +104,4 @@ Verify delivery, close only the GitHub issue, report evidence and clean up when 
 
 ## Hard stops
 
-Stop and name the exact next human action when: a capability preflight fails; the source is invalid or ownership conflicts; a required control cannot pass; a hosted requirement exceeds its deadline; validation exceeds the convergence budget; a selected test is BLOCKED; or the repository cannot answer a required product decision.
+Stop and name the exact next human action when: a capability preflight fails; the source is invalid or ownership conflicts; a required control cannot pass; a hosted requirement exceeds its deadline; a delivery blocker survives the convergence budget; a selected test is BLOCKED; or the repository cannot answer a required product decision.

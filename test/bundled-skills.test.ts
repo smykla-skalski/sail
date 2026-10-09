@@ -114,7 +114,7 @@ void test('Vite loads bundled-skills.ts with each skill on its own core', async 
 void test('the bundled ship-it records which upstream release it matches', () => {
   assert.match(
     shipItCore,
-    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.20 with Sail mode/,
+    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.33 with Sail mode/,
   );
 });
 
@@ -126,7 +126,9 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
   assert.match(prompt, /`task_checkpoint_update`/);
   assert.match(prompt, /`task_evidence_record`/);
   assert.match(prompt, /`validation_gate`/);
-  assert.match(prompt, /Available references: inputs\.md, .*scripts\/telemetry\.py\./);
+  assert.match(prompt, /Available references: inputs\.md, .*scripts\/test_telemetry\.py\./);
+  assert.match(prompt, /publish\.md/);
+  assert.match(prompt, /scripts\/bookkeeping\.py/);
   assert.doesNotMatch(prompt, /# Durable ship-it checkpoint/);
   assert.match(shipItCore, /They extend the phases, hard stops and references\./);
 
