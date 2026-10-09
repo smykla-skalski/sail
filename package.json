@@ -10,6 +10,7 @@
     "format": "prettier --write .",
     "test": "node --test test/*.test.ts",
     "test:agent-replay": "node scripts/replay-agent-failures.mjs",
+    "test:context-eval": "node scripts/run-context-eval.mjs",
     "build": "npm run check && vite build",
     "build:e2e": "tauri build --debug --no-bundle --features e2e --config src-tauri/tauri.e2e.conf.json",
     "test:e2e": "wdio run wdio.conf.ts",
