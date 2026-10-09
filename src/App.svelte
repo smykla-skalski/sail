@@ -6370,6 +6370,7 @@
     provider: string,
     model: string | null,
     criteria: string[] | undefined,
+    untestedCriteria: import('./lib/task-evidence').UntestedCriterion[] | undefined,
     outputReference: string | undefined,
     fallbackReference: string,
     expectedRevision: unknown,
@@ -6385,6 +6386,15 @@
     requireEvidenceRevision(expectedRevision, revision);
     if (owner.issue.checkpoint.revision !== revision)
       throw new Error('Bind the task checkpoint to the current revision before reporting a gate.');
+    const reportedCriteria = [
+      ...(criteria ?? []),
+      ...(untestedCriteria ?? []).map(({ criterion }) => criterion),
+    ];
+    const unknownCriterion = reportedCriteria.find(
+      (criterion) => !owner.issue.checkpoint!.acceptanceCriteria.includes(criterion),
+    );
+    if (unknownCriterion)
+      throw new Error(`Gate evidence named an unknown acceptance criterion: ${unknownCriterion}`);
     const evidenceId = evidenceIdentity?.id ?? crypto.randomUUID();
     const evidenceSequence =
       evidenceIdentity?.sequence ?? nextTaskEvidenceSequence(owner.issue.evidenceManifests ?? []);
@@ -6402,7 +6412,8 @@
         timestamp: evidenceIdentity?.timestamp ?? Date.now(),
         sequence: evidenceSequence,
         outputReference: outputReference ?? fallbackReference,
-        criteria: criteria ?? [],
+        criteria: [...new Set(reportedCriteria)],
+        ...(untestedCriteria?.length ? { untestedCriteria } : {}),
         economics,
       },
       baseRevision,
@@ -6507,6 +6518,7 @@
               owner.run.provider,
               model,
               report.criteria,
+              report.untestedCriteria,
               report.outputReference,
               `thread:${sourceId}`,
               report.revision,
@@ -6563,6 +6575,11 @@
                       mutationGeneration: policy?.mutationGeneration,
                       baseRevision,
                       evidenceSequence: recordedEvidenceSequence,
+                      evidenceCriteria: report.criteria ?? [],
+                      evidenceUntestedCriteria: report.untestedCriteria ?? [],
+                      evidenceOutputReference: report.outputReference ?? `thread:${sourceId}`,
+                      evidenceTimestamp: now,
+                      evidenceEconomics: report.economics,
                     },
                     now,
                   ),
@@ -6609,6 +6626,7 @@
       validateGateVerdict(validation.gate, report.verdict);
       const evidenceTimestamp = Date.now();
       const evidenceCriteria = report.criteria ?? [];
+      const evidenceUntestedCriteria = report.untestedCriteria ?? [];
       const evidenceOutputReference =
         report.outputReference ?? `thread:${receipt.targetId ?? receipt.receiptId}`;
       await commitRevisionBoundValidation({
@@ -6634,6 +6652,7 @@
                 receipt.provider,
                 receipt.model ?? null,
                 report.criteria,
+                report.untestedCriteria,
                 report.outputReference,
                 `thread:${receipt.targetId ?? receipt.receiptId}`,
                 validation.revision,
@@ -6695,6 +6714,7 @@
               verdict: report.verdict,
               reason: report.reason,
               evidenceCriteria,
+              evidenceUntestedCriteria,
               evidenceOutputReference,
               evidenceTimestamp,
               evidenceSequence,
@@ -6753,7 +6773,7 @@
       throw new Error('Choose a Ship It validation gate.');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Gate prompt must be 1–8000 characters.');
-    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
+    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. A PASS (partial) must also provide untestedCriteria as exact criterion and environmental blocker pairs, disjoint from criteria. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
     if (
       !Array.isArray(implementingModels) ||
       !implementingModels.every((model) => typeof model === 'string' && !!model.trim())

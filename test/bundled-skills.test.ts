@@ -202,6 +202,7 @@ void test('Sail mode names only Ship tool fields and values the tools accept', (
       bridge,
     );
   assert.ok(schema, 'ship_progress schema not found');
+  assert.match(bridge, /"untestedCriteria":\{"type":"array"/);
   const evidenceFields = /"task_evidence_record",\s*"[^"]*",\s*"([^"]+)"/.exec(bridge);
   assert.ok(evidenceFields, 'task_evidence_record fields not found');
   const evidence = sailModeRule('Evidence');

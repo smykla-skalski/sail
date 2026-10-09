@@ -382,7 +382,13 @@ void test('durable gate receipts recover manifest evidence after restart', () =>
       verdict: 'PASS (partial)',
       revision: 'revision-one',
       baseRevision: undefined,
-      evidenceCriteria: issue.checkpoint!.acceptanceCriteria,
+      evidenceCriteria: [],
+      evidenceUntestedCriteria: [
+        {
+          criterion: issue.checkpoint!.acceptanceCriteria[0],
+          blocker: 'No hardware device is attached.',
+        },
+      ],
       evidenceOutputReference: 'thread:validator',
       evidenceTimestamp: 11,
       evidenceEconomics: economics,
@@ -402,6 +408,12 @@ void test('durable gate receipts recover manifest evidence after restart', () =>
   assert.equal(issue.evidenceManifests?.[0]?.evidence[0]?.id, 'gate:durable-receipt');
   assert.deepEqual(issue.evidenceManifests?.[0]?.evidence[0]?.economics, economics);
   assert.equal(shipEvidenceReadiness(issue).ready, true);
+  assert.deepEqual(shipEvidenceReadiness(issue).untestedCriteria, [
+    {
+      criterion: issue.checkpoint!.acceptanceCriteria[0],
+      blocker: 'No hardware device is attached.',
+    },
+  ]);
   assert.equal(summary.economicsComplete, true);
   assert.equal(summary.totals.checks, 1);
   assert.equal(recoverValidationEvidence(issue, undefined), null);
@@ -1839,13 +1851,24 @@ void test('accepts typed stage and verdict reports, with gate-specific verdicts'
     parseShipReport({
       gate: 'test-adversary',
       verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: 'Hardware criterion', blocker: 'No device attached.' }],
       economics: testEconomics,
     }),
     {
       gate: 'test-adversary',
       verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: 'Hardware criterion', blocker: 'No device attached.' }],
       economics: testEconomics,
     },
+  );
+  assert.throws(() =>
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      economics: testEconomics,
+    }),
   );
 });
 

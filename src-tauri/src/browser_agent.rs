@@ -1854,6 +1854,7 @@ pub fn run_mcp_stdio() {
                             "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED"]},
                             "reason":{"type":"string","maxLength":2000},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
+                            "untestedCriteria":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string","minLength":1,"maxLength":2000},"blocker":{"type":"string","minLength":1,"maxLength":2000}},"required":["criterion","blocker"],"additionalProperties":false},"maxItems":100},
                             "outputReference":{"type":"string","minLength":1,"maxLength":2000},
                             "revision":{"type":"string","minLength":1},
                             "economics":economics_input_schema()
