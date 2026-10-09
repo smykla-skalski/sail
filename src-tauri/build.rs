@@ -20,7 +20,6 @@ fn main() {
             "get_acp_turn_evidence",
             "start_runtime",
             "repository_path_available",
-            "opencode_plan_review_plugin",
             "validate_repository",
             "list_picker_directory",
             "working_tree_diff",

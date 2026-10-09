@@ -400,6 +400,7 @@ struct Connection {
     pending_directory: Mutex<Option<PathBuf>>,
     session_creation: Mutex<()>,
     ready: Condvar,
+    _opencode_config: Option<crate::opencode_config::IsolatedConfig>,
 }
 
 // The adapter fingerprints `cwd` and `mcpServers`, and recreates a live
@@ -2471,6 +2472,7 @@ fn connect_blocking(
     #[cfg(not(feature = "e2e"))]
     let test_agent: Option<std::ffi::OsString> = None;
     let mut paths = Vec::new();
+    let mut opencode_config = None;
     let mut command = if let Some(path) = test_agent {
         let node = find_executable("node").ok_or("Node.js not found.")?;
         paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
@@ -2492,9 +2494,15 @@ fn connect_blocking(
                     .binary_path
                     .clone()
                     .ok_or("OpenCode binary not found.")?;
+                let config = crate::opencode_config::isolate_for_sail()?;
                 let mut command = Command::new(binary);
                 command.arg("acp");
+                command.env("XDG_CONFIG_HOME", config.xdg_config_home());
                 command.env_remove("OPENCODE_CONFIG_DIR");
+                command.env_remove("OPENCODE_CONFIG");
+                command.env_remove("OPENCODE_CONFIG_CONTENT");
+                command.env("OPENCODE_DISABLE_PROJECT_CONFIG", "true");
+                opencode_config = Some(config);
                 command
             }
         }
@@ -2569,6 +2577,7 @@ fn connect_blocking(
         pending_directory: Mutex::new(None),
         session_creation: Mutex::new(()),
         ready: Condvar::new(),
+        _opencode_config: opencode_config,
     });
     let reader = Arc::clone(&runtime);
     let reader_manager = manager.clone();
