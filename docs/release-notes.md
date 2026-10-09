@@ -25,7 +25,7 @@ There is no automatic updater. To update, download the next package for your pla
 ## OpenCode without a server
 
 - Sail no longer starts `opencode serve` or sends requests to an OpenCode server. OpenCode runs only as an ACP agent, like Claude and Codex.
-- The inline OpenCode chat, its plan-review plugin checks and the repository diagnostics in Settings are gone. Settings > OpenCode keeps the binary path and shows whether OpenCode is available.
+- The inline OpenCode chat and repository diagnostics in Settings are gone. Settings > OpenCode keeps the binary path and shows whether OpenCode is available.
 - Agent spawn, Ship workers, validation gates and agent messages reach OpenCode through ACP. OpenCode model routes use the `provider/model` ID from its model selector; saved `provider:model` routes still work.
 - Side chat for an OpenCode thread uses the seeded ACP side chat.
 - OpenCode subagent sessions that Sail did not see start can appear in the sidebar, because OpenCode's session list has no parent marker.

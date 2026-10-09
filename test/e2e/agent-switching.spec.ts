@@ -11,9 +11,44 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+async function openSidebarThreadWithin(title: string) {
+  await browser.execute((threadTitle) => {
+    Reflect.set(window, '__switchStart', performance.now());
+    const visible = () =>
+      document.querySelector('.agent-header')?.textContent?.includes(threadTitle) ?? false;
+    const observer = new MutationObserver(() => {
+      if (!visible()) return;
+      Reflect.set(window, '__switchVisible', performance.now());
+      observer.disconnect();
+    });
+    observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+    [...document.querySelectorAll<HTMLButtonElement>('.project-agent-row')]
+      .find((row) => row.getAttribute('aria-label')?.includes(threadTitle))
+      ?.click();
+    if (visible()) {
+      Reflect.set(window, '__switchVisible', performance.now());
+      observer.disconnect();
+    }
+  }, title);
+  await expect($('.agent-header')).toHaveText(expect.stringContaining(title));
+  await browser.waitUntil(async () =>
+    browser.execute(() => Reflect.has(window, '__switchVisible')),
+  );
+  const result = await browser.execute(() => ({
+    elapsed:
+      Number(Reflect.get(window, '__switchVisible')) - Number(Reflect.get(window, '__switchStart')),
+    selected: document.querySelector('.project-agent-row.active')?.getAttribute('aria-label'),
+  }));
+  console.log('OpenCode ACP sidebar switch', { title, ...result });
+  expect(result.selected).toContain(title);
+  expect(result.elapsed).toBeLessThan(500);
+  await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+}
+
 describe('agent switching', () => {
   const currentRepository = mkdtempSync(join(tmpdir(), 'sail-switch-current-'));
   const targetRepository = mkdtempSync(join(tmpdir(), 'sail-switch-target-'));
+  const openCodeWorkers = ['OpenCode worker one', 'OpenCode worker two', 'OpenCode worker three'];
 
   before(() => {
     execFileSync('git', ['init', '-q', currentRepository]);
@@ -25,20 +60,24 @@ describe('agent switching', () => {
     rmSync(targetRepository, { recursive: true, force: true });
   });
 
-  it('opens an ACP thread from the sidebar without waiting', async () => {
+  it('opens and switches three working OpenCode ACP threads within 500 ms', async () => {
     const current = realpathSync(currentRepository);
     const target = realpathSync(targetRepository);
     await browser.execute((path) => sessionStorage.setItem('sai-e2e-switch-target', path), target);
-    const session = await browser.tauri.execute(async ({ core }) => {
+    const sessions = await browser.tauri.execute(async ({ core }, titles) => {
       const path = sessionStorage.getItem('sai-e2e-switch-target');
       if (!path) throw new Error('Missing target repository');
-      await core.invoke('acp_connect', { agent: 'claude' });
-      return core.invoke<{ sessionId: string }>('acp_new_session', {
-        params: { agent: 'claude', cwd: path },
-      });
-    });
+      await core.invoke('acp_connect', { agent: 'opencode' });
+      return Promise.all(
+        titles.map((title) =>
+          core.invoke<{ sessionId: string }>('acp_new_session', {
+            params: { agent: 'opencode', cwd: path, title },
+          }),
+        ),
+      );
+    }, openCodeWorkers);
     await browser.execute(
-      ({ current: selectedPath, target: targetPath, sessionId }) => {
+      ({ current: selectedPath, target: targetPath, sessions: created, titles }) => {
         sessionStorage.removeItem('sai-e2e-switch-target');
         localStorage.setItem('sai-directory', selectedPath);
         localStorage.removeItem('sai-pane-layouts');
@@ -48,60 +87,61 @@ describe('agent switching', () => {
         );
         localStorage.setItem(
           'sail-agent-threads',
-          JSON.stringify([
-            {
-              agent: 'claude',
-              sessionId,
+          JSON.stringify(
+            created.map((session, index) => ({
+              agent: 'opencode',
+              sessionId: session.sessionId,
               directory: targetPath,
-              title: 'Switch target',
-              updated: Date.now(),
-            },
-          ]),
+              title: titles[index],
+              updated: Date.now() - index,
+            })),
+          ),
         );
       },
-      { current, target, sessionId: session.sessionId },
+      { current, target, sessions, titles: openCodeWorkers },
     );
+    await browser.tauri.execute(async ({ core }, created) => {
+      for (const [index, session] of created.entries())
+        void core.invoke('acp_prompt', {
+          params: {
+            agent: 'opencode',
+            sessionId: session.sessionId,
+            text: 'Sidebar performance turn',
+            turnId: `opencode-sidebar-${index}`,
+            imagePaths: [],
+          },
+        });
+    }, sessions);
     await browser.refresh();
-    const row = $('.project-agent-row[aria-label*="Switch target"]');
-    await expect(row).toBeDisplayed();
-
-    await browser.execute(() => {
-      Reflect.set(window, '__switchStart', performance.now());
-      const observer = new MutationObserver(() => {
-        if (!document.querySelector('.agent-header')?.textContent?.includes('Switch target'))
-          return;
-        Reflect.set(window, '__switchVisible', performance.now());
-        observer.disconnect();
-      });
-      observer.observe(document.body, { subtree: true, childList: true, characterData: true });
-      document
-        .querySelector<HTMLButtonElement>('.project-agent-row[aria-label*="Switch target"]')
-        ?.click();
-    });
-    await expect($('.agent-header')).toHaveText(expect.stringContaining('Switch target'));
-    await browser.waitUntil(async () =>
-      browser.execute(() => Reflect.has(window, '__switchVisible')),
+    await expect($('.project-agent-row[aria-label*="OpenCode worker one"]')).toBeDisplayed();
+    await expect($('.project-agent-row[aria-label*="OpenCode worker two"]')).toBeDisplayed();
+    await expect($('.project-agent-row[aria-label*="OpenCode worker three"]')).toBeDisplayed();
+    await browser.waitUntil(
+      async () =>
+        browser.execute(() =>
+          [...document.querySelectorAll('.project-agent-row')]
+            .filter((row) => row.getAttribute('aria-label')?.includes('OpenCode worker'))
+            .every((row) => row.getAttribute('aria-label')?.includes('Working')),
+        ),
+      { timeoutMsg: 'OpenCode workers did not remain working before the sidebar timing check' },
     );
-    const result = await browser.execute(() => ({
-      elapsed:
-        Number(Reflect.get(window, '__switchVisible')) -
-        Number(Reflect.get(window, '__switchStart')),
-      selected: document.querySelector('.project-agent-row.active')?.getAttribute('aria-label'),
-    }));
-    console.log('ACP switch from the sidebar', result);
-    expect(result.selected).toContain('Switch target');
-    expect(result.elapsed).toBeLessThan(1_500);
-    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
 
-    await $('.agent-launches button').click();
-    await expect($('.agent-header')).toHaveText(expect.stringContaining('New thread'));
-    await $('.agent-menu-launch').click();
-    const search = $('[aria-label="Search command palette"]');
-    await search.setValue('Claude');
-    await browser.keys('Enter');
-    await search.setValue('Switch target');
-    await browser.keys('Enter');
-    await expect($('.agent-header')).toHaveText(expect.stringContaining('Switch target'));
+    await openSidebarThreadWithin(openCodeWorkers[0]);
+    await openSidebarThreadWithin(openCodeWorkers[1]);
+    await openSidebarThreadWithin(openCodeWorkers[2]);
+    await browser.tauri.execute(
+      async ({ core }, created) =>
+        Promise.all(
+          created.map((session) =>
+            core.invoke('acp_cancel', {
+              agent: 'opencode',
+              sessionId: session.sessionId,
+              turnId: null,
+            }),
+          ),
+        ),
+      sessions,
+    );
   });
 
   it('rejects a saved thread after its selected worktree is removed outside Sail', async () => {
@@ -111,9 +151,9 @@ describe('agent switching', () => {
 
     await $('.agent-menu-launch').click();
     const search = $('[aria-label="Search command palette"]');
-    await search.setValue('Claude');
+    await search.setValue('OpenCode');
     await browser.keys('Enter');
-    await search.setValue('Switch target');
+    await search.setValue(openCodeWorkers[0]);
     await browser.keys('Enter');
     await expect($('.palette-error')).toHaveText('This session is no longer available.');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('New thread'));

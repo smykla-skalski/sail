@@ -1785,23 +1785,6 @@
     setSidebarWidth(width);
   }
 
-  function modelKey(model: ModelRef) {
-    return `${model.providerID}:${model.id}`;
-  }
-
-  let chosenModel = $derived(setup?.models.find((model) => modelKey(model) === selectedModelKey));
-  let agentChoices = $derived(
-    (setup?.agents ?? []).map((agent) => ({ value: agent.id, name: agent.name })),
-  );
-  let modelChoices = $derived(
-    (setup?.models ?? []).map((model) => ({
-      value: modelKey(model),
-      name: `${model.providerID} / ${model.name}`,
-    })),
-  );
-  let effortChoices = $derived(
-    (chosenModel?.variants ?? []).map((variant) => ({ value: variant.id, name: variant.id })),
-  );
   let acpPlanTick = $state(0);
   let acpPlanScope = $derived<PlanScope | null>(
     acpAgent && acpThread ? { agent: acpAgent, directory, sessionId: acpThread.sessionId } : null,
@@ -2184,6 +2167,7 @@
         else unlistenNotificationClick = unlisten;
         return undefined;
       });
+      if (directory) void canonicalizeProject(directory);
     }
     const attentionTimer = setInterval(() => (attentionClock = Date.now()), 30_000);
     const shippingTimer = setInterval(() => void tickShippingRuns(), 15_000);
@@ -8509,7 +8493,11 @@
     const current = selection;
     try {
       const repository = await invoke<string>('validate_repository', { path });
-      if (current !== selection || path === repository) return;
+      if (current !== selection) return;
+      if (path === repository) {
+        setSetting('sai-directory', repository);
+        return;
+      }
       if (paneLayouts[path]) {
         paneLayouts = {
           ...paneLayouts,
