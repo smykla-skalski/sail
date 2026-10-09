@@ -514,6 +514,21 @@
   import { annotateDiffs, repoPath, selectedDiffFile, type WorkingDiffInfo } from './lib/diff';
   import type { DiffComment } from './lib/diff-comments';
   import {
+    automaticCaptureControl,
+    persistAutomaticCapture,
+    type MemoryStatus,
+  } from './lib/memory-capture';
+
+  interface MemoryCaptureCandidate {
+    directory: string;
+    agent: string;
+    sessionId: string;
+    kind: 'decision' | 'constraint' | 'discovery' | 'preference' | 'handoff';
+    content: string;
+    confirmationReason: 'sensitive' | 'broader_scope' | null;
+  }
+
+  import {
     browserReviewPreviews,
     retainCaptureMetadata,
     selectReviewPreview,
@@ -749,6 +764,11 @@
   let memoryRecallProjectKey = $state('');
   let memoryRecallBusy = $state(false);
   let memoryRecallRefresh = 0;
+  let memoryCaptureAvailable = $state(false);
+  let memoryCaptureEnabled = $state(false);
+  let memoryCaptureProjectKey = $state('');
+  let memoryCaptureBusy = $state(false);
+  let memoryCaptureRefresh = 0;
   type BrowserAccessRequest = { id: string; sessionId: string; directory: string; origin?: string };
   type CoordinationRequest = {
     id: string;
@@ -916,6 +936,39 @@
     confirmationResolver = null;
     confirmation = null;
     resolve?.(confirmed);
+  }
+
+  async function captureProjectMemory(candidate: MemoryCaptureCandidate) {
+    try {
+      const status = await invoke<MemoryStatus>('memory_status', {
+        directory: candidate.directory,
+      });
+      if (!status.enabled || getSetting(`sai-memory-auto-capture:${status.projectKey}`) !== 'true')
+        return;
+      if (candidate.confirmationReason) {
+        const reason =
+          candidate.confirmationReason === 'sensitive'
+            ? 'Sensitive values were removed before this preview.'
+            : 'This memory may apply beyond the current task.';
+        const confirmed = await confirmInApp(
+          'Save shared memory?',
+          `${reason}\n\n${candidate.kind}: ${candidate.content}`,
+          'Save memory',
+        );
+        if (!confirmed) return;
+      }
+      await invoke('memory_remember', {
+        directory: candidate.directory,
+        input: {
+          content: candidate.content,
+          kind: candidate.kind,
+          tags: ['automatic-capture'],
+          provenance: { agent: candidate.agent, sessionId: candidate.sessionId },
+        },
+      });
+    } catch (cause) {
+      error = `Could not capture shared memory: ${describe(cause)}`;
+    }
   }
   let editingCommand = $state<string | null>(null);
   let binaryPath = $state(getSetting('sai-opencode-bin') ?? '');
@@ -2037,6 +2090,7 @@
     if (isTauri()) setTimeout(retryCoordinationDeliveries, 2_000);
     let unlistenAgentTerminals: (() => void) | undefined;
     let unlistenNotificationClick: (() => void) | undefined;
+    let unlistenMemoryCapture: (() => void) | undefined;
     let stopEmulatedClick: (() => void) | undefined;
     setTheme(themePreference);
     const stopSystemTheme = watchSystemDark((value) => (systemDark = value));
@@ -2074,6 +2128,9 @@
       void listen<CoordinationRequest>('agent:coordination-request', ({ payload }) => {
         void handleCoordinationRequest(payload);
       }).then((unlisten) => (unlistenCoordination = unlisten));
+      void listen<MemoryCaptureCandidate>('memory:capture-candidate', ({ payload }) => {
+        void captureProjectMemory(payload);
+      }).then((unlisten) => (unlistenMemoryCapture = unlisten));
       void listen<{ id: string; code: number }>('terminal:exit', ({ payload }) => {
         finishCoordinationSetup(payload.id, payload.code);
       }).then((unlisten) => (unlistenTerminalExit = unlisten));
@@ -2242,7 +2299,10 @@
       if (directory) {
         const initialDirectory = directory;
         void canonicalizeProject(initialDirectory).then(() =>
-          refreshAutomaticMemoryRecall(initialDirectory),
+          Promise.all([
+            refreshAutomaticMemoryRecall(initialDirectory),
+            refreshAutomaticMemoryCapture(initialDirectory),
+          ]),
         );
       }
     }
@@ -2281,6 +2341,7 @@
       unlistenTerminalExit?.();
       unlistenAgentTerminals?.();
       unlistenNotificationClick?.();
+      unlistenMemoryCapture?.();
       stopEmulatedClick?.();
       stopSystemTheme();
     };
@@ -2331,6 +2392,42 @@
       error = `Could not update automatic memory recall: ${describe(cause)}`;
     } finally {
       if (memoryRecallProjectKey === projectKey) memoryRecallBusy = false;
+    }
+  }
+
+  async function refreshAutomaticMemoryCapture(path: string) {
+    const refresh = ++memoryCaptureRefresh;
+    memoryCaptureAvailable = false;
+    memoryCaptureEnabled = false;
+    memoryCaptureProjectKey = '';
+    try {
+      const status = await invoke<MemoryStatus>('memory_status', { directory: path });
+      if (refresh !== memoryCaptureRefresh || directory !== path) return;
+      const control = automaticCaptureControl(
+        status,
+        getSetting(`sai-memory-auto-capture:${status.projectKey}`),
+      );
+      memoryCaptureAvailable = control.available;
+      memoryCaptureEnabled = control.enabled;
+      memoryCaptureProjectKey = status.projectKey;
+    } catch (cause) {
+      if (refresh === memoryCaptureRefresh && directory === path)
+        error = `Could not load automatic memory capture: ${describe(cause)}`;
+    }
+  }
+
+  async function toggleAutomaticMemoryCapture() {
+    if (!memoryCaptureAvailable || memoryCaptureBusy || !memoryCaptureProjectKey) return;
+    const projectKey = memoryCaptureProjectKey;
+    const enabled = !memoryCaptureEnabled;
+    memoryCaptureBusy = true;
+    try {
+      await persistAutomaticCapture(projectKey, enabled);
+      if (memoryCaptureProjectKey === projectKey) memoryCaptureEnabled = enabled;
+    } catch (cause) {
+      error = `Could not update automatic memory capture: ${describe(cause)}`;
+    } finally {
+      if (memoryCaptureProjectKey === projectKey) memoryCaptureBusy = false;
     }
   }
 
@@ -8637,6 +8734,7 @@
     diffLoading = false;
     await canonicalizeProject(path);
     if (directory) await refreshAutomaticMemoryRecall(directory);
+    if (directory) await refreshAutomaticMemoryCapture(directory);
   }
 
   async function selectDefaultWorktree(path: string) {
@@ -11630,6 +11728,10 @@
       {memoryRecallAvailable}
       {memoryRecallBusy}
       ontogglememoryrecall={() => void toggleAutomaticMemoryRecall()}
+      memoryCapture={memoryCaptureEnabled}
+      {memoryCaptureAvailable}
+      {memoryCaptureBusy}
+      ontogglememorycapture={() => void toggleAutomaticMemoryCapture()}
       onrunproject={selectedWorktreeConfig?.run
         ? () => splitFocusedPane('row', 'terminal', selectedWorktreeConfig?.run)
         : null}
