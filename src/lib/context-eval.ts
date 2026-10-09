@@ -232,7 +232,11 @@ export function isCorrectContextEvalRun(
 ): boolean {
   const checkIds = new Set(task.checks.map((check) => check.id));
   const observed = new Set(observation.checks.map((check) => check.id));
-  if (checkIds.size !== observed.size || [...checkIds].some((id) => !observed.has(id)))
+  if (
+    checkIds.size !== observation.checks.length ||
+    checkIds.size !== observed.size ||
+    [...checkIds].some((id) => !observed.has(id))
+  )
     return false;
   if (!observation.checks.every((check) => check.passed)) return false;
   if (observation.blindReview.score < preregistered.reviewPassBar) return false;
@@ -264,12 +268,20 @@ export async function runContextEval(
   const matrix = contextEvalMatrixSchema.parse(matrixValue);
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32)
     throw new Error('Context eval concurrency must be an integer from 1 through 32.');
+  const taskSetIdentity = await stableRunId(JSON.stringify(taskSet));
   const invocations = await Promise.all(
     matrix.providers.flatMap((provider) =>
       matrix.arms.flatMap((arm) =>
         taskSet.tasks.flatMap((task) =>
           Array.from({ length: matrix.trials }, (_, index) => index + 1).map(async (trial) => {
-            const identity = JSON.stringify([matrix.revision, provider, arm.id, task.id, trial]);
+            const identity = JSON.stringify([
+              taskSetIdentity,
+              matrix.revision,
+              provider,
+              arm.id,
+              task.id,
+              trial,
+            ]);
             const runId = await stableRunId(identity);
             return {
               revision: matrix.revision,

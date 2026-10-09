@@ -23,7 +23,9 @@ covers every required task type:
 | `no-provider`      | Working in a project with no hub provider configured        |
 
 Evolve the set by adding `tasks-v2.json`; never mutate a version that has
-recorded runs, so paired results stay comparable across reruns.
+recorded runs, so paired results stay comparable across reruns. Run identities
+and seeds include the task-set content, so a changed task set cannot reuse an
+earlier version's run directories.
 
 ## Paired methodology
 
@@ -45,7 +47,8 @@ it does not replace these isolated values, including Windows `USERPROFILE`,
 
 ## Scoring
 
-- Task-specific checks: every check in the task set must pass with evidence.
+- Task-specific checks: exactly one result for every check in the task set
+  must pass with evidence; duplicates do not count as correct.
 - Blind review: a reviewer scores each run without knowing its arm; the score
   must reach the preregistered review pass bar.
 - A run is correct only when all checks pass, the blind review passes, and no

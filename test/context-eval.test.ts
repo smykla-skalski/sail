@@ -148,6 +148,24 @@ void test('runs every provider, arm, task, and trial with stable isolated identi
     repeated.results.map(({ runId, seed }) => ({ runId, seed })),
     results.map(({ runId, seed }) => ({ runId, seed })),
   );
+
+  const revised = await runContextEval(
+    {
+      ...taskSet,
+      name: 'test-tasks-v2',
+      tasks: [{ ...tasks[0], prompt: `${tasks[0].prompt} New instruction.` }, ...tasks.slice(1)],
+    },
+    matrix,
+    async () => observation(),
+  );
+  assert.equal(
+    revised.results.some((result, index) => result.runId === results[index].runId),
+    false,
+  );
+  assert.equal(
+    revised.results.some((result, index) => result.seed === results[index].seed),
+    false,
+  );
 });
 
 void test('bounds parallel eval work without changing result order', async () => {
@@ -261,6 +279,14 @@ void test('correct completion requires every check, the review bar, and no confi
     isCorrectContextEvalRun(
       task,
       observation({ checks: [observation().checks[0]] }),
+      taskSet.preregistered,
+    ),
+    false,
+  );
+  assert.equal(
+    isCorrectContextEvalRun(
+      task,
+      observation({ checks: [...observation().checks, observation().checks[0]] }),
       taskSet.preregistered,
     ),
     false,
