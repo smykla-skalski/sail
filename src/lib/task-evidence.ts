@@ -22,9 +22,16 @@ const evidenceStorageLimit = 200;
 export const evidenceResults = ['passed', 'failed', 'pending', 'blocked'] as const;
 export type EvidenceResult = (typeof evidenceResults)[number];
 
+const visibleTextPattern =
+  /[^\p{White_Space}\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Cs}\p{Cn}\u2800\u3164\uFFA0]/u;
+const concreteTextSchema = z
+  .string()
+  .min(1)
+  .max(2000)
+  .refine((value) => visibleTextPattern.test(value), 'Must contain visible text.');
 export const untestedCriterionSchema = z.object({
-  criterion: z.string().min(1).max(2000),
-  blocker: z.string().min(1).max(2000),
+  criterion: concreteTextSchema,
+  blocker: concreteTextSchema,
 });
 export type UntestedCriterion = z.infer<typeof untestedCriterionSchema>;
 

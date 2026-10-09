@@ -1870,6 +1870,45 @@ void test('accepts typed stage and verdict reports, with gate-specific verdicts'
       economics: testEconomics,
     }),
   );
+  for (const blocker of ['\u200b', '\u2800', '\u3164', '\uFFF9', '\uFFFA', '\uFFFB'])
+    assert.throws(() =>
+      parseShipReport({
+        gate: 'test-adversary',
+        verdict: 'PASS (partial)',
+        criteria: ['Exercised criterion'],
+        untestedCriteria: [{ criterion: 'Hardware criterion', blocker }],
+        economics: testEconomics,
+      }),
+    );
+  assert.throws(() =>
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: 'Hardware criterion', blocker: '   ' }],
+      economics: testEconomics,
+    }),
+  );
+  const spacedCriterion = '  Hardware criterion  ';
+  assert.deepEqual(
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: spacedCriterion, blocker: ' No device attached. ' }],
+      economics: testEconomics,
+    }).untestedCriteria,
+    [{ criterion: spacedCriterion, blocker: ' No device attached. ' }],
+  );
+  assert.doesNotThrow(() =>
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      criteria: ['Exercised criterion'],
+      untestedCriteria: [{ criterion: '硬件标准', blocker: '🧪 沙盒不可用' }],
+      economics: testEconomics,
+    }),
+  );
 });
 
 void test('validation revision drift remains sticky after the tree returns', () => {
