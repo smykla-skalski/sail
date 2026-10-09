@@ -409,7 +409,7 @@ struct Connection {
 struct SessionConfig {
     cwd: String,
     directory: PathBuf,
-    server: Value,
+    servers: Vec<Value>,
     token: String,
 }
 
@@ -422,12 +422,24 @@ fn mcp_server(config: &crate::browser_agent::McpConfig) -> Value {
     })
 }
 
-fn session_request_params(cwd: &str, session_id: Option<&str>, server: &Value) -> Value {
-    let mut params = json!({"cwd":cwd,"mcpServers":[server]});
+fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]) -> Value {
+    let mut params = json!({"cwd":cwd,"mcpServers":servers});
     if let Some(session_id) = session_id {
         params["sessionId"] = json!(session_id);
     }
     params
+}
+
+fn session_servers(browser: Value, memory: Option<Value>) -> Vec<Value> {
+    let mut servers = vec![browser];
+    if let Some(memory) = memory {
+        servers.push(memory);
+    }
+    servers
+}
+
+fn optional_memory_server(result: Result<Option<Value>, String>) -> Option<Value> {
+    result.unwrap_or_default()
 }
 
 fn per_load_mcp() -> bool {
@@ -446,6 +458,7 @@ fn reuse_session_config(
     configs: &mut HashMap<String, SessionConfig>,
     session_id: &str,
     cwd: &str,
+    memory: Option<Value>,
     mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
     mut release: impl FnMut(&str),
 ) -> Result<SessionConfig, String> {
@@ -459,7 +472,7 @@ fn reuse_session_config(
     let next = SessionConfig {
         cwd: cwd.to_string(),
         directory,
-        server: mcp_server(&config),
+        servers: session_servers(mcp_server(&config), memory),
         token: config.token,
     };
     if let Some(previous) = configs.insert(session_id.to_string(), next.clone()) {
@@ -475,22 +488,20 @@ fn restore_params(
     configs: &mut HashMap<String, SessionConfig>,
     session_id: &str,
     cwd: &str,
+    memory: Option<Value>,
     mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
     release: impl FnMut(&str),
 ) -> Result<Value, String> {
     if per_load {
         let config = mint()?;
-        return Ok(session_request_params(
-            cwd,
-            Some(session_id),
-            &mcp_server(&config),
-        ));
+        let servers = session_servers(mcp_server(&config), memory);
+        return Ok(session_request_params(cwd, Some(session_id), &servers));
     }
-    let config = reuse_session_config(configs, session_id, cwd, mint, release)?;
+    let config = reuse_session_config(configs, session_id, cwd, memory, mint, release)?;
     Ok(session_request_params(
         &config.cwd,
         Some(session_id),
-        &config.server,
+        &config.servers,
     ))
 }
 
@@ -3030,11 +3041,13 @@ pub async fn acp_new_session(
     let browser = browser.inner().clone();
     let fence = fence.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        connect_blocking(app, &manager, agent.clone(), profile)?;
+        connect_blocking(app.clone(), &manager, agent.clone(), profile)?;
         let runtime = connection_for_profile(&manager, &agent, profile)?;
         let config =
             browser.config_for_profile(&cwd, None, Some(&agent), Some(profile.as_str()))?;
-        let server = mcp_server(&config);
+        // Memory is optional. A settings, path, or executable error must not block the session.
+        let memory = optional_memory_server(crate::memory::acp_mcp_server(&app, &cwd, &agent));
+        let servers = session_servers(mcp_server(&config), memory);
         let _serial = runtime
             .session_creation
             .lock()
@@ -3047,7 +3060,7 @@ pub async fn acp_new_session(
             .map_err(|error| error.to_string())? = Some(PathBuf::from(&cwd));
         let result = runtime.request(
             "session/new",
-            session_request_params(&cwd, None, &server),
+            session_request_params(&cwd, None, &servers),
             Duration::from_secs(60),
         );
         *runtime
@@ -3080,7 +3093,7 @@ pub async fn acp_new_session(
                     SessionConfig {
                         cwd: cwd.clone(),
                         directory: canonical_directory(&cwd),
-                        server,
+                        servers,
                         token: config.token.clone(),
                     },
                 );
@@ -3261,9 +3274,11 @@ async fn restore_session(
     let manager = manager.inner().clone();
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        connect_blocking(app, &manager, agent.clone(), profile)?;
+        connect_blocking(app.clone(), &manager, agent.clone(), profile)?;
         let runtime =
             register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
+        // A broken or unavailable memory store must not prevent restoring the agent session.
+        let memory = optional_memory_server(crate::memory::acp_mcp_server(&app, &cwd, &agent));
         let params = {
             let mut configs = runtime
                 .session_configs
@@ -3279,6 +3294,7 @@ async fn restore_session(
                 &mut configs,
                 &session_id,
                 &cwd,
+                memory,
                 || {
                     browser.config_for_profile(
                         &cwd,
@@ -3945,20 +3961,31 @@ mod session_config_tests {
             ],
         );
         let params = |config: &McpConfig| {
+            let servers = session_servers(mcp_server(config), None);
             serde_json::to_string(&session_request_params(
                 "/work/repo",
                 Some("session"),
-                &mcp_server(config),
+                &servers,
             ))
             .unwrap()
         };
         assert_eq!(params(&first), params(&second));
         assert_eq!(params(&first), params(&first));
-        let request = session_request_params("/work/repo", None, &mcp_server(&first));
+        let servers = session_servers(mcp_server(&first), None);
+        let request = session_request_params("/work/repo", None, &servers);
         let env = &request["mcpServers"][0]["env"];
         assert_eq!(env[0]["name"], "SAIL_BROWSER_PORT");
         assert_eq!(env[1]["name"], "SAIL_BROWSER_TOKEN");
         assert!(request.get("sessionId").is_none());
+
+        let servers = session_servers(
+            mcp_server(&first),
+            Some(json!({"name":"sail-memory","command":"/opt/sail"})),
+        );
+        let request = session_request_params("/work/repo", None, &servers);
+        assert_eq!(request["mcpServers"].as_array().unwrap().len(), 2);
+        assert_eq!(request["mcpServers"][1]["name"], "sail-memory");
+        assert!(optional_memory_server(Err("store unavailable".into())).is_none());
     }
 
     #[test]
@@ -3972,6 +3999,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             &cwd,
+            Some(json!({"name":"sail-memory","command":"/opt/sail"})),
             || {
                 minted += 1;
                 Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
@@ -3983,6 +4011,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             &cwd,
+            None,
             || {
                 minted += 1;
                 Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
@@ -3993,9 +4022,10 @@ mod session_config_tests {
         assert_eq!(minted, 1);
         assert!(released.is_empty());
         assert_eq!(first.token, "first");
+        assert_eq!(second.servers.len(), 2);
         assert_eq!(
-            session_request_params(&first.cwd, Some("session"), &first.server),
-            session_request_params(&second.cwd, Some("session"), &second.server)
+            session_request_params(&first.cwd, Some("session"), &first.servers),
+            session_request_params(&second.cwd, Some("session"), &second.servers)
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -4010,6 +4040,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             "/work/repo",
+            None,
             || {
                 minted += 1;
                 Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
@@ -4022,6 +4053,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             "/work/repo",
+            None,
             || {
                 minted += 1;
                 Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
@@ -4046,6 +4078,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             &cwd,
+            None,
             || {
                 minted += 1;
                 Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
@@ -4058,6 +4091,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             &cwd,
+            None,
             || {
                 minted += 1;
                 Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
@@ -4067,6 +4101,35 @@ mod session_config_tests {
         .unwrap();
         assert_eq!(minted, 1);
         assert_eq!(first, second);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn enabling_memory_does_not_replace_a_live_session_configuration() {
+        let directory = scratch("memory-opt-in");
+        let cwd = directory.to_string_lossy().into_owned();
+        let mut configs = HashMap::new();
+        let first = reuse_session_config(
+            &mut configs,
+            "session",
+            &cwd,
+            None,
+            || Ok(config("first", &[])),
+            |_| {},
+        )
+        .unwrap();
+        let restored = reuse_session_config(
+            &mut configs,
+            "session",
+            &cwd,
+            Some(json!({"name":"sail-memory","command":"/opt/sail"})),
+            || Err("a live session must keep its original MCP fingerprint".into()),
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(first.servers.len(), 1);
+        assert_eq!(restored.servers, first.servers);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4082,6 +4145,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             &original,
+            None,
             || Ok(config("first", &[])),
             |_| {},
         )
@@ -4090,6 +4154,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             &link.to_string_lossy(),
+            None,
             || Err("a symlinked path must not mint a new config".into()),
             |_| {},
         )
@@ -4109,6 +4174,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             &first_directory.to_string_lossy(),
+            None,
             || Ok(config("first", &[])),
             |token| released.push(token.to_string()),
         )
@@ -4117,6 +4183,7 @@ mod session_config_tests {
             &mut configs,
             "session",
             &second_directory.to_string_lossy(),
+            None,
             || Ok(config("second", &[])),
             |token| released.push(token.to_string()),
         )
