@@ -1390,15 +1390,8 @@ where
     }
 }
 
-fn clear_hosted_pending_on_local_switch(
-    root: &Path,
-    project_key: &str,
-    previous: ProviderKind,
-) -> Result<(), String> {
-    if previous == ProviderKind::Mem0Hosted {
-        save_pending_events(root, project_key, &PendingEvents::new())?;
-    }
-    Ok(())
+fn clear_hosted_pending_on_local_switch(root: &Path, project_key: &str) -> Result<(), String> {
+    save_pending_events(root, project_key, &PendingEvents::new())
 }
 
 fn configured_token(config: &ProviderConfig, key: &str) -> Result<String, String> {
@@ -1661,7 +1654,7 @@ pub fn set_memory_provider(
         } else {
             delete_api_key(&key);
         }
-        clear_hosted_pending_on_local_switch(&root, &key, previous.provider)?;
+        clear_hosted_pending_on_local_switch(&root, &key)?;
         save_runtime_error(&root, &key, None);
         return Ok(ProviderStatus {
             provider: ProviderKind::Local,
@@ -2895,10 +2888,12 @@ mod tests {
             assert_eq!(load_pending_events(&root, "project").unwrap().len(), 1);
             server.join().unwrap();
         }
+        clear_hosted_pending_on_local_switch(&root, "project").unwrap();
+        assert!(load_pending_events(&root, "project").unwrap().is_empty());
     }
 
     #[test]
-    fn selecting_local_explicitly_resets_only_active_hosted_pending() {
+    fn selecting_local_explicitly_resets_dormant_hosted_pending() {
         let root = temporary();
         let mut pending = PendingEvents::new();
         pending.insert(
@@ -2910,12 +2905,8 @@ mod tests {
         );
         save_pending_events(&root, "project", &pending).unwrap();
 
-        clear_hosted_pending_on_local_switch(&root, "project", ProviderKind::AgentMemory).unwrap();
         assert_eq!(load_pending_events(&root, "project").unwrap().len(), 1);
-        clear_hosted_pending_on_local_switch(&root, "project", ProviderKind::Mem0SelfHosted)
-            .unwrap();
-        assert_eq!(load_pending_events(&root, "project").unwrap().len(), 1);
-        clear_hosted_pending_on_local_switch(&root, "project", ProviderKind::Mem0Hosted).unwrap();
+        clear_hosted_pending_on_local_switch(&root, "project").unwrap();
         assert!(load_pending_events(&root, "project").unwrap().is_empty());
     }
 
