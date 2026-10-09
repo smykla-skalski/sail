@@ -103,30 +103,22 @@ public static class ContextEvalJob
     exit 0
 }
 
-[Console]::Error.WriteLine('context eval supervisor: starting')
 [void][System.Reflection.Assembly]::LoadFrom($AssemblyPath)
-[Console]::Error.WriteLine('context eval supervisor: job support loaded')
 
 $exitCode = 1
 try {
     [ContextEvalJob]::AssignCurrentProcess()
-    [Console]::Error.WriteLine('context eval supervisor: job assigned')
     $spec = [System.IO.File]::ReadAllLines($SpecPath)
     if ($spec.Length -ne 3) { throw 'Invalid context evaluation runner spec.' }
-    [Console]::Error.WriteLine('context eval supervisor: spec loaded')
     $start = [System.Diagnostics.ProcessStartInfo]::new()
-    [Console]::Error.WriteLine('context eval supervisor: start info created')
     $start.FileName = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($spec[0]))
     $start.Arguments = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($spec[1]))
     $start.WorkingDirectory = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($spec[2]))
     $start.UseShellExecute = $false
-    [Console]::Error.WriteLine('context eval supervisor: start info ready')
     $runner = [System.Diagnostics.Process]::Start($start)
     if ($null -eq $runner) { throw 'Cannot start context evaluation runner.' }
-    [Console]::Error.WriteLine('context eval supervisor: runner started')
     try {
         $runner.WaitForExit()
-        [Console]::Error.WriteLine('context eval supervisor: runner exited')
         $exitCode = $runner.ExitCode
     } finally {
         $runner.Dispose()
