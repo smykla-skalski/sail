@@ -111,13 +111,14 @@ $exitCode = 1
 try {
     [ContextEvalJob]::AssignCurrentProcess()
     [Console]::Error.WriteLine('context eval supervisor: job assigned')
-    $spec = Get-Content -LiteralPath $SpecPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $spec = [System.IO.File]::ReadAllLines($SpecPath)
+    if ($spec.Length -ne 3) { throw 'Invalid context evaluation runner spec.' }
     [Console]::Error.WriteLine('context eval supervisor: spec loaded')
-    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start = [System.Diagnostics.ProcessStartInfo]::new()
     [Console]::Error.WriteLine('context eval supervisor: start info created')
-    $start.FileName = [string]$spec.command
-    $start.Arguments = [string]$spec.arguments
-    $start.WorkingDirectory = [string]$spec.cwd
+    $start.FileName = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($spec[0]))
+    $start.Arguments = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($spec[1]))
+    $start.WorkingDirectory = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($spec[2]))
     $start.UseShellExecute = $false
     [Console]::Error.WriteLine('context eval supervisor: start info ready')
     $runner = [System.Diagnostics.Process]::Start($start)

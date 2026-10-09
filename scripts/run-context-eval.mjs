@@ -155,14 +155,12 @@ async function execute(invocation) {
   let command = runner.command;
   let launchArgs = args;
   if (process.platform === 'win32') {
-    const spec = join(runDirectory, 'windows-runner.json');
+    const spec = join(runDirectory, 'windows-runner.txt');
     await writeFile(
       spec,
-      JSON.stringify({
-        command: runner.command,
-        arguments: args.map(quoteWindowsArgument).join(' '),
-        cwd: runDirectory,
-      }),
+      [runner.command, args.map(quoteWindowsArgument).join(' '), runDirectory]
+        .map((value) => Buffer.from(value, 'utf8').toString('base64'))
+        .join('\n'),
       { flag: 'wx', mode: 0o600 },
     );
     command = 'powershell.exe';
