@@ -102,6 +102,7 @@
   import type { ThreadStatus } from './lib/attention';
   import type { AgentUsage } from './lib/agent-usage';
   import type { SpawnReceipt } from './lib/agent-results';
+  import { withAutomaticMemoryRecall } from './lib/memory-recall';
   import {
     parentTurnStopHint,
     permissionAlreadyAnswered,
@@ -1833,13 +1834,23 @@
           `acp:${turnAgent}:${id}`,
           turnId,
         );
+      const promptWithAttachments = withAttachedFiles(promptText, sentClipboard);
+      const recalledPrompt = await withAutomaticMemoryRecall(
+        {
+          directory: turnDirectory,
+          prompt: promptWithAttachments,
+          query: text,
+          sessionKey: `acp:${turnAgent}:${id}`,
+        },
+        () => stopRequested,
+      );
       let result;
       try {
         result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
           acp.prompt(
             turnAgent,
             id!,
-            withAttachedFiles(promptText, sentClipboard),
+            recalledPrompt,
             turnId,
             promptImagePaths(sentImages, sentClipboard),
           ),
