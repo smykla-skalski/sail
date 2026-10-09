@@ -419,10 +419,19 @@ void test('Jump to latest tells streaming growth apart from new items', () => {
     latestRevision([running('in_progress', '')]),
     latestRevision([running('in_progress', 'line')]),
   );
-  assert.notEqual(
+  assert.equal(
     latestRevision([running('in_progress', 'x')]),
     latestRevision([running('completed', 'x')]),
   );
+  const note: TranscriptItem = {
+    kind: 'decision',
+    id: 'd1',
+    created: 5,
+    title: 'Format',
+    outcome: 'allowed',
+    reason: '',
+  };
+  assert.notEqual(latestRevision([growing('Hel'), note]), latestRevision([growing('Hello'), note]));
   assert.equal(latestRevision([growing('same')]), latestRevision([growing('same')]));
   assert.equal(jumpLabel(0, false), 'Jump to latest');
   assert.equal(jumpLabel(0, true), 'Jump to latest (new output)');

@@ -446,16 +446,17 @@ export function formatMessageTime(created: number | undefined, now = new Date())
     : `${at.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${clock}`;
 }
 
-/** Changes whenever the newest transcript item grows, such as a streaming message or a running
- * tool's output, so Jump to latest can tell new output from a new item. */
+/** Changes whenever the newest message or tool group grows, such as a streaming message or a
+ * running tool's output, so Jump to latest can tell new output from a new item. Rows placed by
+ * time, such as hooks and decisions, are skipped. */
 export function latestRevision(items: readonly TranscriptItem[]): string {
-  const last = items.at(-1);
+  const last = items.findLast((item) => item.kind === 'message' || item.kind === 'tools');
   if (!last) return '';
   const size =
     last.kind === 'message'
       ? last.text.length
       : last.kind === 'tools'
-        ? last.tools.map((tool) => `${tool.status}:${tool.output.length}`).join(',')
+        ? last.tools.map((tool) => tool.output.length).join(',')
         : '';
   return `${last.id}:${size}`;
 }
