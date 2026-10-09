@@ -68,9 +68,10 @@ outcomes only when the delta's lower uncertainty bound reaches
 Runs report unauthorized access, cross-user or cross-worktree leakage, and
 unapproved sharing, each confirmed or not. Any confirmed event fails the
 safety gate for the whole evaluation: the report records the findings as audit
-evidence, the command exits nonzero, and no improvement verdict is reported.
-Only the operator's confirmed classification counts; unconfirmed observations
-do not fail the gate but stay in the report.
+evidence, omits the paired summary entirely so no improvement verdict exists
+to mislead a consumer, and the command exits nonzero. Only the operator's
+confirmed classification counts; unconfirmed observations do not fail the
+gate but stay in the report.
 
 ## Baseline coordination
 

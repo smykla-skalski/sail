@@ -97,9 +97,9 @@ async function execute(invocation) {
   await writeFile(input, `${JSON.stringify(invocation, null, 2)}\n`, { flag: 'wx' });
   const substitutions = { '{input}': input, '{output}': output, '{workdir}': runDirectory };
   const args = runner.args.map((argument) =>
-    Object.entries(substitutions).reduce(
-      (value, [placeholder, replacement]) => value.replaceAll(placeholder, replacement),
-      argument,
+    argument.replace(
+      /\{input\}|\{output\}|\{workdir\}/g,
+      (placeholder) => substitutions[placeholder],
     ),
   );
   if (!runner.args.some((argument) => argument.includes('{input}')))
@@ -107,21 +107,41 @@ async function execute(invocation) {
   if (!runner.args.some((argument) => argument.includes('{output}')))
     throw new Error(`${runner.provider} runner args must include {output}.`);
 
+  const child = spawn(runner.command, args, {
+    cwd: runDirectory,
+    env: isolatedEnvironment(runDirectory, runner, invocation.seed),
+    stdio: ['ignore', 'inherit', 'inherit'],
+    shell: false,
+    detached: process.platform !== 'win32',
+  });
   await new Promise((resolveRun, rejectRun) => {
-    const child = spawn(runner.command, args, {
-      cwd: runDirectory,
-      env: isolatedEnvironment(runDirectory, runner, invocation.seed),
-      stdio: ['ignore', 'inherit', 'inherit'],
-      shell: false,
-    });
-    const timeout = setTimeout(() => child.kill(), config.timeoutMs);
+    const killRunner = (signal) => {
+      if (!child.pid) return;
+      try {
+        if (process.platform === 'win32') child.kill(signal);
+        else process.kill(-child.pid, signal);
+      } catch {
+        child.kill(signal);
+      }
+    };
+    let timedOut = false;
+    let escalation = null;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      killRunner('SIGTERM');
+      escalation = setTimeout(() => killRunner('SIGKILL'), 5_000);
+    }, config.timeoutMs);
     child.once('error', (error) => {
       clearTimeout(timeout);
+      if (escalation) clearTimeout(escalation);
       rejectRun(error);
     });
     child.once('exit', (code, signal) => {
       clearTimeout(timeout);
-      if (code === 0) resolveRun();
+      if (escalation) clearTimeout(escalation);
+      if (timedOut)
+        rejectRun(new Error(`${invocation.runId} timed out after ${config.timeoutMs} ms.`));
+      else if (code === 0) resolveRun();
       else rejectRun(new Error(`${invocation.runId} exited with ${code ?? signal}.`));
     });
   });
@@ -146,7 +166,7 @@ const report = {
     gate: safetyFindings.length ? 'failed' : 'passed',
     findings: safetyFindings,
   },
-  summary,
+  summary: safetyFindings.length ? null : summary,
 };
 await writeFile(join(outputRoot, 'report.json'), `${JSON.stringify(report, null, 2)}\n`, {
   flag: 'wx',

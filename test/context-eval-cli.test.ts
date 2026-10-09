@@ -120,6 +120,81 @@ void test('CLI fails decisively when a confirmed safety event is recorded', asyn
     const report = JSON.parse(await readFile(join(outputPath, 'report.json'), 'utf8'));
     assert.equal(report.safety.gate, 'failed');
     assert.equal(report.safety.findings.length, 1);
+    assert.equal(report.summary, null);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+void test('CLI substitutes placeholders without rewriting inserted paths', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
+  try {
+    const configPath = join(temporary, 'config.json');
+    const outputPath = join(temporary, '{output}');
+    const runner = join(root, 'test/fixtures/context-eval/runner.mjs');
+    await writeFile(configPath, contextEvalConfig(runner, false));
+    await execute(
+      process.execPath,
+      [
+        join(root, 'scripts/run-context-eval.mjs'),
+        '--tasks',
+        join(root, 'test/fixtures/context-eval/tasks-v1.json'),
+        '--config',
+        configPath,
+        '--output',
+        outputPath,
+      ],
+      { cwd: root },
+    );
+    const report = JSON.parse(await readFile(join(outputPath, 'report.json'), 'utf8'));
+    assert.equal(report.results.length, 14);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+void test('CLI bounds a trapped runner timeout', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
+  try {
+    const configPath = join(temporary, 'config.json');
+    const outputPath = join(temporary, 'output');
+    const runner = join(root, 'test/fixtures/context-eval/runner.mjs');
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        ...JSON.parse(contextEvalConfig(runner, false)),
+        runners: [
+          {
+            provider: 'codex',
+            command: process.execPath,
+            args: [runner, '--trap', '--input', '{input}', '--output', '{output}'],
+          },
+        ],
+        concurrency: 32,
+        timeoutMs: 500,
+      }),
+    );
+    await assert.rejects(
+      () =>
+        execute(
+          process.execPath,
+          [
+            join(root, 'scripts/run-context-eval.mjs'),
+            '--tasks',
+            join(root, 'test/fixtures/context-eval/tasks-v1.json'),
+            '--config',
+            configPath,
+            '--output',
+            outputPath,
+          ],
+          { cwd: root, timeout: 15_000 },
+        ),
+      (error: { stderr: string; killed: boolean }) => {
+        assert.equal(error.killed, false);
+        assert.match(error.stderr, /timed out after 500 ms/);
+        return true;
+      },
+    );
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }

@@ -34,6 +34,10 @@ const safetyEvents =
         },
       ]
     : [];
+if (process.argv.includes('--trap')) {
+  process.on('SIGTERM', () => {});
+  setInterval(() => {}, 1_000);
+}
 writeFileSync(
   outputPath,
   `${JSON.stringify({

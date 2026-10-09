@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   assertContextEvalCoverage,
   collectSafetyFindings,
+  contextEvalMatrixSchema,
   contextEvalObservationSchema,
   contextEvalTaskSetSchema,
   isCorrectContextEvalRun,
@@ -185,6 +186,52 @@ void test('bounds parallel eval work without changing result order', async () =>
     ],
   );
   await assert.rejects(() => runContextEval(taskSet, matrix, async () => observation(), 0), /1/);
+});
+
+void test('rejects duplicate checks, unsafe revisions, and unpaired arms', () => {
+  assert.throws(
+    () =>
+      contextEvalTaskSetSchema.parse({
+        ...taskSet,
+        tasks: [
+          { ...tasks[0], checks: [tasks[0].checks[0], tasks[0].checks[0]] },
+          ...tasks.slice(1),
+        ],
+      }),
+    /check IDs must be unique/,
+  );
+  assert.throws(
+    () => contextEvalMatrixSchema.parse({ ...matrix, revision: '../escaped' }),
+    /invalid_format/,
+  );
+  assert.throws(
+    () =>
+      contextEvalMatrixSchema.parse({
+        ...matrix,
+        arms: [arms[1], { ...arms[1], id: 'hub-v2' }],
+      }),
+    /exactly one baseline and one hub arm/,
+  );
+});
+
+void test('long valid identifiers keep run directory names within filesystem limits', async () => {
+  const longIdentifier = 'x'.repeat(100);
+  const { results } = await runContextEval(
+    { ...taskSet, tasks: [{ ...tasks[0], id: longIdentifier }, ...tasks.slice(1)] },
+    {
+      ...matrix,
+      revision: longIdentifier,
+      providers: ['codex'],
+      arms: [arms[0], { ...arms[1], id: longIdentifier }],
+      trials: 1,
+    },
+    async () => observation(),
+  );
+  assert.equal(
+    results.every(({ runId }) => Buffer.byteLength(runId) <= 255),
+    true,
+  );
+  assert.equal(new Set(results.map(({ runId }) => runId)).size, results.length);
 });
 
 void test('correct completion requires every check, the review bar, and no confirmed safety event', () => {
