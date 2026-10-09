@@ -2028,6 +2028,7 @@ struct DeleteWorktreeRequest {
     expected_branch: Option<String>,
     native_generation: Option<u64>,
     open_code_session_ids: Option<Vec<String>>,
+    stop_agents: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -2211,6 +2212,7 @@ fn verify_open_code_cleanup(
 
 #[tauri::command]
 async fn delete_worktree(
+    app: tauri::AppHandle,
     operation_locks: State<'_, WorktreeOperationLocks>,
     agents: State<'_, acp::AgentManager>,
     fence: State<'_, acp::AgentWorktreeFence>,
@@ -2226,6 +2228,7 @@ async fn delete_worktree(
         expected_branch,
         native_generation,
         open_code_session_ids,
+        stop_agents,
     } = request;
     let operation_locks = operation_locks.inner().clone();
     let agents = agents.inner().clone();
@@ -2242,6 +2245,9 @@ async fn delete_worktree(
         let directory = PathBuf::from(&worktree)
             .git_canonical()
             .unwrap_or_else(|_| PathBuf::from(&worktree));
+        if stop_agents == Some(true) {
+            fence.stop_sessions_in(&app, &agents, &directory)?;
+        }
         fence.cleanup(&agents, &directory, native_generation, || {
             if let Some(session_ids) = open_code_session_ids {
                 let info = runtime_info

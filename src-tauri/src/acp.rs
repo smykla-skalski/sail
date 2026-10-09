@@ -315,6 +315,28 @@ impl AgentWorktreeFence {
         }
     }
 
+    pub fn stop_sessions_in(
+        &self,
+        app: &AppHandle,
+        agents: &AgentManager,
+        directory: &Path,
+    ) -> Result<(), String> {
+        for entry in agents.active_sessions_in(directory)? {
+            let Some((agent, session_id)) = entry.split_once(':') else {
+                continue;
+            };
+            if let Ok(runtime) = connection_for_session(agents, agent, session_id) {
+                let _ = cancel_session(app, &runtime, agent, session_id, None);
+            }
+        }
+        // Cancel is asynchronous; the prompt stays active until the agent replies.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !agents.active_sessions_in(directory)?.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    }
+
     pub fn cleanup<T>(
         &self,
         agents: &AgentManager,
@@ -3700,6 +3722,18 @@ pub fn acp_cancel(
     turn_id: Option<String>,
 ) -> Result<(), String> {
     let runtime = connection_for_session(&manager, &agent, &session_id)?;
+    cancel_session(&app, &runtime, &agent, &session_id, turn_id)
+}
+
+fn cancel_session(
+    app: &AppHandle,
+    runtime: &Connection,
+    agent: &str,
+    session_id: &str,
+    turn_id: Option<String>,
+) -> Result<(), String> {
+    let session_id = session_id.to_string();
+    let agent = agent.to_string();
     let cancelled_turn = {
         let mut prompts = runtime
             .prompt_state
