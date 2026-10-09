@@ -47,7 +47,7 @@ function contextEvalConfig(runner: string, unsafe: boolean): string {
           runner,
           ...(unsafe ? ['--unsafe'] : []),
           '--literal',
-          'space "quote" trailing\\',
+          'José space "quote" trailing\\',
           '--input',
           '{input}',
           '--output',
@@ -140,7 +140,7 @@ void test('CLI substitutes placeholders without rewriting inserted paths', async
   const temporary = await mkdtemp(join(tmpdir(), 'sail-context-eval-'));
   try {
     const configPath = join(temporary, 'config.json');
-    const outputPath = join(temporary, '{output}');
+    const outputPath = join(temporary, 'José {output}');
     const runner = join(root, 'test/fixtures/context-eval/runner.mjs');
     await writeFile(configPath, contextEvalConfig(runner, false));
     await execute(

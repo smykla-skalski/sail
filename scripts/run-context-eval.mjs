@@ -96,6 +96,8 @@ function isolatedEnvironment(runDirectory, runner, seed) {
     environment.Path = process.env.Path ?? environment.PATH;
     environment.PATHEXT = process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
     environment.SystemRoot = process.env.SystemRoot ?? '';
+    environment.TEMP = join(runDirectory, 'tmp');
+    environment.TMP = join(runDirectory, 'tmp');
   }
   for (const name of runner.forwardEnvironment) {
     const value = process.env[name];

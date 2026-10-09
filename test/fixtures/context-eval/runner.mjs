@@ -8,12 +8,16 @@ const inputPath = process.argv[process.argv.indexOf('--input') + 1];
 const outputPath = process.argv[process.argv.indexOf('--output') + 1];
 const invocation = JSON.parse(readFileSync(inputPath, 'utf8'));
 if (process.argv.includes('--literal'))
-  assert.equal(process.argv[process.argv.indexOf('--literal') + 1], 'space "quote" trailing\\');
+  assert.equal(
+    process.argv[process.argv.indexOf('--literal') + 1],
+    'José space "quote" trailing\\',
+  );
 assert.equal(realpathSync(process.cwd()), realpathSync(dirname(inputPath)));
 assert.equal(process.env.SAIL_CONTEXT_EVAL_SEED, String(invocation.seed));
 for (const path of [
   process.env.HOME,
   process.env.TMPDIR,
+  ...(process.platform === 'win32' ? [process.env.TEMP, process.env.TMP] : []),
   process.env.XDG_CONFIG_HOME,
   process.env.XDG_CACHE_HOME,
   process.env.XDG_DATA_HOME,

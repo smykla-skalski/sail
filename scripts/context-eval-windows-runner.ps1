@@ -100,7 +100,7 @@ public static class ContextEvalJob
 $exitCode = 1
 try {
     [ContextEvalJob]::AssignCurrentProcess()
-    $spec = Get-Content -LiteralPath $SpecPath -Raw | ConvertFrom-Json
+    $spec = Get-Content -LiteralPath $SpecPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $start = New-Object System.Diagnostics.ProcessStartInfo
     $start.FileName = [string]$spec.command
     $start.Arguments = [string]$spec.arguments
