@@ -234,6 +234,7 @@ function gateSummary(issue: ShipIssue): string[] {
   }
   const test = verdict('test-adversary');
   if (test === 'PASS') parts.push('test passed');
+  else if (test === 'PASS (partial)') parts.push('test passed (partial)');
   else if (test === 'FAIL') parts.push('test failed');
   else if (test === 'BLOCKED') parts.push('test blocked');
   return parts;

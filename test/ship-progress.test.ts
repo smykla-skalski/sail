@@ -379,7 +379,7 @@ void test('durable gate receipts recover manifest evidence after restart', () =>
     validation: {
       ...receipt.validation,
       gate: 'test-adversary',
-      verdict: 'PASS',
+      verdict: 'PASS (partial)',
       revision: 'revision-one',
       baseRevision: undefined,
       evidenceCriteria: issue.checkpoint!.acceptanceCriteria,
@@ -1801,6 +1801,10 @@ void test('accepts typed stage and verdict reports, with gate-specific verdicts'
     ...emptyTaskEconomics('validator', 'review'),
     checks: 1,
   };
+  const testEconomics = {
+    ...emptyTaskEconomics('validator', 'test'),
+    checks: 1,
+  };
   assert.deepEqual(parseShipReport({ stage: 'ci', status: 'blocked', reason: 'Check failed' }), {
     stage: 'ci',
     status: 'blocked',
@@ -1830,6 +1834,19 @@ void test('accepts typed stage and verdict reports, with gate-specific verdicts'
   assert.throws(() => validateGateVerdict('code-adversary', 'PASS'));
   assert.throws(() => validateGateVerdict('test-adversary', 'CLEAN'));
   assert.doesNotThrow(() => validateGateVerdict('test-adversary', 'PASS'));
+  assert.doesNotThrow(() => validateGateVerdict('test-adversary', 'PASS (partial)'));
+  assert.deepEqual(
+    parseShipReport({
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      economics: testEconomics,
+    }),
+    {
+      gate: 'test-adversary',
+      verdict: 'PASS (partial)',
+      economics: testEconomics,
+    },
+  );
 });
 
 void test('validation revision drift remains sticky after the tree returns', () => {

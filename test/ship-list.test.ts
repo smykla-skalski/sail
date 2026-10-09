@@ -55,7 +55,7 @@ function fixture(count = 4): ShipRun {
 
 function gate(
   name: 'code-adversary' | 'findings-adversary' | 'test-adversary',
-  verdict: 'CLEAN' | 'NEEDS_FIXES' | 'PASS' | 'FAIL' | 'BLOCKED',
+  verdict: 'CLEAN' | 'NEEDS_FIXES' | 'PASS' | 'PASS (partial)' | 'FAIL' | 'BLOCKED',
   updated: number,
 ) {
   return {
@@ -312,6 +312,12 @@ void test('stage indicator keeps its place across fix rounds and names passed ga
   assert.deepEqual(
     indicator.steps.slice(0, 3).map((step) => step.state),
     ['done', 'done', 'current'],
+  );
+
+  issue.gates?.push(gate('test-adversary', 'PASS (partial)', 14));
+  assert.equal(
+    shipStageIndicator(issue).label,
+    'Testing, round 2; review passed; test passed (partial)',
   );
 });
 

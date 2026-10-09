@@ -6,6 +6,7 @@ export const checkpointPhases = [
   'explore',
   'branch',
   'implement',
+  'publish',
   'review',
   'test',
   'pr',

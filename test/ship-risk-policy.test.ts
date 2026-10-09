@@ -120,7 +120,9 @@ void test('all required gates need a latest successful terminal verdict', () => 
   const clean = gate('code-adversary', 'CLEAN');
   const findings = gate('findings-adversary', 'CLEAN');
   const pass = gate('test-adversary', 'PASS');
+  const partialPass = gate('test-adversary', 'PASS (partial)');
   assert.equal(requiredShipGatesSatisfied(policy, [clean, findings, pass]), true);
+  assert.equal(requiredShipGatesSatisfied(policy, [clean, findings, partialPass]), true);
   assert.equal(requiredShipGatesSatisfied(policy, [clean, pass]), false);
   assert.equal(
     requiredShipGatesSatisfied(policy, [clean, findings, gate('test-adversary', 'FAIL')]),

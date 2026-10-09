@@ -34,8 +34,8 @@ void test('updates preserve checkpoint identity and reject contradictory state',
     {
       objective: 'Resume without conversation replay',
       acceptanceCriteria: ['Persist state', 'Reconcile before resume'],
-      phase: 'implement',
-      nextAction: 'Implement the structured checkpoint tools.',
+      phase: 'publish',
+      nextAction: 'Publish the implementation before independent validation.',
     },
     20,
   );

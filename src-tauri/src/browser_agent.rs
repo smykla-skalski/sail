@@ -1851,7 +1851,7 @@ pub fn run_mcp_stdio() {
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging","awaiting_merge"]},
                             "status":{"type":"string","enum":["running","blocked"]},
                             "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
-                            "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","FAIL","BLOCKED"]},
+                            "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED"]},
                             "reason":{"type":"string","maxLength":2000},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},
                             "outputReference":{"type":"string","minLength":1,"maxLength":2000},
@@ -1868,7 +1868,7 @@ pub fn run_mcp_stdio() {
                                 "properties":{
                                     "objective":{"type":"string","minLength":1},
                                     "acceptanceCriteria":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},
-                                    "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","review","test","pr","complete"]},
+                                    "phase":{"type":"string","enum":["resolve","orchestrate","explore","branch","implement","publish","review","test","pr","complete"]},
                                     "status":{"type":"string","enum":["active","blocked","completed","cancelled","failed"]},
                                     "requiredGates":{"type":"array","items":{"type":"string","minLength":1}},
                                     "blocker":{"type":["string","null"]},

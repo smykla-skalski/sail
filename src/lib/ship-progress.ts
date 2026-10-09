@@ -34,7 +34,14 @@ export const stages = [
   'merging',
   'awaiting_merge',
 ] as const;
-export const verdicts = ['CLEAN', 'NEEDS_FIXES', 'PASS', 'FAIL', 'BLOCKED'] as const;
+export const verdicts = [
+  'CLEAN',
+  'NEEDS_FIXES',
+  'PASS',
+  'PASS (partial)',
+  'FAIL',
+  'BLOCKED',
+] as const;
 export type GateVerdict = (typeof verdicts)[number];
 export type ShipCheck = {
   name: string;
@@ -167,8 +174,14 @@ export function requiredValidationGatesSatisfied(
           right.item.created - left.item.created,
       )[0]?.item;
     if (!gate || gate.state !== 'completed') return false;
-    return name === 'test-adversary' ? gate.verdict === 'PASS' : gate.verdict === 'CLEAN';
+    return gateVerdictPassed(name, gate.verdict);
   });
+}
+
+export function gateVerdictPassed(gate: GateName, verdict: GateVerdict | undefined): boolean {
+  return gate === 'test-adversary'
+    ? verdict === 'PASS' || verdict === 'PASS (partial)'
+    : verdict === 'CLEAN';
 }
 
 export const gateMetadataSchema = z.object({
@@ -250,7 +263,9 @@ export function requireValidatorEconomics(
 
 export function validateGateVerdict(gate: GateName, verdict: GateVerdict): void {
   const allowed =
-    gate === 'test-adversary' ? ['PASS', 'FAIL', 'BLOCKED'] : ['CLEAN', 'NEEDS_FIXES', 'BLOCKED'];
+    gate === 'test-adversary'
+      ? ['PASS', 'PASS (partial)', 'FAIL', 'BLOCKED']
+      : ['CLEAN', 'NEEDS_FIXES', 'BLOCKED'];
   if (!allowed.includes(verdict)) throw new Error(`Invalid verdict for ${gate}.`);
 }
 
@@ -661,7 +676,7 @@ export function recoverValidationEvidence(
         name: gate.gate,
         provider: gate.provider,
         model: gate.model,
-        result: ['CLEAN', 'PASS'].includes(gate.verdict!) ? 'passed' : 'failed',
+        result: gateVerdictPassed(gate.gate, gate.verdict) ? 'passed' : 'failed',
         timestamp: gate.evidenceTimestamp!,
         outputReference: gate.evidenceOutputReference!,
         criteria,

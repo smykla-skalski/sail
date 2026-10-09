@@ -80,6 +80,7 @@
     commitRevisionBoundValidation,
     rollbackValidationIssue,
     rollbackValidationReceipt,
+    gateVerdictPassed,
     validateGateVerdict,
     validationRevisionDrifted,
   } from './lib/ship-progress';
@@ -6397,7 +6398,7 @@
         name: gate,
         provider,
         model,
-        result: ['CLEAN', 'PASS'].includes(verdict) ? 'passed' : 'failed',
+        result: gateVerdictPassed(gate, verdict) ? 'passed' : 'failed',
         timestamp: evidenceIdentity?.timestamp ?? Date.now(),
         sequence: evidenceSequence,
         outputReference: outputReference ?? fallbackReference,
@@ -6752,7 +6753,7 @@
       throw new Error('Choose a Ship It validation gate.');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Gate prompt must be 1–8000 characters.');
-    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, FAIL, or BLOCKED. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
+    const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
     if (
       !Array.isArray(implementingModels) ||
       !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
