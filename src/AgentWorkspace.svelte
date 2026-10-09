@@ -784,10 +784,13 @@
       )
         return restored;
       const result = await acp.setConfig(agent, activeSessionId, option.id, value);
-      return result.configOptions ?? restored.map((candidate) =>
-        candidate.id === option.id
-          ? Object.assign({}, candidate, { currentValue: value })
-          : candidate,
+      return (
+        result.configOptions ??
+        restored.map((candidate) =>
+          candidate.id === option.id
+            ? Object.assign({}, candidate, { currentValue: value })
+            : candidate,
+        )
       );
     }, Promise.resolve(options));
   }
