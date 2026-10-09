@@ -208,6 +208,7 @@ mod browser;
 pub mod browser_agent;
 #[cfg(unix)]
 mod child_watchdog;
+mod context;
 mod dev_servers;
 mod diagnostics;
 mod github;
@@ -2458,6 +2459,10 @@ pub fn run() {
             registered_worktrees,
             delete_worktree,
             worktree_config,
+            context::context_provider_status,
+            context::context_register_provider,
+            context::context_approve_provider,
+            context::context_revoke_provider,
             post_turn_checks::approve_post_turn_check,
             post_turn_checks::is_post_turn_check_approved,
             post_turn_checks::cancel_post_turn_check,
