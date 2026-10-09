@@ -490,22 +490,35 @@ pub fn memory_project_key(directory: String) -> Result<String, String> {
     project_key_for(Path::new(&directory))
 }
 
-#[tauri::command]
-pub fn memory_status(app: tauri::AppHandle, directory: String) -> Result<MemoryStatus, String> {
-    let (root, key) = context(&app, &directory)?;
-    let memories = list_at(&root, &key, true)?;
+fn status_at(root: &Path, key: String, mode: String) -> Result<MemoryStatus, String> {
+    if mode == "off" {
+        return Ok(MemoryStatus {
+            mode,
+            enabled: false,
+            project_key: key,
+            count: 0,
+            forgotten_count: 0,
+        });
+    }
+    let memories = list_at(root, &key, true)?;
     let forgotten_count = memories
         .iter()
         .filter(|memory| memory.forgotten_at.is_some())
         .count();
-    let mode = mode(&app, &directory)?;
     Ok(MemoryStatus {
-        enabled: mode != "off",
+        enabled: true,
         mode,
         project_key: key,
         count: memories.len() - forgotten_count,
         forgotten_count,
     })
+}
+
+#[tauri::command]
+pub fn memory_status(app: tauri::AppHandle, directory: String) -> Result<MemoryStatus, String> {
+    let (root, key) = context(&app, &directory)?;
+    let mode = mode(&app, &directory)?;
+    status_at(&root, key, mode)
 }
 
 #[tauri::command]
@@ -869,6 +882,18 @@ mod tests {
         let paths = paths(&root, "project");
         fs::write(&paths.data, "not json").unwrap();
         assert!(read_store(&paths).unwrap_err().contains("corrupt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn off_status_does_not_read_corrupt_storage() {
+        let root = temporary("off-corrupt");
+        let paths = paths(&root, "project");
+        fs::write(&paths.data, "not json").unwrap();
+        let status = status_at(&root, "project".into(), "off".into()).unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.count, 0);
+        assert_eq!(status.forgotten_count, 0);
         fs::remove_dir_all(root).unwrap();
     }
 

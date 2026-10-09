@@ -44,6 +44,7 @@
     type NotificationPreference,
   } from './lib/notification-prefs';
   import {
+    createSerialExecutor,
     exportMemories,
     memoryKinds,
     parseMemoryTags,
@@ -119,8 +120,13 @@
   let memoryRequest = 0;
   let memoryDirectory = '';
   let pendingForget = $state('');
-  let installPreview = $state<MemoryAgentInstallPreview | null>(null);
-  let previewAgentAction = $state<'install' | 'uninstall'>('install');
+  let agentPreview = $state<{
+    action: 'install' | 'uninstall';
+    result: MemoryAgentInstallPreview;
+  } | null>(null);
+  let previewRequest = 0;
+  let memoryModeRequest = 0;
+  const serializeMemoryMode = createSerialExecutor();
 
   async function refreshMemory(directory: string, query = memoryQuery.trim()) {
     const request = ++memoryRequest;
@@ -129,7 +135,8 @@
       memoryRecords = [];
       memoryQuery = '';
       pendingForget = '';
-      installPreview = null;
+      agentPreview = null;
+      previewRequest += 1;
       query = '';
     }
     memoryDirectory = directory;
@@ -189,17 +196,23 @@
   async function setMemoryMode(mode: MemoryMode) {
     const directory = snapshot?.directory;
     if (!directory) return;
+    const request = ++memoryModeRequest;
     memoryStorageError = '';
     try {
-      const projectKey = await invoke<string>('memory_project_key', { directory });
-      await invoke('save_setting', {
-        key: `sai-memory-mode:${projectKey}`,
-        value: mode === 'off' ? null : mode,
+      await serializeMemoryMode(async () => {
+        const projectKey = await invoke<string>('memory_project_key', { directory });
+        await invoke('save_setting', {
+          key: `sai-memory-mode:${projectKey}`,
+          value: mode === 'off' ? null : mode,
+        });
       });
-      installPreview = null;
-      await refreshMemory(directory);
+      if (request === memoryModeRequest && snapshot?.directory === directory) {
+        agentPreview = null;
+        previewRequest += 1;
+        await refreshMemory(directory);
+      }
     } catch (cause) {
-      memoryStorageError = `Storage: ${String(cause)}`;
+      if (request === memoryModeRequest) memoryStorageError = `Storage: ${String(cause)}`;
     }
   }
 
@@ -241,16 +254,17 @@
     agent: MemoryAgentStatus['id'],
     action: 'install' | 'uninstall',
   ) {
+    const request = ++previewRequest;
     memoryConfigError = '';
-    installPreview = null;
-    previewAgentAction = action;
+    agentPreview = null;
     try {
-      installPreview = await invoke<MemoryAgentInstallPreview>(
+      const result = await invoke<MemoryAgentInstallPreview>(
         action === 'install' ? 'preview_memory_agent_install' : 'preview_memory_agent_uninstall',
         { agent },
       );
+      if (request === previewRequest) agentPreview = { action, result };
     } catch (cause) {
-      memoryConfigError = `Configuration: ${String(cause)}`;
+      if (request === previewRequest) memoryConfigError = `Configuration: ${String(cause)}`;
     }
   }
 
@@ -261,7 +275,8 @@
     memoryConfigError = '';
     try {
       await invoke(command, { agent });
-      installPreview = null;
+      agentPreview = null;
+      previewRequest += 1;
       if (snapshot?.directory) await refreshMemory(snapshot.directory);
     } catch (cause) {
       memoryConfigError = `Configuration: ${String(cause)}`;
@@ -1065,10 +1080,10 @@
               </p>
             {/each}
           </div>
-          {#if installPreview}
+          {#if agentPreview}
             <div class="memory-install-preview">
               <h3>Review configuration change</h3>
-              <p><code>{installPreview.path}</code></p>
+              <p><code>{agentPreview.result.path}</code></p>
               <p class="runtime-binary">
                 The preview shows only Sail's shared-memory entry. Other configuration, including
                 credentials, is omitted.
@@ -1076,30 +1091,35 @@
               <div class="memory-config-comparison">
                 <div>
                   <strong>Before</strong>
-                  <pre>{installPreview.before || '(empty)'}</pre>
+                  <pre>{agentPreview.result.before || '(empty)'}</pre>
                 </div>
                 <div>
                   <strong>After</strong>
-                  <pre>{installPreview.after}</pre>
+                  <pre>{agentPreview.result.after}</pre>
                 </div>
               </div>
               <Button
                 size="sm"
-                disabled={!installPreview.changed}
+                disabled={!agentPreview.result.changed}
                 onclick={() =>
-                  installPreview &&
+                  agentPreview &&
                   void changeAgentInstall(
-                    previewAgentAction === 'install'
+                    agentPreview.action === 'install'
                       ? 'install_memory_agent'
                       : 'uninstall_memory_agent',
-                    installPreview.agent,
+                    agentPreview.result.agent,
                   )}
-                >{installPreview.changed
-                  ? `${previewAgentAction === 'install' ? 'Install' : 'Uninstall'} reviewed change`
+                >{agentPreview.result.changed
+                  ? `${agentPreview.action === 'install' ? 'Install' : 'Uninstall'} reviewed change`
                   : 'No change needed'}</Button
               >
-              <Button size="sm" variant="secondary" onclick={() => (installPreview = null)}
-                >Cancel</Button
+              <Button
+                size="sm"
+                variant="secondary"
+                onclick={() => {
+                  previewRequest += 1;
+                  agentPreview = null;
+                }}>Cancel</Button
               >
             </div>
           {/if}

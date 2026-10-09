@@ -1,11 +1,35 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  createSerialExecutor,
   exportMemories,
   parseMemoryMode,
   parseMemoryTags,
   type MemoryRecord,
 } from '../src/lib/shared-memory.ts';
+
+void test('serialized memory changes finish in selection order', async () => {
+  const serialize = createSerialExecutor();
+  const completed: string[] = [];
+  let releaseFirst!: () => void;
+  const first = serialize(
+    () =>
+      new Promise<void>((resolve) => {
+        releaseFirst = () => {
+          completed.push('sail');
+          resolve();
+        };
+      }),
+  );
+  const second = serialize(async () => {
+    completed.push('off');
+  });
+  await Promise.resolve();
+  assert.deepEqual(completed, []);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(completed, ['sail', 'off']);
+});
 
 void test('memory mode defaults to off and accepts explicit opt-in modes', () => {
   assert.equal(parseMemoryMode(null), 'off');

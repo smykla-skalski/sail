@@ -65,6 +65,18 @@ export function parseMemoryTags(value: string): string[] {
   ];
 }
 
+export function createSerialExecutor(): <T>(work: () => Promise<T>) => Promise<T> {
+  let tail = Promise.resolve();
+  return <T>(work: () => Promise<T>) => {
+    const result = tail.then(work, work);
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
+}
+
 export function exportMemories(records: MemoryRecord[]): string {
   return `${JSON.stringify(
     {
