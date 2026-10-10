@@ -547,7 +547,7 @@ fn check_git_content(
     after: &str,
 ) -> Result<(), String> {
     let relative = destination.to_str().ok_or("Invalid destination.")?;
-    let blob = Command::new("git")
+    let blob = git_command()
         .arg("-C")
         .arg(root)
         .args(["cat-file", "blob", &format!("{revision}:{relative}")])
@@ -569,7 +569,7 @@ fn check_git_content(
 
 fn hash_content(root: &Path, path: Option<&str>, content: &[u8]) -> Result<String, String> {
     use std::io::Write;
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command.arg("-C").arg(root).arg("hash-object");
     if let Some(path) = path {
         command.arg(format!("--path={path}"));
@@ -819,7 +819,14 @@ mod tests {
         )
         .unwrap();
         let published = Cell::new(false);
-        let error = accept_with(&repo.0, &proposal, true, || published.set(true)).unwrap_err();
+        let error = accept_with(
+            &repo.0,
+            &proposal,
+            true,
+            || published.set(true),
+            |_, _, _| {},
+        )
+        .unwrap_err();
         assert!(error.contains("Git content conversion"), "{error}");
         assert!(!published.get());
         assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
