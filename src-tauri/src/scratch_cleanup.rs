@@ -12,6 +12,7 @@ const IDLE_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 const MARKER: &str = ".sail-scratch-root";
 const PRIVATE_MARKER: &str = ".sail-cleanup-private";
 const PRIVATE_MARKER_VALUE: &str = "sail-cleanup-private-v1\n";
+const PRIVATE_OWNER: &str = ".sail-cleanup-owner";
 
 pub(crate) fn sweep_on_startup() {
     let root = std::env::temp_dir();
@@ -87,7 +88,9 @@ fn sweep(
             }
             let original = temp.join(original_name);
             let safe = inspect(&root, metadata.dev(), now).is_ok_and(|result| result.is_some())
-                && marker_owner_dead(&root, &processes)
+                && (marker_owner_dead(&root, &processes)
+                    || (!root.join(MARKER).exists()
+                        && owner_dead(&path.join(PRIVATE_OWNER), &processes)))
                 && open_files(&root) == Some(false);
             if safe {
                 let bytes = inspect(&root, metadata.dev(), now)
@@ -99,7 +102,9 @@ fn sweep(
                     remove_private_parent(&path);
                 }
             } else if !original.exists() {
-                restore(&root, &original);
+                if restore_owner_marker(&root, &path).is_ok() {
+                    restore(&root, &original);
+                }
                 if !root.exists() {
                     remove_private_parent(&path);
                 }
@@ -150,6 +155,15 @@ fn sweep(
             }
             continue;
         }
+        // Keep the verified owner outside the tree being removed. A crash can
+        // otherwise delete the root marker first and strand a partial build.
+        if save_private_owner(&quarantine, &private).is_err() {
+            restore(&quarantine, &path);
+            if !quarantine.exists() {
+                remove_private_parent(&private);
+            }
+            continue;
+        }
         if let Err(error) = fs::remove_dir_all(&quarantine) {
             eprintln!(
                 "Sail scratch cleanup kept {}: {error}",
@@ -170,7 +184,9 @@ fn private_child(parent: &Path) -> std::io::Result<Option<PathBuf>> {
         let mut entries = entries
             .collect::<std::io::Result<Vec<_>>>()?
             .into_iter()
-            .filter(|entry| entry.file_name() != PRIVATE_MARKER)
+            .filter(|entry| {
+                entry.file_name() != PRIVATE_MARKER && entry.file_name() != PRIVATE_OWNER
+            })
             .collect::<Vec<_>>();
         if entries.len() > 1 {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
@@ -183,6 +199,12 @@ fn private_child(parent: &Path) -> std::io::Result<Option<PathBuf>> {
 }
 
 fn remove_private_parent(parent: &Path) {
+    if let Err(error) = fs::remove_file(parent.join(PRIVATE_OWNER)) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("Sail scratch cleanup kept {}: {error}", parent.display());
+            return;
+        }
+    }
     if let Err(error) = fs::remove_file(parent.join(PRIVATE_MARKER)) {
         eprintln!("Sail scratch cleanup kept {}: {error}", parent.display());
         return;
@@ -253,7 +275,25 @@ fn private_quarantine_name(name: &str) -> Option<&str> {
 }
 
 fn marker_owner_dead(path: &Path, processes: &System) -> bool {
-    let marker = path.join(MARKER);
+    owner_dead(&path.join(MARKER), processes)
+}
+
+fn save_private_owner(root: &Path, private: &Path) -> std::io::Result<()> {
+    let marker = root.join(MARKER);
+    if !fs::symlink_metadata(&marker)?.is_file() {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    fs::hard_link(marker, private.join(PRIVATE_OWNER))
+}
+
+fn restore_owner_marker(root: &Path, private: &Path) -> std::io::Result<()> {
+    if !root.join(MARKER).exists() {
+        fs::hard_link(private.join(PRIVATE_OWNER), root.join(MARKER))?;
+    }
+    Ok(())
+}
+
+fn owner_dead(marker: &Path, processes: &System) -> bool {
     if !marker.exists() {
         return false;
     }
@@ -577,6 +617,51 @@ mod tests {
         sweep(&temp, future, |_| Some(false)).unwrap();
         assert!(!private.exists());
         assert!(!temp.join(name).exists());
+    }
+
+    #[test]
+    fn recovers_a_partial_deletion_after_the_root_marker_is_removed() {
+        let temp = fixture();
+        let name = "sail-339-target.partial";
+        let private = temp.join(format!(
+            "sail-cleanup-private-{}-{name}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = private.join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&private).unwrap();
+        fs::create_dir(&root).unwrap();
+        cargo_artifacts(&root);
+        fs::write(private.join(PRIVATE_MARKER), PRIVATE_MARKER_VALUE).unwrap();
+        save_private_owner(&root, &private).unwrap();
+        fs::remove_file(root.join(MARKER)).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o300)).unwrap();
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |_| Some(false)).unwrap();
+        assert!(!private.exists());
+        assert!(!temp.join(name).exists());
+    }
+
+    #[test]
+    fn restores_the_owner_marker_when_a_partial_deletion_is_open() {
+        let temp = fixture();
+        let name = "sail-339-target.partial-open";
+        let private = temp.join(format!(
+            "sail-cleanup-private-{}-{name}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = private.join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&private).unwrap();
+        fs::create_dir(&root).unwrap();
+        cargo_artifacts(&root);
+        fs::write(private.join(PRIVATE_MARKER), PRIVATE_MARKER_VALUE).unwrap();
+        save_private_owner(&root, &private).unwrap();
+        fs::remove_file(root.join(MARKER)).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o300)).unwrap();
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |_| Some(true)).unwrap();
+        let restored = temp.join(name);
+        assert!(restored.join(MARKER).exists());
+        assert!(!private.exists());
     }
 
     #[test]
