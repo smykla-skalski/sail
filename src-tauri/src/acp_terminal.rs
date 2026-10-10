@@ -1,6 +1,7 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 #[cfg(unix)]
@@ -10,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::browser_agent::CapabilityProfile;
 
@@ -20,6 +21,25 @@ static NEXT_TERMINAL: AtomicU64 = AtomicU64::new(1);
 pub struct AcpTerminalManager {
     active: Mutex<HashMap<String, Arc<AcpTerminal>>>,
     archived: Mutex<VecDeque<(String, TerminalSnapshot)>>,
+}
+
+pub fn worktree_data_directory(cache_directory: &Path, worktree: &Path) -> PathBuf {
+    let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let digest = Sha256::digest(worktree.to_string_lossy().as_bytes());
+    let name = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    cache_directory.join("terminal-worktrees").join(name)
+}
+
+fn terminal_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("TMPDIR", data_directory.join("tmp")),
+        ("TEMP", data_directory.join("tmp")),
+        ("TMP", data_directory.join("tmp")),
+        ("XDG_CACHE_HOME", data_directory.join("cache")),
+    ]
 }
 
 impl AcpTerminalManager {
@@ -84,6 +104,25 @@ impl AcpTerminalManager {
         for (id, terminal) in terminals {
             let _ = self.archive(id, &terminal);
         }
+    }
+
+    pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
+        let worktree = dunce::canonicalize(worktree).map_err(|error| error.to_string())?;
+        let terminals = self
+            .active
+            .lock()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .filter(|(_, terminal)| {
+                dunce::canonicalize(&terminal.directory)
+                    .is_ok_and(|directory| directory == worktree)
+            })
+            .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
+            .collect::<Vec<_>>();
+        for (id, terminal) in terminals {
+            self.archive(id, &terminal)?;
+        }
+        Ok(())
     }
 
     fn archive(&self, id: String, terminal: &AcpTerminal) -> Result<(), String> {
@@ -320,7 +359,7 @@ fn session(
 }
 
 fn stop(terminal: &AcpTerminal) -> Result<(), String> {
-    if terminal.stopped.swap(true, Ordering::AcqRel) {
+    if terminal.stopped.load(Ordering::Acquire) {
         return Ok(());
     }
     let mut child = terminal.child.lock().map_err(|error| error.to_string())?;
@@ -328,11 +367,20 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     {
         use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
-        let _ = child.try_wait();
-        let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
-        if let Ok(mut watchdog) = terminal.watchdog.lock() {
-            watchdog.stop();
+        if child
+            .try_wait()
+            .map_err(|error| format!("Cannot inspect terminal process: {error}"))?
+            .is_none()
+        {
+            match killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL) {
+                Ok(()) => {}
+                Err(nix::errno::Errno::ESRCH) => {}
+                Err(error) => return Err(format!("Cannot stop terminal process: {error}")),
+            }
         }
+        child
+            .wait()
+            .map_err(|error| format!("Cannot wait for terminal process to stop: {error}"))?;
     }
     #[cfg(windows)]
     if child
@@ -340,11 +388,26 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .is_none()
     {
-        Command::new("taskkill")
+        let output = Command::new("taskkill")
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .output()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("Cannot stop terminal process: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Cannot stop terminal process: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
     }
+    #[cfg(windows)]
+    child
+        .wait()
+        .map_err(|error| format!("Cannot wait for terminal process to stop: {error}"))?;
+    #[cfg(unix)]
+    if let Ok(mut watchdog) = terminal.watchdog.lock() {
+        watchdog.stop();
+    }
+    terminal.stopped.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -385,12 +448,25 @@ pub fn handle(
                 "Terminal working directory must be an existing absolute folder.".to_string(),
             );
         }
+        let data_directory = worktree_data_directory(
+            &app.path()
+                .app_cache_dir()
+                .map_err(|error| error.to_string())?,
+            &fallback,
+        );
+        let temp_directory = data_directory.join("tmp");
+        let cache_directory = data_directory.join("cache");
+        std::fs::create_dir_all(&temp_directory).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&cache_directory).map_err(|error| error.to_string())?;
         let mut command = Command::new(&params.command);
         command.args(&params.args).current_dir(directory);
         #[cfg(unix)]
         command.process_group(0);
         for variable in params.env {
             command.env(variable.name, variable.value);
+        }
+        for (name, value) in terminal_environment(&data_directory) {
+            command.env(name, value);
         }
         let mut child = command
             .stdout(Stdio::piped())
@@ -923,6 +999,33 @@ pub async fn acp_terminal_inspect_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_terminal_data_is_stable_and_private_per_worktree() {
+        let cache = Path::new("/sail-cache");
+        let first = worktree_data_directory(cache, Path::new("/repo/first"));
+        let same = worktree_data_directory(cache, Path::new("/repo/first"));
+        let second = worktree_data_directory(cache, Path::new("/repo/second"));
+
+        assert_eq!(first, same);
+        assert_ne!(first, second);
+        assert!(first.starts_with(cache.join("terminal-worktrees")));
+    }
+
+    #[test]
+    fn terminal_environment_changes_only_worktree_temp_and_cache() {
+        let root = Path::new("/sail-cache/terminal-worktrees/worktree");
+        let environment = terminal_environment(root);
+
+        assert!(environment.contains(&("TMPDIR", root.join("tmp"))));
+        assert!(environment.contains(&("XDG_CACHE_HOME", root.join("cache"))));
+        assert!(!environment.iter().any(|(name, _)| {
+            matches!(
+                *name,
+                "HOME" | "XDG_CONFIG_HOME" | "NPM_CONFIG_CACHE" | "CARGO_HOME"
+            )
+        }));
+    }
 
     #[test]
     fn connection_cleanup_only_matches_its_agent_sessions() {

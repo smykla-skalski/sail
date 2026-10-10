@@ -1822,26 +1822,55 @@ async fn delete_worktree(
         let directory = PathBuf::from(&worktree)
             .git_canonical()
             .unwrap_or_else(|_| PathBuf::from(&worktree));
+        let cache_directory = app
+            .path()
+            .app_cache_dir()
+            .map_err(|error| error.to_string())?;
+        let managed_terminal_data =
+            acp_terminal::worktree_data_directory(&cache_directory, &directory);
+        let worktree_exists = Path::new(&worktree).exists();
+        let terminals = app.state::<acp_terminal::AcpTerminalManager>().inner();
         if stop_agents == Some(true) {
             fence.stop_sessions_in(&app, &agents, &directory)?;
         }
         fence.cleanup(&agents, &directory, native_generation, || {
-            if archive_ignored == Some(true) {
-                archive_ignored_and_remove(checked, worktree, expected_revision, expected_branch)
-            } else {
-                remove_worktree(
-                    checked,
-                    worktree,
-                    force,
-                    expected_revision.as_deref(),
-                    expected_branch.as_deref(),
-                )?;
-                Ok(None)
-            }
+            terminals.stop_worktree(&directory)?;
+            remove_worktree_then_terminal_data(&managed_terminal_data, worktree_exists, || {
+                if archive_ignored == Some(true) {
+                    archive_ignored_and_remove(
+                        checked,
+                        worktree,
+                        expected_revision,
+                        expected_branch,
+                    )
+                } else {
+                    remove_worktree(
+                        checked,
+                        worktree,
+                        force,
+                        expected_revision.as_deref(),
+                        expected_branch.as_deref(),
+                    )?;
+                    Ok(None)
+                }
+            })
         })
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn remove_worktree_then_terminal_data<T>(
+    managed_data: &Path,
+    worktree_existed: bool,
+    remove_worktree: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let result = remove_worktree()?;
+    if worktree_existed && managed_data.exists() {
+        std::fs::remove_dir_all(managed_data)
+            .map_err(|error| format!("Cannot remove worktree terminal data: {error}"))?;
+    }
+    Ok(result)
 }
 
 fn archive_ignored_and_remove(
@@ -2618,16 +2647,42 @@ mod tests {
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
         existing_shipping_worktree, git_change_action, git_patch, git_reference,
         normalize_picker_path, parse_registered_worktrees, registered_worktrees, remove_worktree,
-        remove_worktree_with_hook, remove_worktree_with_hooks, repository_namespace,
-        shipping_base_revision, shipping_changed_paths, shipping_default_branch,
-        shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
-        worktree_overviews, WorktreeOperationLocks,
+        remove_worktree_then_terminal_data, remove_worktree_with_hook, remove_worktree_with_hooks,
+        repository_namespace, shipping_base_revision, shipping_changed_paths,
+        shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
+        working_tree_diff, worktree_overviews, WorktreeOperationLocks,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::GitCanonical;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[test]
+    fn terminal_data_survives_failed_removal_and_is_deleted_after_success() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-terminal-cleanup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let managed = root.join("managed");
+        let sibling = root.join("sibling");
+        fs::create_dir_all(&managed).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(managed.join("cache"), "keep until worktree removal").unwrap();
+        fs::write(sibling.join("cache"), "leave unrelated data alone").unwrap();
+
+        let failure = remove_worktree_then_terminal_data(&managed, true, || {
+            Err::<(), _>("Git removal failed".to_string())
+        });
+        assert_eq!(failure.unwrap_err(), "Git removal failed");
+        assert!(managed.join("cache").exists());
+
+        remove_worktree_then_terminal_data(&managed, true, || Ok(()))
+            .expect("managed data should be deleted after successful removal");
+        assert!(!managed.exists());
+        assert!(sibling.join("cache").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn parses_registered_and_prunable_worktrees() {
