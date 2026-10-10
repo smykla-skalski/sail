@@ -182,9 +182,71 @@ fn default_editor() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_terminal_paths, default_editor, output_page, TerminalOutput};
+    use super::{
+        canonical_terminal_paths, default_editor, git_worktree_root, output_page, TerminalOutput,
+    };
     use std::collections::VecDeque;
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn git_root_output_preserves_non_utf8_bytes_and_trailing_whitespace() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let parsed = super::git_root_path(b"/tmp/worktree-\xff \n".to_vec());
+        assert_eq!(parsed.as_os_str().as_bytes(), b"/tmp/worktree-\xff ");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_worktree_root_preserves_non_utf8_paths_through_utf8_symlink() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let scratch =
+            std::env::temp_dir().join(format!("sail-git-root-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch directory");
+        let root = scratch.join(std::ffi::OsString::from_vec(b"repo-\xff ".to_vec()));
+        let nested = root.join("subdir ");
+        std::fs::create_dir_all(&nested).expect("create unusual worktree path");
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("run git init");
+        assert!(init.success(), "initialize unusual worktree path");
+
+        let alias = scratch.join("utf8-alias");
+        symlink(&root, &alias).expect("create UTF-8 symlink to unusual path");
+        let actual = git_worktree_root(&alias.join("subdir "));
+        let expected = dunce::canonicalize(&root).expect("canonicalize unusual root");
+        assert_eq!(actual, expected);
+
+        std::fs::remove_dir_all(&scratch).expect("remove scratch directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_root_preserves_trailing_whitespace_paths() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-git-root-space-{}", uuid::Uuid::new_v4()));
+        let root = scratch.join("repo ");
+        let nested = root.join("subdir ");
+        std::fs::create_dir_all(&nested).expect("create whitespace worktree path");
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("run git init");
+        assert!(init.success(), "initialize whitespace worktree path");
+
+        let actual = git_worktree_root(&nested);
+        let expected = dunce::canonicalize(&root).expect("canonicalize whitespace root");
+        assert_eq!(actual, expected);
+        std::fs::remove_dir_all(&scratch).expect("remove scratch directory");
+    }
 
     #[cfg(windows)]
     fn drain_conpty_output(master: &dyn portable_pty::MasterPty) -> std::thread::JoinHandle<()> {
@@ -1335,9 +1397,23 @@ pub(crate) fn git_worktree_root(directory: &Path) -> PathBuf {
     output
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        .map(|output| git_root_path(output.stdout))
         .and_then(|path| dunce::canonicalize(path).ok())
         .unwrap_or_else(|| directory.to_path_buf())
+}
+
+fn git_root_path(mut stdout: Vec<u8>) -> PathBuf {
+    if stdout.last() == Some(&b'\n') {
+        stdout.pop();
+    }
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(stdout))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(String::from_utf8_lossy(&stdout).into_owned());
+    path
 }
 
 #[tauri::command]

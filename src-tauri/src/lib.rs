@@ -2031,17 +2031,20 @@ fn discover_nested_worktree_terminal_roots(
                 continue;
             }
         };
-        if !entry
-            .file_type()
-            .map_err(|error| error.to_string())?
-            .is_dir()
-        {
-            continue;
-        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                report_unclassified_terminal_cache(name);
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
         if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             continue;
         }
