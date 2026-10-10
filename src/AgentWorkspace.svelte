@@ -3008,9 +3008,8 @@
     color: var(--sui-muted);
     pointer-events: none;
   }
-  .agent-composer [data-pane-prompt]:focus {
-    outline: 2px solid var(--sui-primary);
-    outline-offset: -2px;
+  .agent-composer [data-pane-prompt]:focus-visible {
+    background: var(--sui-subtle);
   }
   .agent-composer [data-pane-prompt] :global(.composer-image) {
     display: inline-flex;
