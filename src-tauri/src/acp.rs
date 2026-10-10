@@ -2596,6 +2596,10 @@ fn connect_blocking(
         command.env(name, binary);
     }
     #[cfg(unix)]
+    if let Some(owner) = crate::scratch_cleanup::owner_identity() {
+        command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
+    }
+    #[cfg(unix)]
     command.process_group(0);
     let mut child = command
         .stdin(Stdio::piped())
