@@ -77,6 +77,18 @@ for (const secret of ['ab"cd', 'ab\\cd', 'ab\ncd', 'ab\u0001cd']) {
   });
 }
 
+for (const [mode, secret] of [
+  ['echo-numeric-secret', '123'],
+  ['echo-boolean-secret', 'true'],
+] as const) {
+  void test(`rejects ${mode} in an error field`, () => {
+    const result = run(profile(mode), secret);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Error response exposes the secret/);
+    assert.equal(result.stdout, '');
+  });
+}
+
 void test('rejects an error probe that does not send the secret', () => {
   const config = profile();
   config.errorProbe.arguments = {};

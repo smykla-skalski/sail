@@ -455,7 +455,7 @@ async function run(config) {
         return Object.entries(value).some(
           ([key, item]) => containsSecretText(key) || containsSecret(item),
         );
-      return false;
+      return value !== undefined && containsSecretText(JSON.stringify(value));
     };
     assert(!containsSecret(error), 'Error response exposes the secret.');
     checks.push('error', 'secret-redaction');

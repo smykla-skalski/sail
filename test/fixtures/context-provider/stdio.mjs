@@ -61,6 +61,9 @@ for await (const line of createInterface({ input: process.stdin })) {
       reply.result['_meta'] = {
         [JSON.stringify(message.params.arguments.secret).slice(1, -1)]: 'fixture marker',
       };
+    if (mode === 'echo-numeric-secret') reply.result.code = Number(message.params.arguments.secret);
+    if (mode === 'echo-boolean-secret')
+      reply.result.flag = message.params.arguments.secret === 'true';
   } else if (message.method === 'tools/call') {
     reply.result = {
       content: [{ type: 'text', text: 'One bounded result.' }],
