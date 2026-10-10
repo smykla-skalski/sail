@@ -121,9 +121,10 @@ describe('agent thread attention', () => {
     await waitForComposer();
     await $('.agent-composer [data-pane-prompt]').setValue('Stop during setup');
     await submitPrompt();
+    const stoppedDuringSetup = $('.project-agent-row[aria-label*="Stop during setup"]');
+    await expect(stoppedDuringSetup).toBeDisplayed();
     await waitForStopButton();
     await $('.agent-busy button').click();
-    const stoppedDuringSetup = $('.project-agent-row[aria-label*="Stop during setup"]');
     await expect(stoppedDuringSetup.$('.activity-status')).toHaveAttribute(
       'data-state',
       'interrupted',
