@@ -2311,8 +2311,7 @@
 
   async function stop() {
     stopRequested = true;
-    if (activeTurnId && activeSessionId)
-      acp.cancelQueuedTurn(agent, directory, activeSessionId, activeTurnId);
+    if (activeTurnId) acp.cancelQueuedTurn(agent, directory, activeSessionId, activeTurnId);
     if (activePlanRevision)
       reportPlanRevision(activePlanRevision.id, 'Plan revision was cancelled.');
     diagnostic('stop_requested');

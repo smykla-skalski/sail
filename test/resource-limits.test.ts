@@ -213,6 +213,25 @@ void test('queued agent startup can be cancelled before acquiring a slot', async
   }
 });
 
+void test('Stop cancels queued workspace turns with or without a session', async () => {
+  resourceQueues.agent.setLimit(0);
+  try {
+    const stopQueuedTurn = async (sessionId: string | null) => {
+      const pending = acp.acquireTurnSlot('workspace-turn', undefined, '/repo');
+      assert.equal(await settled(pending), false);
+      assert.equal(acp.cancelQueuedTurn('codex', '/repo', sessionId, 'workspace-turn'), true);
+      await assert.rejects(pending, /cancelled/);
+      assert.equal(resourceQueues.agent.status.waiting, 0);
+    };
+    await stopQueuedTurn(null);
+    await stopQueuedTurn('existing-session');
+    resourceQueues.agent.setLimit(1);
+    assert.equal(resourceQueues.agent.status.active, 0);
+  } finally {
+    resourceQueues.agent.setLimit(4);
+  }
+});
+
 async function settled(promise: Promise<unknown>): Promise<boolean> {
   return Promise.race([
     promise.then(() => true),
