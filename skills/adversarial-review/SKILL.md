@@ -14,11 +14,9 @@ metadata:
 
 ## Sail execution rule
 
-When the prompt enables Sail cross-validation, launch each fresh pass with `validation_gate`, passing its gate name, prompt, and every implementation model; wait for the first receipt before launching the second. The tool selects and verifies a configured agent/model pair, preferring a model different from every implementation model and honoring strict routing. Include the actual provider/model in each verdict. Pause with the reason when no eligible choice exists or the model cannot be verified.
+Run every review pass in a fresh subagent session. In Sail, launch each pass with `validation_gate` and wait for its receipt before starting the next. The provider and model may match implementation; model metadata may be unresolved when the fresh execution identity is known. Include actual route metadata when available. If a fresh subagent cannot launch, report `Review Verdict: BLOCKED` with the failed pass and reason.
 
-Without Sail cross-validation, run both passes in the current session with the implementation agent and model. With Sail cross-validation enabled, use fresh subagent sessions for both passes, even when the first pass reports no findings. If either session cannot launch, stop and report `Review Verdict: BLOCKED` with the failed pass and reason.
-
-In same-session mode, read the diff yourself, perform the Code Adversary mandate, then challenge every finding with the Findings Adversary mandate before producing the verdict. The clean-context, spawning, and no-subagent `BLOCKED` rules below apply only with Sail cross-validation enabled.
+Use fresh subagent sessions for both passes, even when the first pass reports no findings. If either session cannot launch, stop and report `Review Verdict: BLOCKED` with the failed pass and reason.
 
 Find the bug, then try to prove the bug report wrong. It answers one question - **is this change correct?** - and answers it hard. It does not evaluate architecture, conventions, dead code, or taste; that is `/staff-code-review`.
 

@@ -129,7 +129,8 @@ describe('provider selected agent spawn', () => {
       { timeout: 15_000 },
     );
     await $('.agent-composer [data-pane-prompt]').setValue('Clipboard fixture source');
-    await $('.agent-actions button').click();
+    await expect($('.agent-actions button:last-child')).toBeEnabled();
+    await $('.agent-actions button:last-child').click();
     try {
       await browser.waitUntil(
         () =>
@@ -168,7 +169,8 @@ describe('provider selected agent spawn', () => {
     await $('.agent-launches button:nth-child(2)').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer [data-pane-prompt]').setValue('Clipboard fixture authenticate Codex');
-    await $('.agent-actions button').click();
+    await expect($('.agent-actions button:last-child')).toBeEnabled();
+    await $('.agent-actions button:last-child').click();
     await browser.waitUntil(
       async () =>
         (await $('.agent-auth button').isDisplayed()) ||
@@ -177,7 +179,8 @@ describe('provider selected agent spawn', () => {
     );
     if (await $('.agent-auth button').isDisplayed()) {
       await $('.agent-auth button').click();
-      await $('.agent-actions button').click();
+      await expect($('.agent-actions button:last-child')).toBeEnabled();
+      await $('.agent-actions button:last-child').click();
     }
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Clipboard received:'),
@@ -294,7 +297,7 @@ describe('provider selected agent spawn', () => {
     expect(routedReceipt?.routing).toMatchObject({
       role: 'implementation',
       risk: 'high',
-      independentReviewRequired: false,
+      contextIsolationRequired: false,
       requested: { provider: sourceThread.agent, model: null },
       actual: { provider: sourceThread.agent },
     });
@@ -339,7 +342,7 @@ describe('provider selected agent spawn', () => {
         .object({ status: z.string(), threadId: z.string(), worktreeId: z.string() })
         .parse(JSON.parse(openCodeResult.content[0].text));
       expect(openCode.status).toBe('started');
-      expect(openCode.threadId).toMatch(/^opencode:/);
+      expect(openCode.threadId).toMatch(/^acp:opencode:/);
       expect(openCode.worktreeId).toBe(path);
     }
 
@@ -568,14 +571,10 @@ describe('provider selected agent spawn', () => {
     expect(after.isError).not.toBe(true);
   });
 
-  it('routes MCP validation gates and enforces strict model selection', async () => {
+  it('routes MCP validation gates through fresh sessions and allows the implementation model', async () => {
     const path = realpathSync(repository);
     const settings = JSON.stringify({
-      choices: [
-        { agent: 'claude', model: 'broken' },
-        { agent: 'claude', model: 'test' },
-        { agent: 'claude', model: 'fast' },
-      ],
+      choices: [{ agent: 'claude', model: 'test' }],
       strictDifferentModel: true,
     });
     await browser.execute((value) => localStorage.setItem('sai-cross-validation', value), settings);
@@ -600,13 +599,12 @@ describe('provider selected agent spawn', () => {
       config,
       sourceThread.sessionId,
       {
-        gate: 'code-adversary',
+        gate: 'inline-review',
         prompt: 'Ship gate fixture validation gate',
-        implementingModels: ['test'],
       },
       'validation_gate',
     );
-    expect(result.isError).not.toBe(true);
+    if (result.isError) throw new Error(result.content[0].text);
     const started = z
       .object({ receiptId: z.string(), accessKey: z.string(), threadId: z.string() })
       .passthrough()
@@ -614,8 +612,8 @@ describe('provider selected agent spawn', () => {
     expect(started).toMatchObject({
       status: 'started',
       provider: 'claude',
-      model: 'fast',
-      gate: 'code-adversary',
+      model: 'test',
+      gate: 'inline-review',
       path,
     });
     expect(started.threadId).not.toBe(`acp:${sourceThread.agent}:${sourceThread.sessionId}`);
@@ -666,42 +664,15 @@ describe('provider selected agent spawn', () => {
     expect(completed.isError).not.toBe(true);
     expect(JSON.parse(completed.content[0].text)).toMatchObject({
       state: 'completed',
-      model: 'fast',
-      validation: { verdict: 'CLEAN', gate: 'code-adversary' },
+      model: 'test',
+      validation: { verdict: 'CLEAN', gate: 'inline-review' },
     });
-    const rejected = await callMcp(
-      config,
-      sourceThread.sessionId,
-      {
-        gate: 'findings-adversary',
-        prompt: 'Clipboard fixture strict gate',
-        implementingModels: ['test', 'fast'],
-      },
-      'validation_gate',
-    );
-    expect(rejected.isError).toBe(true);
-    expect(rejected.content[0].text).toContain('Strict different-model routing is enabled');
-    await browser.tauri.execute(async ({ core }) => {
-      await core.invoke('save_setting', {
-        key: 'sai-cross-validation',
-        value: JSON.stringify({
-          choices: [
-            { agent: 'claude', model: 'test' },
-            { agent: 'claude', model: 'fast' },
-          ],
-          strictDifferentModel: false,
-        }),
-      });
-    });
-    await browser.refresh();
-    await expect($('.agent-launches button')).toBeEnabled();
     const dispatchFailure = await callMcp(
       config,
       sourceThread.sessionId,
       {
         gate: 'test-adversary',
         prompt: 'Gate prompt model unavailable',
-        implementingModels: [],
       },
       'validation_gate',
     );

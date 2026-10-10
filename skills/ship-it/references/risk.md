@@ -4,7 +4,7 @@ Select gates from the committed revision before validation. The portable default
 
 ## Policy format
 
-The document has `schema_version: sai.ship-it.risk-policy/v1`, `risk_order: [low, medium, high]`, one `default_risk`, `independent_review: strict|degraded`, policies for all three levels, and ordered path `rules`. Each policy has unique non-empty `required_gates` and a `fallbacks` object mapping an unavailable gate to a non-empty ordered list of compatible fallback mechanisms; the object is empty when no selected gate has one. IDs use lowercase letters, digits and hyphens. Missing `independent_review` in a legacy v1 policy means `strict`; reject every other value.
+The document has `schema_version: sai.ship-it.risk-policy/v1`, `risk_order: [low, medium, high]`, one `default_risk`, policies for all three levels, and ordered path `rules`. Each policy has unique non-empty `required_gates` and a `fallbacks` object mapping an unavailable gate to a non-empty ordered list of compatible fallback mechanisms; the object is empty when no selected gate has one. IDs use lowercase letters, digits and hyphens. Legacy `independent_review` fields are ignored.
 
 The bundled policy also declares `diff_classes`: each class ID maps to `{"risk": <level>, "paths": [globs]}`. Diff classes are bundled-only. Reject a repository policy that contains `diff_classes`: a repository raises matched paths with `rules`; it can never widen a class or lower its level.
 
@@ -25,7 +25,6 @@ Example repository policy:
   "schema_version": "sai.ship-it.risk-policy/v1",
   "risk_order": ["low", "medium", "high"],
   "default_risk": "low",
-  "independent_review": "strict",
   "policies": {
     "low": {
       "required_gates": ["local-checks", "inline-review", "ci"],
@@ -61,17 +60,17 @@ Example repository policy:
 
 ## Gate shapes
 
-`inline-review` is one review pass by the current execution: hunt concrete defects and unmet acceptance criteria in `git diff origin/<default>...HEAD`, prove each finding with `file:line`, and reply `Review Verdict: CLEAN` or `Review Verdict: NEEDS_FIXES`. It dispatches no Code or Findings Adversary. Sail never runs a gate inline, so there one fresh gate worker makes the single pass. Record a `review` route with the actual mechanism (`inline`, or the Sail worker's) and `independence: not-applicable`; the strict independent-review policy governs `adversarial-review` routes only, because `inline-review` claims no independence. Its evidence result is `gate-inline-review`. A `NEEDS_FIXES` verdict spends the same fix pass and convergence counters as `adversarial-review`.
+`inline-review` is one review pass by a fresh subagent: hunt concrete defects and unmet acceptance criteria in `git diff origin/<default>...HEAD`, prove each finding with `file:line`, and reply `Review Verdict: CLEAN` or `Review Verdict: NEEDS_FIXES`. It dispatches no Code or Findings Adversary. Record the fresh subagent route and verdict in `gate-inline-review`. Its evidence result is `gate-inline-review`. A `NEEDS_FIXES` verdict spends the same fix pass and convergence counters as `adversarial-review`.
 
 `adversarial-review` is the two-pass cycle (Code Adversary, then Findings Adversary) under the convergence policy, and `adversarial-test` is the adversarial manual-test pass. The capability fact `review_gate_required` is true when either review gate is selected; `test_gate_required` is true only when `adversarial-test` is. A level without a review gate runs no review, and a level without `adversarial-test` runs no manual test.
 
 ## Bundled gate sets
 
-| Risk     | Review                | Manual test          | Required gates                                                                  |
-| :------- | :-------------------- | :------------------- | :------------------------------------------------------------------------------ |
-| `low`    | one inline pass       | none                 | `local-checks`, `inline-review`, `ci`                                           |
-| `medium` | one adversarial cycle | one adversarial pass | `local-checks`, `adversarial-review`, `adversarial-test`, `ci`                  |
-| `high`   | one adversarial cycle | one adversarial pass | `local-checks`, `adversarial-review`, `adversarial-test`, `ci`, `hosted-review` |
+| Risk     | Review                  | Manual test          | Required gates                                                                  |
+| :------- | :---------------------- | :------------------- | :------------------------------------------------------------------------------ |
+| `low`    | one fresh subagent pass | none                 | `local-checks`, `inline-review`, `ci`                                           |
+| `medium` | one adversarial cycle   | one adversarial pass | `local-checks`, `adversarial-review`, `adversarial-test`, `ci`                  |
+| `high`   | one adversarial cycle   | one adversarial pass | `local-checks`, `adversarial-review`, `adversarial-test`, `ci`, `hosted-review` |
 
 `high` keeps the full sequence of every supported gate. Release policy still adds `ci` and `hosted-review` as floors whenever the repository requires checks or reviewers, so a lower level never drops a repository control.
 
@@ -89,7 +88,7 @@ Before the first commit there is no committed change set: leave `risk.level`, `r
 4. Never lower the selected risk from the checkpoint, a matching rule or an earlier revision. Lower it only when the user explicitly authorizes overriding the named source and level; record that authorization in the checkpoint.
 5. Recompute after every source change or default-branch merge. A higher result invalidates the revision's gate evidence. A lower recomputation keeps the prior floor unless the user authorized the reduction.
 
-The policy's `independent_review` field authorizes role routing. `strict` enforces an independently resolved review route. `degraded` explicitly authorizes a weaker route only when its evidence records every degradation reason and the repository policy path. A command-line risk floor never changes this field.
+Review and testing always run in fresh subagent sessions. A different model is optional. A command-line risk floor never changes the selected gates.
 
 Before the first validation command, report exactly:
 

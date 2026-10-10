@@ -46,7 +46,24 @@ describe('agent coordination bridge', () => {
       expect.objectContaining({
         name: 'validation_gate',
         inputSchema: expect.objectContaining({
-          required: ['gate', 'prompt', 'implementingModels'],
+          required: ['gate', 'prompt'],
+          properties: expect.objectContaining({
+            gate: expect.objectContaining({
+              enum: ['inline-review', 'code-adversary', 'findings-adversary', 'test-adversary'],
+            }),
+          }),
+        }),
+      }),
+    );
+    expect(tools.result.tools).toContainEqual(
+      expect.objectContaining({
+        name: 'ship_progress',
+        inputSchema: expect.objectContaining({
+          properties: expect.objectContaining({
+            gate: expect.objectContaining({
+              enum: ['inline-review', 'code-adversary', 'findings-adversary', 'test-adversary'],
+            }),
+          }),
         }),
       }),
     );

@@ -16,14 +16,12 @@
       "mechanism",
       "executionId",
       "modelResolution",
-      "independence",
-      "degradationReasons",
+      "contextIsolationRequired",
       "timestamp"
     ],
     "selector_fields": ["provider", "model", "variant"],
     "mechanisms": ["native-subagent", "generic-subagent", "skill", "inline", "service", "process"],
-    "model_resolutions": ["resolved", "unresolved"],
-    "independence_values": ["independent", "degraded", "not-applicable"]
+    "model_resolutions": ["resolved", "unresolved"]
   },
   "route_diagnostic": {
     "required_fields": ["role", "requested", "stage", "reason", "timestamp"],
@@ -33,31 +31,14 @@
       "unsupported-selector",
       "unavailable-mechanism",
       "metadata-unavailable",
-      "strict-same-model",
-      "strict-context-reuse",
-      "strict-inline-execution"
-    ]
-  },
-  "independent_review": {
-    "default": "strict",
-    "applies_to": "adversarial-review",
-    "exempt_gates": ["inline-review"],
-    "strict_rejections": [
-      "same-provider-and-model-as-implementation",
-      "unresolved-model-alias",
-      "implementation-execution-reuse",
+      "context-reuse",
       "inline-execution"
-    ],
-    "degraded_mode_requires": [
-      "explicit-policy-authorization",
-      "degraded-independence-value",
-      "non-empty-degradation-reasons"
     ]
   },
   "adapters": {
     "claude-code": {
       "subagents": ["native-subagent", "generic-subagent"],
-      "fallback": "inline",
+      "fallback": null,
       "selectors": {
         "provider": "session-provider",
         "model": "agent-model",
@@ -67,7 +48,7 @@
     },
     "codex": {
       "subagents": ["generic-subagent"],
-      "fallback": "inline",
+      "fallback": null,
       "selectors": {
         "provider": "session-provider",
         "model": "spawn-agent-model",
@@ -77,7 +58,7 @@
     },
     "opencode": {
       "subagents": ["generic-subagent"],
-      "fallback": "inline",
+      "fallback": null,
       "selectors": {
         "provider": "task-model-provider",
         "model": "task-model-id",
@@ -87,7 +68,7 @@
     },
     "copilot-cli": {
       "subagents": ["native-subagent", "generic-subagent"],
-      "fallback": "inline",
+      "fallback": null,
       "selectors": {
         "provider": "session-provider",
         "model": "agent-model",

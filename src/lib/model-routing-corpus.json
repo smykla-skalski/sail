@@ -8,8 +8,7 @@
     {
       "id": "independent-review",
       "role": "review",
-      "risk": "medium",
-      "implementingModels": ["implementation-model"]
+      "risk": "medium"
     },
     { "id": "ci-failure", "role": "ci-triage", "risk": "medium" }
   ],
@@ -25,7 +24,6 @@
       "id": "reject-review-self-selection",
       "role": "review",
       "risk": "medium",
-      "implementingModels": ["review-model"],
       "model": "review-model"
     }
   ]

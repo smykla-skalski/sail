@@ -130,7 +130,7 @@ await test('spawn receipts persist requested and actual route identity', () => {
     routing: {
       role: 'implementation',
       risk: 'high',
-      independentReviewRequired: true,
+      contextIsolationRequired: false,
       requested: { provider: 'codex', model: 'gpt-6.1-sol', variant: 'xhigh' },
       actual: { provider: 'codex', model: 'gpt-6.1-sol', variant: 'xhigh' },
     },
@@ -140,7 +140,7 @@ await test('spawn receipts persist requested and actual route identity', () => {
     ...routed,
     routing: {
       ...routed.routing!,
-      independentReviewRequired: false,
+      contextIsolationRequired: false,
       requested: { provider: 'codex', model: null, variant: null },
       actual: { provider: 'codex', model: null, variant: null },
     },
@@ -154,6 +154,26 @@ await test('spawn receipts persist requested and actual route identity', () => {
     routing: { ...routed.routing!, requested: { ...routed.routing!.requested, model: 1 } },
   };
   assert.equal(loadSpawnReceipts(JSON.stringify([invalid]))[0].routing, undefined);
+});
+
+await test('legacy review routing receipts migrate to context isolation', () => {
+  const legacy = {
+    ...receipt,
+    routing: {
+      role: 'review',
+      risk: 'high',
+      independentReviewRequired: true,
+      requested: { provider: 'codex', model: 'gpt-6.1-sol', variant: null },
+      actual: { provider: 'codex', model: 'gpt-6.1-sol', variant: null },
+    },
+  };
+  assert.deepEqual(loadSpawnReceipts(JSON.stringify([legacy]))[0].routing, {
+    role: 'review',
+    risk: 'high',
+    contextIsolationRequired: true,
+    requested: legacy.routing.requested,
+    actual: legacy.routing.actual,
+  });
 });
 
 await test('receipts survive restart with bounded results and honest states', () => {

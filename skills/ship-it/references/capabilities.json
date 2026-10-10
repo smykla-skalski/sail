@@ -50,8 +50,6 @@
         "network.write",
         "process.execute",
         "process.read",
-        "inline.review",
-        "inline.test",
         "skill.review",
         "skill.test",
         "state.write",
@@ -78,8 +76,6 @@
         "process.execute",
         "process.jira.read",
         "process.read",
-        "inline.review",
-        "inline.test",
         "skill.review",
         "skill.test",
         "state.write",
@@ -289,7 +285,7 @@
           "when": { "fact": "github_source", "equals": true }
         },
         {
-          "any_of": ["skill.review", "subagent.review", "inline.review"],
+          "any_of": ["skill.review", "subagent.review"],
           "when": { "fact": "review_gate_required", "equals": true },
           "fallback": "portable-review-fallback"
         },
@@ -330,7 +326,7 @@
           "when": { "fact": "test_gate_required", "equals": true }
         },
         {
-          "any_of": ["skill.test", "subagent.test", "inline.test"],
+          "any_of": ["skill.test", "subagent.test"],
           "when": { "fact": "test_gate_required", "equals": true },
           "fallback": "portable-test-fallback"
         },
@@ -382,7 +378,7 @@
           "when": { "fact": "github_source", "equals": true }
         },
         {
-          "any_of": ["skill.review", "subagent.review", "inline.review"],
+          "any_of": ["skill.review", "subagent.review"],
           "when": {
             "all": [
               { "fact": "code_changed", "equals": true },
@@ -392,7 +388,7 @@
           "fallback": "portable-review-fallback"
         },
         {
-          "any_of": ["skill.test", "subagent.test", "inline.test"],
+          "any_of": ["skill.test", "subagent.test"],
           "when": {
             "all": [
               { "fact": "code_changed", "equals": true },

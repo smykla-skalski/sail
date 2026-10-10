@@ -13,7 +13,7 @@ export type SpawnRouteIdentity = {
 export type SpawnRouting = {
   role: ModelRouteRole;
   risk: ShipRisk;
-  independentReviewRequired: boolean;
+  contextIsolationRequired: boolean;
   requested: SpawnRouteIdentity;
   actual: SpawnRouteIdentity | null;
 };
@@ -103,11 +103,13 @@ export function loadSpawnReceipts(raw: string | null): SpawnReceipt[] {
         delete receipt.toolCount;
       if (
         receipt.routing &&
-        (!['exploration', 'implementation', 'debugging', 'review', 'ci-triage'].includes(
+        (!['exploration', 'implementation', 'debugging', 'review', 'testing', 'ci-triage'].includes(
           receipt.routing.role,
         ) ||
           !['low', 'medium', 'high'].includes(receipt.routing.risk) ||
-          typeof receipt.routing.independentReviewRequired !== 'boolean' ||
+          (typeof receipt.routing.contextIsolationRequired !== 'boolean' &&
+            typeof (receipt.routing as SpawnRouting & { independentReviewRequired?: unknown })
+              .independentReviewRequired !== 'boolean') ||
           !receipt.routing.requested ||
           !['claude', 'codex', 'opencode'].includes(receipt.routing.requested.provider) ||
           (receipt.routing.requested.model !== null &&
@@ -122,6 +124,12 @@ export function loadSpawnReceipts(raw: string | null): SpawnReceipt[] {
                 typeof receipt.routing.actual.variant !== 'string'))))
       )
         delete receipt.routing;
+      if (receipt.routing) {
+        const routing = receipt.routing as SpawnRouting & { independentReviewRequired?: unknown };
+        if (typeof routing.contextIsolationRequired !== 'boolean')
+          routing.contextIsolationRequired = ['review', 'testing'].includes(routing.role);
+        delete routing.independentReviewRequired;
+      }
       if (!gateMetadataSchema.safeParse(receipt.validation).success) delete receipt.validation;
     }
     return receipts;
