@@ -111,6 +111,20 @@ fn malformed_source_identity_does_not_disable_valid_unicode_source() {
 }
 
 #[test]
+fn many_failed_sources_cannot_starve_a_healthy_hit() {
+    let mut batches = (0..50)
+        .map(|index| batch("failed", &format!("{index:02}{}", "s".repeat(10)), Err(())))
+        .collect::<Vec<_>>();
+    batches.push(batch("healthy", "source", Ok(vec![hit("ok", b"found")])));
+    let response = search_response(batches, BrokerLimits::default()).unwrap();
+    assert_eq!(response.hits.len(), 1);
+    assert_eq!(response.hits[0].id, "ok");
+    assert!(!response.errors.is_empty());
+    assert!(response.truncated);
+    assert!(serde_json::to_vec(&response).unwrap().len() <= 4 * 1024);
+}
+
+#[test]
 fn preview_remains_within_byte_limit_for_invalid_utf8() {
     let content = [0xff, 0xfe, b'a'];
     let limits = BrokerLimits {

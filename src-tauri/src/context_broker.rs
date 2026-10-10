@@ -158,19 +158,20 @@ pub fn search_response(
         errors: Vec::new(),
         truncated: false,
     };
+    let mut source_errors = Vec::new();
     for batch in batches {
         if !valid_field(&batch.provider, 64) || !valid_field(&batch.source, 256) {
             response.truncated = true;
             continue;
         }
         if !valid_batch(&batch) {
-            response.errors.push(SourceError {
-                provider: batch.provider,
-                source: batch.source,
-                message: "Source unavailable.",
-            });
-            if !fits(&response, limits.response_bytes) {
-                response.errors.pop();
+            if source_errors.len() < MAX_ITEMS {
+                source_errors.push(SourceError {
+                    provider: batch.provider,
+                    source: batch.source,
+                    message: "Source unavailable.",
+                });
+            } else {
                 response.truncated = true;
             }
             continue;
@@ -200,6 +201,28 @@ pub fn search_response(
                 response.hits.pop();
                 response.truncated = true;
             }
+        }
+    }
+    for (index, error) in source_errors.into_iter().enumerate() {
+        response.errors.push(error);
+        if index == 0 {
+            while !fits(&response, limits.response_bytes) {
+                let Some(hit) = response.hits.last_mut() else {
+                    break;
+                };
+                if !hit.preview.is_empty() {
+                    hit.preview.pop();
+                } else if response.hits.len() > 1 {
+                    response.hits.pop();
+                } else {
+                    break;
+                }
+                response.truncated = true;
+            }
+        }
+        if !fits(&response, limits.response_bytes) {
+            response.errors.pop();
+            response.truncated = true;
         }
     }
     Ok(response)
