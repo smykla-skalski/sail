@@ -2,8 +2,8 @@
 set -euo pipefail
 
 repetitions="${1:-1000}"
-if [[ ! "$repetitions" =~ ^[1-9][0-9]*$ ]]; then
-  echo "usage: $0 [positive-repetition-count]" >&2
+if [[ ! "$repetitions" =~ ^([1-9][0-9]{0,2}|1000)$ ]]; then
+  echo "usage: $0 [repetition-count-1-to-1000]" >&2
   exit 2
 fi
 
