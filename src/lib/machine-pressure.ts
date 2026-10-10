@@ -39,14 +39,24 @@ export function pressureReason(
   reading: MachineReading,
   thresholds: PressureThresholds,
 ): string | null {
-  const blockers: string[] = [];
+  const { host, disk } = pressureBlockers(reading, thresholds);
+  const blockers = [...host, ...(disk ? [disk] : [])];
+  return blockers.length ? `Waiting for machine pressure: ${blockers.join('; ')}.` : null;
+}
+
+export function pressureBlockers(
+  reading: MachineReading,
+  thresholds: PressureThresholds,
+): { host: string[]; disk: string | null } {
+  const host: string[] = [];
+  let disk: string | null = null;
   if (!validPair(reading.totalMemory, reading.availableMemory))
-    blockers.push('memory reading unavailable');
+    host.push('memory reading unavailable');
   else if (
     thresholds.memoryFreePercent > 0 &&
     reading.availableMemory * 100 <= reading.totalMemory * thresholds.memoryFreePercent
   )
-    blockers.push(`free memory at or below ${thresholds.memoryFreePercent}%`);
+    host.push(`free memory at or below ${thresholds.memoryFreePercent}%`);
 
   if (
     !Number.isFinite(reading.totalSwap) ||
@@ -55,21 +65,20 @@ export function pressureReason(
     reading.usedSwap < 0 ||
     reading.usedSwap > reading.totalSwap
   )
-    blockers.push('swap reading unavailable');
+    host.push('swap reading unavailable');
   else if (
     thresholds.swapUsedPercent > 0 &&
     reading.totalSwap > 0 &&
     reading.usedSwap * 100 >= reading.totalSwap * thresholds.swapUsedPercent
   )
-    blockers.push(`swap use at or above ${thresholds.swapUsedPercent}%`);
+    host.push(`swap use at or above ${thresholds.swapUsedPercent}%`);
 
-  if (!validPair(reading.totalDisk, reading.availableDisk))
-    blockers.push('disk reading unavailable');
+  if (!validPair(reading.totalDisk, reading.availableDisk)) disk = 'disk reading unavailable';
   else if (
     thresholds.diskFreePercent > 0 &&
     reading.availableDisk * 100 <= reading.totalDisk * thresholds.diskFreePercent
   )
-    blockers.push(`free disk at or below ${thresholds.diskFreePercent}%`);
+    disk = `free disk at or below ${thresholds.diskFreePercent}%`;
 
-  return blockers.length ? `Waiting for machine pressure: ${blockers.join('; ')}.` : null;
+  return { host, disk };
 }

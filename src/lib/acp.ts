@@ -780,7 +780,7 @@ async function acquireTurnSlot(
   if (queue.reason || queue.status.active >= queue.status.limit || queue.status.waiting)
     onQueue?.(queue.status.limit, queue.reason);
   const unsubscribe = queue.subscribe(() => {
-    if (queue.isQueued(turnId)) onQueue?.(queue.status.limit, queue.reason);
+    if (queue.isQueued(turnId)) onQueue?.(queue.status.limit, queue.reasonFor(turnId));
   });
   try {
     return await queue.acquire(turnId, directory);

@@ -10,6 +10,7 @@ export class ResourceQueue {
   private waiters: Waiter[] = [];
   private limit: number;
   private blockedReason: string | null;
+  private directoryReasons = new Map<string, string>();
   private onEnqueue?: () => void;
   private listeners = new Set<() => void>();
 
@@ -21,6 +22,11 @@ export class ResourceQueue {
 
   get reason(): string | null {
     return this.blockedReason;
+  }
+
+  reasonFor(id: string): string | null {
+    const waiter = this.waiters.find((entry) => entry.id === id);
+    return this.blockedReason || (waiter && this.directoryReasons.get(waiter.directory)) || null;
   }
 
   get status() {
@@ -36,6 +42,12 @@ export class ResourceQueue {
   setBlockedReason(reason: string | null): void {
     if (this.blockedReason === reason) return;
     this.blockedReason = reason;
+    this.drain();
+    this.emit();
+  }
+
+  setDirectoryReasons(reasons: Map<string, string>): void {
+    this.directoryReasons = new Map(reasons);
     this.drain();
     this.emit();
   }
@@ -74,7 +86,11 @@ export class ResourceQueue {
 
   private drain(): void {
     while (!this.blockedReason && this.active < this.limit && this.waiters.length) {
-      const waiter = this.waiters.shift()!;
+      const index = this.waiters.findIndex(
+        (waiter) => !this.directoryReasons.has(waiter.directory),
+      );
+      if (index < 0) break;
+      const [waiter] = this.waiters.splice(index, 1);
       this.active++;
       let released = false;
       waiter.resolve(() => {

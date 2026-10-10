@@ -283,7 +283,7 @@
       unsubscribe = queue.subscribe(() => {
         if (liveLabel === label && queue.isQueued(label)) {
           queuedLimit = queue.status.limit;
-          queuedReason = queue.reason;
+          queuedReason = queue.reasonFor(label);
         }
       });
       release = await queue.acquire(label, directory);

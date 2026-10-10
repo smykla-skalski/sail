@@ -4,7 +4,7 @@ import { ResourceQueue } from './resource-queue.ts';
 import {
   defaultPressureThresholds,
   parsePressureThreshold,
-  pressureReason,
+  pressureBlockers,
   pressureThresholdKeys,
   type MachineReading,
   type PressureThresholds,
@@ -35,13 +35,14 @@ let pressureThresholds: PressureThresholds = {
     defaultPressureThresholds.diskFreePercent,
   ),
 };
-let lastReadings: Map<string, MachineReading> | null = null;
 let timer: ReturnType<typeof setInterval> | null = null;
 let refreshing = false;
 let updatingReason = false;
+let readingGeneration = 0;
 
 function checkNewWork(): void {
-  setPressureReason(checkingReason);
+  readingGeneration++;
+  setPressureState(checkingReason, new Map());
   void refreshPressure();
 }
 
@@ -78,10 +79,14 @@ function pendingDirectories(): string[] {
   return [...new Set(Object.values(resourceQueues).flatMap((queue) => queue.waitingDirectories()))];
 }
 
-function setPressureReason(reason: string | null): void {
+function setPressureState(reason: string | null, directoryReasons: Map<string, string>): void {
   updatingReason = true;
   try {
-    for (const queue of Object.values(resourceQueues)) queue.setBlockedReason(reason);
+    for (const queue of Object.values(resourceQueues)) {
+      if (reason) queue.setBlockedReason(reason);
+      queue.setDirectoryReasons(directoryReasons);
+      if (!reason) queue.setBlockedReason(null);
+    }
   } finally {
     updatingReason = false;
   }
@@ -91,43 +96,48 @@ function setPressureReason(reason: string | null): void {
 async function refreshPressure(): Promise<void> {
   if (refreshing || !pendingWork()) return;
   refreshing = true;
+  const generation = readingGeneration;
+  const directories = pendingDirectories();
   try {
-    const directories = pendingDirectories();
-    const readings = new Map(
-      await Promise.all(
-        directories.map(
-          async (directory) =>
-            [
-              directory,
-              await invoke<MachineReading>('machine_pressure', { directory: directory || null }),
-            ] as const,
-        ),
+    const results = await Promise.allSettled(
+      directories.map((directory) =>
+        invoke<MachineReading>('machine_pressure', { directory: directory || null }),
       ),
     );
-    lastReadings = readings;
-    if (pendingDirectories().every((directory) => readings.has(directory)))
-      setPressureReason(readingsReason(readings));
-    else setPressureReason(checkingReason);
+    if (
+      generation !== readingGeneration ||
+      pendingDirectories().some((directory) => !directories.includes(directory))
+    )
+      return;
+    const hostReasons = new Set<string>();
+    const directoryReasons = new Map<string, string>();
+    let validHostReading = false;
+    for (const [index, result] of results.entries()) {
+      const directory = directories[index];
+      if (result.status === 'rejected') {
+        directoryReasons.set(directory, `${directory || 'Workspace'}: machine reading unavailable`);
+        continue;
+      }
+      validHostReading = true;
+      const blockers = pressureBlockers(result.value, pressureThresholds);
+      for (const blocker of blockers.host) hostReasons.add(blocker);
+      if (blockers.disk)
+        directoryReasons.set(directory, `${directory || 'Workspace'}: ${blockers.disk}`);
+    }
+    const reason = !validHostReading
+      ? 'Waiting for machine pressure: host readings unavailable.'
+      : hostReasons.size
+        ? `Waiting for machine pressure: ${[...hostReasons].join('; ')}.`
+        : null;
+    setPressureState(reason, directoryReasons);
   } catch {
-    lastReadings = null;
-    setPressureReason('Waiting for machine pressure: host readings unavailable.');
+    if (generation === readingGeneration)
+      setPressureState('Waiting for machine pressure: host readings unavailable.', new Map());
   } finally {
     refreshing = false;
     updateMonitor();
+    if (generation !== readingGeneration && pendingWork()) void refreshPressure();
   }
-}
-
-function readingsReason(readings: Map<string, MachineReading>): string | null {
-  const reasons = [...readings].flatMap(([directory, reading]) => {
-    const reason = pressureReason(reading, pressureThresholds);
-    if (!reason) return [];
-    return [
-      directory
-        ? `${directory}: ${reason.replace('Waiting for machine pressure: ', '')}`
-        : reason.replace('Waiting for machine pressure: ', ''),
-    ];
-  });
-  return reasons.length ? `Waiting for machine pressure: ${reasons.join(' ')}` : null;
 }
 
 function updateMonitor(): void {
@@ -143,7 +153,7 @@ function updateMonitor(): void {
       timer = null;
     }
     if (Object.values(resourceQueues).some((queue) => queue.reason !== checkingReason))
-      setPressureReason(checkingReason);
+      setPressureState(checkingReason, new Map());
   }
 }
 
@@ -151,9 +161,8 @@ for (const queue of Object.values(resourceQueues)) queue.subscribe(updateMonitor
 
 export function setPressureThresholds(value: PressureThresholds): void {
   pressureThresholds = value;
-  if (lastReadings && pendingDirectories().every((directory) => lastReadings?.has(directory)))
-    setPressureReason(readingsReason(lastReadings));
-  else setPressureReason(checkingReason);
+  readingGeneration++;
+  setPressureState(checkingReason, new Map());
   if (pendingWork()) void refreshPressure();
 }
 

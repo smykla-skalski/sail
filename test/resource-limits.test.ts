@@ -7,6 +7,7 @@ import { resourceQueues } from '../src/lib/resource-limits.ts';
 import {
   defaultPressureThresholds,
   parsePressureThreshold,
+  pressureBlockers,
   pressureReason,
   type MachineReading,
 } from '../src/lib/machine-pressure.ts';
@@ -58,6 +59,16 @@ void test('invalid readings queue starts and report every affected reading', () 
   );
 });
 
+void test('pressure blockers separate host readings from workspace disk readings', () => {
+  assert.deepEqual(
+    pressureBlockers(
+      { ...healthy, availableMemory: 10, availableDisk: 2 },
+      defaultPressureThresholds,
+    ),
+    { host: ['free memory at or below 10%'], disk: 'free disk at or below 2%' },
+  );
+});
+
 void test('configured thresholds parse strictly and zero disables each threshold', () => {
   assert.equal(parsePressureThreshold('0', 10), 0);
   assert.equal(parsePressureThreshold('101', 10), 10);
@@ -94,6 +105,22 @@ void test('queued work retains its workspace disk until admission', async () => 
   const release = await pending;
   assert.deepEqual(queue.waitingDirectories(), []);
   release();
+});
+
+void test('a blocked volume does not delay another volume and recovers in queue order', async () => {
+  const queue = new ResourceQueue(1, 'Checking machine pressure…');
+  const blocked = queue.acquire('blocked', '/Volumes/full');
+  const healthyWork = queue.acquire('healthy', '/Volumes/healthy');
+  queue.setDirectoryReasons(new Map([['/Volumes/full', 'Disk pressure on /Volumes/full']]));
+  queue.setBlockedReason(null);
+  assert.equal(queue.reasonFor('blocked'), 'Disk pressure on /Volumes/full');
+  const releaseHealthy = await healthyWork;
+  assert.equal(await settled(blocked), false);
+  releaseHealthy();
+  queue.setDirectoryReasons(new Map());
+  const releaseBlocked = await blocked;
+  releaseBlocked();
+  assert.equal(queue.status.active, 0);
 });
 
 void test('cancelled agent connection never reaches process startup', async () => {
