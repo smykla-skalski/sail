@@ -62,6 +62,13 @@ export const config = {
   /** New profiles follow the OS appearance. Pin it so color and screenshot checks give the same
    * result on light and dark machines; specs that need dark set `sai-theme` or the appearance. */
   async before() {
+    const hadQuery = await browser.execute(() => {
+      if (!location.search) return false;
+      history.replaceState(null, '', location.pathname);
+      return true;
+    });
+    if (hadQuery) await browser.refresh();
+
     await browser.execute(async (value) => {
       const tauri: unknown = Reflect.get(window, '__TAURI__');
       const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
