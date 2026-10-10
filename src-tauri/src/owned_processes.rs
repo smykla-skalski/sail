@@ -130,7 +130,14 @@ fn stop_process(record: &ProcessRecord) -> Result<bool, String> {
         .args(["/PID", &record.pid.to_string(), "/T", "/F"])
         .output()
         .map_err(|error| error.to_string())?;
-    Ok(output.status.success())
+    if !output.status.success() {
+        return Err(format!(
+            "taskkill failed for PID {}: {}",
+            record.pid,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(true)
 }
 
 fn report(record: &ProcessRecord, reason: &str, stopped: bool) {
@@ -199,6 +206,7 @@ impl Registry {
     }
 
     fn recover(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
         for entry in std::fs::read_dir(&self.directory).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
             let path = entry.path();
@@ -210,9 +218,20 @@ impl Registry {
             {
                 continue;
             }
-            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
-            let mut file: ProcessFile = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            };
+            let mut file: ProcessFile = match serde_json::from_slice(&bytes) {
+                Ok(file) => file,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            };
             if process_started(file.owner_pid) == Some(file.owner_started) {
                 continue;
             }
@@ -236,13 +255,20 @@ impl Registry {
                 }
             }
             file.processes = retained;
-            if file.processes.is_empty() {
-                std::fs::remove_file(&path).map_err(|error| error.to_string())?;
+            let result = if file.processes.is_empty() {
+                std::fs::remove_file(&path).map_err(|error| error.to_string())
             } else {
-                write_file(&path, &file)?;
+                write_file(&path, &file)
+            };
+            if let Err(error) = result {
+                errors.push(format!("{}: {error}", path.display()));
             }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 }
 
@@ -412,6 +438,28 @@ mod tests {
         stale.0.wait().unwrap();
         assert!(running(&mut reused));
         assert!(running(&mut unrelated));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_recovery_file_does_not_skip_valid_owners() {
+        let path = directory();
+        let registry = new_registry(&path, process_started(std::process::id()).unwrap());
+        let previous = new_registry(&path, 0);
+        let mut stale = sleeper();
+        previous
+            .register("crashed-run", stale.0.id(), stale.0.id())
+            .unwrap();
+        {
+            let mut state = previous.state.lock().unwrap();
+            state.processes[0].recorded = now() - RECOVERY_GRACE.as_secs();
+            previous.save(&state).unwrap();
+        }
+        std::fs::write(path.join("owned-processes-invalid.json"), b"{").unwrap();
+
+        assert!(registry.recover().is_err());
+        stale.0.wait().unwrap();
+        assert!(!previous.file.exists());
         std::fs::remove_dir_all(path).unwrap();
     }
 

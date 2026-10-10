@@ -775,6 +775,7 @@ fn owned_session(
 pub fn terminal_owned_create(
     app: AppHandle,
     manager: State<'_, TerminalManager>,
+    agents: State<'_, crate::acp::AgentManager>,
     pane_id: String,
     directory: String,
     command: String,
@@ -792,22 +793,24 @@ pub fn terminal_owned_create(
     if !directory.is_dir() {
         return Err("Terminal directory is not a folder.".into());
     }
-    let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
-    if sessions.contains_key(&pane_id) {
-        return Err("Terminal pane already exists.".into());
-    }
-    let session = Arc::new(spawn(
-        directory,
-        80,
-        24,
-        Some(&command),
-        pane_id.clone(),
-        app,
-        Some(owner),
-    )?);
-    let terminal_id = format!("shell:{}", session.inspect_id);
-    sessions.insert(pane_id, session);
-    Ok(terminal_id)
+    crate::acp::with_active_owned_terminal(&agents, &owner, || {
+        let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
+        if sessions.contains_key(&pane_id) {
+            return Err("Terminal pane already exists.".into());
+        }
+        let session = Arc::new(spawn(
+            directory,
+            80,
+            24,
+            Some(&command),
+            pane_id.clone(),
+            app,
+            Some(owner.clone()),
+        )?);
+        let terminal_id = format!("shell:{}", session.inspect_id);
+        sessions.insert(pane_id, session);
+        Ok(terminal_id)
+    })
 }
 
 #[tauri::command]
