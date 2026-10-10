@@ -186,6 +186,40 @@ mod tests {
     use std::path::Path;
 
     #[cfg(windows)]
+    fn drain_conpty_output(master: &dyn portable_pty::MasterPty) -> std::thread::JoinHandle<()> {
+        use std::io::Read;
+
+        let mut reader = master
+            .try_clone_reader()
+            .expect("clone ConPTY output reader");
+        std::thread::spawn(move || {
+            let mut buffer = [0; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+    }
+
+    #[cfg(windows)]
+    fn close_conpty_bounded(
+        close: impl FnOnce() + Send + 'static,
+        output_drain: std::thread::JoinHandle<()>,
+    ) {
+        let (closed, wait) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            close();
+            let _ = closed.send(output_drain.join().is_ok());
+        });
+        let drained = wait
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("ConPTY close and output drain should finish within 10 seconds");
+        assert!(drained, "ConPTY output reader panicked");
+    }
+
+    #[cfg(windows)]
     #[test]
     fn worktree_removal_stops_owned_pty_descendant_on_first_attempt() {
         use crate::acp_terminal::WindowsTerminalJob;
@@ -197,7 +231,6 @@ mod tests {
         std::fs::create_dir_all(&managed).expect("managed terminal data directory");
         std::fs::write(managed.join("cache-entry"), "private cache")
             .expect("create managed cache entry");
-        let job = WindowsTerminalJob::new().expect("create owned terminal job");
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -206,6 +239,8 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("open ConPTY");
+        let job = WindowsTerminalJob::new().expect("create owned terminal job");
+        let output_drain = drain_conpty_output(pair.master.as_ref());
         let mut command = CommandBuilder::new(super::shell());
         command.set_job_handle(job.raw_handle());
         let mut child = pair
@@ -235,6 +270,8 @@ mod tests {
         assert!(!managed.exists(), "managed data was retained");
         assert_eq!(job.active_processes().unwrap(), 0);
         child.wait().expect("reap stopped terminal shell");
+        drop(writer);
+        close_conpty_bounded(move || drop(pair.master), output_drain);
     }
 
     #[cfg(windows)]
@@ -250,7 +287,6 @@ mod tests {
         std::fs::create_dir_all(&managed).expect("managed terminal data directory");
         std::fs::write(managed.join("cache-entry"), "private cache")
             .expect("create managed cache entry");
-        let job = WindowsTerminalJob::new().expect("create owned terminal job");
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -259,6 +295,8 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("open ConPTY");
+        let job = WindowsTerminalJob::new().expect("create owned terminal job");
+        let output_drain = drain_conpty_output(pair.master.as_ref());
         let mut command = CommandBuilder::new(super::shell());
         command.arg("/C");
         command.arg("start \"\" /B ping -n 60 127.0.0.1 & exit");
@@ -310,10 +348,17 @@ mod tests {
         };
 
         let result = crate::remove_worktree_then_terminal_data(&managed, || session.stop());
+        if result.is_err() {
+            session
+                .job
+                .stop()
+                .expect("stop test job after failed worktree removal");
+        }
         assert!(result.is_ok(), "first removal failed: {result:?}");
         assert!(!managed.exists(), "managed data was retained");
         assert_eq!(session.job.active_processes().unwrap(), 0);
         child.wait().expect("reap exited terminal shell");
+        close_conpty_bounded(move || drop(session), output_drain);
     }
 
     #[cfg(target_os = "macos")]
