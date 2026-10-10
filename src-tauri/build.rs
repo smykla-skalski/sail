@@ -1,4 +1,19 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=src/context_service.m");
+        let mut native = cc::Build::new();
+        native
+            .file("src/context_service.m")
+            .flag("-fobjc-arc")
+            .flag("-fblocks");
+        if std::env::var_os("CARGO_FEATURE_E2E").is_some() {
+            native.define("SAIL_CONTEXT_E2E", None);
+        }
+        native.compile("sail_context_service");
+        for framework in ["Foundation", "Security", "ServiceManagement"] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
     let policy_path = "../src/lib/capability-policy.json";
     println!("cargo:rerun-if-changed={policy_path}");
     let policy: serde_json::Value = serde_json::from_str(
