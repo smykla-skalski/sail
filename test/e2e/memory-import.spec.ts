@@ -47,10 +47,8 @@ describe('agent memory import', () => {
   it('previews local notes and imports each once', async () => {
     await openSettings();
     await $('.settings-navigation button:nth-child(4)').click();
-    await expect($('.memory-import-choice')).toBeDisplayed();
-    await expect($('.memory-record-list')).toHaveText(
-      expect.stringContaining('Use local clusters for acceptance tests.'),
-    );
+    await expect($('button=Import all')).toBeDisplayed();
+    await expect($('.memory-import-choice')).not.toExist();
     await [
       [2560, 1440],
       [1920, 1200],
@@ -85,25 +83,22 @@ describe('agent memory import', () => {
     expect(
       await browser.execute(() => document.documentElement.scrollWidth <= innerWidth + 1),
     ).toBe(true);
-    await $('.memory-import-choice input').click();
     await browser.execute(() => {
-      document
-        .querySelector('.memory-import-choice')
-        ?.closest('.settings-card')
-        ?.querySelector<HTMLButtonElement>('button:not(:disabled)')
+      Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+        .find((button) => button.textContent?.trim() === 'Import all')
         ?.focus();
     });
     expect(await browser.execute(() => document.activeElement?.textContent?.trim())).toBe(
-      'Import 1 selected',
+      'Import all',
     );
-    await $('button=Import 1 selected').click();
+    await $('button=Import all').click();
     await browser.execute(() => {
       document.documentElement.style.zoom = '';
     });
     await expect($('.settings-content')).toHaveText(
       expect.stringContaining('Imported 1 memory from Claude Code.'),
     );
-    await expect($('.memory-import-choice')).not.toExist();
+    await expect($('button=Import all')).not.toExist();
     const records = await browser.tauri.execute(async ({ core }) =>
       core.invoke<Array<{ content: string; provenance: { agent?: string; source?: string } }>>(
         'memory_list',
