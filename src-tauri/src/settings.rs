@@ -686,7 +686,14 @@ pub fn string_setting(app: &tauri::AppHandle, key: &str) -> Result<Option<String
 pub fn reset_test_settings(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(feature = "e2e")]
     {
-        let path = settings_path(&app)?;
+        let _ = app;
+        let root = std::env::var_os("SAIL_E2E_CONFIG_DIR")
+            .ok_or("Settings reset requires SAIL_E2E_CONFIG_DIR")?;
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            return Err("SAIL_E2E_CONFIG_DIR must be an absolute path".into());
+        }
+        let path = root.join("settings.json");
         let _lock = lock_settings(&path)?;
         write_settings(&path, &Settings::new())
     }
