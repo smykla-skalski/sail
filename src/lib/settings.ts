@@ -24,8 +24,19 @@ let ready = false;
 let e2eSettingsDisabled = false;
 let values: Record<string, string> = {};
 let writes = Promise.resolve();
+let e2eQuiesced = false;
+
+if (typeof window !== 'undefined' && import.meta.env?.MODE === 'e2e') {
+  Reflect.set(window, '__SAIL_E2E_QUIESCE_SETTINGS__', async () => {
+    e2eQuiesced = true;
+    ready = false;
+    e2eSettingsDisabled = true;
+    await writes;
+  });
+}
 
 export async function initializeSettings(): Promise<void> {
+  if (e2eQuiesced) return;
   if (!isTauri()) return;
   e2eSettingsDisabled =
     import.meta.env.MODE === 'e2e' && sessionStorage.getItem('sail-e2e-settings') !== 'enabled';

@@ -28,6 +28,7 @@ await test('every Tauri command has a generated permission and capability', () =
     }
   }
 
+  const productionPermissions = new Set(allowed);
   const e2eConfig = JSON.parse(source('tauri.e2e.conf.json'));
   const e2eCapabilities: unknown = e2eConfig.app.security.capabilities;
   assert.ok(Array.isArray(e2eCapabilities));
@@ -43,5 +44,8 @@ await test('every Tauri command has a generated permission and capability', () =
   for (const command of commands) {
     assert.ok(generated.has(command), `${command} has no generated permission`);
     assert.ok(allowed.has(`allow-${command.replaceAll('_', '-')}`), `${command} is not allowed`);
+  }
+  for (const permission of ['allow-acp-reset-test-runtimes', 'allow-reset-test-settings']) {
+    assert.ok(!productionPermissions.has(permission), `${permission} must be E2E-only`);
   }
 });

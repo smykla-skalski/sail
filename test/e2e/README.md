@@ -2,7 +2,15 @@
 
 Run WebdriverIO against a private Sail build and app profile as described in the repository `AGENTS.md`. The fixture specs and later app specs share one app process, so the WebdriverIO `before` hook selects the main window, closes a leftover settings window, resolves pending agent requests, terminates fixture ACP runtimes, clears browser storage, disk-backed fixture settings, and fixture navigation, then reloads the app before each spec. The E2E-only runtime reset prevents fixture processes from exhausting the app’s file descriptors in a full suite.
 
-The E2E build accepts `SAIL_E2E_MACHINE_READING=healthy` to supply fixed healthy host memory and swap readings to the normal machine-pressure guard while keeping the real disk reading. Production builds ignore this variable. For an attached macOS app, pass it and a private `CLAUDE_CONFIG_DIR` through `open --env` and to WebdriverIO. The runner sets both automatically when it starts the app itself.
+The E2E build accepts `SAIL_E2E_MACHINE_READING=healthy` to supply fixed healthy host memory and swap readings to the normal machine-pressure guard while keeping the real disk reading. Production builds ignore this variable. For an attached macOS app, pass it and a private `CLAUDE_CONFIG_DIR` through `open --env` and to WebdriverIO. The runner sets both automatically when it starts the app itself. The E2E build requires an absolute private `SAIL_E2E_CONFIG_DIR` for every settings read and write.
+
+Attached app and runner processes must share `SAIL_E2E_OPEN_URL_LOG` for `conversation-links.spec.ts`: leaving it unset in the runner failed with “Conversation link did not invoke the external browser command”; passing the app’s log path to both made the same spec pass. Set `SAIL_E2E_FAKE_GH_DIR` and `SAIL_E2E_FAKE_GH_BIN` to the private fake-gh fixture paths in both processes. A missing fake-gh fixture directory with no real `gh` on `PATH` returned exit 127 and `gh is not installed`; the fake shim can fall through to a real `gh` if one is available, so do not run attached ship specs with a missing fixture path.
+
+## Signed pre-quiescence run on 2026-10-10
+
+The full private app run on `0e1a6109` completed all 53 spec files in 32m23s: 31 passed and 22 failed. The original `activity-history → agent-questions` and `task-overview-scale → task-overview` fixture transitions passed. `agent-status-bar` failed both in the full run and alone on the same missing permission assertion; `inbox` failed both ways on the same unread-attention timeout. `conversation-links` failed only when the attached app and runner used different URL log paths, as described above.
+
+An additional exact-head `agent-spawn → attention` run failed both attention tests, while attention alone and `agent-status-bar → attention` passed attention. The old app repopulated private disk settings with spawn receipts and activity history after the before-spec reset. The current teardown drains its settings writes and unloads that webview before resetting the locked settings file; its final full-suite result belongs in PR #533.
 
 ## Clean macOS run on 2026-10-10
 

@@ -152,10 +152,27 @@ export const config = {
       if (!Array.isArray(remaining) || remaining.length > 0)
         throw new Error('E2E setup left pending agent requests');
       await invoke('acp_reset_test_runtimes');
+      const quiesce: unknown = Reflect.get(window, '__SAIL_E2E_QUIESCE_SETTINGS__');
+      if (typeof quiesce === 'function') await quiesce();
+      else if (document.querySelector('.app-shell'))
+        throw new Error('E2E app has no settings write barrier');
+      localStorage.clear();
+      sessionStorage.clear();
+      if (location.search) history.replaceState(null, '', location.pathname);
+    });
+    await browser.refresh();
+
+    await browser.execute(async () => {
+      const tauri: unknown = Reflect.get(window, '__TAURI__');
+      const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
+      const invoke: unknown = core && typeof core === 'object' ? Reflect.get(core, 'invoke') : null;
+      if (typeof invoke !== 'function') throw new Error('Tauri API missing; cannot reset settings');
       localStorage.clear();
       sessionStorage.clear();
       await invoke('reset_test_settings');
-      if (location.search) history.replaceState(null, '', location.pathname);
+      const persisted: unknown = await invoke('load_settings');
+      if (!persisted || typeof persisted !== 'object' || Object.keys(persisted).length !== 0)
+        throw new Error('E2E settings were repopulated after reset');
     });
     await browser.refresh();
 

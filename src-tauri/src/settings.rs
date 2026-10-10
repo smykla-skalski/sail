@@ -313,14 +313,24 @@ pub fn finish_interrupted_agent_turn(
 
 pub(crate) fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(feature = "e2e")]
-    if let Some(root) = std::env::var_os("SAIL_E2E_CONFIG_DIR") {
-        return Ok(PathBuf::from(root).join("settings.json"));
+    {
+        let _ = app;
+        let root = std::env::var_os("SAIL_E2E_CONFIG_DIR")
+            .ok_or("E2E settings require SAIL_E2E_CONFIG_DIR")?;
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            return Err("SAIL_E2E_CONFIG_DIR must be an absolute path".into());
+        }
+        Ok(root.join("settings.json"))
     }
-    let config = app
-        .path()
-        .config_dir()
-        .map_err(|error| format!("Cannot locate the configuration directory: {error}"))?;
-    Ok(config.join("sail").join("settings.json"))
+    #[cfg(not(feature = "e2e"))]
+    {
+        let config = app
+            .path()
+            .config_dir()
+            .map_err(|error| format!("Cannot locate the configuration directory: {error}"))?;
+        Ok(config.join("sail").join("settings.json"))
+    }
 }
 
 fn lock_settings(path: &Path) -> Result<File, String> {
@@ -686,14 +696,7 @@ pub fn string_setting(app: &tauri::AppHandle, key: &str) -> Result<Option<String
 pub fn reset_test_settings(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(feature = "e2e")]
     {
-        let _ = app;
-        let root = std::env::var_os("SAIL_E2E_CONFIG_DIR")
-            .ok_or("Settings reset requires SAIL_E2E_CONFIG_DIR")?;
-        let root = PathBuf::from(root);
-        if !root.is_absolute() {
-            return Err("SAIL_E2E_CONFIG_DIR must be an absolute path".into());
-        }
-        let path = root.join("settings.json");
+        let path = settings_path(&app)?;
         let _lock = lock_settings(&path)?;
         write_settings(&path, &Settings::new())
     }
