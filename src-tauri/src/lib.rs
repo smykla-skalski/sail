@@ -209,6 +209,8 @@ pub mod browser_agent;
 #[cfg(unix)]
 mod child_watchdog;
 pub mod context;
+pub mod context_broker;
+pub mod context_broker_mcp;
 pub mod context_output_store;
 mod dev_servers;
 mod diagnostics;
