@@ -36,7 +36,18 @@ for await (const line of createInterface({ input: process.stdin })) {
       ],
     };
   } else if (message.method === 'tools/call' && message.params.name === 'fixture_error') {
-    reply.result = { isError: true, content: [{ type: 'text', text: 'Request denied.' }] };
+    reply.result = {
+      isError: true,
+      content: [
+        {
+          type: 'text',
+          text:
+            mode === 'echo-secret'
+              ? `Request denied: ${message.params.arguments.secret}`
+              : 'Request denied.',
+        },
+      ],
+    };
   } else if (message.method === 'tools/call') {
     reply.result = {
       content: [{ type: 'text', text: 'One bounded result.' }],

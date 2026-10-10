@@ -29,19 +29,29 @@ function profile(mode = 'valid') {
   };
 }
 
-function run(config: object) {
+function run(config: object, secret = 'fixture-secret-123') {
   const directory = mkdtempSync(join(tmpdir(), 'sail-context-conformance-'));
   try {
     const path = join(directory, 'profile.json');
     writeFileSync(path, JSON.stringify(config));
     return spawnSync(process.execPath, [runner, '--config', path], {
       encoding: 'utf8',
-      env: { ...process.env, SAIL_CONFORMANCE_SECRET: 'fixture-secret-123' },
+      env: { ...process.env, SAIL_CONFORMANCE_SECRET: secret },
       timeout: 10_000,
     });
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+}
+
+for (const secret of ['ab"cd', 'ab\\cd', 'ab\ncd', 'ab\u0001cd']) {
+  void test(`rejects decoded secret echo ${JSON.stringify(secret)}`, () => {
+    const result = run(profile('echo-secret'), secret);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Error response exposes the secret/);
+    assert.equal(result.stdout, '');
+    assert.doesNotMatch(result.stderr, /Request denied/);
+  });
 }
 
 void test('offline stdio provider passes the versioned profile', () => {

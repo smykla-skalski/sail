@@ -414,7 +414,16 @@ async function run(config) {
       },
     });
     assert(error?.id === id && (error.error || error.result?.isError), 'Error probe did not fail.');
-    assert(!JSON.stringify(error).includes(secret), 'Error response exposes the secret.');
+    const containsSecret = (value) => {
+      if (typeof value === 'string') return value.includes(secret);
+      if (Array.isArray(value)) return value.some(containsSecret);
+      if (value && typeof value === 'object')
+        return Object.entries(value).some(
+          ([key, item]) => key.includes(secret) || containsSecret(item),
+        );
+      return false;
+    };
+    assert(!containsSecret(error), 'Error response exposes the secret.');
     checks.push('error', 'secret-redaction');
     return { status: 'pass', profileVersion: 1, protocolVersion: PROTOCOL_VERSION, checks };
   } finally {
