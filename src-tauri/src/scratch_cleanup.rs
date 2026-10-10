@@ -283,10 +283,30 @@ fn has_open_files(path: &Path) -> Option<bool> {
     if !output.stdout.is_empty() {
         return Some(true);
     }
-    match output.status.code() {
-        Some(1) => Some(false),
-        _ => None,
+    if output.status.code() != Some(1) {
+        return None;
     }
+    // +D walks directory entries and misses an unlinked file that is still
+    // open. +L1 lists those descriptors, including their last path.
+    let unlinked = Command::new(if cfg!(target_os = "macos") {
+        PathBuf::from("/usr/sbin/lsof")
+    } else {
+        PathBuf::from("lsof")
+    })
+    .args(["-nP", "-Fn", "+L1"])
+    .output()
+    .ok()?;
+    if !unlinked.stderr.is_empty() || !matches!(unlinked.status.code(), Some(0 | 1)) {
+        return None;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let root = path.as_os_str().as_bytes();
+    let active = unlinked.stdout.split(|byte| *byte == b'\n').any(|line| {
+        line.strip_prefix(b"n").is_some_and(|name| {
+            name == root || (name.starts_with(root) && name.get(root.len()) == Some(&b'/'))
+        })
+    });
+    Some(active)
 }
 
 #[cfg(test)]
@@ -354,7 +374,14 @@ mod tests {
         cargo_artifacts(&unknown);
         fs::write(worktree.join(".git"), "gitdir: elsewhere").unwrap();
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
-        sweep(&temp, future, |_| None).unwrap();
+        sweep(&temp, future, |path| {
+            if path == worktree {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .unwrap();
         assert!(worktree.exists());
         assert!(unknown.exists());
     }
@@ -393,6 +420,23 @@ mod tests {
         let result = has_open_files(&temp);
         drop(handle);
         assert_eq!(result, Some(true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finds_an_open_unlinked_file_in_a_scratch_root() {
+        let temp = fixture();
+        let root = temp.join("sail-339-target.unlinked");
+        fs::create_dir(&root).unwrap();
+        cargo_artifacts(&root);
+        let file = root.join("held");
+        let handle = fs::File::create(&file).unwrap();
+        fs::remove_file(&file).unwrap();
+        assert_eq!(has_open_files(&root), Some(true));
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, has_open_files).unwrap();
+        assert!(root.exists());
+        drop(handle);
     }
 
     #[cfg(target_os = "macos")]
