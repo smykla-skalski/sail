@@ -103,12 +103,17 @@ fn write_file(path: &Path, state: &ProcessFile) -> Result<(), String> {
 
 #[cfg(unix)]
 fn stop_process(record: &ProcessRecord) -> Result<bool, String> {
-    if process_started(record.pid) != Some(record.started) {
-        return Ok(false);
+    match process_started(record.pid) {
+        Some(started) if started != record.started => return Ok(false),
+        // A group can outlive its leader. Its ID remains reserved while any
+        // member survives, so an absent leader does not make that group stale.
+        Some(_) | None => {}
     }
     #[cfg(target_os = "macos")]
-    if process_info(record.pid).is_none_or(|info| info.pbi_pgid != record.group) {
-        return Ok(false);
+    if let Some(info) = process_info(record.pid) {
+        if info.pbi_pgid != record.group {
+            return Ok(false);
+        }
     }
     let group = nix::unistd::Pid::from_raw(record.group as i32);
     if group.as_raw() <= 0 || group == nix::unistd::getpgrp() {
@@ -162,6 +167,10 @@ impl Registry {
         if group == 0 || group > i32::MAX as u32 {
             return Err("Invalid owned process group.".into());
         }
+        #[cfg(unix)]
+        if pid != group {
+            return Err("Owned process must lead its process group.".into());
+        }
         let started = process_started(pid).ok_or("Cannot identify owned process.")?;
         #[cfg(target_os = "macos")]
         if process_info(pid).is_none_or(|info| info.pbi_pgid != group) {
@@ -179,17 +188,21 @@ impl Registry {
         self.save(&state)
     }
 
-    fn stop_run(&self, run: &str) -> Result<(), String> {
+    fn stop_matching(
+        &self,
+        reason: &str,
+        matches: impl Fn(&ProcessRecord) -> bool,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let mut retained = Vec::new();
         let mut errors = Vec::new();
         for record in state.processes.drain(..) {
-            if record.run != run {
+            if !matches(&record) {
                 retained.push(record);
                 continue;
             }
             match stop_process(&record) {
-                Ok(stopped) => report(&record, "run_finished", stopped),
+                Ok(stopped) => report(&record, reason, stopped),
                 Err(error) => {
                     errors.push(format!("PID {}: {error}", record.pid));
                     retained.push(record);
@@ -203,6 +216,16 @@ impl Registry {
         } else {
             Err(errors.join("; "))
         }
+    }
+
+    fn stop_run(&self, run: &str) -> Result<(), String> {
+        self.stop_matching("run_finished", |record| record.run == run)
+    }
+
+    fn stop_pid(&self, run: &str, pid: u32) -> Result<(), String> {
+        self.stop_matching("terminal_stopped", |record| {
+            record.run == run && record.pid == pid
+        })
     }
 
     fn recover(&self) -> Result<(), String> {
@@ -325,6 +348,13 @@ pub fn stop_run(run: &str) -> Result<(), String> {
         .get()
         .ok_or("Owned process registry is unavailable.")?
         .stop_run(run)
+}
+
+pub fn stop_pid(run: &str, pid: u32) -> Result<(), String> {
+    REGISTRY
+        .get()
+        .ok_or("Owned process registry is unavailable.")?
+        .stop_pid(run, pid)
 }
 
 pub fn shutdown() -> Result<(), String> {
@@ -483,6 +513,33 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(group, Some(pid as i32));
+    }
+
+    #[test]
+    fn owned_pty_group_stops_from_the_registry() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let path = directory();
+        let registry = new_registry(&path, process_started(std::process::id()).unwrap());
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("sleep");
+        command.arg("30");
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        let pid = child.process_id().unwrap();
+        let group = pair.master.process_group_leader().unwrap() as u32;
+
+        registry.register("owned-pty", pid, group).unwrap();
+        registry.stop_pid("owned-pty", pid).unwrap();
+        assert!(!child.wait().unwrap().success());
+        assert!(registry.state.lock().unwrap().processes.is_empty());
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

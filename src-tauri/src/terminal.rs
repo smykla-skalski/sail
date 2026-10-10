@@ -63,8 +63,6 @@ struct TerminalSession {
     writer: Mutex<Box<dyn Write + Send>>,
     write_busy: AtomicBool,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    #[cfg(unix)]
-    watchdog: Mutex<Option<crate::child_watchdog::ChildWatchdog>>,
     output: Arc<Mutex<TerminalOutput>>,
     changed: Arc<Condvar>,
 }
@@ -79,15 +77,16 @@ impl TerminalSession {
         {
             return;
         }
-        #[cfg(unix)]
-        {
-            if self.owner.is_some() {
-                if let Ok(mut watchdog) = self.watchdog.lock() {
-                    if let Some(mut watchdog) = watchdog.take() {
-                        watchdog.kill_group();
-                    }
-                }
-            } else if let Ok(master) = self.master.lock() {
+        if let (Some(owner), Some(pid)) = (self.owner.as_deref(), self.process_id) {
+            if let Err(error) = crate::owned_processes::stop_pid(owner, pid) {
+                crate::diagnostics::record(
+                    "owned_process_cleanup_failed",
+                    serde_json::json!({"run":owner,"pid":pid,"error":error}),
+                );
+            }
+        } else {
+            #[cfg(unix)]
+            if let Ok(master) = self.master.lock() {
                 if let Some(group) = master.process_group_leader() {
                     let group = nix::unistd::Pid::from_raw(group);
                     if group.as_raw() > 0 && group != nix::unistd::getpgrp() {
@@ -521,8 +520,6 @@ fn spawn(
     }));
     let changed = Arc::new(Condvar::new());
     let process_id = child.process_id();
-    #[cfg(unix)]
-    let mut watchdog = None;
     if let Some(owner) = owner.as_deref() {
         let Some(pid) = process_id else {
             let _ = child.kill();
@@ -549,19 +546,6 @@ fn spawn(
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!("Cannot track terminal ownership: {error}"));
-        }
-        #[cfg(unix)]
-        {
-            watchdog = Some(
-                crate::child_watchdog::ChildWatchdog::start(group as u32).map_err(|error| {
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(group),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
-                    let _ = child.wait();
-                    format!("Cannot start terminal watchdog: {error}")
-                })?,
-            );
         }
     }
     let killer = child.clone_killer();
@@ -617,8 +601,6 @@ fn spawn(
         writer: Mutex::new(writer),
         write_busy: AtomicBool::new(false),
         killer: Mutex::new(killer),
-        #[cfg(unix)]
-        watchdog: Mutex::new(watchdog),
         output,
         changed,
     })
