@@ -53,7 +53,7 @@ pub fn worktree_data_directory(cache_directory: &Path, worktree: &Path) -> PathB
     cache_directory.join("terminal-worktrees").join(name)
 }
 
-fn stable_worktree_identity(worktree: &Path) -> PathBuf {
+pub(crate) fn stable_worktree_identity(worktree: &Path) -> PathBuf {
     if let Ok(canonical) = dunce::canonicalize(worktree) {
         return canonical;
     }
@@ -329,7 +329,7 @@ impl AcpTerminalManager {
     }
 
     pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
-        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let worktree = stable_worktree_identity(worktree);
         let mut blocked = self
             .worktrees_being_removed
             .lock()
@@ -357,7 +357,7 @@ impl AcpTerminalManager {
     }
 
     pub fn allow_worktree_terminals(&self, worktree: &Path) {
-        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let worktree = stable_worktree_identity(worktree);
         if let Ok(mut blocked) = self.worktrees_being_removed.lock() {
             blocked.remove(&worktree);
         }
@@ -368,13 +368,18 @@ impl AcpTerminalManager {
         worktree: &Path,
         create: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let worktree = stable_worktree_identity(worktree);
         let blocked = self
             .worktrees_being_removed
             .lock()
             .map_err(|error| error.to_string())?;
         if blocked.contains(&worktree) {
             return Err("Worktree is being removed.".to_string());
+        }
+        let current = dunce::canonicalize(&worktree)
+            .map_err(|_| "Worktree folder no longer exists.".to_string())?;
+        if !current.is_dir() || current != worktree {
+            return Err("Worktree folder changed while creating terminal.".to_string());
         }
         create()
     }
@@ -1295,6 +1300,9 @@ mod tests {
         let manager = Arc::new(AcpTerminalManager::default());
         let worktree =
             std::env::temp_dir().join(format!("sail-acp-terminal-fence-{}", uuid::Uuid::new_v4()));
+        let external_cwd = worktree.with_extension("external-cwd");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&external_cwd).unwrap();
         let (creating_tx, creating_rx) = std::sync::mpsc::channel();
         let (finish_create_tx, finish_create_rx) = std::sync::mpsc::channel();
         let creator_manager = Arc::clone(&manager);
@@ -1320,14 +1328,29 @@ mod tests {
 
         creator.join().unwrap().unwrap();
         stopper.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let mut created_after_removal = false;
+        let create_after_stop = manager.with_worktree_creation(&worktree, || {
+            assert!(external_cwd.is_dir());
+            created_after_removal = true;
+            Ok(())
+        });
+        assert_eq!(create_after_stop.unwrap_err(), "Worktree is being removed.");
+        assert!(!created_after_removal);
+        std::fs::create_dir_all(&worktree).unwrap();
+        let blocked_recreation = manager.with_worktree_creation(&worktree, || {
+            created_after_removal = true;
+            Ok(())
+        });
         assert_eq!(
-            manager
-                .with_worktree_creation(&worktree, || Ok(()))
-                .unwrap_err(),
+            blocked_recreation.unwrap_err(),
             "Worktree is being removed."
         );
+        assert!(!created_after_removal);
         manager.allow_worktree_terminals(&worktree);
         assert!(manager.with_worktree_creation(&worktree, || Ok(())).is_ok());
+        std::fs::remove_dir_all(worktree).unwrap();
+        std::fs::remove_dir_all(external_cwd).unwrap();
     }
 
     #[cfg(unix)]

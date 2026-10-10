@@ -60,6 +60,7 @@ struct TerminalSession {
     inspect_id: String,
     owner: Option<String>,
     directory: PathBuf,
+    worktree: PathBuf,
     process_id: Option<u32>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     process_group_stop: Arc<Mutex<()>>,
@@ -368,6 +369,7 @@ mod tests {
         let manager = Arc::new(TerminalManager::default());
         let worktree =
             std::env::temp_dir().join(format!("sail-terminal-fence-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&worktree).unwrap();
         let (creating_tx, creating_rx) = mpsc::channel();
         let (finish_create_tx, finish_create_rx) = mpsc::channel();
         let creator_manager = Arc::clone(&manager);
@@ -393,10 +395,27 @@ mod tests {
 
         creator.join().unwrap().unwrap();
         deleter.join().unwrap().unwrap();
-        let create_after_stop = manager.with_worktree_creation(&worktree, || Ok(()));
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let mut created_after_removal = false;
+        let create_after_stop = manager.with_worktree_creation(&worktree, || {
+            created_after_removal = true;
+            Ok(())
+        });
         assert_eq!(create_after_stop.unwrap_err(), "Worktree is being removed.");
+        assert!(!created_after_removal);
+        std::fs::create_dir_all(&worktree).unwrap();
+        let blocked_recreation = manager.with_worktree_creation(&worktree, || {
+            created_after_removal = true;
+            Ok(())
+        });
+        assert_eq!(
+            blocked_recreation.unwrap_err(),
+            "Worktree is being removed."
+        );
+        assert!(!created_after_removal);
         manager.allow_worktree_terminals(&worktree);
         assert!(manager.with_worktree_creation(&worktree, || Ok(())).is_ok());
+        std::fs::remove_dir_all(worktree).unwrap();
     }
 
     #[test]
@@ -505,7 +524,7 @@ impl TerminalManager {
     }
 
     pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
-        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let worktree = crate::acp_terminal::stable_worktree_identity(worktree);
         let mut worktree_operations = self.1.lock().map_err(|error| error.to_string())?;
         worktree_operations.insert(worktree.clone());
         let sessions = self
@@ -515,8 +534,8 @@ impl TerminalManager {
             .iter()
             .filter(|(_, session)| {
                 session.owner.is_some()
-                    && dunce::canonicalize(&session.directory)
-                        .unwrap_or_else(|_| session.directory.clone())
+                    && dunce::canonicalize(&session.worktree)
+                        .unwrap_or_else(|_| session.worktree.clone())
                         == worktree
             })
             .map(|(id, session)| (id.clone(), Arc::clone(session)))
@@ -535,7 +554,7 @@ impl TerminalManager {
     }
 
     pub fn allow_worktree_terminals(&self, worktree: &Path) {
-        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let worktree = crate::acp_terminal::stable_worktree_identity(worktree);
         if let Ok(mut operations) = self.1.lock() {
             operations.remove(&worktree);
         }
@@ -546,10 +565,15 @@ impl TerminalManager {
         worktree: &Path,
         create: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let worktree = crate::acp_terminal::stable_worktree_identity(worktree);
         let operations = self.1.lock().map_err(|error| error.to_string())?;
         if operations.contains(&worktree) {
             return Err("Worktree is being removed.".into());
+        }
+        let current = dunce::canonicalize(&worktree)
+            .map_err(|_| "Worktree folder no longer exists.".to_string())?;
+        if !current.is_dir() || current != worktree {
+            return Err("Worktree folder changed while creating terminal.".into());
         }
         create()
     }
@@ -797,6 +821,11 @@ fn spawn(
     app: AppHandle,
     owner: Option<String>,
 ) -> Result<TerminalSession, String> {
+    let worktree = if owner.is_some() {
+        git_worktree_root(&directory)
+    } else {
+        directory.clone()
+    };
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: rows.max(1),
@@ -825,7 +854,7 @@ fn spawn(
             .app_cache_dir()
             .map_err(|error| error.to_string())?;
         let data_directory =
-            crate::acp_terminal::worktree_data_directory(&cache_directory, &directory);
+            crate::acp_terminal::worktree_data_directory(&cache_directory, &worktree);
         for (key, value) in crate::acp_terminal::terminal_environment(&data_directory) {
             std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
             command.env(key, value);
@@ -939,6 +968,7 @@ fn spawn(
         inspect_id: Uuid::new_v4().to_string(),
         owner,
         directory,
+        worktree,
         process_id,
         master,
         process_group_stop,
@@ -1098,6 +1128,20 @@ fn owned_session(
     Ok(session)
 }
 
+fn git_worktree_root(directory: &Path) -> PathBuf {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    output
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        .and_then(|path| dunce::canonicalize(path).ok())
+        .unwrap_or_else(|| directory.to_path_buf())
+}
+
 #[tauri::command]
 pub fn terminal_owned_create(
     app: AppHandle,
@@ -1119,7 +1163,13 @@ pub fn terminal_owned_create(
     if !directory.is_dir() {
         return Err("Terminal directory is not a folder.".into());
     }
-    manager.with_worktree_creation(&directory, || {
+    let worktree = git_worktree_root(&directory);
+    manager.with_worktree_creation(&worktree, || {
+        let current_directory = dunce::canonicalize(&directory)
+            .map_err(|_| "Terminal directory no longer exists.".to_string())?;
+        if current_directory != directory || !current_directory.is_dir() {
+            return Err("Terminal directory changed while creating terminal.".into());
+        }
         let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
         if sessions.contains_key(&pane_id) {
             return Err("Terminal pane already exists.".into());

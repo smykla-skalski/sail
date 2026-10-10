@@ -11,7 +11,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", windows))]
 use tauri::Emitter;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 const OPENCODE_VERSION: &str = "2.0.24";
 
@@ -1511,8 +1511,16 @@ fn repository_namespace(repository: &Path) -> String {
     format!("{name}-{hash:016x}")
 }
 
+fn allow_worktree_terminal_creation(app: &AppHandle, worktree: &Path) {
+    app.state::<terminal::TerminalManager>()
+        .allow_worktree_terminals(worktree);
+    app.state::<acp_terminal::AcpTerminalManager>()
+        .allow_worktree_terminals(worktree);
+}
+
 #[tauri::command]
 async fn create_worktree(
+    app: AppHandle,
     operation_locks: State<'_, WorktreeOperationLocks>,
     repository: String,
     name: String,
@@ -1523,7 +1531,9 @@ async fn create_worktree(
     tauri::async_runtime::spawn_blocking(move || {
         let repository = validate_repository(repository)?;
         let _lock = operation_locks.lock(Path::new(&repository))?;
-        add_worktree(repository, name, destination_parent, base_ref)
+        let created = add_worktree(repository, name, destination_parent, base_ref)?;
+        allow_worktree_terminal_creation(&app, Path::new(&created.path));
+        Ok(created)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1531,6 +1541,7 @@ async fn create_worktree(
 
 #[tauri::command]
 async fn create_shipping_worktree(
+    app: AppHandle,
     operation_locks: State<'_, WorktreeOperationLocks>,
     repository: String,
     name: String,
@@ -1540,6 +1551,7 @@ async fn create_shipping_worktree(
         let checked = validate_repository(repository)?;
         let _lock = operation_locks.lock(Path::new(&checked))?;
         if let Some(existing) = existing_shipping_worktree(Path::new(&checked), &name)? {
+            allow_worktree_terminal_creation(&app, Path::new(&existing.path));
             return Ok(existing);
         }
         let target = github::target_repository(Path::new(&checked))?;
@@ -1583,6 +1595,7 @@ async fn create_shipping_worktree(
             base_ref: default_ref,
             base_revision,
         });
+        allow_worktree_terminal_creation(&app, Path::new(&created.path));
         Ok(created)
     })
     .await
@@ -1857,8 +1870,10 @@ async fn delete_worktree(
                     }
                 })
             })();
-            terminal_manager.allow_worktree_terminals(&directory);
-            terminals.allow_worktree_terminals(&directory);
+            if result.is_err() {
+                terminal_manager.allow_worktree_terminals(&directory);
+                terminals.allow_worktree_terminals(&directory);
+            }
             result
         })
     })
