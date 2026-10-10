@@ -313,7 +313,7 @@ function stdioTransport(command, args, environment) {
       });
     },
     async verify() {
-      await new Promise((resolve) => setTimeout(resolve, STDIO_FINAL_OUTPUT_MS));
+      await new Promise((done) => setTimeout(done, STDIO_FINAL_OUTPUT_MS));
       if (failed) throw failed;
     },
     async close() {
