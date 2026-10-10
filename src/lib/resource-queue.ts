@@ -1,5 +1,6 @@
 type Waiter = {
   id: string;
+  directory: string;
   resolve: (release: () => void) => void;
   reject: (error: Error) => void;
 };
@@ -9,11 +10,13 @@ export class ResourceQueue {
   private waiters: Waiter[] = [];
   private limit: number;
   private blockedReason: string | null;
+  private onEnqueue?: () => void;
   private listeners = new Set<() => void>();
 
-  constructor(limit: number, blockedReason: string | null = null) {
+  constructor(limit: number, blockedReason: string | null = null, onEnqueue?: () => void) {
     this.limit = limit;
     this.blockedReason = blockedReason;
+    this.onEnqueue = onEnqueue;
   }
 
   get reason(): string | null {
@@ -46,9 +49,14 @@ export class ResourceQueue {
     return this.waiters.some((waiter) => waiter.id === id);
   }
 
-  acquire(id: string): Promise<() => void> {
+  waitingDirectories(): string[] {
+    return this.waiters.map((waiter) => waiter.directory);
+  }
+
+  acquire(id: string, directory = ''): Promise<() => void> {
     return new Promise((resolve, reject) => {
-      this.waiters.push({ id, resolve, reject });
+      this.waiters.push({ id, directory, resolve, reject });
+      this.onEnqueue?.();
       this.drain();
       this.emit();
     });

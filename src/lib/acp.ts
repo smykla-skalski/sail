@@ -774,6 +774,7 @@ const queuedPrompts = new Map<string, { agent: string; sessionId: string }>();
 async function acquireTurnSlot(
   turnId: string,
   onQueue?: (limit: number | null, reason: string | null) => void,
+  directory = '',
 ): Promise<() => void> {
   const queue = resourceQueues.agent;
   if (queue.reason || queue.status.active >= queue.status.limit || queue.status.waiting)
@@ -782,10 +783,34 @@ async function acquireTurnSlot(
     if (queue.isQueued(turnId)) onQueue?.(queue.status.limit, queue.reason);
   });
   try {
-    return await queue.acquire(turnId);
+    return await queue.acquire(turnId, directory);
   } finally {
     unsubscribe();
     onQueue?.(null, null);
+  }
+}
+
+async function limitedConnect(
+  agent: AgentId,
+  profile?: CapabilityProfile,
+  options?: {
+    directory?: string;
+    onQueue?: (limit: number | null, reason: string | null) => void;
+    signal?: AbortSignal;
+  },
+): Promise<Record<string, unknown>> {
+  if (options?.signal?.aborted) throw new Error('Agent connection was cancelled.');
+  const id = `connect-${crypto.randomUUID()}`;
+  const cancel = () => resourceQueues.agent.cancel(id);
+  options?.signal?.addEventListener('abort', cancel, { once: true });
+  let release: (() => void) | null = null;
+  try {
+    release = await acquireTurnSlot(id, options?.onQueue, options?.directory);
+    if (options?.signal?.aborted) throw new Error('Agent connection was cancelled.');
+    return await invoke<Record<string, unknown>>('acp_connect', { agent, profile });
+  } finally {
+    options?.signal?.removeEventListener('abort', cancel);
+    release?.();
   }
 }
 
@@ -797,6 +822,7 @@ async function limitedPrompt(
   imagePaths: string[],
   onQueue?: (limit: number | null, reason: string | null) => void,
   slotHeld = false,
+  directory = '',
 ): Promise<AcpPromptOutcome> {
   if (slotHeld)
     return invoke<AcpPromptOutcome>('acp_prompt', {
@@ -805,7 +831,7 @@ async function limitedPrompt(
   queuedPrompts.set(turnId, { agent, sessionId });
   let release: () => void;
   try {
-    release = await acquireTurnSlot(turnId, onQueue);
+    release = await acquireTurnSlot(turnId, onQueue, directory);
   } finally {
     queuedPrompts.delete(turnId);
   }
@@ -820,8 +846,7 @@ async function limitedPrompt(
 
 export const acp = {
   agents: () => invoke<AgentAvailability[]>('acp_agents'),
-  connect: (agent: AgentId, profile?: CapabilityProfile) =>
-    invoke<Record<string, unknown>>('acp_connect', { agent, profile }),
+  connect: limitedConnect,
   create: (agent: AgentId, cwd: string, profile?: CapabilityProfile, nativeGeneration?: number) =>
     invoke<{
       sessionId: string;
@@ -855,7 +880,8 @@ export const acp = {
     imagePaths: string[] = [],
     onQueue?: (limit: number | null, reason: string | null) => void,
     slotHeld = false,
-  ) => limitedPrompt(agent, sessionId, text, turnId, imagePaths, onQueue, slotHeld),
+    directory = '',
+  ) => limitedPrompt(agent, sessionId, text, turnId, imagePaths, onQueue, slotHeld, directory),
   acquireTurnSlot,
   cancelQueuedTurn: (turnId: string) => resourceQueues.agent.cancel(turnId),
   steer: (agent: AgentId, sessionId: string, text: string, imagePaths: string[] = []) =>

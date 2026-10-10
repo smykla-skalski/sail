@@ -86,6 +86,31 @@ void test('pressure recovery starts queued work without disturbing active work',
   assert.equal(queue.status.active, 0);
 });
 
+void test('queued work retains its workspace disk until admission', async () => {
+  const queue = new ResourceQueue(1, 'Checking machine pressure…');
+  const pending = queue.acquire('external', '/Volumes/work');
+  assert.deepEqual(queue.waitingDirectories(), ['/Volumes/work']);
+  queue.setBlockedReason(null);
+  const release = await pending;
+  assert.deepEqual(queue.waitingDirectories(), []);
+  release();
+});
+
+void test('cancelled agent connection never reaches process startup', async () => {
+  resourceQueues.agent.setBlockedReason(
+    'Waiting for machine pressure: free memory at or below 10%.',
+  );
+  const controller = new AbortController();
+  try {
+    const pending = acp.connect('codex', undefined, { signal: controller.signal });
+    assert.equal(await settled(pending), false);
+    controller.abort();
+    await assert.rejects(pending, /cancelled/);
+  } finally {
+    resourceQueues.agent.setBlockedReason('Checking machine pressure…');
+  }
+});
+
 void test('E2E job limit loads with user settings, unlike test-only E2E keys', () => {
   assert.equal(isSetting('sai-e2e-job-limit'), true);
   assert.equal(isSetting('sai-e2e-delete-worktree'), false);

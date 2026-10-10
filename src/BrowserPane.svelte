@@ -286,7 +286,7 @@
           queuedReason = queue.reason;
         }
       });
-      release = await queue.acquire(label);
+      release = await queue.acquire(label, directory);
       unsubscribe();
       unsubscribe = null;
       queuedLimit = null;
