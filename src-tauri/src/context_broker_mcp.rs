@@ -366,17 +366,23 @@ impl BrokerMcp {
         let response = provider_call("tools/call", json!({"name":"get","arguments":{"id":id}}))
             .map_err(|_| "Provider source unavailable.")?;
         let content = result_content(&response)?;
-        let hit = parse_hit(content)?;
-        if hit.id != id {
-            return Err("Provider source unavailable.".into());
-        }
         let source = content
             .get("sourceUri")
             .and_then(Value::as_str)
-            .ok_or("Provider source unavailable.")?;
-        if source.len() > 256 || source.is_empty() {
-            return Err("Provider source unavailable.".into());
+            .filter(|source| valid_source_field(source, 256));
+        let hit = parse_hit(content).map_err(|message| {
+            source.map_or_else(
+                || message.into(),
+                |source| ToolError::for_source(message, source),
+            )
+        })?;
+        if hit.id != id {
+            return Err(ToolError::for_source(
+                "Provider source unavailable.",
+                source.unwrap_or(&self.provider),
+            ));
         }
+        let source = source.ok_or("Provider source unavailable.")?;
         let stored = self
             .store
             .put(&self.scope, &hit.content)
@@ -720,5 +726,31 @@ mod tests {
         assert_eq!(body["error"], "Output storage is unavailable.");
         assert_eq!(body["source"], "file:///project/notes");
         assert!(!body.to_string().contains("private secret"));
+    }
+
+    #[test]
+    fn malformed_get_keeps_valid_source_attribution() {
+        let fixture = Fixture::new("one");
+        for malformed in [
+            json!({"id":"doc","sourceUri":"file:///project/notes",
+                "revision":"r1","timestampMs":0,"content":"private secret"}),
+            json!({"id":"doc","sourceUri":"file:///project/notes",
+                "revision":null,"timestampMs":1760122800000_u64,
+                "content":"private secret"}),
+        ] {
+            let (response, body) =
+                fixture.call("sail_context_get", json!({"id":"doc"}), |method, _| {
+                    if method == "tools/list" {
+                        return Ok(available());
+                    }
+                    Ok(json!({"result":{"structuredContent":malformed}}))
+                });
+            assert_eq!(response["result"]["isError"], true);
+            assert_eq!(body["provider"], "provider");
+            assert_eq!(body["source"], "file:///project/notes");
+            assert_eq!(body["error"], "Provider source unavailable.");
+            assert!(serde_json::to_vec(&response).unwrap().len() < 512);
+            assert!(!response.to_string().contains("private secret"));
+        }
     }
 }
