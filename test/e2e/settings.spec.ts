@@ -1,6 +1,14 @@
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { returnToWorkspace, openSettings } from './settings-window';
@@ -51,13 +59,34 @@ async function capture(name: string) {
   await browser.saveScreenshot(join(output, `${name}.png`));
 }
 
+async function auditContextViewport(width: number, height: number, name: string) {
+  await browser.setWindowSize(width, height);
+  const viewport = await browser.execute(() => ({
+    width: innerWidth,
+    height: innerHeight,
+    scrollWidth: document.documentElement.scrollWidth,
+  }));
+  expect(viewport.scrollWidth).toBeLessThanOrEqual(viewport.width);
+  console.log(`Context viewport ${name}: ${viewport.width}×${viewport.height}`);
+  await capture(`${viewport.width}x${viewport.height}-context-provider-${name}`);
+  return viewport;
+}
+
+async function auditContextTheme(width: number, height: number, theme: 'light' | 'dark') {
+  await forceAppearance(theme, 'settings');
+  await expectTheme(theme);
+  await auditContextViewport(width, height, theme);
+}
+
 describe('disk-backed settings', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-settings-'));
   const secondRepository = mkdtempSync(join(tmpdir(), 'sail-settings-second-'));
+  const contextRepository = mkdtempSync(join(tmpdir(), 'sail-settings-context-'));
 
   before(async () => {
     execFileSync('git', ['init', '-q', repository]);
     execFileSync('git', ['init', '-q', secondRepository]);
+    execFileSync('git', ['init', '-q', contextRepository]);
     await browser.setWindowSize(1280, 850);
   });
 
@@ -69,6 +98,7 @@ describe('disk-backed settings', () => {
     });
     rmSync(repository, { recursive: true, force: true });
     rmSync(secondRepository, { recursive: true, force: true });
+    rmSync(contextRepository, { recursive: true, force: true });
   });
 
   it('starts new profiles on System and keeps stored Light and Dark choices', async () => {
@@ -83,6 +113,9 @@ describe('disk-backed settings', () => {
       );
       sessionStorage.setItem('sail-e2e-settings', 'enabled');
     }, path);
+    await browser.tauri.execute(async ({ core }) =>
+      core.invoke('save_setting', { key: 'sai-theme', value: 'system' }),
+    );
     await browser.refresh();
     await expect($(`.project-repository-select[title="${path}"]`)).toBeDisplayed();
     await browser.waitUntil(async () => (await read())['sai-theme'] === 'system', {
@@ -227,6 +260,128 @@ describe('disk-backed settings', () => {
     await browser.waitUntil(async () => (await browser.tauri.listWindows()).includes('settings'));
     await browser.tauri.switchWindow('settings');
     await expect($('.settings-window')).toBeDisplayed();
+    await returnToWorkspace();
+  });
+
+  it('reviews a committed provider before approval and revokes it', async () => {
+    await browser.tauri.switchWindow('main');
+    if ((await browser.tauri.listWindows()).includes('settings')) {
+      await browser.tauri.execute(async ({ core }) => {
+        await core.invoke('plugin:window|close', { label: 'settings' });
+      });
+    }
+    const path = realpathSync(contextRepository);
+    const config = join(path, '.sail');
+    const executable = join(path, 'fixture-provider');
+    mkdirSync(config);
+    writeFileSync(join(config, 'worktree.json'), '{"context":{"manifest":".sail/context.json"}}');
+    writeFileSync(
+      join(config, 'context.json'),
+      JSON.stringify({
+        version: 1,
+        providers: [
+          {
+            id: 'project-files',
+            type: 'stdio',
+            command: 'fixture-provider',
+            capabilities: ['search', 'get'],
+          },
+        ],
+      }),
+    );
+    writeFileSync(executable, '#!/bin/sh\nexit 0\n');
+    chmodSync(executable, 0o700);
+    execFileSync('git', ['-C', path, 'add', '.sail']);
+    execFileSync('git', [
+      '-C',
+      path,
+      '-c',
+      'user.name=Sail Test',
+      '-c',
+      'user.email=sail@example.invalid',
+      'commit',
+      '-qm',
+      'context fixture',
+    ]);
+    await browser.execute((selected) => {
+      localStorage.setItem('sai-directory', selected);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [selected], groups: [] }),
+      );
+    }, path);
+    await browser.tauri.execute(async ({ core }, selected) => {
+      await core.invoke('save_setting', { key: 'sai-directory', value: selected });
+      await core.invoke('save_setting', {
+        key: 'sai-project-catalog',
+        value: JSON.stringify({ repositories: [selected], groups: [] }),
+      });
+    }, path);
+    await browser.refresh();
+    await expect($(`.project-repository-select[title="${path}"]`)).toBeDisplayed();
+
+    await openSettings();
+    await $('.settings-navigation nav button:nth-child(5)').click();
+    await expect($('.context-provider-details')).toHaveText(
+      expect.stringContaining('project-files'),
+    );
+    await expect($('.context-provider-details')).toHaveText(
+      expect.stringContaining('Not selected'),
+    );
+    await expect($('button=Approve for this project')).not.toExist();
+
+    await $('#context-executable').setValue(executable);
+    await $('button=Select executable').click();
+    await expect($('.context-provider-details')).toHaveText(expect.stringContaining(executable));
+    await expect($('.context-provider-details')).toHaveText(expect.stringContaining('search, get'));
+    await expect($('button=Approve for this project')).toBeDisplayed();
+    await auditContextTheme(2560, 1440, 'light');
+    await auditContextTheme(2560, 1440, 'dark');
+    await auditContextTheme(1920, 1200, 'light');
+    await auditContextTheme(1920, 1200, 'dark');
+    await auditContextViewport(390, 600, 'mobile');
+    await browser.setWindowSize(1920, 1200);
+    await browser.execute(() => (document.documentElement.style.zoom = '2'));
+    await auditContextViewport(1920, 1200, 'zoom-200');
+    await browser.execute(() => (document.documentElement.style.zoom = ''));
+    await $('#context-executable').click();
+    await browser.keys(['Tab']);
+    const approvalFocus = await browser.execute(() => {
+      const button = Array.from(document.querySelectorAll('button')).find(
+        (item) => item.textContent?.trim() === 'Approve for this project',
+      );
+      if (!button) return null;
+      button.focus();
+      return {
+        focused: document.activeElement === button,
+        tabIndex: button.tabIndex,
+        outline: getComputedStyle(button).outlineStyle,
+      };
+    });
+    expect(approvalFocus?.focused).toBe(true);
+    expect(approvalFocus?.tabIndex).toBeGreaterThanOrEqual(0);
+    expect(approvalFocus?.outline).not.toBe('none');
+    await $('button=Approve for this project').click();
+    await expect($('.context-provider-details')).toHaveText(expect.stringContaining('Approved'));
+
+    writeFileSync(
+      join(config, 'context.json'),
+      '{"version":1,"providers":[{"id":"changed","type":"stdio","command":"fixture-provider","capabilities":["execute"]}]}',
+    );
+    await $('button=Refresh').click();
+    await expect($('.context-provider-details')).toHaveText(expect.stringContaining('Approved'));
+
+    await $('button=Revoke approval').click();
+    await expect($('.context-provider-details')).toHaveText(
+      expect.stringContaining('Approval required'),
+    );
+    await $('button=Approve for this project').click();
+    await expect($('.context-provider-details')).toHaveText(expect.stringContaining('Approved'));
+    writeFileSync(executable, '#!/bin/sh\nexit 1\n');
+    await $('button=Refresh').click();
+    await expect($('.context-provider-details')).toHaveText(
+      expect.stringContaining('Approval required'),
+    );
     await returnToWorkspace();
   });
 });

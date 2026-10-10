@@ -1386,6 +1386,25 @@ time {
 .settings-card ul {
   padding-left: 20px;
 }
+.context-provider-details {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 8px 12px;
+  margin: 16px 0;
+}
+.context-provider-details dt {
+  color: var(--sui-muted);
+}
+.context-provider-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.context-provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .memory-empty {
   padding: 12px;
   border-radius: var(--radius-8);
@@ -1484,6 +1503,9 @@ time {
   .memory-agent,
   .memory-config-comparison {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .context-provider-details {
     grid-template-columns: minmax(0, 1fr);
   }
 }
