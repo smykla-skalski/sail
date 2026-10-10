@@ -12,7 +12,7 @@ impl ChildWatchdog {
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("cat >/dev/null; kill -9 -- -\"$1\"")
+            .arg("cat >/dev/null; kill -9 -\"$1\"")
             .arg("terminal-watchdog")
             .arg(group.to_string())
             .stdin(Stdio::piped())

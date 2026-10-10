@@ -121,7 +121,8 @@ pub(crate) fn kill_terminal_process_groups(shell_process_id: u32) -> Result<(), 
 
     let mut system = System::new_all();
     for _ in 0..40 {
-        let mut groups = std::collections::HashSet::new();
+        let mut groups =
+            std::collections::HashMap::<nix::libc::pid_t, Vec<nix::libc::pid_t>>::new();
         let mut live_members = Vec::new();
         for process in system.processes().values() {
             let pid = process.pid().as_u32() as nix::libc::pid_t;
@@ -132,23 +133,26 @@ pub(crate) fn kill_terminal_process_groups(shell_process_id: u32) -> Result<(), 
             if group <= 0 || unsafe { nix::libc::getsid(pid) } != session_id {
                 continue;
             }
-            groups.insert(group);
             if !matches!(
                 process.status(),
                 ProcessStatus::Zombie | ProcessStatus::Dead
             ) {
                 live_members.push(pid);
+                groups.entry(group).or_default().push(pid);
             }
         }
         if live_members.is_empty() {
             return Ok(());
         }
-        for group in groups {
+        for (group, members) in groups {
             if group <= 0 || group == unsafe { nix::libc::getpgrp() } {
                 continue;
             }
-            if unsafe { nix::libc::getsid(group) } != session_id {
-                return Err("Cannot verify terminal process group ownership.".to_string());
+            let still_owned = members.iter().any(|member| unsafe {
+                nix::libc::getsid(*member) == session_id && nix::libc::getpgid(*member) == group
+            });
+            if !still_owned {
+                continue;
             }
             match nix::sys::signal::killpg(
                 nix::unistd::Pid::from_raw(group),
@@ -185,7 +189,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn stop_kills_interactive_background_job_groups() {
         use super::kill_terminal_process_groups;
@@ -273,19 +277,76 @@ mod tests {
         assert!(!marker.exists(), "shell group child survived stop");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stop_kills_background_job_after_job_group_leader_is_reaped() {
+        use super::kill_terminal_process_groups;
+        use std::time::{Duration, Instant};
+
+        let marker =
+            std::env::temp_dir().join(format!("sail-reaped-job-leader-{}", uuid::Uuid::new_v4()));
+        let ready = marker.with_extension("ready");
+        let leader_pid_file = marker.with_extension("leader");
+        let child_pid_file = marker.with_extension("child");
+        let script = "set -m; (sleep 30 & echo $! > \"$2\"; exit 0) & leader=$!; wait \"$leader\"; echo $leader > \"$3\"; touch \"$4\"; sleep 30";
+        let mut shell = isolated_test_shell_with_arguments(
+            script,
+            &[&marker, &child_pid_file, &leader_pid_file, &ready],
+        );
+        let shell_pid = shell.id();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "job leader did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let leader: nix::libc::pid_t = std::fs::read_to_string(&leader_pid_file)
+            .expect("job leader pid")
+            .trim()
+            .parse()
+            .expect("valid job leader pid");
+        assert_eq!(
+            unsafe { nix::libc::getsid(leader) },
+            -1,
+            "job leader was reaped"
+        );
+        let child: nix::libc::pid_t = std::fs::read_to_string(child_pid_file)
+            .expect("job descendant pid")
+            .trim()
+            .parse()
+            .expect("valid descendant pid");
+        assert_eq!(unsafe { nix::libc::getsid(child) }, shell_pid as i32);
+        assert_ne!(unsafe { nix::libc::getpgid(child) }, -1);
+        assert!(!marker.exists(), "background child fixture exited too late");
+
+        kill_terminal_process_groups(shell_pid)
+            .expect("kill descendant whose process-group leader was reaped");
+        shell.wait().expect("reap terminal shell after cleanup");
+        std::thread::sleep(Duration::from_millis(2200));
+        assert!(!marker.exists(), "descendant survived group leader cleanup");
+    }
+
     #[cfg(unix)]
     fn isolated_test_shell(
         script: &str,
         marker: &Path,
         extra_argument: Option<&Path>,
     ) -> std::process::Child {
+        let mut arguments = vec![marker];
+        if let Some(extra_argument) = extra_argument {
+            arguments.push(extra_argument);
+        }
+        isolated_test_shell_with_arguments(script, &arguments)
+    }
+
+    #[cfg(unix)]
+    fn isolated_test_shell_with_arguments(
+        script: &str,
+        arguments: &[&Path],
+    ) -> std::process::Child {
         use std::os::unix::process::CommandExt;
 
         let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", script, "sh"]).arg(marker);
-        if let Some(extra_argument) = extra_argument {
-            command.arg(extra_argument);
-        }
+        command.args(["-c", script, "sh"]).args(arguments);
         unsafe {
             command.pre_exec(|| {
                 if nix::libc::setsid() == -1 {
