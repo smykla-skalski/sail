@@ -75,6 +75,8 @@ pub struct SearchHit {
     pub revision: String,
     pub timestamp_ms: u64,
     pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
     pub total_bytes: usize,
     pub preview: String,
 }
@@ -122,7 +124,7 @@ fn valid_batch(batch: &SourceBatch) -> bool {
         })
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -188,6 +190,7 @@ pub fn search_response(
                 revision: hit.revision,
                 timestamp_ms: hit.timestamp_ms,
                 sha256: sha256(&hit.content),
+                reference: None,
                 total_bytes: hit.content.len(),
                 preview: preview(&hit.content, limits.preview_bytes),
             });

@@ -10,7 +10,7 @@ The broker calls `sources` with `{"limit":8}`. The result has `structuredContent
 
 ## Search
 
-The broker calls `search` with `{"query":"text","limit":8}`. The result has `structuredContent.items`, an array of at most 128 objects. Each object contains `id`, `sourceUri`, `revision`, `timestampMs` (positive Unix milliseconds), and UTF-8 `content`. IDs and source URIs are at most 256 bytes, revisions at most 128 bytes, and each content value at most 8 MiB. The approved provider ID comes from Sail, not from the result. Sail computes the content hash and limits search hits and the complete serialized agent result to 8 items and 4 KiB by default.
+The broker calls `search` with `{"query":"text","limit":8}`. The result has `structuredContent.items`, an array of at most 128 objects. Each object contains `id`, `sourceUri`, `revision`, `timestampMs` (positive Unix milliseconds), and UTF-8 `content`. IDs and source URIs are at most 256 bytes, revisions at most 128 bytes, and each content value at most 8 MiB. The approved provider ID comes from Sail, not from the result. Sail computes the content hash, stores each returned hit in the current output scope, and includes an opaque reference for stable exact reads. Search hits and the complete serialized agent result stay within 8 items and 4 KiB by default.
 
 ```json
 {

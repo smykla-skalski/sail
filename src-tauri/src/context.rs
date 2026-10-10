@@ -944,10 +944,12 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn provider_response_limit(request: &serde_json::Value) -> usize {
     if request.get("method").and_then(serde_json::Value::as_str) == Some("tools/call")
-        && request
-            .pointer("/params/name")
-            .and_then(serde_json::Value::as_str)
-            == Some("get")
+        && matches!(
+            request
+                .pointer("/params/name")
+                .and_then(serde_json::Value::as_str),
+            Some("get" | "search")
+        )
     {
         LARGE_PROVIDER_RESPONSE_BYTES
     } else {
@@ -1882,6 +1884,10 @@ mod tests {
             "params":{"name":"get","arguments":{"id":"large"}}});
         assert_eq!(
             provider_response_limit(&request),
+            LARGE_PROVIDER_RESPONSE_BYTES
+        );
+        assert_eq!(
+            provider_response_limit(&json!({"method":"tools/call","params":{"name":"search"}})),
             LARGE_PROVIDER_RESPONSE_BYTES
         );
         let response = provider_request_at(

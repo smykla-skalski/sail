@@ -1,4 +1,6 @@
-use crate::context_broker::{search_response, BrokerLimits, RawHit, SourceBatch};
+use crate::context_broker::{
+    search_response, sha256, BrokerLimits, RawHit, SourceBatch, SourceError,
+};
 use crate::context_output_store::{OutputScope, OutputStore};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -261,6 +263,7 @@ impl BrokerMcp {
             return Err("Provider source unavailable.");
         }
         let mut batches = Vec::with_capacity(items.len());
+        let mut payloads = Vec::new();
         for item in items {
             let source = item
                 .get("sourceUri")
@@ -271,14 +274,38 @@ impl BrokerMcp {
                         && !source.chars().any(char::is_control)
                 })
                 .unwrap_or(&self.provider);
+            let parsed = parse_hit(item);
+            if let Ok(hit) = &parsed {
+                payloads.push((sha256(&hit.content), item["content"].as_str().unwrap()));
+            }
             batches.push(SourceBatch {
                 provider: self.provider.clone(),
                 source: source.to_owned(),
-                result: parse_hit(item).map(|hit| vec![hit]).map_err(|_| ()),
+                result: parsed.map(|hit| vec![hit]).map_err(|_| ()),
             });
         }
         let mut result =
             search_response(batches, self.limits).map_err(|_| "Search limits are invalid.")?;
+        let mut retained = Vec::with_capacity(result.hits.len());
+        for mut hit in std::mem::take(&mut result.hits) {
+            let content = payloads
+                .iter()
+                .find(|(sha256, _)| sha256 == &hit.sha256)
+                .map(|(_, content)| content.as_bytes())
+                .ok_or("Provider source unavailable.")?;
+            match self.store.put(&self.scope, content) {
+                Ok(stored) => {
+                    hit.reference = Some(stored.reference);
+                    retained.push(hit);
+                }
+                Err(warning) => result.errors.push(SourceError {
+                    provider: hit.provider,
+                    source: hit.source,
+                    message: warning.message(),
+                }),
+            }
+        }
+        result.hits = retained;
         loop {
             let value =
                 serde_json::to_value(&result).map_err(|_| "Provider source unavailable.")?;
@@ -576,6 +603,8 @@ mod tests {
         let fixture = Fixture::new("one");
         let mut items = vec![json!({"id":"broken","sourceUri":"file:///broken"})];
         for index in 0..40 {
+            items.push(json!({"id":format!("broken-{index}"),
+                "sourceUri":format!("file:///broken-{index}")}));
             items.push(item(&format!("hit-{index}"), &"x".repeat(700)));
         }
         let (response, body) = fixture.call(
@@ -596,6 +625,16 @@ mod tests {
         assert_eq!(body["hits"][0]["provider"], "provider");
         assert_eq!(body["hits"][0]["source"], "file:///project/notes");
         assert_eq!(body["hits"][0]["revision"], "r1");
+        let reference = body["hits"][0]["reference"].as_str().unwrap();
+        let (_, stored) = fixture.call(
+            "sail_context_get",
+            json!({"reference":reference,"offset":0,"length":700}),
+            |_, _| panic!("search result exact read must remain local"),
+        );
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(stored["bytesBase64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, vec![b'x'; 700]);
         assert!(body["hits"][0]["sha256"].as_str().unwrap().len() == 64);
         assert_eq!(body["errors"][0]["source"], "file:///broken");
         assert_eq!(body["truncated"], true);
