@@ -1,6 +1,4 @@
 use base64::Engine;
-#[cfg(windows)]
-use portable_pty::ChildKiller;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -13,6 +11,9 @@ use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
+
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 
@@ -67,7 +68,7 @@ struct TerminalSession {
     writer: Mutex<Box<dyn Write + Send>>,
     write_busy: AtomicBool,
     #[cfg(windows)]
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    process_handle: OwnedHandle,
     output: Arc<Mutex<TerminalOutput>>,
     changed: Arc<Condvar>,
 }
@@ -96,13 +97,44 @@ impl TerminalSession {
         }
         #[cfg(windows)]
         {
-            let mut killer = self.killer.lock().map_err(|error| error.to_string())?;
-            killer
-                .kill()
-                .map_err(|error| format!("Cannot stop terminal process: {error}"))?;
+            stop_owned_windows_process(&self.process_handle)?;
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn open_owned_windows_process(process_id: u32) -> Result<OwnedHandle, String> {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, process_id) }
+        .map_err(|error| format!("Cannot retain terminal process handle: {error}"))?;
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
+}
+
+#[cfg(windows)]
+fn stop_owned_windows_process(handle: &OwnedHandle) -> Result<(), String> {
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+    let process = windows::Win32::Foundation::HANDLE(handle.as_raw_handle() as _);
+    let termination = unsafe { TerminateProcess(process, 1) };
+    let wait = unsafe { WaitForSingleObject(process, 5_000) };
+    if wait == windows::Win32::Foundation::WAIT_OBJECT_0 {
+        return Ok(());
+    }
+    if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
+        return Err(format!(
+            "Cannot confirm terminal process stopped: {}",
+            termination
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "process remained active".to_string())
+        ));
+    }
+    Err(format!(
+        "Cannot inspect terminal process state: {}",
+        std::io::Error::last_os_error()
+    ))
 }
 
 #[cfg(unix)]
@@ -189,6 +221,33 @@ mod tests {
     use super::{canonical_terminal_paths, default_editor, output_page, TerminalOutput};
     use std::collections::VecDeque;
     use std::path::Path;
+
+    #[cfg(windows)]
+    #[test]
+    fn worktree_removal_stops_live_owned_terminal_on_first_attempt() {
+        use super::{open_owned_windows_process, stop_owned_windows_process};
+        use std::process::{Command, Stdio};
+
+        let managed = tempfile::tempdir().expect("managed terminal data directory");
+        std::fs::write(managed.path().join("cache-entry"), "private cache")
+            .expect("create managed cache entry");
+        let mut child = Command::new("ping.exe")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start live terminal child");
+        let process = open_owned_windows_process(child.id())
+            .expect("retain the owned terminal process handle");
+
+        let result = crate::remove_worktree_then_terminal_data(managed.path(), || {
+            stop_owned_windows_process(&process)
+        });
+        assert!(result.is_ok(), "first removal failed: {result:?}");
+        assert!(!managed.path().exists(), "managed data was retained");
+        child.wait().expect("reap stopped terminal child");
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -889,11 +948,27 @@ fn spawn(
     }));
     let changed = Arc::new(Condvar::new());
     let process_id = child.process_id();
+    #[cfg(windows)]
+    let mut child = child;
+    #[cfg(windows)]
+    let process_handle = match process_id {
+        Some(process_id) => match open_owned_windows_process(process_id) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        },
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cannot identify terminal process.".to_string());
+        }
+    };
     let process_group_stop = Arc::new(Mutex::new(()));
     let background_process_group_stop = Arc::clone(&process_group_stop);
     let master = Mutex::new(pair.master);
-    #[cfg(windows)]
-    let killer = child.clone_killer();
     let child = Arc::new(Mutex::new(child));
     let background_output = Arc::clone(&output);
     let background_changed = Arc::clone(&changed);
@@ -975,7 +1050,7 @@ fn spawn(
         writer: Mutex::new(writer),
         write_busy: AtomicBool::new(false),
         #[cfg(windows)]
-        killer: Mutex::new(killer),
+        process_handle,
         output,
         changed,
     })
