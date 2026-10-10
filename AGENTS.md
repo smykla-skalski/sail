@@ -12,8 +12,8 @@
 ## Scratch and build output
 
 - Put all scratch and build output of a worker or gate run under one scratch root made with `mktemp -d "${TMPDIR:-/tmp}/sail-<issue>-<role>.XXXXXX"`. Point `CARGO_TARGET_DIR` and other build caches inside it so a single `rm -rf` removes everything, including the private target dir of an E2E build.
-- Record the creating process with `printf '%s\n' "$$" > "$scratch_root/.sail-scratch-root"` after creating the root. Sail's startup sweep uses this marker to protect a live owner and recognize abandoned roots after two idle hours.
-- Only the run that created a scratch root removes it, via a `trap` or `finally` so it also runs when the run succeeds, fails, is canceled, or stops blocked. Before `rm -rf`, check the path is non-empty and starts with `sail-`.
+- In Sail agent tool shells, record the owning app process with `test -n "${SAIL_SCRATCH_OWNER_PID:-}" && printf '%s\n' "$SAIL_SCRATCH_OWNER_PID" > "$scratch_root/.sail-scratch-root"` after creating the root. Sail passes this long-lived PID to agents; tool shell PIDs exit between commands. Roots without this marker remain the creating run's responsibility and are not swept automatically.
+- The run that created a scratch root removes it via a `trap` or `finally` when it succeeds, fails, is canceled, or stops blocked. Sail's startup sweep reaps marked orphan roots after their owner exits and they have been idle for at least two hours. Before manual `rm -rf`, check the path is non-empty and starts with `sail-`.
 - Never delete directories or worktrees you did not create, including other runs' `sail*` directories and roots left by a dead run. Report those instead.
 - Reuse one target dir per worktree for sequential gates of the same revision; use a fresh one when the revision changes. Concurrent builds use separate target subdirectories inside the root.
 - Pass the scratch root to review and test subagents. They build in their own subdirectory of it instead of creating scratch directories elsewhere, and never remove the root.

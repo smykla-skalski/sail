@@ -1,5 +1,8 @@
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -36,6 +39,36 @@ fn sweep(
         if !metadata.is_dir() || metadata.uid() != owner || !candidate_name(&name, &path) {
             continue;
         }
+        if let Some(original_name) = private_quarantine_name(&name) {
+            let root = path.join("root");
+            if !root.exists() {
+                if now.duration_since(metadata.modified()?).unwrap_or_default() >= IDLE_AGE {
+                    let _ = fs::remove_dir(&path);
+                }
+                continue;
+            }
+            if now.duration_since(metadata.modified()?).unwrap_or_default() < IDLE_AGE {
+                continue;
+            }
+            let original = temp.join(original_name);
+            let safe = inspect(&root, metadata.dev(), now).is_ok_and(|result| result.is_some())
+                && marker_owner_dead(&root)
+                && open_files(&root) == Some(false);
+            if safe {
+                let bytes = inspect(&root, metadata.dev(), now)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                if fs::remove_dir_all(&root).is_ok() {
+                    freed += bytes;
+                    let _ = fs::remove_dir(&path);
+                }
+            } else if !original.exists() {
+                restore(&root, &original);
+                let _ = fs::remove_dir(&path);
+            }
+            continue;
+        }
         let Ok(Some(bytes)) = inspect(&path, metadata.dev(), now) else {
             continue;
         };
@@ -46,8 +79,20 @@ fn sweep(
         if open_files(&path) != Some(false) {
             continue;
         }
-        let quarantine = temp.join(format!("sail-cleanup-quarantine-{}", uuid::Uuid::new_v4()));
+        let private = temp.join(format!(
+            "sail-cleanup-private-{}-{name}",
+            uuid::Uuid::new_v4()
+        ));
+        if fs::create_dir(&private).is_err() {
+            continue;
+        }
+        if fs::set_permissions(&private, fs::Permissions::from_mode(0o300)).is_err() {
+            let _ = fs::remove_dir(&private);
+            continue;
+        }
+        let quarantine = private.join("root");
         if fs::rename(&path, &quarantine).is_err() {
+            let _ = fs::remove_dir(&private);
             continue;
         }
         let safe = inspect(&quarantine, metadata.dev(), now).is_ok_and(|result| result.is_some())
@@ -55,6 +100,7 @@ fn sweep(
             && open_files(&quarantine) == Some(false);
         if !safe {
             restore(&quarantine, &path);
+            let _ = fs::remove_dir(&private);
             continue;
         }
         if let Err(error) = fs::remove_dir_all(&quarantine) {
@@ -64,13 +110,14 @@ fn sweep(
             );
             continue;
         }
+        let _ = fs::remove_dir(&private);
         freed += bytes;
     }
     Ok(freed)
 }
 
 fn restore(quarantine: &Path, original: &Path) {
-    if let Err(error) = fs::rename(quarantine, original) {
+    if let Err(error) = restore_without_replacing(quarantine, original) {
         eprintln!(
             "Sail scratch cleanup kept {} after restore failed: {error}",
             quarantine.display()
@@ -78,52 +125,61 @@ fn restore(quarantine: &Path, original: &Path) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn restore_without_replacing(quarantine: &Path, original: &Path) -> std::io::Result<()> {
+    let source = std::ffi::CString::new(quarantine.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination = std::ffi::CString::new(original.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let result = unsafe {
+        nix::libc::renameatx_np(
+            nix::libc::AT_FDCWD,
+            source.as_ptr(),
+            nix::libc::AT_FDCWD,
+            destination.as_ptr(),
+            nix::libc::RENAME_EXCL,
+        )
+    };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn restore_without_replacing(quarantine: &Path, original: &Path) -> std::io::Result<()> {
+    if original.exists() {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    }
+    fs::rename(quarantine, original)
+}
+
 fn candidate_name(name: &str, path: &Path) -> bool {
+    if private_quarantine_name(name).is_some() {
+        return true;
+    }
     if !name.starts_with("sail") {
         return false;
     }
-    if name.starts_with("sail-") && path.join(MARKER).is_file() {
-        return true;
-    }
-    if name
-        .strip_prefix("sail-cleanup-quarantine-")
-        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-    {
-        return true;
-    }
-    if name
-        .strip_prefix("sail")
-        .and_then(|tail| tail.split_once("-e2e"))
-        .is_some_and(|(issue, _)| issue.parse::<u64>().is_ok())
-    {
-        return has_cargo_artifacts(path);
-    }
-    let Some(tail) = name.strip_prefix("sail-") else {
-        return false;
-    };
-    // Recognize only the old build roots; arbitrary sail-* folders are not ours.
-    ((tail.starts_with("review-") || tail.starts_with("ship-"))
-        || (tail.split_once('-').is_some_and(|(issue, role)| {
-            issue.parse::<u64>().is_ok()
-                && ["target", "cargo", "e2e", "adversary"]
-                    .iter()
-                    .any(|known| role.starts_with(known))
-        })))
-        && has_cargo_artifacts(path)
+    path.join(MARKER).is_file()
 }
 
-fn has_cargo_artifacts(path: &Path) -> bool {
-    ["", "target", "target-worktree"].iter().any(|root| {
-        ["debug", "release"]
-            .iter()
-            .any(|profile| path.join(root).join(profile).join(".fingerprint").is_dir())
-    })
+fn private_quarantine_name(name: &str) -> Option<&str> {
+    let tail = name.strip_prefix("sail-cleanup-private-")?;
+    let (uuid, _) = tail.split_once("-sail")?;
+    uuid::Uuid::parse_str(uuid).ok()?;
+    let original = &tail[uuid.len() + 1..];
+    if original == "sail" || original.contains('/') {
+        return None;
+    }
+    Some(original)
 }
 
 fn marker_owner_dead(path: &Path) -> bool {
     let marker = path.join(MARKER);
     if !marker.exists() {
-        return true;
+        return false;
     }
     let Ok(owner) = fs::read_to_string(marker) else {
         return false;
@@ -206,6 +262,7 @@ mod tests {
 
     fn cargo_artifacts(path: &Path) {
         fs::create_dir_all(path.join("debug").join(".fingerprint")).unwrap();
+        fs::write(path.join(MARKER), i32::MAX.to_string()).unwrap();
     }
 
     #[test]
@@ -288,11 +345,14 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_old_e2e_roots() {
+    fn keeps_unmarked_legacy_roots() {
         let temp = fixture();
-        cargo_artifacts(&temp);
-        assert!(candidate_name("sail339-e2e.abc", &temp));
-        assert!(!candidate_name("sail339-context.abc", &temp));
+        let legacy = temp.join("sail339-e2e.abc");
+        fs::create_dir(&legacy).unwrap();
+        fs::create_dir_all(legacy.join("debug").join(".fingerprint")).unwrap();
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |_| Some(false)).unwrap();
+        assert!(legacy.exists());
     }
 
     #[test]
@@ -321,5 +381,63 @@ mod tests {
         .unwrap();
         assert_eq!(calls.get(), 2);
         assert!(root.exists());
+    }
+
+    #[test]
+    fn hides_quarantine_from_directory_listing() {
+        let temp = fixture();
+        let root = temp.join("sail-339-target.private");
+        fs::create_dir(&root).unwrap();
+        cargo_artifacts(&root);
+        let calls = std::cell::Cell::new(0);
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |path| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                let private = path.parent().unwrap();
+                assert_eq!(
+                    fs::metadata(private).unwrap().permissions().mode() & 0o777,
+                    0o300
+                );
+                assert!(fs::read_dir(private).is_err());
+            }
+            Some(false)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn recovers_an_orphaned_private_quarantine() {
+        let temp = fixture();
+        let name = "sail-339-target.orphan";
+        let private = temp.join(format!(
+            "sail-cleanup-private-{}-{name}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = private.join("root");
+        fs::create_dir(&private).unwrap();
+        fs::create_dir(&root).unwrap();
+        cargo_artifacts(&root);
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o300)).unwrap();
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |_| Some(false)).unwrap();
+        assert!(!private.exists());
+        assert!(!temp.join(name).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_never_replaces_a_new_root() {
+        let temp = fixture();
+        let root = temp.join("sail-339-target.replaced");
+        let quarantine = temp.join("sail-339-target.quarantine");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&quarantine).unwrap();
+        fs::write(root.join("new"), "keep").unwrap();
+        assert!(restore_without_replacing(&quarantine, &root).is_err());
+        assert!(root.join("new").exists());
+        assert!(quarantine.exists());
     }
 }
