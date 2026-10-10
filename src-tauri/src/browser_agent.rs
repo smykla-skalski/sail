@@ -1247,18 +1247,24 @@ pub fn browser_project_access(
 
 #[tauri::command]
 pub fn browser_mcp_config(
+    app: AppHandle,
     manager: State<'_, BrowserManager>,
     directory: String,
     session: Option<String>,
     agent: Option<String>,
     profile: Option<String>,
 ) -> Result<McpConfig, String> {
-    manager.config_for_profile(
+    let mut config = manager.config_for_profile(
         &directory,
         session.as_deref(),
         agent.as_deref(),
         profile.as_deref(),
-    )
+    )?;
+    config.env.insert(
+        "SAIL_BACKGROUND_PRIORITY".into(),
+        crate::background_priority::enabled(&app).to_string(),
+    );
+    Ok(config)
 }
 
 #[tauri::command]

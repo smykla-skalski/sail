@@ -6,6 +6,7 @@ fn main() {
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("--browser-mcp") {
+        sail_lib::background_priority::lower_current_process();
         sail_lib::browser_agent::run_mcp_stdio();
         return;
     }

@@ -385,6 +385,16 @@ pub fn handle(
                 "Terminal working directory must be an existing absolute folder.".to_string(),
             );
         }
+        let background = crate::background_priority::enabled(app);
+        #[cfg(unix)]
+        let mut command = if let Some(nice) = crate::background_priority::nice_program(background) {
+            let mut command = Command::new(nice);
+            command.args(["-n", "10"]).arg(&params.command);
+            command
+        } else {
+            Command::new(&params.command)
+        };
+        #[cfg(windows)]
         let mut command = Command::new(&params.command);
         command.args(&params.args).current_dir(directory);
         #[cfg(unix)]
@@ -397,6 +407,10 @@ pub fn handle(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("Cannot start command: {error}"))?;
+        #[cfg(windows)]
+        if background {
+            crate::background_priority::lower_process(child.id());
+        }
         #[cfg(unix)]
         let watchdog =
             crate::child_watchdog::ChildWatchdog::start(child.id()).map_err(|error| {

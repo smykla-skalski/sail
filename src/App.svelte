@@ -1150,6 +1150,7 @@
   const shortcutPlatform = detectShortcutPlatform();
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
   let agentTerminalsEnabled = $state(getSetting('sai-agent-terminals-enabled') === 'true');
+  let backgroundPriorityEnabled = $state(getSetting('sai-background-priority-enabled') !== 'false');
   let agentStatusEnabled = $state(getSetting('sai-agent-status-enabled') !== 'false');
   let agentThreadListEnabled = $state(getSetting('sai-agent-thread-list-enabled') !== 'false');
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
@@ -2013,6 +2014,7 @@
       personalPostTurnChecks,
       agentWorktreesEnabled,
       agentTerminalsEnabled,
+      backgroundPriorityEnabled,
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
@@ -2208,6 +2210,9 @@
         } else if (action.type === 'agent-terminals') {
           agentTerminalsEnabled = action.value;
           setSetting('sai-agent-terminals-enabled', String(action.value));
+        } else if (action.type === 'background-priority') {
+          backgroundPriorityEnabled = action.value;
+          setSetting('sai-background-priority-enabled', String(action.value));
         } else if (action.type === 'agent-status') {
           agentStatusEnabled = action.value;
           setSetting('sai-agent-status-enabled', String(action.value));
