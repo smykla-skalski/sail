@@ -89,6 +89,12 @@ pub(crate) fn stable_worktree_identity(worktree: &Path) -> PathBuf {
     }
 }
 
+pub(crate) fn worktree_contains(root: &Path, candidate: &Path) -> bool {
+    let root = stable_worktree_identity(root);
+    let candidate = stable_worktree_identity(candidate);
+    candidate == root || candidate.starts_with(&root)
+}
+
 pub(crate) fn terminal_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
     let shared_download_cache = data_directory
         .parent()
@@ -348,10 +354,7 @@ impl AcpTerminalManager {
             .lock()
             .map_err(|error| error.to_string())?
             .iter()
-            .filter(|(_, terminal)| {
-                let terminal_directory = stable_worktree_identity(&terminal.directory);
-                terminal_directory == worktree || terminal_directory.starts_with(&worktree)
-            })
+            .filter(|(_, terminal)| worktree_contains(&worktree, &terminal.directory))
             .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
             .collect::<Vec<_>>();
         for (id, terminal) in terminals {
@@ -382,7 +385,7 @@ impl AcpTerminalManager {
         let worktree = stable_worktree_identity(&terminal_worktree_root(directory));
         if blocked
             .iter()
-            .any(|removed| worktree == *removed || worktree.starts_with(removed))
+            .any(|removed| worktree_contains(removed, &worktree))
         {
             return Err("Worktree is being removed.".to_string());
         }
@@ -1526,6 +1529,49 @@ mod tests {
             worktree_data_directory(&cache, &canonical_parent.join("removed-worktree"));
 
         assert_eq!(before_removal, after_removal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_worktree_identity_normalizes_dotdot_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-terminal-identity-dotdot-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let parent = root.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let missing = parent.join("worktree");
+        let alias = parent.join("..").join("parent").join("worktree");
+
+        assert_eq!(
+            stable_worktree_identity(&missing),
+            stable_worktree_identity(&alias)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn outer_worktree_contains_nested_git_worktree_identity() {
+        let root =
+            std::env::temp_dir().join(format!("sail-terminal-nested-git-{}", uuid::Uuid::new_v4()));
+        let outer = root.join("outer");
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        for path in [&outer, &nested] {
+            assert!(Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let outer = dunce::canonicalize(outer).unwrap();
+        let nested = terminal_worktree_root(&nested);
+
+        assert_ne!(outer, nested, "nested repository keeps its own identity");
+        assert!(worktree_contains(&outer, &nested));
+        assert!(!worktree_contains(&nested, &outer));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

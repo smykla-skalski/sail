@@ -2293,14 +2293,7 @@ where
     let repository = PathBuf::from(validate_repository(repository)?)
         .git_canonical()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
-    let requested_worktree = PathBuf::from(&worktree);
-    let requested_worktree = if requested_worktree.is_absolute() {
-        requested_worktree
-    } else {
-        std::env::current_dir()
-            .map_err(|error| error.to_string())?
-            .join(requested_worktree)
-    };
+    let requested_worktree = acp_terminal::stable_worktree_identity(Path::new(&worktree));
     let worktree = match Path::new(&worktree).git_canonical() {
         Ok(worktree) => worktree,
         Err(_) if !requested_worktree.exists() => {
@@ -2309,10 +2302,8 @@ where
             let still_registered = parse_registered_worktrees(&listed)
                 .into_iter()
                 .any(|entry| {
-                    Path::new(&entry.path) == requested_worktree
-                        || Path::new(&entry.path)
-                            .git_canonical()
-                            .is_ok_and(|registered| registered == requested_worktree)
+                    acp_terminal::stable_worktree_identity(Path::new(&entry.path))
+                        == requested_worktree
                 });
             if still_registered {
                 return Err("Worktree folder no longer exists but is still registered. Refresh before deleting.".into());
@@ -2806,6 +2797,43 @@ mod tests {
                 .iter()
                 .any(|entry| entry.branch.as_deref() == Some("child") && !entry.present),
             "Git must still list the missing child worktree"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_registered_worktree_dotdot_alias_keeps_terminal_data() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-archive-registered-dotdot-test");
+        let managed = root.join("managed-terminal-data");
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(
+            managed.join("cache"),
+            "retain while Git still registers worktree",
+        )
+        .unwrap();
+        fs::remove_dir_all(&worktree).unwrap();
+        let worktree_path = Path::new(&worktree);
+        let parent = worktree_path.parent().unwrap();
+        let alias = parent
+            .join("..")
+            .join(parent.file_name().unwrap())
+            .join(worktree_path.file_name().unwrap());
+
+        let error = remove_worktree_then_terminal_data(&managed, || {
+            archive_ignored_and_remove(
+                repository.clone(),
+                alias.to_string_lossy().into_owned(),
+                Some(expected),
+                None,
+            )
+        })
+        .unwrap_err();
+
+        assert!(error.contains("still registered"), "{error}");
+        assert_eq!(
+            fs::read_to_string(managed.join("cache")).unwrap(),
+            "retain while Git still registers worktree"
         );
         fs::remove_dir_all(root).unwrap();
     }

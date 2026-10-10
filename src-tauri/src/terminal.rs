@@ -660,9 +660,7 @@ impl TerminalManager {
             .iter()
             .filter(|(_, session)| {
                 session.owner.is_some()
-                    && dunce::canonicalize(&session.worktree)
-                        .unwrap_or_else(|_| session.worktree.clone())
-                        == worktree
+                    && crate::acp_terminal::worktree_contains(&worktree, &session.worktree)
             })
             .map(|(id, session)| (id.clone(), Arc::clone(session)))
             .collect::<Vec<_>>();
