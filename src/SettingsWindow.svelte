@@ -252,7 +252,8 @@
       await invoke('context_approve_provider', { directory, expectedFingerprint });
       if (snapshot?.directory === directory) {
         await refreshContext(directory);
-        contextMessage = 'Provider approved for this project. Connection is not available yet.';
+        contextMessage =
+          'Provider approved for this project. Approval does not show connection health.';
       }
     } catch (cause) {
       if (snapshot?.directory === directory) {
@@ -1364,10 +1365,15 @@
           <p role="status">Checking committed context configuration…</p>
         {:else if contextStatus?.state === 'not-configured'}
           <p role="status">This project has no committed context provider selection.</p>
+          <p>
+            To set up a provider, add its selection to this project's Sail context configuration,
+            commit the configuration, then refresh this view. Sail uses the committed selection.
+          </p>
         {:else if contextStatus?.state === 'invalid'}
           <p class="runtime-diagnostic" role="alert">
             {contextStatus.reason || 'The committed context configuration is invalid.'}
           </p>
+          <p>Fix and commit the project context configuration, then refresh this view.</p>
         {:else if contextStatus}
           <dl class="integration-preview context-provider-details">
             <dt>Provider</dt>
@@ -1383,14 +1389,29 @@
             <dt>Committed revision</dt>
             <dd><code>{contextStatus.revision}</code></dd>
             <dt>Approval</dt>
-            <dd>{contextStatus.state === 'approved' ? 'Approved' : 'Approval required'}</dd>
+            <dd>
+              {contextStatus.state === 'approved'
+                ? 'Approved'
+                : contextStatus.state === 'unavailable'
+                  ? 'Unavailable'
+                  : 'Approval required'}
+            </dd>
           </dl>
           {#if contextStatus.reason}<p class="runtime-diagnostic" role="status">
               {contextStatus.reason}
             </p>{/if}
-          <p>
-            Approval records your choice. Sail does not start the provider or add it to agents yet.
-          </p>
+          {#if contextStatus.state === 'unavailable'}
+            <p>
+              Select an available executable for this registry command, then review its identity.
+            </p>
+          {:else if contextStatus.state === 'approval-required'}
+            <p>Review the executable and capabilities before approving this project.</p>
+          {:else}
+            <p>
+              Approval records your choice for this project. It does not show live connection
+              health.
+            </p>
+          {/if}
           <label for="context-executable">Provider executable</label>
           <input
             id="context-executable"
