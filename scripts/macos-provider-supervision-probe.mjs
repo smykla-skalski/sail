@@ -679,6 +679,11 @@ async function main() {
     } else {
       cleanup = 'not-attempted';
     }
+    finding(
+      'registration-denial',
+      false,
+      'a genuine user-denied registration was not exercised on this host',
+    );
     const mandatory = [
       'build-app',
       'build-agent',
@@ -688,6 +693,7 @@ async function main() {
       'signature-valid',
       'scope-matrix',
       'registration',
+      'registration-denial',
       'registration-state',
       'discovery',
       'two-window-reuse',
@@ -734,6 +740,7 @@ async function main() {
       verdict,
       findings,
       limits: [
+        'user-denied registration remains untested; issue-level result is NO-GO',
         'fixture-only service and cancellation semantics',
         'no peer pairing or production call authorization proof',
         'no Linux or Windows proof',
