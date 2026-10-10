@@ -315,6 +315,7 @@ function stdioTransport(command, args, environment) {
     async verify() {
       await new Promise((done) => setTimeout(done, STDIO_FINAL_OUTPUT_MS));
       if (failed) throw failed;
+      if (buffer.length > 0) throw new ConformanceError('Non-MCP output on provider stdout.');
     },
     async close() {
       if (child.exitCode !== null) return;
@@ -454,9 +455,17 @@ async function run(config) {
       },
     });
     assert(error?.jsonrpc === '2.0' && error.id === id, 'Invalid error probe JSON-RPC response.');
+    const rpcError = error.error;
+    const validRpcError =
+      rpcError !== null &&
+      typeof rpcError === 'object' &&
+      !Array.isArray(rpcError) &&
+      Number.isInteger(rpcError.code) &&
+      typeof rpcError.message === 'string';
     assert(
-      error.error || error.result?.isError === true,
-      'Error probe did not fail with a true isError flag.',
+      (validRpcError && error.result === undefined) ||
+        (rpcError === undefined && error.result?.isError === true),
+      'Error probe did not return a valid JSON-RPC error or true isError flag.',
     );
     const containsSecretText = (text) =>
       text.includes(secret) || text.includes(JSON.stringify(secret).slice(1, -1));
