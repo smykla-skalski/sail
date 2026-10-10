@@ -4,6 +4,7 @@ import type { ModelRoutingSettings } from './model-routing';
 import type { MergeOwner } from './issue-shipping';
 import type { ShipArchiveDelay } from './ship-archive';
 import type { ThemePreference } from './theme';
+import type { ResourceKind } from './resource-limits';
 import type {
   NotificationPreference,
   NotificationPrefs,
@@ -34,6 +35,7 @@ export type SettingsSnapshot = {
   mergeOwner: MergeOwner;
   shipArchiveDelay: ShipArchiveDelay;
   contextHandoffThreshold: number;
+  resourceLimits: Record<ResourceKind | 'e2e', number>;
 };
 
 export type SettingsAction =
@@ -51,6 +53,7 @@ export type SettingsAction =
   | { type: 'merge-owner'; value: MergeOwner }
   | { type: 'ship-archive-delay'; value: ShipArchiveDelay }
   | { type: 'context-handoff-threshold'; value: number }
+  | { type: 'resource-limit'; kind: ResourceKind | 'e2e'; value: number }
   | { type: 'detect-agents' }
   | { type: 'cross-validation'; value: ValidationSettings }
   | { type: 'model-routing'; value: ModelRoutingSettings };

@@ -4,8 +4,12 @@ import { writable } from 'svelte/store';
 export const settingsError = writable('');
 const migrationKey = 'sail-settings-migrated-v1';
 
-function isSetting(key: string): boolean {
-  return (key.startsWith('sai-') && !key.startsWith('sai-e2e-')) || key === 'sail-agent-threads';
+export function isSetting(key: string): boolean {
+  return (
+    (key.startsWith('sai-') && !key.startsWith('sai-e2e-')) ||
+    key === 'sai-e2e-job-limit' ||
+    key === 'sail-agent-threads'
+  );
 }
 
 function snapshot(): Record<string, string> {

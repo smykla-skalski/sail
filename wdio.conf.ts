@@ -3,12 +3,26 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { isolatedPaths, privatePort, PrivateEndpointGuard } from './test/e2e-isolation.ts';
+import { E2eJobQueue, e2eJobLimit } from './test/e2e-concurrency.ts';
+
+const limitEnvironment = { ...process.env };
+const jobs = new E2eJobQueue(undefined, () => e2eJobLimit(limitEnvironment));
+const cancelQueuedJob = (signal: number) => {
+  jobs.release();
+  process.exit(128 + signal);
+};
+const cancelOnInterrupt = () => cancelQueuedJob(2);
+const cancelOnTerminate = () => cancelQueuedJob(15);
 
 const port = privatePort(process.env.TAURI_WEBDRIVER_PORT);
 process.env.TAURI_WEBDRIVER_PORT = String(port);
 const serviceModule = '@wdio/tauri-service';
 const { default: TauriService } = await import(serviceModule);
 const state = mkdtempSync(join(tmpdir(), 'sail-e2e-'));
+process.once('exit', () => {
+  jobs.release();
+  rmSync(state, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+});
 const attach = process.env.SAIL_E2E_ATTACH === '1';
 Object.assign(process.env, isolatedPaths(state, attach, process.env));
 if (!attach) process.env.CLAUDE_CONFIG_DIR = join(state, 'claude');
@@ -59,6 +73,21 @@ export const config = {
   mochaOpts: { timeout: 240_000 },
   waitforTimeout: 20_000,
   connectionRetryTimeout: 90_000,
+  async onPrepare() {
+    let lastWaitingLimit: number | null = null;
+    process.once('SIGINT', cancelOnInterrupt);
+    process.once('SIGTERM', cancelOnTerminate);
+    try {
+      await jobs.acquire((limit) => {
+        if (limit === lastWaitingLimit) return;
+        lastWaitingLimit = limit;
+        process.stdout.write(`Waiting for E2E slot (limit ${limit})\n`);
+      });
+    } finally {
+      process.off('SIGINT', cancelOnInterrupt);
+      process.off('SIGTERM', cancelOnTerminate);
+    }
+  },
   /** New profiles follow the OS appearance. Pin it so color and screenshot checks give the same
    * result on light and dark machines; specs that need dark set `sai-theme` or the appearance. */
   async before() {
@@ -71,6 +100,7 @@ export const config = {
     }, e2eAppearance);
   },
   onComplete() {
+    jobs.release();
     rmSync(state, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   },
 };

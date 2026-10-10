@@ -7,6 +7,7 @@
   import { describePickedElement } from './lib/browser-pick';
   import { browserPopIndex, newBrowserTab } from './lib/panes';
   import { watchDetectedServers, type DetectedServer } from './lib/detected-servers';
+  import { resourceQueues } from './lib/resource-limits';
 
   type BrowserLeaf = Extract<Pane, { kind: 'browser' }>;
   type BrowserEvent = { label: string; url: string };
@@ -36,6 +37,8 @@
   let address = $state('');
   let error = $state('');
   let loading = $state(false);
+  let queuedLimit = $state<number | null>(null);
+  let browserRelease: (() => void) | null = null;
   let agentAction = $state('');
   let servers = $state<DetectedServer[]>([]);
   let agentActionTimer: ReturnType<typeof setTimeout> | null = null;
@@ -151,7 +154,14 @@
     liveLabel = null;
     ready = false;
     picking = false;
-    if (label) await invoke('browser_close', { label });
+    if (label) resourceQueues.browser.cancel(label);
+    try {
+      if (label) await invoke('browser_close', { label });
+    } finally {
+      browserRelease?.();
+      browserRelease = null;
+      queuedLimit = null;
+    }
   }
 
   async function togglePicker() {
@@ -260,11 +270,42 @@
     loading = true;
     error = '';
     expectedUrl = url;
+    let release: (() => void) | null = null;
+    let unsubscribe: (() => void) | null = null;
     try {
-      await invoke('browser_open', { label, directory, paneId: pane.id, url, bounds: bounds() });
+      const queue = resourceQueues.browser;
+      if (queue.status.active >= queue.status.limit || queue.status.waiting)
+        queuedLimit = queue.status.limit;
+      unsubscribe = queue.subscribe(() => {
+        if (liveLabel === label && queue.isQueued(label)) queuedLimit = queue.status.limit;
+      });
+      release = await queue.acquire(label);
+      unsubscribe();
+      unsubscribe = null;
+      queuedLimit = null;
+      if (!mounted || currentGeneration !== generation || liveLabel !== label) {
+        release();
+        return;
+      }
+      browserRelease = release;
+      const openingUrl = currentUrl || url;
+      expectedUrl = openingUrl;
+      await invoke('browser_open', {
+        label,
+        directory,
+        paneId: pane.id,
+        url: openingUrl,
+        bounds: bounds(),
+      });
       if (!mounted || currentGeneration !== generation) {
         await invoke('browser_close', { label });
+        release();
+        if (browserRelease === release) browserRelease = null;
         return;
+      }
+      if (currentUrl && currentUrl !== openingUrl) {
+        expectedUrl = currentUrl;
+        await invoke('browser_navigate', { label, url: currentUrl });
       }
       ready = true;
       await invoke('browser_visibility', {
@@ -273,13 +314,17 @@
       });
       await tick();
       await resize();
-      if (loading) beginLoading(url);
+      if (loading) beginLoading(openingUrl);
     } catch (cause) {
+      unsubscribe?.();
+      release?.();
+      if (browserRelease === release) browserRelease = null;
       if (currentGeneration === generation) {
         error = String(cause);
         loading = false;
         liveLabel = null;
         ready = false;
+        queuedLimit = null;
         void invoke('browser_close', { label });
       }
     }
@@ -299,10 +344,10 @@
       const url = normalizeUrl(value);
       address = url;
       recordNavigation(url);
-      if (liveLabel) {
+      if (liveLabel && ready) {
         beginLoading(url);
         await invoke('browser_navigate', { label: liveLabel, url });
-      } else {
+      } else if (!liveLabel) {
         await tick();
         await mountCurrent();
       }
@@ -323,10 +368,10 @@
     updateTab({ ...tab, index });
     address = url;
     try {
-      if (liveLabel) {
+      if (liveLabel && ready) {
         beginLoading(url);
         await invoke('browser_navigate', { label: liveLabel, url });
-      } else {
+      } else if (!liveLabel) {
         await tick();
         await mountCurrent();
       }
@@ -339,6 +384,7 @@
 
   async function reload() {
     if (!currentUrl) return;
+    if (liveLabel && !ready) return;
     if (!liveLabel) {
       await mountCurrent();
       return;
@@ -540,7 +586,9 @@
       {/each}
     </div>
   {/if}
-  {#if loading}<p class="browser-loading" role="status">Loading…</p>{/if}
+  {#if loading}<p class="browser-loading" role="status">
+      {queuedLimit === null ? 'Loading…' : `Waiting for browser slot (limit ${queuedLimit})`}
+    </p>{/if}
   {#if agentAction}<p class="browser-agent-action" role="status">{agentAction}</p>{/if}
   {#if error}<div class="browser-error" role="alert">
       <p>{error}</p>

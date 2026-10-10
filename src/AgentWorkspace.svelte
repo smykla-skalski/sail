@@ -287,6 +287,7 @@
   const promptLocation = $derived(composerTaskLocation(taskLocation, directory, thread?.directory));
   let ready = $state(false);
   let busy = $state(false);
+  let queuedLimit = $state<number | null>(null);
   let connecting = $state(false);
   let sessionWarmupAttempted = $state(false);
   function failedDraftKey() {
@@ -1752,6 +1753,7 @@
     let directClaim = '';
     let directAuthorization: DirectShipAuthorization | undefined;
     let deliverySessionId = activeSessionId;
+    let releaseSlot: (() => void) | null = null;
     busy = true;
     if (activityThread) onstatus(activityThread, 'working');
     stopRequested = false;
@@ -1785,6 +1787,8 @@
     ];
     void follow();
     try {
+      releaseSlot = await acp.acquireTurnSlot(turnId, (limit) => (queuedLimit = limit));
+      if (stopRequested) throw new Error('Agent turn was cancelled.');
       if (!activeSessionId || !activityThread)
         activityThread = await ensureSession(text.slice(0, 60) || 'Attached files', true);
       if (activityThread?.title === 'New thread')
@@ -1881,6 +1885,8 @@
             recalledPrompt,
             turnId,
             promptImagePaths(sentImages, sentClipboard),
+            undefined,
+            true,
           ),
         );
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
@@ -1981,12 +1987,14 @@
       }
       if (external && !queuedMessage) throw cause;
     } finally {
+      releaseSlot?.();
       if (inFlightSteer?.sessionId === deliverySessionId && inFlightSteer.turnId === turnId)
         inFlightSteer.finish();
       if (current === generation) rememberTranscript();
       if (!keepImages) discardAttachments(sentImages, sentClipboard);
       if (deliverySessionId) discardSteeredAttachments(deliverySessionId);
       if (activeTurnId === turnId) activeTurnId = null;
+      queuedLimit = null;
       // Clear busy first so the header and the status bar settle in the same frame.
       if (current === generation) {
         busy = false;
@@ -2245,6 +2253,7 @@
 
   async function stop() {
     stopRequested = true;
+    if (activeTurnId) acp.cancelQueuedTurn(activeTurnId);
     if (activePlanRevision)
       reportPlanRevision(activePlanRevision.id, 'Plan revision was cancelled.');
     diagnostic('stop_requested');
@@ -2601,10 +2610,10 @@
             </section>{/if}
           {#if shownBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
               <div class="agent-busy" role="status">
-                <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
-                    size="sm"
-                    variant="secondary"
-                    onclick={stop}>Stop</Button
+                {#if queuedLimit !== null}Waiting for agent slot (limit {queuedLimit}){:else}<ActivityStatus
+                    status={visibleStatus}
+                  />{/if}{#if !nativeEntries}<Button size="sm" variant="secondary" onclick={stop}
+                    >Stop</Button
                   >{/if}
               </div>
             </ChatMessage>{/if}

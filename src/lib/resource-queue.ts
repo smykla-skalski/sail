@@ -1,0 +1,72 @@
+type Waiter = {
+  id: string;
+  resolve: (release: () => void) => void;
+  reject: (error: Error) => void;
+};
+
+export class ResourceQueue {
+  private active = 0;
+  private waiters: Waiter[] = [];
+  private limit: number;
+  private listeners = new Set<() => void>();
+
+  constructor(limit: number) {
+    this.limit = limit;
+  }
+
+  get status() {
+    return { active: this.active, waiting: this.waiters.length, limit: this.limit };
+  }
+
+  setLimit(limit: number): void {
+    this.limit = limit;
+    this.drain();
+    this.emit();
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  isQueued(id: string): boolean {
+    return this.waiters.some((waiter) => waiter.id === id);
+  }
+
+  acquire(id: string): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      this.waiters.push({ id, resolve, reject });
+      this.drain();
+      this.emit();
+    });
+  }
+
+  cancel(id: string): boolean {
+    const index = this.waiters.findIndex((waiter) => waiter.id === id);
+    if (index < 0) return false;
+    const [waiter] = this.waiters.splice(index, 1);
+    waiter.reject(new Error('Queued work was cancelled.'));
+    this.drain();
+    this.emit();
+    return true;
+  }
+
+  private drain(): void {
+    while (this.active < this.limit && this.waiters.length) {
+      const waiter = this.waiters.shift()!;
+      this.active++;
+      let released = false;
+      waiter.resolve(() => {
+        if (released) return;
+        released = true;
+        this.active--;
+        this.drain();
+        this.emit();
+      });
+    }
+  }
+
+  private emit(): void {
+    for (const listener of this.listeners) listener();
+  }
+}

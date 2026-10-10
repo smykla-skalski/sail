@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getSetting, setSetting } from './settings.ts';
+import { resourceQueues } from './resource-limits.ts';
 import { acpPlans } from './acp-plans.ts';
 import { forgetPlanningState } from './planning-state.ts';
 import { toolCommand } from './tool-display.ts';
@@ -768,6 +769,55 @@ function restoreSession(
   return request;
 }
 
+const queuedPrompts = new Map<string, { agent: string; sessionId: string }>();
+
+async function acquireTurnSlot(
+  turnId: string,
+  onQueue?: (limit: number | null) => void,
+): Promise<() => void> {
+  const queue = resourceQueues.agent;
+  if (queue.status.active >= queue.status.limit || queue.status.waiting)
+    onQueue?.(queue.status.limit);
+  const unsubscribe = queue.subscribe(() => {
+    if (queue.isQueued(turnId)) onQueue?.(queue.status.limit);
+  });
+  try {
+    return await queue.acquire(turnId);
+  } finally {
+    unsubscribe();
+    onQueue?.(null);
+  }
+}
+
+async function limitedPrompt(
+  agent: AgentId,
+  sessionId: string,
+  text: string,
+  turnId: string,
+  imagePaths: string[],
+  onQueue?: (limit: number | null) => void,
+  slotHeld = false,
+): Promise<AcpPromptOutcome> {
+  if (slotHeld)
+    return invoke<AcpPromptOutcome>('acp_prompt', {
+      params: { agent, sessionId, text, turnId, imagePaths },
+    });
+  queuedPrompts.set(turnId, { agent, sessionId });
+  let release: () => void;
+  try {
+    release = await acquireTurnSlot(turnId, onQueue);
+  } finally {
+    queuedPrompts.delete(turnId);
+  }
+  try {
+    return await invoke<AcpPromptOutcome>('acp_prompt', {
+      params: { agent, sessionId, text, turnId, imagePaths },
+    });
+  } finally {
+    release();
+  }
+}
+
 export const acp = {
   agents: () => invoke<AgentAvailability[]>('acp_agents'),
   connect: (agent: AgentId, profile?: CapabilityProfile) =>
@@ -803,16 +853,30 @@ export const acp = {
     text: string,
     turnId: string,
     imagePaths: string[] = [],
-  ) =>
-    invoke<AcpPromptOutcome>('acp_prompt', {
-      params: { agent, sessionId, text, turnId, imagePaths },
-    }),
+    onQueue?: (limit: number | null) => void,
+    slotHeld = false,
+  ) => limitedPrompt(agent, sessionId, text, turnId, imagePaths, onQueue, slotHeld),
+  acquireTurnSlot,
+  cancelQueuedTurn: (turnId: string) => resourceQueues.agent.cancel(turnId),
   steer: (agent: AgentId, sessionId: string, text: string, imagePaths: string[] = []) =>
     invoke<{ outcome: 'injected' | 'startedNewTurn' | 'promptRequired' | 'failed' }>('acp_steer', {
       params: { agent, sessionId, text, imagePaths },
     }),
-  cancel: (agent: AgentId, sessionId: string, turnId: string | null) =>
-    invoke<void>('acp_cancel', { agent, sessionId, turnId }),
+  cancel: (agent: AgentId, sessionId: string, turnId: string | null) => {
+    const queued = [...queuedPrompts].filter(
+      ([id, target]) =>
+        target.agent === agent &&
+        target.sessionId === sessionId &&
+        (turnId === null || id === turnId),
+    );
+    for (const [id] of queued) {
+      queuedPrompts.delete(id);
+      resourceQueues.agent.cancel(id);
+    }
+    return queued.length
+      ? Promise.resolve()
+      : invoke<void>('acp_cancel', { agent, sessionId, turnId });
+  },
   permission: (
     agent: AgentId,
     requestId: string | number,

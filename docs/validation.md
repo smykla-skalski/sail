@@ -18,6 +18,8 @@ Remote MCP registration behavior of the pinned client is re-verified by `node sc
 
 Run `npm ci && npm run build:e2e && npm run test:e2e` on a desktop. WDIO launches the actual Tauri binary against the scripted ACP agent in `test/e2e/acp-agent.mjs` and checks repository setup, missing paths, agent threads, Ship runs and settings.
 
+Settings > Agents > Concurrent jobs caps active agent turns, embedded browser tabs, and E2E test runs separately. The WebdriverIO runner reads the E2E limit before launching workers and queues concurrent invocations in launch order. `SAIL_E2E_JOB_LIMIT` overrides the saved E2E limit for an isolated runner; `SAIL_E2E_LIMIT_DIR` selects a private queue directory when independent test environments must not share slots.
+
 CI runs the frontend and Rust checks on Ubuntu, macOS, and Windows. The desktop WDIO suite requires a graphical runner and is a release check on each supported platform until hosted graphical runners are configured.
 
 ## Credentialed release smoke

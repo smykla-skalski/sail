@@ -889,6 +889,26 @@
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
       </section>
       <section class="settings-card">
+        <h2>Concurrent jobs</h2>
+        <p>
+          Extra work waits in launch order. Zero pauses new work. Lowering a limit leaves active
+          work running. The E2E limit applies to this repository's WebdriverIO runner.
+        </p>
+        {#each [['agent', 'Running agent turns'], ['browser', 'Browser tabs'], ['e2e', 'E2E test runs']] as const as [kind, label] (kind)}
+          <label for={`resource-limit-${kind}`}>{label}</label>
+          <input
+            id={`resource-limit-${kind}`}
+            type="number"
+            min="0"
+            max="32"
+            step="1"
+            value={snapshot?.resourceLimits[kind] ?? 0}
+            onchange={(event) =>
+              send({ type: 'resource-limit', kind, value: Number(event.currentTarget.value) })}
+          />
+        {/each}
+      </section>
+      <section class="settings-card">
         <h2>Ship It cross-validation</h2>
         <p>
           Select the agents and exact models allowed to review and test changes. Model IDs must
