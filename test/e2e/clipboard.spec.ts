@@ -119,6 +119,6 @@ describe('clipboard chat attachments', () => {
       );
     });
     await $('button[aria-label="Remove remove.txt"]').click();
-    await expect($('.agent-actions button')).not.toBeEnabled();
+    await expect($('button=Send ↗')).not.toBeEnabled();
   });
 });
