@@ -1833,6 +1833,9 @@ async fn delete_worktree(
             fence.stop_sessions_in(&app, &agents, &directory)?;
         }
         fence.cleanup(&agents, &directory, native_generation, || {
+            app.state::<terminal::TerminalManager>()
+                .inner()
+                .stop_worktree(&directory)?;
             terminals.stop_worktree(&directory)?;
             remove_worktree_then_terminal_data(&managed_terminal_data, || {
                 if archive_ignored == Some(true) {
@@ -2265,9 +2268,35 @@ where
     let repository = PathBuf::from(validate_repository(repository)?)
         .git_canonical()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
-    let worktree = Path::new(&worktree)
-        .git_canonical()
-        .map_err(|_| "Worktree folder no longer exists.".to_string())?;
+    let requested_worktree = PathBuf::from(&worktree);
+    let requested_worktree = if requested_worktree.is_absolute() {
+        requested_worktree
+    } else {
+        std::env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(requested_worktree)
+    };
+    let worktree = match Path::new(&worktree).git_canonical() {
+        Ok(worktree) => worktree,
+        Err(_) if !requested_worktree.exists() => {
+            let listed = git_reference(&repository, &["worktree", "list", "--porcelain", "-z"])
+                .ok_or("Cannot inspect repository worktrees.")?;
+            let still_registered = parse_registered_worktrees(&listed)
+                .into_iter()
+                .any(|entry| {
+                    Path::new(&entry.path) == requested_worktree
+                        || Path::new(&entry.path)
+                            .git_canonical()
+                            .is_ok_and(|registered| registered == requested_worktree)
+                });
+            if still_registered {
+                return Err("Worktree folder no longer exists but is still registered. Refresh before deleting.".into());
+            }
+            after_remove()?;
+            return Ok(());
+        }
+        Err(_) => return Err("Worktree folder no longer exists.".to_string()),
+    };
     if worktree == repository {
         return Err("Cannot delete the main repository.".to_string());
     }
@@ -2969,6 +2998,53 @@ mod tests {
         )
         .unwrap();
         assert!(!Path::new(&forced.path).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_removal_retry_recovers_after_git_already_removed_it() {
+        let root = std::env::temp_dir().join(format!("sail-delete-retry-{}", uuid::Uuid::new_v4()));
+        let repository = root.join("repository");
+        let parent = root.join("worktrees");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&parent).unwrap();
+        let repository = repository.git_canonical().unwrap();
+        let repository_path = repository.to_str().unwrap();
+        git(repository_path, &["init", "-q"]);
+        fs::write(repository.join("seed"), "seed").unwrap();
+        git(repository_path, &["add", "seed"]);
+        git(
+            repository_path,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        );
+        let created = add_worktree(
+            repository_path.into(),
+            "child".into(),
+            Some(parent.to_string_lossy().into_owned()),
+            Some("HEAD".into()),
+        )
+        .unwrap();
+        remove_worktree(
+            repository_path.into(),
+            created.path.clone(),
+            Some(true),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!Path::new(&created.path).exists());
+        remove_worktree(repository_path.into(), created.path, Some(true), None, None)
+            .expect("retry after successful Git removal should be idempotent");
         fs::remove_dir_all(root).unwrap();
     }
 

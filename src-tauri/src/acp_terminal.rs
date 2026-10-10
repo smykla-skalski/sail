@@ -33,7 +33,7 @@ pub fn worktree_data_directory(cache_directory: &Path, worktree: &Path) -> PathB
     cache_directory.join("terminal-worktrees").join(name)
 }
 
-fn terminal_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
+pub(crate) fn terminal_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
     vec![
         ("TMPDIR", data_directory.join("tmp")),
         ("TEMP", data_directory.join("tmp")),
@@ -107,7 +107,7 @@ impl AcpTerminalManager {
     }
 
     pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
-        let worktree = dunce::canonicalize(worktree).map_err(|error| error.to_string())?;
+        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
         let terminals = self
             .active
             .lock()
@@ -115,7 +115,8 @@ impl AcpTerminalManager {
             .iter()
             .filter(|(_, terminal)| {
                 dunce::canonicalize(&terminal.directory)
-                    .is_ok_and(|directory| directory == worktree)
+                    .unwrap_or_else(|_| terminal.directory.clone())
+                    == worktree
             })
             .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
             .collect::<Vec<_>>();
@@ -367,16 +368,13 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     {
         use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
-        if child
+        child
             .try_wait()
-            .map_err(|error| format!("Cannot inspect terminal process: {error}"))?
-            .is_none()
-        {
-            match killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL) {
-                Ok(()) => {}
-                Err(nix::errno::Errno::ESRCH) => {}
-                Err(error) => return Err(format!("Cannot stop terminal process: {error}")),
-            }
+            .map_err(|error| format!("Cannot inspect terminal process: {error}"))?;
+        match killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => return Err(format!("Cannot stop terminal process: {error}")),
         }
         child
             .wait()

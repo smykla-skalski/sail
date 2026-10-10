@@ -1,5 +1,7 @@
 use base64::Engine;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+#[cfg(windows)]
+use portable_pty::ChildKiller;
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -9,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
@@ -62,34 +64,36 @@ struct TerminalSession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     write_busy: AtomicBool,
+    #[cfg(windows)]
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     output: Arc<Mutex<TerminalOutput>>,
     changed: Arc<Condvar>,
 }
 
 impl TerminalSession {
-    fn stop(&self) {
-        if self
-            .output
-            .lock()
-            .is_ok_and(|output| output.exit_code.is_some())
-        {
-            return;
-        }
+    fn stop(&self) -> Result<(), String> {
         #[cfg(unix)]
         {
-            if let Ok(master) = self.master.lock() {
-                if let Some(group) = master.process_group_leader() {
-                    let group = nix::unistd::Pid::from_raw(group);
-                    if group.as_raw() > 0 && group != nix::unistd::getpgrp() {
-                        let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGTERM);
-                    }
+            let master = self.master.lock().map_err(|error| error.to_string())?;
+            let group = master
+                .process_group_leader()
+                .ok_or("Cannot identify terminal process group.")?;
+            let group = nix::unistd::Pid::from_raw(group);
+            if group.as_raw() > 0 && group != nix::unistd::getpgrp() {
+                match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+                    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                    Err(error) => return Err(format!("Cannot stop terminal process: {error}")),
                 }
             }
         }
-        if let Ok(mut killer) = self.killer.lock() {
-            let _ = killer.kill();
+        #[cfg(windows)]
+        {
+            let mut killer = self.killer.lock().map_err(|error| error.to_string())?;
+            killer
+                .kill()
+                .map_err(|error| format!("Cannot stop terminal process: {error}"))?;
         }
+        Ok(())
     }
 }
 
@@ -196,8 +200,33 @@ impl TerminalManager {
             })
             .unwrap_or_default();
         for session in sessions {
-            session.stop();
+            let _ = session.stop();
         }
+    }
+
+    pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
+        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let sessions = self
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .filter(|(_, session)| {
+                session.owner.is_some()
+                    && dunce::canonicalize(&session.directory)
+                        .unwrap_or_else(|_| session.directory.clone())
+                        == worktree
+            })
+            .map(|(id, session)| (id.clone(), Arc::clone(session)))
+            .collect::<Vec<_>>();
+        for (id, session) in sessions {
+            session.stop()?;
+            self.0
+                .lock()
+                .map_err(|error| error.to_string())?
+                .remove(&id);
+        }
+        Ok(())
     }
 
     pub fn server_roots(&self) -> Vec<(PathBuf, u32)> {
@@ -465,6 +494,18 @@ fn spawn(
         command.arg(script);
     }
     command.cwd(&directory);
+    if owner.is_some() {
+        let cache_directory = app
+            .path()
+            .app_cache_dir()
+            .map_err(|error| error.to_string())?;
+        let data_directory =
+            crate::acp_terminal::worktree_data_directory(&cache_directory, &directory);
+        for (key, value) in crate::acp_terminal::terminal_environment(&data_directory) {
+            std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
+            command.env(key, value);
+        }
+    }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     #[cfg(windows)]
@@ -494,6 +535,7 @@ fn spawn(
     }));
     let changed = Arc::new(Condvar::new());
     let process_id = child.process_id();
+    #[cfg(windows)]
     let killer = child.clone_killer();
     let child = Arc::new(Mutex::new(child));
     let background_output = Arc::clone(&output);
@@ -546,6 +588,7 @@ fn spawn(
         master: Mutex::new(pair.master),
         writer: Mutex::new(writer),
         write_busy: AtomicBool::new(false),
+        #[cfg(windows)]
         killer: Mutex::new(killer),
         output,
         changed,
@@ -783,7 +826,7 @@ pub fn terminal_owned_stop(
     terminal_id: String,
     owner: String,
 ) -> Result<(), String> {
-    owned_session(&manager, &terminal_id, &owner)?.stop();
+    owned_session(&manager, &terminal_id, &owner)?.stop()?;
     Ok(())
 }
 
@@ -823,7 +866,7 @@ pub fn terminal_close(manager: State<'_, TerminalManager>, id: String) -> Result
         .map_err(|error| error.to_string())?
         .remove(&id);
     if let Some(session) = session {
-        session.stop();
+        session.stop()?;
     }
     Ok(())
 }
