@@ -1862,10 +1862,12 @@ async fn delete_worktree(
         let result = (|| {
             let persisted_roots =
                 discover_nested_worktree_terminal_roots(&cache_directory, &directory)?;
+            let runtime_roots = agents.worktree_roots_in(&directory)?;
             let roots = acp_roots
                 .into_iter()
                 .chain(terminal_roots)
                 .chain(persisted_roots)
+                .chain(runtime_roots)
                 .collect::<Vec<_>>();
             let managed_data = persist_worktree_data_manifest(
                 &cache_directory,
@@ -1879,6 +1881,7 @@ async fn delete_worktree(
             fence.cleanup(&agents, &directory, native_generation, || {
                 terminal_manager.stop_worktree(&directory)?;
                 terminals.stop_worktree(&directory)?;
+                agents.stop_worktree(&directory)?;
                 remove_worktree_then_terminal_data_many(&managed_data, || {
                     let result = if archive_ignored == Some(true) {
                         archive_ignored_and_remove(

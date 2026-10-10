@@ -344,6 +344,7 @@
     answeredPermissionKey,
     permissionAlreadyAnswered,
     permissionResolution,
+    shipOwnedTargetKey,
     stoppableSubagents,
     subagentStop,
     type AnsweredPermission,
@@ -433,6 +434,7 @@
     updateEntriesInPlace,
     type AgentCommand,
     type AgentConfigOption,
+    type AgentActivity,
     type AgentEntry,
     type AgentAvailability,
     type AgentEvent,
@@ -851,13 +853,17 @@
   let spawnReceipts = $state<SpawnReceipt[]>(initialSpawnReceipts);
   const spawnOutput = new SvelteMap<string, string>();
   const activeSpawnTargets = new SvelteMap<string, string>();
+  const spawnTargetKey = (path: string, targetId: string) => JSON.stringify([path, targetId]);
   for (const receipt of initialSpawnReceipts) {
     if (
       receipt.targetId &&
       receipt.turnId &&
       (receipt.state === 'working' || receipt.state === 'waiting')
     )
-      activeSpawnTargets.set(receipt.targetId, receipt.receiptId);
+      activeSpawnTargets.set(
+        spawnTargetKey(receipt.targetDirectory ?? '', receipt.targetId),
+        receipt.receiptId,
+      );
   }
   const activeSpawnRequests = new SvelteSet<string>();
   const coordinationDeliveries = new SvelteMap<string, Promise<void>>();
@@ -1648,13 +1654,17 @@
   });
   function recordAnsweredPermission(
     agentId: string,
+    worktreeDirectory: string,
     sessionId: string,
     params: Record<string, unknown> | undefined,
   ) {
     const requestId = params?.requestId;
     if (typeof requestId !== 'string' && typeof requestId !== 'number') return;
-    const inboxKey = `acp:${agentId}:${sessionId}:${requestId}`;
-    const key = answeredPermissionKey(agentId, sessionId, requestId, params);
+    const inboxKey = `acp:${worktreeDirectory}:${agentId}:${sessionId}:${requestId}`;
+    const key = JSON.stringify([
+      worktreeDirectory,
+      answeredPermissionKey(agentId, sessionId, requestId, params),
+    ]);
     const title =
       inboxItems.find((item) => item.key === inboxKey)?.permissionTitle ??
       permissionTitles.get(inboxKey) ??
@@ -1663,25 +1673,34 @@
     if (answeredPermissions.some((item) => item.key === key)) return;
     answeredPermissions = [
       ...answeredPermissions,
-      { key, agentId, sessionId, title, outcome: permissionResolution(params) },
+      {
+        key,
+        agentId,
+        directory: worktreeDirectory,
+        sessionId,
+        title,
+        outcome: permissionResolution(params),
+      },
     ].slice(-50);
   }
   const shipOwnedThreads = $derived.by(() => {
     const owned = new SvelteSet<string>();
     for (const issue of shipRuns.flatMap((run) => run.issues)) {
-      if (issue.threadId) owned.add(issue.threadId);
-      for (const id of issue.checkpointThreadIds ?? []) owned.add(id);
+      if (!issue.path) continue;
+      if (issue.threadId) owned.add(shipOwnedTargetKey(issue.path, issue.threadId));
+      for (const id of issue.checkpointThreadIds ?? [])
+        owned.add(shipOwnedTargetKey(issue.path, id));
     }
     return owned;
   });
   async function stopSubagent(receipt: SpawnReceipt) {
     const policy = subagentStop(receipt, shipOwnedThreads);
     if (policy === 'parent-turn') throw new Error(parentTurnStopHint);
-    if (policy !== 'stop' || !receipt.targetId)
+    if (policy !== 'stop' || !receipt.targetId || !receipt.targetDirectory)
       throw new Error('This subagent stops through Stop run.');
     const match = /^acp:([^:]+):(.+)$/.exec(receipt.targetId);
     if (!match) throw new Error('This subagent cannot be stopped safely.');
-    await acp.cancel(match[1]!, match[2]!, receipt.turnId);
+    await acp.cancel(match[1]!, receipt.targetDirectory, match[2]!, receipt.turnId);
     updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
   }
   async function stopAllSubagents(receipts: SpawnReceipt[]) {
@@ -2167,7 +2186,7 @@
           closingMain = true;
           void (async () => {
             try {
-              const agentActivity = await acp.activity();
+              const agentActivity = await acp.activity(directory);
               if (Object.values(agentActivity).some((agent) => agent.active.length > 0)) {
                 if (
                   !(await confirmInApp(
@@ -2976,7 +2995,7 @@
     if (shippingWorkerSettled(current)) return current;
     const match = /^acp:([^:]+):(.+)$/.exec(threadId);
     if (!match) throw new Error('A task worker identity cannot be stopped safely.');
-    await acp.cancel(match[1], match[2], null);
+    await acp.cancel(match[1], issue.path ?? '', match[2], null);
     return waitForSettledShipWorker(issue, threadId);
   }
 
@@ -3045,7 +3064,12 @@
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
     try {
       return acpReplacementDispatchAction(
-        await acp.turnEvidence(receipt.provider, sessionId, receipt.turnId),
+        await acp.turnEvidence(
+          receipt.provider,
+          receipt.targetDirectory,
+          sessionId,
+          receipt.turnId,
+        ),
       );
     } catch {
       return 'inspect';
@@ -3058,7 +3082,13 @@
     handoff: NonNullable<ShipIssue['contextHandoffs']>[number],
   ): Promise<void> {
     const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
-    if (!receipt || !receipt.targetId || !receipt.turnId || !handoffReceiptNeedsResolution(receipt))
+    if (
+      !receipt ||
+      !receipt.targetId ||
+      !receipt.targetDirectory ||
+      !receipt.turnId ||
+      !handoffReceiptNeedsResolution(receipt)
+    )
       throw new Error('This handoff no longer needs provider inspection.');
     const confirmed = await confirmInApp(
       'Cancel and retry context handoff?',
@@ -3067,7 +3097,7 @@
     );
     if (!confirmed) return;
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
-    await acp.cancel(receipt.provider, sessionId, receipt.turnId);
+    await acp.cancel(receipt.provider, receipt.targetDirectory, sessionId, receipt.turnId);
     updateSpawnReceipt(receipt.receiptId, {
       state: 'interrupted',
       error: 'Cancelled after provider inspection before a safe retry.',
@@ -4005,7 +4035,7 @@
       const available = (await acp.agents()).find((agent) => agent.id === run.provider);
       if (!available?.available)
         throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
-      await acp.connect(run.provider);
+      await acp.connect(run.provider, created.path);
       ensureClaimHeld();
       const gateExecution =
         'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
@@ -4253,12 +4283,13 @@
 
   async function waitForAcpWorkerTermination(
     agent: string,
+    worktreeDirectory: string,
     sessionId: string,
     turnId: string | null,
     deadline: number,
   ): Promise<void> {
     const [agentActivity, interrupted] = await Promise.all([
-      acp.activity(),
+      acp.activity(worktreeDirectory),
       acp.interruptedTurns(),
     ]);
     if (acpWorkerTerminationConfirmed(agentActivity[agent], interrupted, agent, sessionId, turnId))
@@ -4266,7 +4297,7 @@
     if (monotonicDeadlineExpired(performance.now(), deadline))
       throw new Error('ACP worker did not confirm termination after cancellation.');
     await new Promise((resolve) => setTimeout(resolve, 100));
-    return waitForAcpWorkerTermination(agent, sessionId, turnId, deadline);
+    return waitForAcpWorkerTermination(agent, worktreeDirectory, sessionId, turnId, deadline);
   }
 
   async function stopShippingThread(issue: ShipIssue, threadId: string): Promise<void> {
@@ -4282,8 +4313,14 @@
     const [, agent, sessionId] = match;
     const turnId = receipt?.turnId ?? null;
     try {
-      await acp.cancel(agent, sessionId, turnId);
-      await waitForAcpWorkerTermination(agent, sessionId, turnId, performance.now() + 5_000);
+      await acp.cancel(agent, issue.path ?? '', sessionId, turnId);
+      await waitForAcpWorkerTermination(
+        agent,
+        issue.path ?? '',
+        sessionId,
+        turnId,
+        performance.now() + 5_000,
+      );
     } catch (cause) {
       if (!shippingWorkerGone(cause)) throw cause;
     }
@@ -4554,7 +4591,7 @@
     const [, agent, sessionId] = match;
     try {
       const [agentActivity, interrupted] = await Promise.all([
-        acp.activity(),
+        acp.activity(issue.path ?? ''),
         acp.interruptedTurns(),
       ]);
       const state = agentActivity[agent];
@@ -5491,7 +5528,7 @@
       updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
       return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
     }
-    const receiptActivity = await acp.activity().then(
+    const receiptActivity = await acp.activity(receipt.targetDirectory).then(
       (states) => states[receipt.provider],
       () => null,
     );
@@ -5504,14 +5541,15 @@
     authorization: DirectShipAuthorization,
   ): Promise<void> {
     if (!receipt.targetId || !receipt.targetDirectory || !receipt.turnId || !receipt.prompt) return;
-    const agentActivity = await acp.activity();
+    const targetDirectory = receipt.targetDirectory;
+    const agentActivity = await acp.activity(targetDirectory);
     const state = agentActivity[receipt.provider];
     if (acpPromptHasBackendEvidence(receipt, state ?? null)) return;
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
     if (await reconcileDurableAcpTurn(receipt, sessionId)) return;
     activeSpawnRequests.add(receipt.receiptId);
     try {
-      const info = await acp.connect(receipt.provider);
+      const info = await acp.connect(receipt.provider, targetDirectory);
       const capabilities = info.agentCapabilities;
       const sessionCapabilities =
         capabilities && typeof capabilities === 'object' && 'sessionCapabilities' in capabilities
@@ -5523,14 +5561,14 @@
         'resume' in sessionCapabilities;
       const capabilityProfile = capabilityProfileForAcpSession(
         receipt.provider,
-        receipt.targetDirectory,
+        targetDirectory,
         sessionId,
         receipt.validation ? 'review' : undefined,
       );
       if (canResume)
-        await acp.resume(receipt.provider, receipt.targetDirectory, sessionId, capabilityProfile);
-      else await acp.load(receipt.provider, receipt.targetDirectory, sessionId, capabilityProfile);
-      const restoredActivity = (await acp.activity())[receipt.provider] ?? null;
+        await acp.resume(receipt.provider, targetDirectory, sessionId, capabilityProfile);
+      else await acp.load(receipt.provider, targetDirectory, sessionId, capabilityProfile);
+      const restoredActivity = (await acp.activity(targetDirectory))[receipt.provider] ?? null;
       if (acpPromptHasBackendEvidence(receipt, restoredActivity)) {
         reconcileAcpSpawnReceipt(receipt, restoredActivity);
         return;
@@ -5538,15 +5576,15 @@
       if (await reconcileDurableAcpTurn(receipt, sessionId, true)) return;
       requireSpawnPromptDispatch(receipt.receiptId);
       const recalledPrompt = await withAutomaticMemoryRecall({
-        directory: receipt.targetDirectory,
+        directory: targetDirectory,
         prompt: receipt.prompt,
         query: receipt.prompt,
         sessionKey: `acp:${receipt.provider}:${sessionId}`,
       });
       const turn = dispatchAuthorizedDirectShipPrompt(authorization, () =>
-        acp.prompt(receipt.provider, sessionId, recalledPrompt, receipt.turnId!),
+        acp.prompt(receipt.provider, targetDirectory, sessionId, recalledPrompt, receipt.turnId!),
       );
-      activeSpawnTargets.set(receipt.targetId, receipt.receiptId);
+      activeSpawnTargets.set(spawnTargetKey(targetDirectory, receipt.targetId), receipt.receiptId);
       void turn.then(
         (outcome) => {
           const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
@@ -5555,8 +5593,11 @@
             result: spawnOutput.get(receipt.receiptId) ?? current?.result ?? null,
           });
           spawnOutput.delete(receipt.receiptId);
-          if (activeSpawnTargets.get(receipt.targetId!) === receipt.receiptId)
-            activeSpawnTargets.delete(receipt.targetId!);
+          if (
+            activeSpawnTargets.get(spawnTargetKey(targetDirectory, receipt.targetId!)) ===
+            receipt.receiptId
+          )
+            activeSpawnTargets.delete(spawnTargetKey(targetDirectory, receipt.targetId!));
           return undefined;
         },
         async (cause) => {
@@ -5566,13 +5607,16 @@
               error: `Prompt dispatch can be retried: ${describe(cause)}`,
             });
           spawnOutput.delete(receipt.receiptId);
-          if (activeSpawnTargets.get(receipt.targetId!) === receipt.receiptId)
-            activeSpawnTargets.delete(receipt.targetId!);
+          if (
+            activeSpawnTargets.get(spawnTargetKey(targetDirectory, receipt.targetId!)) ===
+            receipt.receiptId
+          )
+            activeSpawnTargets.delete(spawnTargetKey(targetDirectory, receipt.targetId!));
           return undefined;
         },
       );
       await awaitCoordinationStart(turn, async () => {
-        const current = (await acp.activity())[receipt.provider];
+        const current = (await acp.activity(targetDirectory))[receipt.provider];
         return current?.activeTurns[sessionId] === receipt.turnId;
       });
       const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
@@ -5588,8 +5632,13 @@
     sessionId: string,
     providerRestored = false,
   ): Promise<boolean> {
-    if (!receipt.turnId) return false;
-    const evidence = await acp.turnEvidence(receipt.provider, sessionId, receipt.turnId);
+    if (!receipt.targetDirectory || !receipt.turnId) return false;
+    const evidence = await acp.turnEvidence(
+      receipt.provider,
+      receipt.targetDirectory,
+      sessionId,
+      receipt.turnId,
+    );
     if (acpTurnPromptCanRetry(evidence)) return false;
     if (acpTurnNeedsProviderInspection(evidence) && !providerRestored) return false;
     const state = acpTurnEvidenceState(evidence);
@@ -5616,7 +5665,10 @@
       return;
     if (state === 'working' || state === 'waiting') {
       updateSpawnReceipt(receipt.receiptId, { state });
-      activeSpawnTargets.set(receipt.targetId!, receipt.receiptId);
+      activeSpawnTargets.set(
+        spawnTargetKey(receipt.targetDirectory ?? '', receipt.targetId!),
+        receipt.receiptId,
+      );
     } else {
       const sessionId = receipt.targetId?.slice(`acp:${receipt.provider}:`.length);
       const outcome = sessionId ? agentActivity?.finished[sessionId] : undefined;
@@ -5630,8 +5682,12 @@
       });
       if (state === 'completed' && !spawnOutput.has(receipt.receiptId))
         void recoverAcpSpawnResult(receipt).catch(() => undefined);
-      if (receipt.targetId && activeSpawnTargets.get(receipt.targetId) === receipt.receiptId)
-        activeSpawnTargets.delete(receipt.targetId);
+      if (
+        receipt.targetId &&
+        activeSpawnTargets.get(spawnTargetKey(receipt.targetDirectory ?? '', receipt.targetId)) ===
+          receipt.receiptId
+      )
+        activeSpawnTargets.delete(spawnTargetKey(receipt.targetDirectory ?? '', receipt.targetId));
     }
   }
 
@@ -5639,7 +5695,8 @@
     if (!receipt.targetId || !receipt.targetDirectory || !receipt.prompt || !receipt.turnId) return;
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
     async function isLatestFinishedTurn() {
-      const activity = await acp.activity().catch(() => null);
+      if (!receipt.targetDirectory) return false;
+      const activity = await acp.activity(receipt.targetDirectory).catch(() => null);
       return receiptIsLatestFinishedTurn(receipt, activity?.[receipt.provider], sessionId);
     }
     const replay: AgentEntry[] = [];
@@ -5651,9 +5708,9 @@
       if (update && typeof update === 'object')
         updateEntriesInPlace(replay, update as Record<string, unknown>);
     });
-    setAgentReplay(receipt.provider, sessionId, true);
+    setAgentReplay(receipt.provider, receipt.targetDirectory, sessionId, true);
     try {
-      await acp.connect(receipt.provider);
+      await acp.connect(receipt.provider, receipt.targetDirectory);
       await acp.load(
         receipt.provider,
         receipt.targetDirectory,
@@ -5671,7 +5728,7 @@
     } catch {
       return;
     } finally {
-      setAgentReplay(receipt.provider, sessionId, false);
+      setAgentReplay(receipt.provider, receipt.targetDirectory, sessionId, false);
       unlisten();
     }
   }
@@ -5691,7 +5748,7 @@
     if (matches.length > 1) throw new Error('The source agent session is ambiguous.');
     const thread = matches[0];
     if (!thread) throw new Error('The source agent session is unavailable.');
-    const runtime = (await acp.activity())[thread.agent];
+    const runtime = (await acp.activity(thread.directory))[thread.agent];
     if (!runtime?.alive || !runtime.sessions.includes(thread.sessionId))
       throw new Error('The source agent session is unavailable.');
     return { kind: 'acp', agent: thread.agent, title: thread.title };
@@ -5765,8 +5822,8 @@
             target.id === `acp:${item.agent}:${item.sessionId}`,
         );
         if (!thread) throw new Error('The receiving thread is unavailable.');
-        const info = await acp.connect(thread.agent);
-        const agentActivity = (await acp.activity())[thread.agent];
+        const info = await acp.connect(thread.agent, thread.directory);
+        const agentActivity = (await acp.activity(thread.directory))[thread.agent];
         if (!agentActivity?.sessions.includes(thread.sessionId)) {
           const capabilities = info.agentCapabilities;
           const sessionCapabilities =
@@ -5828,19 +5885,33 @@
                   error: null,
                   updated: Date.now(),
                 });
-                activeSpawnTargets.set(target.id, shippingReceipt!.receiptId);
+                activeSpawnTargets.set(
+                  spawnTargetKey(target.directory, target.id),
+                  shippingReceipt!.receiptId,
+                );
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
               async () => {
-                if (activeSpawnTargets.get(target.id) === shippingReceipt!.receiptId)
-                  activeSpawnTargets.delete(target.id);
+                if (
+                  activeSpawnTargets.get(spawnTargetKey(target.directory, target.id)) ===
+                  shippingReceipt!.receiptId
+                )
+                  activeSpawnTargets.delete(spawnTargetKey(target.directory, target.id));
                 saveSpawnReceipt(originalReceipt);
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
-              () => acp.prompt(thread.agent, thread.sessionId, recalledText, turnId),
+              () =>
+                acp.prompt(thread.agent, thread.directory, thread.sessionId, recalledText, turnId),
             );
             turn = started.turn;
-          } else turn = acp.prompt(thread.agent, thread.sessionId, recalledText, turnId);
+          } else
+            turn = acp.prompt(
+              thread.agent,
+              thread.directory,
+              thread.sessionId,
+              recalledText,
+              turnId,
+            );
         } catch {
           abandonImplementationTurn(thread.directory, tracking);
           return;
@@ -5865,8 +5936,11 @@
                     spawnOutput.get(shippingReceipt.receiptId) ?? shippingReceipt.result ?? null,
                 });
                 spawnOutput.delete(shippingReceipt.receiptId);
-                if (activeSpawnTargets.get(target.id) === shippingReceipt.receiptId)
-                  activeSpawnTargets.delete(target.id);
+                if (
+                  activeSpawnTargets.get(spawnTargetKey(target.directory, target.id)) ===
+                  shippingReceipt.receiptId
+                )
+                  activeSpawnTargets.delete(spawnTargetKey(target.directory, target.id));
               }
               return undefined;
             },
@@ -5879,6 +5953,7 @@
                 return undefined;
               const interrupted = await acpFailedPromptInterrupted(
                 thread.agent,
+                thread.directory,
                 thread.sessionId,
                 turnId,
               );
@@ -5889,8 +5964,11 @@
                   error: interrupted ? null : describe(cause),
                 });
                 spawnOutput.delete(shippingReceipt.receiptId);
-                if (activeSpawnTargets.get(target.id) === shippingReceipt.receiptId)
-                  activeSpawnTargets.delete(target.id);
+                if (
+                  activeSpawnTargets.get(spawnTargetKey(target.directory, target.id)) ===
+                  shippingReceipt.receiptId
+                )
+                  activeSpawnTargets.delete(spawnTargetKey(target.directory, target.id));
               }
               if (!interrupted) error = `Agent message turn failed: ${describe(cause)}`;
               return undefined;
@@ -5901,7 +5979,7 @@
             error = `Could not track agent message turn: ${describe(cause)}`;
           });
         await awaitCoordinationStart(turn, async () => {
-          const state = (await acp.activity())[thread.agent];
+          const state = (await acp.activity(thread.directory))[thread.agent];
           return !!state?.active.includes(thread.sessionId);
         });
         finishCoordinationDelivery(message);
@@ -5920,7 +5998,7 @@
 
   async function waitForCoordinationThread(thread: AgentThread): Promise<void> {
     if (disposed) return;
-    const agentActivity = (await acp.activity())[thread.agent];
+    const agentActivity = (await acp.activity(thread.directory))[thread.agent];
     if (!agentActivity?.active.includes(thread.sessionId)) return;
     await new Promise((resolve) => setTimeout(resolve, 1000));
     return waitForCoordinationThread(thread);
@@ -7065,7 +7143,7 @@
       await saveShipRuns();
       try {
         try {
-          await acp.connect(choice.agent);
+          await acp.connect(choice.agent, request.directory);
         } catch (cause) {
           throw new ValidationCandidateUnavailable(
             `Provider ${choice.agent} is unavailable`,
@@ -7329,7 +7407,7 @@
           throw new Error('Target worktree is no longer registered with Git.');
       }
 
-      await acp.connect(chosenProvider);
+      await acp.connect(chosenProvider, destination?.path ?? request.directory);
       if (!destination) {
         const created = await invoke<{ path: string; branch: string; setup: string }>(
           'create_worktree',
@@ -7481,7 +7559,7 @@
           throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
         }
         const changed = await acp
-          .setConfig(source.agent, session.sessionId, modelOption.id, requestedModel)
+          .setConfig(source.agent, created.path, session.sessionId, modelOption.id, requestedModel)
           .catch((cause) => {
             if (!validation) throw cause;
             throw new ValidationCandidateUnavailable(
@@ -7511,6 +7589,7 @@
           throw new Error(`Variant ${source.variant} is unavailable in ${source.agent}.`);
         const changed = await acp.setConfig(
           source.agent,
+          created.path,
           session.sessionId,
           variantOption.id,
           source.variant,
@@ -7582,13 +7661,16 @@
         const targetId = `acp:${source.agent}:${session.sessionId}`;
         if (receiptId) {
           updateSpawnReceipt(receiptId, { state: 'working', dispatchPending: false });
-          activeSpawnTargets.set(targetId, receiptId);
+          activeSpawnTargets.set(spawnTargetKey(created.path, targetId), receiptId);
         }
         try {
-          return acp.prompt(source.agent, session.sessionId, recalledPrompt, turnId);
+          return acp.prompt(source.agent, created.path, session.sessionId, recalledPrompt, turnId);
         } catch (cause) {
-          if (receiptId && activeSpawnTargets.get(targetId) === receiptId)
-            activeSpawnTargets.delete(targetId);
+          if (
+            receiptId &&
+            activeSpawnTargets.get(spawnTargetKey(created.path, targetId)) === receiptId
+          )
+            activeSpawnTargets.delete(spawnTargetKey(created.path, targetId));
           throw cause;
         }
       });
@@ -7610,8 +7692,14 @@
               result: spawnOutput.get(receiptId) ?? current?.result ?? null,
             });
             spawnOutput.delete(receiptId);
-            if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
-              activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
+            if (
+              activeSpawnTargets.get(
+                spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
+              ) === receiptId
+            )
+              activeSpawnTargets.delete(
+                spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
+              );
           }
           return undefined;
         },
@@ -7624,6 +7712,7 @@
             );
           const interrupted = await acpFailedPromptInterrupted(
             source.agent,
+            created.path,
             session.sessionId,
             turnId,
           );
@@ -7634,8 +7723,14 @@
               error: interrupted ? null : describe(cause),
             });
             spawnOutput.delete(receiptId);
-            if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
-              activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
+            if (
+              activeSpawnTargets.get(
+                spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
+              ) === receiptId
+            )
+              activeSpawnTargets.delete(
+                spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
+              );
           }
           if (!interrupted) error = describe(cause);
           throw cause;
@@ -7643,11 +7738,14 @@
       );
       await awaitCoordinationStart(
         finished.catch(async (cause) => {
-          if (await acpFailedPromptInterrupted(source.agent, session.sessionId, turnId)) return;
+          if (
+            await acpFailedPromptInterrupted(source.agent, created.path, session.sessionId, turnId)
+          )
+            return;
           throw cause;
         }),
         async () => {
-          const state = (await acp.activity())[source.agent];
+          const state = (await acp.activity(created.path))[source.agent];
           return !!state?.active.includes(session.sessionId);
         },
       );
@@ -7658,9 +7756,9 @@
         threadId: `acp:${source.agent}:${session.sessionId}`,
       };
     } catch (cause) {
-      await acp.cancel(source.agent, session.sessionId, null).catch(() => undefined);
+      await acp.cancel(source.agent, created.path, session.sessionId, null).catch(() => undefined);
       if (nativeGeneration !== undefined)
-        await acp.releaseSessionFence(source.agent, session.sessionId);
+        await acp.releaseSessionFence(source.agent, created.path, session.sessionId);
       throw cause;
     }
   }
@@ -7789,7 +7887,10 @@
               acpResult.value.map(async (pending) => {
                 const sessionId = pending.message.params?.sessionId;
                 const thread = [...agentThreads, ...nativeChildThreads].find(
-                  (item) => item.agent === pending.agent && item.sessionId === sessionId,
+                  (item) =>
+                    item.agent === pending.agent &&
+                    item.sessionId === sessionId &&
+                    item.directory === pending.directory,
                 );
                 const trust = thread
                   ? await acp
@@ -7811,18 +7912,22 @@
         const requestId = pending.message.id;
         if (typeof sessionId !== 'string' || requestId == null) continue;
         const thread = [...agentThreads, ...nativeChildThreads].find(
-          (item) => item.agent === pending.agent && item.sessionId === sessionId,
+          (item) =>
+            item.agent === pending.agent &&
+            item.sessionId === sessionId &&
+            item.directory === pending.directory,
         );
         if (!thread) continue;
         const location = byDirectory.get(thread.directory);
         if (!location) continue;
-        const nativeChild = nativeSubagents[nativeSubagentId(pending.agent, sessionId)];
+        const nativeChild =
+          nativeSubagents[nativeSubagentId(pending.agent, pending.directory, sessionId)];
         if (pending.message.method === 'elicitation/create') {
           const message = pending.message.params?.message;
           const schema = pending.message.params?.requestedSchema;
           items.push({
             ...location,
-            key: `elicitation:${pending.agent}:${sessionId}:${requestId}`,
+            key: `elicitation:${pending.directory}:${pending.agent}:${sessionId}:${requestId}`,
             kind: 'question',
             agent: `${agentAvailability.find((item) => item.id === pending.agent)?.name ?? pending.agent}${nativeChild ? ` · ${nativeChild.name}` : ''}`,
             agentId: pending.agent,
@@ -7863,7 +7968,7 @@
           options,
           resourceTrust,
         });
-        const key = `acp:${pending.agent}:${sessionId}:${requestId}`;
+        const key = `acp:${pending.directory}:${pending.agent}:${sessionId}:${requestId}`;
         const rawPermissionGeneration = pending.message.params?.sailPermissionGeneration;
         const permissionGeneration =
           typeof rawPermissionGeneration === 'number'
@@ -7919,6 +8024,7 @@
             );
             await acp.permission(
               pending.agent,
+              thread.directory,
               requestId,
               optionId,
               sessionId,
@@ -8779,7 +8885,8 @@
     );
     // OpenCode's session/list has no parent marker, so only children Sail has seen are hidden.
     return threads.filter(
-      (thread) => !nativeSubagents[nativeSubagentId('opencode', thread.sessionId)],
+      (thread) =>
+        !nativeSubagents[nativeSubagentId('opencode', thread.directory, thread.sessionId)],
     );
   }
 
@@ -9678,6 +9785,7 @@
         respond: (resolvedOptionId: string | null) =>
           acp.permission(
             thread.agent,
+            thread.directory,
             item.requestId!,
             resolvedOptionId,
             item.sessionId,
@@ -10548,7 +10656,7 @@
         const recoveredThread = thread;
         const handoffReceipt = handoffReceiptForInterruptedTurn(turn, spawnReceipts);
         const alreadyActive = async () => {
-          const current = (await acp.activity())[turn.agent];
+          const current = (await acp.activity(turn.directory))[turn.agent];
           return current?.activeTurns[turn.sessionId] === turn.turnId;
         };
         try {
@@ -10561,7 +10669,7 @@
             updateAgentThreadStatus(recoveredThread, 'working');
             return;
           }
-          const info = await acp.connect(turn.agent);
+          const info = await acp.connect(turn.agent, turn.directory);
           const capabilities = info.agentCapabilities;
           const sessionCapabilities =
             capabilities &&
@@ -10598,7 +10706,13 @@
             query: turn.text,
             sessionKey: `acp:${turn.agent}:${turn.sessionId}`,
           });
-          const continued = acp.prompt(turn.agent, turn.sessionId, recalledPrompt, turn.turnId);
+          const continued = acp.prompt(
+            turn.agent,
+            turn.directory,
+            turn.sessionId,
+            recalledPrompt,
+            turn.turnId,
+          );
           void (async () => {
             try {
               const outcome = await continued;
@@ -10615,6 +10729,7 @@
                 else {
                   const interrupted = await acpFailedPromptInterrupted(
                     turn.agent,
+                    turn.directory,
                     turn.sessionId,
                     turn.turnId,
                   );
@@ -10626,7 +10741,7 @@
             }
           })();
           await awaitCoordinationStart(continued, async () => {
-            const state = (await acp.activity())[turn.agent];
+            const state = (await acp.activity(turn.directory))[turn.agent];
             return !!state?.active.includes(turn.sessionId);
           });
         } catch (cause) {
@@ -10634,6 +10749,7 @@
           else {
             const interrupted = await acpFailedPromptInterrupted(
               turn.agent,
+              turn.directory,
               turn.sessionId,
               turn.turnId,
             );
@@ -10649,7 +10765,21 @@
   async function restoreAgentActivity(attempt = 0) {
     const revision = attentionRevision;
     try {
-      const backendActivity = await acp.activity();
+      const activityDirectories = [
+        ...new Set([
+          ...agentThreads.map((thread) => thread.directory),
+          ...spawnReceipts.flatMap((item) => (item.targetDirectory ? [item.targetDirectory] : [])),
+          directory,
+        ]),
+      ];
+      const backendActivity: Record<string, AgentActivity> = {};
+      await Promise.all(
+        activityDirectories.map(async (path) => {
+          const scoped = await acp.activity(path);
+          for (const [agent, state] of Object.entries(scoped))
+            backendActivity[JSON.stringify([path, agent])] = state;
+        }),
+      );
       if (disposed) return;
       for (const receipt of spawnReceipts.filter(
         (item) =>
@@ -10658,7 +10788,10 @@
           item.turnId &&
           !receiptIsSettled(item.state),
       ))
-        reconcileAcpSpawnReceipt(receipt, backendActivity[receipt.provider]);
+        reconcileAcpSpawnReceipt(
+          receipt,
+          backendActivity[JSON.stringify([receipt.targetDirectory, receipt.provider])],
+        );
       if (revision !== attentionRevision) {
         if (attempt < 2) await restoreAgentActivity(attempt + 1);
         return;
@@ -10668,6 +10801,7 @@
         threadAttention,
         agentThreads.map((thread) => ({
           agent: thread.agent,
+          directory: thread.directory,
           sessionId: thread.sessionId,
           key: threadKey(thread),
           viewed: threadIsViewed(threadKey(thread)),
@@ -10859,14 +10993,35 @@
   }
 
   function handleAgentEvent(event: AgentEvent) {
+    if (event.message.method === 'sail/disconnected' && !event.directory) {
+      const sessionDirectories = event.message.params?.sessionDirectories;
+      if (sessionDirectories && typeof sessionDirectories === 'object') {
+        const groups = new SvelteMap<string, string[]>();
+        for (const [sessionId, path] of Object.entries(sessionDirectories)) {
+          if (typeof path !== 'string') continue;
+          groups.set(path, [...(groups.get(path) ?? []), sessionId]);
+        }
+        for (const [path, sessionIds] of groups)
+          handleAgentEvent({
+            ...event,
+            directory: path,
+            message: { ...event.message, params: { ...event.message.params, sessionIds } },
+          });
+      }
+      return;
+    }
+    const eventDirectory = event.directory ?? event.worktree;
+    if (!eventDirectory) return;
     const eventSessionId = event.message.params?.sessionId;
     const eventThread =
       typeof eventSessionId === 'string'
         ? [...agentThreads, ...nativeChildThreads].find(
-            (thread) => thread.agent === event.agent && thread.sessionId === eventSessionId,
+            (thread) =>
+              thread.agent === event.agent &&
+              thread.sessionId === eventSessionId &&
+              thread.directory === eventDirectory,
           )
         : undefined;
-    const eventDirectory = eventThread?.directory ?? directory;
     const eventProfile = capabilityProfileFromMetadata(
       event.message.params,
       eventThread?.capabilityProfile ?? 'build',
@@ -10878,8 +11033,9 @@
       eventDirectory,
       Date.now(),
       typeof eventSessionId === 'string' &&
-        (!!replayingAgentSessions[JSON.stringify([event.agent, eventSessionId])] ||
-          !!nativeSubagents[nativeSubagentId(event.agent, eventSessionId)]?.restored),
+        (!!replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, eventSessionId])] ||
+          !!nativeSubagents[nativeSubagentId(event.agent, eventDirectory, eventSessionId)]
+            ?.restored),
       eventProfile,
     );
     if (nativeSubagents !== previousNativeSubagents) nativeSubagentGeneration += 1;
@@ -10903,11 +11059,12 @@
     )
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
-      recordAnsweredPermission(event.agent, eventSessionId, event.message.params);
+      recordAnsweredPermission(event.agent, eventDirectory, eventSessionId, event.message.params);
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       nativeSubagents = setNativeSubagentWaiting(
         nativeSubagents,
         event.agent,
+        eventDirectory,
         eventSessionId,
         false,
       );
@@ -10919,7 +11076,10 @@
         if (update && typeof update === 'object') {
           const data = update as Record<string, unknown>;
           const thread = [...agentThreads, ...nativeChildThreads].find(
-            (item) => item.agent === event.agent && item.sessionId === sessionId,
+            (item) =>
+              item.agent === event.agent &&
+              item.sessionId === sessionId &&
+              item.directory === eventDirectory,
           );
           const planDirectory = thread?.directory ?? eventDirectory;
           const priorPlan = loadNativePlan({
@@ -10930,21 +11090,21 @@
           const plan = nativePlanUpdate(event.agent, data, priorPlan);
           if (plan)
             saveNativePlan({ agent: event.agent, directory: planDirectory, sessionId }, plan);
-          if (replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
-            invalidateLiveTranscript(event.agent, sessionId);
-          else if (tracksLiveTranscript(event.agent, sessionId)) {
-            applyLiveTranscriptUpdate(event.agent, sessionId, data);
+          if (replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])])
+            invalidateLiveTranscript(event.agent, eventDirectory, sessionId);
+          else if (tracksLiveTranscript(event.agent, eventDirectory, sessionId)) {
+            applyLiveTranscriptUpdate(event.agent, eventDirectory, sessionId, data);
             acpPlans().observe({ agent: event.agent, directory: planDirectory, sessionId }, data);
           }
           if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions))
-            rememberSessionState(event.agent, sessionId, {
+            rememberSessionState(event.agent, eventDirectory, sessionId, {
               configOptions: data.configOptions as AgentConfigOption[],
             });
           if (
             data.sessionUpdate === 'available_commands_update' &&
             Array.isArray(data.availableCommands)
           )
-            rememberSessionState(event.agent, sessionId, {
+            rememberSessionState(event.agent, eventDirectory, sessionId, {
               availableCommands: data.availableCommands as AgentCommand[],
             });
         }
@@ -10961,11 +11121,17 @@
           typeof content.text === 'string'
             ? content.text
             : null;
-        if (text && !replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
+        if (
+          text &&
+          !replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])]
+        )
           for (const receipt of spawnReceipts.filter(
             (item) =>
               item.targetId === `acp:${event.agent}:${sessionId}` &&
-              activeSpawnTargets.get(item.targetId) === item.receiptId &&
+              item.targetDirectory === eventDirectory &&
+              item.targetDirectory === eventDirectory &&
+              activeSpawnTargets.get(spawnTargetKey(eventDirectory, item.targetId)) ===
+                item.receiptId &&
               !receiptIsSettled(item.state),
           )) {
             const result = `${receipt.result ?? ''}${text}`.slice(-16_000);
@@ -10981,21 +11147,31 @@
           typeof update.title === 'string'
             ? update.title
             : null;
-        if (toolTitle && !replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
+        if (
+          toolTitle &&
+          !replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])]
+        )
           for (const receipt of spawnReceipts.filter(
             (item) =>
               item.targetId === `acp:${event.agent}:${sessionId}` &&
-              activeSpawnTargets.get(item.targetId) === item.receiptId &&
+              item.targetDirectory === eventDirectory &&
+              item.targetDirectory === eventDirectory &&
+              activeSpawnTargets.get(spawnTargetKey(eventDirectory, item.targetId)) ===
+                item.receiptId &&
               !receiptIsSettled(item.state),
           ))
             updateSpawnReceipt(receipt.receiptId, { activity: toolTitle });
         const usage = acpUsage(params?.update);
-        const replaying = !!replayingAgentSessions[JSON.stringify([event.agent, sessionId])];
+        const replaying =
+          !!replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])];
         if (usage?.rates && !replaying) agentRates = { ...agentRates, [event.agent]: usage.rates };
         if (usage) {
           const nextUsage = { ...agentUsage };
           const matchingThreads = [...agentThreads, ...nativeChildThreads].filter(
-            (item) => item.agent === event.agent && item.sessionId === sessionId,
+            (item) =>
+              item.agent === event.agent &&
+              item.sessionId === sessionId &&
+              item.directory === eventDirectory,
           );
           for (const thread of matchingThreads) {
             nextUsage[threadKey(thread)] = { context: usage.context };
@@ -11015,7 +11191,10 @@
             : '';
         if (!replaying && /compact|retry/i.test(updateKind)) {
           const matchingThread = [...agentThreads, ...nativeChildThreads].find(
-            (item) => item.agent === event.agent && item.sessionId === sessionId,
+            (item) =>
+              item.agent === event.agent &&
+              item.sessionId === sessionId &&
+              item.directory === eventDirectory,
           );
           if (matchingThread)
             void recordShipContextEvent(
@@ -11029,7 +11208,7 @@
     }
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
       // The scheduled refresh lags; the thread header already shows the request answered.
-      const resolvedKey = `acp:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
+      const resolvedKey = `acp:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
       resolvedDuringRefresh.set(resolvedKey, inboxGeneration);
       if (inboxItems.some((item) => item.key === resolvedKey))
         inboxItems = inboxItems.filter((item) => item.key !== resolvedKey);
@@ -11062,13 +11241,19 @@
         event.message.params?.notify !== false
       ) {
         const thread = agentThreads.find(
-          (item) => item.agent === event.agent && item.sessionId === sessionId,
+          (item) =>
+            item.agent === event.agent &&
+            item.sessionId === sessionId &&
+            item.directory === eventDirectory,
         );
         if (thread)
           void runCompletedChecks(thread.directory, `acp:${event.agent}:${sessionId}`, turnId);
       }
       for (const thread of agentThreads.filter(
-        (item) => item.agent === event.agent && item.sessionId === sessionId,
+        (item) =>
+          item.agent === event.agent &&
+          item.sessionId === sessionId &&
+          item.directory === eventDirectory,
       )) {
         updateAgentThreadStatus(thread, status, event.message.params?.notify !== false);
         if (
@@ -11081,6 +11266,7 @@
       for (const receipt of spawnReceipts.filter(
         (item) =>
           item.targetId === `acp:${event.agent}:${sessionId}` &&
+          item.targetDirectory === eventDirectory &&
           item.turnId === turnId &&
           !receiptIsSettled(item.state),
       ))
@@ -11096,15 +11282,26 @@
     } else if (event.message.method === 'session/request_permission') {
       const sessionId = event.message.params?.sessionId;
       if (typeof sessionId !== 'string') return;
-      nativeSubagents = setNativeSubagentWaiting(nativeSubagents, event.agent, sessionId, true);
+      nativeSubagents = setNativeSubagentWaiting(
+        nativeSubagents,
+        event.agent,
+        eventDirectory,
+        sessionId,
+        true,
+      );
       for (const thread of agentThreads.filter(
-        (item) => item.agent === event.agent && item.sessionId === sessionId,
+        (item) =>
+          item.agent === event.agent &&
+          item.sessionId === sessionId &&
+          item.directory === eventDirectory,
       ))
         updateAgentThreadStatus(thread, 'waiting');
       for (const receipt of spawnReceipts.filter(
         (item) =>
           item.targetId === `acp:${event.agent}:${sessionId}` &&
-          activeSpawnTargets.get(item.targetId) === item.receiptId &&
+          item.targetDirectory === eventDirectory &&
+          activeSpawnTargets.get(spawnTargetKey(eventDirectory, item.targetId)) ===
+            item.receiptId &&
           !receiptIsSettled(item.state),
       ))
         updateSpawnReceipt(receipt.receiptId, { state: 'waiting' });
@@ -11112,18 +11309,20 @@
       const disconnectedSessionIds =
         acpDisconnectedSessionIds(event.message) ??
         Object.values(nativeSubagents)
-          .filter((child) => child.agent === event.agent)
+          .filter((child) => child.agent === event.agent && child.directory === eventDirectory)
           .map((child) => child.sessionId);
       for (const sessionId of disconnectedSessionIds)
         clearStructuredQuestions(event.agent, sessionId);
       nativeSubagents = disconnectNativeSubagents(
         nativeSubagents,
         event.agent,
+        eventDirectory,
         disconnectedSessionIds,
       );
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
+          item.directory === eventDirectory &&
           acpDisconnectAffectsSession(
             event.message,
             item.sessionId,
@@ -11139,6 +11338,7 @@
           : null;
         return (
           item.provider === event.agent &&
+          item.targetDirectory === eventDirectory &&
           acpDisconnectAffectsSession(event.message, sessionId) &&
           !receiptIsSettled(item.state)
         );
@@ -11147,16 +11347,26 @@
     }
   }
 
-  function setAgentReplay(agent: AgentId, sessionId: string | null, replaying: boolean) {
+  function setAgentReplay(
+    agent: AgentId,
+    worktreeDirectory: string,
+    sessionId: string | null,
+    replaying: boolean,
+  ) {
     if (!sessionId) return;
-    const key = JSON.stringify([agent, sessionId]);
+    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
     const next = { ...replayingAgentSessions };
     const count = (next[key] ?? 0) + (replaying ? 1 : -1);
     if (count > 0) next[key] = count;
     else delete next[key];
     replayingAgentSessions = next;
     if (!replaying && sessionId)
-      nativeSubagents = finalizeNativeSubagentRestore(nativeSubagents, agent, sessionId);
+      nativeSubagents = finalizeNativeSubagentRestore(
+        nativeSubagents,
+        agent,
+        worktreeDirectory,
+        sessionId,
+      );
   }
 
   function invalidatePaneSelection(id: string) {
@@ -11694,12 +11904,15 @@
                 {subagentControl}
                 childPrompts={acpThread
                   ? nativeSubagentAcceptsPrompts(
-                      nativeSubagents[nativeSubagentId(acpThread.agent, acpThread.sessionId)],
+                      nativeSubagents[
+                        nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                      ],
                     )
                   : false}
                 nativeEntries={acpThread
-                  ? nativeSubagents[nativeSubagentId(acpThread.agent, acpThread.sessionId)]
-                      ?.transcript
+                  ? nativeSubagents[
+                      nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                    ]?.transcript
                   : undefined}
                 focusPrompt={promptFocusPane === 'main'}
                 picked={pickedAttachments.main}
