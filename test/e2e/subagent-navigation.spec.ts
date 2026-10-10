@@ -90,7 +90,7 @@ describe('subagent navigation and control', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Native child permission');
+    await $('.agent-composer [data-pane-prompt]').setValue('Native child permission');
     await $('.agent-actions button').click();
     await expect($('.spawn-permission')).toBeDisplayed();
   }
@@ -172,7 +172,10 @@ describe('subagent navigation and control', () => {
       expect.stringContaining("Read-only: the agent doesn't accept messages for subagents yet"),
     );
     await expect($('.agent-busy button')).not.toExist();
-    await expect($('.agent-composer textarea')).toBeDisabled();
+    await expect($('.agent-composer [data-pane-prompt]')).toHaveAttribute(
+      'contenteditable',
+      'false',
+    );
     await expect($('.breadcrumb-parent')).toBeDisplayed();
     await expect($('button[aria-label="Go to parent thread"]')).toBeDisplayed();
 

@@ -24,7 +24,7 @@ describe('conversation links', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Link example');
+    await $('.agent-composer [data-pane-prompt]').setValue('Link example');
     await $('.agent-actions button').click();
     await $('.agent-permission button').click();
     const link = $('.agent-conversation a[href="https://example.com/path"]');

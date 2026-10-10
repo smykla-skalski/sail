@@ -32,8 +32,8 @@ describe('agent questions', () => {
     await expect($('.agent-launches button')).toBeEnabled();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').waitForEnabled();
-    await $('.agent-composer textarea').setValue('Ask user questions');
+    await $('.agent-composer [data-pane-prompt]').waitForEnabled();
+    await $('.agent-composer [data-pane-prompt]').setValue('Ask user questions');
     await expect($(sendButton)).toBeEnabled();
     await $(sendButton).click();
 
@@ -44,7 +44,7 @@ describe('agent questions', () => {
       console.error('Agent question diagnostic', {
         header: await $('.agent-header').getText(),
         composer: await $('.agent-composer').getText(),
-        draft: await $('.agent-composer textarea').getValue(),
+        draft: await $('.agent-composer [data-pane-prompt]').getText(),
         conversation: await $('.agent-conversation').getText(),
       });
       throw cause;
@@ -123,7 +123,7 @@ describe('agent questions', () => {
     );
     await expect(form).not.toBeExisting();
 
-    await $('.agent-composer textarea').setValue('Ask structured question');
+    await $('.agent-composer [data-pane-prompt]').setValue('Ask structured question');
     await expect($(sendButton)).toBeEnabled();
     await $(sendButton).click();
     try {
@@ -132,7 +132,7 @@ describe('agent questions', () => {
       console.error('Enum question diagnostic', {
         header: await $('.agent-header').getText(),
         actions: await $('.agent-actions').getText(),
-        draft: await $('.agent-composer textarea').getValue(),
+        draft: await $('.agent-composer [data-pane-prompt]').getText(),
         conversation: await $('.agent-conversation').getText(),
       });
       throw cause;

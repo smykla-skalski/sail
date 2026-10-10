@@ -27,7 +27,7 @@ describe('shared transcript view', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Do a small thing');
+    await $('.agent-composer [data-pane-prompt]').setValue('Do a small thing');
     await $('.agent-actions button').click();
     const card = $('.permission-card');
     await expect(card).toBeDisplayed();
@@ -46,10 +46,10 @@ describe('shared transcript view', () => {
   it('keeps a queued message under the running turn and places the permission card', async () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Delayed approval');
+    await $('.agent-composer [data-pane-prompt]').setValue('Delayed approval');
     await $('.agent-actions button:last-of-type').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
-    await $('.agent-composer textarea').setValue('Queued follow-up');
+    await $('.agent-composer [data-pane-prompt]').setValue('Queued follow-up');
     await $('.agent-actions button:last-of-type').click();
     await expect($('.agent-conversation .queued-messages')).toHaveText(
       expect.stringContaining('Queued follow-up'),

@@ -98,8 +98,8 @@ describe('agent status bar', () => {
       shell: idleLayout.shell,
     });
     await $('.agent-launches button').click();
-    await expect($('.agent-composer textarea')).toBeEnabled();
-    await $('.agent-composer textarea').setValue('Delayed approval');
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
+    await $('.agent-composer [data-pane-prompt]').setValue('Delayed approval');
     await startStatusSampler();
     await $(sendButton).click();
     // The first session of a fresh app can take a while to start the agent.
@@ -153,7 +153,7 @@ describe('agent status bar', () => {
     expect(await statusMismatches()).toEqual([]);
 
     await startStatusSampler();
-    await $('.agent-composer textarea').setValue('Delayed approval');
+    await $('.agent-composer [data-pane-prompt]').setValue('Delayed approval');
     await $(sendButton).click();
     await expect($('.agent-header .activity-status')).toHaveText(
       expect.stringContaining('Working'),
