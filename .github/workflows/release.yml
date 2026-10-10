@@ -231,7 +231,7 @@ jobs:
     name: Signed private context auth fixture
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.context_auth_514 &&
-      github.ref == 'refs/heads/feat/issue-514-macos-session-auth' && github.actor == 'Automaat'
+      github.ref == 'refs/heads/fix/issue-514-signed-fixture-action' && github.actor == 'Automaat'
     runs-on: macos-15
 
     steps:
@@ -252,7 +252,7 @@ jobs:
         with:
           node-version: '24'
 
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb9281d # stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       - name: Install frontend dependencies
         run: npm ci
