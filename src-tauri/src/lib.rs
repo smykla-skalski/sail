@@ -1828,14 +1828,13 @@ async fn delete_worktree(
             .map_err(|error| error.to_string())?;
         let managed_terminal_data =
             acp_terminal::worktree_data_directory(&cache_directory, &directory);
-        let worktree_exists = Path::new(&worktree).exists();
         let terminals = app.state::<acp_terminal::AcpTerminalManager>().inner();
         if stop_agents == Some(true) {
             fence.stop_sessions_in(&app, &agents, &directory)?;
         }
         fence.cleanup(&agents, &directory, native_generation, || {
             terminals.stop_worktree(&directory)?;
-            remove_worktree_then_terminal_data(&managed_terminal_data, worktree_exists, || {
+            remove_worktree_then_terminal_data(&managed_terminal_data, || {
                 if archive_ignored == Some(true) {
                     archive_ignored_and_remove(
                         checked,
@@ -1862,11 +1861,10 @@ async fn delete_worktree(
 
 fn remove_worktree_then_terminal_data<T>(
     managed_data: &Path,
-    worktree_existed: bool,
     remove_worktree: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
     let result = remove_worktree()?;
-    if worktree_existed && managed_data.exists() {
+    if managed_data.exists() {
         std::fs::remove_dir_all(managed_data)
             .map_err(|error| format!("Cannot remove worktree terminal data: {error}"))?;
     }
@@ -2671,16 +2669,46 @@ mod tests {
         fs::write(managed.join("cache"), "keep until worktree removal").unwrap();
         fs::write(sibling.join("cache"), "leave unrelated data alone").unwrap();
 
-        let failure = remove_worktree_then_terminal_data(&managed, true, || {
+        let failure = remove_worktree_then_terminal_data(&managed, || {
             Err::<(), _>("Git removal failed".to_string())
         });
         assert_eq!(failure.unwrap_err(), "Git removal failed");
         assert!(managed.join("cache").exists());
 
-        remove_worktree_then_terminal_data(&managed, true, || Ok(()))
+        remove_worktree_then_terminal_data(&managed, || Ok(()))
             .expect("managed data should be deleted after successful removal");
         assert!(!managed.exists());
         assert!(sibling.join("cache").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_data_is_cleaned_when_worktree_is_already_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-terminal-missing-worktree-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = root.join("repository");
+        let worktree = root.join("worktrees/missing");
+        let managed = root.join("managed");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(managed.join("cache"), "stale terminal data").unwrap();
+        git(repository.to_str().unwrap(), &["init", "-q"]);
+
+        let archived = remove_worktree_then_terminal_data(&managed, || {
+            archive_ignored_and_remove(
+                repository.to_string_lossy().into_owned(),
+                worktree.to_string_lossy().into_owned(),
+                None,
+                None,
+            )
+        })
+        .expect("an already-removed worktree should finish terminal cleanup");
+
+        assert_eq!(archived, None);
+        assert!(!managed.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
