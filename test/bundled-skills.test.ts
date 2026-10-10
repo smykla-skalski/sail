@@ -114,7 +114,7 @@ void test('Vite loads bundled-skills.ts with each skill on its own core', async 
 void test('the bundled ship-it records which upstream release it matches', () => {
   assert.match(
     shipItCore,
-    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.35 with Sail mode/,
+    /upstream: smykla-skalski\/sai plugins\/ship-it 1\.4\.36 with Sail mode/,
   );
 });
 
@@ -179,9 +179,9 @@ void test('the bundled ship-it prompt carries Sail mode and the merge-owner rule
     gateRouting,
     /`code-adversary\.md` and `findings-adversary\.md` from `adversarial-review`/,
   );
-  assert.match(gateRouting, /apply only when Sail's gate rule requires a gate session/);
-  assert.match(gateRouting, /CI triage uses a fresh native subagent/);
-  assert.match(gateRouting, /`mechanism: inline` and `independence: not-applicable`/);
+  assert.match(gateRouting, /Every review and test attempt runs in its own fresh subagent session/);
+  assert.match(gateRouting, /a different model is optional/);
+  assert.match(gateRouting, /CI triage uses a fresh subagent/);
   const progress = sailModeRule('Progress');
   assert.match(progress, /NEEDS_FIXES, FAIL and CI fix rounds stay `running`/);
   assert.match(progress, /when the convergence budget stops the run, report `status: "blocked"`/);

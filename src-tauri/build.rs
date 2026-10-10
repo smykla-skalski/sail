@@ -1,4 +1,19 @@
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=src/context_service.m");
+        let mut native = cc::Build::new();
+        native
+            .file("src/context_service.m")
+            .flag("-fobjc-arc")
+            .flag("-fblocks");
+        if std::env::var_os("CARGO_FEATURE_E2E").is_some() {
+            native.define("SAIL_CONTEXT_E2E", None);
+        }
+        native.compile("sail_context_service");
+        for framework in ["Foundation", "Security", "ServiceManagement"] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
     let policy_path = "../src/lib/capability-policy.json";
     println!("cargo:rerun-if-changed={policy_path}");
     let policy: serde_json::Value = serde_json::from_str(
@@ -13,8 +28,11 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "diagnostic_event",
             "load_settings",
+            "machine_pressure",
             "migrate_settings",
             "save_setting",
+            "worktree_storage_cleanup_status",
+            "retry_worktree_storage_cleanup",
             "list_interrupted_agent_turns",
             "finish_interrupted_agent_turn",
             "get_acp_turn_evidence",
@@ -53,6 +71,7 @@ fn main() {
             "git_change_action",
             "diff_file_contents",
             "create_worktree",
+            "worktree_pressure_directory",
             "create_shipping_worktree",
             "find_shipping_worktree",
             "run_shipping_setup",

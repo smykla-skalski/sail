@@ -17,6 +17,8 @@ import {
   isSubagentThread,
   loadSpawnReceipts,
   receiptForSource,
+  receiptIsLatestFinishedTurn,
+  replayResultForReceipt,
   receiptMatchesTurn,
   receiptNeedsRefresh,
   promptConflictTurnId,
@@ -60,6 +62,59 @@ void test('receipt settlement is correlated to its current turn', () => {
   assert.equal(receiptMatchesTurn(receipt, 'turn-one'), true);
   assert.equal(receiptMatchesTurn({ ...receipt, turnId: 'turn-two' }, 'turn-one'), false);
   assert.equal(receiptMatchesTurn(undefined, 'turn-one'), false);
+});
+
+void test('transcript recovery belongs only to the latest finished turn', () => {
+  const activity = {
+    activeTurns: {},
+    finished: { target: { status: 'done' as const, notify: true, turnId: 'turn-one' } },
+  };
+  assert.equal(receiptIsLatestFinishedTurn(receipt, activity, 'target'), true);
+  assert.equal(
+    receiptIsLatestFinishedTurn(
+      receipt,
+      {
+        ...activity,
+        activeTurns: { target: 'turn-two' },
+      },
+      'target',
+    ),
+    false,
+  );
+  assert.equal(
+    receiptIsLatestFinishedTurn(
+      receipt,
+      {
+        ...activity,
+        finished: { target: { ...activity.finished.target, turnId: 'turn-two' } },
+      },
+      'target',
+    ),
+    false,
+  );
+  assert.equal(receiptIsLatestFinishedTurn(receipt, null, 'target'), false);
+});
+
+void test('transcript recovery finds an older unique prompt after a later turn starts', () => {
+  const entries = [
+    { id: '1', type: 'user' as const, text: 'first task' },
+    { id: '2', type: 'assistant' as const, text: 'first answer' },
+    { id: '3', type: 'user' as const, text: 'second task' },
+    { id: '4', type: 'assistant' as const, text: 'second answer' },
+  ];
+  assert.equal(replayResultForReceipt(entries, 'first task', false), 'first answer');
+  assert.equal(replayResultForReceipt(entries, 'second task', false), 'second answer');
+});
+
+void test('transcript recovery does not assign a repeated prompt to an older turn', () => {
+  const entries = [
+    { id: '1', type: 'user' as const, text: 'same task' },
+    { id: '2', type: 'assistant' as const, text: 'first answer' },
+    { id: '3', type: 'user' as const, text: 'same task' },
+    { id: '4', type: 'assistant' as const, text: 'second answer' },
+  ];
+  assert.equal(replayResultForReceipt(entries, 'same task', false), null);
+  assert.equal(replayResultForReceipt(entries, 'same task', true), 'second answer');
 });
 
 await test('spawn receipts stay scoped to the launching source and project', () => {
@@ -130,7 +185,7 @@ await test('spawn receipts persist requested and actual route identity', () => {
     routing: {
       role: 'implementation',
       risk: 'high',
-      independentReviewRequired: true,
+      contextIsolationRequired: false,
       requested: { provider: 'codex', model: 'gpt-6.1-sol', variant: 'xhigh' },
       actual: { provider: 'codex', model: 'gpt-6.1-sol', variant: 'xhigh' },
     },
@@ -140,7 +195,7 @@ await test('spawn receipts persist requested and actual route identity', () => {
     ...routed,
     routing: {
       ...routed.routing!,
-      independentReviewRequired: false,
+      contextIsolationRequired: false,
       requested: { provider: 'codex', model: null, variant: null },
       actual: { provider: 'codex', model: null, variant: null },
     },
@@ -154,6 +209,26 @@ await test('spawn receipts persist requested and actual route identity', () => {
     routing: { ...routed.routing!, requested: { ...routed.routing!.requested, model: 1 } },
   };
   assert.equal(loadSpawnReceipts(JSON.stringify([invalid]))[0].routing, undefined);
+});
+
+await test('legacy review routing receipts migrate to context isolation', () => {
+  const legacy = {
+    ...receipt,
+    routing: {
+      role: 'review',
+      risk: 'high',
+      independentReviewRequired: true,
+      requested: { provider: 'codex', model: 'gpt-6.1-sol', variant: null },
+      actual: { provider: 'codex', model: 'gpt-6.1-sol', variant: null },
+    },
+  };
+  assert.deepEqual(loadSpawnReceipts(JSON.stringify([legacy]))[0].routing, {
+    role: 'review',
+    risk: 'high',
+    contextIsolationRequired: true,
+    requested: legacy.routing.requested,
+    actual: legacy.routing.actual,
+  });
 });
 
 await test('receipts survive restart with bounded results and honest states', () => {

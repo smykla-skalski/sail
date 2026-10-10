@@ -76,6 +76,7 @@
     type QueuedAgentMessage,
   } from './lib/agent-queue';
   import {
+    acpCancelMatchesSession,
     acp,
     acpDisconnectAffectsSession,
     acpFinishedPromptStatus,
@@ -193,7 +194,12 @@
     oncreated: (thread: AgentThread) => void;
     onactivity: (thread: AgentThread) => void;
     onstatus: (thread: AgentThread, status: ThreadStatus, notifyOnDone?: boolean) => void;
-    onreplaychange?: (agent: AgentId, sessionId: string | null, replaying: boolean) => void;
+    onreplaychange?: (
+      agent: AgentId,
+      directory: string,
+      sessionId: string | null,
+      replaying: boolean,
+    ) => void;
     onterminal: (id: string) => void;
     onentrieschange?: (entries: AgentEntry[], sessionId: string | null, ready: boolean) => void;
     onnativeplan?: (plan: NativePlan | null) => void;
@@ -287,6 +293,9 @@
   const promptLocation = $derived(composerTaskLocation(taskLocation, directory, thread?.directory));
   let ready = $state(false);
   let busy = $state(false);
+  let queuedLimit = $state<number | null>(null);
+  let queuedReason = $state<string | null>(null);
+  let connectAbort: AbortController | null = null;
   let connecting = $state(false);
   let sessionWarmupAttempted = $state(false);
   function failedDraftKey() {
@@ -495,7 +504,7 @@
   function setReplaying(value: boolean) {
     if (replaying === value) return;
     replaying = value;
-    onreplaychange?.(agent, activeSessionId, value);
+    onreplaychange?.(agent, directory, activeSessionId, value);
   }
   let replayEntries: AgentEntry[] = [];
   let pendingUpdates: Record<string, unknown>[] = [];
@@ -827,7 +836,7 @@
         !option.options.some((choice) => choice.value === value)
       )
         return restored;
-      const result = await acp.setConfig(agent, sessionId, option.id, value);
+      const result = await acp.setConfig(agent, directory, sessionId, option.id, value);
       return (
         result.configOptions ??
         restored.map((candidate) =>
@@ -877,7 +886,7 @@
     const target = modeAfterPlan(option, workingMode);
     if (!target) return;
     if (settingConfig) await settingConfig;
-    const result = await acp.setConfig(agent, id, option.id, target);
+    const result = await acp.setConfig(agent, directory, id, option.id, target);
     configOptions =
       result.configOptions ??
       configOptions.map((item) =>
@@ -1185,6 +1194,9 @@
     try {
       await acp.elicitation(
         agent,
+        directory,
+        elicitation.sessionId,
+        activeCapabilityProfile,
         elicitation.id,
         action,
         action === 'accept' ? content : undefined,
@@ -1200,11 +1212,13 @@
   }
 
   async function activate(id: string | null) {
+    connectAbort?.abort();
+    connectAbort = null;
     rememberTranscript();
     const previousSessionId = activeSessionId;
     // Opening a native child leaves the parent running too, so its transcript keeps updating.
     if (previousSessionId && previousSessionId !== id && !ephemeral && !showingNativeChild)
-      trackLiveTranscript(agent, previousSessionId, entries, historyLoaded);
+      trackLiveTranscript(agent, directory, previousSessionId, entries, historyLoaded);
     showingNativeChild = !!nativeEntries;
     rememberDraft(previousSessionId);
     const savedDraft = recallComposerDraft(composerDraftKey(directory, agent, id));
@@ -1228,9 +1242,11 @@
     elicitationDrafts = {};
     onnativeplan?.(nativePlan);
     entries = id && thread ? loadRecentTranscript(thread) : [];
-    const kept = id && !nativeEntries ? takeLiveTranscript(agent, id) : null;
+    const kept = id && !nativeEntries ? takeLiveTranscript(agent, directory, id) : null;
     const liveView =
-      id && !nativeEntries ? liveSessionView(entries, kept, sessionState(agent, id)) : null;
+      id && !nativeEntries
+        ? liveSessionView(entries, kept, sessionState(agent, directory, id))
+        : null;
     if (liveView) entries = liveView.entries;
     visibleCount = 50;
     historyLoaded = !id;
@@ -1272,7 +1288,7 @@
       if (id) {
         // A child has no connection of its own to open, but its pending requests still replay here.
         const waiting = await fencedAcpPermissionInventory(
-          () => acp.pendingPermissions(agent, id),
+          () => acp.pendingPermissions(agent, directory, id),
           () => permissionInventoryRevision,
           () => current === generation && activeSessionId === id,
         ).catch(() => null);
@@ -1282,7 +1298,17 @@
       return;
     }
     try {
-      const info = await acp.connect(agent, activeCapabilityProfile);
+      const controller = new AbortController();
+      connectAbort = controller;
+      const info = await acp.connect(agent, directory, activeCapabilityProfile, {
+        directory,
+        signal: controller.signal,
+        onQueue: (limit, reason) => {
+          if (current !== generation) return;
+          queuedLimit = limit;
+          queuedReason = reason;
+        },
+      });
       if (current !== generation) return;
       authMethods = (info.authMethods as AgentAuthMethod[] | undefined) ?? [];
       if (id) {
@@ -1292,7 +1318,7 @@
             ? capabilities.loadSession
             : false;
         if (!canLoad) throw new Error(`${name} does not support restoring threads.`);
-        const runtime = (await acp.activity().catch(() => null))?.[agent];
+        const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
         if (current !== generation) return;
         const runningTurn = runtime?.alive ? runtime.activeTurns[id] : undefined;
         if (liveView && runningTurn !== undefined) {
@@ -1303,7 +1329,7 @@
           rememberThreadConfig(configOptions);
           if (liveView.availableCommands) updateSkills(liveView.availableCommands);
           if (commandUpdates[id]) updateSkills(commandUpdates[id]);
-          const latest = (await acp.activity().catch(() => null))?.[agent];
+          const latest = (await acp.activity(directory).catch(() => null))?.[agent];
           if (current === generation && latest?.activeTurns[id] !== runningTurn) {
             liveTurn = false;
             activeTurnId = null;
@@ -1349,15 +1375,17 @@
           if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
         }
         const waiting = await fencedAcpPermissionInventory(
-          () => acp.pendingPermissions(agent, id),
+          () => acp.pendingPermissions(agent, directory, id),
           () => permissionInventoryRevision,
           () => current === generation && activeSessionId === id,
         );
         if (waiting) for (const request of waiting) queuePermission(request);
-        const pendingElicitations = await acp.pendingElicitations(agent, id).then(
-          (requests) => ({ requests, available: true }),
-          () => ({ requests: [], available: false }),
-        );
+        const pendingElicitations = await acp
+          .pendingElicitations(agent, directory, id, activeCapabilityProfile)
+          .then(
+            (requests) => ({ requests, available: true }),
+            () => ({ requests: [], available: false }),
+          );
         if (current === generation && activeSessionId === id && pendingElicitations.available) {
           const pendingIDs = new Set(
             pendingElicitations.requests.flatMap((request) =>
@@ -1380,6 +1408,7 @@
         if (thread) onstatus(thread, 'failed');
       }
     } finally {
+      if (current === generation) connectAbort = null;
       if (current === generation) connecting = false;
     }
     if (current === generation) {
@@ -1431,7 +1460,8 @@
         capabilityProfile: activeCapabilityProfile,
       };
       if (current !== generation) {
-        if (ephemeral) await acp.cancel(sessionAgent, session.sessionId, null).catch(() => {});
+        if (ephemeral)
+          await acp.cancel(sessionAgent, sessionDirectory, session.sessionId, null).catch(() => {});
         if (!disposed || !claimedSessionCreations.has(task))
           throw new Error('Agent pane closed while creating the thread.');
         await invoke('validate_repository', { path: sessionDirectory });
@@ -1500,6 +1530,13 @@
     void listen<AgentEvent>('acp-event', ({ payload }) => {
       if (disposed || payload.agent !== agent) return;
       const { message } = payload;
+      const disconnectedDirectory =
+        message.method === 'sail/disconnected' && activeSessionId
+          ? (message.params?.sessionDirectories as Record<string, unknown> | undefined)?.[
+              activeSessionId
+            ]
+          : undefined;
+      if (payload.directory !== directory && disconnectedDirectory !== directory) return;
       if (
         message.method === 'sail/disconnected' &&
         acpDisconnectAffectsSession(message, activeSessionId, activeCapabilityProfile)
@@ -1555,7 +1592,17 @@
       }
       if (message.method === '$/cancel_request') {
         const id = params?.id;
-        if (typeof id === 'string' || typeof id === 'number') {
+        if (
+          activeSessionId &&
+          acpCancelMatchesSession(
+            payload,
+            agent,
+            directory,
+            activeCapabilityProfile,
+            activeSessionId,
+          ) &&
+          (typeof id === 'string' || typeof id === 'number')
+        ) {
           elicitations = elicitations.filter((item) => String(item.id) !== String(id));
           delete elicitationDrafts[String(id)];
           if (activeSessionId)
@@ -1655,16 +1702,18 @@
       setReplaying(false);
       rememberTranscript();
       if (activeSessionId && !nativeEntries && !ephemeral)
-        trackLiveTranscript(agent, activeSessionId, entries, historyLoaded);
+        trackLiveTranscript(agent, directory, activeSessionId, entries, historyLoaded);
       generation++;
+      connectAbort?.abort();
       clearTimeout(updateTimer);
       unlisten?.();
       if (ephemeral && activeSessionId) {
-        void acp.cancel(agent, activeSessionId, activeTurnId).catch(() => {});
+        void acp.cancel(agent, directory, activeSessionId, activeTurnId).catch(() => {});
         for (const permission of permissions)
           void acp
             .permission(
               agent,
+              directory,
               permission.id,
               null,
               permission.sessionId,
@@ -1752,6 +1801,7 @@
     let directClaim = '';
     let directAuthorization: DirectShipAuthorization | undefined;
     let deliverySessionId = activeSessionId;
+    let releaseSlot: (() => void) | null = null;
     busy = true;
     if (activityThread) onstatus(activityThread, 'working');
     stopRequested = false;
@@ -1785,6 +1835,15 @@
     ];
     void follow();
     try {
+      releaseSlot = await acp.acquireTurnSlot(
+        turnId,
+        (limit, reason) => {
+          queuedLimit = limit;
+          queuedReason = reason;
+        },
+        turnDirectory,
+      );
+      if (stopRequested) throw new Error('Agent turn was cancelled.');
       if (!activeSessionId || !activityThread)
         activityThread = await ensureSession(text.slice(0, 60) || 'Attached files', true);
       if (activityThread?.title === 'New thread')
@@ -1804,7 +1863,7 @@
       if (planRequested || forcePlan) {
         if (!id || !planModeOption)
           throw new Error(`${name} does not expose a planning mode for this session.`);
-        const result = await acp.setConfig(turnAgent, id, planModeOption.id, 'plan');
+        const result = await acp.setConfig(turnAgent, directory, id, planModeOption.id, 'plan');
         configOptions = result.configOptions ?? configOptions;
       }
       if (shipIssue && id && !ephemeral) {
@@ -1877,10 +1936,13 @@
         result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
           acp.prompt(
             turnAgent,
+            directory,
             id!,
             recalledPrompt,
             turnId,
             promptImagePaths(sentImages, sentClipboard),
+            undefined,
+            true,
           ),
         );
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
@@ -1904,7 +1966,7 @@
       restoreShell();
       const backendStatus =
         phase === 'prompt' && deliverySessionId
-          ? await acpFinishedPromptStatus(turnAgent, deliverySessionId, turnId)
+          ? await acpFinishedPromptStatus(turnAgent, turnDirectory, deliverySessionId, turnId)
           : null;
       const interrupted =
         backendStatus === 'interrupted' ||
@@ -1981,12 +2043,15 @@
       }
       if (external && !queuedMessage) throw cause;
     } finally {
+      releaseSlot?.();
       if (inFlightSteer?.sessionId === deliverySessionId && inFlightSteer.turnId === turnId)
         inFlightSteer.finish();
       if (current === generation) rememberTranscript();
       if (!keepImages) discardAttachments(sentImages, sentClipboard);
       if (deliverySessionId) discardSteeredAttachments(deliverySessionId);
       if (activeTurnId === turnId) activeTurnId = null;
+      queuedLimit = null;
+      queuedReason = null;
       // Clear busy first so the header and the status bar settle in the same frame.
       if (current === generation) {
         busy = false;
@@ -2170,6 +2235,7 @@
         () =>
           acp.steer(
             turnAgent,
+            turnDirectory,
             sessionId,
             withAttachedFiles(
               resolveSkillPrompt(skills, next.text, steerModel),
@@ -2245,6 +2311,8 @@
 
   async function stop() {
     stopRequested = true;
+    if (activeTurnId && activeSessionId)
+      acp.cancelQueuedTurn(agent, directory, activeSessionId, activeTurnId);
     if (activePlanRevision)
       reportPlanRevision(activePlanRevision.id, 'Plan revision was cancelled.');
     diagnostic('stop_requested');
@@ -2256,7 +2324,7 @@
     const pending = permissions;
     let cancelSent = false;
     try {
-      await acp.cancel(agent, sessionId, activeTurnId);
+      await acp.cancel(agent, directory, sessionId, activeTurnId);
       cancelSent = true;
       // Cancelling the session already settles its pending requests in the backend.
       await Promise.all(
@@ -2264,6 +2332,7 @@
           acp
             .permission(
               agent,
+              directory,
               permission.id,
               null,
               permission.sessionId,
@@ -2295,13 +2364,14 @@
       const policy = livePermissionPolicy(permission);
       const settledOptionId = permissionChoiceForPolicy(policy, permission.options, optionId);
       await permissionResolver.resolve({
-        key: `acp:${agent}:${permission.sessionId}:${permission.id}`,
+        key: `acp:${directory}:${agent}:${permission.sessionId}:${permission.id}`,
         generation: permission.fingerprint ?? permission.generation ?? permission.sessionId,
         policy,
         optionId: settledOptionId,
         respond: (selectedOptionId: string | null) =>
           acp.permission(
             agent,
+            directory,
             permission.id,
             selectedOptionId,
             permission.sessionId,
@@ -2325,7 +2395,9 @@
         return;
       }
       error = describe(cause);
-      const pending = await acp.pendingPermissions(agent, permission.sessionId).catch(() => null);
+      const pending = await acp
+        .pendingPermissions(agent, directory, permission.sessionId)
+        .catch(() => null);
       const pendingIdentities = pending?.flatMap((message) => {
         const sessionId = message.params?.sessionId;
         return (typeof message.id === 'string' || typeof message.id === 'number') &&
@@ -2373,7 +2445,7 @@
     const task = (async () => {
       if (previous) await previous;
       try {
-        const result = await acp.setConfig(agent, sessionId, configId, value);
+        const result = await acp.setConfig(agent, directory, sessionId, configId, value);
         if (activeSessionId !== sessionId) return;
         configFailure = '';
         error = '';
@@ -2414,7 +2486,7 @@
     authenticating = true;
     error = '';
     try {
-      await acp.authenticate(agent, methodId, activeCapabilityProfile);
+      await acp.authenticate(agent, directory, methodId, activeCapabilityProfile);
       authNeeded = false;
       if (activeSessionId) await activate(activeSessionId);
       else if (pickerOpen) await ensureSession('New thread');
@@ -2601,10 +2673,11 @@
             </section>{/if}
           {#if shownBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
               <div class="agent-busy" role="status">
-                <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
-                    size="sm"
-                    variant="secondary"
-                    onclick={stop}>Stop</Button
+                {#if queuedLimit !== null}{queuedReason ??
+                    `Waiting for agent slot (limit ${queuedLimit})`}{:else}<ActivityStatus
+                    status={visibleStatus}
+                  />{/if}{#if !nativeEntries}<Button size="sm" variant="secondary" onclick={stop}
+                    >Stop</Button
                   >{/if}
               </div>
             </ChatMessage>{/if}
@@ -2634,6 +2707,9 @@
         </p>{/if}
       {#if error}<p class="agent-error" role="alert">
           {error} <button onclick={() => void activate(activeSessionId)}>Retry</button>
+        </p>{/if}
+      {#if connecting && queuedReason}<p class="agent-warning" role="status">
+          {queuedReason}
         </p>{/if}
       {#if authNeeded}
         <div class="agent-auth" role="group" aria-label="Agent sign in">

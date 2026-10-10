@@ -75,6 +75,10 @@ pub struct AgentAvailability {
 #[serde(rename_all = "camelCase")]
 struct AgentEvent {
     agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree: Option<String>,
     message: Value,
 }
 
@@ -137,7 +141,7 @@ impl NativeSubagentRegistry {
         self.0
             .iter()
             .filter(|(_, entry)| {
-                entry.directory == directory
+                crate::acp_terminal::worktree_contains(directory, &entry.directory)
                     && !matches!(
                         entry.outcome.as_str(),
                         "completed" | "failed" | "interrupted"
@@ -172,7 +176,7 @@ impl NativeSubagentRegistry {
 struct WorktreeFenceState {
     generations: HashMap<PathBuf, u64>,
     starting_sessions: HashMap<PathBuf, usize>,
-    guarded_sessions: HashMap<(String, String), GuardedSession>,
+    guarded_sessions: HashMap<(String, PathBuf, String), GuardedSession>,
 }
 
 struct GuardedSession {
@@ -261,7 +265,11 @@ impl AgentWorktreeFence {
             return Err("Repository directory no longer exists.".into());
         }
         state.guarded_sessions.insert(
-            (agent.to_string(), session_id.to_string()),
+            (
+                agent.to_string(),
+                directory.to_path_buf(),
+                session_id.to_string(),
+            ),
             GuardedSession {
                 directory: directory.to_path_buf(),
                 expected_generation,
@@ -270,23 +278,37 @@ impl AgentWorktreeFence {
         Ok(())
     }
 
-    fn release_session(&self, agent: &str, session_id: &str) -> Result<(), String> {
+    fn release_session(
+        &self,
+        agent: &str,
+        directory: &Path,
+        session_id: &str,
+    ) -> Result<(), String> {
         self.0
             .lock()
             .map_err(|error| error.to_string())?
             .guarded_sessions
-            .remove(&(agent.to_string(), session_id.to_string()));
+            .remove(&(
+                agent.to_string(),
+                directory.to_path_buf(),
+                session_id.to_string(),
+            ));
         Ok(())
     }
 
     fn dispatch_session<T>(
         &self,
         agent: &str,
+        directory: &Path,
         session_id: &str,
         dispatch: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         let mut state = self.0.lock().map_err(|error| error.to_string())?;
-        let key = (agent.to_string(), session_id.to_string());
+        let key = (
+            agent.to_string(),
+            directory.to_path_buf(),
+            session_id.to_string(),
+        );
         let Some(guard) = state.guarded_sessions.remove(&key) else {
             drop(state);
             return dispatch();
@@ -320,12 +342,9 @@ impl AgentWorktreeFence {
         agents: &AgentManager,
         directory: &Path,
     ) -> Result<(), String> {
-        for entry in agents.active_sessions_in(directory)? {
-            let Some((agent, session_id)) = entry.split_once(':') else {
-                continue;
-            };
-            if let Ok(runtime) = connection_for_session(agents, agent, session_id) {
-                let _ = cancel_session(app, &runtime, agent, session_id, None);
+        for (agent, worktree, session_id) in agents.active_sessions_in(directory)? {
+            if let Ok(runtime) = connection_for_session(agents, &agent, &session_id, &worktree) {
+                let _ = cancel_session(app, &runtime, &agent, &session_id, None);
             }
         }
         // Cancel is asynchronous; the prompt stays active until the agent replies.
@@ -352,14 +371,12 @@ impl AgentWorktreeFence {
         if expected_generation.is_some_and(|expected| expected != generation) {
             return Err("Task-owned subagents changed before worktree cleanup.".into());
         }
-        if state
-            .starting_sessions
-            .get(directory)
-            .is_some_and(|count| *count > 0)
-            || state
-                .guarded_sessions
-                .values()
-                .any(|guard| guard.directory == directory)
+        if state.starting_sessions.iter().any(|(starting, count)| {
+            *count > 0 && crate::acp_terminal::worktree_contains(directory, starting)
+        }) || state
+            .guarded_sessions
+            .values()
+            .any(|guard| crate::acp_terminal::worktree_contains(directory, &guard.directory))
         {
             return Err("An agent session is starting in this worktree.".into());
         }
@@ -367,7 +384,11 @@ impl AgentWorktreeFence {
         if !active.is_empty() {
             return Err(format!(
                 "Worktree has active agent sessions: {}.",
-                active.join(", ")
+                active
+                    .iter()
+                    .map(|(agent, _, session)| format!("{agent}:{session}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         cleanup()
@@ -377,6 +398,8 @@ impl AgentWorktreeFence {
 struct Connection {
     agent: String,
     profile: CapabilityProfile,
+    worktree: PathBuf,
+    _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(unix)]
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
@@ -509,7 +532,11 @@ fn linked_worktree_git_directories(cwd: &str) -> Option<Vec<String>> {
     )
 }
 
-fn codex_permission_profile_config(scope: &Path, temp: &Path) -> Result<String, String> {
+fn codex_permission_profile_config(
+    scope: &Path,
+    temp: &Path,
+    extra_writable: &[PathBuf],
+) -> Result<String, String> {
     let directories =
         linked_worktree_git_directories(scope.to_str().ok_or("Invalid assigned worktree path.")?)
             .ok_or("Assigned worktree Git metadata is unavailable.")?;
@@ -527,6 +554,7 @@ fn codex_permission_profile_config(scope: &Path, temp: &Path) -> Result<String, 
         temp.to_path_buf(),
         common_dir.join("packed-refs.lock"),
     ];
+    writable.extend_from_slice(extra_writable);
     let branch = Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
@@ -604,16 +632,8 @@ fn codex_permission_profile_config(scope: &Path, temp: &Path) -> Result<String, 
     .map_err(|error| error.to_string())
 }
 
-fn session_servers(browser: Value, memory: Option<Value>) -> Vec<Value> {
-    let mut servers = vec![browser];
-    if let Some(memory) = memory {
-        servers.push(memory);
-    }
-    servers
-}
-
-fn optional_memory_server(result: Result<Option<Value>, String>) -> Option<Value> {
-    result.unwrap_or_default()
+fn session_servers(browser: Value) -> Vec<Value> {
+    vec![browser]
 }
 
 fn per_load_mcp() -> bool {
@@ -632,7 +652,6 @@ fn reuse_session_config(
     configs: &mut HashMap<String, SessionConfig>,
     session_id: &str,
     cwd: &str,
-    memory: Option<Value>,
     mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
     mut release: impl FnMut(&str),
 ) -> Result<SessionConfig, String> {
@@ -646,7 +665,7 @@ fn reuse_session_config(
     let next = SessionConfig {
         cwd: cwd.to_string(),
         directory,
-        servers: session_servers(mcp_server(&config), memory),
+        servers: session_servers(mcp_server(&config)),
         token: config.token,
     };
     if let Some(previous) = configs.insert(session_id.to_string(), next.clone()) {
@@ -662,16 +681,15 @@ fn restore_params(
     configs: &mut HashMap<String, SessionConfig>,
     session_id: &str,
     cwd: &str,
-    memory: Option<Value>,
     mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
     release: impl FnMut(&str),
 ) -> Result<Value, String> {
     if per_load {
         let config = mint()?;
-        let servers = session_servers(mcp_server(&config), memory);
+        let servers = session_servers(mcp_server(&config));
         return Ok(session_request_params(cwd, Some(session_id), &servers));
     }
-    let config = reuse_session_config(configs, session_id, cwd, memory, mint, release)?;
+    let config = reuse_session_config(configs, session_id, cwd, mint, release)?;
     Ok(session_request_params(
         &config.cwd,
         Some(session_id),
@@ -691,6 +709,24 @@ struct PendingPermission {
 struct PendingElicitation {
     message: Value,
     received_at: u64,
+}
+
+fn attach_cancelled_elicitation_session(
+    message: &mut Value,
+    pending: &Mutex<HashMap<String, PendingElicitation>>,
+) -> Option<String> {
+    let request_id = message.pointer("/params/id")?.to_string();
+    let request = pending.lock().ok()?.remove(&request_id)?;
+    let session_id = request
+        .message
+        .pointer("/params/sessionId")?
+        .as_str()?
+        .to_string();
+    let params = message.get_mut("params")?.as_object_mut()?;
+    params
+        .entry("sessionId")
+        .or_insert_with(|| Value::String(session_id.clone()));
+    Some(session_id)
 }
 
 #[cfg(test)]
@@ -976,6 +1012,7 @@ fn resolve_session_permissions(
 #[serde(rename_all = "camelCase")]
 pub struct PendingPermissionInfo {
     agent: String,
+    directory: String,
     message: Value,
     received_at: u64,
 }
@@ -1078,28 +1115,42 @@ pub fn acp_permission_resources_trusted(
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        self.stop_child();
+        let _ = self.stop_child();
     }
 }
 
 impl Connection {
-    fn stop_child(&self) {
+    fn stop_child(&self) -> Result<(), String> {
         if let Ok(mut child) = self.child.lock() {
             if self.stopped.swap(true, Ordering::AcqRel) {
-                return;
+                return self
+                    ._storage_lease
+                    .as_ref()
+                    .map_or(Ok(()), |lease| lease.release_clean());
             }
-            stop_process(&mut child);
+            if let Err(error) = stop_process(&mut child) {
+                self.stopped.store(false, Ordering::Release);
+                return Err(error);
+            }
+        } else {
+            return Err("Cannot lock agent process for shutdown.".into());
         }
         #[cfg(unix)]
-        if let Ok(mut watchdog) = self.watchdog.lock() {
-            watchdog.stop();
+        self.watchdog
+            .lock()
+            .map_err(|_| "Cannot lock agent process watchdog for shutdown.")?
+            .stop();
+        if let Some(lease) = &self._storage_lease {
+            lease.release_clean()?;
         }
+        Ok(())
     }
 
-    fn terminate(&self) {
-        self.stop_child();
+    fn terminate(&self) -> Result<(), String> {
+        self.stop_child()?;
         self.alive.store(false, Ordering::Release);
         self.ready.notify_all();
+        Ok(())
     }
 
     fn write(&self, message: &Value) -> Result<(), String> {
@@ -1254,33 +1305,115 @@ impl Connection {
     }
 }
 
-fn stop_process(child: &mut Child) {
+fn stop_process(child: &mut Child) -> Result<(), String> {
     #[cfg(unix)]
     {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
-        let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+        crate::terminal::kill_terminal_process_groups(child.id())?;
     }
     #[cfg(windows)]
-    let _ = Command::new("taskkill")
-        .args(["/PID", &child.id().to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = child.kill();
-    let _ = child.wait();
+    {
+        let result = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("Cannot start agent process-tree shutdown: {error}"))?;
+        if !result.success()
+            && child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            return Err(format!(
+                "Cannot stop agent process tree (taskkill exited {result})."
+            ));
+        }
+    }
+    if child
+        .try_wait()
+        .map_err(|error| format!("Cannot inspect agent process: {error}"))?
+        .is_none()
+    {
+        child
+            .kill()
+            .map_err(|error| format!("Cannot stop agent process: {error}"))?;
+    }
+    child
+        .wait()
+        .map_err(|error| format!("Cannot wait for agent process shutdown: {error}"))?;
+    Ok(())
 }
 
-type ConnectionKey = (String, CapabilityProfile, Option<PathBuf>);
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ConnectionKey {
+    worktree: PathBuf,
+    agent: String,
+    profile: CapabilityProfile,
+}
+
+fn worktree_identity(directory: &Path) -> PathBuf {
+    crate::acp_terminal::stable_worktree_identity(&crate::terminal::git_worktree_root(directory))
+}
+
+fn connection_key(agent: &str, profile: CapabilityProfile, directory: &Path) -> ConnectionKey {
+    ConnectionKey {
+        worktree: worktree_identity(directory),
+        agent: agent.to_string(),
+        profile,
+    }
+}
+
+fn session_directory(runtime: &Connection, session_id: &str) -> Option<String> {
+    runtime
+        .session_directories
+        .lock()
+        .ok()?
+        .get(session_id)
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn runtime_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut environment = crate::acp_terminal::terminal_environment(data_directory);
+    let shared_download_cache = data_directory
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(data_directory)
+        .join("terminal-package-downloads");
+    let build_directory = data_directory.join("build");
+    environment.extend([
+        ("CARGO_TARGET_DIR", build_directory.join("cargo-target")),
+        ("GOCACHE", build_directory.join("go-cache")),
+        ("GOTMPDIR", build_directory.join("go-tmp")),
+        ("NPM_CONFIG_CACHE", shared_download_cache.join("npm")),
+        ("YARN_CACHE_FOLDER", shared_download_cache.join("yarn")),
+        ("COREPACK_HOME", shared_download_cache.join("corepack")),
+    ]);
+    environment
+}
+
+fn prepare_runtime_directories(data_directory: &Path) -> Result<(), String> {
+    for directory in [
+        data_directory.join("tmp"),
+        data_directory.join("cache"),
+        data_directory.join("build"),
+        data_directory.join("build/go-tmp"),
+    ] {
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Default)]
 pub struct AgentManager(Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>);
 
 impl AgentManager {
-    fn active_sessions_in(&self, directory: &Path) -> Result<Vec<String>, String> {
+    fn active_sessions_in(
+        &self,
+        directory: &Path,
+    ) -> Result<Vec<(String, PathBuf, String)>, String> {
         let agents = self.0.lock().map_err(|error| error.to_string())?;
         let mut active = Vec::new();
-        for ((agent, _profile, _scope), runtime) in agents.iter() {
+        for (key, runtime) in agents.iter() {
             let directories = runtime
                 .session_directories
                 .lock()
@@ -1294,11 +1427,15 @@ impl AgentManager {
                     .active
                     .keys()
                     .filter(|session_id| {
-                        directories
-                            .get(*session_id)
-                            .is_some_and(|path| path == directory)
+                        directories.get(*session_id).is_some_and(|path| {
+                            crate::acp_terminal::worktree_contains(directory, path)
+                        })
                     })
-                    .map(|session_id| format!("{agent}:{session_id}")),
+                    .filter_map(|session_id| {
+                        directories.get(session_id).map(|_path| {
+                            (key.agent.clone(), key.worktree.clone(), session_id.clone())
+                        })
+                    }),
             );
             drop(prompts);
             drop(directories);
@@ -1309,7 +1446,7 @@ impl AgentManager {
                     .map_err(|error| error.to_string())?
                     .active_in(directory)
                     .into_iter()
-                    .map(|session_id| format!("{agent}:{session_id}")),
+                    .map(|session_id| (key.agent.clone(), key.worktree.clone(), session_id)),
             );
         }
         active.sort();
@@ -1323,13 +1460,13 @@ impl AgentManager {
     ) -> Result<Vec<NativeSubagentSnapshot>, String> {
         let agents = self.0.lock().map_err(|error| error.to_string())?;
         let mut snapshots = Vec::new();
-        for ((agent, profile, _scope), runtime) in agents.iter() {
+        for (key, runtime) in agents.iter() {
             snapshots.extend(
                 runtime
                     .native_subagents
                     .lock()
                     .map_err(|error| error.to_string())?
-                    .snapshots(agent, *profile, directory),
+                    .snapshots(&key.agent, key.profile, directory),
             );
         }
         snapshots.sort_by(|left, right| {
@@ -1380,8 +1517,51 @@ impl AgentManager {
             })
             .unwrap_or_default();
         for runtime in connections {
-            runtime.terminate();
+            let _ = runtime.terminate();
         }
+    }
+
+    pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
+        let worktree = worktree_identity(worktree);
+        let keys = self
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .keys()
+            .filter(|key| crate::acp_terminal::worktree_contains(&worktree, &key.worktree))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let runtime = self
+                .0
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(&key)
+                .cloned();
+            let Some(runtime) = runtime else { continue };
+            runtime.terminate()?;
+            let mut agents = self.0.lock().map_err(|error| error.to_string())?;
+            if agents
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &runtime))
+            {
+                agents.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn worktree_roots_in(&self, worktree: &Path) -> Result<Vec<PathBuf>, String> {
+        let worktree = worktree_identity(worktree);
+        let agents = self.0.lock().map_err(|error| error.to_string())?;
+        let mut roots = agents
+            .keys()
+            .filter(|key| crate::acp_terminal::worktree_contains(&worktree, &key.worktree))
+            .map(|key| key.worktree.clone())
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
     }
 
     pub fn server_roots(&self) -> Vec<u32> {
@@ -2122,10 +2302,15 @@ pub struct PromptOutcome {
 #[tauri::command]
 pub fn acp_activity(
     manager: State<'_, AgentManager>,
+    directory: String,
 ) -> Result<HashMap<String, AgentActivity>, String> {
+    let worktree = worktree_identity(Path::new(&directory));
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     let mut activity = HashMap::<String, AgentActivity>::new();
-    for runtime in agents.values() {
+    for runtime in agents
+        .values()
+        .filter(|runtime| runtime.worktree == worktree)
+    {
         let prompts = runtime
             .prompt_state
             .lock()
@@ -2189,6 +2374,20 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                directory: runtime
+                    .session_directories
+                    .lock()
+                    .ok()
+                    .and_then(|directories| {
+                        permission
+                            .message
+                            .pointer("/params/sessionId")
+                            .and_then(Value::as_str)
+                            .and_then(|id| directories.get(id).cloned())
+                    })
+                    .unwrap_or_else(|| runtime.worktree.clone())
+                    .to_string_lossy()
+                    .into_owned(),
                 message: permission.message.clone(),
                 received_at: permission.received_at,
             });
@@ -2201,6 +2400,20 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                directory: runtime
+                    .session_directories
+                    .lock()
+                    .ok()
+                    .and_then(|directories| {
+                        elicitation
+                            .message
+                            .pointer("/params/sessionId")
+                            .and_then(Value::as_str)
+                            .and_then(|id| directories.get(id).cloned())
+                    })
+                    .unwrap_or_else(|| runtime.worktree.clone())
+                    .to_string_lossy()
+                    .into_owned(),
                 message: elicitation.message.clone(),
                 received_at: elicitation.received_at,
             });
@@ -2468,35 +2681,53 @@ fn connection_for_profile(
     manager: &AgentManager,
     id: &str,
     profile: CapabilityProfile,
+    directory: &Path,
 ) -> Result<Arc<Connection>, String> {
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     agents
-        .get(&(id.to_string(), profile, None))
+        .get(&connection_key(id, profile, directory))
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".into())
 }
 
-fn connection_for_scope(
+fn connection_for_elicitation(
     manager: &AgentManager,
-    id: &str,
+    agent: &str,
     profile: CapabilityProfile,
-    scope: Option<PathBuf>,
+    directory: &Path,
+    session_id: &str,
 ) -> Result<Arc<Connection>, String> {
-    let agents = manager.0.lock().map_err(|error| error.to_string())?;
-    agents
-        .get(&(id.to_string(), profile, scope))
-        .filter(|runtime| runtime.alive.load(Ordering::Acquire))
-        .cloned()
-        .ok_or_else(|| "Agent is not connected.".into())
+    let runtime = connection_for_profile(manager, agent, profile, directory)?;
+    let sessions = runtime
+        .session_profiles
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if sessions.get(session_id) != Some(&profile) {
+        return Err("Agent session is not connected in this profile and worktree.".into());
+    }
+    drop(sessions);
+    Ok(runtime)
 }
 
-fn codex_scope(agent: &str, cwd: &Path) -> Option<PathBuf> {
-    if agent != "codex" {
-        return None;
+fn claim_pending_elicitation(
+    pending: &Mutex<HashMap<String, PendingElicitation>>,
+    request_key: &str,
+    session_id: &str,
+) -> Result<PendingElicitation, String> {
+    let mut pending = pending.lock().map_err(|error| error.to_string())?;
+    if !pending.get(request_key).is_some_and(|request| {
+        request
+            .message
+            .pointer("/params/sessionId")
+            .and_then(Value::as_str)
+            == Some(session_id)
+    }) {
+        return Err("Elicitation request is no longer pending for this session.".into());
     }
-    let canonical = cwd.canonicalize().ok()?;
-    linked_worktree_git_directories(canonical.to_str()?).map(|_| canonical)
+    pending
+        .remove(request_key)
+        .ok_or_else(|| "Elicitation request is no longer pending.".to_string())
 }
 
 fn unique_session_owner(
@@ -2518,12 +2749,24 @@ fn connection_for_session(
     manager: &AgentManager,
     id: &str,
     session_id: &str,
+    directory: &Path,
 ) -> Result<Arc<Connection>, String> {
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
+    let key = connection_key(id, CapabilityProfile::Build, directory);
+    let runtime = agents.values().find(|runtime| {
+        runtime.agent == id
+            && runtime.worktree == key.worktree
+            && runtime.alive.load(Ordering::Acquire)
+            && runtime
+                .session_profiles
+                .lock()
+                .is_ok_and(|profiles| profiles.contains_key(session_id))
+    });
     let matches = agents
         .values()
         .filter(|runtime| {
             runtime.agent == id
+                && runtime.worktree == key.worktree
                 && runtime.alive.load(Ordering::Acquire)
                 && runtime
                     .session_profiles
@@ -2532,14 +2775,9 @@ fn connection_for_session(
         })
         .collect::<Vec<_>>();
     unique_session_owner(matches.iter().map(|runtime| runtime.profile))?;
-    if matches.len() > 1 {
-        return Err("Agent session is connected to multiple worktrees.".into());
-    }
-    matches
-        .first()
+    runtime
         .cloned()
-        .cloned()
-        .ok_or_else(|| "Agent session is not connected.".to_string())
+        .ok_or_else(|| "Agent session is not connected in this worktree.".to_string())
 }
 
 fn register_session(
@@ -2549,12 +2787,14 @@ fn register_session(
     session_id: &str,
     directory: PathBuf,
 ) -> Result<Arc<Connection>, String> {
+    let key = connection_key(agent, profile, &directory);
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     let mut owners = Vec::new();
-    for runtime in agents
-        .values()
-        .filter(|runtime| runtime.agent == agent && runtime.alive.load(Ordering::Acquire))
-    {
+    for runtime in agents.values().filter(|runtime| {
+        runtime.agent == agent
+            && runtime.worktree == key.worktree
+            && runtime.alive.load(Ordering::Acquire)
+    }) {
         if runtime
             .session_profiles
             .lock()
@@ -2572,26 +2812,11 @@ fn register_session(
             ));
         }
     }
-    let scope = codex_scope(agent, &directory);
     let runtime = agents
-        .get(&(agent.to_string(), profile, scope))
+        .get(&key)
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".to_string())?;
-    for existing in agents.values().filter(|existing| {
-        existing.agent == agent
-            && existing.alive.load(Ordering::Acquire)
-            && !Arc::ptr_eq(existing, &runtime)
-    }) {
-        if existing
-            .session_profiles
-            .lock()
-            .map_err(|error| error.to_string())?
-            .contains_key(session_id)
-        {
-            return Err("Agent session is already connected to another worktree.".into());
-        }
-    }
     runtime
         .session_directories
         .lock()
@@ -2710,12 +2935,13 @@ pub async fn acp_connect(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     agent: String,
+    directory: String,
     profile: Option<String>,
 ) -> Result<Value, String> {
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        connect_blocking(app, &manager, agent, profile, None)
+        connect_blocking(app, &manager, agent, profile, Path::new(&directory))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2763,14 +2989,37 @@ fn connect_blocking(
     manager: &AgentManager,
     agent: String,
     profile: CapabilityProfile,
-    scope: Option<PathBuf>,
+    directory: &Path,
+) -> Result<Value, String> {
+    let worktree = worktree_identity(directory);
+    if !worktree.is_dir() {
+        return Err("Repository directory does not exist.".into());
+    }
+    let fence = app.state::<AgentWorktreeFence>().inner().clone();
+    fence.begin_session(&worktree, None)?;
+    let result = connect_blocking_inner(app.clone(), manager, agent, profile, &worktree);
+    let finish = fence.finish_session(&worktree, None);
+    match (result, finish) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn connect_blocking_inner(
+    app: AppHandle,
+    manager: &AgentManager,
+    agent: String,
+    profile: CapabilityProfile,
+    worktree: &Path,
 ) -> Result<Value, String> {
     let definition = definition(&agent)?;
+    let key = connection_key(&agent, profile, worktree);
     let live = manager
         .0
         .lock()
         .map_err(|error| error.to_string())?
-        .get(&(agent.clone(), profile, scope.clone()))
+        .get(&key)
         .is_some_and(|existing| existing.alive.load(Ordering::Acquire));
     // Probe before taking the agent lock; a live connection needs no availability check.
     let mut availability = if live {
@@ -2779,7 +3028,6 @@ fn connect_blocking(
         Some(agent_availability_for(&app, &agent)?)
     };
     let mut agents = manager.0.lock().map_err(|error| error.to_string())?;
-    let key = (agent.clone(), profile, scope.clone());
     if let Some(existing) = agents.get(&key) {
         if existing.alive.load(Ordering::Acquire) {
             let existing = Arc::clone(existing);
@@ -2855,13 +3103,6 @@ fn connect_blocking(
                 let mut command = Command::new(node);
                 command.arg(adapter);
                 command.env_remove("CODEX_ACP_PERMISSION_PROFILE_CONFIG");
-                if let Some(scope) = scope.as_ref() {
-                    let profile_config = codex_permission_profile_config(scope, &temp.0)?;
-                    command.env("CODEX_ACP_PERMISSION_PROFILE_CONFIG", profile_config);
-                    for variable in ["TMPDIR", "TMP", "TEMP"] {
-                        command.env(variable, &temp.0);
-                    }
-                }
                 owned_temp = Some(temp);
                 command
             }
@@ -2881,20 +3122,60 @@ fn connect_blocking(
     if let (Some(name), Some(binary)) = (definition.binary_env, availability.binary_path) {
         command.env(name, binary);
     }
+    let cache_directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    let (data_directory, storage_lease) =
+        crate::register_worktree_storage(&cache_directory, worktree)?;
+    prepare_runtime_directories(&data_directory)?;
+    if let Some(temp) = owned_temp.as_ref() {
+        if linked_worktree_git_directories(worktree.to_str().ok_or("Invalid worktree path.")?)
+            .is_some()
+        {
+            let shared_cache = data_directory
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(&data_directory)
+                .join("terminal-package-downloads");
+            std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
+            command.env(
+                "CODEX_ACP_PERMISSION_PROFILE_CONFIG",
+                codex_permission_profile_config(
+                    worktree,
+                    &temp.0,
+                    &[data_directory.clone(), shared_cache],
+                )?,
+            );
+        }
+    }
+    for (name, value) in runtime_environment(&data_directory) {
+        command.env(name, value);
+    }
+    command.current_dir(worktree);
     #[cfg(unix)]
-    command.process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Could not start {}: {error}", definition.name))?;
+    storage_lease.mark_started();
     if !is_test_agent {
         observe_agent_with_reef(&agent, child.id());
     }
     #[cfg(unix)]
     let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id()).map_err(|error| {
-        stop_process(&mut child);
+        let _ = stop_process(&mut child);
         format!("Could not start {} watchdog: {error}", definition.name)
     })?;
     let input = child.stdin.take().ok_or("Agent stdin unavailable.")?;
@@ -2918,6 +3199,8 @@ fn connect_blocking(
     let runtime = Arc::new(Connection {
         agent: agent.clone(),
         profile,
+        worktree: worktree.to_path_buf(),
+        _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
         #[cfg(unix)]
         watchdog: Mutex::new(watchdog),
@@ -3109,11 +3392,10 @@ fn connect_blocking(
                     }
                 }
                 if message.get("method").and_then(Value::as_str) == Some("$/cancel_request") {
-                    if let Some(id) = message.pointer("/params/id") {
-                        if let Ok(mut elicitations) = reader.elicitation_state.lock() {
-                            elicitations.remove(&id.to_string());
-                        }
-                    }
+                    let _ = attach_cancelled_elicitation_session(
+                        &mut message,
+                        &reader.elicitation_state,
+                    );
                 }
                 if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
                     if let Some(id) = message.get("id").cloned() {
@@ -3172,6 +3454,8 @@ fn connect_blocking(
                                 "acp-event",
                                 AgentEvent {
                                     agent: agent_id.clone(),
+                                    directory: session_directory(&reader, &session_id),
+                                    worktree: Some(reader.worktree.to_string_lossy().into_owned()),
                                     message: json!({"method":"sail/permission_resolved","params":{
                                         "sessionId":session_id,"requestId":request_id,
                                         "sailPermissionGeneration":generation,
@@ -3188,6 +3472,11 @@ fn connect_blocking(
                     "acp-event",
                     AgentEvent {
                         agent: agent_id.clone(),
+                        directory: message
+                            .pointer("/params/sessionId")
+                            .and_then(Value::as_str)
+                            .and_then(|session_id| session_directory(&reader, session_id)),
+                        worktree: Some(reader.worktree.to_string_lossy().into_owned()),
                         message,
                     },
                 );
@@ -3220,12 +3509,26 @@ fn connect_blocking(
             .map(|profiles| profiles.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         session_ids.sort();
+        let session_directories = reader
+            .session_directories
+            .lock()
+            .map(|directories| {
+                session_ids
+                    .iter()
+                    .filter_map(|id| {
+                        directories
+                            .get(id)
+                            .map(|path| (id.clone(), path.to_string_lossy().into_owned()))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         crate::diagnostics::record(
             "agent_disconnected",
             json!({"agent":agent_id,"profile":profile.as_str(),"sessionIds":session_ids}),
         );
         app.state::<crate::acp_terminal::AcpTerminalManager>()
-            .stop_sessions(&agent_id, profile, &session_ids);
+            .stop_sessions(&agent_id, profile, &reader.worktree, &session_ids);
         reader.ready.notify_all();
         if let Ok(mut state) = reader.permission_state.lock() {
             state.pending.clear();
@@ -3243,8 +3546,11 @@ fn connect_blocking(
             "acp-event",
             AgentEvent {
                 agent: agent_id,
+                directory: None,
+                worktree: Some(reader.worktree.to_string_lossy().into_owned()),
                 message: json!({"method":"sail/disconnected","params":{
-                    "profile":profile.as_str(),"sessionIds":session_ids
+                    "profile":profile.as_str(),"sessionIds":session_ids,
+                    "sessionDirectories":session_directories
                 }}),
             },
         );
@@ -3262,10 +3568,10 @@ fn connect_blocking(
             Duration::from_secs(60),
         )
         .inspect_err(|_| {
-            runtime.terminate();
+            let _ = runtime.terminate();
         })?;
     if result.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
-        runtime.terminate();
+        let _ = runtime.terminate();
         return Err("Agent does not support ACP v1.".into());
     }
     *runtime
@@ -3280,9 +3586,10 @@ fn connect_blocking(
 pub fn acp_pending_permissions(
     manager: State<'_, AgentManager>,
     agent: String,
+    directory: String,
     session_id: String,
 ) -> Result<Vec<Value>, String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
     let permissions = runtime
         .permission_state
         .lock()
@@ -3305,9 +3612,18 @@ pub fn acp_pending_permissions(
 pub fn acp_pending_elicitations(
     manager: State<'_, AgentManager>,
     agent: String,
+    directory: String,
     session_id: String,
+    profile: String,
 ) -> Result<Vec<Value>, String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id)?;
+    let profile = parse_profile(Some(&profile))?;
+    let runtime = connection_for_elicitation(
+        &manager,
+        &agent,
+        profile,
+        Path::new(&directory),
+        &session_id,
+    )?;
     let pending = runtime
         .elicitation_state
         .lock()
@@ -3329,6 +3645,9 @@ pub fn acp_pending_elicitations(
 #[serde(rename_all = "camelCase")]
 pub struct AcpElicitationParams {
     agent: String,
+    directory: String,
+    session_id: String,
+    profile: String,
     request_id: Value,
     action: String,
     content: Option<Value>,
@@ -3339,21 +3658,16 @@ pub fn acp_elicitation(
     manager: State<'_, AgentManager>,
     params: AcpElicitationParams,
 ) -> Result<(), String> {
-    let runtime = manager
-        .0
-        .lock()
-        .map_err(|error| error.to_string())?
-        .values()
-        .find(|runtime| runtime.agent == params.agent)
-        .cloned()
-        .ok_or_else(|| "Agent is not connected.".to_string())?;
+    let profile = parse_profile(Some(&params.profile))?;
+    let runtime = connection_for_elicitation(
+        &manager,
+        &params.agent,
+        profile,
+        Path::new(&params.directory),
+        &params.session_id,
+    )?;
     let key = params.request_id.to_string();
-    let pending = runtime
-        .elicitation_state
-        .lock()
-        .map_err(|error| error.to_string())?
-        .remove(&key)
-        .ok_or_else(|| "Elicitation request is no longer pending.".to_string())?;
+    let pending = claim_pending_elicitation(&runtime.elicitation_state, &key, &params.session_id)?;
     let mut result = json!({"action":params.action});
     if let Some(content) = params.content {
         result["content"] = content;
@@ -3402,14 +3716,17 @@ pub async fn acp_new_session(
     let browser = browser.inner().clone();
     let fence = fence.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let scope = codex_scope(&agent, Path::new(&cwd));
-        connect_blocking(app.clone(), &manager, agent.clone(), profile, scope.clone())?;
-        let runtime = connection_for_scope(&manager, &agent, profile, scope)?;
+        connect_blocking(
+            app.clone(),
+            &manager,
+            agent.clone(),
+            profile,
+            Path::new(&cwd),
+        )?;
+        let runtime = connection_for_profile(&manager, &agent, profile, Path::new(&cwd))?;
         let config =
             browser.config_for_profile(&cwd, None, Some(&agent), Some(profile.as_str()))?;
-        // Memory is optional. A settings, path, or executable error must not block the session.
-        let memory = optional_memory_server(crate::memory::acp_mcp_server(&app, &cwd, &agent));
-        let servers = session_servers(mcp_server(&config), memory);
+        let servers = session_servers(mcp_server(&config));
         let _serial = runtime
             .session_creation
             .lock()
@@ -3482,7 +3799,7 @@ pub async fn acp_new_session(
             if let Ok(mut profiles) = runtime.session_profiles.lock() {
                 profiles.remove(id);
             }
-            let _ = fence.release_session(&agent, id);
+            let _ = fence.release_session(&agent, &directory, id);
             return Err(error);
         }
         browser.identify(&config.token, id);
@@ -3496,9 +3813,10 @@ pub async fn acp_new_session(
 pub fn acp_release_session_fence(
     fence: State<'_, AgentWorktreeFence>,
     agent: String,
+    directory: String,
     session_id: String,
 ) -> Result<(), String> {
-    fence.release_session(&agent, &session_id)
+    fence.release_session(&agent, Path::new(&directory), &session_id)
 }
 
 /// Releases the browser token a deleted thread's session still holds.
@@ -3507,17 +3825,19 @@ pub fn acp_forget_session(
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
     agent: String,
+    directory: String,
     session_id: String,
 ) -> Result<(), String> {
-    let runtimes = manager
-        .0
-        .lock()
-        .map_err(|error| error.to_string())?
-        .values()
-        .filter(|runtime| runtime.agent == agent)
-        .cloned()
-        .collect::<Vec<_>>();
-    for runtime in runtimes {
+    for profile in [
+        CapabilityProfile::Explore,
+        CapabilityProfile::Review,
+        CapabilityProfile::Build,
+        CapabilityProfile::Release,
+    ] {
+        let Ok(runtime) = connection_for_profile(&manager, &agent, profile, Path::new(&directory))
+        else {
+            continue;
+        };
         let removed = runtime
             .session_configs
             .lock()
@@ -3593,15 +3913,15 @@ pub async fn acp_list_sessions(
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let scope = codex_scope(&agent, Path::new(&cwd));
-        let capabilities = connect_blocking(app, &manager, agent.clone(), profile, scope.clone())?;
+        let capabilities =
+            connect_blocking(app, &manager, agent.clone(), profile, Path::new(&cwd))?;
         if capabilities
             .pointer("/agentCapabilities/sessionCapabilities/list")
             .is_none()
         {
             return Ok(json!({"sessions": []}));
         }
-        let runtime = connection_for_scope(&manager, &agent, profile, scope)?;
+        let runtime = connection_for_profile(&manager, &agent, profile, Path::new(&cwd))?;
         let mut params = json!({"cwd": cwd});
         if let Some(cursor) = cursor {
             params["cursor"] = json!(cursor);
@@ -3637,12 +3957,15 @@ async fn restore_session(
     let manager = manager.inner().clone();
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let scope = codex_scope(&agent, Path::new(&cwd));
-        connect_blocking(app.clone(), &manager, agent.clone(), profile, scope)?;
+        connect_blocking(
+            app.clone(),
+            &manager,
+            agent.clone(),
+            profile,
+            Path::new(&cwd),
+        )?;
         let runtime =
             register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
-        // A broken or unavailable memory store must not prevent restoring the agent session.
-        let memory = optional_memory_server(crate::memory::acp_mcp_server(&app, &cwd, &agent));
         let params = {
             let mut configs = runtime
                 .session_configs
@@ -3658,7 +3981,6 @@ async fn restore_session(
                 &mut configs,
                 &session_id,
                 &cwd,
-                memory,
                 || {
                     browser.config_for_profile(
                         &cwd,
@@ -3740,6 +4062,7 @@ async fn prepare_prompt_content(
 #[serde(rename_all = "camelCase")]
 pub struct AcpPromptParams {
     agent: String,
+    directory: String,
     session_id: String,
     text: String,
     turn_id: String,
@@ -3754,13 +4077,14 @@ pub async fn acp_prompt(
 ) -> Result<Value, String> {
     let AcpPromptParams {
         agent,
+        directory,
         session_id,
         text,
         turn_id,
         image_paths,
     } = params;
     let content = prepare_prompt_content(&app, &text, image_paths).await?;
-    let runtime = connection_for_session(&manager, &agent, &session_id)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
     {
         let mut prompts = runtime
             .prompt_state
@@ -3796,6 +4120,7 @@ pub async fn acp_prompt(
         &app,
         crate::settings::AcpTurnEvidence {
             agent: agent.clone(),
+            directory: directory.clone(),
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             status: "prepared".into(),
@@ -3828,6 +4153,7 @@ pub async fn acp_prompt(
         let evidence_agent = agent.clone();
         let evidence_session = session_id.clone();
         let evidence_turn = turn_id.clone();
+        let evidence_directory = directory.clone();
         let dispatch_phase = Arc::new(AtomicU8::new(0));
         let uncertain_phase = Arc::clone(&dispatch_phase);
         let dispatched_phase = Arc::clone(&dispatch_phase);
@@ -3835,8 +4161,10 @@ pub async fn acp_prompt(
         let uncertain_agent = agent.clone();
         let uncertain_session = session_id.clone();
         let uncertain_turn = turn_id.clone();
+        let uncertain_directory = directory.clone();
         let dispatch_agent = agent.clone();
         let dispatch_session = session_id.clone();
+        let dispatch_directory = PathBuf::from(directory.clone());
         let writer = Arc::clone(&runtime);
         let response = runtime.request_response_around_write(
             "session/prompt",
@@ -3845,11 +4173,12 @@ pub async fn acp_prompt(
             }),
             Duration::from_secs(60 * 60 * 3),
             move |message| {
-                dispatch_fence.dispatch_session(&dispatch_agent, &dispatch_session, || {
+                dispatch_fence.dispatch_session(&dispatch_agent, &dispatch_directory, &dispatch_session, || {
                     crate::settings::record_acp_turn_evidence(
                         &uncertain_app,
                         crate::settings::AcpTurnEvidence {
                             agent: uncertain_agent,
+                            directory: uncertain_directory,
                             session_id: uncertain_session,
                             turn_id: uncertain_turn,
                             status: "dispatch_uncertain".into(),
@@ -3871,6 +4200,7 @@ pub async fn acp_prompt(
                     &evidence_app,
                     crate::settings::AcpTurnEvidence {
                         agent: evidence_agent.clone(),
+                        directory: evidence_directory.clone(),
                         session_id: evidence_session.clone(),
                         turn_id: evidence_turn.clone(),
                         status: "dispatched".into(),
@@ -3968,6 +4298,7 @@ pub async fn acp_prompt(
             &app,
             crate::settings::AcpTurnEvidence {
                 agent: agent.clone(),
+                directory: directory.clone(),
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 status: evidence_status.into(),
@@ -4027,12 +4358,15 @@ pub async fn acp_prompt(
                 .is_some_and(|prompt| prompt.turn_id == turn_id)
             {
                 if !runtime.stopped.load(Ordering::Acquire) {
+                    if let Some(directory) = directory.as_ref() {
                     let _ = crate::settings::clear_interrupted_turn(
                         &app,
                         &agent,
+                        &directory.to_string_lossy(),
                         &session_id,
                         &turn_id,
                     );
+                    }
                 }
                 prompts.active.remove(&session_id);
                 prompts.finished.insert(
@@ -4056,6 +4390,8 @@ pub async fn acp_prompt(
                 "acp-event",
                 AgentEvent {
                     agent,
+                    directory: directory.map(|path| path.to_string_lossy().into_owned()),
+                    worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
                     message: json!({"method":"sail/prompt_finished","params":{
                         "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
                         "error":result.as_ref().err(),
@@ -4074,6 +4410,7 @@ pub async fn acp_prompt(
 #[serde(rename_all = "camelCase")]
 pub struct AcpSteerParams {
     agent: String,
+    directory: String,
     session_id: String,
     text: String,
     image_paths: Vec<String>,
@@ -4087,11 +4424,12 @@ pub async fn acp_steer(
 ) -> Result<Value, String> {
     let AcpSteerParams {
         agent,
+        directory,
         session_id,
         text,
         image_paths,
     } = params;
-    let runtime = connection_for_session(&manager, &agent, &session_id)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
     let supported = runtime
         .capabilities
         .lock()
@@ -4131,10 +4469,11 @@ pub fn acp_cancel(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     agent: String,
+    directory: String,
     session_id: String,
     turn_id: Option<String>,
 ) -> Result<(), String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
     cancel_session(&app, &runtime, &agent, &session_id, turn_id)
 }
 
@@ -4201,6 +4540,8 @@ fn cancel_session(
                 "acp-event",
                 AgentEvent {
                     agent: agent.clone(),
+                    directory: session_directory(runtime, &session_id),
+                    worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
                     message: json!({"method":"sail/permission_resolved","params":{
                         "sessionId":session_id,"requestId":request_id,
                         "sailPermissionGeneration":pending.generation,
@@ -4218,6 +4559,7 @@ fn cancel_session(
 #[serde(rename_all = "camelCase")]
 pub struct AcpPermissionParams {
     agent: String,
+    directory: String,
     request_id: Value,
     option_id: Option<String>,
     session_id: String,
@@ -4233,6 +4575,7 @@ pub fn acp_permission(
 ) -> Result<(), String> {
     let AcpPermissionParams {
         agent,
+        directory,
         request_id,
         option_id,
         session_id,
@@ -4247,7 +4590,7 @@ pub fn acp_permission(
     let outcome = option_id
         .map(|id| json!({"outcome":"selected","optionId":id}))
         .unwrap_or_else(|| json!({"outcome":"cancelled"}));
-    let runtime = connection_for_session(&manager, &agent, &session_id)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
     let pending = runtime.respond(
         request_id.clone(),
         &session_id,
@@ -4262,6 +4605,8 @@ pub fn acp_permission(
         "acp-event",
         AgentEvent {
             agent,
+            directory: Some(directory),
+            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
             message: json!({"method":"sail/permission_resolved","params":{
                 "sessionId":session_id,"requestId":request_id,
                 "sailPermissionGeneration":pending.generation,
@@ -4278,11 +4623,12 @@ pub fn acp_permission(
 pub async fn acp_set_config(
     manager: State<'_, AgentManager>,
     agent: String,
+    directory: String,
     session_id: String,
     config_id: String,
     value: String,
 ) -> Result<Value, String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id)?;
+    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
     tauri::async_runtime::spawn_blocking(move || {
         runtime.request(
             "session/set_config_option",
@@ -4298,11 +4644,12 @@ pub async fn acp_set_config(
 pub async fn acp_authenticate(
     manager: State<'_, AgentManager>,
     agent: String,
+    directory: String,
     method_id: String,
     profile: Option<String>,
 ) -> Result<Value, String> {
     let profile = parse_profile(profile.as_deref())?;
-    let runtime = connection_for_profile(&manager, &agent, profile)?;
+    let runtime = connection_for_profile(&manager, &agent, profile, Path::new(&directory))?;
     tauri::async_runtime::spawn_blocking(move || {
         runtime.request(
             "authenticate",
@@ -4312,6 +4659,24 @@ pub async fn acp_authenticate(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[cfg(all(test, unix))]
+fn spawn_test_session_process() -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("sleep");
+    command.arg("30").stdin(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    command.spawn().expect("test ACP runtime should start")
 }
 
 #[cfg(test)]
@@ -4330,6 +4695,291 @@ mod session_config_tests {
                 .collect::<BTreeMap<_, _>>(),
             token: token.into(),
         }
+    }
+
+    #[cfg(unix)]
+    fn test_runtime(
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_id: &str,
+    ) -> Arc<Connection> {
+        let mut child = super::spawn_test_session_process();
+        let input = child.stdin.take().expect("test runtime stdin");
+        let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
+            .expect("test runtime watchdog should start");
+        Arc::new(Connection {
+            agent: agent.to_owned(),
+            profile,
+            worktree: worktree.to_path_buf(),
+            _storage_lease: None,
+            child: Mutex::new(child),
+            watchdog: Mutex::new(watchdog),
+            stopped: AtomicBool::new(false),
+            input: Mutex::new(input),
+            pending: Mutex::new(HashMap::new()),
+            reader_progress: ReaderProgress::default(),
+            permission_state: Mutex::new(PermissionState::default()),
+            elicitation_state: Mutex::new(HashMap::from([(
+                "7".to_string(),
+                PendingElicitation {
+                    message: json!({"method":"elicitation/create","id":7,"params":{"sessionId":session_id}}),
+                    received_at: 1,
+                },
+            )])),
+            next_permission_generation: AtomicU64::new(1),
+            prompt_state: Mutex::new(PromptState::default()),
+            cancelled_prompts: Mutex::new(HashSet::new()),
+            next_id: AtomicU64::new(1),
+            alive: AtomicBool::new(true),
+            capabilities: Mutex::new(Value::Null),
+            session_directories: Mutex::new(HashMap::from([(
+                session_id.to_owned(),
+                worktree.to_path_buf(),
+            )])),
+            session_configs: Mutex::new(HashMap::new()),
+            native_subagents: Mutex::new(NativeSubagentRegistry::default()),
+            session_profiles: Mutex::new(HashMap::from([(session_id.to_owned(), profile)])),
+            pending_directory: Mutex::new(None),
+            session_creation: Mutex::new(()),
+            ready: Condvar::new(),
+            _owned_temp: None,
+        })
+    }
+
+    #[test]
+    fn runtime_keys_and_build_caches_are_private_per_worktree() {
+        let scratch = scratch("runtime-cache");
+        let first = scratch.join("first");
+        let second = scratch.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        assert_ne!(
+            connection_key("codex", CapabilityProfile::Build, &first),
+            connection_key("codex", CapabilityProfile::Build, &second),
+        );
+
+        let cache = scratch.join("app-cache");
+        let first_data = crate::acp_terminal::worktree_data_directory(&cache, &first);
+        let second_data = crate::acp_terminal::worktree_data_directory(&cache, &second);
+        prepare_runtime_directories(&first_data).unwrap();
+        prepare_runtime_directories(&second_data).unwrap();
+        let first_environment = runtime_environment(&first_data);
+        let second_environment = runtime_environment(&second_data);
+        let path = |environment: &[(&str, PathBuf)], name| {
+            environment
+                .iter()
+                .find(|(key, _)| *key == name)
+                .unwrap()
+                .1
+                .clone()
+        };
+        for name in [
+            "TMPDIR",
+            "XDG_CACHE_HOME",
+            "CARGO_TARGET_DIR",
+            "GOCACHE",
+            "GOTMPDIR",
+        ] {
+            assert_ne!(
+                path(&first_environment, name),
+                path(&second_environment, name)
+            );
+        }
+        for directory in [
+            first_data.join("tmp"),
+            first_data.join("cache"),
+            first_data.join("build/go-tmp"),
+            second_data.join("tmp"),
+            second_data.join("cache"),
+            second_data.join("build/go-tmp"),
+        ] {
+            assert!(
+                directory.is_dir(),
+                "{} was not created",
+                directory.display()
+            );
+        }
+        for name in [
+            "PIP_CACHE_DIR",
+            "UV_CACHE_DIR",
+            "POETRY_CACHE_DIR",
+            "NPM_CONFIG_CACHE",
+            "YARN_CACHE_FOLDER",
+            "COREPACK_HOME",
+        ] {
+            assert_eq!(
+                path(&first_environment, name),
+                path(&second_environment, name)
+            );
+        }
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_elicitation_ids_route_to_the_requested_profile_and_session() {
+        let scratch = scratch("elicitation-owner");
+        let worktree = scratch.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let build = test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &worktree,
+            "build-session",
+        );
+        let review = test_runtime(
+            "codex",
+            CapabilityProfile::Review,
+            &worktree,
+            "review-session",
+        );
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key("codex", CapabilityProfile::Build, &worktree),
+            Arc::clone(&build),
+        );
+        manager.0.lock().unwrap().insert(
+            connection_key("codex", CapabilityProfile::Review, &worktree),
+            Arc::clone(&review),
+        );
+
+        let selected = connection_for_elicitation(
+            &manager,
+            "codex",
+            CapabilityProfile::Review,
+            &worktree,
+            "review-session",
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&selected, &review));
+        assert!(connection_for_elicitation(
+            &manager,
+            "codex",
+            CapabilityProfile::Review,
+            &worktree,
+            "build-session",
+        )
+        .is_err());
+        assert!(
+            claim_pending_elicitation(&selected.elicitation_state, "7", "build-session",).is_err()
+        );
+        let response =
+            claim_pending_elicitation(&selected.elicitation_state, "7", "review-session").unwrap();
+        assert_eq!(
+            response
+                .message
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str),
+            Some("review-session")
+        );
+        assert!(build.elicitation_state.lock().unwrap().contains_key("7"));
+
+        manager.shutdown();
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn cancelled_elicitation_emits_its_original_session_id() {
+        let pending = Mutex::new(HashMap::from([(
+            "7".to_string(),
+            PendingElicitation {
+                message: json!({"method":"elicitation/create","id":7,"params":{"sessionId":"nested-session"}}),
+                received_at: 1,
+            },
+        )]));
+        let mut cancelled = json!({"method":"$/cancel_request","params":{"id":7}});
+
+        assert_eq!(
+            attach_cancelled_elicitation_session(&mut cancelled, &pending).as_deref(),
+            Some("nested-session")
+        );
+        assert_eq!(
+            cancelled
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str),
+            Some("nested-session")
+        );
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_worktree_runtime_preserves_sibling_runtimes() {
+        let scratch = scratch("runtime-stop");
+        let first = scratch.join("first");
+        let sibling = scratch.join("sibling");
+        let nested = first.join("nested");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let spawn = |worktree: &Path| {
+            let mut child = super::spawn_test_session_process();
+            let input = child.stdin.take().expect("test runtime stdin");
+            let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
+                .expect("test runtime watchdog should start");
+            Arc::new(Connection {
+                agent: "codex".into(),
+                profile: CapabilityProfile::Build,
+                worktree: worktree.to_path_buf(),
+                _storage_lease: None,
+                child: Mutex::new(child),
+                watchdog: Mutex::new(watchdog),
+                stopped: AtomicBool::new(false),
+                input: Mutex::new(input),
+                pending: Mutex::new(HashMap::new()),
+                reader_progress: ReaderProgress::default(),
+                permission_state: Mutex::new(PermissionState::default()),
+                elicitation_state: Mutex::new(HashMap::new()),
+                next_permission_generation: AtomicU64::new(1),
+                prompt_state: Mutex::new(PromptState::default()),
+                cancelled_prompts: Mutex::new(HashSet::new()),
+                next_id: AtomicU64::new(1),
+                alive: AtomicBool::new(true),
+                capabilities: Mutex::new(Value::Null),
+                session_directories: Mutex::new(HashMap::new()),
+                session_configs: Mutex::new(HashMap::new()),
+                native_subagents: Mutex::new(NativeSubagentRegistry::default()),
+                session_profiles: Mutex::new(HashMap::new()),
+                pending_directory: Mutex::new(None),
+                session_creation: Mutex::new(()),
+                ready: Condvar::new(),
+                _owned_temp: None,
+            })
+        };
+        let first_runtime = spawn(&first);
+        let nested_runtime = spawn(&nested);
+        let sibling_runtime = spawn(&sibling);
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key("codex", CapabilityProfile::Build, &first),
+            first_runtime.clone(),
+        );
+        manager.0.lock().unwrap().insert(
+            connection_key("codex", CapabilityProfile::Build, &nested),
+            nested_runtime.clone(),
+        );
+        manager.0.lock().unwrap().insert(
+            connection_key("codex", CapabilityProfile::Build, &sibling),
+            sibling_runtime.clone(),
+        );
+        assert_eq!(
+            manager.worktree_roots_in(&first).unwrap(),
+            vec![worktree_identity(&first), worktree_identity(&nested)]
+        );
+
+        manager.stop_worktree(&first).unwrap();
+
+        assert!(!first_runtime.alive.load(Ordering::Acquire));
+        assert!(!nested_runtime.alive.load(Ordering::Acquire));
+        assert!(sibling_runtime.alive.load(Ordering::Acquire));
+        let agents = manager.0.lock().unwrap();
+        assert!(!agents.contains_key(&connection_key("codex", CapabilityProfile::Build, &first)));
+        assert!(!agents.contains_key(&connection_key("codex", CapabilityProfile::Build, &nested)));
+        assert!(agents.contains_key(&connection_key("codex", CapabilityProfile::Build, &sibling)));
+        drop(agents);
+        manager.shutdown();
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -4358,7 +5008,7 @@ mod session_config_tests {
             ],
         );
         let params = |config: &McpConfig| {
-            let servers = session_servers(mcp_server(config), None);
+            let servers = session_servers(mcp_server(config));
             serde_json::to_string(&session_request_params(
                 "/work/repo",
                 Some("session"),
@@ -4368,21 +5018,17 @@ mod session_config_tests {
         };
         assert_eq!(params(&first), params(&second));
         assert_eq!(params(&first), params(&first));
-        let servers = session_servers(mcp_server(&first), None);
+        let servers = session_servers(mcp_server(&first));
         let request = session_request_params("/work/repo", None, &servers);
         let env = &request["mcpServers"][0]["env"];
         assert_eq!(env[0]["name"], "SAIL_BROWSER_PORT");
         assert_eq!(env[1]["name"], "SAIL_BROWSER_TOKEN");
         assert!(request.get("sessionId").is_none());
 
-        let servers = session_servers(
-            mcp_server(&first),
-            Some(json!({"name":"sail-memory","command":"/opt/sail"})),
-        );
+        let servers = session_servers(mcp_server(&first));
         let request = session_request_params("/work/repo", None, &servers);
-        assert_eq!(request["mcpServers"].as_array().unwrap().len(), 2);
-        assert_eq!(request["mcpServers"][1]["name"], "sail-memory");
-        assert!(optional_memory_server(Err("store unavailable".into())).is_none());
+        assert_eq!(request["mcpServers"].as_array().unwrap().len(), 1);
+        assert_eq!(request["mcpServers"][0]["name"], "sail-browser");
     }
 
     #[test]
@@ -4439,9 +5085,15 @@ mod session_config_tests {
             .iter()
             .any(|root| root == &json!(common.join("logs/refs"))));
         assert!(!roots.iter().any(|root| root == &json!(common)));
-        assert_eq!(codex_scope("codex", &linked), linked.canonicalize().ok());
+        assert_eq!(worktree_identity(&linked), linked.canonicalize().unwrap());
+        let build_cache = root.join("task-build-cache");
         let profile: Value = serde_json::from_str(
-            &codex_permission_profile_config(&linked, &root.join("task-tmp")).unwrap(),
+            &codex_permission_profile_config(
+                &linked,
+                &root.join("task-tmp"),
+                std::slice::from_ref(&build_cache),
+            )
+            .unwrap(),
         )
         .unwrap();
         let overrides = profile["configOverrides"].as_array().unwrap();
@@ -4456,6 +5108,9 @@ mod session_config_tests {
                 value.contains("filesystem") && value.contains("worktrees/linked")
             })
         }));
+        assert!(overrides.iter().any(|value| value
+            .as_str()
+            .is_some_and(|value| value.contains(build_cache.to_str().unwrap()))));
         let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
         assert_eq!(
             restored["additionalDirectories"],
@@ -4492,7 +5147,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             &cwd,
-            Some(json!({"name":"sail-memory","command":"/opt/sail"})),
             || {
                 minted += 1;
                 Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
@@ -4504,7 +5158,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             &cwd,
-            None,
             || {
                 minted += 1;
                 Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
@@ -4515,7 +5168,7 @@ mod session_config_tests {
         assert_eq!(minted, 1);
         assert!(released.is_empty());
         assert_eq!(first.token, "first");
-        assert_eq!(second.servers.len(), 2);
+        assert_eq!(second.servers.len(), 1);
         assert_eq!(
             session_request_params(&first.cwd, Some("session"), &first.servers),
             session_request_params(&second.cwd, Some("session"), &second.servers)
@@ -4533,7 +5186,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             "/work/repo",
-            None,
             || {
                 minted += 1;
                 Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
@@ -4546,7 +5198,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             "/work/repo",
-            None,
             || {
                 minted += 1;
                 Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
@@ -4571,7 +5222,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             &cwd,
-            None,
             || {
                 minted += 1;
                 Ok(config("first", &[("SAIL_BROWSER_TOKEN", "first")]))
@@ -4584,7 +5234,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             &cwd,
-            None,
             || {
                 minted += 1;
                 Ok(config("second", &[("SAIL_BROWSER_TOKEN", "second")]))
@@ -4598,15 +5247,14 @@ mod session_config_tests {
     }
 
     #[test]
-    fn enabling_memory_does_not_replace_a_live_session_configuration() {
-        let directory = scratch("memory-opt-in");
+    fn a_live_session_keeps_its_original_browser_configuration() {
+        let directory = scratch("browser-reuse");
         let cwd = directory.to_string_lossy().into_owned();
         let mut configs = HashMap::new();
         let first = reuse_session_config(
             &mut configs,
             "session",
             &cwd,
-            None,
             || Ok(config("first", &[])),
             |_| {},
         )
@@ -4615,7 +5263,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             &cwd,
-            Some(json!({"name":"sail-memory","command":"/opt/sail"})),
             || Err("a live session must keep its original MCP fingerprint".into()),
             |_| {},
         )
@@ -4638,7 +5285,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             &original,
-            None,
             || Ok(config("first", &[])),
             |_| {},
         )
@@ -4647,7 +5293,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             &link.to_string_lossy(),
-            None,
             || Err("a symlinked path must not mint a new config".into()),
             |_| {},
         )
@@ -4667,7 +5312,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             &first_directory.to_string_lossy(),
-            None,
             || Ok(config("first", &[])),
             |token| released.push(token.to_string()),
         )
@@ -4676,7 +5320,6 @@ mod session_config_tests {
             &mut configs,
             "session",
             &second_directory.to_string_lossy(),
-            None,
             || Ok(config("second", &[])),
             |token| released.push(token.to_string()),
         )
@@ -4691,6 +5334,21 @@ mod session_config_tests {
 #[cfg(test)]
 mod native_subagent_fence_tests {
     use super::*;
+
+    #[test]
+    fn nested_native_sessions_are_active_for_outer_worktree_cleanup() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-nested-acp-{}", uuid::Uuid::new_v4()));
+        let outer = scratch.join("outer");
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut registry = NativeSubagentRegistry::default();
+        registry.spawn("parent", "child", nested.clone());
+
+        assert_eq!(registry.active_in(&outer), vec!["child"]);
+
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
 
     #[test]
     fn backend_spawn_observed_after_frontend_snapshot_blocks_cleanup() {
@@ -4719,18 +5377,15 @@ mod native_subagent_fence_tests {
     #[cfg(unix)]
     #[test]
     fn active_opencode_turn_blocks_worktree_cleanup() {
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stdin(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .expect("placeholder agent should start");
+        let mut child = spawn_test_session_process();
         let input = child.stdin.take().expect("placeholder agent stdin");
         let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
             .expect("placeholder watchdog should start");
         let runtime = Arc::new(Connection {
             agent: "opencode".into(),
             profile: CapabilityProfile::Build,
+            worktree: PathBuf::from("/worktree"),
+            _storage_lease: None,
             child: Mutex::new(child),
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
@@ -4773,11 +5428,10 @@ mod native_subagent_fence_tests {
             },
         );
         let agents = AgentManager::default();
-        agents
-            .0
-            .lock()
-            .unwrap()
-            .insert(("opencode".into(), CapabilityProfile::Build, None), runtime);
+        agents.0.lock().unwrap().insert(
+            connection_key("opencode", CapabilityProfile::Build, Path::new("/worktree")),
+            runtime,
+        );
         let mut cleaned = false;
 
         let error = AgentWorktreeFence::default()
@@ -4880,7 +5534,7 @@ mod native_subagent_fence_tests {
         let mut dispatched = false;
 
         let error = fence
-            .dispatch_session("codex", "replacement", || {
+            .dispatch_session("codex", &directory, "replacement", || {
                 dispatched = true;
                 Ok(())
             })
@@ -5347,7 +6001,7 @@ mod native_agent_tests {
     }
 
     #[test]
-    fn agents_keep_their_availability_entries() {
+    fn npx_agents_keep_their_availability_entries() {
         let (root, binary) = fake_opencode("2.0.24");
         let ids: Vec<_> =
             agent_availability(Ok(Some(binary.to_string_lossy().into_owned())), |_| true)

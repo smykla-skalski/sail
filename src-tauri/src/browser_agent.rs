@@ -1464,7 +1464,7 @@ fn skill_reference(arguments: &Value) -> Result<Value, String> {
 const TOOLS: &[(&str, &str, &str)] = &[
     (
         "sail_skill",
-        "Read the Sail skill for using this session's worktree, agent, terminal, thread, and embedded browser tools.",
+        "Read the Sail skill for using this session's worktree, agent, memory, terminal, thread, and embedded browser tools.",
         "",
     ),
     (
@@ -1479,7 +1479,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "memory_search",
-        "Search durable memories shared by this Git project and its linked worktrees.",
+        "Search this Git project's durable memories. In Sail, prefer this server over any system-wide Sail memory server; they share one store.",
         "query",
     ),
     (
@@ -1997,11 +1997,10 @@ pub fn run_mcp_stdio() {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object",
                         "properties":{
-                            "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
+                            "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "prompt":{"type":"string"},
-                            "implementingModels":{"type":"array","items":{"type":"string"}}
                         },
-                        "required":["gate","prompt","implementingModels"]
+                        "required":["gate","prompt"]
                     }});
                 }
                 if *name == "validation_policy" {
@@ -2016,7 +2015,7 @@ pub fn run_mcp_stdio() {
                         "type":"object","properties":{
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging","awaiting_merge"]},
                             "status":{"type":"string","enum":["running","blocked"]},
-                            "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
+                            "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED"]},
                             "reason":{"type":"string","maxLength":2000},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},

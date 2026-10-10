@@ -6,6 +6,7 @@ import {
   initializeSettings,
   removeSetting,
   setSetting,
+  setSettingDurable,
   settingKeys,
 } from './lib/settings';
 import { migrateOpenCodeSettings } from './lib/opencode-migration';
@@ -60,6 +61,20 @@ async function start() {
     const { default: TaskOverviewScaleFixture } =
       await import('../test/e2e/task-overview-scale-fixture.svelte');
     mount(TaskOverviewScaleFixture, { target: document.getElementById('root')! });
+  } else if (
+    import.meta.env.MODE === 'e2e' &&
+    new URLSearchParams(location.search).has('settings-durable-fixture')
+  ) {
+    await initializeSettings();
+    const output = document.createElement('output');
+    output.id = 'settings-durable-result';
+    try {
+      await setSettingDurable('sai-e2e-durable-probe', 'saved');
+      output.value = getSetting('sai-e2e-durable-probe') ?? '';
+    } catch (cause) {
+      output.value = String(cause);
+    }
+    document.getElementById('root')!.append(output);
   } else if (new URLSearchParams(location.search).get('window') === 'settings') {
     const { default: SettingsWindow } = await import('./SettingsWindow.svelte');
     mount(SettingsWindow, { target: document.getElementById('root')! });

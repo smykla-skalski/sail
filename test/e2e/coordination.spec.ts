@@ -41,12 +41,31 @@ describe('agent coordination bridge', () => {
       .map((line) => JSON.parse(line));
     expect(initialization.result.instructions).toContain('# Sail');
     expect(initialization.result.instructions).toContain('agent_spawn');
+    expect(initialization.result.instructions).toContain('## Shared memory');
+    expect(initialization.result.instructions).toContain('use the `sail-browser` memory tools');
     expect(tools.result.tools.map((tool: { name: string }) => tool.name)).toContain('sail_skill');
     expect(tools.result.tools).toContainEqual(
       expect.objectContaining({
         name: 'validation_gate',
         inputSchema: expect.objectContaining({
-          required: ['gate', 'prompt', 'implementingModels'],
+          required: ['gate', 'prompt'],
+          properties: expect.objectContaining({
+            gate: expect.objectContaining({
+              enum: ['inline-review', 'code-adversary', 'findings-adversary', 'test-adversary'],
+            }),
+          }),
+        }),
+      }),
+    );
+    expect(tools.result.tools).toContainEqual(
+      expect.objectContaining({
+        name: 'ship_progress',
+        inputSchema: expect.objectContaining({
+          properties: expect.objectContaining({
+            gate: expect.objectContaining({
+              enum: ['inline-review', 'code-adversary', 'findings-adversary', 'test-adversary'],
+            }),
+          }),
         }),
       }),
     );

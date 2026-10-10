@@ -2535,19 +2535,24 @@ mod tests {
     }
 
     #[test]
-    fn agentmemory_reconciliation_reads_later_pages_before_writing() {
+    fn agentmemory_loopback_reconciliation_reads_later_pages_before_writing() {
         let root = temporary();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
+            let accepted_endpoint = listener.local_addr().unwrap();
             let (mut first, _) = listener.accept().unwrap();
             let request = read_request(&mut first);
             assert!(
                 request.starts_with("GET /memories/page?"),
-                "unexpected request: {:?}",
+                "unexpected request at http://{accepted_endpoint}: {:?}",
                 request.lines().next()
             );
-            assert!(!request.contains("cursor="));
+            assert!(
+                !request.contains("cursor="),
+                "unexpected request at http://{accepted_endpoint}: {:?}",
+                request.lines().next()
+            );
             respond(
                 &mut first,
                 r#"{"items":[{"id":"unmanaged"}],"next_cursor":"1","pagination_supported":true}"#,
@@ -2555,7 +2560,11 @@ mod tests {
 
             let (mut second, _) = listener.accept().unwrap();
             let request = read_request(&mut second);
-            assert!(request.contains("cursor=1"));
+            assert!(
+                request.starts_with("GET /memories/page?") && request.contains("cursor=1"),
+                "unexpected request at http://{accepted_endpoint}: {:?}",
+                request.lines().next()
+            );
             respond(
                 &mut second,
                 r#"{"items":[{"id":"remote-id","metadata":{"sail_memory_id":"local-id","sail_updated_at":42}}],"next_cursor":null,"pagination_supported":true}"#,
@@ -2574,7 +2583,7 @@ mod tests {
     }
 
     #[test]
-    fn agentmemory_outage_keeps_local_search_and_sync_feedback() {
+    fn agentmemory_loopback_outage_keeps_local_search_and_sync_feedback() {
         let root = temporary();
         let settings = root.join("settings.json");
         let key = Uuid::new_v4().to_string();
@@ -2591,11 +2600,12 @@ mod tests {
         )
         .unwrap();
         let server = std::thread::spawn(move || {
+            let accepted_endpoint = listener.local_addr().unwrap();
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_request(&mut stream);
             assert!(
                 request.starts_with("GET /memories/page?"),
-                "unexpected request: {:?}",
+                "unexpected request at http://{accepted_endpoint}: {:?}",
                 request.lines().next()
             );
             respond_status(

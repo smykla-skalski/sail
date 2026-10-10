@@ -111,8 +111,8 @@
             'unreported'}{receipt.routing.actual.variant
             ? ` / ${receipt.routing.actual.variant}`
             : ''}{/if}
-        {#if receipt.routing.independentReviewRequired}
-          · independent review required{/if}
+        {#if receipt.routing.contextIsolationRequired}
+          · fresh gate context required{/if}
       </p>
     {/if}
     {#if receipt.result}

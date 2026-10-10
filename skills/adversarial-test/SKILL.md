@@ -12,13 +12,11 @@ metadata:
 
 # Adversarial Test
 
-When the prompt enables Sail cross-validation, launch the fresh Test Adversary session with `validation_gate`, passing its gate name, prompt, and every implementation model; wait for its receipt. The tool selects and verifies a configured agent/model pair, preferring a model different from every implementation model and honoring strict routing. Include the actual provider/model in the verdict. Pause with the reason when no eligible choice exists or the model cannot be verified. Otherwise run the Test Adversary work in this session with the implementation agent and model.
+Run the Test Adversary in a fresh subagent session. In Sail, launch it with `validation_gate` and wait for its receipt. The provider and model may match implementation; model metadata may be unresolved when the fresh execution identity is known. Include actual route metadata when available. If a fresh subagent cannot launch, stop and report `Test Verdict: BLOCKED` with the reason.
 
 ## Sail execution rule
 
-With Sail cross-validation enabled, run the Test Adversary in a fresh subagent session. If it cannot launch, stop and report `Test Verdict: BLOCKED` with the reason. Otherwise run the pass in this session.
-
-In same-session mode, derive the acceptance criteria, run the real product surface, attack its boundaries, and rerun every reproduction directly. The clean-context, spawning, and no-subagent `BLOCKED` rules below apply only with Sail cross-validation enabled.
+Use a fresh subagent session for every pass and reproduction rerun. If one cannot launch, stop and report `Test Verdict: BLOCKED` with the reason.
 
 Prove the change does **not** do what the task says - by running it. It answers one question - **does this change work for a user?** - and answers it with commands and output, not by reading code. Code correctness review is the `adversarial-review` skill.
 
@@ -29,7 +27,7 @@ One subagent with a clean context, then a check by you:
 
 The subagent gets a clean context so it tests the task, not the implementer's belief about the task.
 
-Verdicts: `PASS`; `PASS (partial)` when a criterion stayed `UNTESTED` because the environment (sandbox, tooling, build, an unreachable pane) could not exercise it - callers treat it as passing and list the untested criteria; `FAIL`; `BLOCKED` only for a product precondition a human must supply. A UI change needs a screenshot of the changed surface at a viewport of at least 2560x1440 in the evidence directory. A tester that twice declines a runnable surface triggers the inline fallback, not `BLOCKED`.
+Verdicts: `PASS`; `PASS (partial)` when a criterion stayed `UNTESTED` because the environment (sandbox, tooling, build, an unreachable pane) could not exercise it - callers treat it as passing and list the untested criteria; `FAIL`; `BLOCKED` when a fresh subagent cannot launch or a product precondition needs a human. A UI change needs a screenshot of the changed surface at a viewport of at least 2560x1440 in the evidence directory. A tester that twice declines a runnable surface produces no valid test verdict.
 
 ## Required guidance
 
