@@ -778,12 +778,14 @@ fn publish_owner_directory(
     let owner = temporary.join(OWNER_FILE);
     let contents = encode_owner(identity);
     let write = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&owner)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&owner)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+        }
         fs::rename(&temporary, data_directory)?;
         Ok::<_, std::io::Error>(())
     })();
@@ -1335,6 +1337,28 @@ mod tests {
     fn git_paths_decode_utf8_output_separately_from_owner_path_bytes() {
         let path = git_path_from_bytes("/tmp/café-工作".as_bytes().to_vec()).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/café-工作"));
+    }
+
+    #[test]
+    fn owner_directory_is_published_after_closing_metadata_file() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-worktree-owner-publication-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let data_directory = root.join("owned");
+        let identity = WorktreeIdentity {
+            root: root.join("worktree"),
+            common_dir: root.join("common"),
+            admin_dir: root.join("common/worktrees/admin"),
+            generation: uuid::Uuid::new_v4().to_string(),
+            repository_generation: uuid::Uuid::new_v4().to_string(),
+        };
+
+        publish_owner_directory(&data_directory, &identity).unwrap();
+
+        assert_eq!(read_owner(&data_directory).unwrap(), identity);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
