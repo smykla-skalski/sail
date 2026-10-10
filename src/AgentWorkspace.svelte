@@ -119,6 +119,12 @@
     stageClipboardFile,
     stageClipboardImage,
   } from './lib/attachments';
+  import {
+    composerText,
+    imageToken,
+    imageTokenPattern,
+    renderInlineComposer,
+  } from './lib/inline-composer';
   import { coordinationPrompt, type CoordinationMessage } from './lib/coordination';
   import {
     isShellDraft,
@@ -377,7 +383,7 @@
   function chooseSkill(skill: SkillChoice) {
     draft = insertSkill(draft, skill);
     skillSelected = 0;
-    void tick().then(() => prompt.focus());
+    void tick().then(() => prompt?.focus());
   }
   let images = $state<BrowserAttachment[]>([]);
   let clipboardAttachments = $state<{ path: string; name: string; image: boolean }[]>([]);
@@ -388,11 +394,12 @@
 
   function removeImage(image: BrowserAttachment) {
     images = images.filter((item) => item.id !== image.id);
-    draft = draft.replace(image.text, '').trim();
+    draft = draft.replace(imageToken(image.imagePath), '').replace(image.text, '').trim();
     void invoke('browser_remove_capture', { path: image.imagePath });
   }
   function removeClipboardAttachment(attachment: { path: string; image: boolean }) {
     clipboardAttachments = clipboardAttachments.filter((item) => item.path !== attachment.path);
+    if (attachment.image) draft = draft.replace(imageToken(attachment.path), '');
     if (attachment.image) void invoke('browser_remove_capture', { path: attachment.path });
     else void removeClipboardFile(attachment.path);
   }
@@ -402,13 +409,9 @@
     if (!files.length) return;
     event.preventDefault();
     const pastedText = event.clipboardData?.getData('text/plain') ?? '';
-    const input = event.target instanceof HTMLTextAreaElement ? event.target : null;
-    const insertionOffset = input ? input.selectionStart + pastedText.length : draft.length;
-    if (pastedText && input) {
-      const caret = insertionOffset;
-      draft = insertClipboardText(draft, pastedText, input.selectionStart, input.selectionEnd);
-      void tick().then(() => input.setSelectionRange(caret, caret));
-    }
+    const selection = composerSelection();
+    if (pastedText) insertComposerText(pastedText, selection.start, selection.end);
+    const insertionOffset = Math.min(selection.start, selection.end) + pastedText.length;
     const current = generation;
     const staged = await Promise.all(
       files.map(async (file) => {
@@ -432,6 +435,21 @@
       }
     }
     clipboardAttachments = [...clipboardAttachments, ...stagedAttachments];
+    const tokens = stagedAttachments
+      .filter((item) => item.image)
+      .map((item) => imageToken(item.path))
+      .join(' ');
+    if (tokens) {
+      const before = draft.slice(0, insertionOffset);
+      const after = draft.slice(pastedText ? insertionOffset : selection.end);
+      const prefix = before && !/\s$/.test(before) ? ' ' : '';
+      const suffix = after && /^\s/.test(after) ? '' : ' ';
+      insertComposerText(
+        `${prefix}${tokens}${suffix}`,
+        insertionOffset,
+        pastedText ? insertionOffset : selection.end,
+      );
+    }
   }
   let error = $state('');
   let entries = $state.raw<AgentEntry[]>([]);
@@ -535,7 +553,92 @@
   $effect(() => {
     if (spawnRevision && autoFollow) void follow();
   });
-  let prompt: HTMLTextAreaElement;
+  let prompt = $state<HTMLDivElement>();
+
+  function composerSelection(): { start: number; end: number } {
+    const selection = window.getSelection();
+    if (!prompt || !selection?.rangeCount || !prompt.contains(selection.anchorNode)) {
+      return { start: draft.length, end: draft.length };
+    }
+    const offset = (node: Node, position: number) => {
+      const range = document.createRange();
+      range.selectNodeContents(prompt!);
+      range.setEnd(node, position);
+      return composerText(range.cloneContents()).length;
+    };
+    const anchor = offset(selection.anchorNode!, selection.anchorOffset);
+    const focus = offset(selection.focusNode!, selection.focusOffset);
+    return { start: Math.min(anchor, focus), end: Math.max(anchor, focus) };
+  }
+
+  function setComposerSelection(start: number, end = start) {
+    if (!prompt) return;
+    const locate = (offset: number): [Node, number] => {
+      for (const node of Array.from(prompt!.childNodes)) {
+        const length = composerText(node).length;
+        if (offset <= length) {
+          if (node instanceof Text) return [node, offset];
+          return [prompt!, Array.from(prompt!.childNodes).indexOf(node) + (offset > 0 ? 1 : 0)];
+        }
+        offset -= length;
+      }
+      return [prompt!, prompt!.childNodes.length];
+    };
+    const [startNode, startOffset] = locate(start);
+    const [endNode, endOffset] = locate(end);
+    const range = document.createRange();
+    range.setStart(startNode, startOffset);
+    range.setEnd(endNode, endOffset);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  }
+
+  function renderComposer() {
+    if (!prompt || composerText(prompt) === draft) return;
+    const selection = document.activeElement === prompt ? composerSelection() : null;
+    renderInlineComposer(prompt, draft, [
+      ...clipboardAttachments
+        .filter((item) => item.image)
+        .map((item) => ({
+          path: item.path,
+          name: item.name,
+          remove: () => removeClipboardAttachment(item),
+        })),
+      ...images.map((item) => ({
+        path: item.imagePath,
+        name: item.imagePath.split(/[\\/]/).at(-1) || 'image',
+        remove: () => removeImage(item),
+      })),
+    ]);
+    if (selection) setComposerSelection(selection.start, selection.end);
+  }
+
+  $effect(() => {
+    renderComposer();
+  });
+
+  function updateComposer() {
+    if (!prompt) return;
+    draft = composerText(prompt);
+    for (const image of images) {
+      if (!draft.includes(imageToken(image.imagePath))) removeImage(image);
+    }
+    for (const attachment of clipboardAttachments) {
+      if (attachment.image && !draft.includes(imageToken(attachment.path)))
+        removeClipboardAttachment(attachment);
+    }
+    rememberDraft();
+  }
+
+  function insertComposerText(text: string, start: number, end = start) {
+    draft = insertClipboardText(draft, text, Math.min(start, end), Math.max(start, end));
+    void tick().then(() => setComposerSelection(Math.min(start, end) + text.length));
+  }
+
+  function readableImageTokens(text: string): string {
+    return text.replace(imageTokenPattern, '[image]');
+  }
   const preparedFailures = new Map<string, string>();
   const name = $derived(agentName);
   const transcriptItems = $derived(
@@ -799,7 +902,7 @@
       activeSessionId !== (thread?.sessionId ?? null)
     )
       return;
-    prompt.focus();
+    prompt?.focus();
     onpromptfocused?.();
   }
 
@@ -811,7 +914,7 @@
     if (!picked || picked.id === lastPicked) return;
     lastPicked = picked.id;
     images = [...images, picked];
-    draft = [draft.trim(), picked.text].filter(Boolean).join('\n\n');
+    draft = [draft.trim(), picked.text, imageToken(picked.imagePath)].filter(Boolean).join('\n\n');
     onpickedconsumed?.(picked.id);
     void focusPromptWhenReady();
   });
@@ -856,7 +959,7 @@
       `${activeSessionId}:${tool.id}`,
       failure,
     );
-    void tick().then(() => prompt.focus());
+    void tick().then(() => prompt?.focus());
   }
 
   function flushUpdates() {
@@ -1282,21 +1385,19 @@
     if (current === generation) {
       await tick();
       if (savedDraft && prompt)
-        prompt.setSelectionRange(savedDraft.selectionStart, savedDraft.selectionEnd);
+        setComposerSelection(savedDraft.selectionStart, savedDraft.selectionEnd);
       await follow();
       if (scroll.scrollHeight <= scroll.clientHeight && entries.length > visibleCount)
         void showEarlier();
     }
   }
 
-  function rememberDraft(
-    sessionId = activeSessionId,
-    input: HTMLTextAreaElement | undefined = prompt,
-  ) {
+  function rememberDraft(sessionId = activeSessionId) {
+    const selection = composerSelection();
     rememberComposerDraft(composerDraftKey(directory, agent, sessionId), {
-      text: input?.value ?? draft,
-      selectionStart: input?.selectionStart ?? draft.length,
-      selectionEnd: input?.selectionEnd ?? draft.length,
+      text: draft,
+      selectionStart: selection.start,
+      selectionEnd: selection.end,
     });
   }
 
@@ -1587,8 +1688,9 @@
   ) {
     if (externalText === undefined) await pendingPaste;
     const external = externalText !== undefined;
+    const composerDraft = (externalText ?? draft).trim();
     const text =
-      (externalText ?? draft).trim() ||
+      readableImageTokens(composerDraft) ||
       (!external && clipboardAttachments.length ? 'Please review the attachments.' : '');
     const shell = external ? null : shellCommand(text);
     if (shell !== null) {
@@ -1724,7 +1826,7 @@
         restoreShell();
         if (current === generation) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
-          draft = [text, draft.trim()].filter(Boolean).join('\n\n');
+          draft = [composerDraft, draft.trim()].filter(Boolean).join('\n\n');
           images = [...sentImages, ...images];
           clipboardAttachments = [...sentClipboard, ...clipboardAttachments];
           keepImages = true;
@@ -1870,7 +1972,7 @@
           entries = entries.filter((entry) => entry.id !== userEntryId);
         } else if (!external || queuedMessage) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
-          draft = [text, draft.trim()].filter(Boolean).join('\n\n');
+          draft = [composerDraft, draft.trim()].filter(Boolean).join('\n\n');
           images = [...sentImages, ...images];
           clipboardAttachments = [...sentClipboard, ...clipboardAttachments];
           keepImages = true;
@@ -2328,6 +2430,14 @@
   }
 
   function keydown(event: KeyboardEvent) {
+    if (event.key === 'Tab' && !event.shiftKey && event.target === prompt) {
+      const remove = prompt?.querySelector<HTMLButtonElement>('.composer-image button');
+      if (remove) {
+        event.preventDefault();
+        remove.focus();
+        return;
+      }
+    }
     if (skillMatches.length) {
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
         event.preventDefault();
@@ -2350,6 +2460,10 @@
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       void send();
+    } else if (event.key === 'Enter' && event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      const selection = composerSelection();
+      insertComposerText('\n', selection.start, selection.end);
     }
   }
 
@@ -2571,10 +2685,11 @@
           }}
         />
       {/each}
-      <textarea
+      <div
         bind:this={prompt}
         data-pane-prompt
         role="combobox"
+        tabindex={directory && !readOnlyChild ? 0 : -1}
         aria-autocomplete="list"
         aria-label={`Message ${name}`}
         aria-describedby={`${skillMenuId}-hint`}
@@ -2584,16 +2699,27 @@
         aria-activedescendant={skillMatches.length
           ? `${skillMenuId}-option-${Math.min(skillSelected, skillMatches.length - 1)}`
           : undefined}
-        bind:value={draft}
-        oninput={(event) => rememberDraft(activeSessionId, event.currentTarget)}
-        onselect={(event) => rememberDraft(activeSessionId, event.currentTarget)}
+        contenteditable={!!directory && !readOnlyChild}
+        oninput={updateComposer}
+        onkeyup={() => rememberDraft()}
+        onmouseup={() => rememberDraft()}
         onpaste={(event) => {
-          pendingPaste = Promise.all([pendingPaste, pasteFiles(event)]).then(() => {});
+          if (clipboardFiles(event).length) {
+            pendingPaste = Promise.all([pendingPaste, pasteFiles(event)]).then(() => {});
+          } else {
+            event.preventDefault();
+            const selection = composerSelection();
+            insertComposerText(
+              event.clipboardData?.getData('text/plain') ?? '',
+              selection.start,
+              selection.end,
+            );
+          }
         }}
         onkeydown={keydown}
-        rows="3"
-        placeholder={`Message ${name}… (start with ! to run a shell command)`}
-        disabled={!directory || readOnlyChild}></textarea>
+        data-placeholder={`Message ${name}… (start with ! to run a shell command)`}
+        aria-disabled={!directory || readOnlyChild}
+      ></div>
       <ComposerHint id={`${skillMenuId}-hint`} />
       <SkillMenu
         id={skillMenuId}
@@ -2601,17 +2727,9 @@
         selected={skillSelected}
         choose={chooseSkill}
       />
-      {#if images.length}<div class="attachments">
-          {#each images as image (image.id)}<span
-              >📷 {image.imagePath.split(/[\\/]/).at(-1)}
-              <button aria-label="Remove picked element" onclick={() => removeImage(image)}
-                >×</button
-              ></span
-            >{/each}
-        </div>{/if}
-      {#if clipboardAttachments.length}<div class="attachments">
-          {#each clipboardAttachments as attachment (attachment.path)}<span
-              >{attachment.image ? '📷' : '📎'}
+      {#if clipboardAttachments.some((attachment) => !attachment.image)}<div class="attachments">
+          {#each clipboardAttachments.filter((attachment) => !attachment.image) as attachment (attachment.path)}<span
+              >📎
               {attachment.name}
               <button
                 aria-label={`Remove ${attachment.name}`}
@@ -2794,16 +2912,51 @@
     flex: 0 0 auto;
     padding-inline: 20px;
   }
-  .agent-composer textarea {
+  .agent-composer [data-pane-prompt] {
     width: 100%;
-    resize: vertical;
     box-sizing: border-box;
+    min-height: 5.5em;
+    max-height: 40vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     background: transparent;
     color: inherit;
     border: 0;
     outline: 0;
     padding: 15px 16px;
     font: inherit;
+  }
+  .agent-composer [data-pane-prompt]:empty::before {
+    content: attr(data-placeholder);
+    color: var(--sui-muted);
+    pointer-events: none;
+  }
+  .agent-composer [data-pane-prompt]:focus {
+    outline: 2px solid var(--sui-primary);
+    outline-offset: -2px;
+  }
+  .agent-composer [data-pane-prompt] :global(.composer-image) {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: baseline;
+    padding: 2px 6px;
+    border-radius: var(--radius-6);
+    background: var(--sui-subtle);
+    color: var(--sui-muted);
+    font-size: var(--type-12);
+    white-space: nowrap;
+  }
+  .agent-composer [data-pane-prompt] :global(.composer-image button) {
+    margin-left: 6px;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  .agent-composer [data-pane-prompt] :global(.composer-image button:focus) {
+    outline: 2px solid var(--sui-primary);
+    outline-offset: 1px;
   }
   .agent-actions {
     display: flex;

@@ -164,7 +164,7 @@ describe('type scale and full-width transcript', () => {
   it('fills the agent transcript width at 1280 px', async () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue(prose);
+    await $('.agent-composer [data-pane-prompt]').setValue(prose);
     await $('.agent-actions button:last-of-type').click();
     await expect($('.permission-card')).toBeDisplayed();
     await $('.permission-card .permission-link').click();
@@ -179,12 +179,9 @@ describe('type scale and full-width transcript', () => {
 
   it('gives Markdown headings in the transcript a size scale', async () => {
     await browser.execute(() => {
-      const composer = document.querySelector<HTMLTextAreaElement>('.agent-composer textarea');
+      const composer = document.querySelector<HTMLElement>('.agent-composer [data-pane-prompt]');
       if (!composer) throw new Error('No composer');
-      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(
-        composer,
-        '# Heading one\n## Heading two\n### Heading three\n\nBody text',
-      );
+      composer.textContent = '# Heading one\n## Heading two\n### Heading three\n\nBody text';
       composer.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await $('.agent-actions button:last-of-type').click();

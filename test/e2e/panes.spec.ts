@@ -195,7 +195,7 @@ describe('split agent panes', () => {
     await browser.keys('ArrowDown');
     await expect($(enabledChoices)).toBeFocused();
     await browser.keys('Enter');
-    await expect($('.pane-leaf.focused textarea[data-pane-prompt]')).toBeFocused();
+    await expect($('.pane-leaf.focused [data-pane-prompt]')).toBeFocused();
     const header = await browser.execute(() => {
       const actions = document.querySelector<HTMLElement>('.topbar-actions')!;
       return {
@@ -226,7 +226,7 @@ describe('split agent panes', () => {
     await browser.keys('F6');
     const focusedAfter = await $('.pane-leaf.focused').getAttribute('data-pane-id');
     expect(focusedAfter).not.toBe(focusedBefore);
-    await expect($('.pane-leaf.focused textarea[data-pane-prompt]')).toBeFocused();
+    await expect($('.pane-leaf.focused [data-pane-prompt]')).toBeFocused();
 
     await browser.refresh();
     await expect($('.pane-split.column')).toBeDisplayed();
@@ -256,7 +256,7 @@ describe('split agent panes', () => {
     await browser.refresh();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Parent memory');
+    await $('.agent-composer [data-pane-prompt]').setValue('Parent memory');
     await $('.agent-actions button').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await $('.agent-permission button').click();
@@ -275,7 +275,7 @@ describe('split agent panes', () => {
     );
     await browser.keys(['Meta', 'w']);
     await expect($('[aria-label="Side chat pane"]')).not.toExist();
-    await expect($('.agent-composer textarea')).toBeFocused();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeFocused();
     await browser.refresh();
     await expect($('[aria-label="Side chat pane"]')).not.toExist();
     await expect($('.agent-conversation')).toHaveText(

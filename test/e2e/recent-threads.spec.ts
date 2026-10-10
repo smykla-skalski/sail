@@ -6,8 +6,8 @@ import { join } from 'node:path';
 
 async function createThread(title: string) {
   await $('.agent-launches button').click();
-  await expect($('.agent-composer textarea')).toBeEnabled();
-  await $('.agent-composer textarea').setValue(title);
+  await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
+  await $('.agent-composer [data-pane-prompt]').setValue(title);
   await $('.agent-actions button').click();
   await expect($('.agent-permission')).toBeDisplayed();
   await $('.agent-permission button').click();
@@ -90,8 +90,8 @@ describe('recent thread shortcuts', () => {
         (await browser.execute(() => localStorage.getItem('sai-directory'))) === secondPath,
     );
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Thread two'));
-    await expect($('.agent-composer textarea')).toBeEnabled();
-    await expect($('.agent-composer textarea')).toBeFocused();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeFocused();
     await expect($('.agent-error')).not.toExist();
 
     await browser.keys(['Meta', '9']);
@@ -102,8 +102,8 @@ describe('recent thread shortcuts', () => {
     await expect($('.agent-launches button')).toBeEnabled();
     await browser.keys(['Meta', '1']);
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Thread two'));
-    await expect($('.agent-composer textarea')).toBeEnabled();
-    await expect($('.agent-composer textarea')).toBeFocused();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeFocused();
     await expect($('.agent-error')).not.toExist();
     await browser.execute(() =>
       window.dispatchEvent(
@@ -115,8 +115,8 @@ describe('recent thread shortcuts', () => {
         (await browser.execute(() => localStorage.getItem('sai-directory'))) === firstPath,
     );
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Thread one'));
-    await expect($('.agent-composer textarea')).toBeEnabled();
-    await expect($('.agent-composer textarea')).toBeFocused();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeFocused();
     await expect($('.agent-error')).not.toExist();
 
     await browser.execute(() =>
@@ -134,8 +134,8 @@ describe('recent thread shortcuts', () => {
         (await browser.execute(() => localStorage.getItem('sai-directory'))) === secondPath,
     );
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Thread two'));
-    await expect($('.agent-composer textarea')).toBeEnabled();
-    await expect($('.agent-composer textarea')).toBeFocused();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeFocused();
     await expect($('.agent-error')).not.toExist();
     await $('.project-agent-row[aria-label*="Thread one"]').click();
     await browser.waitUntil(

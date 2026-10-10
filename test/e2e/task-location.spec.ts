@@ -96,13 +96,13 @@ describe('composer task location', () => {
       const location = document.querySelector<HTMLElement>('.agent-composer .task-location')!;
       const branchLabel = location.querySelector<HTMLElement>('.task-location-branch')!;
       const agent = document.querySelector<HTMLElement>('.agent-header .agent-heading')!;
-      const prompt = document.querySelector<HTMLTextAreaElement>('.agent-composer textarea')!;
+      const prompt = document.querySelector<HTMLElement>('.agent-composer [data-pane-prompt]')!;
       return {
         locationRight: location.getBoundingClientRect().right,
         viewport: innerWidth,
         branchOverflow: branchLabel.scrollWidth > branchLabel.clientWidth,
         agentVisible: agent.getBoundingClientRect().height > 0,
-        promptEnabled: !prompt.disabled,
+        promptEnabled: prompt.contentEditable === 'true',
       };
     });
     expect(compact.locationRight).toBeLessThanOrEqual(compact.viewport + 1);
@@ -116,18 +116,20 @@ describe('composer task location', () => {
       'aria-label',
       `Task location: ${repositoryName}, unknown branch or worktree`,
     );
-    await expect($('.agent-composer textarea')).toBeEnabled();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
 
     await $('.mobile-switcher button:nth-child(1)').click();
     await $(`.project-default-worktree-select[title="${repositoryPath}"]`).click();
     await $('.mobile-switcher button:nth-child(2)').click();
     await browser.waitUntil(async () => {
       const state = await browser.execute((staleBranch) => {
-        const prompt = document.querySelector<HTMLTextAreaElement>('[data-pane-prompt]');
+        const prompt = document.querySelector<HTMLElement>('[data-pane-prompt]');
         const label = document
           .querySelector<HTMLElement>('.task-location')
           ?.getAttribute('aria-label');
-        return !!prompt && !prompt.disabled && !!label && !label.includes(staleBranch);
+        return (
+          !!prompt && prompt.contentEditable === 'true' && !!label && !label.includes(staleBranch)
+        );
       }, branch);
       return state;
     });
