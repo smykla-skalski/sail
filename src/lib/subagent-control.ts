@@ -79,8 +79,8 @@ export function childPermissions(
   return {
     pending: control.permissions.filter(
       (item) =>
-        (item.kind === 'acp-permission' || item.kind === 'opencode-permission') &&
-        (item.agentId ?? 'opencode') === child.agentId &&
+        item.kind === 'acp-permission' &&
+        item.agentId === child.agentId &&
         item.sessionId === child.sessionId &&
         item.directory === receipt.targetDirectory,
     ),

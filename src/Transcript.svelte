@@ -44,7 +44,6 @@
     onterminal,
     onretrycheck = () => {},
     onstopshell = () => {},
-    ontoolfix,
     failure,
     queuedActions,
     tail,
@@ -59,8 +58,6 @@
     onterminal?: (id: string) => void;
     onretrycheck?: (check: PostTurnCheck) => void;
     onstopshell?: (run: ShellRun) => void;
-    /** Offered on failed tools when the host can hand the failure to the agent. */
-    ontoolfix?: (tool: TranscriptTool) => void;
     /** Host card for a failed tool, shown above its group. */
     failure?: Snippet<[TranscriptTool]>;
     queuedActions?: Snippet;
@@ -99,7 +96,6 @@
     source={tool.source}
     expanded={revealed}
     {live}
-    onfix={toolFailed(tool) && ontoolfix && tool.error ? () => ontoolfix(tool) : undefined}
   >
     {#each tool.terminalIds as terminalId (terminalId)}
       <button onclick={() => onterminal?.(terminalId)}>Open terminal</button>

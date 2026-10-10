@@ -27,12 +27,6 @@ async function start() {
     mount(DiagramFixture, { target: document.getElementById('root')! });
   } else if (
     import.meta.env.MODE === 'e2e' &&
-    new URLSearchParams(location.search).has('tool-failure-fixture')
-  ) {
-    const { default: ToolFailureFixture } = await import('../test/e2e/tool-failure-fixture.svelte');
-    mount(ToolFailureFixture, { target: document.getElementById('root')! });
-  } else if (
-    import.meta.env.MODE === 'e2e' &&
     new URLSearchParams(location.search).has('spawn-activity-fixture')
   ) {
     const { default: SpawnActivityFixture } =

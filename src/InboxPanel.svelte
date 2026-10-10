@@ -94,15 +94,7 @@
             </span>
             <span class="inbox-text">{item.text}</span>
           </button>
-          {#if item.kind === 'opencode-permission'}
-            <div class="inbox-actions">
-              {#if item.allow !== false}<button
-                  disabled={!!busyKey}
-                  onclick={() => decide(item, 'once')}>Allow once</button
-                >{/if}
-              <button disabled={!!busyKey} onclick={() => decide(item, 'reject')}>Reject</button>
-            </div>
-          {:else if item.kind === 'acp-permission'}
+          {#if item.kind === 'acp-permission'}
             <div class="inbox-actions">
               {#each item.options ?? [] as option (option.optionId)}{#if item.allow !== false || !option.kind.startsWith('allow')}<button
                     disabled={!!busyKey}

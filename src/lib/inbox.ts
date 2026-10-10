@@ -9,9 +9,9 @@ export type InboxLocation = {
 
 export type InboxItem = InboxLocation & {
   key: string;
-  kind: 'acp-permission' | 'opencode-permission' | 'question' | 'turn-completed' | 'check-failed';
+  kind: 'acp-permission' | 'question' | 'turn-completed' | 'check-failed';
   agent: string;
-  agentId?: string;
+  agentId: string;
   sessionId: string;
   requestId?: string | number;
   text: string;
@@ -21,7 +21,6 @@ export type InboxItem = InboxLocation & {
   options?: { optionId: string; name: string; kind: string }[];
   allow?: boolean;
   policy?: PermissionPolicyDecision;
-  permissionPolicies?: Record<string, PermissionPolicyDecision>;
   permissionTitle?: string;
   permissionToolCall?: unknown;
   permissionResourceTrust?: { trusted: boolean; canonicalResources: string[] };
@@ -126,14 +125,6 @@ export function markInboxOutcomeRead(items: InboxOutcome[], key: string): InboxO
 
 export function isInboxOutcome(item: InboxItem): boolean {
   return item.kind === 'turn-completed' || item.kind === 'check-failed';
-}
-
-export type InboxOpenRoute = 'outcome' | 'acp-request' | 'opencode-request';
-
-/** How opening an Inbox row reaches its thread and the request or result inside it. */
-export function inboxOpenRoute(item: Pick<InboxItem, 'kind'>): InboxOpenRoute {
-  if (item.kind === 'turn-completed' || item.kind === 'check-failed') return 'outcome';
-  return item.kind === 'acp-permission' ? 'acp-request' : 'opencode-request';
 }
 
 export function inboxTurnMessageIndex(

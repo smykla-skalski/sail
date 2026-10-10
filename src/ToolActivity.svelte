@@ -14,7 +14,6 @@
     expanded = false,
     activityId,
     live = false,
-    onfix,
     children,
   }: {
     title: string;
@@ -27,7 +26,6 @@
     activityId?: string;
     /** False while the host replays history; errors already present then stay silent. */
     live?: boolean;
-    onfix?: () => void;
     children?: import('svelte').Snippet;
   } = $props();
 
@@ -69,7 +67,6 @@
       {/if}
       {#if error}<p class="tool-activity-error">{error}</p>{/if}
       {#if source}<p class="tool-activity-source">Reported by {source}</p>{/if}
-      {#if onfix}<button class="tool-activity-fix" onclick={onfix}>Fix with agent</button>{/if}
       {#if children}{@render children()}{/if}
     </div>
   {/if}
@@ -156,14 +153,5 @@
   .tool-activity-source {
     margin: 8px 0 0;
     color: var(--sui-muted);
-  }
-  .tool-activity-fix {
-    margin-top: 8px;
-    padding: 5px 9px;
-    border: 1px solid var(--shell-divider);
-    border-radius: var(--radius-6);
-    color: inherit;
-    background: transparent;
-    cursor: pointer;
   }
 </style>

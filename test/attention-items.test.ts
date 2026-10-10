@@ -65,7 +65,7 @@ function kinds(items: AttentionCandidate[]): string[] {
 }
 
 void test('session requests become permission and question items that cannot be dismissed', () => {
-  const question: InboxItem = { ...permission('q'), kind: 'question', agentId: undefined };
+  const question: InboxItem = { ...permission('q'), kind: 'question' };
   const items = sessionRequestCandidates([
     permission('a'),
     question,
@@ -74,7 +74,7 @@ void test('session requests become permission and question items that cannot be 
   assert.deepEqual(kinds(items), ['permission:thread', 'question:thread']);
   assert.ok(items.every((item) => !item.dismissible && item.severity === 'critical'));
   assert.equal(items[0].repo, 'alpha');
-  assert.equal(items[1].target.type === 'thread' && items[1].target.agentId, 'opencode');
+  assert.equal(items[1].target.type === 'thread' && items[1].target.agentId, 'claude');
 });
 
 void test('ship issues map to needs-input, ready-to-merge and closed-unmerged items', () => {
