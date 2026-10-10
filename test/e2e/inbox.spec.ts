@@ -37,7 +37,8 @@ describe('pending requests across projects', () => {
     await $('.agent-launches button').click();
     await $('.agent-composer textarea').waitForEnabled();
     await $('.agent-composer textarea').setValue('First request');
-    await $('.agent-actions button').click();
+    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
+    await $('.agent-actions button:last-child').click();
     try {
       await expect($('.agent-permission')).toBeDisplayed();
     } catch (cause) {
@@ -57,7 +58,8 @@ describe('pending requests across projects', () => {
     await $('.agent-launches button').click();
     await $('.agent-composer textarea').waitForEnabled();
     await $('.agent-composer textarea').setValue('Second request');
-    await $('.agent-actions button').click();
+    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
+    await $('.agent-actions button:last-child').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await $(`.project-default-worktree-select[title="${paths[0]}"]`).click();
 
@@ -94,7 +96,8 @@ describe('pending requests across projects', () => {
     await $('.agent-launches button').click();
     await $('.agent-composer textarea').waitForEnabled();
     await $('.agent-composer textarea').setValue('Activity demo');
-    await $('.agent-actions button').click();
+    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
+    await $('.agent-actions button:last-child').click();
     await browser.waitUntil(async () => (await $$('.inbox-result')).length === 1);
     await $('[data-topbar-inbox]').click();
     await expect($('.inbox-result')).toHaveText(expect.stringContaining('Turn completed'));
@@ -111,7 +114,8 @@ describe('pending requests across projects', () => {
     );
     await $('[aria-label="Close pending requests"]').click();
     await $('.agent-composer textarea').setValue('Steer no-response follow-up');
-    await $('.agent-actions button').click();
+    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
+    await $('.agent-actions button:last-child').click();
     await browser.waitUntil(async () => (await $$('.inbox-result')).length === 2);
     await $('[data-topbar-inbox]').click();
     const results = await $$('.inbox-result');
@@ -171,7 +175,8 @@ describe('pending requests across projects', () => {
     await $('.agent-launches button').click();
     await $('.agent-composer textarea').waitForEnabled();
     await $('.agent-composer textarea').setValue('Activity demo');
-    await $('.agent-actions button').click();
+    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
+    await $('.agent-actions button:last-child').click();
     await $(`.project-default-worktree-select[title="${paths[1]}"]`).click();
     await browser.waitUntil(() =>
       browser.execute(() =>
