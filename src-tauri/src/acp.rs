@@ -2605,7 +2605,10 @@ fn connect_blocking(
     if let (Some(name), Some(binary)) = (definition.binary_env, availability.binary_path) {
         command.env(name, binary);
     }
-    command.env("SAIL_SCRATCH_OWNER_PID", std::process::id().to_string());
+    #[cfg(unix)]
+    if let Some(owner) = crate::scratch_cleanup::owner_identity() {
+        command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
+    }
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command

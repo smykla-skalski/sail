@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const IDLE_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 const MARKER: &str = ".sail-scratch-root";
@@ -19,6 +20,18 @@ pub(crate) fn sweep_on_startup() {
     }
 }
 
+pub(crate) fn owner_identity() -> Option<String> {
+    let pid = std::process::id();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    let started = system.process(Pid::from_u32(pid))?.start_time();
+    Some(format!("{pid} {started}"))
+}
+
 fn sweep(
     temp: &Path,
     now: SystemTime,
@@ -26,6 +39,12 @@ fn sweep(
 ) -> std::io::Result<u64> {
     let mut freed = 0;
     let owner = unsafe { nix::libc::geteuid() };
+    let mut processes = System::new();
+    processes.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing(),
+    );
     for entry in fs::read_dir(temp)? {
         let Ok(entry) = entry else {
             continue;
@@ -59,7 +78,7 @@ fn sweep(
             }
             let original = temp.join(original_name);
             let safe = inspect(&root, metadata.dev(), now).is_ok_and(|result| result.is_some())
-                && marker_owner_dead(&root)
+                && marker_owner_dead(&root, &processes)
                 && open_files(&root) == Some(false);
             if safe {
                 let bytes = inspect(&root, metadata.dev(), now)
@@ -79,7 +98,7 @@ fn sweep(
         let Ok(Some(bytes)) = inspect(&path, metadata.dev(), now) else {
             continue;
         };
-        if !marker_owner_dead(&path) {
+        if !marker_owner_dead(&path, &processes) {
             continue;
         }
         // An unknown lsof result is unsafe: lack of permission is not proof of idleness.
@@ -106,7 +125,7 @@ fn sweep(
             continue;
         }
         let safe = inspect(&quarantine, metadata.dev(), now).is_ok_and(|result| result.is_some())
-            && marker_owner_dead(&quarantine)
+            && marker_owner_dead(&quarantine, &processes)
             && open_files(&quarantine) == Some(false);
         if !safe {
             restore(&quarantine, &path);
@@ -200,7 +219,7 @@ fn private_quarantine_name(name: &str) -> Option<&str> {
     Some(original)
 }
 
-fn marker_owner_dead(path: &Path) -> bool {
+fn marker_owner_dead(path: &Path, processes: &System) -> bool {
     let marker = path.join(MARKER);
     if !marker.exists() {
         return false;
@@ -208,14 +227,26 @@ fn marker_owner_dead(path: &Path) -> bool {
     let Ok(owner) = fs::read_to_string(marker) else {
         return false;
     };
-    let Ok(pid) = owner.trim().parse::<i32>() else {
+    let mut parts = owner.split_whitespace();
+    let (Some(pid), Some(started), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
-    if pid <= 0 {
+    let Ok(pid) = pid.parse::<i32>() else {
+        return false;
+    };
+    let Ok(started) = started.parse::<u64>() else {
+        return false;
+    };
+    if pid <= 0 || started == 0 {
         return false;
     }
     let result = unsafe { nix::libc::kill(pid, 0) };
-    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ESRCH)
+    if result == -1 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ESRCH);
+    }
+    processes
+        .process(Pid::from_u32(pid as u32))
+        .is_some_and(|process| process.start_time() != started)
 }
 
 fn inspect(path: &Path, device: u64, now: SystemTime) -> std::io::Result<Option<u64>> {
@@ -286,7 +317,7 @@ mod tests {
 
     fn cargo_artifacts(path: &Path) {
         fs::create_dir_all(path.join("debug").join(".fingerprint")).unwrap();
-        fs::write(path.join(MARKER), i32::MAX.to_string()).unwrap();
+        fs::write(path.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
     }
 
     #[test]
@@ -333,10 +364,24 @@ mod tests {
         let temp = fixture();
         let active = temp.join("sail-339-implement.owned");
         fs::create_dir(&active).unwrap();
-        fs::write(active.join(MARKER), std::process::id().to_string()).unwrap();
+        fs::write(active.join(MARKER), owner_identity().unwrap()).unwrap();
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
         sweep(&temp, future, |_| Some(false)).unwrap();
         assert!(active.exists());
+    }
+
+    #[test]
+    fn sweeps_a_reused_pid_with_a_different_start_time() {
+        let temp = fixture();
+        let stale = temp.join("sail-339-target.reused");
+        fs::create_dir(&stale).unwrap();
+        let identity = owner_identity().unwrap();
+        let (pid, started) = identity.split_once(' ').unwrap();
+        let old_start = started.parse::<u64>().unwrap() - 1;
+        fs::write(stale.join(MARKER), format!("{pid} {old_start}")).unwrap();
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |_| Some(false)).unwrap();
+        assert!(!stale.exists());
     }
 
     #[cfg(target_os = "macos")]
