@@ -726,6 +726,13 @@ describe('native Ship run history', () => {
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Done: Do a small thing'),
     );
+    const sourceSessionId = await browser.execute(() => {
+      const threads: Array<{ title?: string; sessionId?: string }> = JSON.parse(
+        localStorage.getItem('sail-agent-threads') ?? '[]',
+      );
+      return threads.find((thread) => thread.title === 'Do a small thing')?.sessionId;
+    });
+    expect(sourceSessionId).toBeDefined();
     const run: ShipRun = {
       id: 'ship-reply',
       source: 'plan',
@@ -740,7 +747,7 @@ describe('native Ship run history', () => {
           title: 'Worker with a question',
           state: 'working',
           path: repository,
-          threadId: 'acp:claude:claude-test-1',
+          threadId: `acp:claude:${sourceSessionId}`,
           reportedStatus: 'blocked',
           blockedReason: 'Which token?\nSecond line',
         }),

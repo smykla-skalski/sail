@@ -1,4 +1,6 @@
 {
+  "productName": "Sail E2E",
+  "identifier": "dev.smykla.sail.e2e",
   "build": {
     "beforeBuildCommand": "npm run build -- --mode e2e"
   },

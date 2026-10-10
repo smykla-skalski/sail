@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   assertShipGateAllowed,
+  defaultShipValidationConfig,
   pathMatchesRiskPattern,
   readStableShipValidationInputs,
   requiredShipGatesSatisfied,
@@ -38,6 +39,28 @@ function gate(name: ShipGate['gate'], verdict: ShipGate['verdict'], updated = 1)
     revision: 'revision-a',
   };
 }
+
+void test('Sail low-risk defaults to a fresh inline-review gate', () => {
+  const lowRiskConfig = { ...defaultShipValidationConfig, defaultRisk: 'low' as const };
+  const policy = selectShipValidationPolicy(lowRiskConfig, [], null, 'revision-a', undefined, 1);
+  assert.deepEqual(policy.requiredGates, ['inline-review']);
+});
+
+void test('Sail higher-risk defaults replace inline-review with adversarial review', () => {
+  for (const risk of ['medium', 'high'] as const) {
+    const policy = selectShipValidationPolicy(
+      defaultShipValidationConfig,
+      [],
+      risk,
+      'revision-a',
+      undefined,
+      1,
+    );
+    assert.ok(!policy.requiredGates.includes('inline-review'));
+    assert.ok(policy.requiredGates.includes('code-adversary'));
+    assert.ok(policy.requiredGates.includes('findings-adversary'));
+  }
+});
 
 void test('path matching is deterministic across separators and recursive patterns', () => {
   assert.equal(pathMatchesRiskPattern('src-tauri/src/lib.rs', 'src-tauri/**'), true);
@@ -101,7 +124,7 @@ void test('repository policies cannot remove gates at higher risk', () => {
         medium: [],
         high: ['test-adversary'],
       }),
-    /retain every low-risk gate/,
+    /retain or strengthen every low-risk gate/,
   );
   assert.throws(
     () =>

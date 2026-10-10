@@ -40,8 +40,8 @@ export type NativeSubagent = {
 
 export type NativeSubagentStore = Record<string, NativeSubagent>;
 
-export function nativeSubagentId(agent: string, sessionId: string): string {
-  return `${agent}:${sessionId}`;
+export function nativeSubagentId(agent: string, directory: string, sessionId: string): string {
+  return JSON.stringify([agent, directory, sessionId]);
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -50,8 +50,15 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function rootSession(store: NativeSubagentStore, agent: string, parentSessionId: string): string {
-  return store[nativeSubagentId(agent, parentSessionId)]?.rootSessionId ?? parentSessionId;
+function rootSession(
+  store: NativeSubagentStore,
+  agent: string,
+  directory: string,
+  parentSessionId: string,
+): string {
+  return (
+    store[nativeSubagentId(agent, directory, parentSessionId)]?.rootSessionId ?? parentSessionId
+  );
 }
 
 function isReplaySubagent(sessionId: string): boolean {
@@ -63,14 +70,21 @@ function isReplaySubagent(sessionId: string): boolean {
 function duplicatesLiveChild(
   store: NativeSubagentStore,
   agent: string,
+  directory: string,
   parentSessionId: string,
   sessionId: string,
 ): boolean {
-  if (!isReplaySubagent(sessionId) || store[nativeSubagentId(agent, sessionId)]) return false;
-  if (isReplaySubagent(parentSessionId)) return !store[nativeSubagentId(agent, parentSessionId)];
-  const root = rootSession(store, agent, parentSessionId);
+  if (!isReplaySubagent(sessionId) || store[nativeSubagentId(agent, directory, sessionId)])
+    return false;
+  if (isReplaySubagent(parentSessionId))
+    return !store[nativeSubagentId(agent, directory, parentSessionId)];
+  const root = rootSession(store, agent, directory, parentSessionId);
   return Object.values(store).some(
-    (child) => child.agent === agent && child.rootSessionId === root && !child.restored,
+    (child) =>
+      child.agent === agent &&
+      child.directory === directory &&
+      child.rootSessionId === root &&
+      !child.restored,
   );
 }
 
@@ -171,8 +185,9 @@ export function updateNativeSubagents(
     const sessionId = update.subagentSessionId;
     if (typeof sessionId !== 'string' || !sessionId.trim() || sessionId === parentSessionId)
       return store;
-    if (duplicatesLiveChild(store, event.agent, parentSessionId, sessionId)) return store;
-    const id = nativeSubagentId(event.agent, sessionId);
+    if (duplicatesLiveChild(store, event.agent, directory, parentSessionId, sessionId))
+      return store;
+    const id = nativeSubagentId(event.agent, directory, sessionId);
     const previous = store[id];
     const prompt = typeof update.prompt === 'string' ? update.prompt : previous?.prompt;
     // Only claude-agent-acp marks replayed children, so its live children stay live while a
@@ -199,7 +214,7 @@ export function updateNativeSubagents(
         directory: previous?.directory || directory,
         sessionId,
         parentSessionId,
-        rootSessionId: rootSession(store, event.agent, parentSessionId),
+        rootSessionId: rootSession(store, event.agent, directory, parentSessionId),
         name:
           typeof update.name === 'string' && update.name.trim()
             ? update.name
@@ -223,7 +238,7 @@ export function updateNativeSubagents(
         capabilityProfile: replayed
           ? capabilityProfile
           : (previous?.capabilityProfile ??
-            store[nativeSubagentId(event.agent, parentSessionId)]?.capabilityProfile ??
+            store[nativeSubagentId(event.agent, directory, parentSessionId)]?.capabilityProfile ??
             capabilityProfile),
         ...(malformed ? { error: incompleteHistory } : {}),
       },
@@ -233,7 +248,7 @@ export function updateNativeSubagents(
   if (update.sessionUpdate === 'subagent_state_update') {
     const sessionId = update.subagentSessionId;
     if (typeof sessionId !== 'string') return store;
-    const id = nativeSubagentId(event.agent, sessionId);
+    const id = nativeSubagentId(event.agent, directory, sessionId);
     const child = store[id];
     if (!child) return store;
     const outcome = state(update.state);
@@ -262,7 +277,7 @@ export function updateNativeSubagents(
     };
   }
 
-  const id = nativeSubagentId(event.agent, parentSessionId);
+  const id = nativeSubagentId(event.agent, directory, parentSessionId);
   const child = store[id];
   if (!child) return store;
   const toolCallId = typeof update.toolCallId === 'string' ? update.toolCallId : undefined;
@@ -312,9 +327,14 @@ export function reconcileNativeSubagents(
   for (let pass = 0; pass < snapshots.length; pass += 1) {
     let changed = false;
     for (const snapshot of snapshots) {
-      const id = nativeSubagentId(snapshot.agent, snapshot.sessionId);
+      const id = nativeSubagentId(snapshot.agent, snapshot.directory, snapshot.sessionId);
       const previous = next[id];
-      const rootSessionId = rootSession(next, snapshot.agent, snapshot.parentSessionId);
+      const rootSessionId = rootSession(
+        next,
+        snapshot.agent,
+        snapshot.directory,
+        snapshot.parentSessionId,
+      );
       if (
         previous?.directory === snapshot.directory &&
         previous.capabilityProfile === snapshot.capabilityProfile &&
@@ -366,11 +386,12 @@ export function reconcileNativeSubagents(
 export function setNativeSubagentWaiting(
   store: NativeSubagentStore,
   agent: string,
+  directory: string,
   sessionId: string,
   waiting: boolean,
   now = Date.now(),
 ): NativeSubagentStore {
-  const id = nativeSubagentId(agent, sessionId);
+  const id = nativeSubagentId(agent, directory, sessionId);
   const child = store[id];
   if (!child || !['working', 'waiting'].includes(child.outcome)) return store;
   return {
@@ -391,13 +412,20 @@ export function setNativeSubagentWaiting(
 export function finalizeNativeSubagentRestore(
   store: NativeSubagentStore,
   agent: string,
+  directory: string,
   rootSessionId: string,
   now = Date.now(),
 ): NativeSubagentStore {
   let changed = false;
   const next = { ...store };
   for (const [id, child] of Object.entries(store)) {
-    if (child.agent !== agent || child.rootSessionId !== rootSessionId || !child.restored) continue;
+    if (
+      child.agent !== agent ||
+      child.directory !== directory ||
+      child.rootSessionId !== rootSessionId ||
+      !child.restored
+    )
+      continue;
     if (child.outcome !== 'working' && child.outcome !== 'waiting') continue;
     next[id] = { ...child, outcome: 'unknown', activity: 'Disconnected', updated: now };
     changed = true;
@@ -408,6 +436,7 @@ export function finalizeNativeSubagentRestore(
 export function disconnectNativeSubagents(
   store: NativeSubagentStore,
   agent: string,
+  directory: string,
   sessionIds: readonly string[],
   now = Date.now(),
 ): NativeSubagentStore {
@@ -416,6 +445,7 @@ export function disconnectNativeSubagents(
   for (const [id, child] of Object.entries(store)) {
     if (
       child.agent !== agent ||
+      child.directory !== directory ||
       !sessionIds.includes(child.sessionId) ||
       !['working', 'waiting'].includes(child.outcome)
     )
@@ -462,9 +492,9 @@ export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt
   return Object.values(store).map((child) => {
     const status = nativeSubagentStatus(child);
     return {
-      receiptId: `native:${child.agent}:${child.sessionId}`,
+      receiptId: `native:${JSON.stringify([child.agent, child.directory, child.sessionId])}`,
       accessKey: '',
-      requestId: `native:${child.sessionId}`,
+      requestId: `native:${JSON.stringify([child.directory, child.sessionId])}`,
       project: child.directory,
       sourceId: `acp:${child.agent}:${child.parentSessionId}`,
       sourceDirectory: child.directory,

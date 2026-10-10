@@ -28,15 +28,15 @@ const settings: ModelRoutingSettings = {
     { role: 'debugging', risk: 'medium', provider: 'opencode', model: 'openai:gpt-6.1-sol' },
     { role: 'review', risk: 'medium', provider: 'claude', model: 'review-model' },
     { role: 'review', risk: 'high', provider: 'claude', model: 'review-model' },
+    { role: 'testing', risk: 'medium', provider: 'claude', model: 'review-model' },
     { role: 'ci-triage', risk: 'medium', provider: 'codex', model: 'gpt-6.1-luna' },
   ],
-  independentReviewRisks: ['medium', 'high'],
 };
 
 void test('selects an exact route by role and task risk', () => {
   assert.deepEqual(selectModelRoute(settings, { role: 'implementation', risk: 'low' }), {
     route: settings.routes[1],
-    independentReviewRequired: false,
+    contextIsolationRequired: false,
     reason: null,
   });
   assert.match(
@@ -45,16 +45,17 @@ void test('selects an exact route by role and task risk', () => {
   );
 });
 
-void test('rejects aliases and non-independent review routes', () => {
+void test('rejects aliases and accepts a review route that uses the implementation model', () => {
   const alias = { ...settings, routes: [{ ...settings.routes[0], model: 'latest' }] };
   assert.match(selectModelRoute(alias, { role: 'exploration', risk: 'low' }).reason ?? '', /exact/);
-  assert.match(
-    selectModelRoute(settings, {
-      role: 'review',
-      risk: 'medium',
-      implementingModels: ['provider:review-model'],
-    }).reason ?? '',
-    /Independent review/,
+  assert.deepEqual(selectModelRoute(settings, { role: 'review', risk: 'medium' }), {
+    route: settings.routes[4],
+    contextIsolationRequired: true,
+    reason: null,
+  });
+  assert.equal(
+    selectModelRoute(settings, { role: 'testing', risk: 'medium' }).contextIsolationRequired,
+    true,
   );
 });
 
@@ -66,49 +67,30 @@ void test('parses, deduplicates, and defaults review requirements safely', () =>
   );
   assert.equal(parsed.routes.length, 1);
   assert.equal(parsed.routes[0].model, 'replacement');
-  assert.deepEqual(parsed.independentReviewRisks, ['medium', 'high']);
+  assert.deepEqual(parsed, {
+    routes: [{ ...settings.routes[0], model: 'replacement' }],
+  });
 });
 
-void test('uses the requesting agent when no routes or review requirement are configured', () => {
+void test('defaults safely when no model routes are configured', () => {
   const disabled = parseModelRoutingSettings(null);
-  assert.deepEqual(disabled, { routes: [], independentReviewRisks: [] });
+  assert.deepEqual(disabled, { routes: [] });
   assert.deepEqual(selectModelRoute(disabled, { role: 'implementation', risk: 'high' }), {
     route: null,
-    independentReviewRequired: false,
+    contextIsolationRequired: false,
     reason: null,
   });
-  assert.match(
-    selectModelRoute(
-      { routes: [], independentReviewRisks: ['high'] },
-      { role: 'implementation', risk: 'high' },
-    ).reason ?? '',
-    /No high-risk implementation/,
-  );
-  const malformedRoutes = parseModelRoutingSettings(
-    JSON.stringify({ routes: 'invalid', independentReviewRisks: ['high'] }),
-  );
-  assert.deepEqual(malformedRoutes, {
-    routes: [],
-    independentReviewRisks: ['low', 'medium', 'high'],
-  });
-  assert.match(
-    selectModelRoute(malformedRoutes, { role: 'implementation', risk: 'high' }).reason ?? '',
-    /No high-risk implementation/,
-  );
+  const malformedRoutes = parseModelRoutingSettings(JSON.stringify({ routes: 'invalid' }));
+  assert.deepEqual(malformedRoutes, { routes: [] });
   for (const raw of [
     '{',
     JSON.stringify({
       routes: [{ role: 'implementation', risk: 'high', provider: 'codex', model: '' }],
     }),
-    JSON.stringify({ routes: [], independentReviewRisks: 'high' }),
-    JSON.stringify({ routes: [], independentReviewRisks: ['bogus'] }),
   ]) {
     const malformed = parseModelRoutingSettings(raw);
-    assert.deepEqual(malformed.independentReviewRisks, ['low', 'medium', 'high']);
-    assert.match(
-      selectModelRoute(malformed, { role: 'implementation', risk: 'low' }).reason ?? '',
-      /No low-risk implementation/,
-    );
+    assert.deepEqual(malformed, { routes: [] });
+    assert.equal(selectModelRoute(malformed, { role: 'implementation', risk: 'low' }).reason, null);
   }
 });
 
@@ -117,7 +99,7 @@ void test('evaluates accepted tasks and known routing failures', () => {
     revision: '2026-10-08.1',
     accepted: 6,
     acceptedTotal: 6,
-    failuresPrevented: 3,
+    failuresPrevented: 2,
     failureTotal: 3,
   });
 });
@@ -138,7 +120,6 @@ void test('OpenCode routes use the provider/model ID its ACP selector lists', ()
     const selection = selectModelRoute(
       {
         routes: [{ role: 'debugging', risk: 'low', provider: 'opencode', model }],
-        independentReviewRisks: [],
       },
       { role: 'debugging', risk: 'low' },
     );
@@ -146,16 +127,9 @@ void test('OpenCode routes use the provider/model ID its ACP selector lists', ()
   }
 });
 
-void test('independent review rejects the same OpenCode model in either ID form', () => {
-  const selection = selectModelRoute(
-    {
-      routes: [
-        { role: 'implementation', risk: 'high', provider: 'opencode', model: 'openai/gpt-6.1-sol' },
-        { role: 'review', risk: 'high', provider: 'opencode', model: 'openai:gpt-6.1-sol' },
-      ],
-      independentReviewRisks: ['high'],
-    },
-    { role: 'implementation', risk: 'high' },
+void test('legacy model-separation settings are ignored', () => {
+  const parsed = parseModelRoutingSettings(
+    JSON.stringify({ routes: [settings.routes[4]], independentReviewRisks: ['high'] }),
   );
-  assert.equal(selection.route, null);
+  assert.deepEqual(parsed, { routes: [settings.routes[4]] });
 });

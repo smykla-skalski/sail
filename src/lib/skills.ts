@@ -37,11 +37,10 @@ export const sailGateRules: Record<string, string> = {
 
 const defaultGateRules: Record<string, string> = {
   'ship-it':
-    'Run the Code Adversary, Findings Adversary, and Test Adversary in this Ship It session with the implementation agent and model.',
+    'Run the Code Adversary, Findings Adversary, and Test Adversary through validation_gate, each in its own fresh subagent session.',
   'adversarial-review':
-    'Run the Code Adversary and Findings Adversary in this session with the implementation agent and model.',
-  'adversarial-test':
-    'Run the Test Adversary in this session with the implementation agent and model.',
+    'Run the Code Adversary and Findings Adversary through validation_gate in separate fresh subagent sessions.',
+  'adversarial-test': 'Run the Test Adversary through validation_gate in a fresh subagent session.',
 };
 
 const failedGateRule =
@@ -49,9 +48,6 @@ const failedGateRule =
 
 const shipProgressStageRule =
   'Sail progress reporting: call ship_progress with { stage, status: "running" } before implementing, reviewing, testing, opening the pull request, waiting on CI, and merging. Use stages implementing, reviewing, testing, pull_request, ci, and merging respectively. When the user merges and the pull request is mergeable, call ship_progress with { stage: "awaiting_merge", status: "running" } and stop. When work cannot continue, call ship_progress with { stage, status: "blocked", reason } before explaining the blocker.';
-
-const shipProgressInlineVerdictRule =
-  'After each completed Code Adversary, Findings Adversary, or Test Adversary pass, call ship_progress with { gate, verdict, reason? } using gates code-adversary, findings-adversary, or test-adversary and the actual verdict.';
 
 export function mergeSkills(installed: SkillChoice[], bundled: SkillChoice[]): SkillChoice[] {
   const native = new Map(installed.map((skill) => [skill.name.toLowerCase(), skill]));
@@ -73,24 +69,15 @@ export function resolveSkillPrompt(
   const settings =
     typeof localStorage !== 'undefined'
       ? parseValidationSettings(getSetting(validationSettingsKey))
-      : { choices: [], strictDifferentModel: false };
+      : { choices: [] };
   const policy =
     rule && typeof localStorage !== 'undefined'
       ? `\n\n${validationInstructions(settings, currentModel)}`
       : '';
   const gate = rule
-    ? settings.choices.length || settings.strictDifferentModel
-      ? `\n\n${rule} ${failedGateRule}${policy}`
-      : `\n\nSail default gate rule: ${defaultGateRules[skill.name.toLowerCase()]} Do not call validation_gate or require agent coordination.${policy}`
+    ? `\n\nSail gate rule: ${defaultGateRules[skill.name.toLowerCase()]} ${failedGateRule}${policy}`
     : '';
-  const reporting =
-    skill.name.toLowerCase() === 'ship-it'
-      ? `\n\n${shipProgressStageRule}${
-          settings.choices.length || settings.strictDifferentModel
-            ? ''
-            : ` ${shipProgressInlineVerdictRule}`
-        }`
-      : '';
+  const reporting = skill.name.toLowerCase() === 'ship-it' ? `\n\n${shipProgressStageRule}` : '';
   return skill.instructions
     ? `${text}${gate}${reporting}\n\nFollow this bundled Sail skill:\n\n${skill.instructions}`
     : `${text}${gate}${reporting}`;

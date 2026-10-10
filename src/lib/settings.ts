@@ -4,8 +4,12 @@ import { writable } from 'svelte/store';
 export const settingsError = writable('');
 const migrationKey = 'sail-settings-migrated-v1';
 
-function isSetting(key: string): boolean {
-  return (key.startsWith('sai-') && !key.startsWith('sai-e2e-')) || key === 'sail-agent-threads';
+export function isSetting(key: string): boolean {
+  return (
+    (key.startsWith('sai-') && !key.startsWith('sai-e2e-')) ||
+    key === 'sai-e2e-job-limit' ||
+    key === 'sail-agent-threads'
+  );
 }
 
 function snapshot(): Record<string, string> {
@@ -17,13 +21,15 @@ function snapshot(): Record<string, string> {
 }
 
 let ready = false;
+let e2eSettingsDisabled = false;
 let values: Record<string, string> = {};
 let writes = Promise.resolve();
 
 export async function initializeSettings(): Promise<void> {
   if (!isTauri()) return;
-  if (import.meta.env.MODE === 'e2e' && sessionStorage.getItem('sail-e2e-settings') !== 'enabled')
-    return;
+  e2eSettingsDisabled =
+    import.meta.env.MODE === 'e2e' && sessionStorage.getItem('sail-e2e-settings') !== 'enabled';
+  if (e2eSettingsDisabled) return;
   try {
     const saved =
       localStorage.getItem(migrationKey) === '1'
@@ -70,7 +76,8 @@ export function setSetting(key: string, value: string): void {
 }
 
 export async function setSettingDurable(key: string, value: string): Promise<void> {
-  if (isTauri() && !ready) throw new Error('Sail settings are unavailable.');
+  if (isTauri() && !ready && !e2eSettingsDisabled)
+    throw new Error('Sail settings are unavailable.');
   setSetting(key, value);
   await writes;
 }

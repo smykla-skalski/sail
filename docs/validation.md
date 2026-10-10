@@ -7,9 +7,6 @@
 | OpenCode CLI | `@opencode/cli@2.0.24`           | ACP availability check (`opencode --version`)          |
 | Tauri app    | This repository's current commit | Rust CI on Linux, macOS, Windows; desktop WDIO locally |
 
-| OpenCode CLI | `@opencode/cli@2.0.24` | ACP availability check (`opencode --version`) |
-| Tauri app | This repository's current commit | Rust CI on Linux, macOS, Windows; desktop WDIO locally |
-
 Sail starts OpenCode as `<binary> acp` and requires the exact CLI version above. Update the version pin in `src-tauri/src/lib.rs` and this table together.
 
 Remote MCP registration behavior of the pinned client is re-verified by `node scripts/opencode-remote-mcp-probe.mjs` (see `docs/provider-runtime.md`); the unit suite runs it when the pinned client is available and skips otherwise.
@@ -17,6 +14,10 @@ Remote MCP registration behavior of the pinned client is re-verified by `node sc
 ## Automated checks
 
 Run `npm ci && npm run build:e2e && npm run test:e2e` on a desktop. WDIO launches the actual Tauri binary against the scripted ACP agent in `test/e2e/acp-agent.mjs` and checks repository setup, missing paths, agent threads, Ship runs and settings.
+
+On macOS, set `SAIL_E2E_CONFIG_DIR` to an absolute private directory before `build:e2e` and keep the same value when launching the app or running `test:e2e`. The bundled context LaunchAgent uses this path for its approval store and the build fails when it is absent.
+
+Settings > Agents > Concurrent jobs caps active agent turns, embedded browser tabs, and E2E test runs separately. The WebdriverIO runner reads the E2E limit before launching workers and queues concurrent invocations in launch order. `SAIL_E2E_JOB_LIMIT` overrides the saved E2E limit for an isolated runner; `SAIL_E2E_LIMIT_DIR` selects a private queue directory when independent test environments must not share slots.
 
 CI runs the frontend and Rust checks on Ubuntu, macOS, and Windows. The desktop WDIO suite requires a graphical runner and is a release check on each supported platform until hosted graphical runners are configured.
 

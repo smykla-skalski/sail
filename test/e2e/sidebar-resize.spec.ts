@@ -1,8 +1,9 @@
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { takeElementScreenshot } from './element-screenshot';
 
 const shots = process.env.SAIL_E2E_SHOTS;
 
@@ -31,54 +32,95 @@ async function shot(name: string) {
 
 describe('resizable left pane', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-sidebar-resize-'));
+  const settingKeys = [
+    'sai-directory',
+    'sail-agent-threads',
+    'sai-thread-attention',
+    'sai-project-catalog',
+    'sai-sidebar-width',
+    'sai-theme',
+  ];
+  let previousNative: Array<[string, string | null]> = [];
+  let previousLocal: Array<[string, string | null]> = [];
+  let previousE2eSetting: string | null = null;
 
-  before(() => execFileSync('git', ['init', '-q', repository]));
-  after(() => rmSync(repository, { recursive: true, force: true }));
+  before(async () => {
+    execFileSync('git', ['init', '-q', repository]);
+    previousNative = await browser.tauri.execute(async ({ core }, keys) => {
+      const saved = await core.invoke<Record<string, string>>('load_settings');
+      return keys.map((key): [string, string | null] => [key, saved[key] ?? null]);
+    }, settingKeys);
+    previousLocal = await browser.execute(
+      (keys) => keys.map((key): [string, string | null] => [key, localStorage.getItem(key)]),
+      settingKeys,
+    );
+    previousE2eSetting = await browser.execute(() => sessionStorage.getItem('sail-e2e-settings'));
+  });
+  after(async () => {
+    try {
+      await browser.tauri.execute(async ({ core }, entries) => {
+        await Promise.all(
+          entries.map(([key, value]) => core.invoke('save_setting', { key, value })),
+        );
+      }, previousNative);
+      await browser.execute(
+        (entries, e2eSetting) => {
+          for (const [key, value] of entries) {
+            if (value === null) localStorage.removeItem(key);
+            else localStorage.setItem(key, value);
+          }
+          if (e2eSetting === null) sessionStorage.removeItem('sail-e2e-settings');
+          else sessionStorage.setItem('sail-e2e-settings', e2eSetting);
+        },
+        previousLocal,
+        previousE2eSetting,
+      );
+    } finally {
+      rmSync(repository, { recursive: true, force: true });
+    }
+  });
 
   it('resizes by keyboard, collapses to an icon rail and persists the width', async () => {
     const path = realpathSync(repository);
-    const settings = await browser.execute((selectedPath) => {
-      sessionStorage.setItem('sail-e2e-settings', 'enabled');
-      const states = ['done', 'interrupted', 'failed'] as const;
-      const threads = states.map((state, index) => ({
-        agent: 'claude',
-        directory: selectedPath,
-        sessionId: `rail-${state}`,
-        title: `Rail ${state}`,
-        updated: Date.now() - index,
-      }));
-      localStorage.setItem('sai-directory', selectedPath);
-      localStorage.setItem('sail-agent-threads', JSON.stringify(threads));
-      localStorage.setItem(
-        'sai-thread-attention',
-        JSON.stringify(
-          Object.fromEntries(
-            threads.map((thread, index) => [
-              JSON.stringify([thread.agent, thread.directory, thread.sessionId]),
-              { status: states[index], unread: false },
-            ]),
+    const settings = await browser.execute(
+      (selectedPath, selectedKeys) => {
+        sessionStorage.setItem('sail-e2e-settings', 'enabled');
+        const states = ['done', 'interrupted', 'failed'] as const;
+        const threads = states.map((state, index) => ({
+          agent: 'claude',
+          directory: selectedPath,
+          sessionId: `rail-${state}`,
+          title: `Rail ${state}`,
+          updated: Date.now() - index,
+        }));
+        localStorage.setItem('sai-directory', selectedPath);
+        localStorage.setItem('sail-agent-threads', JSON.stringify(threads));
+        localStorage.setItem(
+          'sai-thread-attention',
+          JSON.stringify(
+            Object.fromEntries(
+              threads.map((thread, index) => [
+                JSON.stringify([thread.agent, thread.directory, thread.sessionId]),
+                { status: states[index], unread: false },
+              ]),
+            ),
           ),
-        ),
-      );
-      localStorage.setItem(
-        'sai-project-catalog',
-        JSON.stringify({
-          repositories: [selectedPath],
-          groups: [{ id: 'work', name: 'Work', collapsed: false, repositories: [selectedPath] }],
-          worktrees: {},
-        }),
-      );
-      localStorage.setItem('sai-sidebar-width', '248');
-      localStorage.setItem('sai-theme', 'dark');
-      return [
-        'sai-directory',
-        'sail-agent-threads',
-        'sai-thread-attention',
-        'sai-project-catalog',
-        'sai-sidebar-width',
-        'sai-theme',
-      ].map((key) => [key, localStorage.getItem(key)]);
-    }, path);
+        );
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({
+            repositories: [selectedPath],
+            groups: [{ id: 'work', name: 'Work', collapsed: false, repositories: [selectedPath] }],
+            worktrees: {},
+          }),
+        );
+        localStorage.setItem('sai-sidebar-width', '248');
+        localStorage.setItem('sai-theme', 'dark');
+        return selectedKeys.map((key) => [key, localStorage.getItem(key)]);
+      },
+      path,
+      settingKeys,
+    );
     await browser.tauri.execute(async ({ core }, entries) => {
       await Promise.all(entries.map(([key, value]) => core.invoke('save_setting', { key, value })));
     }, settings);
@@ -122,6 +164,9 @@ describe('resizable left pane', () => {
       ),
     ).toBe(true);
     await shot('2560-rail');
+    const sidebarScreenshot = await takeElementScreenshot('.sidebar');
+    expect(sidebarScreenshot.readUInt32BE(16)).toBeLessThan(300);
+    if (shots) writeFileSync(join(shots, '2560-rail-sidebar.png'), sidebarScreenshot);
 
     await browser.refresh();
     await expect($('.app-shell')).toHaveAttribute('data-sidebar-rail', 'true');

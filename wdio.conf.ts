@@ -3,12 +3,26 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { isolatedPaths, privatePort, PrivateEndpointGuard } from './test/e2e-isolation.ts';
+import { E2eJobQueue, e2eJobLimit } from './test/e2e-concurrency.ts';
+
+const limitEnvironment = { ...process.env };
+const jobs = new E2eJobQueue(undefined, () => e2eJobLimit(limitEnvironment));
+const cancelQueuedJob = (signal: number) => {
+  jobs.release();
+  process.exit(128 + signal);
+};
+const cancelOnInterrupt = () => cancelQueuedJob(2);
+const cancelOnTerminate = () => cancelQueuedJob(15);
 
 const port = privatePort(process.env.TAURI_WEBDRIVER_PORT);
 process.env.TAURI_WEBDRIVER_PORT = String(port);
 const serviceModule = '@wdio/tauri-service';
 const { default: TauriService } = await import(serviceModule);
 const state = mkdtempSync(join(tmpdir(), 'sail-e2e-'));
+process.once('exit', () => {
+  jobs.release();
+  rmSync(state, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+});
 const attach = process.env.SAIL_E2E_ATTACH === '1';
 Object.assign(process.env, isolatedPaths(state, attach, process.env));
 if (!attach) process.env.CLAUDE_CONFIG_DIR = join(state, 'claude');
@@ -59,6 +73,21 @@ export const config = {
   mochaOpts: { timeout: 240_000 },
   waitforTimeout: 20_000,
   connectionRetryTimeout: 90_000,
+  async onPrepare() {
+    let lastWaitingLimit: number | null = null;
+    process.once('SIGINT', cancelOnInterrupt);
+    process.once('SIGTERM', cancelOnTerminate);
+    try {
+      await jobs.acquire((limit) => {
+        if (limit === lastWaitingLimit) return;
+        lastWaitingLimit = limit;
+        process.stdout.write(`Waiting for E2E slot (limit ${limit})\n`);
+      });
+    } finally {
+      process.off('SIGINT', cancelOnInterrupt);
+      process.off('SIGTERM', cancelOnTerminate);
+    }
+  },
   /** Specs share one app process. Clear state left by earlier specs before pinning appearance. */
   async before() {
     await browser.switchToWindow('main');
@@ -80,8 +109,16 @@ export const config = {
       const resolutions = pending.map((item) => {
         if (!item || typeof item !== 'object') throw new Error('Invalid pending inbox item');
         const agent: unknown = Reflect.get(item, 'agent');
+        const directory: unknown = Reflect.get(item, 'directory');
+        const profile: unknown = Reflect.get(item, 'profile');
         const message: unknown = Reflect.get(item, 'message');
-        if (typeof agent !== 'string' || !message || typeof message !== 'object')
+        if (
+          typeof agent !== 'string' ||
+          typeof directory !== 'string' ||
+          typeof profile !== 'string' ||
+          !message ||
+          typeof message !== 'object'
+        )
           throw new Error('Invalid pending inbox request');
         const method: unknown = Reflect.get(message, 'method');
         const params: unknown = Reflect.get(message, 'params');
@@ -93,11 +130,11 @@ export const config = {
           if (typeof requestId !== 'string' && typeof requestId !== 'number')
             throw new Error('Pending elicitation has no request ID');
           return invoke('acp_elicitation', {
-            params: { agent, sessionId, requestId, action: 'cancel', content: null },
+            params: { agent, directory, sessionId, profile, requestId, action: 'cancel', content: null },
           });
         }
         if (method === 'session/request_permission') {
-          return invoke('acp_cancel', { agent, sessionId, turnId: null });
+          return invoke('acp_cancel', { agent, directory, sessionId, turnId: null });
         }
         throw new Error(`Unexpected pending request: ${String(method)}`);
       });
@@ -121,6 +158,7 @@ export const config = {
     }, e2eAppearance);
   },
   onComplete() {
+    jobs.release();
     rmSync(state, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   },
 };

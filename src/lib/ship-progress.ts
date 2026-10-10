@@ -25,7 +25,12 @@ import {
   type UntestedCriterion,
 } from './task-evidence.ts';
 
-export const gateNames = ['code-adversary', 'findings-adversary', 'test-adversary'] as const;
+export const gateNames = [
+  'inline-review',
+  'code-adversary',
+  'findings-adversary',
+  'test-adversary',
+] as const;
 export type GateName = (typeof gateNames)[number];
 export const stages = [
   'implementing',

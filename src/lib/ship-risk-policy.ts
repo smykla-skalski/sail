@@ -33,12 +33,18 @@ export const shipValidationConfigSchema = z
       if (new Set(gates).size !== gates.length)
         context.addIssue({ code: 'custom', message: `${risk} validation gates must be unique.` });
     }
-    for (const gate of config.low)
-      if (!config.medium.includes(gate) || !config.high.includes(gate))
+    for (const gate of config.low) {
+      const coveredAt = (risk: 'medium' | 'high') =>
+        config[risk].includes(gate) ||
+        (gate === 'inline-review' &&
+          config[risk].includes('code-adversary') &&
+          config[risk].includes('findings-adversary'));
+      if (!coveredAt('medium') || !coveredAt('high'))
         context.addIssue({
           code: 'custom',
-          message: 'Higher risks must retain every low-risk gate.',
+          message: 'Higher risks must retain or strengthen every low-risk gate.',
         });
+    }
     for (const gate of config.medium)
       if (!config.high.includes(gate))
         context.addIssue({
@@ -89,7 +95,7 @@ export const shipValidationPolicySchema = z.object({
 
 export const defaultShipValidationConfig: ShipValidationConfig = {
   defaultRisk: 'medium',
-  low: ['test-adversary'],
+  low: ['inline-review'],
   medium: ['code-adversary', 'findings-adversary', 'test-adversary'],
   high: ['code-adversary', 'findings-adversary', 'test-adversary'],
   paths: [],
