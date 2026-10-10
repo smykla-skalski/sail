@@ -366,6 +366,21 @@ impl AcpTerminalManager {
         Ok(())
     }
 
+    pub fn begin_worktree_removal(&self, worktree: &Path) -> Result<Vec<PathBuf>, String> {
+        let worktree = stable_worktree_identity(worktree);
+        let mut blocked = self
+            .worktrees_being_removed
+            .lock()
+            .map_err(|error| error.to_string())?;
+        blocked.insert(worktree.clone());
+        let terminals = self.active.lock().map_err(|error| error.to_string())?;
+        Ok(terminals
+            .values()
+            .filter(|terminal| worktree_contains(&worktree, &terminal.directory))
+            .map(|terminal| stable_worktree_identity(&terminal.directory))
+            .collect())
+    }
+
     pub fn allow_worktree_terminals(&self, worktree: &Path) {
         let worktree = stable_worktree_identity(worktree);
         if let Ok(mut blocked) = self.worktrees_being_removed.lock() {

@@ -1842,16 +1842,42 @@ async fn delete_worktree(
         let managed_terminal_data =
             acp_terminal::worktree_data_directory(&cache_directory, &directory);
         let terminals = app.state::<acp_terminal::AcpTerminalManager>().inner();
-        if stop_agents == Some(true) {
-            fence.stop_sessions_in(&app, &agents, &directory)?;
-        }
-        fence.cleanup(&agents, &directory, native_generation, || {
-            let terminal_manager = app.state::<terminal::TerminalManager>();
-            let result = (|| {
+        let terminal_manager = app.state::<terminal::TerminalManager>();
+        let acp_roots = match terminals.begin_worktree_removal(&directory) {
+            Ok(roots) => roots,
+            Err(error) => {
+                terminals.allow_worktree_terminals(&directory);
+                return Err(error);
+            }
+        };
+        let terminal_roots = match terminal_manager.begin_worktree_removal(&directory) {
+            Ok(roots) => roots,
+            Err(error) => {
+                terminal_manager.allow_worktree_terminals(&directory);
+                terminals.allow_worktree_terminals(&directory);
+                return Err(error);
+            }
+        };
+        let mut removed_from_git = false;
+        let result = (|| {
+            let roots = acp_roots
+                .into_iter()
+                .chain(terminal_roots)
+                .collect::<Vec<_>>();
+            let managed_data = persist_worktree_data_manifest(
+                &cache_directory,
+                &managed_terminal_data,
+                &directory,
+                &roots,
+            )?;
+            if stop_agents == Some(true) {
+                fence.stop_sessions_in(&app, &agents, &directory)?;
+            }
+            fence.cleanup(&agents, &directory, native_generation, || {
                 terminal_manager.stop_worktree(&directory)?;
                 terminals.stop_worktree(&directory)?;
-                remove_worktree_then_terminal_data(&managed_terminal_data, || {
-                    if archive_ignored == Some(true) {
+                remove_worktree_then_terminal_data_many(&managed_data, || {
+                    let result = if archive_ignored == Some(true) {
                         archive_ignored_and_remove(
                             checked,
                             worktree,
@@ -1867,30 +1893,213 @@ async fn delete_worktree(
                             expected_branch.as_deref(),
                         )?;
                         Ok(None)
+                    };
+                    if result.is_ok() {
+                        removed_from_git = true;
                     }
+                    result
                 })
-            })();
-            if result.is_err() {
-                terminal_manager.allow_worktree_terminals(&directory);
-                terminals.allow_worktree_terminals(&directory);
-            }
-            result
-        })
+            })
+        })();
+        if result.is_err() && !removed_from_git {
+            terminal_manager.allow_worktree_terminals(&directory);
+            terminals.allow_worktree_terminals(&directory);
+        }
+        result
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
+#[cfg(test)]
 fn remove_worktree_then_terminal_data<T>(
     managed_data: &Path,
     remove_worktree: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    remove_worktree_then_terminal_data_many(&[managed_data.to_path_buf()], remove_worktree)
+}
+
+fn remove_worktree_then_terminal_data_many<T>(
+    managed_data: &[PathBuf],
+    remove_worktree: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     let result = remove_worktree()?;
-    if managed_data.exists() {
-        std::fs::remove_dir_all(managed_data)
-            .map_err(|error| format!("Cannot remove worktree terminal data: {error}"))?;
+    for directory in managed_data {
+        match std::fs::remove_dir_all(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("Cannot remove worktree terminal data: {error}"));
+            }
+        }
     }
     Ok(result)
+}
+
+const NESTED_WORKTREE_MANIFEST_PREFIX: &str = "nested-worktrees-";
+const NESTED_WORKTREE_MANIFEST_HEADER: &str = "sail-terminal-worktrees-v1";
+
+fn persist_worktree_data_manifest(
+    cache_directory: &Path,
+    outer_data: &Path,
+    outer_worktree: &Path,
+    discovered_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let outer_worktree = acp_terminal::stable_worktree_identity(outer_worktree);
+    let mut roots = HashSet::new();
+    roots.insert(outer_worktree.clone());
+    if outer_data.is_dir() {
+        for entry in std::fs::read_dir(outer_data).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(NESTED_WORKTREE_MANIFEST_PREFIX) || !name.ends_with(".manifest") {
+                continue;
+            }
+            if !entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Err("Nested worktree manifest is not a regular file.".into());
+            }
+            let contents =
+                std::fs::read_to_string(entry.path()).map_err(|error| error.to_string())?;
+            let mut lines = contents.lines();
+            if lines.next() != Some(NESTED_WORKTREE_MANIFEST_HEADER) {
+                return Err("Nested worktree manifest is malformed.".into());
+            }
+            for line in lines {
+                if line.is_empty() {
+                    continue;
+                }
+                let path = decode_manifest_path(line)?;
+                let path = acp_terminal::stable_worktree_identity(&path);
+                validate_nested_worktree_root(&outer_worktree, &path)?;
+                roots.insert(path);
+            }
+        }
+    }
+    for root in discovered_roots {
+        let root = acp_terminal::stable_worktree_identity(root);
+        if root != outer_worktree {
+            validate_nested_worktree_root(&outer_worktree, &root)?;
+            roots.insert(root);
+        }
+    }
+    let nested = roots
+        .iter()
+        .filter(|root| **root != outer_worktree)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !nested.is_empty() {
+        std::fs::create_dir_all(outer_data).map_err(|error| error.to_string())?;
+        let mut entries = nested.clone();
+        entries.sort();
+        let mut contents = format!("{NESTED_WORKTREE_MANIFEST_HEADER}\n");
+        for root in &entries {
+            contents.push_str(&encode_manifest_path(root));
+            contents.push('\n');
+        }
+        let temporary = outer_data.join(format!(
+            ".{NESTED_WORKTREE_MANIFEST_PREFIX}{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        let published = outer_data.join(format!(
+            "{NESTED_WORKTREE_MANIFEST_PREFIX}{}.manifest",
+            uuid::Uuid::new_v4()
+        ));
+        let write_result = (|| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| error.to_string())?;
+            file.write_all(contents.as_bytes())
+                .map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+            rename_without_replace(&temporary, &published).map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        write_result?;
+    }
+    let mut data = nested
+        .iter()
+        .map(|root| acp_terminal::worktree_data_directory(cache_directory, root))
+        .collect::<Vec<_>>();
+    data.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    data.push(outer_data.to_path_buf());
+    Ok(data)
+}
+
+fn validate_nested_worktree_root(outer: &Path, candidate: &Path) -> Result<(), String> {
+    let outer = acp_terminal::stable_worktree_identity(outer);
+    let candidate = acp_terminal::stable_worktree_identity(candidate);
+    if candidate == outer || !candidate.starts_with(&outer) {
+        return Err(
+            "Nested worktree manifest contains a path outside the selected worktree.".into(),
+        );
+    }
+    Ok(())
+}
+
+fn encode_manifest_path(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let bytes = path.to_string_lossy().as_bytes().to_vec();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_manifest_path(encoded: &str) -> Result<PathBuf, String> {
+    if encoded.len() & 1 != 0 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Nested worktree manifest contains an invalid path encoding.".into());
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).unwrap_or_default() as u8;
+            let low = (pair[1] as char).to_digit(16).unwrap_or_default() as u8;
+            (high << 4) | low
+        })
+        .collect::<Vec<_>>();
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(bytes))
+    };
+    #[cfg(windows)]
+    let path = {
+        use std::os::windows::ffi::OsStringExt;
+        if bytes.len() & 1 != 0 {
+            return Err("Nested worktree manifest contains an invalid Windows path.".into());
+        }
+        PathBuf::from(OsString::from_wide(
+            &bytes
+                .chunks(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        ))
+    };
+    #[cfg(not(any(unix, windows)))]
+    let path = PathBuf::from(String::from_utf8(bytes).map_err(|error| error.to_string())?);
+    Ok(path)
 }
 
 fn archive_ignored_and_remove(
@@ -2688,12 +2897,14 @@ mod tests {
     use super::working_tree_generation;
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
-        existing_shipping_worktree, git_change_action, git_patch, git_reference,
-        normalize_picker_path, parse_registered_worktrees, registered_worktrees, remove_worktree,
-        remove_worktree_then_terminal_data, remove_worktree_with_hook, remove_worktree_with_hooks,
-        repository_namespace, shipping_base_revision, shipping_changed_paths,
-        shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
-        working_tree_diff, worktree_overviews, WorktreeOperationLocks,
+        encode_manifest_path, existing_shipping_worktree, git_change_action, git_patch,
+        git_reference, normalize_picker_path, parse_registered_worktrees,
+        persist_worktree_data_manifest, registered_worktrees, remove_worktree,
+        remove_worktree_then_terminal_data, remove_worktree_then_terminal_data_many,
+        remove_worktree_with_hook, remove_worktree_with_hooks, repository_namespace,
+        shipping_base_revision, shipping_changed_paths, shipping_default_branch,
+        shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
+        worktree_overviews, WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::GitCanonical;
@@ -2730,6 +2941,83 @@ mod tests {
             .expect("managed data should be deleted after successful removal");
         assert!(!managed.exists());
         assert!(sibling.join("cache").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_terminal_data_manifest_survives_partial_stop_and_retries_after_removal() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-nested-terminal-cleanup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = root.join("cache");
+        let outer = root.join("worktrees/outer");
+        let nested = outer.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let outer_data = crate::acp_terminal::worktree_data_directory(&cache, &outer);
+        let nested_data = crate::acp_terminal::worktree_data_directory(&cache, &nested);
+        fs::create_dir_all(&nested_data).unwrap();
+        fs::write(nested_data.join("cache"), "nested terminal data").unwrap();
+        fs::create_dir_all(&outer_data).unwrap();
+        fs::write(outer_data.join("cache"), "outer terminal data").unwrap();
+
+        let first_attempt = persist_worktree_data_manifest(
+            &cache,
+            &outer_data,
+            &outer,
+            std::slice::from_ref(&nested),
+        )
+        .expect("persist roots before stopping terminals");
+        let error = remove_worktree_then_terminal_data_many(&first_attempt, || {
+            Err::<(), _>("second terminal stop failed".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(error, "second terminal stop failed");
+        assert!(nested_data.join("cache").exists());
+        assert!(outer_data.join("cache").exists());
+
+        fs::remove_dir_all(&outer).unwrap();
+        let retry = persist_worktree_data_manifest(&cache, &outer_data, &outer, &[])
+            .expect("retry should recover roots from the manifest");
+        assert!(retry.iter().any(|path| path == &nested_data));
+        remove_worktree_then_terminal_data_many(&retry, || Ok(()))
+            .expect("clean nested data after successful removal");
+        assert!(!nested_data.exists());
+        assert!(!outer_data.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_terminal_data_manifest_rejects_outside_roots_before_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-nested-terminal-manifest-validation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = root.join("cache");
+        let outer = root.join("worktrees/outer");
+        let outside = root.join("unrelated-worktree");
+        fs::create_dir_all(&outer).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outer_data = crate::acp_terminal::worktree_data_directory(&cache, &outer);
+        let outside_data = crate::acp_terminal::worktree_data_directory(&cache, &outside);
+        fs::create_dir_all(&outer_data).unwrap();
+        fs::create_dir_all(&outside_data).unwrap();
+        fs::write(outside_data.join("cache"), "unrelated cache").unwrap();
+        let manifest = outer_data.join("nested-worktrees-invalid.manifest");
+        fs::write(
+            &manifest,
+            format!(
+                "{NESTED_WORKTREE_MANIFEST_HEADER}\n{}\n",
+                encode_manifest_path(&outside)
+            ),
+        )
+        .unwrap();
+
+        let error = persist_worktree_data_manifest(&cache, &outer_data, &outer, &[])
+            .expect_err("outside roots must be rejected");
+        assert!(error.contains("outside the selected worktree"));
+        assert!(outside_data.join("cache").exists());
+        assert!(outer_data.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -298,9 +298,13 @@ mod tests {
             .expect("open ConPTY");
         let job = WindowsTerminalJob::new().expect("create owned terminal job");
         let output_drain = drain_conpty_output(pair.master.as_ref());
-        let mut command = CommandBuilder::new(super::shell());
-        command.arg("/C");
-        command.arg("start \"\" /B ping -n 60 127.0.0.1 & exit");
+        let mut command = CommandBuilder::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Process -FilePath 'ping.exe' -ArgumentList @('-n','60','127.0.0.1'); exit 0",
+        ]);
         command.set_job_handle(job.raw_handle());
         let mut child = pair
             .slave
@@ -721,6 +725,21 @@ impl TerminalManager {
                 .remove(&id);
         }
         Ok(())
+    }
+
+    pub fn begin_worktree_removal(&self, worktree: &Path) -> Result<Vec<PathBuf>, String> {
+        let worktree = crate::acp_terminal::stable_worktree_identity(worktree);
+        let mut worktree_operations = self.1.lock().map_err(|error| error.to_string())?;
+        worktree_operations.insert(worktree.clone());
+        let sessions = self.0.lock().map_err(|error| error.to_string())?;
+        Ok(sessions
+            .values()
+            .filter(|session| {
+                session.owner.is_some()
+                    && crate::acp_terminal::worktree_contains(&worktree, &session.worktree)
+            })
+            .map(|session| crate::acp_terminal::stable_worktree_identity(&session.worktree))
+            .collect())
     }
 
     pub fn allow_worktree_terminals(&self, worktree: &Path) {
