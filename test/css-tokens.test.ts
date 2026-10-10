@@ -13,7 +13,6 @@ const tokenFiles = new Set(['src/style.css']);
 // GitHub check dots. Counts must match exactly so new literals and stale entries both fail.
 const literalAllowlist: Record<string, Record<string, number>> = {
   'src/AgentStatusBar.svelte': { '#0004': 1 },
-  'src/AgentWorkspace.svelte': { '#0003': 1, '#0009': 1 },
   'src/Diagram.svelte': { 'rgb(0 0 0 / 70%)': 1 },
   'src/DiffPanel.svelte': { 'rgba(37, 153, 103, 0.13)': 1, 'rgba(213, 82, 82, 0.13)': 1 },
   'src/OptionPicker.svelte': { '#0002': 1 },
