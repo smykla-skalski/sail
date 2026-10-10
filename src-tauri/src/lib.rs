@@ -3020,6 +3020,7 @@ pub fn run() {
             acp::acp_agents,
             acp::acp_connect,
             acp::acp_new_session,
+            acp::acp_reset_test_runtimes,
             acp::acp_forget_session,
             acp::acp_release_session_fence,
             acp::acp_load_session,

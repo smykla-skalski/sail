@@ -4,6 +4,13 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+async function sendWhenReady() {
+  const send = $('.agent-actions button:last-child');
+  await expect(send).toHaveText('Send ↗');
+  await send.waitForEnabled();
+  await send.click();
+}
+
 describe('pending requests across projects', () => {
   const first = mkdtempSync(join(tmpdir(), 'sail-inbox-first-'));
   const second = mkdtempSync(join(tmpdir(), 'sail-inbox-second-'));
@@ -37,8 +44,7 @@ describe('pending requests across projects', () => {
     await $('.agent-launches button').click();
     await $('.agent-composer [data-pane-prompt]').waitForEnabled();
     await $('.agent-composer [data-pane-prompt]').setValue('First request');
-    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
-    await $('.agent-actions button:last-child').click();
+    await sendWhenReady();
     try {
       await expect($('.agent-permission')).toBeDisplayed();
     } catch (cause) {
@@ -58,8 +64,7 @@ describe('pending requests across projects', () => {
     await $('.agent-launches button').click();
     await $('.agent-composer [data-pane-prompt]').waitForEnabled();
     await $('.agent-composer [data-pane-prompt]').setValue('Second request');
-    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
-    await $('.agent-actions button:last-child').click();
+    await sendWhenReady();
     await expect($('.agent-permission')).toBeDisplayed();
     await $(`.project-default-worktree-select[title="${paths[0]}"]`).click();
 
@@ -96,8 +101,7 @@ describe('pending requests across projects', () => {
     await $('.agent-launches button').click();
     await $('.agent-composer [data-pane-prompt]').waitForEnabled();
     await $('.agent-composer [data-pane-prompt]').setValue('Activity demo');
-    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
-    await $('.agent-actions button:last-child').click();
+    await sendWhenReady();
     await browser.waitUntil(async () => (await $$('.inbox-result')).length === 1);
     await $('[data-topbar-inbox]').click();
     await expect($('.inbox-result')).toHaveText(expect.stringContaining('Turn completed'));
@@ -114,8 +118,7 @@ describe('pending requests across projects', () => {
     );
     await $('[aria-label="Close pending requests"]').click();
     await $('.agent-composer [data-pane-prompt]').setValue('Steer no-response follow-up');
-    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
-    await $('.agent-actions button:last-child').click();
+    await sendWhenReady();
     await browser.waitUntil(async () => (await $$('.inbox-result')).length === 2);
     await $('[data-topbar-inbox]').click();
     const results = await $$('.inbox-result');
@@ -175,8 +178,7 @@ describe('pending requests across projects', () => {
     await $('.agent-launches button').click();
     await $('.agent-composer [data-pane-prompt]').waitForEnabled();
     await $('.agent-composer [data-pane-prompt]').setValue('Activity demo');
-    await expect($('.agent-actions button:last-child')).toHaveText('Send ↗');
-    await $('.agent-actions button:last-child').click();
+    await sendWhenReady();
     await $(`.project-default-worktree-select[title="${paths[1]}"]`).click();
     await browser.waitUntil(() =>
       browser.execute(() =>

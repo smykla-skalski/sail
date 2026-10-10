@@ -3558,6 +3558,22 @@ pub fn acp_release_session_fence(
     fence.release_session(&agent, Path::new(&directory), &session_id)
 }
 
+/// E2E specs share one app process; release their fixture runtimes between specs.
+/// The command is only permitted by the E2E capability and has no production effect.
+#[tauri::command]
+pub fn acp_reset_test_runtimes(manager: State<'_, AgentManager>) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        manager.shutdown();
+        Ok(())
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let _ = manager;
+        Err("ACP test runtime reset requires the E2E build".into())
+    }
+}
+
 /// Releases the browser token a deleted thread's session still holds.
 #[tauri::command]
 pub fn acp_forget_session(

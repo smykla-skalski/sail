@@ -94,7 +94,7 @@ export const config = {
   async before() {
     await browser.switchToWindow('main');
     await browser.setWindowSize(1280, 850);
-    const needsReload = await browser.execute(async () => {
+    await browser.execute(async () => {
       const tauri: unknown = Reflect.get(window, '__TAURI__');
       const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
       const invoke: unknown = core && typeof core === 'object' ? Reflect.get(core, 'invoke') : null;
@@ -103,8 +103,7 @@ export const config = {
       const windows: unknown = await invoke('plugin:wdio|list_windows');
       if (!Array.isArray(windows) || !windows.every((label) => typeof label === 'string'))
         throw new Error('Invalid Tauri window list');
-      const hadSettingsWindow = windows.includes('settings');
-      if (hadSettingsWindow) await invoke('plugin:window|close', { label: 'settings' });
+      if (windows.includes('settings')) await invoke('plugin:window|close', { label: 'settings' });
       const response: unknown = await invoke('acp_pending_inbox');
       if (!Array.isArray(response)) throw new Error('Invalid pending inbox response');
       const pending: unknown[] = response;
@@ -152,12 +151,12 @@ export const config = {
       const remaining: unknown = await invoke('acp_pending_inbox');
       if (!Array.isArray(remaining) || remaining.length > 0)
         throw new Error('E2E setup left pending agent requests');
-      sessionStorage.removeItem('sail-e2e-settings');
-      const hadQuery = !!location.search;
-      if (hadQuery) history.replaceState(null, '', location.pathname);
-      return hadSettingsWindow || hadQuery || pending.length > 0;
+      await invoke('acp_reset_test_runtimes');
+      localStorage.clear();
+      sessionStorage.clear();
+      if (location.search) history.replaceState(null, '', location.pathname);
     });
-    if (needsReload) await browser.refresh();
+    await browser.refresh();
 
     await browser.execute(async (value) => {
       const tauri: unknown = Reflect.get(window, '__TAURI__');
