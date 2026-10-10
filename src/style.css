@@ -3136,9 +3136,43 @@ time {
 }
 .sidebar-rail .rail-thread {
   height: 36px;
+  --rail-activity-color: var(--activity-neutral);
 }
-.sidebar-rail .rail-thread .activity-status {
+.sidebar-rail .rail-thread[data-state='working'] {
+  --rail-activity-color: var(--activity-working);
+}
+.sidebar-rail .rail-thread[data-state='fixing'] {
+  --rail-activity-color: var(--activity-fixing);
+}
+.sidebar-rail .rail-thread[data-state='stalled'] {
+  --rail-activity-color: var(--activity-stalled);
+}
+.sidebar-rail .rail-thread[data-state='waiting'] {
+  --rail-activity-color: var(--activity-waiting);
+}
+.sidebar-rail .rail-thread[data-state='completed'],
+.sidebar-rail .rail-thread[data-state='ready'] {
+  --rail-activity-color: var(--activity-completed);
+}
+.sidebar-rail .rail-thread[data-state='failed'],
+.sidebar-rail .rail-thread[data-state='interrupted'] {
+  --rail-activity-color: var(--activity-failed);
+}
+.sidebar-rail .rail-thread .harness-icon {
+  color: var(--rail-activity-color);
+}
+.sidebar-rail .rail-thread-state {
   position: absolute;
-  right: 3px;
-  bottom: 3px;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  color: var(--rail-activity-color);
+  background: var(--shell-sidebar);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
 }
