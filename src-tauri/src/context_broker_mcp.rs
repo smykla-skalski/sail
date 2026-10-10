@@ -8,6 +8,12 @@ use serde_json::{json, Value};
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const PAGE_BYTES: usize = 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderCallError {
+    Unavailable,
+    ResponseTooLarge,
+}
+
 struct ToolError {
     message: &'static str,
     source: Option<String>,
@@ -51,7 +57,7 @@ impl BrokerMcp {
     pub fn handle(
         &self,
         input: &str,
-        mut provider_call: impl FnMut(&str, Value) -> Result<Value, ()>,
+        mut provider_call: impl FnMut(&str, Value) -> Result<Value, ProviderCallError>,
     ) -> Option<Value> {
         let request: Value = match serde_json::from_str(input) {
             Ok(request) => request,
@@ -103,7 +109,7 @@ impl BrokerMcp {
         &self,
         name: &str,
         arguments: &Value,
-        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ()>,
+        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ProviderCallError>,
     ) -> Value {
         let outcome: Result<Value, ToolError> = match name {
             "sail_context_sources" => self.sources(provider_call).map_err(Into::into),
@@ -125,7 +131,7 @@ impl BrokerMcp {
 
     fn available_tools(
         &self,
-        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ()>,
+        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ProviderCallError>,
     ) -> Result<Vec<String>, &'static str> {
         let mut names = Vec::new();
         let mut cursor = None::<String>;
@@ -170,7 +176,7 @@ impl BrokerMcp {
 
     fn sources(
         &self,
-        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ()>,
+        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ProviderCallError>,
     ) -> Result<Value, &'static str> {
         let names = self.available_tools(provider_call)?;
         if !names.iter().any(|name| name == "sources") {
@@ -225,7 +231,7 @@ impl BrokerMcp {
 
     fn health(
         &self,
-        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ()>,
+        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ProviderCallError>,
     ) -> Result<Value, &'static str> {
         let names = self.available_tools(provider_call)?;
         Ok(json!({
@@ -239,7 +245,7 @@ impl BrokerMcp {
     fn search(
         &self,
         arguments: &Value,
-        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ()>,
+        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ProviderCallError>,
     ) -> Result<Value, &'static str> {
         let query = arguments
             .get("query")
@@ -250,11 +256,21 @@ impl BrokerMcp {
         if !names.iter().any(|name| name == "search") {
             return Err("Provider search is unavailable.");
         }
-        let response = provider_call(
-            "tools/call",
-            json!({"name":"search","arguments":{"query":query,"limit":self.limits.items}}),
-        )
-        .map_err(|_| "Provider source unavailable.")?;
+        let mut limit = self.limits.items;
+        let mut truncated = false;
+        let response = loop {
+            match provider_call(
+                "tools/call",
+                json!({"name":"search","arguments":{"query":query,"limit":limit}}),
+            ) {
+                Ok(response) => break response,
+                Err(ProviderCallError::ResponseTooLarge) if limit > 1 => {
+                    limit /= 2;
+                    truncated = true;
+                }
+                Err(_) => return Err("Provider source unavailable."),
+            }
+        };
         let items = result_content(&response)?
             .get("items")
             .and_then(Value::as_array)
@@ -286,6 +302,7 @@ impl BrokerMcp {
         }
         let mut result =
             search_response(batches, self.limits).map_err(|_| "Search limits are invalid.")?;
+        result.truncated |= truncated;
         let mut retained = Vec::with_capacity(result.hits.len());
         for mut hit in std::mem::take(&mut result.hits) {
             let content = payloads
@@ -330,7 +347,7 @@ impl BrokerMcp {
     fn get(
         &self,
         arguments: &Value,
-        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ()>,
+        provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ProviderCallError>,
     ) -> Result<Value, ToolError> {
         let offset = match arguments.get("offset") {
             Some(value) => value.as_u64().ok_or("Read offset is invalid.")?,
@@ -521,7 +538,7 @@ mod tests {
             &self,
             name: &str,
             arguments: Value,
-            mut provider: impl FnMut(&str, Value) -> Result<Value, ()>,
+            mut provider: impl FnMut(&str, Value) -> Result<Value, ProviderCallError>,
         ) -> (Value, Value) {
             let request = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
                 "params":{"name":name,"arguments":arguments}});
@@ -644,6 +661,65 @@ mod tests {
         assert!(body["hits"][0]["sha256"].as_str().unwrap().len() == 64);
         assert_eq!(body["errors"][0]["source"], "file:///broken");
         assert_eq!(body["truncated"], true);
+    }
+
+    #[test]
+    fn search_retries_only_oversized_batches() {
+        let fixture = Fixture::new("search-budget");
+        let mut limits = Vec::new();
+        let (_, body) = fixture.call(
+            "sail_context_search",
+            json!({"query":"needle"}),
+            |method, params| {
+                if method == "tools/list" {
+                    return Ok(available());
+                }
+                let limit = params["arguments"]["limit"].as_u64().unwrap();
+                limits.push(limit);
+                if limit == 8 {
+                    return Err(ProviderCallError::ResponseTooLarge);
+                }
+                let items = (0..limit)
+                    .map(|index| item(&format!("hit-{index}"), "content"))
+                    .collect::<Vec<_>>();
+                Ok(json!({"result":{"structuredContent":{"items":items}}}))
+            },
+        );
+        assert_eq!(limits, [8, 4]);
+        assert_eq!(body["hits"].as_array().unwrap().len(), 4);
+        assert_eq!(body["truncated"], true);
+        assert!(body["hits"][0]["reference"].as_str().is_some());
+
+        let mut limits = Vec::new();
+        let (_, body) = fixture.call(
+            "sail_context_search",
+            json!({"query":"needle"}),
+            |method, params| {
+                if method == "tools/list" {
+                    return Ok(available());
+                }
+                limits.push(params["arguments"]["limit"].as_u64().unwrap());
+                Err(ProviderCallError::ResponseTooLarge)
+            },
+        );
+        assert_eq!(limits, [8, 4, 2, 1]);
+        assert_eq!(body["source"], "provider");
+        assert_eq!(body["error"], "Provider source unavailable.");
+
+        let mut calls = 0;
+        let (_, body) = fixture.call(
+            "sail_context_search",
+            json!({"query":"needle"}),
+            |method, _| {
+                if method == "tools/list" {
+                    return Ok(available());
+                }
+                calls += 1;
+                Err(ProviderCallError::Unavailable)
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(body["error"], "Provider source unavailable.");
     }
 
     #[test]
