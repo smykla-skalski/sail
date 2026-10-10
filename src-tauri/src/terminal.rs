@@ -77,6 +77,12 @@ impl TerminalSession {
             .process_group_stop
             .lock()
             .map_err(|error| error.to_string())?;
+        let ownership_stop =
+            if let (Some(owner), Some(pid)) = (self.owner.as_deref(), self.process_id) {
+                crate::owned_processes::stop_pid(owner, pid)
+            } else {
+                Ok(())
+            };
         #[cfg(unix)]
         {
             if self
@@ -86,6 +92,7 @@ impl TerminalSession {
                 .exit_code
                 .is_some()
             {
+                ownership_stop?;
                 return Ok(());
             }
             kill_terminal_process_groups(
@@ -97,6 +104,7 @@ impl TerminalSession {
         {
             self.job.stop()?;
         }
+        ownership_stop?;
         Ok(())
     }
 }
@@ -747,6 +755,21 @@ impl Drop for TerminalManager {
 }
 
 impl TerminalManager {
+    pub fn stop_owner(&self, owner: &str) -> Result<(), String> {
+        let sessions = self
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .filter(|session| session.owner.as_deref() == Some(owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        for session in sessions {
+            session.stop()?;
+        }
+        Ok(())
+    }
+
     pub fn shutdown(&self) {
         let sessions = self
             .0
@@ -1126,7 +1149,7 @@ fn spawn(
         command.set_job_handle(job.raw_handle());
         job
     };
-    let child = pair
+    let mut child = pair
         .slave
         .spawn_command(command)
         .map_err(|error| error.to_string())?;
@@ -1151,6 +1174,34 @@ fn spawn(
     }));
     let changed = Arc::new(Condvar::new());
     let process_id = child.process_id();
+    if let Some(owner) = owner.as_deref() {
+        let Some(pid) = process_id else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cannot identify terminal process.".into());
+        };
+        #[cfg(unix)]
+        let group = pair.master.process_group_leader();
+        #[cfg(windows)]
+        let group = Some(pid as i32);
+        let Some(group) = group else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cannot identify terminal process group.".into());
+        };
+        if let Err(error) = crate::owned_processes::register_session(owner, pid, group as u32) {
+            #[cfg(unix)]
+            if group > 0 && group != nix::unistd::getpgrp().as_raw() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(group),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Cannot track terminal ownership: {error}"));
+        }
+    }
     let process_group_stop = Arc::new(Mutex::new(()));
     let background_process_group_stop = Arc::clone(&process_group_stop);
     let master = Mutex::new(pair.master);
@@ -1420,6 +1471,7 @@ fn git_root_path(mut stdout: Vec<u8>) -> PathBuf {
 pub fn terminal_owned_create(
     app: AppHandle,
     manager: State<'_, TerminalManager>,
+    agents: State<'_, crate::acp::AgentManager>,
     pane_id: String,
     directory: String,
     command: String,
@@ -1438,28 +1490,30 @@ pub fn terminal_owned_create(
         return Err("Terminal directory is not a folder.".into());
     }
     let worktree = git_worktree_root(&directory);
-    manager.with_worktree_creation(&worktree, || {
-        let current_directory = dunce::canonicalize(&directory)
-            .map_err(|_| "Terminal directory no longer exists.".to_string())?;
-        if current_directory != directory || !current_directory.is_dir() {
-            return Err("Terminal directory changed while creating terminal.".into());
-        }
-        let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
-        if sessions.contains_key(&pane_id) {
-            return Err("Terminal pane already exists.".into());
-        }
-        let session = Arc::new(spawn(
-            directory.clone(),
-            80,
-            24,
-            Some(&command),
-            pane_id.clone(),
-            app,
-            Some(owner),
-        )?);
-        let terminal_id = format!("shell:{}", session.inspect_id);
-        sessions.insert(pane_id, session);
-        Ok(terminal_id)
+    crate::acp::with_active_owned_terminal(&agents, &owner, || {
+        manager.with_worktree_creation(&worktree, || {
+            let current_directory = dunce::canonicalize(&directory)
+                .map_err(|_| "Terminal directory no longer exists.".to_string())?;
+            if current_directory != directory || !current_directory.is_dir() {
+                return Err("Terminal directory changed while creating terminal.".into());
+            }
+            let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
+            if sessions.contains_key(&pane_id) {
+                return Err("Terminal pane already exists.".into());
+            }
+            let session = Arc::new(spawn(
+                directory.clone(),
+                80,
+                24,
+                Some(&command),
+                pane_id.clone(),
+                app,
+                Some(owner.clone()),
+            )?);
+            let terminal_id = format!("shell:{}", session.inspect_id);
+            sessions.insert(pane_id, session);
+            Ok(terminal_id)
+        })
     })
 }
 

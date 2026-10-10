@@ -1422,6 +1422,7 @@ pub struct AgentActivity {
 #[derive(Default)]
 struct PromptState {
     active: HashMap<String, ActivePrompt>,
+    finishing: HashSet<String>,
     finished: HashMap<String, PromptOutcome>,
     tool_turns: HashMap<String, HashMap<String, String>>,
     retired_tool_turns: HashMap<String, VecDeque<(String, String)>>,
@@ -1673,6 +1674,47 @@ mod interruption_report_tests {
             agent_message_overflow: false,
             known_tool_calls: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn prompt_cleanup_finishes_before_next_turn_can_start() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Mutex::new(prompts);
+        let finished = finish_prompt_after_cleanup(
+            &state,
+            "target",
+            "turn",
+            PromptOutcome {
+                status: "done",
+                notify: true,
+                error: None,
+                turn_id: "turn".into(),
+            },
+            || {
+                let prompts = state.lock().unwrap();
+                assert!(prompts.active.contains_key("target"));
+                assert!(prompts.finishing.contains("target"));
+                drop(prompts);
+                assert!(with_active_terminal_prompt_state(&state, "target", || Ok(())).is_err());
+            },
+        );
+
+        assert!(finished);
+        let prompts = state.lock().unwrap();
+        assert!(!prompts.active.contains_key("target"));
+        assert_eq!(prompts.finished.get("target").unwrap().turn_id, "turn");
+    }
+
+    #[test]
+    fn terminal_creation_requires_an_active_turn() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Mutex::new(prompts);
+        assert!(with_active_terminal_prompt_state(&state, "target", || Ok(())).is_ok());
+        assert!(with_active_terminal_prompt_state(&state, "other", || Ok(())).is_err());
+        state.lock().unwrap().active.remove("target");
+        assert!(with_active_terminal_prompt_state(&state, "target", || Ok(())).is_err());
     }
 
     #[test]
@@ -3107,15 +3149,36 @@ fn connect_blocking_inner(
                                     .or_else(|| runtime.pending_directory.lock().ok()?.clone());
                                 let manager =
                                     app.state::<crate::acp_terminal::AcpTerminalManager>();
-                                let response = match crate::acp_terminal::handle(
-                                    &app,
-                                    &manager,
-                                    &agent,
-                                    runtime.profile,
-                                    &method,
-                                    params,
-                                    directory,
-                                ) {
+                                let session_id = params
+                                    .get("sessionId")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string);
+                                let handle_request = || {
+                                    crate::acp_terminal::handle(
+                                        &app,
+                                        &manager,
+                                        &agent,
+                                        runtime.profile,
+                                        &method,
+                                        params,
+                                        directory,
+                                    )
+                                };
+                                let result = if method == "terminal/create" {
+                                    match session_id {
+                                        Some(session_id) => with_active_terminal_prompt(
+                                            &runtime,
+                                            &session_id,
+                                            handle_request,
+                                        ),
+                                        None => {
+                                            Err("Terminal request requires a session ID.".into())
+                                        }
+                                    }
+                                } else {
+                                    handle_request()
+                                };
+                                let response = match result {
                                     Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
                                     Err(error) => {
                                         json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error}})
@@ -3826,7 +3889,7 @@ pub async fn acp_prompt(
             .prompt_state
             .lock()
             .map_err(|error| error.to_string())?;
-        if prompts.active.contains_key(&session_id) {
+        if prompts.active.contains_key(&session_id) || prompts.finishing.contains(&session_id) {
             return Err("This agent thread already has an active turn.".to_string());
         }
         let processed_generation = runtime.reader_progress.processed()?;
@@ -4087,12 +4150,17 @@ pub async fn acp_prompt(
             cancelled.remove(&turn_id);
         }
         crate::memory_capture::store_completed(&app, candidates);
-        let latest = if let Ok(mut prompts) = runtime.prompt_state.lock() {
-            if prompts
-                .active
-                .get(&session_id)
-                .is_some_and(|prompt| prompt.turn_id == turn_id)
-            {
+        let latest = finish_prompt_after_cleanup(
+            &runtime.prompt_state,
+            &session_id,
+            &turn_id,
+            PromptOutcome {
+                status,
+                notify,
+                error: result.as_ref().err().cloned(),
+                turn_id: turn_id.clone(),
+            },
+            || {
                 if !runtime.stopped.load(Ordering::Acquire) {
                     if let Some(directory) = directory.as_ref() {
                     let _ = crate::settings::clear_interrupted_turn(
@@ -4104,23 +4172,9 @@ pub async fn acp_prompt(
                     );
                     }
                 }
-                prompts.active.remove(&session_id);
-                prompts.finished.insert(
-                    session_id.clone(),
-                    PromptOutcome {
-                        status,
-                        notify,
-                        error: result.as_ref().err().cloned(),
-                        turn_id: turn_id.clone(),
-                    },
-                );
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+                cleanup_session_processes(&app, &runtime, &agent, &session_id);
+            },
+        );
         if latest {
             let _ = app.emit(
                 "acp-event",
@@ -4200,6 +4254,126 @@ pub async fn acp_steer(
     .map_err(|error| error.to_string())?
 }
 
+fn finish_prompt_after_cleanup(
+    state: &Mutex<PromptState>,
+    session_id: &str,
+    turn_id: &str,
+    outcome: PromptOutcome,
+    cleanup: impl FnOnce(),
+) -> bool {
+    let latest = state.lock().is_ok_and(|mut prompts| {
+        let latest = prompts
+            .active
+            .get(session_id)
+            .is_some_and(|prompt| prompt.turn_id == turn_id);
+        if latest {
+            prompts.finishing.insert(session_id.to_string());
+        }
+        latest
+    });
+    if !latest {
+        return false;
+    }
+    // Keep the old turn active while cleanup runs so the next turn cannot start.
+    cleanup();
+    let Ok(mut prompts) = state.lock() else {
+        return false;
+    };
+    if !prompts
+        .active
+        .get(session_id)
+        .is_some_and(|prompt| prompt.turn_id == turn_id)
+    {
+        return false;
+    }
+    prompts.active.remove(session_id);
+    prompts.finishing.remove(session_id);
+    prompts.finished.insert(session_id.to_string(), outcome);
+    true
+}
+
+fn with_active_terminal_prompt_state<T>(
+    state: &Mutex<PromptState>,
+    session_id: &str,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let prompts = state.lock().map_err(|error| error.to_string())?;
+    if !prompts.active.contains_key(session_id) || prompts.finishing.contains(session_id) {
+        return Err("This agent turn is no longer accepting terminal commands.".into());
+    }
+    action()
+}
+
+fn with_active_terminal_prompt<T>(
+    runtime: &Connection,
+    session_id: &str,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    with_active_terminal_prompt_state(&runtime.prompt_state, session_id, action)
+}
+
+pub fn with_active_owned_terminal<T>(
+    manager: &AgentManager,
+    owner: &str,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let (directory, source) = owner
+        .rsplit_once('\0')
+        .ok_or("Terminal owner must identify an ACP session.")?;
+    let source = source
+        .strip_prefix("acp:")
+        .ok_or("Terminal owner must identify an ACP session.")?;
+    let (agent, session_id) = source
+        .split_once(':')
+        .ok_or("Terminal owner must identify an ACP session.")?;
+    let runtime = connection_for_session(manager, agent, session_id, Path::new(directory))?;
+    let current_directory = runtime
+        .session_directories
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(session_id)
+        .cloned();
+    if current_directory.as_deref() != Some(Path::new(directory)) {
+        return Err("Terminal owner does not match the agent session directory.".into());
+    }
+    with_active_terminal_prompt(&runtime, session_id, action)
+}
+
+fn cleanup_session_processes(app: &AppHandle, runtime: &Connection, agent: &str, session_id: &str) {
+    let directory = runtime
+        .session_directories
+        .lock()
+        .ok()
+        .and_then(|directories| directories.get(session_id).cloned());
+    if let Some(directory) = directory {
+        let owner = format!("{}\0acp:{}:{}", directory.display(), agent, session_id);
+        if let Err(error) = crate::owned_processes::stop_run(&owner) {
+            crate::diagnostics::record(
+                "owned_process_cleanup_failed",
+                json!({
+                    "run": owner, "error": error
+                }),
+            );
+        }
+        if let Err(error) = app
+            .state::<crate::terminal::TerminalManager>()
+            .stop_owner(&owner)
+        {
+            crate::diagnostics::record(
+                "owned_process_cleanup_failed",
+                json!({"run":owner,"error":error}),
+            );
+        }
+    }
+    app.state::<crate::acp_terminal::AcpTerminalManager>()
+        .stop_sessions(
+            agent,
+            runtime.profile,
+            &runtime.worktree,
+            &[session_id.to_string()],
+        );
+}
+
 #[tauri::command]
 pub fn acp_cancel(
     app: AppHandle,
@@ -4222,16 +4396,25 @@ fn cancel_session(
 ) -> Result<(), String> {
     let session_id = session_id.to_string();
     let agent = agent.to_string();
-    let cancelled_turn = {
+    let (cancelled_turn, cleanup_current) = {
         let mut prompts = runtime
             .prompt_state
             .lock()
             .map_err(|error| error.to_string())?;
         let cancelled_turn = prompts.cancellation_turn(&session_id, turn_id);
+        let cleanup_current = cancelled_turn.as_deref().is_some_and(|turn_id| {
+            prompts
+                .active
+                .get(&session_id)
+                .is_some_and(|prompt| prompt.turn_id == turn_id)
+        });
         if let Some(turn_id) = cancelled_turn.as_deref() {
             prompts.retire_turn(&session_id, turn_id);
         }
-        cancelled_turn
+        if cleanup_current {
+            prompts.finishing.insert(session_id.clone());
+        }
+        (cancelled_turn, cleanup_current)
     };
     crate::diagnostics::record(
         "cancel_requested",
@@ -4254,6 +4437,12 @@ fn cancel_session(
     let result = runtime.notify("session/cancel", json!({"sessionId":session_id}));
     if result.is_err() {
         permission_state.canceling_sessions.remove(&session_id);
+        drop(permission_state);
+        if cleanup_current {
+            if let Ok(mut prompts) = runtime.prompt_state.lock() {
+                prompts.finishing.remove(&session_id);
+            }
+        }
         if let Some(turn_id) = cancelled_turn.as_ref() {
             runtime
                 .cancelled_prompts
@@ -4262,6 +4451,9 @@ fn cancel_session(
                 .remove(turn_id);
         }
         return result;
+    }
+    if cleanup_current {
+        cleanup_session_processes(app, runtime, &agent, &session_id);
     }
     resolve_session_permissions(
         &mut permission_state.pending,
