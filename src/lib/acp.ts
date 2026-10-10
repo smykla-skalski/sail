@@ -252,11 +252,43 @@ export interface AgentCommand {
 
 export interface AgentEvent {
   agent: AgentId;
+  directory?: string;
+  worktree?: string;
   message: {
     id?: string | number;
     method?: string;
     params?: Record<string, unknown>;
   };
+}
+
+export function acpEventMatchesSession(
+  event: AgentEvent,
+  agent: string,
+  directory: string,
+  sessionId: string,
+): boolean {
+  return (
+    event.agent === agent &&
+    (event.directory ?? event.worktree) === directory &&
+    event.message.method === 'session/update' &&
+    event.message.params?.sessionId === sessionId
+  );
+}
+
+export function acpCancelMatchesSession(
+  event: AgentEvent,
+  agent: string,
+  directory: string,
+  profile: CapabilityProfile,
+  sessionId: string,
+): boolean {
+  return (
+    event.agent === agent &&
+    event.directory === directory &&
+    event.message.method === '$/cancel_request' &&
+    event.message.params?.sessionId === sessionId &&
+    event.message.params?.sailCapabilityProfile === profile
+  );
 }
 
 export function acpDisconnectedSessionIds(message: AgentEvent['message']): string[] | null {
@@ -312,6 +344,7 @@ export interface NativeSubagentSnapshotSet {
 
 export interface AcpPendingInboxItem {
   agent: AgentId;
+  directory: string;
   message: AgentEvent['message'];
   receivedAt: number;
 }
@@ -598,21 +631,26 @@ const liveTranscripts = new Map<string, LiveTranscript>();
 /** Restores in flight per session. Their history replay must not reach a kept transcript. */
 const restoringTranscripts = new Map<string, number>();
 
-function sessionKey(agent: AgentId, sessionId: string): string {
-  return JSON.stringify([agent, sessionId]);
+function sessionKey(agent: AgentId, directory: string, sessionId: string): string {
+  return JSON.stringify([agent, directory, sessionId]);
 }
 
 export function rememberSessionState(
   agent: AgentId,
+  directory: string,
   sessionId: string,
   state: AgentSessionState,
 ): void {
-  const key = sessionKey(agent, sessionId);
+  const key = sessionKey(agent, directory, sessionId);
   sessionStates.set(key, { ...sessionStates.get(key), ...state });
 }
 
-export function sessionState(agent: AgentId, sessionId: string): AgentSessionState | undefined {
-  return sessionStates.get(sessionKey(agent, sessionId));
+export function sessionState(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+): AgentSessionState | undefined {
+  return sessionStates.get(sessionKey(agent, directory, sessionId));
 }
 
 /** Keeps the transcript of a session that is no longer shown and applies its updates as they
@@ -620,11 +658,12 @@ export function sessionState(agent: AgentId, sessionId: string): AgentSessionSta
  * A restore would replay history while the turn streams. */
 export function trackLiveTranscript(
   agent: AgentId,
+  directory: string,
   sessionId: string,
   entries: readonly AgentEntry[],
   complete: boolean,
 ): void {
-  const key = sessionKey(agent, sessionId);
+  const key = sessionKey(agent, directory, sessionId);
   liveTranscripts.delete(key);
   if (restoringTranscripts.has(key)) return;
   liveTranscripts.set(key, { entries: entries.slice(), complete });
@@ -634,17 +673,22 @@ export function trackLiveTranscript(
   }
 }
 
-export function tracksLiveTranscript(agent: AgentId, sessionId: string): boolean {
-  return liveTranscripts.has(sessionKey(agent, sessionId));
+export function tracksLiveTranscript(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+): boolean {
+  return liveTranscripts.has(sessionKey(agent, directory, sessionId));
 }
 
 export function applyLiveTranscriptUpdate(
   agent: AgentId,
+  directory: string,
   sessionId: string,
   update: Record<string, unknown>,
   now = Date.now(),
 ): void {
-  const key = sessionKey(agent, sessionId);
+  const key = sessionKey(agent, directory, sessionId);
   const transcript = liveTranscripts.get(key);
   if (!transcript) return;
   if (restoringTranscripts.has(key)) {
@@ -657,20 +701,28 @@ export function applyLiveTranscriptUpdate(
 }
 
 /** Drops a transcript that a history replay made unreliable; switching back then restores. */
-export function invalidateLiveTranscript(agent: AgentId, sessionId: string): void {
-  liveTranscripts.delete(sessionKey(agent, sessionId));
+export function invalidateLiveTranscript(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+): void {
+  liveTranscripts.delete(sessionKey(agent, directory, sessionId));
 }
 
 /** Returns the kept transcript and stops tracking, or null when none is kept. */
-export function takeLiveTranscript(agent: AgentId, sessionId: string): LiveTranscript | null {
-  const key = sessionKey(agent, sessionId);
+export function takeLiveTranscript(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+): LiveTranscript | null {
+  const key = sessionKey(agent, directory, sessionId);
   const transcript = liveTranscripts.get(key) ?? null;
   liveTranscripts.delete(key);
   return transcript;
 }
 
-export function forgetSessionState(agent: AgentId, sessionId: string): void {
-  const key = sessionKey(agent, sessionId);
+export function forgetSessionState(agent: AgentId, directory: string, sessionId: string): void {
+  const key = sessionKey(agent, directory, sessionId);
   sessionStates.delete(key);
   liveTranscripts.delete(key);
 }
@@ -716,6 +768,7 @@ function isCommand(value: unknown): value is AgentCommand {
 
 function rememberRestoredState(
   agent: AgentId,
+  directory: string,
   sessionId: string,
   session: { configOptions?: unknown; availableCommands?: unknown },
 ): void {
@@ -725,7 +778,7 @@ function rememberRestoredState(
   const availableCommands: unknown[] | null = Array.isArray(session.availableCommands)
     ? session.availableCommands
     : null;
-  rememberSessionState(agent, sessionId, {
+  rememberSessionState(agent, directory, sessionId, {
     configOptions: configOptions.filter(isConfigOption),
     ...(availableCommands ? { availableCommands: availableCommands.filter(isCommand) } : {}),
   });
@@ -744,8 +797,8 @@ function restoreSession(
   const existing = restoringSessions.get(key);
   if (existing) return existing;
   // A restore replays history, so this session's kept transcript can no longer be trusted.
-  invalidateLiveTranscript(agent, sessionId);
-  const live = sessionKey(agent, sessionId);
+  invalidateLiveTranscript(agent, cwd, sessionId);
+  const live = sessionKey(agent, cwd, sessionId);
   restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
   const request = invoke<Record<string, unknown>>(method, {
     agent,
@@ -753,8 +806,8 @@ function restoreSession(
     sessionId,
     profile,
   }).then((session) => {
-    invalidateLiveTranscript(agent, sessionId);
-    rememberRestoredState(agent, sessionId, session);
+    invalidateLiveTranscript(agent, cwd, sessionId);
+    rememberRestoredState(agent, cwd, sessionId, session);
     return session;
   });
   restoringSessions.set(key, request);
@@ -769,7 +822,16 @@ function restoreSession(
   return request;
 }
 
-const queuedPrompts = new Map<string, { agent: string; sessionId: string }>();
+const queuedPrompts = new Map<string, { agent: string; directory: string; sessionId: string }>();
+
+function queuedPromptKey(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+  turnId: string,
+): string {
+  return JSON.stringify([agent, directory, sessionId, turnId]);
+}
 
 async function acquireTurnSlot(
   turnId: string,
@@ -791,6 +853,7 @@ async function acquireTurnSlot(
 
 async function limitedPrompt(
   agent: AgentId,
+  directory: string,
   sessionId: string,
   text: string,
   turnId: string,
@@ -800,18 +863,19 @@ async function limitedPrompt(
 ): Promise<AcpPromptOutcome> {
   if (slotHeld)
     return invoke<AcpPromptOutcome>('acp_prompt', {
-      params: { agent, sessionId, text, turnId, imagePaths },
+      params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
-  queuedPrompts.set(turnId, { agent, sessionId });
+  const queueId = queuedPromptKey(agent, directory, sessionId, turnId);
+  queuedPrompts.set(queueId, { agent, directory, sessionId });
   let release: () => void;
   try {
-    release = await acquireTurnSlot(turnId, onQueue);
+    release = await acquireTurnSlot(queueId, onQueue);
   } finally {
-    queuedPrompts.delete(turnId);
+    queuedPrompts.delete(queueId);
   }
   try {
     return await invoke<AcpPromptOutcome>('acp_prompt', {
-      params: { agent, sessionId, text, turnId, imagePaths },
+      params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
   } finally {
     release();
@@ -820,8 +884,8 @@ async function limitedPrompt(
 
 export const acp = {
   agents: () => invoke<AgentAvailability[]>('acp_agents'),
-  connect: (agent: AgentId, profile?: CapabilityProfile) =>
-    invoke<Record<string, unknown>>('acp_connect', { agent, profile }),
+  connect: (agent: AgentId, directory: string, profile?: CapabilityProfile) =>
+    invoke<Record<string, unknown>>('acp_connect', { agent, directory, profile }),
   create: (agent: AgentId, cwd: string, profile?: CapabilityProfile, nativeGeneration?: number) =>
     invoke<{
       sessionId: string;
@@ -830,44 +894,54 @@ export const acp = {
     }>('acp_new_session', {
       params: { agent, cwd, profile, nativeGeneration },
     }).then((session) => {
-      rememberRestoredState(agent, session.sessionId, session);
+      rememberRestoredState(agent, cwd, session.sessionId, session);
       return session;
     }),
   listSessions: (agent: AgentId, cwd: string, cursor?: string, profile?: CapabilityProfile) =>
     invoke<AgentSessionListing>('acp_list_sessions', { agent, cwd, cursor, profile }),
-  releaseSessionFence: (agent: AgentId, sessionId: string) =>
-    invoke<void>('acp_release_session_fence', { agent, sessionId }),
+  releaseSessionFence: (agent: AgentId, directory: string, sessionId: string) =>
+    invoke<void>('acp_release_session_fence', { agent, directory, sessionId }),
   load: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
     restoreSession('acp_load_session', agent, cwd, sessionId, profile),
   resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
     restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
   forget: (agent: AgentId, directory: string, sessionId: string) => {
-    forgetSessionState(agent, sessionId);
+    forgetSessionState(agent, directory, sessionId);
     forgetPlanningState({ agent, directory, sessionId });
     acpPlans().forget({ agent, directory, sessionId });
-    return invoke<void>('acp_forget_session', { agent, sessionId });
+    return invoke<void>('acp_forget_session', { agent, directory, sessionId });
   },
   prompt: (
     agent: AgentId,
+    directory: string,
     sessionId: string,
     text: string,
     turnId: string,
     imagePaths: string[] = [],
     onQueue?: (limit: number | null) => void,
     slotHeld = false,
-  ) => limitedPrompt(agent, sessionId, text, turnId, imagePaths, onQueue, slotHeld),
+  ) => limitedPrompt(agent, directory, sessionId, text, turnId, imagePaths, onQueue, slotHeld),
   acquireTurnSlot,
-  cancelQueuedTurn: (turnId: string) => resourceQueues.agent.cancel(turnId),
-  steer: (agent: AgentId, sessionId: string, text: string, imagePaths: string[] = []) =>
+  cancelQueuedTurn: (agent: AgentId, directory: string, sessionId: string, turnId: string) =>
+    resourceQueues.agent.cancel(queuedPromptKey(agent, directory, sessionId, turnId)),
+  steer: (
+    agent: AgentId,
+    directory: string,
+    sessionId: string,
+    text: string,
+    imagePaths: string[] = [],
+  ) =>
     invoke<{ outcome: 'injected' | 'startedNewTurn' | 'promptRequired' | 'failed' }>('acp_steer', {
-      params: { agent, sessionId, text, imagePaths },
+      params: { agent, directory, sessionId, text, imagePaths },
     }),
-  cancel: (agent: AgentId, sessionId: string, turnId: string | null) => {
+  cancel: (agent: AgentId, directory: string, sessionId: string, turnId: string | null) => {
     const queued = [...queuedPrompts].filter(
       ([id, target]) =>
         target.agent === agent &&
+        target.directory === directory &&
         target.sessionId === sessionId &&
-        (turnId === null || id === turnId),
+        (turnId === null || target.sessionId === sessionId) &&
+        (turnId === null || id === queuedPromptKey(agent, directory, sessionId, turnId)),
     );
     for (const [id] of queued) {
       queuedPrompts.delete(id);
@@ -875,10 +949,11 @@ export const acp = {
     }
     return queued.length
       ? Promise.resolve()
-      : invoke<void>('acp_cancel', { agent, sessionId, turnId });
+      : invoke<void>('acp_cancel', { agent, directory, sessionId, turnId });
   },
   permission: (
     agent: AgentId,
+    directory: string,
     requestId: string | number,
     optionId: string | null,
     sessionId: string,
@@ -888,6 +963,7 @@ export const acp = {
     invoke<void>('acp_permission', {
       params: {
         agent,
+        directory,
         requestId,
         optionId,
         sessionId,
@@ -900,59 +976,95 @@ export const acp = {
       workspace,
       resources,
     }),
-  pendingPermissions: (agent: AgentId, sessionId: string) =>
-    invoke<AgentEvent['message'][]>('acp_pending_permissions', { agent, sessionId }),
-  pendingElicitations: (agent: AgentId, sessionId: string) =>
-    invoke<AgentEvent['message'][]>('acp_pending_elicitations', { agent, sessionId }),
+  pendingPermissions: (agent: AgentId, directory: string, sessionId: string) =>
+    invoke<AgentEvent['message'][]>('acp_pending_permissions', { agent, directory, sessionId }),
+  pendingElicitations: (
+    agent: AgentId,
+    directory: string,
+    sessionId: string,
+    profile: CapabilityProfile,
+  ) =>
+    invoke<AgentEvent['message'][]>('acp_pending_elicitations', {
+      agent,
+      directory,
+      sessionId,
+      profile,
+    }),
   elicitation: (
     agent: AgentId,
+    directory: string,
+    sessionId: string,
+    profile: CapabilityProfile,
     requestId: string | number,
     action: 'accept' | 'decline' | 'cancel',
     content?: Record<string, unknown>,
-  ) => invoke<void>('acp_elicitation', { params: { agent, requestId, action, content } }),
+  ) =>
+    invoke<void>('acp_elicitation', {
+      params: { agent, directory, sessionId, profile, requestId, action, content },
+    }),
   pendingInbox: () => invoke<AcpPendingInboxItem[]>('acp_pending_inbox'),
-  activity: () => invoke<Record<AgentId, AgentActivity>>('acp_activity'),
+  activity: (directory: string) =>
+    invoke<Record<AgentId, AgentActivity>>('acp_activity', { directory }),
   nativeSubagents: (directory: string) =>
     invoke<NativeSubagentSnapshotSet>('acp_native_subagents', { directory }),
-  turnEvidence: (agent: AgentId, sessionId: string, turnId: string) =>
-    invoke<AcpTurnEvidence | null>('get_acp_turn_evidence', { agent, sessionId, turnId }),
+  turnEvidence: (agent: AgentId, directory: string, sessionId: string, turnId: string) =>
+    invoke<AcpTurnEvidence | null>('get_acp_turn_evidence', {
+      agent,
+      directory,
+      sessionId,
+      turnId,
+    }),
   interruptedTurns: () => invoke<InterruptedAgentTurn[]>('list_interrupted_agent_turns'),
   finishInterruptedTurn: (turn: InterruptedAgentTurn) =>
     invoke<void>('finish_interrupted_agent_turn', {
       agent: turn.agent,
+      directory: turn.directory,
       sessionId: turn.sessionId,
       turnId: turn.turnId,
     }),
   prepareRestart: () => invoke<void>('acp_prepare_restart'),
-  setConfig: (agent: AgentId, sessionId: string, configId: string, value: string) =>
+  setConfig: (
+    agent: AgentId,
+    directory: string,
+    sessionId: string,
+    configId: string,
+    value: string,
+  ) =>
     invoke<{ configOptions?: AgentConfigOption[] }>('acp_set_config', {
       agent,
+      directory,
       sessionId,
       configId,
       value,
     }).then((result) => {
       if (result.configOptions)
-        rememberSessionState(agent, sessionId, { configOptions: result.configOptions });
+        rememberSessionState(agent, directory, sessionId, { configOptions: result.configOptions });
       return result;
     }),
-  authenticate: (agent: AgentId, methodId: string, profile?: CapabilityProfile) =>
-    invoke<Record<string, unknown>>('acp_authenticate', { agent, methodId, profile }),
+  authenticate: (
+    agent: AgentId,
+    directory: string,
+    methodId: string,
+    profile?: CapabilityProfile,
+  ) => invoke<Record<string, unknown>>('acp_authenticate', { agent, directory, methodId, profile }),
 };
 
 export async function acpFinishedPromptStatus(
   agent: AgentId,
+  directory: string,
   sessionId: string,
   turnId: string,
 ): Promise<'done' | 'failed' | 'interrupted' | null> {
-  const activity = await acp.activity().catch(() => null);
+  const activity = await acp.activity(directory).catch(() => null);
   const finished = activity?.[agent]?.finished[sessionId];
   return finished?.turnId === turnId ? finished.status : null;
 }
 
 export async function acpFailedPromptInterrupted(
   agent: AgentId,
+  directory: string,
   sessionId: string,
   turnId: string,
 ): Promise<boolean> {
-  return (await acpFinishedPromptStatus(agent, sessionId, turnId)) === 'interrupted';
+  return (await acpFinishedPromptStatus(agent, directory, sessionId, turnId)) === 'interrupted';
 }

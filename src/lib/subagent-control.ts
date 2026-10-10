@@ -6,6 +6,7 @@ export type PermissionResolution = 'answered' | 'cancelled';
 export type AnsweredPermission = {
   key: string;
   agentId: string;
+  directory: string;
   sessionId: string;
   title: string;
   outcome: PermissionResolution;
@@ -104,10 +105,19 @@ export function subagentStop(
   shipOwnedTargets: ReadonlySet<string> = new Set(),
 ): SubagentStop {
   if (receipt.receiptId.startsWith('native:')) return 'parent-turn';
-  if (receipt.validation || (receipt.targetId && shipOwnedTargets.has(receipt.targetId)))
+  if (
+    receipt.validation ||
+    (receipt.targetId &&
+      receipt.targetDirectory &&
+      shipOwnedTargets.has(shipOwnedTargetKey(receipt.targetDirectory, receipt.targetId)))
+  )
     return 'ship-managed';
   if (!receipt.targetId || !receipt.targetDirectory) return 'none';
   return childSession(receipt) ? 'stop' : 'none';
+}
+
+export function shipOwnedTargetKey(directory: string, targetId: string): string {
+  return JSON.stringify([directory, targetId]);
 }
 
 export const parentTurnStopHint = 'Stop the parent turn to stop Claude subagents';

@@ -145,7 +145,12 @@
     running: (thread: AgentThread | null) => boolean;
     activityReady: boolean;
     onstatus: (thread: AgentThread, status: ThreadStatus, notifyOnDone?: boolean) => void;
-    onreplaychange: (agent: string, sessionId: string | null, replaying: boolean) => void;
+    onreplaychange: (
+      agent: string,
+      directory: string,
+      sessionId: string | null,
+      replaying: boolean,
+    ) => void;
     onchanges: (id: string) => void;
     pendingCommands: Record<string, string>;
     oncommandstarted: (id: string) => void;

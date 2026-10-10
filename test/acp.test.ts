@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acpDisconnectAffectsSession,
+  acpCancelMatchesSession,
+  acpEventMatchesSession,
   applyLiveTranscriptUpdate,
   forgetRecentTranscript,
   forgetSessionState,
@@ -40,6 +42,42 @@ void test('scoped ACP disconnect only affects sessions from the exited connectio
   assert.equal(acpDisconnectAffectsSession(message, 'build-session', 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'review'), true);
+});
+
+void test('ACP replay ignores updates from a sibling worktree with the same session ID', () => {
+  const event: AgentEvent = {
+    agent: 'codex',
+    directory: '/sibling-repo',
+    worktree: '/sibling-repo',
+    message: { method: 'session/update', params: { sessionId: 'shared-session', update: {} } },
+  };
+  assert.equal(acpEventMatchesSession(event, 'codex', '/repo', 'shared-session'), false);
+  assert.equal(acpEventMatchesSession(event, 'codex', '/sibling-repo', 'shared-session'), true);
+});
+
+void test('ACP cancellation matches session, worktree, and runtime profile', () => {
+  const event: AgentEvent = {
+    agent: 'codex',
+    directory: '/repo/subdir',
+    worktree: '/repo',
+    message: {
+      method: '$/cancel_request',
+      params: { id: 7, sessionId: 'shared-session', sailCapabilityProfile: 'review' },
+    },
+  };
+  assert.equal(
+    acpCancelMatchesSession(event, 'codex', '/repo/subdir', 'review', 'shared-session'),
+    true,
+  );
+  assert.equal(
+    acpCancelMatchesSession(event, 'codex', '/repo/subdir', 'build', 'shared-session'),
+    false,
+  );
+  assert.equal(acpCancelMatchesSession(event, 'codex', '/repo', 'review', 'shared-session'), false);
+  assert.equal(
+    acpCancelMatchesSession(event, 'codex', '/repo/subdir', 'review', 'other-session'),
+    false,
+  );
 });
 
 void test('ACP chunks stream into one assistant message and tool updates keep their place', () => {
@@ -329,37 +367,64 @@ const chunk = (text: string) => ({
   content: { type: 'text', text },
 });
 
+void test('same provider session ids stay isolated between worktrees', () => {
+  const first = [{ id: 'first', type: 'assistant' as const, text: 'first worktree' }];
+  const second = [{ id: 'second', type: 'assistant' as const, text: 'second worktree' }];
+  trackLiveTranscript('codex', '/repo/one', 'same-session', first, true);
+  trackLiveTranscript('codex', '/repo/two', 'same-session', second, true);
+  rememberSessionState('codex', '/repo/one', 'same-session', { configOptions: [] });
+  rememberSessionState('codex', '/repo/two', 'same-session', {
+    configOptions: [
+      { id: 'model', name: 'Model', type: 'select' as const, currentValue: 'other', options: [] },
+    ],
+  });
+
+  assert.equal(
+    takeLiveTranscript('codex', '/repo/one', 'same-session')?.entries[0]?.text,
+    'first worktree',
+  );
+  assert.equal(sessionState('codex', '/repo/one', 'same-session')?.configOptions.length, 0);
+  assert.equal(
+    takeLiveTranscript('codex', '/repo/two', 'same-session')?.entries[0]?.text,
+    'second worktree',
+  );
+  assert.equal(
+    sessionState('codex', '/repo/two', 'same-session')?.configOptions[0]?.currentValue,
+    'other',
+  );
+});
+
 void test('a kept transcript applies every update while the session is off screen', () => {
   const shown: AgentEntry[] = [
     { id: 'p', type: 'user', text: 'Fix the bug' },
     { id: 'a', type: 'assistant', text: 'Working on' },
   ];
-  trackLiveTranscript('claude', 'live', shown, true);
+  trackLiveTranscript('claude', '/repo', 'live', shown, true);
   shown.push({ id: 'later', type: 'assistant', text: 'not kept' });
-  applyLiveTranscriptUpdate('claude', 'live', chunk(' it'));
-  applyLiveTranscriptUpdate('claude', 'live', {
+  applyLiveTranscriptUpdate('claude', '/repo', 'live', chunk(' it'));
+  applyLiveTranscriptUpdate('claude', '/repo', 'live', {
     sessionUpdate: 'user_message_chunk',
     content: { type: 'text', text: 'Fix the bug' },
   });
-  applyLiveTranscriptUpdate('claude', 'live', {
+  applyLiveTranscriptUpdate('claude', '/repo', 'live', {
     sessionUpdate: 'tool_call',
     toolCallId: 'read',
     title: 'Read file',
     status: 'in_progress',
   });
   for (let index = 0; index < 2500; index += 1)
-    applyLiveTranscriptUpdate('claude', 'live', {
+    applyLiveTranscriptUpdate('claude', '/repo', 'live', {
       sessionUpdate: 'tool_call_update',
       toolCallId: 'read',
       status: index === 2499 ? 'completed' : 'in_progress',
     });
-  applyLiveTranscriptUpdate('claude', 'live', {
+  applyLiveTranscriptUpdate('claude', '/repo', 'live', {
     sessionUpdate: 'user_message_chunk',
     content: { type: 'text', text: 'Also add a test' },
   });
   for (let index = 0; index < 2500; index += 1)
-    applyLiveTranscriptUpdate('claude', 'live', chunk(`${index},`));
-  applyLiveTranscriptUpdate('claude', 'untracked', chunk('ignored'));
+    applyLiveTranscriptUpdate('claude', '/repo', 'live', chunk(`${index},`));
+  applyLiveTranscriptUpdate('claude', '/repo', 'untracked', chunk('ignored'));
   const configOptions = [
     {
       id: 'model',
@@ -369,11 +434,11 @@ void test('a kept transcript applies every update while the session is off scree
       options: [{ value: 'opus', name: 'Opus' }],
     },
   ];
-  rememberSessionState('claude', 'live', { configOptions });
+  rememberSessionState('claude', '/repo', 'live', { configOptions });
   const view = liveSessionView(
     [],
-    takeLiveTranscript('claude', 'live'),
-    sessionState('claude', 'live'),
+    takeLiveTranscript('claude', '/repo', 'live'),
+    sessionState('claude', '/repo', 'live'),
   );
   assert.ok(view);
   const flood = Array.from({ length: 2500 }, (_, index) => `${index},`).join('');
@@ -385,53 +450,53 @@ void test('a kept transcript applies every update while the session is off scree
   );
   assert.equal(view.configOptions, configOptions);
   assert.equal(view.complete, true);
-  assert.equal(takeLiveTranscript('claude', 'live'), null);
-  assert.equal(takeLiveTranscript('claude', 'untracked'), null);
+  assert.equal(takeLiveTranscript('claude', '/repo', 'live'), null);
+  assert.equal(takeLiveTranscript('claude', '/repo', 'untracked'), null);
 });
 
 void test('without a complete kept transcript the capped cache is shown as incomplete', () => {
   const cached: AgentEntry[] = [{ id: 'a', type: 'assistant', text: 'Cached' }];
-  rememberSessionState('claude', 'busy', { configOptions: [] });
+  rememberSessionState('claude', '/repo', 'busy', { configOptions: [] });
   const missing = liveSessionView(
     cached,
-    takeLiveTranscript('claude', 'busy'),
-    sessionState('claude', 'busy'),
+    takeLiveTranscript('claude', '/repo', 'busy'),
+    sessionState('claude', '/repo', 'busy'),
   );
   assert.equal(missing?.entries, cached);
   assert.equal(missing?.complete, false);
-  trackLiveTranscript('claude', 'busy', cached, false);
-  applyLiveTranscriptUpdate('claude', 'busy', chunk(' more'));
+  trackLiveTranscript('claude', '/repo', 'busy', cached, false);
+  applyLiveTranscriptUpdate('claude', '/repo', 'busy', chunk(' more'));
   const partial = liveSessionView(
     [],
-    takeLiveTranscript('claude', 'busy'),
-    sessionState('claude', 'busy'),
+    takeLiveTranscript('claude', '/repo', 'busy'),
+    sessionState('claude', '/repo', 'busy'),
   );
   assert.equal(partial?.complete, false);
   assert.deepEqual(
     partial?.entries.map((entry) => entry.type !== 'tool' && entry.text),
     ['Cached more'],
   );
-  trackLiveTranscript('claude', 'replayed', cached, true);
-  invalidateLiveTranscript('claude', 'replayed');
-  assert.equal(takeLiveTranscript('claude', 'replayed'), null);
-  trackLiveTranscript('claude', 'unknown-state', [], true);
-  const reloaded = liveSessionView(cached, null, sessionState('claude', 'unknown-state'));
+  trackLiveTranscript('claude', '/repo', 'replayed', cached, true);
+  invalidateLiveTranscript('claude', '/repo', 'replayed');
+  assert.equal(takeLiveTranscript('claude', '/repo', 'replayed'), null);
+  trackLiveTranscript('claude', '/repo', 'unknown-state', [], true);
+  const reloaded = liveSessionView(cached, null, sessionState('claude', '/repo', 'unknown-state'));
   assert.deepEqual(reloaded, { complete: false, entries: cached, configOptions: [] });
-  takeLiveTranscript('claude', 'unknown-state');
+  takeLiveTranscript('claude', '/repo', 'unknown-state');
 });
 
 void test('kept transcripts are bounded and dropped with their thread', () => {
   for (let index = 0; index <= liveTranscriptLimit; index += 1)
-    trackLiveTranscript('codex', `s${index}`, [], true);
-  assert.equal(tracksLiveTranscript('codex', 's0'), false);
-  assert.equal(tracksLiveTranscript('codex', 's1'), true);
-  trackLiveTranscript('codex', 's1', [], true);
-  trackLiveTranscript('codex', 'extra', [], true);
-  assert.equal(tracksLiveTranscript('codex', 's1'), true);
-  assert.equal(tracksLiveTranscript('codex', 's2'), false);
-  forgetSessionState('codex', 's1');
-  assert.equal(tracksLiveTranscript('codex', 's1'), false);
+    trackLiveTranscript('codex', '/repo', `s${index}`, [], true);
+  assert.equal(tracksLiveTranscript('codex', '/repo', 's0'), false);
+  assert.equal(tracksLiveTranscript('codex', '/repo', 's1'), true);
+  trackLiveTranscript('codex', '/repo', 's1', [], true);
+  trackLiveTranscript('codex', '/repo', 'extra', [], true);
+  assert.equal(tracksLiveTranscript('codex', '/repo', 's1'), true);
+  assert.equal(tracksLiveTranscript('codex', '/repo', 's2'), false);
+  forgetSessionState('codex', '/repo', 's1');
+  assert.equal(tracksLiveTranscript('codex', '/repo', 's1'), false);
   for (let index = 0; index <= liveTranscriptLimit; index += 1)
-    takeLiveTranscript('codex', `s${index}`);
-  takeLiveTranscript('codex', 'extra');
+    takeLiveTranscript('codex', '/repo', `s${index}`);
+  takeLiveTranscript('codex', '/repo', 'extra');
 });
