@@ -59,15 +59,37 @@ export const config = {
   mochaOpts: { timeout: 240_000 },
   waitforTimeout: 20_000,
   connectionRetryTimeout: 90_000,
-  /** New profiles follow the OS appearance. Pin it so color and screenshot checks give the same
-   * result on light and dark machines; specs that need dark set `sai-theme` or the appearance. */
+  /** Specs share one app process. Clear state left by earlier specs before pinning appearance. */
   async before() {
-    const hadQuery = await browser.execute(() => {
-      if (!location.search) return false;
-      history.replaceState(null, '', location.pathname);
-      return true;
+    const needsReload = await browser.execute(async () => {
+      const tauri: unknown = Reflect.get(window, '__TAURI__');
+      const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
+      const invoke: unknown = core && typeof core === 'object' ? Reflect.get(core, 'invoke') : null;
+      if (typeof invoke !== 'function')
+        throw new Error('Tauri API missing; cannot reset E2E state');
+      const response: unknown = await invoke('acp_pending_inbox');
+      if (!Array.isArray(response)) throw new Error('Invalid pending inbox response');
+      const pending: unknown[] = response;
+      await Promise.all(
+        pending.flatMap((item) => {
+          if (!item || typeof item !== 'object') return [];
+          const agent: unknown = Reflect.get(item, 'agent');
+          const message: unknown = Reflect.get(item, 'message');
+          const params: unknown =
+            message && typeof message === 'object' ? Reflect.get(message, 'params') : null;
+          const sessionId: unknown =
+            params && typeof params === 'object' ? Reflect.get(params, 'sessionId') : null;
+          return typeof agent === 'string' && typeof sessionId === 'string'
+            ? [invoke('acp_cancel', { agent, sessionId, turnId: null })]
+            : [];
+        }),
+      );
+      sessionStorage.removeItem('sail-e2e-settings');
+      const hadQuery = !!location.search;
+      if (hadQuery) history.replaceState(null, '', location.pathname);
+      return hadQuery || pending.length > 0;
     });
-    if (hadQuery) await browser.refresh();
+    if (needsReload) await browser.refresh();
 
     await browser.execute(async (value) => {
       const tauri: unknown = Reflect.get(window, '__TAURI__');
