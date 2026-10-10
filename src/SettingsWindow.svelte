@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { Button } from '@smykla-skalski/sui';
   import { invoke } from '@tauri-apps/api/core';
+  import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import OptionPicker from './OptionPicker.svelte';
   import { getSetting } from './lib/settings';
   import {
@@ -71,7 +72,7 @@
   let personalChecks = $state('');
   let personalChecksDirty = $state(false);
   let binaryDirty = $state(false);
-  let selectedSection = $state<'general' | 'opencode' | 'agents' | 'memory'>('general');
+  let selectedSection = $state<'general' | 'opencode' | 'agents' | 'context' | 'memory'>('general');
   let validationAgent = $state('');
   let validationModel = $state('');
   let routingRole = $state<ModelRouteRole>('implementation');
@@ -142,6 +143,127 @@
   let memoryProviderError = $state('');
   let memoryProviderLoading = $state(false);
   let pendingProviderResolution = $state(false);
+  type ContextProviderStatus = {
+    state: 'not-configured' | 'invalid' | 'unavailable' | 'approval-required' | 'approved';
+    id: string | null;
+    command: string | null;
+    executable: string | null;
+    executableSha256: string | null;
+    capabilities: string[];
+    fingerprint: string | null;
+    revision: string | null;
+    reason: string | null;
+  };
+  let contextStatus = $state<ContextProviderStatus | null>(null);
+  let contextDirectory = '';
+  let contextRequest = 0;
+  let contextLoading = $state(false);
+  let contextBusy = $state(false);
+  let contextExecutable = $state('');
+  let contextError = $state('');
+  let contextMessage = $state('');
+
+  async function refreshContext(directory: string) {
+    const request = ++contextRequest;
+    if (contextDirectory !== directory) {
+      contextStatus = null;
+      contextExecutable = '';
+      contextMessage = '';
+      contextError = '';
+    }
+    contextDirectory = directory;
+    if (!directory) return;
+    contextLoading = true;
+    try {
+      const status = await invoke<ContextProviderStatus>('context_provider_status', { directory });
+      if (request === contextRequest && contextDirectory === directory) {
+        contextStatus = status;
+        contextExecutable = status.executable ?? contextExecutable;
+        contextError = '';
+      }
+    } catch (cause) {
+      if (request === contextRequest && contextDirectory === directory)
+        contextError = `Provider status: ${String(cause)}`;
+    } finally {
+      if (request === contextRequest && contextDirectory === directory) contextLoading = false;
+    }
+  }
+
+  async function chooseContextExecutable() {
+    try {
+      const path = await openDialog({
+        directory: false,
+        multiple: false,
+        title: 'Choose provider executable',
+      });
+      if (typeof path === 'string') contextExecutable = path;
+    } catch (cause) {
+      contextError = `Choose executable: ${String(cause)}`;
+    }
+  }
+
+  async function registerContextExecutable() {
+    const directory = snapshot?.directory;
+    const command = contextStatus?.command;
+    const executable = contextExecutable.trim();
+    if (!directory || !command || !executable || executable === contextStatus?.executable) return;
+    contextBusy = true;
+    contextError = '';
+    contextMessage = '';
+    try {
+      await invoke('context_register_provider', { command, executable });
+      if (snapshot?.directory === directory) {
+        await refreshContext(directory);
+        contextMessage = 'Executable selected. Review its identity before approval.';
+      }
+    } catch (cause) {
+      if (snapshot?.directory === directory) contextError = `Select executable: ${String(cause)}`;
+    } finally {
+      contextBusy = false;
+    }
+  }
+
+  async function approveContextProvider() {
+    const directory = snapshot?.directory;
+    const expectedFingerprint = contextStatus?.fingerprint;
+    if (!directory || contextStatus?.state !== 'approval-required' || !expectedFingerprint) return;
+    contextBusy = true;
+    contextError = '';
+    contextMessage = '';
+    try {
+      await invoke('context_approve_provider', { directory, expectedFingerprint });
+      if (snapshot?.directory === directory) {
+        await refreshContext(directory);
+        contextMessage = 'Provider approved for this project. Connection is not available yet.';
+      }
+    } catch (cause) {
+      if (snapshot?.directory === directory) {
+        await refreshContext(directory);
+        contextError = `Approval: ${String(cause)}`;
+      }
+    } finally {
+      contextBusy = false;
+    }
+  }
+
+  async function revokeContextProvider() {
+    const directory = snapshot?.directory;
+    if (!directory || contextStatus?.state !== 'approved') return;
+    contextBusy = true;
+    contextError = '';
+    contextMessage = '';
+    try {
+      await invoke('context_revoke_provider', { directory });
+      if (snapshot?.directory === directory) {
+        await refreshContext(directory);
+        contextMessage = 'Provider approval revoked for this project.';
+      }
+    } catch (cause) {
+      if (snapshot?.directory === directory) contextError = `Revoke approval: ${String(cause)}`;
+    } finally {
+      contextBusy = false;
+    }
+  }
 
   async function refreshMemory(directory: string, query = memoryQuery.trim()) {
     const request = ++memoryRequest;
@@ -622,6 +744,8 @@
           }
           if (selectedSection === 'memory' && snapshot.directory !== memoryDirectory)
             void refreshMemory(snapshot.directory);
+          if (selectedSection === 'context' && snapshot.directory !== contextDirectory)
+            void refreshContext(snapshot.directory);
           themePreference = snapshot.theme;
           if (!binaryDirty) binaryPath = snapshot.binaryPath;
           if (!personalChecksDirty) personalChecks = snapshot.personalPostTurnChecks.join('\n');
@@ -680,6 +804,14 @@
           selectedSection = 'memory';
           if (snapshot?.directory) void refreshMemory(snapshot.directory);
         }}>Memory</button
+      >
+      <button
+        class:active={selectedSection === 'context'}
+        aria-current={selectedSection === 'context' ? 'page' : undefined}
+        onclick={() => {
+          selectedSection = 'context';
+          if (snapshot?.directory) void refreshContext(snapshot.directory);
+        }}>Context</button
       >
     </nav>
   </aside>
@@ -1152,6 +1284,97 @@
           />
           Notification sound
         </label>
+      </section>
+    {:else if selectedSection === 'context'}
+      <h1>Context provider</h1>
+      <section class="settings-card">
+        <h2>Project approval</h2>
+        <p class="runtime-binary" title={snapshot?.directory ?? ''}>
+          {snapshot?.directory || 'Select a project to review its context provider.'}
+        </p>
+        {#if contextError}<p class="runtime-diagnostic" role="alert">{contextError}</p>{/if}
+        {#if contextMessage}<p class="runtime-binary" role="status">{contextMessage}</p>{/if}
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={!snapshot?.directory || contextLoading || contextBusy}
+          onclick={() => snapshot?.directory && void refreshContext(snapshot.directory)}
+          >Refresh</Button
+        >
+        {#if !snapshot?.directory}
+          <p role="status">No project selected.</p>
+        {:else if contextLoading && !contextStatus}
+          <p role="status">Checking committed context configuration…</p>
+        {:else if contextStatus?.state === 'not-configured'}
+          <p role="status">This project has no committed context provider selection.</p>
+        {:else if contextStatus?.state === 'invalid'}
+          <p class="runtime-diagnostic" role="alert">
+            {contextStatus.reason || 'The committed context configuration is invalid.'}
+          </p>
+        {:else if contextStatus}
+          <dl class="integration-preview context-provider-details">
+            <dt>Provider</dt>
+            <dd>{contextStatus.id}</dd>
+            <dt>Registry command</dt>
+            <dd><code>{contextStatus.command}</code></dd>
+            <dt>Executable</dt>
+            <dd><code>{contextStatus.executable ?? 'Not selected'}</code></dd>
+            <dt>SHA-256</dt>
+            <dd><code>{contextStatus.executableSha256 ?? 'Unavailable'}</code></dd>
+            <dt>Capabilities</dt>
+            <dd>{contextStatus.capabilities.join(', ')}</dd>
+            <dt>Committed revision</dt>
+            <dd><code>{contextStatus.revision}</code></dd>
+            <dt>Approval</dt>
+            <dd>{contextStatus.state === 'approved' ? 'Approved' : 'Approval required'}</dd>
+          </dl>
+          {#if contextStatus.reason}<p class="runtime-diagnostic" role="status">
+              {contextStatus.reason}
+            </p>{/if}
+          <p>
+            Approval records your choice. Sail does not start the provider or add it to agents yet.
+          </p>
+          <label for="context-executable">Provider executable</label>
+          <input
+            id="context-executable"
+            type="text"
+            bind:value={contextExecutable}
+            placeholder="Absolute path to executable"
+            disabled={contextBusy}
+          />
+          <p>
+            Selecting an executable replaces this registry command for every project and revokes
+            their approvals.
+          </p>
+          <div class="context-provider-actions">
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={contextBusy}
+              onclick={chooseContextExecutable}>Browse…</Button
+            >
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={contextBusy ||
+                !contextExecutable.trim() ||
+                contextExecutable.trim() === contextStatus.executable}
+              onclick={registerContextExecutable}>Select executable</Button
+            >
+            {#if contextStatus.state === 'approval-required' && contextStatus.fingerprint}
+              <Button size="sm" disabled={contextBusy} onclick={approveContextProvider}
+                >Approve for this project</Button
+              >
+            {:else if contextStatus.state === 'approved'}
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={contextBusy}
+                onclick={revokeContextProvider}>Revoke approval</Button
+              >
+            {/if}
+          </div>
+        {/if}
       </section>
     {:else}
       <h1>Memory</h1>
