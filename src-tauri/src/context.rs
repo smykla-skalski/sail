@@ -533,6 +533,32 @@ pub fn context_provider_status(
     })
 }
 
+#[cfg(target_os = "macos")]
+pub fn provider_mcp_server(app: &tauri::AppHandle, directory: &Path) -> Option<serde_json::Value> {
+    let canonical = dunce::canonicalize(directory).ok()?;
+    let current = locked_store(&store_path(app).ok()?, |store| {
+        Ok((status(&canonical, store), false))
+    })
+    .ok()?;
+    if current.state != "approved" {
+        return None;
+    }
+    let session = ContextSession::open(&canonical).ok()?;
+    session.check().ok()?;
+    let executable = std::env::current_exe().ok()?;
+    Some(serde_json::json!({
+        "name": current.id?,
+        "command": executable.to_string_lossy(),
+        "args": ["--context-mcp", canonical.to_string_lossy()],
+        "env": []
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn provider_mcp_server(_: &tauri::AppHandle, _: &Path) -> Option<serde_json::Value> {
+    None
+}
+
 #[tauri::command]
 pub fn context_register_provider(
     app: tauri::AppHandle,
@@ -646,7 +672,7 @@ pub unsafe extern "C" fn sail_context_validate_approval(
     let Ok(store_path) = service_store_path() else {
         return false;
     };
-    let Ok(Some((project_key, fingerprint))) = locked_store(&store_path, |store| {
+    let Ok(Some((project_key, fingerprint, provider))) = locked_store(&store_path, |store| {
         let current = status(&directory, store);
         if current.state != "approved"
             || expected.is_some_and(|value| current.fingerprint.as_deref() != Some(value))
@@ -654,7 +680,11 @@ pub unsafe extern "C" fn sail_context_validate_approval(
             return Ok((None, false));
         }
         Ok((
-            Some((project_key(&directory)?, current.fingerprint.unwrap())),
+            Some((
+                project_key(&directory)?,
+                current.fingerprint.clone().unwrap(),
+                current,
+            )),
             false,
         ))
     }) else {
@@ -663,6 +693,8 @@ pub unsafe extern "C" fn sail_context_validate_approval(
     let Ok(serialized) = serde_json::to_vec(&serde_json::json!({
         "projectKey": project_key,
         "fingerprint": fingerprint,
+        "providerId": provider.id,
+        "executable": provider.executable,
     })) else {
         return false;
     };
@@ -690,6 +722,14 @@ unsafe extern "C" {
         error_length: usize,
     ) -> bool;
     fn sail_context_session_close(handle: *mut std::ffi::c_void);
+    fn sail_context_session_request(
+        handle: *mut std::ffi::c_void,
+        request: *const std::ffi::c_char,
+        output: *mut std::ffi::c_char,
+        output_length: usize,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> bool;
     #[cfg(feature = "e2e")]
     fn sail_context_probe_replay(
         directory: *const std::ffi::c_char,
@@ -766,6 +806,546 @@ impl ContextSession {
                 .into_owned())
         }
     }
+
+    pub fn request(&self, message: &str) -> Result<Option<String>, String> {
+        let message = std::ffi::CString::new(message)
+            .map_err(|_| "Context MCP request contains a NUL byte.".to_string())?;
+        let mut output = vec![0_i8; 1024 * 1024 + 1];
+        let mut error = [0_i8; 512];
+        if !unsafe {
+            sail_context_session_request(
+                self.0,
+                message.as_ptr(),
+                output.as_mut_ptr(),
+                output.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        } {
+            return Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        let value = unsafe { std::ffi::CStr::from_ptr(output.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        Ok((!value.is_empty()).then_some(value))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+    let session = ContextSession::open(directory)?;
+    let input = std::io::stdin();
+    let mut input = input.lock();
+    loop {
+        if input
+            .fill_buf()
+            .map_err(|error| error.to_string())?
+            .is_empty()
+        {
+            break;
+        }
+        let line = read_bounded_line(&mut input, 1024 * 1024 + 1)?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        if let Some(response) = session.request(&line)? {
+            writeln!(std::io::stdout(), "{response}").map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct ProviderProcess {
+    fingerprint: String,
+    initialization: Option<serde_json::Value>,
+    initialized_notification_sent: bool,
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: Option<std::io::BufReader<std::process::ChildStdout>>,
+    stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl ProviderProcess {
+    fn error(&self, reason: &str) -> String {
+        let tail = self
+            .stderr_tail
+            .lock()
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes.iter().copied().collect::<Vec<_>>()).into_owned()
+            })
+            .unwrap_or_default();
+        if tail.trim().is_empty() {
+            reason.into()
+        } else {
+            format!("{reason} Provider stderr: {}", tail.trim())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ProviderProcess {
+    fn drop(&mut self) {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+        }
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "macos")]
+type ProviderSlot = std::sync::Arc<std::sync::Mutex<Option<ProviderProcess>>>;
+
+#[cfg(target_os = "macos")]
+static PROVIDERS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, ProviderSlot>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+static ACTIVE_SESSIONS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn active_sessions() -> &'static std::sync::Mutex<HashSet<String>> {
+    ACTIVE_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// `capability` must point to a valid NUL-terminated session capability.
+pub unsafe extern "C" fn sail_context_session_activate(
+    capability: *const std::ffi::c_char,
+) -> bool {
+    if capability.is_null() {
+        return false;
+    }
+    let Ok(capability) = unsafe { std::ffi::CStr::from_ptr(capability) }.to_str() else {
+        return false;
+    };
+    if capability.len() != 64 {
+        return false;
+    }
+    active_sessions()
+        .lock()
+        .is_ok_and(|mut sessions| sessions.insert(capability.into()))
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// `capability` must point to a valid NUL-terminated session capability.
+pub unsafe extern "C" fn sail_context_session_deactivate(capability: *const std::ffi::c_char) {
+    if capability.is_null() {
+        return;
+    }
+    let Ok(capability) = unsafe { std::ffi::CStr::from_ptr(capability) }.to_str() else {
+        return;
+    };
+    if let Ok(mut sessions) = active_sessions().lock() {
+        sessions.remove(capability);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// `key` must point to a valid NUL-terminated project key.
+pub unsafe extern "C" fn sail_context_provider_stop(key: *const std::ffi::c_char) {
+    if key.is_null() {
+        return;
+    }
+    let Ok(key) = unsafe { std::ffi::CStr::from_ptr(key) }.to_str() else {
+        return;
+    };
+    if let Some(providers) = PROVIDERS.get() {
+        if let Ok(mut providers) = providers.lock() {
+            let removed = providers.remove(key);
+            drop(providers);
+            if let Some(slot) = removed {
+                if let Ok(mut provider) = slot.lock() {
+                    provider.take();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn forget_provider(key: &str, slot: &ProviderSlot) {
+    if let Some(providers) = PROVIDERS.get() {
+        if let Ok(mut providers) = providers.lock() {
+            if providers
+                .get(key)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, slot))
+            {
+                providers.remove(key);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_literal(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_provider(
+    directory: &Path,
+    current: &ProviderStatus,
+    data_root: &Path,
+) -> Result<ProviderProcess, String> {
+    use std::os::unix::process::CommandExt;
+    let executable = PathBuf::from(
+        current
+            .executable
+            .as_deref()
+            .ok_or("Provider executable missing.")?,
+    );
+    fs::create_dir_all(data_root).map_err(|error| error.to_string())?;
+    fs::set_permissions(data_root, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    let data_root = dunce::canonicalize(data_root).map_err(|error| error.to_string())?;
+    let profile = format!(
+        "(version 1)\n(deny default)\n(allow file-read-data (literal \"/\"))\n\
+         (allow file-read* (subpath \"/System\") (subpath \"/usr/lib\") \
+         (subpath \"/Library/Apple\") (literal \"{}\") \
+         (subpath \"{}\") (subpath \"{}\"))\n\
+         (allow file-write* (subpath \"{}\"))\n\
+         (allow process-exec (literal \"{}\"))\n\
+         (allow sysctl-read (sysctl-name \"kern.bootargs\") \
+         (sysctl-name \"security.mac.lockdown_mode_state\"))\n",
+        seatbelt_literal(&executable),
+        seatbelt_literal(directory),
+        seatbelt_literal(&data_root),
+        seatbelt_literal(&data_root),
+        seatbelt_literal(&executable),
+    );
+    if !Path::new("/usr/bin/sandbox-exec").is_file() {
+        return Err("Provider confinement is unavailable on this macOS installation.".into());
+    }
+    let mut child = Command::new("/usr/bin/sandbox-exec")
+        .arg("-p")
+        .arg(profile)
+        .arg(&executable)
+        .current_dir(directory)
+        .env_clear()
+        .env("HOME", &data_root)
+        .env("TMPDIR", &data_root)
+        .env("PATH", "/usr/bin:/bin")
+        .process_group(0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Provider startup failed: {error}"))?;
+    let stdin = child.stdin.take().ok_or("Provider stdin unavailable.")?;
+    let stdout = child.stdout.take().ok_or("Provider stdout unavailable.")?;
+    let mut stderr = child.stderr.take().ok_or("Provider stderr unavailable.")?;
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let tail = stderr_tail.clone();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        while let Ok(count) = stderr.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            if let Ok(mut tail) = tail.lock() {
+                for byte in &buffer[..count] {
+                    tail.push_back(*byte);
+                }
+                while tail.len() > 4096 {
+                    tail.pop_front();
+                }
+            }
+        }
+    });
+    Ok(ProviderProcess {
+        fingerprint: current
+            .fingerprint
+            .clone()
+            .ok_or("Provider fingerprint missing.")?,
+        initialization: None,
+        initialized_notification_sent: false,
+        child,
+        stdin,
+        stdout: Some(std::io::BufReader::new(stdout)),
+        stderr_tail,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn provider_request(
+    directory: &Path,
+    expected: &str,
+    capability: &str,
+    message: &str,
+) -> Result<Option<String>, String> {
+    #[cfg(feature = "e2e")]
+    let root = PathBuf::from(
+        std::env::var_os("SAIL_E2E_CONFIG_DIR")
+            .ok_or("Set SAIL_E2E_CONFIG_DIR for isolated provider data.")?,
+    );
+    #[cfg(not(feature = "e2e"))]
+    let root = dirs::data_dir()
+        .ok_or("Cannot locate provider data directory.")?
+        .join("sail/context-providers");
+    provider_request_at(
+        directory,
+        expected,
+        Some(capability),
+        message,
+        &service_store_path()?,
+        &root,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn provider_request_at(
+    directory: &Path,
+    expected: &str,
+    capability: Option<&str>,
+    message: &str,
+    store_path: &Path,
+    data_root: &Path,
+) -> Result<Option<String>, String> {
+    use std::time::Duration;
+    if message.len() > 1024 * 1024 {
+        return Err("Context MCP request exceeds 1 MiB.".into());
+    }
+    let request: serde_json::Value =
+        serde_json::from_str(message).map_err(|_| "Invalid context MCP JSON-RPC request.")?;
+    if !request.is_object()
+        || request.get("jsonrpc").and_then(|value| value.as_str()) != Some("2.0")
+        || request
+            .get("method")
+            .and_then(|value| value.as_str())
+            .is_none()
+    {
+        return Err("Invalid context MCP JSON-RPC request.".into());
+    }
+    let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
+    let key = project_key(&canonical)?;
+    let providers = PROVIDERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    let slot = providers
+        .lock()
+        .map_err(|error| error.to_string())?
+        .entry(key.clone())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
+        .clone();
+    let mut provider = slot.lock().map_err(|error| error.to_string())?;
+    let sessions = active_sessions()
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if capability.is_some_and(|capability| !sessions.contains(capability)) {
+        if provider.is_none() {
+            drop(provider);
+            forget_provider(&key, &slot);
+        }
+        return Err("Context session revoked before provider request.".into());
+    }
+    let current = locked_store(store_path, |store| Ok((status(&canonical, store), false)))?;
+    if current.state != "approved" || current.fingerprint.as_deref() != Some(expected) {
+        provider.take();
+        drop(provider);
+        forget_provider(&key, &slot);
+        return Err("Context approval changed or was revoked.".into());
+    }
+    let stale = provider.as_mut().is_some_and(|current| {
+        current.fingerprint != expected || current.child.try_wait().ok().flatten().is_some()
+    });
+    if stale {
+        provider.take();
+    }
+    if provider.is_none() {
+        *provider = Some(spawn_provider(&canonical, &current, &data_root.join(&key))?);
+    }
+    let process = provider.as_mut().ok_or("Provider unavailable.")?;
+    let method = request
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap();
+    if method == "initialize" {
+        if let Some(result) = &process.initialization {
+            let id = request
+                .get("id")
+                .ok_or("MCP initialize request has no ID.")?;
+            return Ok(Some(
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}).to_string(),
+            ));
+        }
+    }
+    if method == "notifications/initialized" && process.initialized_notification_sent {
+        return Ok(None);
+    }
+    if let Err(error) = writeln!(process.stdin, "{message}").and_then(|()| process.stdin.flush()) {
+        let detail = process.error(&format!("Provider request failed: {error}"));
+        provider.take();
+        drop(provider);
+        forget_provider(&key, &slot);
+        return Err(detail);
+    }
+    drop(sessions);
+    if request.get("id").is_none() {
+        if method == "notifications/initialized" {
+            process.initialized_notification_sent = true;
+        }
+        return Ok(None);
+    }
+    let reader = process
+        .stdout
+        .take()
+        .ok_or("Provider output unavailable.")?;
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let request_id = request.get("id").cloned();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let result = (|| -> Result<String, String> {
+            let mut messages = String::new();
+            for _ in 0..32 {
+                let line = read_bounded_line(&mut reader, 1024 * 1024 - messages.len())?;
+                let value: serde_json::Value = serde_json::from_str(line.trim_end())
+                    .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
+                if value.get("jsonrpc").and_then(|version| version.as_str()) != Some("2.0") {
+                    return Err("Provider returned invalid JSON-RPC.".into());
+                }
+                let matched = value.get("id") == request_id.as_ref();
+                if value.get("id").is_some() && !matched {
+                    return Err("Provider response ID did not match the request.".into());
+                }
+                if matched && value.get("result").is_none() && value.get("error").is_none() {
+                    return Err("Provider returned a request instead of a response.".into());
+                }
+                if !matched
+                    && value
+                        .get("method")
+                        .and_then(|method| method.as_str())
+                        .is_none()
+                {
+                    return Err("Provider returned an invalid notification.".into());
+                }
+                messages.push_str(&line);
+                if matched {
+                    return Ok(messages);
+                }
+            }
+            Err("Provider sent too many messages before its response.".into())
+        })();
+        let _ = send.send((result, reader));
+    });
+    let response = match receive.recv_timeout(Duration::from_secs(30)) {
+        Ok((Ok(response), reader)) => {
+            process.stdout = Some(reader);
+            response
+        }
+        Ok((Err(error), _)) => {
+            let detail = process.error(&error);
+            provider.take();
+            drop(provider);
+            forget_provider(&key, &slot);
+            return Err(detail);
+        }
+        Err(_) => {
+            let detail = process.error("Provider response timed out.");
+            provider.take();
+            drop(provider);
+            forget_provider(&key, &slot);
+            return Err(detail);
+        }
+    };
+    if method == "initialize" {
+        if let Some(result) = response
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .and_then(|value| value.get("result").cloned())
+        {
+            process.initialization = Some(result);
+        }
+    }
+    Ok(Some(response.trim_end().to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn read_bounded_line(reader: &mut impl std::io::BufRead, limit: usize) -> Result<String, String> {
+    let mut output = Vec::new();
+    loop {
+        let available = reader.fill_buf().map_err(|error| error.to_string())?;
+        if available.is_empty() {
+            return Err("MCP message ended before a newline.".into());
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if output.len() + count > limit {
+            return Err("MCP message exceeds 1 MiB.".into());
+        }
+        let done = available[count - 1] == b'\n';
+        output.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if done {
+            return String::from_utf8(output).map_err(|error| error.to_string());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+/// All pointers must reference valid buffers of the stated lengths.
+pub unsafe extern "C" fn sail_context_provider_request(
+    directory: *const std::ffi::c_char,
+    expected: *const std::ffi::c_char,
+    capability: *const std::ffi::c_char,
+    message: *const std::ffi::c_char,
+    output: *mut std::ffi::c_char,
+    output_length: usize,
+) -> bool {
+    use std::ffi::CStr;
+    if directory.is_null()
+        || expected.is_null()
+        || capability.is_null()
+        || message.is_null()
+        || output.is_null()
+        || output_length == 0
+    {
+        return false;
+    }
+    let result = (|| {
+        let directory = unsafe { CStr::from_ptr(directory) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let expected = unsafe { CStr::from_ptr(expected) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let capability = unsafe { CStr::from_ptr(capability) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        let message = unsafe { CStr::from_ptr(message) }
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        provider_request(Path::new(directory), expected, capability, message)
+    })();
+    let (ok, text) = match result {
+        Ok(Some(response)) => (true, response),
+        Ok(None) => (true, String::new()),
+        Err(error) => (false, error),
+    };
+    if text.len() >= output_length {
+        return false;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), output.cast::<u8>(), text.len());
+        *output.add(text.len()) = 0;
+    }
+    ok
 }
 
 #[cfg(target_os = "macos")]
@@ -781,6 +1361,17 @@ mod tests {
     use serde_json::json;
 
     struct Repository(PathBuf);
+
+    #[cfg(target_os = "macos")]
+    struct StopProvider(String);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for StopProvider {
+        fn drop(&mut self) {
+            let key = std::ffi::CString::new(self.0.clone()).unwrap();
+            unsafe { sail_context_provider_stop(key.as_ptr()) };
+        }
+    }
 
     impl Repository {
         fn new(name: &str) -> Self {
@@ -831,6 +1422,27 @@ mod tests {
             );
             self.commit();
         }
+
+        #[cfg(target_os = "macos")]
+        fn provider_fixture(&self) -> PathBuf {
+            let executable = self.0.join("provider");
+            let source =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/fixtures/context-provider.c");
+            assert!(Command::new("cc")
+                .args(["-o"])
+                .arg(&executable)
+                .arg(source)
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&executable)
+                .status()
+                .unwrap()
+                .success());
+            dunce::canonicalize(executable).unwrap()
+        }
     }
 
     impl Drop for Repository {
@@ -856,6 +1468,282 @@ mod tests {
             )]),
             approvals: BTreeMap::new(),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_provider_can_exchange_a_bounded_mcp_line() {
+        let repository = Repository::new("confined-provider");
+        repository.configure();
+        let executable = repository.provider_fixture();
+        let current = ProviderStatus {
+            state: "approved".into(),
+            id: Some("fixture".into()),
+            command: Some("fixture".into()),
+            executable: Some(executable.to_string_lossy().into_owned()),
+            executable_sha256: None,
+            capabilities: vec!["get".into()],
+            fingerprint: Some("fixture-fingerprint".into()),
+            revision: None,
+            reason: None,
+        };
+        let mut provider =
+            spawn_provider(&repository.0, &current, &repository.0.join("data")).unwrap();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"write"}"#;
+        writeln!(provider.stdin, "{request}").unwrap();
+        provider.stdin.flush().unwrap();
+        let response = read_bounded_line(provider.stdout.as_mut().unwrap(), 1024)
+            .unwrap_or_else(|error| panic!("{}", provider.error(&error)));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], 1);
+        assert!(response["result"]["pid"].as_i64().unwrap() > 0);
+        assert!(repository.0.join("data/written").exists());
+        assert!(read_bounded_line(&mut std::io::Cursor::new(vec![b'x'; 5]), 4).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_requests_track_committed_approval_and_stop_after_change() {
+        let repository = Repository::new("runtime-approval");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let call = || {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                request,
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let first: serde_json::Value = serde_json::from_str(&call().unwrap().unwrap()).unwrap();
+        assert_eq!(first["id"], 1);
+        repository.write(
+            ".sail/context.json",
+            r#"{"version":1,"providers":[{"id":"project-files","type":"stdio","command":"fixture-provider","capabilities":["execute"]}]}"#,
+        );
+        let second: serde_json::Value = serde_json::from_str(&call().unwrap().unwrap()).unwrap();
+        assert_eq!(first["result"]["pid"], second["result"]["pid"]);
+        repository.commit();
+        assert!(call().unwrap_err().contains("approval changed"));
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn second_agent_reuses_provider_initialization() {
+        let repository = Repository::new("runtime-initialize");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let call = |id| {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"initialize"}}"#),
+                &store_path,
+                &repository.0.join("data"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first: serde_json::Value = serde_json::from_str(&call(1)).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&call(2)).unwrap();
+        assert_eq!(first["id"], 1);
+        assert_eq!(second["id"], 2);
+        assert_eq!(first["result"]["pid"], second["result"]["pid"]);
+        assert_eq!(first["result"]["initializeCount"], 1);
+        assert_eq!(second["result"]["initializeCount"], 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_startup_failure_returns_an_error_without_a_live_process() {
+        let repository = Repository::new("runtime-startup");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let store_path = repository.0.join("approvals.json");
+        let executable = dunce::canonicalize("/usr/bin/false").unwrap();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let result = provider_request_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &store_path,
+            &repository.0.join("data"),
+        );
+        assert!(result.is_err());
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn executable_replacement_revokes_a_live_provider() {
+        let repository = Repository::new("runtime-executable-change");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.0.join("provider");
+        repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let call = || {
+            provider_request_at(
+                &repository.0,
+                &fingerprint,
+                None,
+                request,
+                &store_path,
+                &repository.0.join("data"),
+            )
+        };
+        let response: serde_json::Value = serde_json::from_str(&call().unwrap().unwrap()).unwrap();
+        assert_eq!(response["id"], 1);
+        let replacement = repository.0.join("replacement");
+        fs::copy("/usr/bin/false", &replacement).unwrap();
+        fs::rename(replacement, executable).unwrap();
+        assert!(call().unwrap_err().contains("approval changed"));
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queued_request_does_not_launch_after_session_closes() {
+        let repository = Repository::new("runtime-queued-revocation");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let store_path = repository.0.join("approvals.json");
+        let executable = dunce::canonicalize("/bin/cat").unwrap();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let capability = sha256(uuid::Uuid::new_v4().as_bytes());
+        let capability_c = std::ffi::CString::new(capability.clone()).unwrap();
+        assert!(unsafe { sail_context_session_activate(capability_c.as_ptr()) });
+        let providers = PROVIDERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+        let guard = providers.lock().unwrap();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let directory = repository.0.clone();
+        let data_root = directory.join("data");
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            provider_request_at(
+                &directory,
+                &fingerprint,
+                Some(&capability),
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+                &store_path,
+                &data_root,
+            )
+        });
+        waiting.recv().unwrap();
+        unsafe { sail_context_session_deactivate(capability_c.as_ptr()) };
+        drop(guard);
+        assert!(worker
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("session revoked"));
+        assert!(!providers.lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stalled_provider_does_not_block_another_project() {
+        let slow = Repository::new("runtime-slow-project");
+        let fast = Repository::new("runtime-fast-project");
+        slow.configure();
+        fast.configure();
+        let slow_executable = slow.provider_fixture();
+        let fast_executable = fast.provider_fixture();
+        let configure = |repository: &Repository, executable: &Path| {
+            let store_path = repository.0.join("approvals.json");
+            let fingerprint = locked_store(&store_path, |store| {
+                register(store, "fixture-provider", executable);
+                let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+                approve(&repository.0, store, &fingerprint)?;
+                Ok((fingerprint, true))
+            })
+            .unwrap();
+            (store_path, fingerprint)
+        };
+        let (slow_store, slow_fingerprint) = configure(&slow, &slow_executable);
+        let (fast_store, fast_fingerprint) = configure(&fast, &fast_executable);
+        let slow_key = project_key(&slow.0).unwrap();
+        let fast_key = project_key(&fast.0).unwrap();
+        let _stop_slow = StopProvider(slow_key.clone());
+        let _stop_fast = StopProvider(fast_key);
+        let slow_data = slow.0.join("data");
+        let slow_dir = slow.0.clone();
+        let worker = std::thread::spawn(move || {
+            provider_request_at(
+                &slow_dir,
+                &slow_fingerprint,
+                None,
+                r#"{"jsonrpc":"2.0","id":1,"method":"slow"}"#,
+                &slow_store,
+                &slow_data,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !worker.is_finished(),
+            "slow provider finished before fast request"
+        );
+        let start = std::time::Instant::now();
+        let response = provider_request_at(
+            &fast.0,
+            &fast_fingerprint,
+            None,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &fast_store,
+            &fast.0.join("data"),
+        )
+        .unwrap();
+        assert!(response.is_some());
+        assert!(start.elapsed() < std::time::Duration::from_millis(1500));
+        assert!(worker.join().unwrap().is_ok());
     }
 
     #[test]
