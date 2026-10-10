@@ -17,6 +17,7 @@ pub struct SelectedMemory {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Proposal {
+    repository: PathBuf,
     memory: SelectedMemory,
     destination: PathBuf,
     revision: String,
@@ -73,6 +74,7 @@ pub fn preview(
         return Err("Select a repository root.".into());
     }
     let target = checked_target(&root, destination)?;
+    check_index_state(&root, destination)?;
     let revision = git(&root, &["rev-parse", "--verify", "HEAD"])?;
     let before = read_document(&target)?;
     if !git(
@@ -99,6 +101,7 @@ pub fn preview(
     after.push('\n');
     let diff = unified_diff(destination, &before, &after);
     Ok(Proposal {
+        repository: root,
         memory,
         destination: destination.to_owned(),
         revision,
@@ -119,7 +122,11 @@ pub fn accept(
     let root = repository
         .canonicalize()
         .map_err(|_| "Repository is unavailable.")?;
+    if root != proposal.repository {
+        return Err("Proposal belongs to another repository; review it there.".into());
+    }
     let target = checked_target(&root, &proposal.destination)?;
+    check_index_state(&root, &proposal.destination)?;
     if git(&root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
         || read_document(&target)? != proposal.before
         || !git(
@@ -165,6 +172,7 @@ pub fn accept(
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("Cannot prepare proposal: {error}"))?;
         if checked_target(&root, &proposal.destination)? != target
+            || check_index_state(&root, &proposal.destination).is_err()
             || read_document(&target)? != proposal.before
             || git(&root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
         {
@@ -181,7 +189,7 @@ pub fn accept(
 fn checked_target(root: &Path, destination: &Path) -> Result<PathBuf, String> {
     let parts: Vec<_> = destination.components().collect();
     let allowed = matches!(parts.as_slice(), [Component::Normal(name)] if *name == "AGENTS.md" || *name == "CLAUDE.md")
-        || matches!(parts.as_slice(), [Component::Normal(dir), Component::Normal(name)] if *dir == "docs" && Path::new(name).extension().is_some_and(|ext| ext == "md"));
+        || matches!(parts.as_slice(), [Component::Normal(dir), Component::Normal(name)] if *dir == "docs" && Path::new(name).extension().is_some_and(|ext| ext == "md") && name.to_str().is_some_and(|name| !name.starts_with('.') && !name.chars().any(char::is_control)));
     if !allowed {
         return Err("Select an existing repository instruction or docs Markdown file.".into());
     }
@@ -205,6 +213,7 @@ fn checked_target(root: &Path, destination: &Path) -> Result<PathBuf, String> {
     }
     let relative = destination.to_str().ok_or("Invalid destination.")?;
     let output = Command::new("git")
+        .arg("--literal-pathspecs")
         .arg("-C")
         .arg(root)
         .args(["ls-files", "--error-unmatch", "--", relative])
@@ -214,6 +223,15 @@ fn checked_target(root: &Path, destination: &Path) -> Result<PathBuf, String> {
         return Err("Destination must already be tracked.".into());
     }
     Ok(target)
+}
+
+fn check_index_state(root: &Path, destination: &Path) -> Result<(), String> {
+    let relative = destination.to_str().ok_or("Invalid destination.")?;
+    let flags = git(root, &["ls-files", "-v", "--", relative])?;
+    if flags != format!("H {relative}") {
+        return Err("Destination has hidden or changed Git index state.".into());
+    }
+    Ok(())
 }
 
 fn read_document(path: &Path) -> Result<String, String> {
@@ -227,6 +245,7 @@ fn read_document(path: &Path) -> Result<String, String> {
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
+        .arg("--literal-pathspecs")
         .arg("-C")
         .arg(root)
         .args(args)
@@ -391,6 +410,53 @@ mod tests {
         fs::write(repo.0.join("docs/project.md"), "new version\n").unwrap();
         repo.git(&["add", "docs/project.md"]);
         repo.git(&["commit", "-qm", "next"]);
+        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert_eq!(
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "# Rules\n"
+        );
+    }
+
+    #[test]
+    fn proposal_cannot_be_accepted_in_another_clone_at_the_same_revision() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let other_path = std::env::temp_dir().join(format!(
+            "sail-knowledge-clone-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&repo.0)
+            .arg(&other_path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(accept(&other_path, &proposal, true).is_err());
+        assert_eq!(
+            fs::read_to_string(other_path.join("AGENTS.md")).unwrap(),
+            "# Rules\n"
+        );
+        fs::remove_dir_all(other_path).unwrap();
+    }
+
+    #[test]
+    fn hidden_index_flags_cannot_hide_the_reviewable_change() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        repo.git(&["update-index", "--assume-unchanged", "AGENTS.md"]);
+        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert!(preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "change",
+            true
+        )
+        .is_err());
+        repo.git(&["update-index", "--no-assume-unchanged", "AGENTS.md"]);
+        repo.git(&["update-index", "--skip-worktree", "AGENTS.md"]);
         assert!(accept(&repo.0, &proposal, true).is_err());
         assert_eq!(
             fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
