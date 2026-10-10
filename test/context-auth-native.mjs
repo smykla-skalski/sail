@@ -202,6 +202,9 @@ try {
   assert.equal(await second.check(), 'authorized');
   console.log('PASS: two signed sessions in one per-user service');
 
+  assert.equal(run(binary, ['--context-auth-replay-probe', project]), 'replay-rejected');
+  console.log('PASS: capability cannot be replayed on a separate XPC connection');
+
   expectFailure(binary, ['--context-auth-probe', other], /Context approval unavailable/);
   const copied = join(scratch, 'copied.app');
   run('ditto', [app, copied]);
@@ -234,6 +237,31 @@ try {
   assert.equal(await fourth.check(), 'authorized');
   fourth.close();
   console.log('PASS: service restart invalidates old capability and admits new session');
+
+  assert.ok(process.env.APPLE_SIGNING_IDENTITY, 'Signed upgrade requires a signing identity');
+  run('plutil', [
+    '-replace',
+    'CFBundleVersion',
+    '-string',
+    '514.2',
+    join(app, 'Contents', 'Info.plist'),
+  ]);
+  run('codesign', [
+    '--force',
+    '--deep',
+    '--options',
+    'runtime',
+    '--sign',
+    process.env.APPLE_SIGNING_IDENTITY,
+    app,
+  ]);
+  run('codesign', ['--verify', '--deep', '--strict', app]);
+  expectFailure(
+    binary,
+    ['--context-auth-probe', project],
+    /Context service (signature or path rejected|unavailable or stale after upgrade)/,
+  );
+  console.log('PASS: upgraded app rejects the stale signed service');
 } finally {
   for (const probe of probes) if (!probe.killed) probe.kill('SIGTERM');
   try {

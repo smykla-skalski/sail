@@ -277,6 +277,42 @@ void sail_context_session_close(void *handle) {
     }
 }
 
+#ifdef SAIL_CONTEXT_E2E
+bool sail_context_probe_replay(const char *directory, char *error, size_t errorLength) {
+    void *handle = sail_context_session_open(directory, error, errorLength);
+    if (!handle) return false;
+    @autoreleasepool {
+        SailContextSession *session = (__bridge SailContextSession *)handle;
+        xpc_connection_t other = xpc_connection_create_mach_service(serviceLabel().UTF8String, NULL, 0);
+        NSString *hash = selfCodeHash();
+        NSString *requirement = [NSString stringWithFormat:@"cdhash H\"%@\"", hash];
+        if (!hash || xpc_connection_set_peer_code_signing_requirement(other, requirement.UTF8String) != 0) {
+            writeError(error, errorLength, @"Replay probe cannot verify service signature.");
+            xpc_connection_set_event_handler(other, ^(xpc_object_t ignored) { (void)ignored; });
+            xpc_connection_resume(other);
+            xpc_connection_cancel(other);
+            sail_context_session_close(handle);
+            return false;
+        }
+        xpc_connection_set_event_handler(other, ^(xpc_object_t ignored) { (void)ignored; });
+        xpc_connection_resume(other);
+        xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(request, "op", "check");
+        xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
+        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(other, request);
+        bool rejected = xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+            [senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)] &&
+            !xpc_dictionary_get_bool(reply, "authorized") &&
+            xpc_dictionary_get_string(reply, "error") != NULL;
+        xpc_connection_cancel(other);
+        bool originalAuthorized = sail_context_session_check(handle, error, errorLength);
+        sail_context_session_close(handle);
+        if (!rejected) writeError(error, errorLength, @"Cross-connection capability replay was not rejected.");
+        return rejected && originalAuthorized;
+    }
+}
+#endif
+
 bool sail_context_service_unregister(char *error, size_t errorLength) {
     @autoreleasepool {
         if (@available(macOS 13.0, *)) {

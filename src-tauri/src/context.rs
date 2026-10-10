@@ -691,6 +691,12 @@ unsafe extern "C" {
     ) -> bool;
     fn sail_context_session_close(handle: *mut std::ffi::c_void);
     #[cfg(feature = "e2e")]
+    fn sail_context_probe_replay(
+        directory: *const std::ffi::c_char,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> bool;
+    #[cfg(feature = "e2e")]
     fn sail_context_service_unregister(error: *mut std::ffi::c_char, error_length: usize) -> bool;
 }
 
@@ -708,6 +714,20 @@ pub fn is_service_process() -> bool {
 pub fn unregister_e2e_service() -> Result<(), String> {
     let mut error = [0_i8; 512];
     if unsafe { sail_context_service_unregister(error.as_mut_ptr(), error.len()) } {
+        Ok(())
+    } else {
+        Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "e2e"))]
+pub fn probe_e2e_replay(directory: &Path) -> Result<(), String> {
+    let directory = std::ffi::CString::new(directory.to_string_lossy().as_bytes())
+        .map_err(|_| "Invalid context directory.".to_string())?;
+    let mut error = [0_i8; 512];
+    if unsafe { sail_context_probe_replay(directory.as_ptr(), error.as_mut_ptr(), error.len()) } {
         Ok(())
     } else {
         Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }

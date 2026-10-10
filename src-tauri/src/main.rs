@@ -2,6 +2,20 @@
 
 fn main() {
     #[cfg(all(target_os = "macos", feature = "e2e"))]
+    if std::env::args().nth(1).as_deref() == Some("--context-auth-replay-probe") {
+        let Some(directory) = std::env::args().nth(2) else {
+            std::process::exit(64);
+        };
+        match sail_lib::context::probe_e2e_replay(std::path::Path::new(&directory)) {
+            Ok(()) => println!("replay-rejected"),
+            Err(error) => {
+                eprintln!("replay: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    #[cfg(all(target_os = "macos", feature = "e2e"))]
     if std::env::args().nth(1).as_deref() == Some("--context-auth-unregister-probe") {
         match sail_lib::context::unregister_e2e_service() {
             Ok(()) => println!("unregistered"),
