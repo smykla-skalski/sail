@@ -545,7 +545,7 @@ pub fn provider_mcp_server(app: &tauri::AppHandle, directory: &Path) -> Option<s
     }
     let executable = std::env::current_exe().ok()?;
     Some(serde_json::json!({
-        "name": current.id?,
+        "name": "sail-context",
         "command": executable.to_string_lossy(),
         "args": ["--context-mcp", canonical.to_string_lossy()],
         "env": []
@@ -865,10 +865,50 @@ impl ContextSession {
 
 #[cfg(target_os = "macos")]
 pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
+    use crate::context_output_store::{OutputLimits, OutputScope, OutputStore};
     use std::io::{BufRead, Write};
+    let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
+    let provider = locked_store(&service_store_path()?, |store| {
+        Ok((status(&canonical, store), false))
+    })?;
+    if provider.state != "approved" {
+        return Err("Context provider is not approved.".into());
+    }
+    let provider_id = provider.id.ok_or("Context provider ID is unavailable.")?;
+    let revision = provider
+        .revision
+        .ok_or("Context provider revision is unavailable.")?;
+    let common_dir = String::from_utf8(git(&canonical, &["rev-parse", "--git-common-dir"])?)
+        .map_err(|_| "Context repository path is invalid.")?;
+    let common_dir = common_dir.trim();
+    let repository =
+        dunce::canonicalize(canonical.join(common_dir)).map_err(|error| error.to_string())?;
+    let scope = OutputScope {
+        repository: repository.to_string_lossy().into_owned(),
+        worktree: canonical.to_string_lossy().into_owned(),
+        user: unsafe { nix::libc::geteuid() }.to_string(),
+        provider: provider_id.clone(),
+        session: uuid::Uuid::new_v4().to_string(),
+        revision,
+    };
+    #[cfg(feature = "e2e")]
+    let data_root = PathBuf::from(
+        std::env::var_os("SAIL_E2E_CONFIG_DIR")
+            .ok_or("Set SAIL_E2E_CONFIG_DIR for isolated broker data.")?,
+    );
+    #[cfg(not(feature = "e2e"))]
+    let data_root = dirs::data_dir()
+        .ok_or("Cannot locate broker data directory.")?
+        .join("sail");
+    fs::create_dir_all(&data_root).map_err(|error| error.to_string())?;
+    let store = OutputStore::open(data_root.join("context-output"), OutputLimits::default())
+        .map_err(|warning| warning.message().to_owned())?;
+    let broker = crate::context_broker_mcp::BrokerMcp::new(provider_id, scope, store);
     let session = ContextSession::open(directory)?;
     let input = std::io::stdin();
     let mut input = input.lock();
+    let mut initialized = false;
+    let mut next_id = 1_u64;
     loop {
         if input
             .fill_buf()
@@ -879,11 +919,76 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
         }
         let line = read_bounded_line(&mut input, 1024 * 1024 + 1)?;
         let line = line.trim_end_matches(['\r', '\n']);
-        if let Some(response) = session.request(line)? {
+        if session.check().is_err() {
+            break;
+        }
+        if let Some(response) = broker.handle(line, |method, params| {
+            broker_provider_call(&session, &mut initialized, &mut next_id, method, params)
+        }) {
+            if session.check().is_err() {
+                break;
+            }
             writeln!(std::io::stdout(), "{response}").map_err(|error| error.to_string())?;
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn broker_provider_call(
+    session: &ContextSession,
+    initialized: &mut bool,
+    next_id: &mut u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ()> {
+    if !*initialized {
+        let response = broker_provider_request(
+            session,
+            next_id,
+            "initialize",
+            serde_json::json!({
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"sail-context","version":env!("CARGO_PKG_VERSION")}
+            }),
+        )?;
+        if response
+            .pointer("/result/protocolVersion")
+            .and_then(serde_json::Value::as_str)
+            != Some("2025-06-18")
+        {
+            return Err(());
+        }
+        session
+            .request(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .map_err(|_| ())?;
+        *initialized = true;
+    }
+    broker_provider_request(session, next_id, method, params)
+}
+
+#[cfg(target_os = "macos")]
+fn broker_provider_request(
+    session: &ContextSession,
+    next_id: &mut u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ()> {
+    let id = *next_id;
+    *next_id = next_id.checked_add(1).ok_or(())?;
+    let request = serde_json::json!({
+        "jsonrpc":"2.0","id":id,"method":method,"params":params
+    });
+    let response = session
+        .request(&request.to_string())
+        .map_err(|_| ())?
+        .ok_or(())?;
+    response
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("id").and_then(serde_json::Value::as_u64) == Some(id))
+        .ok_or(())
 }
 
 #[cfg(target_os = "macos")]

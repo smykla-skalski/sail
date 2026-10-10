@@ -62,6 +62,10 @@
   } from './lib/shared-memory';
 
   let snapshot = $state<SettingsSnapshot | null>(null);
+  type WorktreeStoragePending = { cacheKey: string; reason: string };
+  let worktreeStoragePending = $state<WorktreeStoragePending[]>([]);
+  let worktreeStorageLoading = $state(false);
+  let worktreeStorageError = $state('');
   const openCodeAgent = $derived(snapshot?.agents.find((agent) => agent.id === 'opencode'));
   const notificationsOn = $derived(
     notificationTypes.some(
@@ -186,6 +190,20 @@
         contextError = `Provider status: ${String(cause)}`;
     } finally {
       if (request === contextRequest && contextDirectory === directory) contextLoading = false;
+    }
+  }
+
+  async function refreshWorktreeStorage(retry = false) {
+    worktreeStorageLoading = true;
+    worktreeStorageError = '';
+    try {
+      worktreeStoragePending = await invoke<WorktreeStoragePending[]>(
+        retry ? 'retry_worktree_storage_cleanup' : 'worktree_storage_cleanup_status',
+      );
+    } catch (cause) {
+      worktreeStorageError = `Private agent storage status: ${String(cause)}`;
+    } finally {
+      worktreeStorageLoading = false;
     }
   }
 
@@ -738,6 +756,7 @@
         const stop = await listen<SettingsSnapshot>(settingsState, (event) => {
           snapshot = event.payload;
           if (selectedSection === 'agents') {
+            void refreshWorktreeStorage();
             if (snapshot.directory !== hookDirectory) void inspectHooks(snapshot.directory);
             if (snapshot.directory !== integrationDirectory)
               void inspectIntegration(snapshot.directory);
@@ -790,6 +809,7 @@
         aria-current={selectedSection === 'agents' ? 'page' : undefined}
         onclick={() => {
           selectedSection = 'agents';
+          void refreshWorktreeStorage();
           if (snapshot?.directory) {
             if (snapshot.directory !== hookDirectory) void inspectHooks(snapshot.directory);
             if (snapshot.directory !== integrationDirectory)
@@ -887,6 +907,32 @@
             <strong>{agent.name}</strong>: {agent.binaryPath ?? agent.reason ?? 'Unavailable'}
           </p>{/each}
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
+      </section>
+      <section class="settings-card">
+        <h2>Private agent storage</h2>
+        {#if worktreeStorageError}<p class="runtime-diagnostic" role="alert">
+            {worktreeStorageError}
+          </p>
+        {:else if worktreeStoragePending.length > 0}
+          <p role="status">
+            {worktreeStoragePending.length} cleanup item(s) are pending. Their data was retained because
+            Sail could not verify that no process still owns it or that its Git worktree identity is unchanged.
+          </p>
+          <ul>
+            {#each worktreeStoragePending as item (item.cacheKey)}
+              <li>{item.reason} <code>{item.cacheKey}</code></li>
+            {/each}
+          </ul>
+        {:else}
+          <p role="status">No private agent storage cleanup is pending.</p>
+        {/if}
+        <Button
+          size="sm"
+          disabled={worktreeStorageLoading}
+          onclick={() => void refreshWorktreeStorage(true)}
+        >
+          {worktreeStorageLoading ? 'Checking…' : 'Retry cleanup'}
+        </Button>
       </section>
       <section class="settings-card">
         <h2>Concurrent jobs</h2>

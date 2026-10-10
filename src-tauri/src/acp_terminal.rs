@@ -500,6 +500,7 @@ struct AcpTerminal {
     profile: CapabilityProfile,
     session_id: String,
     directory: PathBuf,
+    _storage_lease: Option<std::sync::Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(windows)]
     job: WindowsTerminalJob,
@@ -634,6 +635,40 @@ fn snapshot(session: &AcpTerminal) -> Result<TerminalSnapshot, String> {
     })
 }
 
+#[cfg(unix)]
+fn start_watchdog_or_cleanup(
+    child: &mut Child,
+    storage_lease: &crate::worktree_storage::WorktreeDataLease,
+    start_watchdog: impl FnOnce(u32) -> std::io::Result<crate::child_watchdog::ChildWatchdog>,
+) -> Result<crate::child_watchdog::ChildWatchdog, String> {
+    match start_watchdog(child.id()) {
+        Ok(watchdog) => Ok(watchdog),
+        Err(start_error) => {
+            let stop_result = crate::terminal::kill_terminal_process_groups(child.id());
+            if stop_result.is_err() {
+                let _ = child.kill();
+            }
+            let wait_result = child.wait();
+            match (stop_result, wait_result) {
+                (Ok(()), Ok(_)) => {
+                    storage_lease.release_clean().map_err(|cleanup_error| {
+                        format!(
+                            "Cannot start command watchdog: {start_error}; cannot release storage lease: {cleanup_error}"
+                        )
+                    })?;
+                    Err(format!("Cannot start command watchdog: {start_error}"))
+                }
+                (Err(stop_error), _) => Err(format!(
+                    "Cannot start command watchdog: {start_error}; cannot confirm command shutdown: {stop_error}"
+                )),
+                (_, Err(wait_error)) => Err(format!(
+                    "Cannot start command watchdog: {start_error}; cannot reap command: {wait_error}"
+                )),
+            }
+        }
+    }
+}
+
 fn session(
     manager: &AcpTerminalManager,
     agent: &str,
@@ -668,11 +703,17 @@ fn session(
 
 fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     if terminal.stopped.load(Ordering::Acquire) {
-        return Ok(());
+        return terminal
+            ._storage_lease
+            .as_ref()
+            .map_or(Ok(()), |lease| lease.release_clean());
     }
     let mut child = terminal.child.lock().map_err(|error| error.to_string())?;
     if terminal.stopped.load(Ordering::Acquire) {
-        return Ok(());
+        return terminal
+            ._storage_lease
+            .as_ref()
+            .map_or(Ok(()), |lease| lease.release_clean());
     }
     #[cfg(unix)]
     {
@@ -692,6 +733,9 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
         watchdog.stop();
     }
     terminal.stopped.store(true, Ordering::Release);
+    if let Some(lease) = &terminal._storage_lease {
+        lease.release_clean()?;
+    }
     Ok(())
 }
 
@@ -753,7 +797,7 @@ pub fn handle(
                     "Terminal working directory must be an existing absolute folder.".to_string(),
                 );
             }
-            let data_directory = crate::register_worktree_terminal_data(
+            let (data_directory, storage_lease) = crate::register_worktree_storage(
                 &app.path()
                     .app_cache_dir()
                     .map_err(|error| error.to_string())?,
@@ -788,15 +832,13 @@ pub fn handle(
             let mut child = command
                 .spawn()
                 .map_err(|error| format!("Cannot start command: {error}"))?;
+            storage_lease.mark_started();
             #[cfg(unix)]
-            let watchdog =
-                crate::child_watchdog::ChildWatchdog::start(child.id()).map_err(|error| {
-                    use nix::sys::signal::{killpg, Signal};
-                    use nix::unistd::Pid;
-                    let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
-                    let _ = child.wait();
-                    format!("Cannot start command watchdog: {error}")
-                })?;
+            let watchdog = start_watchdog_or_cleanup(
+                &mut child,
+                &storage_lease,
+                crate::child_watchdog::ChildWatchdog::start,
+            )?;
             let stdout = child
                 .stdout
                 .take()
@@ -815,6 +857,7 @@ pub fn handle(
                 profile,
                 session_id: params.session_id.clone(),
                 directory: worktree.to_path_buf(),
+                _storage_lease: Some(storage_lease),
                 child: Mutex::new(child),
                 #[cfg(windows)]
                 job,
@@ -1460,6 +1503,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn watchdog_start_failure_reaps_child_and_releases_storage_marker() {
+        use std::os::unix::process::CommandExt;
+
+        let scratch = std::env::temp_dir().join(format!(
+            "sail-acp-watchdog-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let worktree = scratch.join("worktree");
+        let cache = scratch.join("cache");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (data_directory, lease) = crate::register_worktree_storage(&cache, &worktree).unwrap();
+        let mut command = Command::new("sleep");
+        command
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        lease.mark_started();
+
+        let error = start_watchdog_or_cleanup(&mut child, &lease, |_| {
+            Err(std::io::Error::other("injected watchdog startup failure"))
+        })
+        .err()
+        .expect("injected watchdog startup error should be returned");
+
+        assert!(error.contains("injected watchdog startup failure"));
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!std::fs::read_dir(&data_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .any(|name| name.to_string_lossy().starts_with(".active-")));
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn nested_agent_terminal_uses_root_cache_and_stops_with_worktree() {
         use std::os::unix::process::CommandExt;
 
@@ -1509,6 +1597,7 @@ mod tests {
             profile: CapabilityProfile::Review,
             session_id: "nested-session".to_string(),
             directory: nested.clone(),
+            _storage_lease: None,
             child: Mutex::new(child),
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
