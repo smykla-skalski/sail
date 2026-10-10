@@ -7354,9 +7354,55 @@
     if (Date.now() >= request.expiresAt)
       throw new Error('The agent spawn request expired before launch.');
     // Return before the backend's five-minute coordination timeout.
-    const responseDeadline = request.expiresAt + 180_000;
-    const previousSpawn = agentSpawnQueue;
+    let responseDeadline = request.expiresAt + 180_000;
+    let pressureQueuedAt: number | null = null;
+    let resolveQueuedResponse: ((value: Record<string, unknown>) => void) | null = null;
+    const queuedResponse = new Promise<Record<string, unknown>>((resolve) => {
+      resolveQueuedResponse = resolve;
+    });
+    let releaseSpawnQueue: (() => void) | null = null;
     const launched = (async () => {
+      await coordinationSource(request);
+      updateSpawnReceipt(receiptId, { state: 'starting' });
+
+      if (destination) {
+        const targetPath = destination.path;
+        const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+          repository: project,
+          paths: [targetPath],
+        });
+        if (!registered.some((worktree) => worktree.path === targetPath))
+          throw new Error('Target worktree is no longer registered with Git.');
+      }
+
+      const pressureDirectory =
+        destination?.path ??
+        (await invoke<string>('worktree_pressure_directory', { repository: project }));
+      await acp.connect(chosenProvider, undefined, {
+        directory: pressureDirectory,
+        onQueue: (limit, reason) => {
+          if (limit !== null && reason?.startsWith('Waiting for machine pressure:')) {
+            pressureQueuedAt ??= Date.now();
+            updateSpawnReceipt(receiptId, { state: 'queued' });
+            resolveQueuedResponse?.({
+              status: 'queued',
+              receiptId,
+              accessKey: receiptAccessKey,
+              sourceId,
+              reason,
+            });
+            resolveQueuedResponse = null;
+          } else if (pressureQueuedAt !== null) {
+            responseDeadline += Date.now() - pressureQueuedAt;
+            pressureQueuedAt = null;
+          }
+        },
+      });
+      updateSpawnReceipt(receiptId, { state: 'starting' });
+      const previousSpawn = agentSpawnQueue;
+      agentSpawnQueue = new Promise<void>((resolve) => {
+        releaseSpawnQueue = resolve;
+      });
       const queueRemaining = responseDeadline - Date.now();
       if (queueRemaining <= 0) throw new Error('Agent spawn timed out while waiting to launch.');
       await new Promise<void>((resolve, reject) => {
@@ -7374,23 +7420,6 @@
       });
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out while waiting to launch.');
-      await coordinationSource(request);
-      updateSpawnReceipt(receiptId, { state: 'starting' });
-
-      if (destination) {
-        const targetPath = destination.path;
-        const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
-          repository: project,
-          paths: [targetPath],
-        });
-        if (!registered.some((worktree) => worktree.path === targetPath))
-          throw new Error('Target worktree is no longer registered with Git.');
-      }
-
-      const pressureDirectory =
-        destination?.path ??
-        (await invoke<string>('worktree_pressure_directory', { repository: project }));
-      await acp.connect(chosenProvider, undefined, { directory: pressureDirectory });
       if (!destination) {
         const created = await invoke<{ path: string; branch: string; setup: string }>(
           'create_worktree',
@@ -7488,8 +7517,16 @@
         status: 'started',
       };
     })();
-    agentSpawnQueue = launched.catch(() => undefined);
-    return launched;
+    const trackedLaunch = launched
+      .finally(() => releaseSpawnQueue?.())
+      .catch((cause) => {
+        const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+        if (receipt && !receiptIsSettled(receipt.state))
+          updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        activeSpawnRequests.delete(receiptId);
+        throw cause;
+      });
+    return Promise.race([trackedLaunch, queuedResponse]);
   }
 
   async function startCoordinatedThread(
