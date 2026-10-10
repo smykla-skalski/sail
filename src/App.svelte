@@ -1781,7 +1781,7 @@
         title: item.text,
         outcome: 'waiting',
         at: item.receivedAt,
-        agent: item.agentId ?? (item.kind === 'opencode-permission' ? 'opencode' : undefined),
+        agent: item.agentId,
         sessionId: item.sessionId,
       });
     }
@@ -9581,7 +9581,7 @@
       (element) =>
         element.dataset.requestId === String(item.requestId) &&
         element.dataset.sessionId === item.sessionId &&
-        (item.kind !== 'acp-permission' || element.dataset.agentId === item.agentId) &&
+        element.dataset.agentId === item.agentId &&
         element.getClientRects().length,
     );
     if (request) {
@@ -9630,17 +9630,13 @@
       }
       return;
     }
-    if (item.kind === 'acp-permission' || item.kind === 'question') {
-      const thread = [...agentThreads, ...nativeChildThreads].find(
-        (entry) =>
-          entry.agent === item.agentId &&
-          entry.sessionId === item.sessionId &&
-          entry.directory === item.directory,
-      );
-      if (thread) await jumpToRecentThread(threadKey(thread));
-    } else {
-      await jumpToRecentThread(JSON.stringify(['opencode', item.directory, item.sessionId]));
-    }
+    const thread = [...agentThreads, ...nativeChildThreads].find(
+      (entry) =>
+        entry.agent === item.agentId &&
+        entry.sessionId === item.sessionId &&
+        entry.directory === item.directory,
+    );
+    if (thread) await jumpToRecentThread(threadKey(thread));
     await focusInboxRequest(item);
   }
 
@@ -9663,7 +9659,7 @@
       const request = inboxItems.find(
         (item) =>
           !isInboxOutcome(item) &&
-          (item.agentId ?? 'opencode') === route.agentId &&
+          item.agentId === route.agentId &&
           item.directory === route.directory &&
           item.sessionId === route.sessionId &&
           String(item.requestId) === String(route.requestId),
@@ -9812,19 +9808,6 @@
       void restoreAgentActivity();
       return;
     }
-    recordDecisionActivity(
-      {
-        agent: item.agentId ?? 'opencode',
-        directory: item.directory,
-        sessionId: item.sessionId,
-        title: item.text,
-        updated: item.receivedAt,
-      },
-      String(item.requestId ?? item.key),
-      item.text,
-      optionId === null ? 'rejected' : optionId === 'reject' ? 'rejected' : 'completed',
-    );
-    await refreshInbox();
   }
 
   function createAgentThread(thread: AgentThread) {
