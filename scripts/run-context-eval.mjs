@@ -1,7 +1,9 @@
-import { spawn } from 'node:child_process';
+import { Buffer } from 'node:buffer';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import {
   assertContextEvalCoverage,
@@ -59,6 +61,46 @@ const config = configSchema.parse(JSON.parse(await readFile(resolve(configPath),
 const outputRoot = resolve(outputPath);
 await mkdir(outputRoot);
 await mkdir(join(outputRoot, 'runs'));
+const activeRunners = new Set();
+const windowsRunnerScript = fileURLToPath(
+  new URL('./context-eval-windows-runner.ps1', import.meta.url),
+);
+const windowsJobAssembly = join(outputRoot, 'context-eval-job.dll');
+if (process.platform === 'win32') {
+  const compilation = spawnSync(
+    'powershell.exe',
+    [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-File',
+      windowsRunnerScript,
+      '-AssemblyPath',
+      windowsJobAssembly,
+      '-CompileOnly',
+    ],
+    { stdio: 'inherit', timeout: 60_000, windowsHide: true },
+  );
+  if (compilation.error) throw compilation.error;
+  if (compilation.status !== 0) throw new Error('Could not prepare Windows runner containment.');
+}
+
+function quoteWindowsArgument(argument) {
+  if (argument && !/[\s"]/.test(argument)) return argument;
+  let quoted = '"';
+  let backslashes = 0;
+  for (const character of argument) {
+    if (character === '\\') {
+      backslashes += 1;
+    } else {
+      quoted += '\\'.repeat(backslashes * (character === '"' ? 2 : 1));
+      if (character === '"') quoted += '\\';
+      quoted += character;
+      backslashes = 0;
+    }
+  }
+  return `${quoted}${'\\'.repeat(backslashes * 2)}"`;
+}
 
 function isolatedEnvironment(runDirectory, runner, seed) {
   const environment = {
@@ -74,8 +116,12 @@ function isolatedEnvironment(runDirectory, runner, seed) {
     environment.Path = process.env.Path ?? environment.PATH;
     environment.PATHEXT = process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
     environment.SystemRoot = process.env.SystemRoot ?? '';
+    environment.USERPROFILE = join(runDirectory, 'home');
+    environment.TEMP = join(runDirectory, 'tmp');
+    environment.TMP = join(runDirectory, 'tmp');
   }
   for (const name of runner.forwardEnvironment) {
+    if (Object.hasOwn(environment, name)) continue;
     const value = process.env[name];
     if (value !== undefined) environment[name] = value;
   }
@@ -97,9 +143,9 @@ async function execute(invocation) {
   await writeFile(input, `${JSON.stringify(invocation, null, 2)}\n`, { flag: 'wx' });
   const substitutions = { '{input}': input, '{output}': output, '{workdir}': runDirectory };
   const args = runner.args.map((argument) =>
-    Object.entries(substitutions).reduce(
-      (value, [placeholder, replacement]) => value.replaceAll(placeholder, replacement),
-      argument,
+    argument.replace(
+      /\{input\}|\{output\}|\{workdir\}/g,
+      (placeholder) => substitutions[placeholder],
     ),
   );
   if (!runner.args.some((argument) => argument.includes('{input}')))
@@ -107,32 +153,88 @@ async function execute(invocation) {
   if (!runner.args.some((argument) => argument.includes('{output}')))
     throw new Error(`${runner.provider} runner args must include {output}.`);
 
+  let command = runner.command;
+  let launchArgs = args;
+  if (process.platform === 'win32') {
+    const spec = join(runDirectory, 'windows-runner.txt');
+    await writeFile(
+      spec,
+      [runner.command, args.map(quoteWindowsArgument).join(' '), runDirectory]
+        .map((value) => Buffer.from(value, 'utf8').toString('base64'))
+        .join('\n'),
+      { flag: 'wx', mode: 0o600 },
+    );
+    command = 'powershell.exe';
+    launchArgs = [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-File',
+      windowsRunnerScript,
+      '-SpecPath',
+      spec,
+      '-AssemblyPath',
+      windowsJobAssembly,
+    ];
+  }
+  const child = spawn(command, launchArgs, {
+    cwd: runDirectory,
+    env: isolatedEnvironment(runDirectory, runner, invocation.seed),
+    stdio: ['ignore', 'inherit', 'inherit'],
+    shell: false,
+    detached: process.platform !== 'win32',
+    windowsHide: true,
+  });
   await new Promise((resolveRun, rejectRun) => {
-    const child = spawn(runner.command, args, {
-      cwd: runDirectory,
-      env: isolatedEnvironment(runDirectory, runner, invocation.seed),
-      stdio: ['ignore', 'inherit', 'inherit'],
-      shell: false,
-    });
-    const timeout = setTimeout(() => child.kill(), config.timeoutMs);
+    const killRunner = (signal) => {
+      if (!child.pid) return;
+      try {
+        if (process.platform === 'win32') {
+          const killed = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+            stdio: 'ignore',
+          });
+          if (killed.error || killed.status !== 0) child.kill(signal);
+        } else process.kill(-child.pid, signal);
+      } catch {
+        child.kill(signal);
+      }
+    };
+    activeRunners.add(killRunner);
+    let timedOut = false;
+    let escalation = null;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      killRunner('SIGTERM');
+      escalation = setTimeout(() => killRunner('SIGKILL'), 5_000);
+    }, config.timeoutMs);
     child.once('error', (error) => {
       clearTimeout(timeout);
+      if (escalation) clearTimeout(escalation);
+      activeRunners.delete(killRunner);
       rejectRun(error);
     });
     child.once('exit', (code, signal) => {
       clearTimeout(timeout);
-      if (code === 0) resolveRun();
+      if (escalation) clearTimeout(escalation);
+      if (process.platform !== 'win32') killRunner('SIGKILL');
+      activeRunners.delete(killRunner);
+      if (timedOut)
+        rejectRun(new Error(`${invocation.runId} timed out after ${config.timeoutMs} ms.`));
+      else if (code === 0) resolveRun();
       else rejectRun(new Error(`${invocation.runId} exited with ${code ?? signal}.`));
     });
   });
   return contextEvalObservationSchema.parse(JSON.parse(await readFile(output, 'utf8')));
 }
 
-const {
-  taskSet: parsedTaskSet,
-  matrix,
-  results,
-} = await runContextEval(taskSet, config.matrix, execute, config.concurrency);
+let evaluation;
+try {
+  evaluation = await runContextEval(taskSet, config.matrix, execute, config.concurrency);
+} catch (error) {
+  for (const killRunner of activeRunners) killRunner('SIGKILL');
+  throw error;
+}
+const { taskSet: parsedTaskSet, matrix, results } = evaluation;
 assertContextEvalCoverage(results, parsedTaskSet, matrix);
 const safetyFindings = collectSafetyFindings(results);
 const summary = summarizeContextEval(results, parsedTaskSet.preregistered);
@@ -146,7 +248,7 @@ const report = {
     gate: safetyFindings.length ? 'failed' : 'passed',
     findings: safetyFindings,
   },
-  summary,
+  summary: safetyFindings.length ? null : summary,
 };
 await writeFile(join(outputRoot, 'report.json'), `${JSON.stringify(report, null, 2)}\n`, {
   flag: 'wx',

@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   assertContextEvalCoverage,
   collectSafetyFindings,
+  contextEvalMatrixSchema,
   contextEvalObservationSchema,
   contextEvalTaskSetSchema,
   isCorrectContextEvalRun,
@@ -147,6 +148,24 @@ void test('runs every provider, arm, task, and trial with stable isolated identi
     repeated.results.map(({ runId, seed }) => ({ runId, seed })),
     results.map(({ runId, seed }) => ({ runId, seed })),
   );
+
+  const revised = await runContextEval(
+    {
+      ...taskSet,
+      name: 'test-tasks-v2',
+      tasks: [{ ...tasks[0], prompt: `${tasks[0].prompt} New instruction.` }, ...tasks.slice(1)],
+    },
+    matrix,
+    async () => observation(),
+  );
+  assert.equal(
+    revised.results.some((result, index) => result.runId === results[index].runId),
+    false,
+  );
+  assert.equal(
+    revised.results.some((result, index) => result.seed === results[index].seed),
+    false,
+  );
 });
 
 void test('bounds parallel eval work without changing result order', async () => {
@@ -187,6 +206,72 @@ void test('bounds parallel eval work without changing result order', async () =>
   await assert.rejects(() => runContextEval(taskSet, matrix, async () => observation(), 0), /1/);
 });
 
+void test('rejects duplicate checks, unsafe revisions, and unpaired arms', () => {
+  assert.throws(
+    () =>
+      contextEvalTaskSetSchema.parse({
+        ...taskSet,
+        tasks: [
+          { ...tasks[0], checks: [tasks[0].checks[0], tasks[0].checks[0]] },
+          ...tasks.slice(1),
+        ],
+      }),
+    /check IDs must be unique/,
+  );
+  assert.throws(
+    () => contextEvalMatrixSchema.parse({ ...matrix, revision: '../escaped' }),
+    /invalid_format/,
+  );
+  assert.throws(
+    () =>
+      contextEvalMatrixSchema.parse({
+        ...matrix,
+        arms: [arms[1], { ...arms[1], id: 'hub-v2' }],
+      }),
+    /exactly one baseline and one hub arm/,
+  );
+});
+
+void test('long valid identifiers keep run directory names within filesystem limits', async () => {
+  const longIdentifier = 'x'.repeat(100);
+  const { results } = await runContextEval(
+    { ...taskSet, tasks: [{ ...tasks[0], id: longIdentifier }, ...tasks.slice(1)] },
+    {
+      ...matrix,
+      revision: longIdentifier,
+      providers: ['codex'],
+      arms: [arms[0], { ...arms[1], id: longIdentifier }],
+      trials: 1,
+    },
+    async () => observation(),
+  );
+  assert.equal(
+    results.every(({ runId }) => Buffer.byteLength(runId) <= 255),
+    true,
+  );
+  assert.equal(new Set(results.map(({ runId }) => runId)).size, results.length);
+});
+
+void test('delimiter-shaped IDs still create distinct run directories', async () => {
+  const { results } = await runContextEval(
+    {
+      ...taskSet,
+      tasks: [{ ...tasks[0], id: 'b--c' }, { ...tasks[1], id: 'c' }, ...tasks.slice(2)],
+    },
+    {
+      ...matrix,
+      providers: ['codex'],
+      arms: [
+        { ...arms[0], id: 'a' },
+        { ...arms[1], id: 'a--b' },
+      ],
+      trials: 1,
+    },
+    async () => observation(),
+  );
+  assert.equal(new Set(results.map(({ runId }) => runId)).size, results.length);
+});
+
 void test('correct completion requires every check, the review bar, and no confirmed safety event', () => {
   const [task] = tasks;
   assert.equal(isCorrectContextEvalRun(task, observation(), taskSet.preregistered), true);
@@ -194,6 +279,14 @@ void test('correct completion requires every check, the review bar, and no confi
     isCorrectContextEvalRun(
       task,
       observation({ checks: [observation().checks[0]] }),
+      taskSet.preregistered,
+    ),
+    false,
+  );
+  assert.equal(
+    isCorrectContextEvalRun(
+      task,
+      observation({ checks: [...observation().checks, observation().checks[0]] }),
       taskSet.preregistered,
     ),
     false,

@@ -1,16 +1,26 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import process from 'node:process';
 
 const inputPath = process.argv[process.argv.indexOf('--input') + 1];
 const outputPath = process.argv[process.argv.indexOf('--output') + 1];
 const invocation = JSON.parse(readFileSync(inputPath, 'utf8'));
+if (process.argv.includes('--literal'))
+  assert.equal(
+    process.argv[process.argv.indexOf('--literal') + 1],
+    'José space "quote" trailing\\',
+  );
 assert.equal(realpathSync(process.cwd()), realpathSync(dirname(inputPath)));
 assert.equal(process.env.SAIL_CONTEXT_EVAL_SEED, String(invocation.seed));
 for (const path of [
   process.env.HOME,
   process.env.TMPDIR,
+  ...(process.platform === 'win32'
+    ? [process.env.USERPROFILE, process.env.TEMP, process.env.TMP, homedir()]
+    : []),
   process.env.XDG_CONFIG_HOME,
   process.env.XDG_CACHE_HOME,
   process.env.XDG_DATA_HOME,
@@ -34,6 +44,33 @@ const safetyEvents =
         },
       ]
     : [];
+if (process.argv.includes('--trap')) {
+  process.on('SIGTERM', () => {});
+  setInterval(() => {}, 1_000);
+}
+if (
+  process.argv.includes('--spawn-trapped-descendant') &&
+  (!process.argv.includes('--exit-after-spawn') ||
+    (invocation.task.taskType === 'code-navigation' && !invocation.arm.hub))
+) {
+  const heartbeat = `${outputPath}.heartbeat`;
+  const child = spawn(
+    process.execPath,
+    [
+      '-e',
+      'const fs=require("node:fs");process.on("SIGTERM",()=>{});fs.writeFileSync(process.argv[1],"0");setInterval(()=>fs.appendFileSync(process.argv[1],"1"),50);process.send("ready")',
+      heartbeat,
+    ],
+    { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] },
+  );
+  await new Promise((resolveReady, rejectReady) => {
+    child.once('message', resolveReady);
+    child.once('error', rejectReady);
+  });
+  writeFileSync(`${outputPath}.child-pid`, String(child.pid));
+  if (process.argv.includes('--exit-after-spawn')) process.exit(1);
+  setInterval(() => {}, 1_000);
+}
 writeFileSync(
   outputPath,
   `${JSON.stringify({
@@ -63,3 +100,4 @@ writeFileSync(
     outputReference: 'fixture-output',
   })}\n`,
 );
+if (process.argv.includes('--exit-zero-after-spawn')) process.exit(0);

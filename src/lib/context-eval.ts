@@ -22,6 +22,7 @@ export const contextEvalSafetyEventKinds = [
 export const contextEvalArms = ['baseline', 'hub'] as const;
 
 const identifier = z.string().regex(/^[a-z0-9][a-z0-9-]{0,99}$/);
+const revisionIdentifier = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/);
 const counter = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const rfc3339 = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
 
@@ -75,6 +76,14 @@ export const contextEvalTaskSetSchema = z
     const ids = taskSet.tasks.map((task) => task.id);
     if (new Set(ids).size !== ids.length)
       context.addIssue({ code: 'custom', message: 'Task IDs must be unique.' });
+    for (const task of taskSet.tasks) {
+      const checkIds = task.checks.map((check) => check.id);
+      if (new Set(checkIds).size !== checkIds.length)
+        context.addIssue({
+          code: 'custom',
+          message: `Task ${task.id} check IDs must be unique.`,
+        });
+    }
     for (const taskType of contextEvalTaskTypes)
       if (!taskSet.tasks.some((task) => task.taskType === taskType))
         context.addIssue({
@@ -99,7 +108,7 @@ export type ContextEvalArm = z.infer<typeof contextEvalArmSchema>;
 
 export const contextEvalMatrixSchema = z
   .object({
-    revision: z.string().min(1).max(100),
+    revision: revisionIdentifier,
     providers: z.array(z.enum(contextEvalProviders)).min(1),
     arms: z.array(contextEvalArmSchema).min(1).max(4),
     trials: z.number().int().min(1).max(10),
@@ -112,6 +121,12 @@ export const contextEvalMatrixSchema = z
     ] as const)
       if (new Set(values).size !== values.length)
         context.addIssue({ code: 'custom', message: `Context eval ${name} must be unique.` });
+    const hubArms = matrix.arms.filter((arm) => arm.hub).length;
+    if (hubArms !== 1 || matrix.arms.length - hubArms !== 1)
+      context.addIssue({
+        code: 'custom',
+        message: 'Context eval arms must contain exactly one baseline and one hub arm.',
+      });
   });
 
 export type ContextEvalMatrix = z.infer<typeof contextEvalMatrixSchema>;
@@ -202,6 +217,14 @@ function stableSeed(value: string): number {
   return hash >>> 0;
 }
 
+async function stableRunId(identity: string): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(identity),
+  );
+  return `run-${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
 export function isCorrectContextEvalRun(
   task: ContextEvalTask,
   observation: ContextEvalObservation,
@@ -209,7 +232,11 @@ export function isCorrectContextEvalRun(
 ): boolean {
   const checkIds = new Set(task.checks.map((check) => check.id));
   const observed = new Set(observation.checks.map((check) => check.id));
-  if (checkIds.size !== observed.size || [...checkIds].some((id) => !observed.has(id)))
+  if (
+    checkIds.size !== observation.checks.length ||
+    checkIds.size !== observed.size ||
+    [...checkIds].some((id) => !observed.has(id))
+  )
     return false;
   if (!observation.checks.every((check) => check.passed)) return false;
   if (observation.blindReview.score < preregistered.reviewPassBar) return false;
@@ -241,21 +268,32 @@ export async function runContextEval(
   const matrix = contextEvalMatrixSchema.parse(matrixValue);
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 32)
     throw new Error('Context eval concurrency must be an integer from 1 through 32.');
-  const invocations = matrix.providers.flatMap((provider) =>
-    matrix.arms.flatMap((arm) =>
-      taskSet.tasks.flatMap((task) =>
-        Array.from({ length: matrix.trials }, (_, index) => index + 1).map((trial) => {
-          const runId = [matrix.revision, provider, arm.id, task.id, `trial-${trial}`].join('--');
-          return {
-            revision: matrix.revision,
-            provider,
-            arm,
-            task,
-            trial,
-            runId,
-            seed: stableSeed(runId),
-          } satisfies ContextEvalInvocation;
-        }),
+  const taskSetIdentity = await stableRunId(JSON.stringify(taskSet));
+  const invocations = await Promise.all(
+    matrix.providers.flatMap((provider) =>
+      matrix.arms.flatMap((arm) =>
+        taskSet.tasks.flatMap((task) =>
+          Array.from({ length: matrix.trials }, (_, index) => index + 1).map(async (trial) => {
+            const identity = JSON.stringify([
+              taskSetIdentity,
+              matrix.revision,
+              provider,
+              arm.id,
+              task.id,
+              trial,
+            ]);
+            const runId = await stableRunId(identity);
+            return {
+              revision: matrix.revision,
+              provider,
+              arm,
+              task,
+              trial,
+              runId,
+              seed: stableSeed(runId),
+            } satisfies ContextEvalInvocation;
+          }),
+        ),
       ),
     ),
   );

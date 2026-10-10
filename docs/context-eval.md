@@ -23,7 +23,9 @@ covers every required task type:
 | `no-provider`      | Working in a project with no hub provider configured        |
 
 Evolve the set by adding `tasks-v2.json`; never mutate a version that has
-recorded runs, so paired results stay comparable across reruns.
+recorded runs, so paired results stay comparable across reruns. Run identities
+and seeds include the task-set content, so a changed task set cannot reuse an
+earlier version's run directories.
 
 ## Paired methodology
 
@@ -38,9 +40,15 @@ the model version, the task prompt, the granted tool permissions, the source
 revision, the trial, and a stable seed derived from those identities, so a
 rerun after a provider or agent change repeats the same work deterministically.
 
+Each runner starts with a private home, XDG directories, temp directory, and
+evaluation seed. `forwardEnvironment` passes through other named host variables;
+it does not replace these isolated values, including Windows `USERPROFILE`,
+`TEMP`, and `TMP`.
+
 ## Scoring
 
-- Task-specific checks: every check in the task set must pass with evidence.
+- Task-specific checks: exactly one result for every check in the task set
+  must pass with evidence; duplicates do not count as correct.
 - Blind review: a reviewer scores each run without knowing its arm; the score
   must reach the preregistered review pass bar.
 - A run is correct only when all checks pass, the blind review passes, and no
@@ -68,9 +76,21 @@ outcomes only when the delta's lower uncertainty bound reaches
 Runs report unauthorized access, cross-user or cross-worktree leakage, and
 unapproved sharing, each confirmed or not. Any confirmed event fails the
 safety gate for the whole evaluation: the report records the findings as audit
-evidence, the command exits nonzero, and no improvement verdict is reported.
-Only the operator's confirmed classification counts; unconfirmed observations
-do not fail the gate but stay in the report.
+evidence, omits the paired summary entirely so no improvement verdict exists
+to mislead a consumer, and the command exits nonzero. Only the operator's
+confirmed classification counts; unconfirmed observations do not fail the
+gate but stay in the report.
+
+## Runner timeouts
+
+When a runner completes, times out, or exits with an error, the harness stops
+its descendants before the next trial. A failure also stops other active
+runners. On Windows, a supervisor assigns itself to a Job Object before
+launching the runner; closing the supervisor ends its descendants.
+If the Job Object cannot be established, the runner never starts. On macOS and
+Linux, the harness stops process groups. A descendant that creates a separate
+process group can outlive that cleanup; use a host-level supervisor for adapters
+that launch detached jobs.
 
 ## Baseline coordination
 
