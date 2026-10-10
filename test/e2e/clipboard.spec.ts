@@ -102,7 +102,7 @@ describe('clipboard chat attachments', () => {
     });
     expect(await $('.clipboard-image-preview').isExisting()).toBe(false);
     await expect($('button[aria-label="Remove pixel.png"]')).toBeDisplayed();
-    await $('.agent-actions button').click();
+    await $('button=Send ↗').click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('image: image/png'));
     const imageConversation = await $('.agent-conversation').getText();
     expect(imageConversation).toContain('Attached images (image data included):');
