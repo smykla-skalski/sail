@@ -61,6 +61,7 @@ export const config = {
   connectionRetryTimeout: 90_000,
   /** Specs share one app process. Clear state left by earlier specs before pinning appearance. */
   async before() {
+    await browser.setWindowSize(1280, 850);
     const needsReload = await browser.execute(async () => {
       const tauri: unknown = Reflect.get(window, '__TAURI__');
       const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
@@ -70,20 +71,34 @@ export const config = {
       const response: unknown = await invoke('acp_pending_inbox');
       if (!Array.isArray(response)) throw new Error('Invalid pending inbox response');
       const pending: unknown[] = response;
-      await Promise.all(
-        pending.flatMap((item) => {
-          if (!item || typeof item !== 'object') return [];
-          const agent: unknown = Reflect.get(item, 'agent');
-          const message: unknown = Reflect.get(item, 'message');
-          const params: unknown =
-            message && typeof message === 'object' ? Reflect.get(message, 'params') : null;
-          const sessionId: unknown =
-            params && typeof params === 'object' ? Reflect.get(params, 'sessionId') : null;
-          return typeof agent === 'string' && typeof sessionId === 'string'
-            ? [invoke('acp_cancel', { agent, sessionId, turnId: null })]
-            : [];
-        }),
-      );
+      const resolutions = pending.map((item) => {
+        if (!item || typeof item !== 'object') throw new Error('Invalid pending inbox item');
+        const agent: unknown = Reflect.get(item, 'agent');
+        const message: unknown = Reflect.get(item, 'message');
+        if (typeof agent !== 'string' || !message || typeof message !== 'object')
+          throw new Error('Invalid pending inbox request');
+        const method: unknown = Reflect.get(message, 'method');
+        const params: unknown = Reflect.get(message, 'params');
+        const sessionId: unknown =
+          params && typeof params === 'object' ? Reflect.get(params, 'sessionId') : null;
+        if (typeof sessionId !== 'string') throw new Error('Pending request has no session');
+        if (method === 'elicitation/create') {
+          const requestId: unknown = Reflect.get(message, 'id');
+          if (typeof requestId !== 'string' && typeof requestId !== 'number')
+            throw new Error('Pending elicitation has no request ID');
+          return invoke('acp_elicitation', {
+            params: { agent, requestId, action: 'cancel', content: null },
+          });
+        }
+        if (method === 'session/request_permission') {
+          return invoke('acp_cancel', { agent, sessionId, turnId: null });
+        }
+        throw new Error(`Unexpected pending request: ${String(method)}`);
+      });
+      await Promise.all(resolutions);
+      const remaining: unknown = await invoke('acp_pending_inbox');
+      if (!Array.isArray(remaining) || remaining.length > 0)
+        throw new Error('E2E setup left pending agent requests');
       sessionStorage.removeItem('sail-e2e-settings');
       const hadQuery = !!location.search;
       if (hadQuery) history.replaceState(null, '', location.pathname);

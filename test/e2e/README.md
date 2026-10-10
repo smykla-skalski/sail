@@ -1,6 +1,6 @@
 # E2E suite observations
 
-Run WebdriverIO against a private Sail build and app profile as described in the repository `AGENTS.md`. The fixture specs and later app specs share one app process, so the WebdriverIO `before` hook resets fixture navigation, pending agent requests, and the durable E2E settings flag between specs.
+Run WebdriverIO against a private Sail build and app profile as described in the repository `AGENTS.md`. The fixture specs and later app specs share one app process, so the WebdriverIO `before` hook resets the window size, fixture navigation, pending agent requests, and the durable E2E settings flag between specs.
 
 ## Clean macOS run on 2026-10-10
 
@@ -36,4 +36,4 @@ The full run before that focused reset also reported failures in these files. Th
 - `visual.spec.ts`
 - `worktree-responsive.spec.ts`
 
-The final revision needs another full run to establish the remaining suite result. Keep failures tied to the exact revision and app profile used for each run.
+The full-suite result for the final revision is recorded in PR #533. Keep failures tied to the exact revision and app profile used for each run.
