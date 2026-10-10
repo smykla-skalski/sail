@@ -339,7 +339,7 @@ describe('provider selected agent spawn', () => {
         .object({ status: z.string(), threadId: z.string(), worktreeId: z.string() })
         .parse(JSON.parse(openCodeResult.content[0].text));
       expect(openCode.status).toBe('started');
-      expect(openCode.threadId).toMatch(/^opencode:/);
+      expect(openCode.threadId).toMatch(/^acp:opencode:/);
       expect(openCode.worktreeId).toBe(path);
       const openCodeReceipt = z
         .object({ receiptId: z.string(), accessKey: z.string() })
@@ -395,7 +395,7 @@ describe('provider selected agent spawn', () => {
     const sourceThread = z
       .array(agentThread)
       .parse(JSON.parse(saved ?? '[]'))
-      .find((thread) => thread.directory === path);
+      .find((thread) => thread.directory === path && thread.title === 'Clipboard fixture source');
     if (!sourceThread) throw new Error('Source thread was not restored');
     const sessionId = sourceThread.sessionId;
     const config = await browser.tauri.execute(
@@ -792,7 +792,7 @@ describe('provider selected agent spawn', () => {
     const sourceThread = z
       .array(agentThread)
       .parse(JSON.parse(saved ?? '[]'))
-      .find((thread) => thread.directory === path);
+      .find((thread) => thread.directory === path && thread.title === 'Clipboard fixture source');
     if (!sourceThread) throw new Error('Source thread was not restored');
     const sessionId = sourceThread.sessionId;
     const config = await browser.tauri.execute(
