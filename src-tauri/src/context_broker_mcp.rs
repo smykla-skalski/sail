@@ -33,6 +33,9 @@ impl BrokerMcp {
             Err(_) => return Some(rpc_error(Value::Null, -32700, "Invalid JSON.")),
         };
         let id = request.get("id").cloned();
+        if id.as_ref().is_some_and(|id| !valid_rpc_id(id)) {
+            return Some(rpc_error(Value::Null, -32600, "Invalid request ID."));
+        }
         let Some(method) = request.get("method").and_then(Value::as_str) else {
             return Some(rpc_error(
                 id.unwrap_or(Value::Null),
@@ -143,11 +146,54 @@ impl BrokerMcp {
         provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ()>,
     ) -> Result<Value, &'static str> {
         let names = self.available_tools(provider_call)?;
-        Ok(json!({
-            "sources": [{"provider": self.provider, "source": self.provider,
-                "search": names.iter().any(|name| name == "search"),
-                "get": names.iter().any(|name| name == "get")}]
-        }))
+        if !names.iter().any(|name| name == "sources") {
+            return Err("Provider source list is unavailable.");
+        }
+        let response = provider_call(
+            "tools/call",
+            json!({"name":"sources","arguments":{"limit":self.limits.items}}),
+        )
+        .map_err(|_| "Provider source list is unavailable.")?;
+        let sources = result_content(&response)?
+            .get("sources")
+            .and_then(Value::as_array)
+            .ok_or("Provider source list is unavailable.")?;
+        if sources.len() > 128 {
+            return Err("Provider source list is unavailable.");
+        }
+        let mut result = json!({"sources":[],"errors":[],"truncated":false});
+        for source in sources {
+            let uri = source.get("sourceUri").and_then(Value::as_str);
+            let revision = source.get("revision").and_then(Value::as_str);
+            let timestamp = source.get("timestampMs").and_then(Value::as_u64);
+            let valid = uri.is_some_and(|uri| valid_source_field(uri, 256))
+                && revision.is_some_and(|revision| valid_source_field(revision, 128))
+                && timestamp.is_some_and(|timestamp| timestamp > 0);
+            if !valid {
+                let error = json!({"provider":self.provider,"source":
+                    uri.filter(|uri| valid_source_field(uri, 256)).unwrap_or(&self.provider),
+                    "message":"Source unavailable."});
+                result["errors"].as_array_mut().unwrap().push(error);
+            } else if result["sources"].as_array().unwrap().len() < self.limits.items {
+                result["sources"].as_array_mut().unwrap().push(json!({
+                    "provider":self.provider,"source":uri.unwrap(),
+                    "revision":revision.unwrap(),"timestampMs":timestamp.unwrap()
+                }));
+            } else {
+                result["truncated"] = json!(true);
+            }
+            while serde_json::to_vec(&tool_result(result.clone(), false))
+                .is_ok_and(|encoded| encoded.len() > self.limits.response_bytes)
+            {
+                result["truncated"] = json!(true);
+                if result["errors"].as_array_mut().unwrap().pop().is_none()
+                    && result["sources"].as_array_mut().unwrap().pop().is_none()
+                {
+                    return Err("Source list response limit is too small.");
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn health(
@@ -157,7 +203,8 @@ impl BrokerMcp {
         let names = self.available_tools(provider_call)?;
         Ok(json!({
             "provider": self.provider,
-            "state": if names.iter().any(|name| name == "search")
+            "state": if names.iter().any(|name| name == "sources")
+                && names.iter().any(|name| name == "search")
                 && names.iter().any(|name| name == "get") {"ready"} else {"missing-tools"}
         }))
     }
@@ -351,6 +398,18 @@ fn parse_hit(item: &Value) -> Result<RawHit, &'static str> {
     })
 }
 
+fn valid_source_field(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn valid_rpc_id(value: &Value) -> bool {
+    match value {
+        Value::String(id) => id.len() <= 128 && !id.chars().any(char::is_control),
+        Value::Number(number) => number.to_string().len() <= 32,
+        _ => false,
+    }
+}
+
 fn tool_result(value: Value, is_error: bool) -> Value {
     json!({"content":[{"type":"text","text":value.to_string()}],"isError":is_error})
 }
@@ -422,7 +481,7 @@ mod tests {
     }
 
     fn available() -> Value {
-        json!({"result":{"tools":[{"name":"search"},{"name":"get"},
+        json!({"result":{"tools":[{"name":"sources"},{"name":"search"},{"name":"get"},
             {"name":"secret_admin_tool"}]}})
     }
 
@@ -449,12 +508,20 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 4);
         assert!(!names.contains(&"secret_admin_tool"));
-        let (_, sources) = fixture.call("sail_context_sources", json!({}), |method, _| {
-            assert_eq!(method, "tools/list");
-            Ok(available())
+        let (_, sources) = fixture.call("sail_context_sources", json!({}), |method, params| {
+            if method == "tools/list" {
+                return Ok(available());
+            }
+            assert_eq!(params["name"], "sources");
+            Ok(json!({"result":{"structuredContent":{"sources":[
+                {"sourceUri":"file:///project/broken","revision":"r1","timestampMs":0},
+                {"sourceUri":"file:///project/notes","revision":"r1",
+                 "timestampMs":1760122800000_u64}
+            ]}}}))
         });
         assert_eq!(sources["sources"][0]["provider"], "provider");
-        assert_eq!(sources["sources"][0]["search"], true);
+        assert_eq!(sources["sources"][0]["source"], "file:///project/notes");
+        assert_eq!(sources["errors"][0]["source"], "file:///project/broken");
     }
 
     #[test]
@@ -463,7 +530,7 @@ mod tests {
         let (_, health) = fixture.call("sail_context_health", json!({}), |method, params| {
             assert_eq!(method, "tools/list");
             if params.get("cursor").is_some() {
-                Ok(json!({"result":{"tools":[{"name":"search"},{"name":"get"}]}}))
+                Ok(json!({"result":{"tools":[{"name":"sources"},{"name":"search"},{"name":"get"}]}}))
             } else {
                 Ok(json!({"result":{"tools":[{"name":"other"}],"nextCursor":"page-2"}}))
             }
@@ -498,7 +565,7 @@ mod tests {
         );
         assert!(serde_json::to_vec(&response["result"]).unwrap().len() <= 4096);
         assert!(body["hits"].as_array().unwrap().len() <= 8);
-        assert!(body["hits"].as_array().unwrap().len() >= 1);
+        assert!(!body["hits"].as_array().unwrap().is_empty());
         assert_eq!(body["hits"][0]["provider"], "provider");
         assert_eq!(body["hits"][0]["source"], "file:///project/notes");
         assert_eq!(body["hits"][0]["revision"], "r1");
@@ -549,6 +616,15 @@ mod tests {
     #[test]
     fn malformed_provider_and_storage_failures_are_bounded() {
         let fixture = Fixture::new("one");
+        let invalid_id = json!({"jsonrpc":"2.0","id":"x".repeat(100_000),"method":"ping"});
+        let invalid_response = fixture
+            .broker
+            .handle(&invalid_id.to_string(), |_, _| {
+                panic!("invalid ID must not call provider")
+            })
+            .unwrap();
+        assert!(serde_json::to_vec(&invalid_response).unwrap().len() < 128);
+        assert!(invalid_response["id"].is_null());
         let (response, body) = fixture.call("sail_context_get", json!({"id":"doc"}), |method, _| {
             if method == "tools/list" {
                 return Ok(available());

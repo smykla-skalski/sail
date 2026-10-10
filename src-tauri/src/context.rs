@@ -925,6 +925,9 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
         if let Some(response) = broker.handle(line, |method, params| {
             broker_provider_call(&session, &mut initialized, &mut next_id, method, params)
         }) {
+            if session.check().is_err() {
+                break;
+            }
             writeln!(std::io::stdout(), "{response}").map_err(|error| error.to_string())?;
         }
     }

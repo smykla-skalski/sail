@@ -2,7 +2,11 @@
 
 The Sail broker uses MCP 2025-06-18 over the approved local stdio relay. This profile applies only to a provider selected by the committed worktree manifest and approved by the user. The broker advertises `sail_context_sources`, `sail_context_search`, `sail_context_get`, and `sail_context_health` to Claude, Codex, and OpenCode; it does not advertise the provider's tool catalog.
 
-A provider exposes MCP tools named `search` and `get` in `tools/list`; Sail follows at most 16 pages and 128 tool entries. This first profile uses fixed names because the manifest does not yet map capabilities to arbitrary tool names. Its result shape uses `structuredContent`, `sourceUri`, and `revision`, as in the draft #307 conformance profile. The conformance kit is still a draft and does not define this production profile.
+A provider exposes MCP tools named `sources`, `search`, and `get` in `tools/list`; Sail follows at most 16 pages and 128 tool entries. This first profile uses fixed names because the manifest does not yet map capabilities to arbitrary tool names. Its result shape uses `structuredContent`, `sourceUri`, and `revision`, as in the draft #307 conformance profile. The conformance kit is still a draft and does not define this production profile.
+
+## Sources
+
+The broker calls `sources` with `{"limit":8}`. The result has `structuredContent.sources`, an array of objects with `sourceUri`, `revision`, and positive `timestampMs`. Sail caps the agent result at eight sources and 4 KiB by default. Malformed source entries receive source-specific errors while valid sources remain visible.
 
 ## Search
 
