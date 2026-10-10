@@ -336,7 +336,7 @@ jobs:
         with:
           node-version: '24'
 
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb9281d # stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       - name: Install frontend dependencies
         run: npm ci
