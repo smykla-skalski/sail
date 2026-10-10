@@ -1,6 +1,6 @@
 import { sameThreadId } from './thread-id.ts';
 import { gateMetadataSchema, type GateMetadata } from './ship-progress.ts';
-import type { AcpTurnEvidence, AgentActivity, InterruptedAgentTurn } from './acp';
+import type { AcpTurnEvidence, AgentActivity, AgentEntry, InterruptedAgentTurn } from './acp';
 import type { ModelRouteRole } from './model-routing.ts';
 import type { ShipRisk } from './ship-risk-policy.ts';
 
@@ -213,6 +213,27 @@ export function receiptIsLatestFinishedTurn(
     !!receipt.turnId &&
     !activity?.activeTurns[sessionId] &&
     activity?.finished[sessionId]?.turnId === receipt.turnId
+  );
+}
+
+export function replayResultForReceipt(
+  entries: AgentEntry[],
+  prompt: string,
+  latestFinished: boolean,
+): string | null {
+  const matches = entries.flatMap((entry, index) =>
+    entry.type === 'user' && entry.text.includes(prompt) ? [index] : [],
+  );
+  // A reused prompt cannot identify an older turn without a provider turn ID.
+  if (matches.length !== 1 && !(latestFinished && matches.length > 0)) return null;
+  const following = entries.slice(matches.at(-1)! + 1);
+  const nextUser = following.findIndex((entry) => entry.type === 'user');
+  const turn = nextUser < 0 ? following : following.slice(0, nextUser);
+  return (
+    turn
+      .flatMap((entry) => (entry.type === 'assistant' ? [entry.text] : []))
+      .join('\n')
+      .slice(-16_000) || null
   );
 }
 

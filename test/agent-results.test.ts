@@ -18,6 +18,7 @@ import {
   loadSpawnReceipts,
   receiptForSource,
   receiptIsLatestFinishedTurn,
+  replayResultForReceipt,
   receiptMatchesTurn,
   receiptNeedsRefresh,
   promptConflictTurnId,
@@ -92,6 +93,28 @@ void test('transcript recovery belongs only to the latest finished turn', () => 
     false,
   );
   assert.equal(receiptIsLatestFinishedTurn(receipt, null, 'target'), false);
+});
+
+void test('transcript recovery finds an older unique prompt after a later turn starts', () => {
+  const entries = [
+    { id: '1', type: 'user' as const, text: 'first task' },
+    { id: '2', type: 'assistant' as const, text: 'first answer' },
+    { id: '3', type: 'user' as const, text: 'second task' },
+    { id: '4', type: 'assistant' as const, text: 'second answer' },
+  ];
+  assert.equal(replayResultForReceipt(entries, 'first task', false), 'first answer');
+  assert.equal(replayResultForReceipt(entries, 'second task', false), 'second answer');
+});
+
+void test('transcript recovery does not assign a repeated prompt to an older turn', () => {
+  const entries = [
+    { id: '1', type: 'user' as const, text: 'same task' },
+    { id: '2', type: 'assistant' as const, text: 'first answer' },
+    { id: '3', type: 'user' as const, text: 'same task' },
+    { id: '4', type: 'assistant' as const, text: 'second answer' },
+  ];
+  assert.equal(replayResultForReceipt(entries, 'same task', false), null);
+  assert.equal(replayResultForReceipt(entries, 'same task', true), 'second answer');
 });
 
 await test('spawn receipts stay scoped to the launching source and project', () => {
