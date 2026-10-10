@@ -210,7 +210,7 @@ function expectEachOnce(text: string, prefix: string, last: number) {
 }
 
 async function sendPrompt(text: string) {
-  await $('.agent-composer textarea').setValue(text);
+  await $('.agent-composer [data-pane-prompt]').setValue(text);
   await $("//*[contains(@class,'agent-actions')]//button[contains(.,'Send')]").click();
 }
 

@@ -371,7 +371,7 @@ describe('visual layout audit', () => {
     await $(`.project-worktree-select[title="${worktree}"]`).click({ button: 'right' });
     await capture('desktop-worktree-menu');
     await $('.brand').click();
-    await $('.agent-composer textarea').setValue('unbrokentoken'.repeat(30));
+    await $('.agent-composer [data-pane-prompt]').setValue('unbrokentoken'.repeat(30));
     await $('.agent-actions button').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await capture('desktop-agent-permission');

@@ -122,11 +122,13 @@ describe('provider selected agent spawn', () => {
     await browser.waitUntil(
       () =>
         browser.execute(() =>
-          Boolean(document.querySelector('.agent-composer textarea:not([disabled])')),
+          Boolean(
+            document.querySelector('.agent-composer [data-pane-prompt][contenteditable="true"]'),
+          ),
         ),
       { timeout: 15_000 },
     );
-    await $('.agent-composer textarea').setValue('Clipboard fixture source');
+    await $('.agent-composer [data-pane-prompt]').setValue('Clipboard fixture source');
     await $('.agent-actions button').click();
     try {
       await browser.waitUntil(
@@ -165,7 +167,7 @@ describe('provider selected agent spawn', () => {
 
     await $('.agent-launches button:nth-child(2)').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Clipboard fixture authenticate Codex');
+    await $('.agent-composer [data-pane-prompt]').setValue('Clipboard fixture authenticate Codex');
     await $('.agent-actions button').click();
     await browser.waitUntil(
       async () =>

@@ -1386,6 +1386,25 @@ time {
 .settings-card ul {
   padding-left: 20px;
 }
+.context-provider-details {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 8px 12px;
+  margin: 16px 0;
+}
+.context-provider-details dt {
+  color: var(--sui-muted);
+}
+.context-provider-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.context-provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .memory-empty {
   padding: 12px;
   border-radius: var(--radius-8);
@@ -1484,6 +1503,9 @@ time {
   .memory-agent,
   .memory-config-comparison {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .context-provider-details {
     grid-template-columns: minmax(0, 1fr);
   }
 }
@@ -3136,9 +3158,43 @@ time {
 }
 .sidebar-rail .rail-thread {
   height: 36px;
+  --rail-activity-color: var(--activity-neutral);
 }
-.sidebar-rail .rail-thread .activity-status {
+.sidebar-rail .rail-thread[data-state='working'] {
+  --rail-activity-color: var(--activity-working);
+}
+.sidebar-rail .rail-thread[data-state='fixing'] {
+  --rail-activity-color: var(--activity-fixing);
+}
+.sidebar-rail .rail-thread[data-state='stalled'] {
+  --rail-activity-color: var(--activity-stalled);
+}
+.sidebar-rail .rail-thread[data-state='waiting'] {
+  --rail-activity-color: var(--activity-waiting);
+}
+.sidebar-rail .rail-thread[data-state='completed'],
+.sidebar-rail .rail-thread[data-state='ready'] {
+  --rail-activity-color: var(--activity-completed);
+}
+.sidebar-rail .rail-thread[data-state='failed'],
+.sidebar-rail .rail-thread[data-state='interrupted'] {
+  --rail-activity-color: var(--activity-failed);
+}
+.sidebar-rail .rail-thread .harness-icon {
+  color: var(--rail-activity-color);
+}
+.sidebar-rail .rail-thread-state {
   position: absolute;
-  right: 3px;
-  bottom: 3px;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  color: var(--rail-activity-color);
+  background: var(--shell-sidebar);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
 }

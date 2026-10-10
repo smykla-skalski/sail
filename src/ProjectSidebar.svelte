@@ -882,17 +882,19 @@
   {#each railLocations(path) as location (location)}
     {#each threads[location] ?? [] as thread (threadKey(thread))}
       {@const status = threadStatus(thread)}
+      {@const state = activityState(status)}
       {@const key = threadKey(thread)}
       <button
         class="rail-thread"
         class:active={selectedThread === key}
+        data-state={state.state}
         aria-current={selectedThread === key ? 'page' : undefined}
         aria-label={`${providerName(thread)}: ${thread.title}, ${statusLabel(status)}`}
         title={`${providerName(thread)} · ${thread.title} · ${statusLabel(status)}`}
         onclick={() => onselectthread(key)}
       >
-        <HarnessIcon agent={thread.agent} size={16} />
-        <ActivityStatus {status} label={statusLabel(status)} compact />
+        <HarnessIcon agent={thread.agent} size={20} />
+        <span class="rail-thread-state" aria-hidden="true">{state.icon}</span>
       </button>
     {/each}
   {/each}
