@@ -2009,7 +2009,13 @@ where
             .then(|| archive.to_string_lossy().into_owned())
     };
     if !worktree.exists() {
-        validate_repository(repository)?;
+        remove_worktree(
+            repository,
+            worktree.to_string_lossy().into_owned(),
+            None,
+            expected_revision.as_deref(),
+            expected_branch.as_deref(),
+        )?;
         return Ok(saved_archive());
     }
     match remove_worktree(
@@ -2748,6 +2754,38 @@ mod tests {
 
         assert_eq!(archived, None);
         assert!(!managed.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archived_removal_keeps_terminal_data_when_missing_worktree_is_still_registered() {
+        let (root, repository, worktree, expected) =
+            ignored_archive_fixture("sail-archive-registered-missing-test");
+        let managed = root.join("managed-terminal-data");
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(
+            managed.join("cache"),
+            "retain while Git still registers worktree",
+        )
+        .unwrap();
+        fs::remove_dir_all(&worktree).unwrap();
+
+        let error = remove_worktree_then_terminal_data(&managed, || {
+            archive_ignored_and_remove(repository.clone(), worktree.clone(), Some(expected), None)
+        })
+        .unwrap_err();
+
+        assert!(error.contains("still registered"), "{error}");
+        assert_eq!(
+            fs::read_to_string(managed.join("cache")).unwrap(),
+            "retain while Git still registers worktree"
+        );
+        let listed = git_reference(
+            Path::new(&repository),
+            &["worktree", "list", "--porcelain", "-z"],
+        )
+        .expect("list registered worktrees");
+        assert!(listed.contains(&worktree));
         fs::remove_dir_all(root).unwrap();
     }
 

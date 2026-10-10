@@ -26,7 +26,23 @@ pub struct AcpTerminalManager {
 
 pub fn worktree_data_directory(cache_directory: &Path, worktree: &Path) -> PathBuf {
     let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
-    let digest = Sha256::digest(worktree.to_string_lossy().as_bytes());
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::ffi::OsStrExt;
+        worktree.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let identity = {
+        use std::os::windows::ffi::OsStrExt;
+        worktree
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let identity = worktree.to_string_lossy().as_bytes().to_vec();
+    let digest = Sha256::digest(identity);
     let name = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1177,6 +1193,21 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, second);
         assert!(first.starts_with(cache.join("terminal-worktrees")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_terminal_data_distinguishes_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let cache = Path::new("/sail-cache");
+        let first = PathBuf::from(std::ffi::OsString::from_vec(b"/repo/tree-\xff".to_vec()));
+        let second = PathBuf::from(std::ffi::OsString::from_vec(b"/repo/tree-\xfe".to_vec()));
+
+        assert_ne!(
+            worktree_data_directory(cache, &first),
+            worktree_data_directory(cache, &second)
+        );
     }
 
     #[test]
