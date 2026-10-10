@@ -51,7 +51,7 @@ path = "examples/whoami_async.rs"
 version = "1.0"
 
 [dependencies.downcast-rs]
-version = "1.0"
+version = "2.0"
 
 [dependencies.filedescriptor]
 version = "0.8.3"
