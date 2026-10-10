@@ -64,6 +64,8 @@ void test('offline stdio provider passes the versioned profile', () => {
 
 for (const [mode, reason] of [
   ['wrong-version', 'Unsupported MCP protocol version'],
+  ['secret-version', 'Unsupported MCP protocol version'],
+  ['secret-error-code', 'Provider returned a JSON-RPC error'],
   ['invalid-stdout', 'Non-MCP output'],
   ['oversized', 'exceeds 64 KiB'],
   ['wrong-revision', 'revision provenance differs'],
@@ -82,52 +84,89 @@ void test('rejects unsupported profile versions', () => {
   assert.match(result.stderr, /Unsupported conformance profile version/);
 });
 
+void test('inherited object properties cannot satisfy provenance', () => {
+  const config = profile('wrong-revision');
+  config.probe.sourcePointer = '/constructor/name';
+  config.probe.revisionPointer = '/constructor/name';
+  config.probe.expectedSource = 'Object';
+  config.probe.expectedRevision = 'Object';
+
+  const result = run(config);
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /source provenance differs/);
+});
+
+async function runHttp(mode: string) {
+  const server = spawn(process.execPath, [httpFixture, mode], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const port = await new Promise<string>((resolvePort, reject) => {
+      let text = '';
+      server.once('error', reject);
+      server.once('exit', (code) =>
+        reject(new Error(`HTTP fixture exited before listening: ${code}`)),
+      );
+      server.stdout.setEncoding('utf8');
+      server.stdout.on('data', (chunk: string) => {
+        text += chunk;
+        if (text.includes('\n')) resolvePort(text.trim());
+      });
+    });
+    const config = {
+      ...profile(),
+      transport: {
+        type: 'streamable-http',
+        url: `http://127.0.0.1:${port}/mcp`,
+        headerEnvironment: { Authorization: 'SAIL_CONFORMANCE_TOKEN' },
+      },
+    };
+    const directory = mkdtempSync(join(tmpdir(), 'sail-context-conformance-'));
+    try {
+      const path = join(directory, 'profile.json');
+      writeFileSync(path, JSON.stringify(config));
+      return spawnSync(process.execPath, [runner, '--config', path], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          SAIL_CONFORMANCE_SECRET: 'fixture-secret-123',
+          SAIL_CONFORMANCE_TOKEN: 'Bearer fixture-token',
+        },
+        timeout: 10_000,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  } finally {
+    server.kill();
+  }
+}
+
 for (const mode of ['json', 'sse', 'sse-open']) {
   void test(`offline Streamable HTTP provider passes with ${mode} responses`, async () => {
-    const server = spawn(process.execPath, [httpFixture, mode], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    try {
-      const port = await new Promise<string>((resolvePort, reject) => {
-        let text = '';
-        server.once('error', reject);
-        server.once('exit', (code) =>
-          reject(new Error(`HTTP fixture exited before listening: ${code}`)),
-        );
-        server.stdout.setEncoding('utf8');
-        server.stdout.on('data', (chunk: string) => {
-          text += chunk;
-          if (text.includes('\n')) resolvePort(text.trim());
-        });
-      });
-      const config = {
-        ...profile(),
-        transport: {
-          type: 'streamable-http',
-          url: `http://127.0.0.1:${port}/mcp`,
-          headerEnvironment: { Authorization: 'SAIL_CONFORMANCE_TOKEN' },
-        },
-      };
-      const directory = mkdtempSync(join(tmpdir(), 'sail-context-conformance-'));
-      try {
-        const path = join(directory, 'profile.json');
-        writeFileSync(path, JSON.stringify(config));
-        const result = spawnSync(process.execPath, [runner, '--config', path], {
-          encoding: 'utf8',
-          env: {
-            ...process.env,
-            SAIL_CONFORMANCE_SECRET: 'fixture-secret-123',
-            SAIL_CONFORMANCE_TOKEN: 'Bearer fixture-token',
-          },
-          timeout: 10_000,
-        });
-        assert.equal(result.status, 0, result.stderr);
-        assert.equal(JSON.parse(result.stdout).status, 'pass');
-      } finally {
-        rmSync(directory, { recursive: true, force: true });
-      }
-    } finally {
-      server.kill();
-    }
+    const result = await runHttp(mode);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).status, 'pass');
+  });
+}
+
+for (const mode of [
+  'malformed-json-init',
+  'malformed-json-list',
+  'malformed-json-read',
+  'malformed-json-error',
+  'malformed-sse-init',
+  'malformed-sse-list',
+  'malformed-sse-read',
+  'malformed-sse-error',
+]) {
+  void test(`${mode} cannot expose provider text`, async () => {
+    const result = await runHttp(mode);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Invalid provider JSON response/);
+    assert.doesNotMatch(result.stderr, /fixture-secret-123/);
   });
 }

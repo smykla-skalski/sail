@@ -10,16 +10,31 @@ const PROTOCOL_VERSION = '2025-06-18';
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const TIMEOUT_MS = 5000;
 
+class ConformanceError extends Error {}
+
 function assert(condition, message) {
-  if (!condition) throw new Error(message);
+  if (!condition) throw new ConformanceError(message);
+}
+
+function parseProviderJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ConformanceError('Invalid provider JSON response.');
+  }
 }
 
 function pointer(value, path) {
   assert(typeof path === 'string' && path.startsWith('/'), 'Invalid provenance pointer.');
-  return path
-    .slice(1)
-    .split('/')
-    .reduce((current, part) => current?.[part.replaceAll('~1', '/').replaceAll('~0', '~')], value);
+  let current = value;
+  for (const part of path.slice(1).split('/')) {
+    const key = part.replaceAll('~1', '/').replaceAll('~0', '~');
+    if (current === null || typeof current !== 'object' || !Object.hasOwn(current, key)) {
+      return undefined;
+    }
+    current = current[key];
+  }
+  return current;
 }
 
 function validateConfig(config) {
@@ -140,7 +155,7 @@ function parseSseEvent(event) {
     .filter((line) => line.startsWith('data:'))
     .map((line) => line.slice(5).trimStart())
     .join('\n');
-  return data ? JSON.parse(data) : undefined;
+  return data ? parseProviderJson(data) : undefined;
 }
 
 async function readSseResponse(response, id) {
@@ -151,7 +166,7 @@ async function readSseResponse(response, id) {
   let size = 0;
   async function readNext() {
     const { done, value } = await reader.read();
-    if (done) throw new Error('SSE response did not include the matching request ID.');
+    if (done) throw new ConformanceError('SSE response did not include the matching request ID.');
     size += value.length;
     assert(size <= MAX_MESSAGE_BYTES, 'SSE response exceeds 64 KiB.');
     buffer += decoder.decode(value, { stream: true });
@@ -204,7 +219,7 @@ function httpTransport(url, headerEnvironment) {
     const contentType = response.headers.get('content-type') ?? '';
     if (contentType.startsWith('text/event-stream')) return readSseResponse(response, message.id);
     assert(contentType.startsWith('application/json'), 'Unexpected HTTP response content type.');
-    return JSON.parse(await boundedResponse(response));
+    return parseProviderJson(await boundedResponse(response));
   }
   return { send, async close() {} };
 }
@@ -231,7 +246,7 @@ function stdioTransport(command, args) {
     pending.clear();
   };
   child.on('error', fail);
-  child.on('exit', (code) => fail(new Error(`Provider exited with status ${code}.`)));
+  child.on('exit', (code) => fail(new ConformanceError(`Provider exited with status ${code}.`)));
   child.stdin.on('error', fail);
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk) => {
@@ -241,10 +256,10 @@ function stdioTransport(command, args) {
       const line = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
       if (Buffer.byteLength(line) > MAX_MESSAGE_BYTES)
-        return fail(new Error('Stdio response exceeds 64 KiB.'));
+        return fail(new ConformanceError('Stdio response exceeds 64 KiB.'));
       if (!line.trim()) continue;
       try {
-        const message = JSON.parse(line);
+        const message = parseProviderJson(line);
         assert(message.jsonrpc === '2.0', 'Invalid JSON-RPC message on stdout.');
         const waiting = pending.get(message.id);
         if (waiting) {
@@ -253,11 +268,11 @@ function stdioTransport(command, args) {
           waiting.resolve(message);
         }
       } catch {
-        fail(new Error('Non-MCP output on provider stdout.'));
+        fail(new ConformanceError('Non-MCP output on provider stdout.'));
       }
     }
     if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES)
-      fail(new Error('Stdio response exceeds 64 KiB.'));
+      fail(new ConformanceError('Stdio response exceeds 64 KiB.'));
   });
   child.stderr.resume();
   return {
@@ -272,7 +287,7 @@ function stdioTransport(command, args) {
       return new Promise((resolveMessage, reject) => {
         const timer = setTimeout(() => {
           pending.delete(message.id);
-          reject(new Error('Provider request timed out.'));
+          reject(new ConformanceError('Provider request timed out.'));
         }, TIMEOUT_MS);
         pending.set(message.id, { resolve: resolveMessage, reject, timer });
         child.stdin.write(encoded);
@@ -295,7 +310,7 @@ function stdioTransport(command, args) {
 
 function result(message, id) {
   assert(message?.jsonrpc === '2.0' && message.id === id, 'Invalid JSON-RPC response ID.');
-  if (message.error) throw new Error(`Provider returned JSON-RPC error ${message.error.code}.`);
+  if (message.error) throw new ConformanceError('Provider returned a JSON-RPC error.');
   assert(message.result && typeof message.result === 'object', 'Missing JSON-RPC result.');
   return message.result;
 }
@@ -322,7 +337,7 @@ async function run(config) {
     );
     assert(
       initialized.protocolVersion === PROTOCOL_VERSION,
-      `Unsupported MCP protocol version ${initialized.protocolVersion}; expected ${PROTOCOL_VERSION}.`,
+      `Unsupported MCP protocol version; expected ${PROTOCOL_VERSION}.`,
     );
     assert(initialized.capabilities?.tools, 'Provider does not advertise tools.');
     checks.push('initialize');
@@ -412,12 +427,19 @@ async function main() {
     process.argv.length === 4 && process.argv[2] === '--config',
     'Usage: node scripts/context-provider-conformance.mjs --config FILE',
   );
-  const config = validateConfig(JSON.parse(await readFile(resolve(process.argv[3]), 'utf8')));
+  let config;
+  try {
+    config = JSON.parse(await readFile(resolve(process.argv[3]), 'utf8'));
+  } catch {
+    throw new ConformanceError('Cannot read a valid conformance profile JSON file.');
+  }
+  validateConfig(config);
   const report = await run(config);
   process.stdout.write(`${JSON.stringify(report)}\n`);
 }
 
 main().catch((error) => {
-  process.stderr.write(`${JSON.stringify({ status: 'fail', message: error.message })}\n`);
+  const message = error instanceof ConformanceError ? error.message : 'Conformance run failed.';
+  process.stderr.write(`${JSON.stringify({ status: 'fail', message })}\n`);
   process.exitCode = 1;
 });

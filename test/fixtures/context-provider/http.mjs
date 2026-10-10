@@ -43,16 +43,27 @@ const server = createServer(async (request, response) => {
       },
     };
   }
-  const reply = JSON.stringify({ jsonrpc: '2.0', id: message.id, result });
+  const phase =
+    message.method === 'initialize'
+      ? 'init'
+      : message.method === 'tools/list'
+        ? 'list'
+        : message.params.name === 'fixture_error'
+          ? 'error'
+          : 'read';
+  const malformed = mode === `malformed-json-${phase}` || mode === `malformed-sse-${phase}`;
+  const reply = malformed
+    ? `{"jsonrpc":"2.0","id":${message.id},"result":{"secret":"fixture-secret-123",}`
+    : JSON.stringify({ jsonrpc: '2.0', id: message.id, result });
   const headers = message.method === 'initialize' ? { 'mcp-session-id': 'fixture-session' } : {};
   if (message.method !== 'initialize' && request.headers['mcp-session-id'] !== 'fixture-session') {
     response.writeHead(400).end();
     return;
   }
-  if (mode === 'sse' || mode === 'sse-open') {
+  if (mode === 'sse' || mode === 'sse-open' || mode.startsWith('malformed-sse-')) {
     response.writeHead(200, { ...headers, 'content-type': 'text/event-stream' });
     response.write(`event: message\ndata: ${reply}\n\n`);
-    if (mode === 'sse') response.end();
+    if (mode !== 'sse-open') response.end();
   } else {
     response.writeHead(200, { ...headers, 'content-type': 'application/json' });
     response.end(reply);

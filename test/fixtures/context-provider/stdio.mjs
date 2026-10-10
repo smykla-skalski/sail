@@ -14,11 +14,21 @@ for await (const line of createInterface({ input: process.stdin })) {
   const reply = { jsonrpc: '2.0', id: message.id };
   if (message.method === 'initialize') {
     reply.result = {
-      protocolVersion: mode === 'wrong-version' ? '2024-11-05' : '2025-06-18',
+      protocolVersion:
+        mode === 'wrong-version'
+          ? '2024-11-05'
+          : mode === 'secret-version'
+            ? 'fixture-secret-123'
+            : '2025-06-18',
       capabilities: { tools: {} },
       serverInfo: { name: 'sail-fixture', version: '1.0.0' },
     };
   } else if (message.method === 'tools/list') {
+    if (mode === 'secret-error-code') {
+      reply.error = { code: 'fixture-secret-123', message: 'Request denied.' };
+      output(reply);
+      continue;
+    }
     reply.result = {
       tools: [
         { name: 'fixture_search', inputSchema: { type: 'object', properties: {} } },
