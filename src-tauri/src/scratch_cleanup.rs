@@ -24,11 +24,15 @@ fn sweep(
     let mut freed = 0;
     let owner = unsafe { nix::libc::geteuid() };
     for entry in fs::read_dir(temp)? {
-        let entry = entry?;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let metadata = fs::symlink_metadata(&path)?;
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
         if !metadata.is_dir() || metadata.uid() != owner || !candidate_name(&name, &path) {
             continue;
         }
@@ -42,13 +46,36 @@ fn sweep(
         if open_files(&path) != Some(false) {
             continue;
         }
-        if let Err(error) = fs::remove_dir_all(&path) {
-            eprintln!("Sail scratch cleanup kept {}: {error}", path.display());
+        let quarantine = temp.join(format!("sail-cleanup-quarantine-{}", uuid::Uuid::new_v4()));
+        if fs::rename(&path, &quarantine).is_err() {
+            continue;
+        }
+        let safe = inspect(&quarantine, metadata.dev(), now).is_ok_and(|result| result.is_some())
+            && marker_owner_dead(&quarantine)
+            && open_files(&quarantine) == Some(false);
+        if !safe {
+            restore(&quarantine, &path);
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(&quarantine) {
+            eprintln!(
+                "Sail scratch cleanup kept {}: {error}",
+                quarantine.display()
+            );
             continue;
         }
         freed += bytes;
     }
     Ok(freed)
+}
+
+fn restore(quarantine: &Path, original: &Path) {
+    if let Err(error) = fs::rename(quarantine, original) {
+        eprintln!(
+            "Sail scratch cleanup kept {} after restore failed: {error}",
+            quarantine.display()
+        );
+    }
 }
 
 fn candidate_name(name: &str, path: &Path) -> bool {
@@ -59,23 +86,38 @@ fn candidate_name(name: &str, path: &Path) -> bool {
         return true;
     }
     if name
+        .strip_prefix("sail-cleanup-quarantine-")
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+    {
+        return true;
+    }
+    if name
         .strip_prefix("sail")
         .and_then(|tail| tail.split_once("-e2e"))
         .is_some_and(|(issue, _)| issue.parse::<u64>().is_ok())
     {
-        return true;
+        return has_cargo_artifacts(path);
     }
     let Some(tail) = name.strip_prefix("sail-") else {
         return false;
     };
     // Recognize only the old build roots; arbitrary sail-* folders are not ours.
-    (tail.starts_with("review-") || tail.starts_with("ship-"))
+    ((tail.starts_with("review-") || tail.starts_with("ship-"))
         || (tail.split_once('-').is_some_and(|(issue, role)| {
             issue.parse::<u64>().is_ok()
                 && ["target", "cargo", "e2e", "adversary"]
                     .iter()
                     .any(|known| role.starts_with(known))
-        }))
+        })))
+        && has_cargo_artifacts(path)
+}
+
+fn has_cargo_artifacts(path: &Path) -> bool {
+    ["", "target", "target-worktree"].iter().any(|root| {
+        ["debug", "release"]
+            .iter()
+            .any(|profile| path.join(root).join(profile).join(".fingerprint").is_dir())
+    })
 }
 
 fn marker_owner_dead(path: &Path) -> bool {
@@ -162,6 +204,10 @@ mod tests {
         Fixture(root)
     }
 
+    fn cargo_artifacts(path: &Path) {
+        fs::create_dir_all(path.join("debug").join(".fingerprint")).unwrap();
+    }
+
     #[test]
     fn removes_only_stale_closed_build_roots() {
         let temp = fixture();
@@ -171,6 +217,9 @@ mod tests {
         let unrelated = temp.join("sail-context-keep");
         for path in [&stale, &open, &recent, &unrelated] {
             fs::create_dir(path).unwrap();
+        }
+        for path in [&stale, &open, &recent] {
+            cargo_artifacts(path);
         }
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
         sweep(&temp, SystemTime::now(), |_| Some(false)).unwrap();
@@ -189,6 +238,8 @@ mod tests {
         let unknown = temp.join("sail-339-target.unknown");
         fs::create_dir(&worktree).unwrap();
         fs::create_dir(&unknown).unwrap();
+        cargo_artifacts(&worktree);
+        cargo_artifacts(&unknown);
         fs::write(worktree.join(".git"), "gitdir: elsewhere").unwrap();
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
         sweep(&temp, future, |_| None).unwrap();
@@ -226,6 +277,8 @@ mod tests {
         let closed = temp.join("sail-339-cargo.closed");
         fs::create_dir(&open).unwrap();
         fs::create_dir(&closed).unwrap();
+        cargo_artifacts(&open);
+        cargo_artifacts(&closed);
         let handle = fs::File::create(open.join("held")).unwrap();
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
         sweep(&temp, future, has_open_files).unwrap();
@@ -236,10 +289,37 @@ mod tests {
 
     #[test]
     fn recognizes_old_e2e_roots() {
-        assert!(candidate_name("sail339-e2e.abc", Path::new("/tmp/none")));
-        assert!(!candidate_name(
-            "sail339-context.abc",
-            Path::new("/tmp/none")
-        ));
+        let temp = fixture();
+        cargo_artifacts(&temp);
+        assert!(candidate_name("sail339-e2e.abc", &temp));
+        assert!(!candidate_name("sail339-context.abc", &temp));
+    }
+
+    #[test]
+    fn keeps_unverified_legacy_folders() {
+        let temp = fixture();
+        let notes = temp.join("sail-review-notes");
+        fs::create_dir(&notes).unwrap();
+        fs::create_dir(notes.join("debug")).unwrap();
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |_| Some(false)).unwrap();
+        assert!(notes.exists());
+    }
+
+    #[test]
+    fn restores_a_root_opened_during_quarantine() {
+        let temp = fixture();
+        let root = temp.join("sail-339-target.race");
+        fs::create_dir(&root).unwrap();
+        cargo_artifacts(&root);
+        let calls = std::cell::Cell::new(0);
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |_| {
+            calls.set(calls.get() + 1);
+            Some(calls.get() == 2)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert!(root.exists());
     }
 }
