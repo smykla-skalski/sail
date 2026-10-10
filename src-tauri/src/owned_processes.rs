@@ -186,6 +186,10 @@ impl Registry {
         if pid != group {
             return Err("Owned process must lead its process group.".into());
         }
+        #[cfg(unix)]
+        if session && unsafe { nix::libc::getsid(pid as i32) } != pid as i32 {
+            return Err("Owned process must lead its session.".into());
+        }
         let started = process_started(pid).ok_or("Cannot identify owned process.")?;
         #[cfg(target_os = "macos")]
         if process_info(pid).is_none_or(|info| info.pbi_pgid != group) {
@@ -454,6 +458,18 @@ mod tests {
         registry.stop_run("run-a").unwrap();
         owned.0.wait().unwrap();
         assert!(running(&mut unrelated));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn session_registration_rejects_a_process_group_without_a_new_session() {
+        let path = directory();
+        let registry = new_registry(&path, process_started(std::process::id()).unwrap());
+        let mut child = sleeper();
+        assert!(registry
+            .register_session("not-a-session", child.0.id(), child.0.id())
+            .is_err());
+        assert!(running(&mut child));
         std::fs::remove_dir_all(path).unwrap();
     }
 
