@@ -113,7 +113,6 @@
   let memoryRecords = $state<MemoryRecord[]>([]);
   let memoryAgents = $state<MemoryAgentStatus[]>([]);
   let memoryImportCandidates = $state<MemoryImportCandidate[]>([]);
-  let memoryImportSelection = $state<string[]>([]);
   let memoryImportLoading = $state(false);
   let memoryImportError = $state('');
   let memoryImportMessage = $state('');
@@ -150,7 +149,6 @@
       memoryStatus = null;
       memoryRecords = [];
       memoryImportCandidates = [];
-      memoryImportSelection = [];
       memoryImportError = '';
       memoryImportMessage = '';
       memoryQuery = '';
@@ -200,9 +198,6 @@
         });
         if (request === memoryRequest && memoryDirectory === directory) {
           memoryImportCandidates = candidates;
-          memoryImportSelection = memoryImportSelection.filter((id) =>
-            candidates.some((candidate) => candidate.id === id),
-          );
           memoryImportError = '';
         }
       } catch (cause) {
@@ -391,17 +386,17 @@
 
   async function importAgentMemories() {
     const directory = snapshot?.directory;
-    if (!directory || !memoryImportSelection.length || memoryImportLoading) return;
+    const ids = memoryImportCandidates.map((candidate) => candidate.id);
+    if (!directory || !ids.length || memoryImportLoading) return;
     memoryImportLoading = true;
     memoryImportError = '';
     memoryImportMessage = '';
     try {
       const imported = await invoke<MemoryRecord[]>('import_agent_memories', {
         directory,
-        ids: memoryImportSelection,
+        ids,
       });
       if (snapshot?.directory !== directory) return;
-      memoryImportSelection = [];
       memoryImportMessage = `Imported ${imported.length} ${imported.length === 1 ? 'memory' : 'memories'} from Claude Code.`;
       await refreshMemory(directory);
     } catch (cause) {
@@ -1441,34 +1436,10 @@
             No new Claude Code memories found for this project.
           </p>
         {:else}
-          <p>Review each memory before importing. Existing content is skipped.</p>
-          <ul class="memory-record-list">
-            {#each memoryImportCandidates as candidate (candidate.id)}
-              <li>
-                <label class="memory-import-choice">
-                  <input
-                    type="checkbox"
-                    checked={memoryImportSelection.includes(candidate.id)}
-                    onchange={(event) => {
-                      memoryImportSelection = event.currentTarget.checked
-                        ? [...memoryImportSelection, candidate.id]
-                        : memoryImportSelection.filter((id) => id !== candidate.id);
-                    }}
-                  />
-                  <span>Import from Claude Code</span>
-                </label>
-                <small class="runtime-binary" title={candidate.source}
-                  >{candidate.source.split(/[\\/]/).at(-1)}</small
-                >
-                <p>{candidate.content}</p>
-              </li>
-            {/each}
-          </ul>
           <Button
             size="sm"
-            disabled={!memoryImportSelection.length || memoryImportLoading}
-            onclick={() => void importAgentMemories()}
-            >Import {memoryImportSelection.length} selected</Button
+            disabled={memoryImportLoading}
+            onclick={() => void importAgentMemories()}>Import all</Button
           >
         {/if}
       </section>
