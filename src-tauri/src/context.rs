@@ -847,7 +847,7 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
         }
         let line = read_bounded_line(&mut input, 1024 * 1024 + 1)?;
         let line = line.trim_end_matches(['\r', '\n']);
-        if let Some(response) = session.request(&line)? {
+        if let Some(response) = session.request(line)? {
             writeln!(std::io::stdout(), "{response}").map_err(|error| error.to_string())?;
         }
     }
@@ -1017,6 +1017,52 @@ fn seatbelt_literal(path: &Path) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn make_provider_stdin_nonblocking(stdin: &std::process::ChildStdin) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+    if flags < 0
+        || unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) } < 0
+    {
+        return Err(format!(
+            "Cannot configure provider stdin: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn write_provider_request(
+    stdin: &mut std::process::ChildStdin,
+    message: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    use std::io::Write;
+    let deadline = std::time::Instant::now() + timeout;
+    for bytes in [message.as_bytes(), b"\n".as_slice()] {
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            match stdin.write(remaining) {
+                Ok(0) => return Err("Provider stdin closed before request completed.".into()),
+                Ok(count) => remaining = &remaining[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let remaining_time =
+                        deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining_time.is_zero() {
+                        return Err("Provider stdin write timed out.".into());
+                    }
+                    std::thread::sleep(remaining_time.min(std::time::Duration::from_millis(10)));
+                }
+                Err(error) => return Err(format!("Provider stdin write failed: {error}")),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn staged_provider(
     executable: &Path,
     expected_hash: &str,
@@ -1110,6 +1156,11 @@ fn spawn_provider(
         .spawn()
         .map_err(|error| format!("Provider startup failed: {error}"))?;
     let stdin = child.stdin.take().ok_or("Provider stdin unavailable.")?;
+    if let Err(error) = make_provider_stdin_nonblocking(&stdin) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     let stdout = child.stdout.take().ok_or("Provider stdout unavailable.")?;
     let mut stderr = child.stderr.take().ok_or("Provider stderr unavailable.")?;
     let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
@@ -1206,10 +1257,13 @@ fn provider_request_at(
         .clone()
         .ok_or("Provider is stopping; retry.")?;
     let mut provider = slot.lock().map_err(|error| error.to_string())?;
-    let sessions = active_sessions()
-        .lock()
-        .map_err(|error| error.to_string())?;
-    if capability.is_some_and(|capability| !sessions.contains(capability)) {
+    let session_active = || -> Result<bool, String> {
+        let sessions = active_sessions()
+            .lock()
+            .map_err(|error| error.to_string())?;
+        Ok(capability.is_none_or(|capability| sessions.contains(capability)))
+    };
+    if !session_active()? {
         if provider.is_none() {
             drop(provider);
             forget_provider(&key, &slot);
@@ -1229,8 +1283,20 @@ fn provider_request_at(
     if stale {
         provider.take();
     }
+    if !session_active()? {
+        provider.take();
+        drop(provider);
+        forget_provider(&key, &slot);
+        return Err("Context session revoked before provider launch.".into());
+    }
     if provider.is_none() {
         *provider = Some(spawn_provider(&canonical, &current, &data_root.join(&key))?);
+    }
+    if !session_active()? {
+        provider.take();
+        drop(provider);
+        forget_provider(&key, &slot);
+        return Err("Context session revoked before provider request.".into());
     }
     let process = provider.as_mut().ok_or("Provider unavailable.")?;
     let method = request
@@ -1250,14 +1316,14 @@ fn provider_request_at(
     if method == "notifications/initialized" && process.initialized_notification_sent {
         return Ok(None);
     }
-    if let Err(error) = writeln!(process.stdin, "{message}").and_then(|()| process.stdin.flush()) {
-        let detail = process.error(&format!("Provider request failed: {error}"));
+    if let Err(error) = write_provider_request(&mut process.stdin, message, Duration::from_secs(30))
+    {
+        let detail = process.error(&error);
         provider.take();
         drop(provider);
         forget_provider(&key, &slot);
         return Err(detail);
     }
-    drop(sessions);
     if request.get("id").is_none() {
         if method == "notifications/initialized" {
             process.initialized_notification_sent = true;
@@ -1556,8 +1622,12 @@ mod tests {
         let mut provider =
             spawn_provider(&repository.0, &current, &repository.0.join("data")).unwrap();
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"write"}"#;
-        writeln!(provider.stdin, "{request}").unwrap();
-        provider.stdin.flush().unwrap();
+        write_provider_request(
+            &mut provider.stdin,
+            request,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
         let response = read_bounded_line(provider.stdout.as_mut().unwrap(), 1024)
             .unwrap_or_else(|error| panic!("{}", provider.error(&error)));
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1767,6 +1837,109 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("Provider is stopping"));
         drop(guard);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stalled_provider_stdin_does_not_block_session_close() {
+        use std::os::unix::process::CommandExt;
+
+        let repository = Repository::new("runtime-stalled-stdin");
+        repository.configure();
+        let store_path = repository.0.join("approvals.json");
+        let executable = dunce::canonicalize("/usr/bin/yes").unwrap();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let key = project_key(&repository.0).unwrap();
+        let mut child = Command::new(&executable)
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        make_provider_stdin_nonblocking(&stdin).unwrap();
+        let pid = child.id() as i32;
+        let slot: ProviderSlot =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(ProviderProcess {
+                fingerprint: fingerprint.clone(),
+                initialization: None,
+                initialized_notification_sent: false,
+                stdout: Some(std::io::BufReader::new(child.stdout.take().unwrap())),
+                child,
+                stdin,
+                stderr_tail: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                staged_executable: None,
+            })));
+        PROVIDERS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap()
+            .insert(key, Some(slot.clone()));
+        let capability = sha256(uuid::Uuid::new_v4().as_bytes());
+        let capability_c = std::ffi::CString::new(capability.clone()).unwrap();
+        assert!(unsafe { sail_context_session_activate(capability_c.as_ptr()) });
+        let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"payload":"x".repeat(900_000)}}).to_string();
+        let directory = repository.0.clone();
+        let data_root = repository.0.join("data");
+        let worker = std::thread::spawn(move || {
+            provider_request_at(
+                &directory,
+                &fingerprint,
+                Some(&capability),
+                &request,
+                &store_path,
+                &data_root,
+            )
+        });
+        let start = std::time::Instant::now();
+        while slot.try_lock().is_ok() && start.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let entered_slot = slot.try_lock().is_err();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        unsafe { sail_context_session_deactivate(capability_c.as_ptr()) };
+        let close_elapsed = start.elapsed();
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            entered_slot,
+            "Provider request did not enter its project slot"
+        );
+        assert!(close_elapsed < std::time::Duration::from_millis(100));
+        assert!(worker.join().unwrap().is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_stdin_write_times_out_when_unread() {
+        let mut child = Command::new("/usr/bin/yes")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        make_provider_stdin_nonblocking(&stdin).unwrap();
+        let error = write_provider_request(
+            &mut stdin,
+            &"x".repeat(900_000),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap_err();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(error.contains("timed out"));
     }
 
     #[cfg(target_os = "macos")]
