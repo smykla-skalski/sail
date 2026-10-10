@@ -264,7 +264,10 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         };
         let repo_lock = match FileLock::try_acquire(&repo_lock_path, true) {
             Ok(lock) => lock,
-            Err(_) => continue,
+            Err(_) => {
+                report_pending(&data_directory, "active-use");
+                continue;
+            }
         };
         let mutation_path = match lock_path(cache_directory, "mutation", &data_directory) {
             Ok(path) => path,
@@ -275,7 +278,10 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         };
         let mutation = match FileLock::try_acquire(&mutation_path, true) {
             Ok(lock) => lock,
-            Err(_) => continue,
+            Err(_) => {
+                report_pending(&data_directory, "active-use");
+                continue;
+            }
         };
         let lease_path = match lock_path(cache_directory, "lease", &data_directory) {
             Ok(path) => path,
@@ -286,7 +292,10 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         };
         let lease = match FileLock::try_acquire(&lease_path, true) {
             Ok(lock) => lock,
-            Err(_) => continue,
+            Err(_) => {
+                report_pending(&data_directory, "active-use");
+                continue;
+            }
         };
         if has_active_markers(&data_directory) {
             report_pending(&data_directory, "unclean-active-use");
@@ -380,7 +389,7 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
                         .ok()
                         .and_then(|path| FileLock::try_acquire(&path, true).ok());
                     if lease.is_none() {
-                        None
+                        Some("active-use")
                     } else if has_active_markers(&directory) {
                         Some("unclean-active-use")
                     } else if identity.root.exists() {
@@ -1394,6 +1403,36 @@ mod tests {
 
         assert!(!directory.exists());
         assert!(pending.is_empty(), "remaining: {pending:?}");
+    }
+
+    #[test]
+    fn active_lease_is_reported_pending_and_retry_cleans_after_release() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.mark_started();
+        fixture.remove(&fixture.first);
+
+        let pending = retry_cleanup(&fixture.cache);
+
+        assert!(directory.exists(), "active owner data must be retained");
+        assert!(
+            pending.iter().any(|item| {
+                item.cache_key == directory.file_name().unwrap().to_string_lossy()
+                    && item.reason == "active-use"
+            }),
+            "active owner should be visible in cleanup status: {pending:?}"
+        );
+
+        lease.release_clean().unwrap();
+        let pending = retry_cleanup(&fixture.cache);
+
+        assert!(
+            !directory.exists(),
+            "released stale data should be reclaimed"
+        );
+        assert!(!pending
+            .iter()
+            .any(|item| item.cache_key == directory.file_name().unwrap().to_string_lossy()));
     }
 
     #[test]
