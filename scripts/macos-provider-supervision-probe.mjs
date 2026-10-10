@@ -557,12 +557,12 @@ async function serviceTrials(project) {
     const oldProcessAbsent = !oldProcess.stdout.includes(provider);
     const stopped = Boolean(
       afterKill &&
-        afterKill.servicePid !== beforeKill.servicePid &&
-        launchdStatus.status === 0 &&
-        serviceExitSignal === 9 &&
-        firstHeartbeat &&
-        firstHeartbeat === secondHeartbeat &&
-        oldProcessAbsent,
+      afterKill.servicePid !== beforeKill.servicePid &&
+      launchdStatus.status === 0 &&
+      serviceExitSignal === 9 &&
+      firstHeartbeat &&
+      firstHeartbeat === secondHeartbeat &&
+      oldProcessAbsent,
     );
     finding(
       'service-restart-cleanup',
