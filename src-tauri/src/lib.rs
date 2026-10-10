@@ -2024,7 +2024,13 @@ fn discover_nested_worktree_terminal_roots(
     };
     let mut roots = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                diagnostics::record("terminal_cache_owner_unclassified", serde_json::json!({}));
+                continue;
+            }
+        };
         if !entry
             .file_type()
             .map_err(|error| error.to_string())?
@@ -2043,31 +2049,60 @@ fn discover_nested_worktree_terminal_roots(
         let owner_metadata = match owner_file.symlink_metadata() {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.to_string()),
+            Err(_) => {
+                report_unclassified_terminal_cache(name);
+                continue;
+            }
         };
         if !owner_metadata.file_type().is_file() {
-            return Err("Terminal cache owner metadata is not a regular file.".into());
+            report_unclassified_terminal_cache(name);
+            continue;
         }
-        let contents = std::fs::read_to_string(&owner_file).map_err(|error| error.to_string())?;
+        let contents = match std::fs::read_to_string(&owner_file) {
+            Ok(contents) => contents,
+            Err(_) => {
+                report_unclassified_terminal_cache(name);
+                continue;
+            }
+        };
         let mut lines = contents.lines();
         if lines.next() != Some(NESTED_WORKTREE_MANIFEST_HEADER) {
-            return Err("Terminal cache owner metadata is malformed.".into());
+            report_unclassified_terminal_cache(name);
+            continue;
         }
-        let root = acp_terminal::stable_worktree_identity(&decode_manifest_path(
-            lines
-                .next()
-                .ok_or("Terminal cache owner metadata is incomplete.")?,
-        )?);
+        let encoded_root = match lines.next() {
+            Some(root) => root,
+            None => {
+                report_unclassified_terminal_cache(name);
+                continue;
+            }
+        };
+        let decoded_root = match decode_manifest_path(encoded_root) {
+            Ok(root) => root,
+            Err(_) => {
+                report_unclassified_terminal_cache(name);
+                continue;
+            }
+        };
+        let root = acp_terminal::stable_worktree_identity(&decoded_root);
         if lines.next().is_some()
             || acp_terminal::worktree_data_directory(cache_directory, &root) != entry.path()
         {
-            return Err("Terminal cache owner metadata does not match its directory.".into());
+            report_unclassified_terminal_cache(name);
+            continue;
         }
         if root != outer_worktree && root.starts_with(&outer_worktree) {
             roots.push(root);
         }
     }
     Ok(roots)
+}
+
+fn report_unclassified_terminal_cache(cache_key: &str) {
+    diagnostics::record(
+        "terminal_cache_owner_unclassified",
+        serde_json::json!({"cacheKey": cache_key}),
+    );
 }
 
 fn persist_worktree_data_manifest(
@@ -3063,6 +3098,7 @@ mod tests {
         shipping_base_revision, shipping_changed_paths, shipping_default_branch,
         shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
         worktree_overviews, WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER,
+        WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::GitCanonical;
@@ -3177,6 +3213,61 @@ mod tests {
         assert!(error.contains("outside the selected worktree"));
         assert!(outside_data.join("cache").exists());
         assert!(outer_data.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_unrelated_terminal_owner_does_not_block_selected_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-nested-terminal-owner-corruption-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = root.join("cache");
+        let outer = root.join("worktrees/outer");
+        let nested = outer.join("nested-inactive");
+        let active_nested = outer.join("nested-active");
+        let unrelated = root.join("worktrees/unrelated");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&active_nested).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        let nested_data = register_worktree_terminal_data(&cache, &nested).unwrap();
+        fs::write(nested_data.join("cache"), "inactive nested cache").unwrap();
+
+        let active_data = crate::acp_terminal::worktree_data_directory(&cache, &active_nested);
+        fs::create_dir_all(&active_data).unwrap();
+        fs::write(active_data.join("cache"), "active nested cache").unwrap();
+        fs::write(
+            active_data.join(WORKTREE_DATA_OWNER_FILE),
+            "corrupted owner metadata",
+        )
+        .unwrap();
+        let unrelated_data = crate::acp_terminal::worktree_data_directory(&cache, &unrelated);
+        fs::create_dir_all(&unrelated_data).unwrap();
+        fs::write(unrelated_data.join("cache"), "unrelated cache").unwrap();
+        fs::write(
+            unrelated_data.join(WORKTREE_DATA_OWNER_FILE),
+            "corrupted owner metadata",
+        )
+        .unwrap();
+
+        let discovered = discover_nested_worktree_terminal_roots(&cache, &outer).unwrap();
+        assert_eq!(
+            discovered,
+            vec![crate::acp_terminal::stable_worktree_identity(&nested)]
+        );
+        let outer_data = crate::acp_terminal::worktree_data_directory(&cache, &outer);
+        let cleanup = persist_worktree_data_manifest(
+            &cache,
+            &outer_data,
+            &outer,
+            &[discovered[0].clone(), active_nested.clone()],
+        )
+        .unwrap();
+        remove_worktree_then_terminal_data_many(&cleanup, || Ok(()))
+            .expect("unrelated corrupt metadata must not block selected cleanup");
+        assert!(!nested_data.exists());
+        assert!(!active_data.exists());
+        assert!(unrelated_data.join("cache").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
