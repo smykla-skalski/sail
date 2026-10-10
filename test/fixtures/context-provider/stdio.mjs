@@ -44,7 +44,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     };
   } else if (message.method === 'tools/call' && message.params.name === 'fixture_error') {
     reply.result = {
-      isError: true,
+      isError: mode === 'string-false-error' ? 'false' : true,
       content: [
         {
           type: 'text',
@@ -80,5 +80,6 @@ for await (const line of createInterface({ input: process.stdin })) {
   if (message.method === 'tools/call' && message.params.name === 'fixture_error') {
     if (mode === 'trailing-stdout') process.stdout.write('ready\n');
     if (mode === 'delayed-trailing-stdout') setTimeout(() => process.stdout.write('ready\n'), 10);
+    if (mode === 'late-trailing-stdout') setTimeout(() => process.stdout.write('ready\n'), 250);
   }
 }

@@ -127,7 +127,7 @@ void test('does not match a secret against the JSON-RPC envelope', () => {
   assert.equal(JSON.parse(result.stdout).status, 'pass');
 });
 
-for (const mode of ['trailing-stdout', 'delayed-trailing-stdout']) {
+for (const mode of ['trailing-stdout', 'delayed-trailing-stdout', 'late-trailing-stdout']) {
   void test(`rejects ${mode} after the final response`, () => {
     const result = run(profile(mode));
     assert.equal(result.status, 1);
@@ -135,6 +135,13 @@ for (const mode of ['trailing-stdout', 'delayed-trailing-stdout']) {
     assert.equal(result.stdout, '');
   });
 }
+
+void test('rejects a string false isError in the error probe', () => {
+  const result = run(profile('string-false-error'));
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Error probe did not fail with a true isError flag/);
+  assert.equal(result.stdout, '');
+});
 
 void test('offline stdio provider passes the versioned profile', () => {
   const result = run(profile());
