@@ -35,6 +35,43 @@ pub(crate) fn owner_identity() -> Option<String> {
     Some(format!("{pid} {started}"))
 }
 
+pub(crate) fn wrap_command(command: Command) -> std::io::Result<Command> {
+    let mut wrapped = Command::new(std::env::current_exe()?);
+    wrapped
+        .arg("--exec-with-scratch-owner")
+        .arg(command.get_program())
+        .args(command.get_args());
+    if let Some(directory) = command.get_current_dir() {
+        wrapped.current_dir(directory);
+    }
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            wrapped.env(name, value);
+        } else {
+            wrapped.env_remove(name);
+        }
+    }
+    Ok(wrapped)
+}
+
+pub fn exec_with_scratch_owner() -> ! {
+    use std::os::unix::process::CommandExt;
+
+    let mut args = std::env::args_os().skip(2);
+    let Some(program) = args.next() else {
+        eprintln!("Scratch owner wrapper needs a command");
+        std::process::exit(2);
+    };
+    let mut command = Command::new(program);
+    command.args(args).env_remove("SAIL_SCRATCH_OWNER_IDENTITY");
+    if let Some(owner) = owner_identity() {
+        command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
+    }
+    let error = command.exec();
+    eprintln!("Scratch owner wrapper could not launch command: {error}");
+    std::process::exit(1);
+}
+
 fn sweep(
     temp: &Path,
     now: SystemTime,

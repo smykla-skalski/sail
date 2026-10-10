@@ -223,6 +223,11 @@ mod opencode_config;
 mod post_turn_checks;
 #[cfg(unix)]
 mod scratch_cleanup;
+
+#[cfg(unix)]
+pub fn exec_with_scratch_owner() -> ! {
+    scratch_cleanup::exec_with_scratch_owner()
+}
 mod settings;
 mod shell_command;
 mod ship_actions;

@@ -387,11 +387,14 @@ pub fn handle(
         }
         let mut command = Command::new(&params.command);
         command.args(&params.args).current_dir(directory);
-        #[cfg(unix)]
-        command.process_group(0);
         for variable in params.env {
             command.env(variable.name, variable.value);
         }
+        #[cfg(unix)]
+        let mut command = crate::scratch_cleanup::wrap_command(command)
+            .map_err(|error| format!("Could not prepare terminal owner: {error}"))?;
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
