@@ -53,6 +53,21 @@ function validateConfig(config) {
         config.transport.args.every((arg) => typeof arg === 'string'),
       'Invalid stdio arguments.',
     );
+    assert(
+      config.transport.environment === undefined ||
+        (config.transport.environment &&
+          typeof config.transport.environment === 'object' &&
+          !Array.isArray(config.transport.environment)),
+      'Invalid stdio environment mapping.',
+    );
+    for (const [name, environment] of Object.entries(config.transport.environment ?? {})) {
+      assert(/^[A-Z][A-Z0-9_]*$/.test(name), 'Invalid stdio environment name.');
+      assert(
+        typeof environment === 'string' && /^[A-Z][A-Z0-9_]*$/.test(environment),
+        'Invalid stdio source environment name.',
+      );
+      assert(process.env[environment], `Stdio environment ${environment} is unset.`);
+    }
   } else {
     const url = new URL(config.transport.url);
     assert(
@@ -224,14 +239,17 @@ function httpTransport(url, headerEnvironment) {
   return { send, async close() {} };
 }
 
-function stdioTransport(command, args) {
+function stdioTransport(command, args, environment) {
   const child = spawn(command, args, {
     detached: process.platform !== 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
     env: Object.fromEntries(
       ['PATH', 'HOME', 'TMPDIR', 'SYSTEMROOT', 'WINDIR']
         .filter((name) => process.env[name])
-        .map((name) => [name, process.env[name]]),
+        .map((name) => [name, process.env[name]])
+        .concat(
+          Object.entries(environment ?? {}).map(([name, source]) => [name, process.env[source]]),
+        ),
     ),
   });
   const pending = new Map();
@@ -318,7 +336,11 @@ function result(message, id) {
 async function run(config) {
   const transport =
     config.transport.type === 'stdio'
-      ? stdioTransport(config.transport.command, config.transport.args)
+      ? stdioTransport(
+          config.transport.command,
+          config.transport.args,
+          config.transport.environment,
+        )
       : httpTransport(config.transport.url, config.transport.headerEnvironment);
   const checks = [];
   let id = 0;
@@ -368,6 +390,10 @@ async function run(config) {
     assert(
       tools.some((tool) => tool.name === config.probe.tool),
       'Probe tool is not advertised.',
+    );
+    assert(
+      tools.some((tool) => tool.name === config.errorProbe.tool),
+      'Error probe tool is not advertised.',
     );
     checks.push('capabilities');
 

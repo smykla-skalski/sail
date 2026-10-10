@@ -29,7 +29,7 @@ The standalone suite accepts Streamable HTTP endpoints today, but Sail does not 
 
 MCP messages are UTF-8 JSON-RPC 2.0. A stdio server writes one JSON-RPC message per stdout line, logs only to stderr, and does not write banners to stdout. An HTTP server accepts POST at one endpoint, includes either JSON or SSE responses, returns 202 for accepted notifications, and follows the negotiated `MCP-Protocol-Version` and optional `Mcp-Session-Id` headers. The suite checks protocol version `2025-06-18` exactly; another negotiated version fails with a compatibility message.
 
-The provider advertises tools in `tools/list`. At least one safe, read-only tool must return a bounded result with source and revision provenance. The profile points to these values in the tool's result with JSON Pointers, so authors can test existing MCP output shapes without a Sail-specific tool name. A second tool must exercise an error path: the suite sends a sentinel secret in its arguments and fails if the error response repeats it. The sentinel comes from an environment variable and is never stored in the profile or report.
+The provider advertises tools in `tools/list`. At least one safe, read-only tool must return a bounded result with source and revision provenance. The profile points to these values in the tool's result with JSON Pointers, so authors can test existing MCP output shapes without a Sail-specific tool name. A second advertised tool must exercise an error path: the suite sends a sentinel secret in its arguments and fails if the error response repeats it. The sentinel comes from an environment variable and is never stored in the profile or report.
 
 Profile v1 limits each transport response and tool result to 64 KiB, advertised tools to 128 across at most 16 pages, and `structuredContent.items` to 20 when present. Requests time out after five seconds. These are conformance limits for this kit; the production broker owns its eventual per-provider policy. A passing report contains check names only, not provider output, arguments, tokens or credentials.
 
@@ -65,6 +65,17 @@ Set `SAIL_CONFORMANCE_SECRET` to a disposable sentinel, then run:
 
 ```sh
 node scripts/context-provider-conformance.mjs --config /absolute/path/to/profile.json
+```
+
+For a stdio provider that needs a credential, add an `environment` mapping under `transport`. The key is the variable passed to the provider; the value names a variable already set for the runner. The profile stores variable names, never credential values:
+
+```json
+{
+  "type": "stdio",
+  "command": "/absolute/path/to/node",
+  "args": ["/absolute/path/to/provider.mjs"],
+  "environment": { "SAIL_PROVIDER_TOKEN": "SAIL_CONFORMANCE_TOKEN" }
+}
 ```
 
 For Streamable HTTP, replace `transport` with:

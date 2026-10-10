@@ -13,6 +13,11 @@ for await (const line of createInterface({ input: process.stdin })) {
   }
   const reply = { jsonrpc: '2.0', id: message.id };
   if (message.method === 'initialize') {
+    if (mode === 'requires-credential' && process.env.SAIL_PROVIDER_TOKEN !== 'fixture-token') {
+      reply.error = { code: -32000, message: 'Credential required.' };
+      output(reply);
+      continue;
+    }
     reply.result = {
       protocolVersion:
         mode === 'wrong-version'
@@ -32,7 +37,9 @@ for await (const line of createInterface({ input: process.stdin })) {
     reply.result = {
       tools: [
         { name: 'fixture_search', inputSchema: { type: 'object', properties: {} } },
-        { name: 'fixture_error', inputSchema: { type: 'object', properties: {} } },
+        ...(mode === 'missing-error-tool'
+          ? []
+          : [{ name: 'fixture_error', inputSchema: { type: 'object', properties: {} } }]),
       ],
     };
   } else if (message.method === 'tools/call' && message.params.name === 'fixture_error') {

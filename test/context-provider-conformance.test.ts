@@ -29,14 +29,18 @@ function profile(mode = 'valid') {
   };
 }
 
-function run(config: object, secret = 'fixture-secret-123') {
+function run(
+  config: object,
+  secret = 'fixture-secret-123',
+  environment: Record<string, string> = {},
+) {
   const directory = mkdtempSync(join(tmpdir(), 'sail-context-conformance-'));
   try {
     const path = join(directory, 'profile.json');
     writeFileSync(path, JSON.stringify(config));
     return spawnSync(process.execPath, [runner, '--config', path], {
       encoding: 'utf8',
-      env: { ...process.env, SAIL_CONFORMANCE_SECRET: secret },
+      env: { ...process.env, ...environment, SAIL_CONFORMANCE_SECRET: secret },
       timeout: 10_000,
     });
   } finally {
@@ -80,6 +84,29 @@ void test('rejects an error probe that does not send the secret', () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Error probe arguments must include \$SECRET/);
   assert.equal(result.stdout, '');
+});
+
+void test('rejects an unadvertised error probe tool', () => {
+  const result = run(profile('missing-error-tool'));
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Error probe tool is not advertised/);
+  assert.equal(result.stdout, '');
+});
+
+void test('passes a named credential to a stdio provider', () => {
+  const config = profile('requires-credential');
+  config.transport.environment = { SAIL_PROVIDER_TOKEN: 'SAIL_CONFORMANCE_TOKEN' };
+  const result = run(config, 'fixture-secret-123', { SAIL_CONFORMANCE_TOKEN: 'fixture-token' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, 'pass');
+});
+
+void test('rejects an unset stdio credential source', () => {
+  const config = profile();
+  config.transport.environment = { SAIL_PROVIDER_TOKEN: 'SAIL_CONFORMANCE_UNSET_TOKEN' };
+  const result = run(config);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Stdio environment SAIL_CONFORMANCE_UNSET_TOKEN is unset/);
 });
 
 void test('offline stdio provider passes the versioned profile', () => {
