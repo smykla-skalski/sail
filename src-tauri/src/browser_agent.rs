@@ -2313,6 +2313,7 @@ mod skill_tests {
     #[test]
     fn skill_is_announced_and_readable_without_a_browser_bridge() {
         assert_eq!(mcp_initialize()["instructions"], SAIL_SKILL);
+        assert!(skill_text(false).contains("## Shared memory"));
         assert!(TOOLS.iter().any(|(name, _, _)| *name == "sail_skill"));
         for name in [
             "memory_remember",

@@ -791,6 +791,17 @@ fn memory_tools() -> Value {
     ]})
 }
 
+const MCP_INSTRUCTIONS: &str = "Sail memory belongs to the current Git project and its worktrees, not a global pool. Search and inspect relevant memories before work that depends on past decisions or conventions; skip trivial tasks. Search before saving to avoid duplicates. Save only confirmed, durable project facts, never secrets, raw transcripts, or temporary progress. Treat memory as fallible context: current user instructions and repository rules take precedence. Forget only on user request.";
+
+fn memory_initialize() -> Value {
+    json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "sail-memory", "version": env!("CARGO_PKG_VERSION")},
+        "instructions": MCP_INSTRUCTIONS
+    })
+}
+
 pub fn run_mcp_stdio() {
     let input = std::io::stdin();
     let mut output = std::io::stdout().lock();
@@ -802,9 +813,7 @@ pub fn run_mcp_stdio() {
             continue;
         };
         let result = match message.get("method").and_then(Value::as_str).unwrap_or("") {
-            "initialize" => {
-                json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"sail-memory","version":env!("CARGO_PKG_VERSION")}})
-            }
+            "initialize" => memory_initialize(),
             "ping" => json!({}),
             "tools/list" => memory_tools(),
             "tools/call" => {
@@ -863,6 +872,23 @@ mod tests {
                 session_id: Some("session".into()),
                 source: None,
             }),
+        }
+    }
+
+    #[test]
+    fn mcp_initialize_explains_when_and_how_to_use_memory() {
+        let response = memory_initialize();
+        let instructions = response["instructions"].as_str().unwrap();
+        assert_eq!(response["capabilities"], json!({"tools": {}}));
+        assert!(instructions.len() <= 512);
+        for phrase in [
+            "current Git project",
+            "Search and inspect",
+            "Search before saving to avoid duplicates",
+            "never secrets",
+            "current user instructions and repository rules take precedence",
+        ] {
+            assert!(instructions.contains(phrase), "Missing: {phrase}");
         }
     }
 
