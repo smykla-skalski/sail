@@ -506,7 +506,13 @@
     parseResourceLimit,
     resourceLimitKeys,
     setResourceLimit,
+    setPressureThresholds,
   } from './lib/resource-limits';
+  import {
+    defaultPressureThresholds,
+    parsePressureThreshold,
+    pressureThresholdKeys,
+  } from './lib/machine-pressure';
   import {
     parseThemePreference,
     resolveTheme,
@@ -1148,6 +1154,20 @@
       defaultResourceLimits.browser,
     ),
     e2e: parseResourceLimit(getSetting(resourceLimitKeys.e2e), defaultResourceLimits.e2e),
+  });
+  let pressureThresholds = $state({
+    memoryFreePercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.memoryFreePercent),
+      defaultPressureThresholds.memoryFreePercent,
+    ),
+    swapUsedPercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.swapUsedPercent),
+      defaultPressureThresholds.swapUsedPercent,
+    ),
+    diskFreePercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.diskFreePercent),
+      defaultPressureThresholds.diskFreePercent,
+    ),
   });
   let contextHandoffThreshold = $state(
     parseContextHandoffThreshold(getSetting('sai-context-handoff-threshold')),
@@ -2032,6 +2052,7 @@
       shipArchiveDelay,
       contextHandoffThreshold,
       resourceLimits,
+      pressureThresholds,
     };
   }
 
@@ -2262,6 +2283,12 @@
             resourceLimits = { ...resourceLimits, [action.kind]: action.value };
             setSetting(resourceLimitKeys[action.kind], String(action.value));
             if (action.kind !== 'e2e') setResourceLimit(action.kind, action.value);
+          }
+        } else if (action.type === 'pressure-threshold') {
+          if (Number.isSafeInteger(action.value) && action.value >= 0 && action.value <= 100) {
+            pressureThresholds = { ...pressureThresholds, [action.kind]: action.value };
+            setSetting(pressureThresholdKeys[action.kind], String(action.value));
+            setPressureThresholds(pressureThresholds);
           }
         } else if (action.type === 'detect-agents') void detectAgents();
         else if (action.type === 'cross-validation') {

@@ -8,10 +8,16 @@ export class ResourceQueue {
   private active = 0;
   private waiters: Waiter[] = [];
   private limit: number;
+  private blockedReason: string | null;
   private listeners = new Set<() => void>();
 
-  constructor(limit: number) {
+  constructor(limit: number, blockedReason: string | null = null) {
     this.limit = limit;
+    this.blockedReason = blockedReason;
+  }
+
+  get reason(): string | null {
+    return this.blockedReason;
   }
 
   get status() {
@@ -20,6 +26,13 @@ export class ResourceQueue {
 
   setLimit(limit: number): void {
     this.limit = limit;
+    this.drain();
+    this.emit();
+  }
+
+  setBlockedReason(reason: string | null): void {
+    if (this.blockedReason === reason) return;
+    this.blockedReason = reason;
     this.drain();
     this.emit();
   }
@@ -52,7 +65,7 @@ export class ResourceQueue {
   }
 
   private drain(): void {
-    while (this.active < this.limit && this.waiters.length) {
+    while (!this.blockedReason && this.active < this.limit && this.waiters.length) {
       const waiter = this.waiters.shift()!;
       this.active++;
       let released = false;

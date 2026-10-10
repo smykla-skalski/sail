@@ -773,19 +773,19 @@ const queuedPrompts = new Map<string, { agent: string; sessionId: string }>();
 
 async function acquireTurnSlot(
   turnId: string,
-  onQueue?: (limit: number | null) => void,
+  onQueue?: (limit: number | null, reason: string | null) => void,
 ): Promise<() => void> {
   const queue = resourceQueues.agent;
-  if (queue.status.active >= queue.status.limit || queue.status.waiting)
-    onQueue?.(queue.status.limit);
+  if (queue.reason || queue.status.active >= queue.status.limit || queue.status.waiting)
+    onQueue?.(queue.status.limit, queue.reason);
   const unsubscribe = queue.subscribe(() => {
-    if (queue.isQueued(turnId)) onQueue?.(queue.status.limit);
+    if (queue.isQueued(turnId)) onQueue?.(queue.status.limit, queue.reason);
   });
   try {
     return await queue.acquire(turnId);
   } finally {
     unsubscribe();
-    onQueue?.(null);
+    onQueue?.(null, null);
   }
 }
 
@@ -795,7 +795,7 @@ async function limitedPrompt(
   text: string,
   turnId: string,
   imagePaths: string[],
-  onQueue?: (limit: number | null) => void,
+  onQueue?: (limit: number | null, reason: string | null) => void,
   slotHeld = false,
 ): Promise<AcpPromptOutcome> {
   if (slotHeld)
@@ -853,7 +853,7 @@ export const acp = {
     text: string,
     turnId: string,
     imagePaths: string[] = [],
-    onQueue?: (limit: number | null) => void,
+    onQueue?: (limit: number | null, reason: string | null) => void,
     slotHeld = false,
   ) => limitedPrompt(agent, sessionId, text, turnId, imagePaths, onQueue, slotHeld),
   acquireTurnSlot,

@@ -38,6 +38,7 @@
   let error = $state('');
   let loading = $state(false);
   let queuedLimit = $state<number | null>(null);
+  let queuedReason = $state<string | null>(null);
   let browserRelease: (() => void) | null = null;
   let agentAction = $state('');
   let servers = $state<DetectedServer[]>([]);
@@ -161,6 +162,7 @@
       browserRelease?.();
       browserRelease = null;
       queuedLimit = null;
+      queuedReason = null;
     }
   }
 
@@ -274,15 +276,21 @@
     let unsubscribe: (() => void) | null = null;
     try {
       const queue = resourceQueues.browser;
-      if (queue.status.active >= queue.status.limit || queue.status.waiting)
+      if (queue.reason || queue.status.active >= queue.status.limit || queue.status.waiting) {
         queuedLimit = queue.status.limit;
+        queuedReason = queue.reason;
+      }
       unsubscribe = queue.subscribe(() => {
-        if (liveLabel === label && queue.isQueued(label)) queuedLimit = queue.status.limit;
+        if (liveLabel === label && queue.isQueued(label)) {
+          queuedLimit = queue.status.limit;
+          queuedReason = queue.reason;
+        }
       });
       release = await queue.acquire(label);
       unsubscribe();
       unsubscribe = null;
       queuedLimit = null;
+      queuedReason = null;
       if (!mounted || currentGeneration !== generation || liveLabel !== label) {
         release();
         return;
@@ -325,6 +333,7 @@
         liveLabel = null;
         ready = false;
         queuedLimit = null;
+        queuedReason = null;
         void invoke('browser_close', { label });
       }
     }
@@ -587,7 +596,9 @@
     </div>
   {/if}
   {#if loading}<p class="browser-loading" role="status">
-      {queuedLimit === null ? 'Loading…' : `Waiting for browser slot (limit ${queuedLimit})`}
+      {queuedLimit === null
+        ? 'Loading…'
+        : (queuedReason ?? `Waiting for browser slot (limit ${queuedLimit})`)}
     </p>{/if}
   {#if agentAction}<p class="browser-agent-action" role="status">{agentAction}</p>{/if}
   {#if error}<div class="browser-error" role="alert">
