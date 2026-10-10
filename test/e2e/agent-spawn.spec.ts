@@ -344,6 +344,30 @@ describe('provider selected agent spawn', () => {
       expect(openCode.status).toBe('started');
       expect(openCode.threadId).toMatch(/^acp:opencode:/);
       expect(openCode.worktreeId).toBe(path);
+      const openCodeReceipt = z
+        .object({ receiptId: z.string(), accessKey: z.string() })
+        .parse(JSON.parse(openCodeResult.content[0].text));
+      const openCodeDone = await callMcp(
+        config,
+        sessionId,
+        {
+          receiptId: openCodeReceipt.receiptId,
+          accessKey: openCodeReceipt.accessKey,
+          timeoutMs: 10_000,
+        },
+        'agent_wait',
+      );
+      expect(JSON.parse(openCodeDone.content[0].text)).toMatchObject({ state: 'completed' });
+      const openCodeAnswer = await callMcp(
+        config,
+        sessionId,
+        { receiptId: openCodeReceipt.receiptId, accessKey: openCodeReceipt.accessKey },
+        'agent_result',
+      );
+      expect(JSON.parse(openCodeAnswer.content[0].text)).toMatchObject({
+        state: 'completed',
+        result: expect.stringContaining('Clipboard received: Clipboard fixture OpenCode'),
+      });
     }
 
     await browser.refresh();
@@ -374,7 +398,7 @@ describe('provider selected agent spawn', () => {
     const sourceThread = z
       .array(agentThread)
       .parse(JSON.parse(saved ?? '[]'))
-      .find((thread) => thread.directory === path);
+      .find((thread) => thread.directory === path && thread.title === 'Clipboard fixture source');
     if (!sourceThread) throw new Error('Source thread was not restored');
     const sessionId = sourceThread.sessionId;
     const config = await browser.tauri.execute(
@@ -739,7 +763,7 @@ describe('provider selected agent spawn', () => {
     const sourceThread = z
       .array(agentThread)
       .parse(JSON.parse(saved ?? '[]'))
-      .find((thread) => thread.directory === path);
+      .find((thread) => thread.directory === path && thread.title === 'Clipboard fixture source');
     if (!sourceThread) throw new Error('Source thread was not restored');
     const sessionId = sourceThread.sessionId;
     const config = await browser.tauri.execute(

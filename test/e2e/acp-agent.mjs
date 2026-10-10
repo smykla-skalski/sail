@@ -23,7 +23,8 @@ let nextTerminalRequest = 3000;
 const agent = process.argv[2];
 let authenticated = agent !== 'codex';
 let nextSession = 0;
-const sessionRun = process.env.SAIL_ACP_TEST_UNIQUE_SESSIONS ? `-${process.pid}` : '';
+// A provider can run under several capability profiles in separate processes.
+const sessionRun = `-${process.pid}`;
 let nextPermission = 1000;
 
 function send(message) {

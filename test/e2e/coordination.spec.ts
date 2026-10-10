@@ -41,6 +41,8 @@ describe('agent coordination bridge', () => {
       .map((line) => JSON.parse(line));
     expect(initialization.result.instructions).toContain('# Sail');
     expect(initialization.result.instructions).toContain('agent_spawn');
+    expect(initialization.result.instructions).toContain('## Shared memory');
+    expect(initialization.result.instructions).toContain('use the `sail-browser` memory tools');
     expect(tools.result.tools.map((tool: { name: string }) => tool.name)).toContain('sail_skill');
     expect(tools.result.tools).toContainEqual(
       expect.objectContaining({

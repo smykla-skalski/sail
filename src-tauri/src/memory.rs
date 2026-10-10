@@ -124,31 +124,6 @@ pub fn standalone_paths(app: &tauri::AppHandle) -> Result<(PathBuf, PathBuf), St
     Ok((memory_root(app)?, crate::settings::settings_path(app)?))
 }
 
-pub fn acp_mcp_server(
-    app: &tauri::AppHandle,
-    directory: &str,
-    agent: &str,
-) -> Result<Option<Value>, String> {
-    if mode(app, directory)? == "off" {
-        return Ok(None);
-    }
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("Cannot locate Sail executable: {error}"))?;
-    let (root, settings) = standalone_paths(app)?;
-    Ok(Some(json!({
-        "name": "sail-memory",
-        "command": executable.to_string_lossy(),
-        "args": ["--memory-mcp"],
-        "env": [
-            {"name": "SAIL_MEMORY_ACCESS", "value": "sail"},
-            {"name": "SAIL_MEMORY_AGENT", "value": agent},
-            {"name": "SAIL_MEMORY_PROJECT_DIR", "value": directory},
-            {"name": "SAIL_MEMORY_ROOT", "value": root.to_string_lossy()},
-            {"name": "SAIL_SETTINGS_PATH", "value": settings.to_string_lossy()}
-        ]
-    })))
-}
-
 fn paths(root: &Path, key: &str) -> StorePaths {
     StorePaths {
         data: root.join(format!("{key}.json")),
@@ -784,14 +759,14 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
 fn memory_tools() -> Value {
     json!({"tools":[
         {"name":"memory_remember","description":"Store one concise durable project fact. Never store raw transcripts, complete tool output, secrets, or temporary progress.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"content":{"type":"string","minLength":1,"maxLength":4000},"kind":{"type":"string","enum":["decision","constraint","discovery","preference","handoff","other"]},"tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16}},"required":["content"]}},
-        {"name":"memory_search","description":"Search durable memories shared by this Git project and its linked worktrees.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","maxLength":1000},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["query"]}},
+        {"name":"memory_search","description":"Search this Git project's durable memories. External agents use this server; inside Sail, prefer sail-browser, which shares the same store.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","maxLength":1000},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["query"]}},
         {"name":"memory_inspect","description":"Inspect one project memory by ID.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"}},"required":["id"]}},
         {"name":"memory_forget","description":"Forget one project memory by ID and remove its stored content.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"}},"required":["id"]}},
         {"name":"memory_rate","description":"Rate one project memory as unhelpful (-1), unrated (0), or helpful (1).","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"},"rating":{"type":"integer","enum":[-1,0,1]}},"required":["id","rating"]}}
     ]})
 }
 
-const MCP_INSTRUCTIONS: &str = "Sail memory belongs to the current Git project and its worktrees, not a global pool. Search and inspect relevant memories before work that depends on past decisions or conventions; skip trivial tasks. Search before saving to avoid duplicates. Save only confirmed, durable project facts, never secrets, raw transcripts, or temporary progress. Treat memory as fallible context: current user instructions and repository rules take precedence. Forget only on user request.";
+const MCP_INSTRUCTIONS: &str = "Sail memory belongs to the current Git project and its worktrees. Outside Sail, use this server; inside Sail, prefer sail-browser, which shares the store. Search and inspect relevant memories before work that depends on past decisions; skip trivial tasks. Search before saving to avoid duplicates. Save only durable facts, never secrets, raw transcripts, or temporary progress. The current user instructions and repository rules take precedence. Forget only on user request.";
 
 fn memory_initialize() -> Value {
     json!({

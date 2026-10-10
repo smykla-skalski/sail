@@ -466,6 +466,8 @@
     handoffPromptNeedsRecovery,
     loadSpawnReceipts,
     receiptForSource,
+    receiptIsLatestFinishedTurn,
+    replayResultForReceipt,
     receiptMatchesTurn,
     receiptNeedsRefresh,
     receiptIsSettled,
@@ -5613,8 +5615,12 @@
   }
 
   async function recoverAcpSpawnResult(receipt: SpawnReceipt) {
-    if (!receipt.targetId || !receipt.targetDirectory || !receipt.prompt) return;
+    if (!receipt.targetId || !receipt.targetDirectory || !receipt.prompt || !receipt.turnId) return;
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
+    async function isLatestFinishedTurn() {
+      const activity = await acp.activity().catch(() => null);
+      return receiptIsLatestFinishedTurn(receipt, activity?.[receipt.provider], sessionId);
+    }
     const replay: AgentEntry[] = [];
     const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
       if (payload.agent !== receipt.provider || payload.message.method !== 'session/update') return;
@@ -5638,17 +5644,8 @@
           receipt.validation ? 'review' : undefined,
         ),
       );
-      const promptIndex = replay.findLastIndex(
-        (entry) => entry.type === 'user' && entry.text.includes(receipt.prompt!),
-      );
-      if (promptIndex < 0) return;
-      const following = replay.slice(promptIndex + 1);
-      const nextUser = following.findIndex((entry) => entry.type === 'user');
-      const turn = nextUser < 0 ? following : following.slice(0, nextUser);
-      const result = turn
-        .flatMap((entry) => (entry.type === 'assistant' ? [entry.text] : []))
-        .join('\n')
-        .slice(-16_000);
+      const latestFinished = await isLatestFinishedTurn();
+      const result = replayResultForReceipt(replay, receipt.prompt, latestFinished);
       if (result) updateSpawnReceipt(receipt.receiptId, { result }, true);
     } catch {
       return;
@@ -5810,16 +5807,18 @@
                   error: null,
                   updated: Date.now(),
                 });
+                activeSpawnTargets.set(target.id, shippingReceipt!.receiptId);
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
               async () => {
+                if (activeSpawnTargets.get(target.id) === shippingReceipt!.receiptId)
+                  activeSpawnTargets.delete(target.id);
                 saveSpawnReceipt(originalReceipt);
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
               () => acp.prompt(thread.agent, thread.sessionId, recalledText, turnId),
             );
             turn = started.turn;
-            activeSpawnTargets.set(target.id, shippingReceipt.receiptId);
           } else turn = acp.prompt(thread.agent, thread.sessionId, recalledText, turnId);
         } catch {
           abandonImplementationTurn(thread.directory, tracking);
@@ -6195,7 +6194,11 @@
         await new Promise((resolve) => setTimeout(resolve, Math.min(250, deadline - Date.now())));
         return awaitReceipt(await boundedReceipt(current));
       }
-      const current = await awaitReceipt(await boundedReceipt(receipt));
+      let current = await awaitReceipt(await boundedReceipt(receipt));
+      if (request.name === 'agent_result' && current.state === 'completed' && !current.result) {
+        await recoverAcpSpawnResult(current);
+        current = spawnReceipts.find((item) => item.receiptId === current.receiptId) ?? current;
+      }
       const status = {
         receiptId: current.receiptId,
         requestId: current.requestId,
@@ -7196,7 +7199,7 @@
     if (routeSelection?.reason)
       throw new Error(routeSelection.reason ?? 'No eligible model route.');
     const route = routeSelection?.route;
-    const selectedProvider = route?.provider ?? provider ?? request.sourceAgent;
+    const selectedProvider = route?.provider ?? provider ?? source.agent;
     const chosenProvider: SpawnReceipt['provider'] =
       selectedProvider === 'claude'
         ? 'claude'
@@ -7554,13 +7557,22 @@
         query: prompt,
         sessionKey: `acp:${source.agent}:${session.sessionId}`,
       });
-      const turn = dispatchAuthorizedDirectShipPrompt(promptAuthorization, () =>
-        acp.prompt(source.agent, session.sessionId, recalledPrompt, turnId),
-      );
-      if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', dispatchPending: false });
+      const turn = dispatchAuthorizedDirectShipPrompt(promptAuthorization, () => {
+        const targetId = `acp:${source.agent}:${session.sessionId}`;
+        if (receiptId) {
+          updateSpawnReceipt(receiptId, { state: 'working', dispatchPending: false });
+          activeSpawnTargets.set(targetId, receiptId);
+        }
+        try {
+          return acp.prompt(source.agent, session.sessionId, recalledPrompt, turnId);
+        } catch (cause) {
+          if (receiptId && activeSpawnTargets.get(targetId) === receiptId)
+            activeSpawnTargets.delete(targetId);
+          throw cause;
+        }
+      });
       if (receiptId)
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
-      if (receiptId) activeSpawnTargets.set(`acp:${source.agent}:${session.sessionId}`, receiptId);
       const finished = turn.then(
         async (outcome) => {
           if (tracking)
