@@ -10,6 +10,8 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const IDLE_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 const MARKER: &str = ".sail-scratch-root";
+const PRIVATE_MARKER: &str = ".sail-cleanup-private";
+const PRIVATE_MARKER_VALUE: &str = "sail-cleanup-private-v1\n";
 
 pub(crate) fn sweep_on_startup() {
     let root = std::env::temp_dir();
@@ -59,6 +61,13 @@ fn sweep(
             continue;
         }
         if let Some(original_name) = private_quarantine_name(&name) {
+            if fs::read_to_string(path.join(PRIVATE_MARKER))
+                .ok()
+                .as_deref()
+                != Some(PRIVATE_MARKER_VALUE)
+            {
+                continue;
+            }
             if now.duration_since(metadata.modified()?).unwrap_or_default() < IDLE_AGE {
                 continue;
             }
@@ -66,7 +75,7 @@ fn sweep(
                 continue;
             };
             let Some(old_root) = root else {
-                let _ = fs::remove_dir(&path);
+                remove_private_parent(&path);
                 continue;
             };
             // A process may have seen the old child name during recovery's
@@ -87,11 +96,13 @@ fn sweep(
                     .unwrap_or(0);
                 if fs::remove_dir_all(&root).is_ok() {
                     freed += bytes;
-                    let _ = fs::remove_dir(&path);
+                    remove_private_parent(&path);
                 }
             } else if !original.exists() {
                 restore(&root, &original);
-                let _ = fs::remove_dir(&path);
+                if !root.exists() {
+                    remove_private_parent(&path);
+                }
             }
             continue;
         }
@@ -112,8 +123,13 @@ fn sweep(
         if fs::create_dir(&private).is_err() {
             continue;
         }
-        if fs::set_permissions(&private, fs::Permissions::from_mode(0o300)).is_err() {
+        if fs::write(private.join(PRIVATE_MARKER), PRIVATE_MARKER_VALUE).is_err() {
+            let _ = fs::remove_file(private.join(PRIVATE_MARKER));
             let _ = fs::remove_dir(&private);
+            continue;
+        }
+        if fs::set_permissions(&private, fs::Permissions::from_mode(0o300)).is_err() {
+            remove_private_parent(&private);
             continue;
         }
         // The child name is independent of the visible parent name. A process
@@ -121,7 +137,7 @@ fn sweep(
         // derive the child path during the final open-file check and deletion.
         let quarantine = private.join(uuid::Uuid::new_v4().to_string());
         if fs::rename(&path, &quarantine).is_err() {
-            let _ = fs::remove_dir(&private);
+            remove_private_parent(&private);
             continue;
         }
         let safe = inspect(&quarantine, metadata.dev(), now).is_ok_and(|result| result.is_some())
@@ -129,7 +145,9 @@ fn sweep(
             && open_files(&quarantine) == Some(false);
         if !safe {
             restore(&quarantine, &path);
-            let _ = fs::remove_dir(&private);
+            if !quarantine.exists() {
+                remove_private_parent(&private);
+            }
             continue;
         }
         if let Err(error) = fs::remove_dir_all(&quarantine) {
@@ -139,24 +157,39 @@ fn sweep(
             );
             continue;
         }
-        let _ = fs::remove_dir(&private);
+        remove_private_parent(&private);
         freed += bytes;
     }
     Ok(freed)
 }
 
 fn private_child(parent: &Path) -> std::io::Result<Option<PathBuf>> {
+    let original_permissions = fs::metadata(parent)?.permissions();
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     let entries = fs::read_dir(parent).and_then(|entries| {
-        let mut entries = entries.collect::<std::io::Result<Vec<_>>>()?;
+        let mut entries = entries
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|entry| entry.file_name() != PRIVATE_MARKER)
+            .collect::<Vec<_>>();
         if entries.len() > 1 {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
         }
         Ok(entries.pop().map(|entry| entry.path()))
     });
-    let hidden = fs::set_permissions(parent, fs::Permissions::from_mode(0o300));
+    let hidden = fs::set_permissions(parent, original_permissions);
     hidden?;
     entries
+}
+
+fn remove_private_parent(parent: &Path) {
+    if let Err(error) = fs::remove_file(parent.join(PRIVATE_MARKER)) {
+        eprintln!("Sail scratch cleanup kept {}: {error}", parent.display());
+        return;
+    }
+    if let Err(error) = fs::remove_dir(parent) {
+        eprintln!("Sail scratch cleanup kept {}: {error}", parent.display());
+    }
 }
 
 fn restore(quarantine: &Path, original: &Path) {
@@ -538,11 +571,47 @@ mod tests {
         fs::create_dir(&private).unwrap();
         fs::create_dir(&root).unwrap();
         cargo_artifacts(&root);
+        fs::write(private.join(PRIVATE_MARKER), PRIVATE_MARKER_VALUE).unwrap();
         fs::set_permissions(&private, fs::Permissions::from_mode(0o300)).unwrap();
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
         sweep(&temp, future, |_| Some(false)).unwrap();
         assert!(!private.exists());
         assert!(!temp.join(name).exists());
+    }
+
+    #[test]
+    fn ignores_unrelated_quarantine_shaped_directory() {
+        let temp = fixture();
+        let unrelated = temp.join(format!(
+            "sail-cleanup-private-{}-sail-project",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("notes"), "keep").unwrap();
+        let mode = fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777;
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |_| Some(false)).unwrap();
+        assert!(unrelated.join("notes").exists());
+        assert_eq!(
+            fs::metadata(&unrelated).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+    }
+
+    #[test]
+    fn failed_private_listing_restores_original_mode() {
+        let temp = fixture();
+        let private = temp.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::write(private.join(PRIVATE_MARKER), PRIVATE_MARKER_VALUE).unwrap();
+        fs::write(private.join("first"), "keep").unwrap();
+        fs::write(private.join("second"), "keep").unwrap();
+        let mode = fs::metadata(&private).unwrap().permissions().mode() & 0o777;
+        assert!(private_child(&private).is_err());
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            mode
+        );
     }
 
     #[cfg(target_os = "macos")]
