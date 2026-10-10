@@ -17,13 +17,15 @@ function snapshot(): Record<string, string> {
 }
 
 let ready = false;
+let e2eSettingsDisabled = false;
 let values: Record<string, string> = {};
 let writes = Promise.resolve();
 
 export async function initializeSettings(): Promise<void> {
   if (!isTauri()) return;
-  if (import.meta.env.MODE === 'e2e' && sessionStorage.getItem('sail-e2e-settings') !== 'enabled')
-    return;
+  e2eSettingsDisabled =
+    import.meta.env.MODE === 'e2e' && sessionStorage.getItem('sail-e2e-settings') !== 'enabled';
+  if (e2eSettingsDisabled) return;
   try {
     const saved =
       localStorage.getItem(migrationKey) === '1'
@@ -70,7 +72,8 @@ export function setSetting(key: string, value: string): void {
 }
 
 export async function setSettingDurable(key: string, value: string): Promise<void> {
-  if (isTauri() && !ready) throw new Error('Sail settings are unavailable.');
+  if (isTauri() && !ready && !e2eSettingsDisabled)
+    throw new Error('Sail settings are unavailable.');
   setSetting(key, value);
   await writes;
 }
