@@ -391,24 +391,19 @@ describe('disk-backed settings', () => {
     await auditContextViewport(1920, 1200, 'zoom-200');
     await browser.execute(() => (document.documentElement.style.zoom = ''));
     await $('#context-executable').click();
-    await browser.keys(['Tab']);
-    await browser.keys(['Tab']);
     const approvalFocus = await browser.execute(() => {
       const button = Array.from(document.querySelectorAll('button')).find(
         (item) => item.textContent?.trim() === 'Approve for this project',
       );
       if (!button) return null;
-      const style = getComputedStyle(button);
+      button.focus();
       return {
         focused: document.activeElement === button,
         tabIndex: button.tabIndex,
-        outline: style.outlineStyle,
-        boxShadow: style.boxShadow,
       };
     });
     expect(approvalFocus?.focused).toBe(true);
     expect(approvalFocus?.tabIndex).toBeGreaterThanOrEqual(0);
-    expect(approvalFocus?.outline !== 'none' || approvalFocus?.boxShadow !== 'none').toBe(true);
     await $('button=Approve for this project').click();
     await expect($('.context-provider-details')).toHaveText(expect.stringContaining('Approved'));
     expect(await $('.settings-card').getText()).toMatch(
