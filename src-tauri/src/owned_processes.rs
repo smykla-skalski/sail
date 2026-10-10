@@ -169,7 +169,7 @@ impl Registry {
         write_file(&self.file, state)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn register(&self, run: &str, pid: u32, group: u32) -> Result<(), String> {
         self.register_kind(run, pid, group, false)
     }
