@@ -417,7 +417,13 @@ pub(crate) fn retry_cleanup(cache_directory: &Path) -> Vec<CleanupPending> {
 
 pub(crate) fn data_directory_for_root(cache_directory: &Path, root: &Path) -> Option<PathBuf> {
     let root = stable_worktree_identity(root);
+    if root.exists() {
+        let identity = resolve_identity(&root).ok()?;
+        let path = identity_data_directory(cache_directory, &identity).ok()?;
+        return (read_owner(&path).ok().as_ref() == Some(&identity)).then_some(path);
+    }
     let entries = fs::read_dir(cache_directory.join("terminal-worktrees")).ok()?;
+    let mut match_path = None;
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(identity) = read_owner(&path) else {
@@ -428,15 +434,36 @@ pub(crate) fn data_directory_for_root(cache_directory: &Path, root: &Path) -> Op
                 .ok()
                 .as_deref()
                 == Some(path.as_path())
+            && match_path.replace(path).is_some()
         {
-            return Some(path);
+            return None;
         }
     }
-    None
+    match_path
 }
 
 pub(crate) fn is_managed_directory(path: &Path) -> bool {
     read_owner(path).is_ok()
+}
+
+pub(crate) fn data_directory_owned_by(
+    cache_directory: &Path,
+    data_directory: &Path,
+    expected_root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let identity = read_owner(data_directory).map_err(|reason| reason.to_string())?;
+    let expected_directory = identity_data_directory(cache_directory, &identity)?;
+    if expected_directory != data_directory
+        || !identity
+            .root
+            .starts_with(stable_worktree_identity(expected_root))
+    {
+        return Err("Private storage owner does not match the selected worktree.".into());
+    }
+    if identity.root.exists() && resolve_identity(&identity.root).ok().as_ref() != Some(&identity) {
+        return Ok(None);
+    }
+    Ok(Some(identity.root))
 }
 
 pub(crate) fn discover_data_directories(cache_directory: &Path, outer_root: &Path) -> Vec<PathBuf> {
@@ -455,12 +482,19 @@ pub(crate) fn discover_data_directories(cache_directory: &Path, outer_root: &Pat
         if !identity.root.starts_with(&outer_root) {
             continue;
         }
+        if resolve_identity(&identity.root).ok().as_ref() != Some(&identity) {
+            continue;
+        }
         match identity_data_directory(cache_directory, &identity) {
             Ok(expected) if expected == path => directories.push(path),
             _ => report_pending(&path, "owner-cache-key-mismatch"),
         }
     }
-    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    directories.sort_by_key(|path| {
+        read_owner(path)
+            .map(|identity| std::cmp::Reverse(identity.root.components().count()))
+            .unwrap_or(std::cmp::Reverse(0))
+    });
     directories
 }
 
@@ -1479,6 +1513,40 @@ mod tests {
             .iter()
             .any(|item| item.cache_key == old_directory.file_name().unwrap().to_string_lossy()));
         new_lease.release_clean().unwrap();
+    }
+
+    #[test]
+    fn explicit_cleanup_selects_only_the_current_generation_at_a_reused_path() {
+        let fixture = GitFixture::new();
+        let (old_directory, old_lease) = register(&fixture.cache, &fixture.first).unwrap();
+        old_lease.release_clean().unwrap();
+        fixture.remove(&fixture.first);
+        GitFixture::git(
+            &fixture.repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                fixture.first.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let (new_directory, new_lease) = register(&fixture.cache, &fixture.first).unwrap();
+        new_lease.release_clean().unwrap();
+
+        assert_ne!(old_directory, new_directory);
+        assert_eq!(
+            data_directory_for_root(&fixture.cache, &fixture.first),
+            Some(new_directory.clone())
+        );
+        let selected = discover_data_directories(&fixture.cache, &fixture.first);
+        assert_eq!(selected, vec![new_directory.clone()]);
+        fixture.remove(&fixture.first);
+        remove_after_worktree_removal(&fixture.cache, &selected).unwrap();
+
+        assert!(!new_directory.exists());
+        assert!(old_directory.exists());
     }
 
     #[test]

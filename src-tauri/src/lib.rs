@@ -1957,7 +1957,7 @@ fn remove_worktree_then_terminal_data_many<T>(
 }
 
 const NESTED_WORKTREE_MANIFEST_PREFIX: &str = "nw-";
-const NESTED_WORKTREE_MANIFEST_HEADER: &str = "sail-terminal-worktrees-v1";
+const NESTED_WORKTREE_MANIFEST_HEADER: &str = "sail-terminal-worktrees-v2";
 const WORKTREE_DATA_OWNER_FILE: &str = "worktree-owner-v1";
 
 #[cfg(test)]
@@ -2141,8 +2141,21 @@ fn persist_worktree_data_manifest(
     discovered_roots: &[PathBuf],
 ) -> Result<Vec<PathBuf>, String> {
     let outer_worktree = acp_terminal::stable_worktree_identity(outer_worktree);
-    let mut roots = HashSet::new();
-    roots.insert(outer_worktree.clone());
+    for root in discovered_roots {
+        let root = acp_terminal::stable_worktree_identity(root);
+        if root != outer_worktree {
+            validate_nested_worktree_root(&outer_worktree, &root)?;
+        }
+    }
+    if !worktree_storage::is_managed_directory(outer_data) {
+        return Ok(Vec::new());
+    }
+    if worktree_storage::data_directory_for_root(cache_directory, &outer_worktree).as_deref()
+        != Some(outer_data)
+    {
+        return Err("Selected worktree storage generation changed before cleanup.".into());
+    }
+    let mut data_directories = HashSet::from([outer_data.to_path_buf()]);
     if outer_data.is_dir() {
         for entry in std::fs::read_dir(outer_data).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
@@ -2168,10 +2181,16 @@ fn persist_worktree_data_manifest(
                 if line.is_empty() {
                     continue;
                 }
-                let path = decode_manifest_path(line)?;
-                let path = acp_terminal::stable_worktree_identity(&path);
-                validate_nested_worktree_root(&outer_worktree, &path)?;
-                roots.insert(path);
+                let data_directory = decode_manifest_path(line)?;
+                if worktree_storage::data_directory_owned_by(
+                    cache_directory,
+                    &data_directory,
+                    &outer_worktree,
+                )?
+                .is_some()
+                {
+                    data_directories.insert(data_directory);
+                }
             }
         }
     }
@@ -2179,21 +2198,39 @@ fn persist_worktree_data_manifest(
         let root = acp_terminal::stable_worktree_identity(root);
         if root != outer_worktree {
             validate_nested_worktree_root(&outer_worktree, &root)?;
-            roots.insert(root);
+            if let Some(data_directory) =
+                worktree_storage::data_directory_for_root(cache_directory, &root)
+            {
+                if worktree_storage::data_directory_owned_by(
+                    cache_directory,
+                    &data_directory,
+                    &outer_worktree,
+                )?
+                .is_some()
+                {
+                    data_directories.insert(data_directory);
+                }
+            }
         }
     }
-    let nested = roots
-        .iter()
-        .filter(|root| **root != outer_worktree)
-        .cloned()
+    for data_directory in
+        worktree_storage::discover_data_directories(cache_directory, &outer_worktree)
+    {
+        data_directories.insert(data_directory);
+    }
+    let mut nested = data_directories
+        .into_iter()
+        .filter(|data_directory| data_directory != outer_data)
         .collect::<Vec<_>>();
+    nested.sort_by_key(|data_directory| {
+        worktree_storage::data_directory_owned_by(cache_directory, data_directory, &outer_worktree)
+            .map(|root| std::cmp::Reverse(root.map_or(0, |path| path.components().count())))
+            .unwrap_or(std::cmp::Reverse(0))
+    });
     if !nested.is_empty() {
-        std::fs::create_dir_all(outer_data).map_err(|error| error.to_string())?;
-        let mut entries = nested.clone();
-        entries.sort();
         let mut contents = format!("{NESTED_WORKTREE_MANIFEST_HEADER}\n");
-        for root in &entries {
-            contents.push_str(&encode_manifest_path(root));
+        for data_directory in &nested {
+            contents.push_str(&encode_manifest_path(data_directory));
             contents.push('\n');
         }
         let temporary = outer_data.join(format!(
@@ -2222,15 +2259,8 @@ fn persist_worktree_data_manifest(
         }
         write_result?;
     }
-    let _ = nested;
-    if worktree_storage::is_managed_directory(outer_data) {
-        Ok(worktree_storage::discover_data_directories(
-            cache_directory,
-            &outer_worktree,
-        ))
-    } else {
-        Ok(Vec::new())
-    }
+    nested.push(outer_data.to_path_buf());
+    Ok(nested)
 }
 
 fn validate_nested_worktree_root(outer: &Path, candidate: &Path) -> Result<(), String> {
@@ -3198,6 +3228,80 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_manifest_does_not_select_a_prior_generation_at_a_reused_path() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-worktree-generation-manifest-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = root.join("repository");
+        let worktree = root.join("worktree");
+        let cache = root.join("cache");
+        fs::create_dir_all(&repository).unwrap();
+        let repository_arg = repository.to_str().unwrap();
+        let worktree_arg = worktree.to_str().unwrap();
+        git(repository_arg, &["init", "-q"]);
+        git(repository_arg, &["config", "user.name", "Sail Test"]);
+        git(
+            repository_arg,
+            &["config", "user.email", "sail@example.test"],
+        );
+        fs::write(repository.join("tracked"), "fixture").unwrap();
+        git(repository_arg, &["add", "tracked"]);
+        git(repository_arg, &["commit", "--quiet", "-m", "fixture"]);
+        git(
+            repository_arg,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                worktree_arg,
+                "HEAD",
+            ],
+        );
+        let (old_data, old_lease) = worktree_storage::register(&cache, &worktree).unwrap();
+        old_lease.release_clean().unwrap();
+        fs::write(
+            old_data.join("nw-prior.manifest"),
+            format!(
+                "{NESTED_WORKTREE_MANIFEST_HEADER}\n{}\n",
+                encode_manifest_path(&old_data)
+            ),
+        )
+        .unwrap();
+        git(
+            repository_arg,
+            &["worktree", "remove", "--force", worktree_arg],
+        );
+        git(
+            repository_arg,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                worktree_arg,
+                "HEAD",
+            ],
+        );
+        let (new_data, new_lease) = worktree_storage::register(&cache, &worktree).unwrap();
+        new_lease.release_clean().unwrap();
+        assert_ne!(old_data, new_data);
+
+        let selected = persist_worktree_data_manifest(&cache, &new_data, &worktree, &[]).unwrap();
+        assert_eq!(selected, vec![new_data.clone()]);
+        git(
+            repository_arg,
+            &["worktree", "remove", "--force", worktree_arg],
+        );
+        worktree_storage::remove_after_worktree_removal(&cache, &selected).unwrap();
+
+        assert!(!new_data.exists());
+        assert!(old_data.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn legacy_nested_terminal_data_survives_partial_stop_and_is_reported_pending() {
         let root = std::env::temp_dir().join(format!(
             "sail-nested-terminal-cleanup-test-{}",
@@ -3251,29 +3355,56 @@ mod tests {
             "sail-nested-terminal-manifest-validation-{}",
             uuid::Uuid::new_v4()
         ));
+        let repository = root.join("repository");
         let cache = root.join("cache");
         let outer = root.join("worktrees/outer");
         let outside = root.join("unrelated-worktree");
-        fs::create_dir_all(&outer).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        let outer_data = crate::acp_terminal::worktree_data_directory(&cache, &outer);
-        let outside_data = crate::acp_terminal::worktree_data_directory(&cache, &outside);
-        fs::create_dir_all(&outer_data).unwrap();
-        fs::create_dir_all(&outside_data).unwrap();
+        fs::create_dir_all(&repository).unwrap();
+        let repository_arg = repository.to_str().unwrap();
+        let outer_arg = outer.to_str().unwrap();
+        let outside_arg = outside.to_str().unwrap();
+        git(repository_arg, &["init", "-q"]);
+        git(repository_arg, &["config", "user.name", "Sail Test"]);
+        git(
+            repository_arg,
+            &["config", "user.email", "sail@example.test"],
+        );
+        fs::write(repository.join("tracked"), "fixture").unwrap();
+        git(repository_arg, &["add", "tracked"]);
+        git(repository_arg, &["commit", "--quiet", "-m", "fixture"]);
+        git(
+            repository_arg,
+            &["worktree", "add", "--quiet", "--detach", outer_arg, "HEAD"],
+        );
+        git(
+            repository_arg,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                outside_arg,
+                "HEAD",
+            ],
+        );
+        let (outer_data, outer_lease) = worktree_storage::register(&cache, &outer).unwrap();
+        outer_lease.release_clean().unwrap();
+        let (outside_data, outside_lease) = worktree_storage::register(&cache, &outside).unwrap();
+        outside_lease.release_clean().unwrap();
         fs::write(outside_data.join("cache"), "unrelated cache").unwrap();
         let manifest = outer_data.join("nw-invalid.manifest");
         fs::write(
             &manifest,
             format!(
                 "{NESTED_WORKTREE_MANIFEST_HEADER}\n{}\n",
-                encode_manifest_path(&outside)
+                encode_manifest_path(&outside_data)
             ),
         )
         .unwrap();
 
         let error = persist_worktree_data_manifest(&cache, &outer_data, &outer, &[])
             .expect_err("outside roots must be rejected");
-        assert!(error.contains("outside the selected worktree"));
+        assert!(error.contains("does not match the selected worktree"));
         assert!(outside_data.join("cache").exists());
         assert!(outer_data.exists());
         fs::remove_dir_all(root).unwrap();
