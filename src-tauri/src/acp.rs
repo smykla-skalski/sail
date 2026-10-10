@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
+use uuid::Uuid;
 
 use crate::browser_agent::CapabilityProfile;
 
@@ -28,6 +29,7 @@ enum Launch {
     },
     // Native binary resolved by the shared OpenCode settings; started as `<binary> acp`.
     OpenCode,
+    VendoredCodex,
 }
 
 const OPENCODE_BINARY_SETTING: &str = "sai-opencode-bin";
@@ -48,10 +50,7 @@ const AGENTS: &[AgentDefinition] = &[
         name: "Codex",
         executable: "codex",
         binary_env: Some("CODEX_PATH"),
-        launch: Launch::Npx {
-            package: "@agentclientprotocol/codex-acp@2.0.0",
-            min_node_major: 18,
-        },
+        launch: Launch::VendoredCodex,
     },
     AgentDefinition {
         id: "opencode",
@@ -423,6 +422,23 @@ struct Connection {
     pending_directory: Mutex<Option<PathBuf>>,
     session_creation: Mutex<()>,
     ready: Condvar,
+    _owned_temp: Option<OwnedTempDir>,
+}
+
+struct OwnedTempDir(PathBuf);
+
+impl OwnedTempDir {
+    fn create() -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!("sail-codex-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).map_err(|error| error.to_string())?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for OwnedTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 // The adapter fingerprints `cwd` and `mcpServers`, and recreates a live
@@ -447,10 +463,173 @@ fn mcp_server(config: &crate::browser_agent::McpConfig) -> Value {
 
 fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]) -> Value {
     let mut params = json!({"cwd":cwd,"mcpServers":servers});
+    if let Some(git_directories) = linked_worktree_git_directories(cwd) {
+        params["additionalDirectories"] = json!(git_directories);
+    }
     if let Some(session_id) = session_id {
         params["sessionId"] = json!(session_id);
     }
     params
+}
+
+fn linked_worktree_git_directories(cwd: &str) -> Option<Vec<String>> {
+    let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args([
+            "-C",
+            cwd,
+            "rev-parse",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut paths = stdout.lines();
+    let top_level = PathBuf::from(paths.next()?).canonicalize().ok()?;
+    if top_level != PathBuf::from(cwd).canonicalize().ok()? {
+        return None;
+    }
+    let resolve = |path: &str| {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path.canonicalize().ok()
+        } else {
+            PathBuf::from(cwd).join(path).canonicalize().ok()
+        }
+    };
+    let git_dir = resolve(paths.next()?)?;
+    let common_dir = resolve(paths.next()?)?;
+    if git_dir == common_dir || !git_dir.starts_with(common_dir.join("worktrees")) {
+        return None;
+    }
+    // A copied .git pointer makes Git report the copied directory as its
+    // worktree, even though the linked Git directory belongs to another one.
+    let backlink = std::fs::read_to_string(git_dir.join("gitdir")).ok()?;
+    let backlink = PathBuf::from(backlink.trim());
+    let backlink = if backlink.is_absolute() {
+        backlink
+    } else {
+        git_dir.join(backlink)
+    };
+    if backlink.canonicalize().ok()? != PathBuf::from(cwd).join(".git").canonicalize().ok()? {
+        return None;
+    }
+    let directories = [git_dir, common_dir.join("objects")];
+    Some(
+        directories
+            .into_iter()
+            .filter_map(|directory| directory.canonicalize().ok())
+            .filter(|directory| directory.starts_with(&common_dir))
+            .map(|directory| directory.to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+fn codex_permission_profile_config(
+    scope: &Path,
+    temp: &Path,
+    extra_writable: &[PathBuf],
+) -> Result<String, String> {
+    let directories =
+        linked_worktree_git_directories(scope.to_str().ok_or("Invalid assigned worktree path.")?)
+            .ok_or("Assigned worktree Git metadata is unavailable.")?;
+    let git_dir = PathBuf::from(&directories[0]);
+    let objects = PathBuf::from(&directories[1]);
+    let common_dir = git_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("Invalid linked Git directory.")?
+        .to_path_buf();
+    let mut writable = vec![
+        scope.to_path_buf(),
+        git_dir,
+        objects,
+        temp.to_path_buf(),
+        common_dir.join("packed-refs.lock"),
+    ];
+    writable.extend_from_slice(extra_writable);
+    let branch = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args([
+            "-C",
+            scope.to_str().ok_or("Invalid worktree path.")?,
+            "symbolic-ref",
+            "-q",
+            "HEAD",
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if branch.status.success() {
+        let reference = String::from_utf8(branch.stdout).map_err(|error| error.to_string())?;
+        let reference = reference.trim();
+        let branch_name = reference
+            .strip_prefix("refs/heads/")
+            .ok_or("Invalid assigned branch reference.")?;
+        let branch_path = Path::new(branch_name);
+        if branch_path.components().next().is_none()
+            || branch_path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("Invalid assigned branch reference.".into());
+        }
+        let ref_path = common_dir.join("refs/heads").join(branch_path);
+        let log_path = common_dir.join("logs/refs/heads").join(branch_path);
+        for path in [ref_path, log_path] {
+            let parent = path.parent().ok_or("Invalid assigned branch path.")?;
+            if parent.canonicalize().ok().as_deref() != Some(parent) {
+                return Err("Assigned branch path resolves through a symlink.".into());
+            }
+            if std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err("Assigned branch reference is a symlink.".into());
+            }
+            writable.push(path.with_extension(format!(
+                "{}lock",
+                path.extension().map_or(String::new(), |extension| format!(
+                    "{}.",
+                    extension.to_string_lossy()
+                ))
+            )));
+            writable.push(path);
+        }
+    }
+    let mut rules = vec![
+        "\":tmpdir\"=\"read\"".to_string(),
+        "\":slash_tmp\"=\"read\"".to_string(),
+    ];
+    for path in writable {
+        let key =
+            serde_json::to_string(&path.to_string_lossy()).map_err(|error| error.to_string())?;
+        rules.push(format!("{key}=\"write\""));
+    }
+    let overrides = vec![
+        "default_permissions=\"sail-agent\"".to_string(),
+        "permissions.sail-read-only={extends=\":read-only\"}".to_string(),
+        format!(
+            "permissions.sail-agent={{extends=\":workspace\",filesystem={{{}}}}}",
+            rules.join(",")
+        ),
+    ];
+    serde_json::to_string(&json!({
+        "configOverrides": overrides,
+        "modeProfiles": {
+            "read-only": "sail-read-only",
+            "agent": "sail-agent",
+            "agent-full-access": "sail-agent"
+        }
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn session_servers(browser: Value) -> Vec<Value> {
@@ -2729,6 +2908,24 @@ fn agent_availability(
                     },
                 }
             }
+            Launch::VendoredCodex => {
+                let binary = find_executable(agent.executable);
+                AgentAvailability {
+                    id: agent.id.into(),
+                    name: agent.name.into(),
+                    binary_path: binary
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    available: binary.is_some() && major.is_some_and(|version| version >= 18),
+                    reason: if binary.is_none() {
+                        Some(format!("Install {} first.", agent.name))
+                    } else if major.is_none_or(|version| version < 18) {
+                        Some("Codex requires Node.js 18 or newer.".into())
+                    } else {
+                        None
+                    },
+                }
+            }
         })
         .collect()
 }
@@ -2765,6 +2962,26 @@ fn agent_availability_for(app: &AppHandle, agent: &str) -> Result<AgentAvailabil
             .reason
             .unwrap_or_else(|| "Agent unavailable.".into()))
     }
+}
+
+fn vendored_codex_adapter(app: &AppHandle) -> Result<PathBuf, String> {
+    let bundled = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?
+        .join("codex-acp/index.js.txt");
+    if bundled.is_file() {
+        return Ok(bundled);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/codex-acp/dist/index.js.txt");
+        if source.is_file() {
+            return Ok(source);
+        }
+    }
+    Err("The bundled Codex ACP adapter is missing.".into())
 }
 
 fn connect_blocking(
@@ -2849,6 +3066,7 @@ fn connect_blocking_inner(
     let test_agent: Option<std::ffi::OsString> = None;
     let mut paths = Vec::new();
     let is_test_agent = test_agent.is_some();
+    let mut owned_temp = None;
     let mut command = if let Some(path) = test_agent {
         let node = find_executable("node").ok_or("Node.js not found.")?;
         paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
@@ -2875,6 +3093,19 @@ fn connect_blocking_inner(
                 command.env_remove("OPENCODE_CONFIG_DIR");
                 command
             }
+            Launch::VendoredCodex => {
+                let node = find_executable("node").ok_or("Node.js not found.")?;
+                paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
+                let temp = OwnedTempDir::create()?;
+                let adapter = temp.0.join("index.mjs");
+                std::fs::copy(vendored_codex_adapter(&app)?, &adapter)
+                    .map_err(|error| format!("Could not stage Codex ACP adapter: {error}"))?;
+                let mut command = Command::new(node);
+                command.arg(adapter);
+                command.env_remove("CODEX_ACP_PERMISSION_PROFILE_CONFIG");
+                owned_temp = Some(temp);
+                command
+            }
         }
     };
     paths.extend(std::env::split_paths(&original_path));
@@ -2898,6 +3129,26 @@ fn connect_blocking_inner(
     let (data_directory, storage_lease) =
         crate::register_worktree_storage(&cache_directory, worktree)?;
     prepare_runtime_directories(&data_directory)?;
+    if let Some(temp) = owned_temp.as_ref() {
+        if linked_worktree_git_directories(worktree.to_str().ok_or("Invalid worktree path.")?)
+            .is_some()
+        {
+            let shared_cache = data_directory
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(&data_directory)
+                .join("terminal-package-downloads");
+            std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
+            command.env(
+                "CODEX_ACP_PERMISSION_PROFILE_CONFIG",
+                codex_permission_profile_config(
+                    worktree,
+                    &temp.0,
+                    &[data_directory.clone(), shared_cache],
+                )?,
+            );
+        }
+    }
     for (name, value) in runtime_environment(&data_directory) {
         command.env(name, value);
     }
@@ -2972,6 +3223,7 @@ fn connect_blocking_inner(
         pending_directory: Mutex::new(None),
         session_creation: Mutex::new(()),
         ready: Condvar::new(),
+        _owned_temp: owned_temp,
     });
     let reader = Arc::clone(&runtime);
     let reader_manager = manager.clone();
@@ -4491,6 +4743,7 @@ mod session_config_tests {
             pending_directory: Mutex::new(None),
             session_creation: Mutex::new(()),
             ready: Condvar::new(),
+            _owned_temp: None,
         })
     }
 
@@ -4691,6 +4944,7 @@ mod session_config_tests {
                 pending_directory: Mutex::new(None),
                 session_creation: Mutex::new(()),
                 ready: Condvar::new(),
+                _owned_temp: None,
             })
         };
         let first_runtime = spawn(&first);
@@ -4775,6 +5029,114 @@ mod session_config_tests {
         let request = session_request_params("/work/repo", None, &servers);
         assert_eq!(request["mcpServers"].as_array().unwrap().len(), 1);
         assert_eq!(request["mcpServers"][0]["name"], "sail-browser");
+    }
+
+    #[test]
+    fn linked_worktree_session_grants_only_its_git_paths() {
+        let root = scratch("linked-git");
+        let main = root.join("main");
+        let linked = root.join("linked");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(&main)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&main)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&main)
+            .args(["worktree", "add", "-q", "-b", "sail/test"])
+            .arg(&linked)
+            .status()
+            .unwrap()
+            .success());
+
+        let request = session_request_params(linked.to_str().unwrap(), None, &[]);
+        let common = main.join(".git").canonicalize().unwrap();
+        let roots = request["additionalDirectories"].as_array().unwrap();
+        assert_eq!(roots.len(), 2);
+        assert!(roots
+            .iter()
+            .any(|root| root == &json!(common.join("worktrees/linked"))));
+        assert!(roots
+            .iter()
+            .any(|root| root == &json!(common.join("objects"))));
+        assert!(!roots.iter().any(|root| root == &json!(common.join("refs"))));
+        assert!(!roots
+            .iter()
+            .any(|root| root == &json!(common.join("logs/refs"))));
+        assert!(!roots.iter().any(|root| root == &json!(common)));
+        assert_eq!(
+            worktree_identity(&linked),
+            crate::acp_terminal::stable_worktree_identity(&linked.canonicalize().unwrap())
+        );
+        let build_cache = root.join("task-build-cache");
+        let profile: Value = serde_json::from_str(
+            &codex_permission_profile_config(
+                &linked,
+                &root.join("task-tmp"),
+                std::slice::from_ref(&build_cache),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let overrides = profile["configOverrides"].as_array().unwrap();
+        assert!(overrides.iter().any(|value| value
+            .as_str()
+            .is_some_and(|value| value.contains("refs/heads/sail/test"))));
+        assert!(overrides.iter().all(|value| !value
+            .as_str()
+            .is_some_and(|value| value.contains("filesystem.\""))));
+        assert!(overrides.iter().any(|value| {
+            value.as_str().is_some_and(|value| {
+                value.contains("filesystem") && value.contains("worktrees/linked")
+            })
+        }));
+        assert!(overrides.iter().any(|value| value
+            .as_str()
+            .is_some_and(|value| value.contains(build_cache.to_str().unwrap()))));
+        let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
+        assert_eq!(
+            restored["additionalDirectories"],
+            request["additionalDirectories"]
+        );
+        assert!(session_request_params(main.to_str().unwrap(), None, &[])
+            .get("additionalDirectories")
+            .is_none());
+
+        let copied = root.join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::copy(linked.join(".git"), copied.join(".git")).unwrap();
+        assert!(session_request_params(copied.to_str().unwrap(), None, &[])
+            .get("additionalDirectories")
+            .is_none());
+
+        std::fs::create_dir(linked.join("nested")).unwrap();
+        assert!(
+            session_request_params(linked.join("nested").to_str().unwrap(), None, &[])
+                .get("additionalDirectories")
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5048,6 +5410,7 @@ mod native_subagent_fence_tests {
             pending_directory: Mutex::new(None),
             session_creation: Mutex::new(()),
             ready: Condvar::new(),
+            _owned_temp: None,
         });
         let directory = PathBuf::from("/worktree");
         runtime
