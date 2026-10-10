@@ -50,35 +50,34 @@ export function pressureBlockers(
 ): { host: string[]; disk: string | null } {
   const host: string[] = [];
   let disk: string | null = null;
-  if (!validPair(reading.totalMemory, reading.availableMemory))
-    host.push('memory reading unavailable');
-  else if (
-    thresholds.memoryFreePercent > 0 &&
-    reading.availableMemory * 100 <= reading.totalMemory * thresholds.memoryFreePercent
-  )
-    host.push(`free memory at or below ${thresholds.memoryFreePercent}%`);
+  if (thresholds.memoryFreePercent > 0) {
+    if (!validPair(reading.totalMemory, reading.availableMemory))
+      host.push('memory reading unavailable');
+    else if (reading.availableMemory * 100 <= reading.totalMemory * thresholds.memoryFreePercent)
+      host.push(`free memory at or below ${thresholds.memoryFreePercent}%`);
+  }
 
-  if (
-    !Number.isFinite(reading.totalSwap) ||
-    !Number.isFinite(reading.usedSwap) ||
-    reading.totalSwap < 0 ||
-    reading.usedSwap < 0 ||
-    reading.usedSwap > reading.totalSwap
-  )
-    host.push('swap reading unavailable');
-  else if (
-    thresholds.swapUsedPercent > 0 &&
-    reading.totalSwap > 0 &&
-    reading.usedSwap * 100 >= reading.totalSwap * thresholds.swapUsedPercent
-  )
-    host.push(`swap use at or above ${thresholds.swapUsedPercent}%`);
+  if (thresholds.swapUsedPercent > 0) {
+    if (
+      !Number.isFinite(reading.totalSwap) ||
+      !Number.isFinite(reading.usedSwap) ||
+      reading.totalSwap < 0 ||
+      reading.usedSwap < 0 ||
+      reading.usedSwap > reading.totalSwap
+    )
+      host.push('swap reading unavailable');
+    else if (
+      reading.totalSwap > 0 &&
+      reading.usedSwap * 100 >= reading.totalSwap * thresholds.swapUsedPercent
+    )
+      host.push(`swap use at or above ${thresholds.swapUsedPercent}%`);
+  }
 
-  if (!validPair(reading.totalDisk, reading.availableDisk)) disk = 'disk reading unavailable';
-  else if (
-    thresholds.diskFreePercent > 0 &&
-    reading.availableDisk * 100 <= reading.totalDisk * thresholds.diskFreePercent
-  )
-    disk = `free disk at or below ${thresholds.diskFreePercent}%`;
+  if (thresholds.diskFreePercent > 0) {
+    if (!validPair(reading.totalDisk, reading.availableDisk)) disk = 'disk reading unavailable';
+    else if (reading.availableDisk * 100 <= reading.totalDisk * thresholds.diskFreePercent)
+      disk = `free disk at or below ${thresholds.diskFreePercent}%`;
+  }
 
   return { host, disk };
 }

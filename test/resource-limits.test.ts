@@ -80,6 +80,20 @@ void test('configured thresholds parse strictly and zero disables each threshold
     ),
     null,
   );
+  assert.equal(
+    pressureReason(
+      { ...healthy, totalMemory: 0, usedSwap: 101, totalDisk: 0 },
+      { memoryFreePercent: 0, swapUsedPercent: 0, diskFreePercent: 0 },
+    ),
+    null,
+  );
+  assert.deepEqual(
+    pressureBlockers(
+      { ...healthy, totalMemory: 0, usedSwap: 101, totalDisk: 0 },
+      { memoryFreePercent: 0, swapUsedPercent: 70, diskFreePercent: 0 },
+    ),
+    { host: ['swap reading unavailable'], disk: null },
+  );
 });
 
 void test('pressure recovery starts queued work without disturbing active work', async () => {
