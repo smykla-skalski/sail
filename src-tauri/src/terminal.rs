@@ -63,22 +63,31 @@ struct TerminalSession {
     writer: Mutex<Box<dyn Write + Send>>,
     write_busy: AtomicBool,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    #[cfg(unix)]
+    watchdog: Mutex<Option<crate::child_watchdog::ChildWatchdog>>,
     output: Arc<Mutex<TerminalOutput>>,
     changed: Arc<Condvar>,
 }
 
 impl TerminalSession {
     fn stop(&self) {
-        if self
-            .output
-            .lock()
-            .is_ok_and(|output| output.exit_code.is_some())
+        if self.owner.is_none()
+            && self
+                .output
+                .lock()
+                .is_ok_and(|output| output.exit_code.is_some())
         {
             return;
         }
         #[cfg(unix)]
         {
-            if let Ok(master) = self.master.lock() {
+            if self.owner.is_some() {
+                if let Ok(mut watchdog) = self.watchdog.lock() {
+                    if let Some(mut watchdog) = watchdog.take() {
+                        watchdog.kill_group();
+                    }
+                }
+            } else if let Ok(master) = self.master.lock() {
                 if let Some(group) = master.process_group_leader() {
                     let group = nix::unistd::Pid::from_raw(group);
                     if group.as_raw() > 0 && group != nix::unistd::getpgrp() {
@@ -183,6 +192,24 @@ impl Drop for TerminalManager {
 }
 
 impl TerminalManager {
+    pub fn stop_owner(&self, owner: &str) {
+        let sessions = self
+            .0
+            .lock()
+            .ok()
+            .map(|sessions| {
+                sessions
+                    .values()
+                    .filter(|session| session.owner.as_deref() == Some(owner))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for session in sessions {
+            session.stop();
+        }
+    }
+
     pub fn shutdown(&self) {
         let sessions = self
             .0
@@ -469,7 +496,7 @@ fn spawn(
     command.env("COLORTERM", "truecolor");
     #[cfg(windows)]
     command.env("PROMPT", "$E]9;9;$P$E\\$P$G");
-    let child = pair
+    let mut child = pair
         .slave
         .spawn_command(command)
         .map_err(|error| error.to_string())?;
@@ -494,6 +521,49 @@ fn spawn(
     }));
     let changed = Arc::new(Condvar::new());
     let process_id = child.process_id();
+    #[cfg(unix)]
+    let mut watchdog = None;
+    if let Some(owner) = owner.as_deref() {
+        let Some(pid) = process_id else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cannot identify terminal process.".into());
+        };
+        #[cfg(unix)]
+        let group = pair.master.process_group_leader();
+        #[cfg(windows)]
+        let group = Some(pid as i32);
+        let Some(group) = group else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cannot identify terminal process group.".into());
+        };
+        if let Err(error) = crate::owned_processes::register(owner, pid, group as u32) {
+            #[cfg(unix)]
+            if group > 0 && group != nix::unistd::getpgrp().as_raw() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(group),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Cannot track terminal ownership: {error}"));
+        }
+        #[cfg(unix)]
+        {
+            watchdog = Some(
+                crate::child_watchdog::ChildWatchdog::start(group as u32).map_err(|error| {
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(group),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                    let _ = child.wait();
+                    format!("Cannot start terminal watchdog: {error}")
+                })?,
+            );
+        }
+    }
     let killer = child.clone_killer();
     let child = Arc::new(Mutex::new(child));
     let background_output = Arc::clone(&output);
@@ -547,6 +617,8 @@ fn spawn(
         writer: Mutex::new(writer),
         write_busy: AtomicBool::new(false),
         killer: Mutex::new(killer),
+        #[cfg(unix)]
+        watchdog: Mutex::new(watchdog),
         output,
         changed,
     })

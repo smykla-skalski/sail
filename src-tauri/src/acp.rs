@@ -3757,6 +3757,7 @@ pub async fn acp_prompt(
             false
         };
         if latest {
+            cleanup_session_processes(&app, &runtime, &agent, &session_id);
             let _ = app.emit(
                 "acp-event",
                 AgentEvent {
@@ -3831,6 +3832,29 @@ pub async fn acp_steer(
     .map_err(|error| error.to_string())?
 }
 
+fn cleanup_session_processes(app: &AppHandle, runtime: &Connection, agent: &str, session_id: &str) {
+    let directory = runtime
+        .session_directories
+        .lock()
+        .ok()
+        .and_then(|directories| directories.get(session_id).cloned());
+    if let Some(directory) = directory {
+        let owner = format!("{}\0acp:{}:{}", directory.display(), agent, session_id);
+        if let Err(error) = crate::owned_processes::stop_run(&owner) {
+            crate::diagnostics::record(
+                "owned_process_cleanup_failed",
+                json!({
+                    "run": owner, "error": error
+                }),
+            );
+        }
+        app.state::<crate::terminal::TerminalManager>()
+            .stop_owner(&owner);
+    }
+    app.state::<crate::acp_terminal::AcpTerminalManager>()
+        .stop_sessions(agent, runtime.profile, &[session_id.to_string()]);
+}
+
 #[tauri::command]
 pub fn acp_cancel(
     app: AppHandle,
@@ -3892,6 +3916,9 @@ fn cancel_session(
                 .remove(turn_id);
         }
         return result;
+    }
+    if cancelled_turn.is_some() {
+        cleanup_session_processes(app, runtime, &agent, &session_id);
     }
     resolve_session_permissions(
         &mut permission_state.pending,

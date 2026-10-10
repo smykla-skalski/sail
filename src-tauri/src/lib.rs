@@ -221,6 +221,7 @@ mod memory_import;
 mod memory_install;
 mod memory_provider;
 mod opencode_config;
+mod owned_processes;
 mod post_turn_checks;
 mod settings;
 mod shell_command;
@@ -2404,6 +2405,8 @@ pub fn run() {
             if let Err(error) = diagnostics::init(_app.handle()) {
                 eprintln!("Sail diagnostics unavailable: {error}");
             }
+            let process_directory = _app.path().app_config_dir()?.join("owned-processes");
+            owned_processes::init(process_directory).map_err(std::io::Error::other)?;
             browser_agent::start_bridge(_app.handle())?;
             if let Err(error) = hook_activity::start_bridge(_app.handle()) {
                 eprintln!("Sail hook receiver unavailable: {error}");
@@ -2602,6 +2605,12 @@ pub fn run() {
                 }
                 if let Some(terminals) = app.try_state::<terminal::TerminalManager>() {
                     terminals.shutdown();
+                }
+                if let Err(error) = owned_processes::shutdown() {
+                    diagnostics::record(
+                        "owned_process_cleanup_failed",
+                        serde_json::json!({"error": error}),
+                    );
                 }
                 if let Some(manager) = app.try_state::<hook_activity::HookActivityManager>() {
                     hook_activity::cleanup(&manager);

@@ -326,12 +326,15 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     let mut child = terminal.child.lock().map_err(|error| error.to_string())?;
     #[cfg(unix)]
     {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
-        let _ = child.try_wait();
-        let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
         if let Ok(mut watchdog) = terminal.watchdog.lock() {
-            watchdog.stop();
+            watchdog.kill_group();
+        }
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            let _ = child.kill();
         }
     }
     #[cfg(windows)]
@@ -397,6 +400,22 @@ pub fn handle(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("Cannot start command: {error}"))?;
+        let owner = format!(
+            "{}\0acp:{}:{}",
+            fallback.display(),
+            agent,
+            params.session_id
+        );
+        if let Err(error) = crate::owned_processes::register(&owner, child.id(), child.id()) {
+            #[cfg(unix)]
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Cannot track command ownership: {error}"));
+        }
         #[cfg(unix)]
         let watchdog =
             crate::child_watchdog::ChildWatchdog::start(child.id()).map_err(|error| {
