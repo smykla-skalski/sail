@@ -75,16 +75,11 @@ impl TerminalSession {
         #[cfg(unix)]
         {
             let master = self.master.lock().map_err(|error| error.to_string())?;
-            let group = master
-                .process_group_leader()
-                .ok_or("Cannot identify terminal process group.")?;
-            let group = nix::unistd::Pid::from_raw(group);
-            if group.as_raw() > 0 && group != nix::unistd::getpgrp() {
-                match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
-                    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-                    Err(error) => return Err(format!("Cannot stop terminal process: {error}")),
-                }
-            }
+            kill_terminal_process_groups(
+                self.process_id
+                    .ok_or("Cannot identify terminal process group.")?,
+                master.process_group_leader(),
+            )?;
         }
         #[cfg(windows)]
         {
@@ -95,6 +90,31 @@ impl TerminalSession {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn kill_terminal_process_groups(
+    shell_process_id: u32,
+    foreground_group: Option<i32>,
+) -> Result<(), String> {
+    let shell_group = nix::unistd::Pid::from_raw(shell_process_id as i32);
+    if shell_group.as_raw() <= 0 || shell_group == nix::unistd::getpgrp() {
+        return Err("Cannot identify terminal process group.".to_string());
+    }
+    let foreground_group = foreground_group.map(nix::unistd::Pid::from_raw);
+    for group in [Some(shell_group), foreground_group].into_iter().flatten() {
+        if group == shell_group && group.as_raw() <= 0 {
+            return Err("Cannot identify terminal process group.".to_string());
+        }
+        if group.as_raw() <= 0 || group == nix::unistd::getpgrp() {
+            continue;
+        }
+        match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => return Err(format!("Cannot stop terminal process: {error}")),
+        }
+    }
+    Ok(())
 }
 
 fn default_editor() -> String {
@@ -117,6 +137,81 @@ mod tests {
     use super::{canonical_terminal_paths, default_editor, output_page, TerminalOutput};
     use std::collections::VecDeque;
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_kills_shell_and_foreground_job_groups() {
+        use super::kill_terminal_process_groups;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let shell_marker =
+            std::env::temp_dir().join(format!("sail-shell-child-{}", uuid::Uuid::new_v4()));
+        let foreground_marker =
+            std::env::temp_dir().join(format!("sail-foreground-child-{}", uuid::Uuid::new_v4()));
+        let mut shell = Command::new("/bin/sh")
+            .args(["-c", "(sleep 1; touch \"$1\") &", "sh"])
+            .arg(&shell_marker)
+            .process_group(0)
+            .spawn()
+            .expect("spawn shell group");
+        let shell_pid = shell.id();
+        shell.wait().expect("shell leader exits");
+        let mut foreground = Command::new("/bin/sh")
+            .args(["-c", "(sleep 1; touch \"$1\") &", "sh"])
+            .arg(&foreground_marker)
+            .process_group(0)
+            .spawn()
+            .expect("spawn foreground job group");
+        let foreground_pid = foreground.id();
+        foreground.wait().expect("foreground leader exits");
+        assert!(
+            !shell_marker.exists(),
+            "shell group fixture exited too late"
+        );
+        assert!(
+            !foreground_marker.exists(),
+            "foreground group fixture exited too late"
+        );
+
+        kill_terminal_process_groups(shell_pid, Some(foreground_pid as i32))
+            .expect("kill both owned terminal process groups");
+        std::thread::sleep(Duration::from_millis(1200));
+
+        assert!(!shell_marker.exists(), "shell group child survived stop");
+        assert!(
+            !foreground_marker.exists(),
+            "foreground job child survived stop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_kills_shell_group_when_foreground_group_is_gone() {
+        use super::kill_terminal_process_groups;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        let marker =
+            std::env::temp_dir().join(format!("sail-exited-shell-child-{}", uuid::Uuid::new_v4()));
+        let mut shell = Command::new("/bin/sh")
+            .args(["-c", "(sleep 1; touch \"$1\") &", "sh"])
+            .arg(&marker)
+            .process_group(0)
+            .spawn()
+            .expect("spawn shell group");
+        let shell_pid = shell.id();
+        shell.wait().expect("shell leader exits before stop");
+        assert!(!marker.exists(), "shell group fixture exited too late");
+
+        kill_terminal_process_groups(shell_pid, None)
+            .expect("kill shell group after its foreground group disappeared");
+        std::thread::sleep(Duration::from_millis(1200));
+
+        assert!(!marker.exists(), "shell group child survived stop");
+    }
 
     #[test]
     fn default_editor_path_survives_argument_parsing() {

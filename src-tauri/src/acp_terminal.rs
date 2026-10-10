@@ -366,16 +366,10 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     let mut child = terminal.child.lock().map_err(|error| error.to_string())?;
     #[cfg(unix)]
     {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
         child
             .try_wait()
             .map_err(|error| format!("Cannot inspect terminal process: {error}"))?;
-        match killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL) {
-            Ok(()) => {}
-            Err(nix::errno::Errno::ESRCH) => {}
-            Err(error) => return Err(format!("Cannot stop terminal process: {error}")),
-        }
+        kill_terminal_process_group(child.id())?;
         child
             .wait()
             .map_err(|error| format!("Cannot wait for terminal process to stop: {error}"))?;
@@ -407,6 +401,21 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     }
     terminal.stopped.store(true, Ordering::Release);
     Ok(())
+}
+
+#[cfg(unix)]
+fn kill_terminal_process_group(process_id: u32) -> Result<(), String> {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let group = Pid::from_raw(process_id as i32);
+    if group.as_raw() <= 0 || group == nix::unistd::getpgrp() {
+        return Err("Cannot identify terminal process group.".to_string());
+    }
+    match killpg(group, Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(format!("Cannot stop terminal process: {error}")),
+    }
 }
 
 pub fn handle(
@@ -997,6 +1006,31 @@ pub async fn acp_terminal_inspect_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_kills_process_group_after_its_leader_exits() {
+        use std::os::unix::process::CommandExt;
+
+        let marker =
+            std::env::temp_dir().join(format!("sail-terminal-survivor-{}", uuid::Uuid::new_v4()));
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "(sleep 1; touch \"$1\") &", "sh"])
+            .arg(&marker)
+            .process_group(0)
+            .spawn()
+            .expect("spawn terminal leader and child");
+        let process_id = child.id();
+        child.wait().expect("terminal leader exits");
+
+        kill_terminal_process_group(process_id).expect("stop the surviving process group");
+        std::thread::sleep(Duration::from_millis(1200));
+
+        assert!(
+            !marker.exists(),
+            "process group child survived terminal stop"
+        );
+    }
 
     #[test]
     fn worktree_terminal_data_is_stable_and_private_per_worktree() {

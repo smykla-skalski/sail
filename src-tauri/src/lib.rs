@@ -2698,10 +2698,16 @@ mod tests {
         fs::write(managed.join("cache"), "keep until worktree removal").unwrap();
         fs::write(sibling.join("cache"), "leave unrelated data alone").unwrap();
 
-        let failure = remove_worktree_then_terminal_data(&managed, || {
+        let stop_failure = remove_worktree_then_terminal_data(&managed, || {
+            Err::<(), _>("Terminal stop failed".to_string())
+        });
+        assert_eq!(stop_failure.unwrap_err(), "Terminal stop failed");
+        assert!(managed.join("cache").exists());
+
+        let removal_failure = remove_worktree_then_terminal_data(&managed, || {
             Err::<(), _>("Git removal failed".to_string())
         });
-        assert_eq!(failure.unwrap_err(), "Git removal failed");
+        assert_eq!(removal_failure.unwrap_err(), "Git removal failed");
         assert!(managed.join("cache").exists());
 
         remove_worktree_then_terminal_data(&managed, || Ok(()))
