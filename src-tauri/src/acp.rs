@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
+use uuid::Uuid;
 
 use crate::browser_agent::CapabilityProfile;
 
@@ -28,6 +29,7 @@ enum Launch {
     },
     // Native binary resolved by the shared OpenCode settings; started as `<binary> acp`.
     OpenCode,
+    VendoredCodex,
 }
 
 const OPENCODE_BINARY_SETTING: &str = "sai-opencode-bin";
@@ -48,10 +50,7 @@ const AGENTS: &[AgentDefinition] = &[
         name: "Codex",
         executable: "codex",
         binary_env: Some("CODEX_PATH"),
-        launch: Launch::Npx {
-            package: "@agentclientprotocol/codex-acp@2.0.0",
-            min_node_major: 18,
-        },
+        launch: Launch::VendoredCodex,
     },
     AgentDefinition {
         id: "opencode",
@@ -400,6 +399,23 @@ struct Connection {
     pending_directory: Mutex<Option<PathBuf>>,
     session_creation: Mutex<()>,
     ready: Condvar,
+    _owned_temp: Option<OwnedTempDir>,
+}
+
+struct OwnedTempDir(PathBuf);
+
+impl OwnedTempDir {
+    fn create() -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!("sail-codex-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).map_err(|error| error.to_string())?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for OwnedTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 // The adapter fingerprints `cwd` and `mcpServers`, and recreates a live
@@ -482,12 +498,7 @@ fn linked_worktree_git_directories(cwd: &str) -> Option<Vec<String>> {
     if backlink.canonicalize().ok()? != PathBuf::from(cwd).join(".git").canonicalize().ok()? {
         return None;
     }
-    let directories = [
-        git_dir,
-        common_dir.join("objects"),
-        common_dir.join("refs"),
-        common_dir.join("logs").join("refs"),
-    ];
+    let directories = [git_dir, common_dir.join("objects")];
     Some(
         directories
             .into_iter()
@@ -496,6 +507,101 @@ fn linked_worktree_git_directories(cwd: &str) -> Option<Vec<String>> {
             .map(|directory| directory.to_string_lossy().into_owned())
             .collect(),
     )
+}
+
+fn codex_permission_profile_config(scope: &Path, temp: &Path) -> Result<String, String> {
+    let directories =
+        linked_worktree_git_directories(scope.to_str().ok_or("Invalid assigned worktree path.")?)
+            .ok_or("Assigned worktree Git metadata is unavailable.")?;
+    let git_dir = PathBuf::from(&directories[0]);
+    let objects = PathBuf::from(&directories[1]);
+    let common_dir = git_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("Invalid linked Git directory.")?
+        .to_path_buf();
+    let mut writable = vec![
+        scope.to_path_buf(),
+        git_dir,
+        objects,
+        temp.to_path_buf(),
+        common_dir.join("packed-refs.lock"),
+    ];
+    let branch = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args([
+            "-C",
+            scope.to_str().ok_or("Invalid worktree path.")?,
+            "symbolic-ref",
+            "-q",
+            "HEAD",
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if branch.status.success() {
+        let reference = String::from_utf8(branch.stdout).map_err(|error| error.to_string())?;
+        let reference = reference.trim();
+        let branch_name = reference
+            .strip_prefix("refs/heads/")
+            .ok_or("Invalid assigned branch reference.")?;
+        let branch_path = Path::new(branch_name);
+        if branch_path.components().next().is_none()
+            || branch_path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("Invalid assigned branch reference.".into());
+        }
+        let ref_path = common_dir.join("refs/heads").join(branch_path);
+        let log_path = common_dir.join("logs/refs/heads").join(branch_path);
+        for path in [ref_path, log_path] {
+            let parent = path.parent().ok_or("Invalid assigned branch path.")?;
+            if parent.canonicalize().ok().as_deref() != Some(parent) {
+                return Err("Assigned branch path resolves through a symlink.".into());
+            }
+            if std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err("Assigned branch reference is a symlink.".into());
+            }
+            writable.push(path.with_extension(format!(
+                "{}lock",
+                path.extension().map_or(String::new(), |extension| format!(
+                    "{}.",
+                    extension.to_string_lossy()
+                ))
+            )));
+            writable.push(path);
+        }
+    }
+    let mut rules = vec![
+        "\":tmpdir\"=\"read\"".to_string(),
+        "\":slash_tmp\"=\"read\"".to_string(),
+    ];
+    for path in writable {
+        let key =
+            serde_json::to_string(&path.to_string_lossy()).map_err(|error| error.to_string())?;
+        rules.push(format!("{key}=\"write\""));
+    }
+    let overrides = vec![
+        "default_permissions=\"sail-agent\"".to_string(),
+        "permissions.sail-read-only={extends=\":read-only\"}".to_string(),
+        format!(
+            "permissions.sail-agent={{extends=\":workspace\",filesystem={{{}}}}}",
+            rules.join(",")
+        ),
+    ];
+    serde_json::to_string(&json!({
+        "configOverrides": overrides,
+        "modeProfiles": {
+            "read-only": "sail-read-only",
+            "agent": "sail-agent",
+            "agent-full-access": "sail-agent"
+        }
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn session_servers(browser: Value, memory: Option<Value>) -> Vec<Value> {
@@ -1165,7 +1271,7 @@ fn stop_process(child: &mut Child) {
     let _ = child.wait();
 }
 
-type ConnectionKey = (String, CapabilityProfile);
+type ConnectionKey = (String, CapabilityProfile, Option<PathBuf>);
 
 #[derive(Clone, Default)]
 pub struct AgentManager(Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>);
@@ -1174,7 +1280,7 @@ impl AgentManager {
     fn active_sessions_in(&self, directory: &Path) -> Result<Vec<String>, String> {
         let agents = self.0.lock().map_err(|error| error.to_string())?;
         let mut active = Vec::new();
-        for ((agent, _profile), runtime) in agents.iter() {
+        for ((agent, _profile, _scope), runtime) in agents.iter() {
             let directories = runtime
                 .session_directories
                 .lock()
@@ -1217,7 +1323,7 @@ impl AgentManager {
     ) -> Result<Vec<NativeSubagentSnapshot>, String> {
         let agents = self.0.lock().map_err(|error| error.to_string())?;
         let mut snapshots = Vec::new();
-        for ((agent, profile), runtime) in agents.iter() {
+        for ((agent, profile, _scope), runtime) in agents.iter() {
             snapshots.extend(
                 runtime
                     .native_subagents
@@ -2365,10 +2471,32 @@ fn connection_for_profile(
 ) -> Result<Arc<Connection>, String> {
     let agents = manager.0.lock().map_err(|error| error.to_string())?;
     agents
-        .get(&(id.to_string(), profile))
+        .get(&(id.to_string(), profile, None))
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".into())
+}
+
+fn connection_for_scope(
+    manager: &AgentManager,
+    id: &str,
+    profile: CapabilityProfile,
+    scope: Option<PathBuf>,
+) -> Result<Arc<Connection>, String> {
+    let agents = manager.0.lock().map_err(|error| error.to_string())?;
+    agents
+        .get(&(id.to_string(), profile, scope))
+        .filter(|runtime| runtime.alive.load(Ordering::Acquire))
+        .cloned()
+        .ok_or_else(|| "Agent is not connected.".into())
+}
+
+fn codex_scope(agent: &str, cwd: &Path) -> Option<PathBuf> {
+    if agent != "codex" {
+        return None;
+    }
+    let canonical = cwd.canonicalize().ok()?;
+    linked_worktree_git_directories(canonical.to_str()?).map(|_| canonical)
 }
 
 fn unique_session_owner(
@@ -2404,6 +2532,9 @@ fn connection_for_session(
         })
         .collect::<Vec<_>>();
     unique_session_owner(matches.iter().map(|runtime| runtime.profile))?;
+    if matches.len() > 1 {
+        return Err("Agent session is connected to multiple worktrees.".into());
+    }
     matches
         .first()
         .cloned()
@@ -2441,11 +2572,26 @@ fn register_session(
             ));
         }
     }
+    let scope = codex_scope(agent, &directory);
     let runtime = agents
-        .get(&(agent.to_string(), profile))
+        .get(&(agent.to_string(), profile, scope))
         .filter(|runtime| runtime.alive.load(Ordering::Acquire))
         .cloned()
         .ok_or_else(|| "Agent is not connected.".to_string())?;
+    for existing in agents.values().filter(|existing| {
+        existing.agent == agent
+            && existing.alive.load(Ordering::Acquire)
+            && !Arc::ptr_eq(existing, &runtime)
+    }) {
+        if existing
+            .session_profiles
+            .lock()
+            .map_err(|error| error.to_string())?
+            .contains_key(session_id)
+        {
+            return Err("Agent session is already connected to another worktree.".into());
+        }
+    }
     runtime
         .session_directories
         .lock()
@@ -2537,6 +2683,24 @@ fn agent_availability(
                     },
                 }
             }
+            Launch::VendoredCodex => {
+                let binary = find_executable(agent.executable);
+                AgentAvailability {
+                    id: agent.id.into(),
+                    name: agent.name.into(),
+                    binary_path: binary
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    available: binary.is_some() && major.is_some_and(|version| version >= 18),
+                    reason: if binary.is_none() {
+                        Some(format!("Install {} first.", agent.name))
+                    } else if major.is_none_or(|version| version < 18) {
+                        Some("Codex requires Node.js 18 or newer.".into())
+                    } else {
+                        None
+                    },
+                }
+            }
         })
         .collect()
 }
@@ -2550,9 +2714,11 @@ pub async fn acp_connect(
 ) -> Result<Value, String> {
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || connect_blocking(app, &manager, agent, profile))
-        .await
-        .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        connect_blocking(app, &manager, agent, profile, None)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn agent_availability_for(app: &AppHandle, agent: &str) -> Result<AgentAvailability, String> {
@@ -2572,18 +2738,39 @@ fn agent_availability_for(app: &AppHandle, agent: &str) -> Result<AgentAvailabil
     }
 }
 
+fn vendored_codex_adapter(app: &AppHandle) -> Result<PathBuf, String> {
+    let bundled = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?
+        .join("codex-acp/index.js");
+    if bundled.is_file() {
+        return Ok(bundled);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/codex-acp/dist/index.js");
+        if source.is_file() {
+            return Ok(source);
+        }
+    }
+    Err("The bundled Codex ACP adapter is missing.".into())
+}
+
 fn connect_blocking(
     app: AppHandle,
     manager: &AgentManager,
     agent: String,
     profile: CapabilityProfile,
+    scope: Option<PathBuf>,
 ) -> Result<Value, String> {
     let definition = definition(&agent)?;
     let live = manager
         .0
         .lock()
         .map_err(|error| error.to_string())?
-        .get(&(agent.clone(), profile))
+        .get(&(agent.clone(), profile, scope.clone()))
         .is_some_and(|existing| existing.alive.load(Ordering::Acquire));
     // Probe before taking the agent lock; a live connection needs no availability check.
     let mut availability = if live {
@@ -2592,7 +2779,7 @@ fn connect_blocking(
         Some(agent_availability_for(&app, &agent)?)
     };
     let mut agents = manager.0.lock().map_err(|error| error.to_string())?;
-    let key = (agent.clone(), profile);
+    let key = (agent.clone(), profile, scope.clone());
     if let Some(existing) = agents.get(&key) {
         if existing.alive.load(Ordering::Acquire) {
             let existing = Arc::clone(existing);
@@ -2631,6 +2818,7 @@ fn connect_blocking(
     let test_agent: Option<std::ffi::OsString> = None;
     let mut paths = Vec::new();
     let is_test_agent = test_agent.is_some();
+    let mut owned_temp = None;
     let mut command = if let Some(path) = test_agent {
         let node = find_executable("node").ok_or("Node.js not found.")?;
         paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
@@ -2655,6 +2843,23 @@ fn connect_blocking(
                 let mut command = Command::new(binary);
                 command.arg("acp");
                 command.env_remove("OPENCODE_CONFIG_DIR");
+                command
+            }
+            Launch::VendoredCodex => {
+                let node = find_executable("node").ok_or("Node.js not found.")?;
+                paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
+                let mut command = Command::new(node);
+                command.arg(vendored_codex_adapter(&app)?);
+                command.env_remove("CODEX_ACP_PERMISSION_PROFILE_CONFIG");
+                if let Some(scope) = scope.as_ref() {
+                    let temp = OwnedTempDir::create()?;
+                    let profile_config = codex_permission_profile_config(scope, &temp.0)?;
+                    command.env("CODEX_ACP_PERMISSION_PROFILE_CONFIG", profile_config);
+                    for variable in ["TMPDIR", "TMP", "TEMP"] {
+                        command.env(variable, &temp.0);
+                    }
+                    owned_temp = Some(temp);
+                }
                 command
             }
         }
@@ -2732,6 +2937,7 @@ fn connect_blocking(
         pending_directory: Mutex::new(None),
         session_creation: Mutex::new(()),
         ready: Condvar::new(),
+        _owned_temp: owned_temp,
     });
     let reader = Arc::clone(&runtime);
     let reader_manager = manager.clone();
@@ -3193,8 +3399,9 @@ pub async fn acp_new_session(
     let browser = browser.inner().clone();
     let fence = fence.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        connect_blocking(app.clone(), &manager, agent.clone(), profile)?;
-        let runtime = connection_for_profile(&manager, &agent, profile)?;
+        let scope = codex_scope(&agent, Path::new(&cwd));
+        connect_blocking(app.clone(), &manager, agent.clone(), profile, scope.clone())?;
+        let runtime = connection_for_scope(&manager, &agent, profile, scope)?;
         let config =
             browser.config_for_profile(&cwd, None, Some(&agent), Some(profile.as_str()))?;
         // Memory is optional. A settings, path, or executable error must not block the session.
@@ -3299,15 +3506,15 @@ pub fn acp_forget_session(
     agent: String,
     session_id: String,
 ) -> Result<(), String> {
-    for profile in [
-        CapabilityProfile::Explore,
-        CapabilityProfile::Review,
-        CapabilityProfile::Build,
-        CapabilityProfile::Release,
-    ] {
-        let Ok(runtime) = connection_for_profile(&manager, &agent, profile) else {
-            continue;
-        };
+    let runtimes = manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .values()
+        .filter(|runtime| runtime.agent == agent)
+        .cloned()
+        .collect::<Vec<_>>();
+    for runtime in runtimes {
         let removed = runtime
             .session_configs
             .lock()
@@ -3383,14 +3590,15 @@ pub async fn acp_list_sessions(
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let capabilities = connect_blocking(app, &manager, agent.clone(), profile)?;
+        let scope = codex_scope(&agent, Path::new(&cwd));
+        let capabilities = connect_blocking(app, &manager, agent.clone(), profile, scope.clone())?;
         if capabilities
             .pointer("/agentCapabilities/sessionCapabilities/list")
             .is_none()
         {
             return Ok(json!({"sessions": []}));
         }
-        let runtime = connection_for_profile(&manager, &agent, profile)?;
+        let runtime = connection_for_scope(&manager, &agent, profile, scope)?;
         let mut params = json!({"cwd": cwd});
         if let Some(cursor) = cursor {
             params["cursor"] = json!(cursor);
@@ -3426,7 +3634,8 @@ async fn restore_session(
     let manager = manager.inner().clone();
     let browser = browser.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        connect_blocking(app.clone(), &manager, agent.clone(), profile)?;
+        let scope = codex_scope(&agent, Path::new(&cwd));
+        connect_blocking(app.clone(), &manager, agent.clone(), profile, scope)?;
         let runtime =
             register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
         // A broken or unavailable memory store must not prevent restoring the agent session.
@@ -4206,7 +4415,7 @@ mod session_config_tests {
         assert!(Command::new("git")
             .args(["-C"])
             .arg(&main)
-            .args(["worktree", "add", "-q", "--detach"])
+            .args(["worktree", "add", "-q", "-b", "sail/test"])
             .arg(&linked)
             .status()
             .unwrap()
@@ -4215,18 +4424,35 @@ mod session_config_tests {
         let request = session_request_params(linked.to_str().unwrap(), None, &[]);
         let common = main.join(".git").canonicalize().unwrap();
         let roots = request["additionalDirectories"].as_array().unwrap();
-        assert_eq!(roots.len(), 4);
+        assert_eq!(roots.len(), 2);
         assert!(roots
             .iter()
             .any(|root| root == &json!(common.join("worktrees/linked"))));
         assert!(roots
             .iter()
             .any(|root| root == &json!(common.join("objects"))));
-        assert!(roots.iter().any(|root| root == &json!(common.join("refs"))));
-        assert!(roots
+        assert!(!roots.iter().any(|root| root == &json!(common.join("refs"))));
+        assert!(!roots
             .iter()
             .any(|root| root == &json!(common.join("logs/refs"))));
         assert!(!roots.iter().any(|root| root == &json!(common)));
+        assert_eq!(codex_scope("codex", &linked), linked.canonicalize().ok());
+        let profile: Value = serde_json::from_str(
+            &codex_permission_profile_config(&linked, &root.join("task-tmp")).unwrap(),
+        )
+        .unwrap();
+        let overrides = profile["configOverrides"].as_array().unwrap();
+        assert!(overrides.iter().any(|value| value
+            .as_str()
+            .is_some_and(|value| value.contains("refs/heads/sail/test"))));
+        assert!(overrides.iter().all(|value| !value
+            .as_str()
+            .is_some_and(|value| value.contains("filesystem.\""))));
+        assert!(overrides.iter().any(|value| {
+            value.as_str().is_some_and(|value| {
+                value.contains("filesystem") && value.contains("worktrees/linked")
+            })
+        }));
         let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
         assert_eq!(
             restored["additionalDirectories"],
@@ -4523,6 +4749,7 @@ mod native_subagent_fence_tests {
             pending_directory: Mutex::new(None),
             session_creation: Mutex::new(()),
             ready: Condvar::new(),
+            _owned_temp: None,
         });
         let directory = PathBuf::from("/worktree");
         runtime
@@ -4547,7 +4774,7 @@ mod native_subagent_fence_tests {
             .0
             .lock()
             .unwrap()
-            .insert(("opencode".into(), CapabilityProfile::Build), runtime);
+            .insert(("opencode".into(), CapabilityProfile::Build, None), runtime);
         let mut cleaned = false;
 
         let error = AgentWorktreeFence::default()
@@ -5117,7 +5344,7 @@ mod native_agent_tests {
     }
 
     #[test]
-    fn npx_agents_keep_their_availability_entries() {
+    fn agents_keep_their_availability_entries() {
         let (root, binary) = fake_opencode("2.0.24");
         let ids: Vec<_> =
             agent_availability(Ok(Some(binary.to_string_lossy().into_owned())), |_| true)
