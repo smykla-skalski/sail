@@ -1930,8 +1930,7 @@ time {
   padding: 28px var(--transcript-gutter);
 }
 .conversation:focus-visible {
-  outline: 3px solid var(--sui-primary);
-  outline-offset: -3px;
+  box-shadow: inset 3px 0 var(--sui-muted);
 }
 .chat-area > .conversation,
 .chat-area > .chat-body > .conversation {
@@ -2138,9 +2137,6 @@ time {
   border: 1px solid var(--shell-control-border);
   border-radius: var(--radius-12);
   background: var(--sui-surface);
-}
-.composer:focus-within {
-  border-color: var(--sui-primary);
 }
 .composer.shell-mode {
   border-color: var(--sui-warning-ink);
