@@ -61,7 +61,7 @@ struct TerminalSession {
     owner: Option<String>,
     directory: PathBuf,
     process_id: Option<u32>,
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
     process_group_stop: Arc<Mutex<()>>,
     writer: Mutex<Box<dyn Write + Send>>,
     write_busy: AtomicBool,
@@ -88,11 +88,9 @@ impl TerminalSession {
         }
         #[cfg(unix)]
         {
-            let master = self.master.lock().map_err(|error| error.to_string())?;
             kill_terminal_process_groups(
                 self.process_id
                     .ok_or("Cannot identify terminal process group.")?,
-                master.process_group_leader(),
             )?;
         }
         #[cfg(windows)]
@@ -107,28 +105,63 @@ impl TerminalSession {
 }
 
 #[cfg(unix)]
-fn kill_terminal_process_groups(
-    shell_process_id: u32,
-    foreground_group: Option<i32>,
-) -> Result<(), String> {
-    let shell_group = nix::unistd::Pid::from_raw(shell_process_id as i32);
-    if shell_group.as_raw() <= 0 || shell_group == nix::unistd::getpgrp() {
+pub(crate) fn kill_terminal_process_groups(shell_process_id: u32) -> Result<(), String> {
+    use sysinfo::{ProcessStatus, System};
+
+    // Every owned terminal is its own session leader. Its unreaped child handle
+    // keeps this session ID reserved even after the shell exits.
+    let session_id = shell_process_id as nix::libc::pid_t;
+    if session_id <= 0 || session_id == unsafe { nix::libc::getsid(0) } {
         return Err("Cannot identify terminal process group.".to_string());
     }
-    let foreground_group = foreground_group.map(nix::unistd::Pid::from_raw);
-    for group in [Some(shell_group), foreground_group].into_iter().flatten() {
-        if group == shell_group && group.as_raw() <= 0 {
-            return Err("Cannot identify terminal process group.".to_string());
-        }
-        if group.as_raw() <= 0 || group == nix::unistd::getpgrp() {
-            continue;
-        }
-        match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(error) => return Err(format!("Cannot stop terminal process: {error}")),
-        }
+    let observed_session = unsafe { nix::libc::getsid(session_id) };
+    if observed_session != -1 && observed_session != session_id {
+        return Err("Cannot verify terminal process session ownership.".to_string());
     }
-    Ok(())
+
+    let mut system = System::new_all();
+    for _ in 0..40 {
+        let mut groups = std::collections::HashSet::new();
+        let mut live_members = Vec::new();
+        for process in system.processes().values() {
+            let pid = process.pid().as_u32() as nix::libc::pid_t;
+            if unsafe { nix::libc::getsid(pid) } != session_id {
+                continue;
+            }
+            let group = unsafe { nix::libc::getpgid(pid) };
+            if group <= 0 || unsafe { nix::libc::getsid(pid) } != session_id {
+                continue;
+            }
+            groups.insert(group);
+            if !matches!(
+                process.status(),
+                ProcessStatus::Zombie | ProcessStatus::Dead
+            ) {
+                live_members.push(pid);
+            }
+        }
+        if live_members.is_empty() {
+            return Ok(());
+        }
+        for group in groups {
+            if group <= 0 || group == unsafe { nix::libc::getpgrp() } {
+                continue;
+            }
+            if unsafe { nix::libc::getsid(group) } != session_id {
+                return Err("Cannot verify terminal process group ownership.".to_string());
+            }
+            match nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(group),
+                nix::sys::signal::Signal::SIGKILL,
+            ) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                Err(error) => return Err(format!("Cannot stop terminal process: {error}")),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        system.refresh_all();
+    }
+    Err("Cannot confirm terminal process groups stopped.".to_string())
 }
 
 fn default_editor() -> String {
@@ -154,71 +187,70 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stop_kills_shell_and_foreground_job_groups() {
+    fn stop_kills_interactive_background_job_groups() {
         use super::kill_terminal_process_groups;
-        use std::os::unix::process::CommandExt;
         use std::process::Command;
 
-        let shell_marker =
-            std::env::temp_dir().join(format!("sail-shell-child-{}", uuid::Uuid::new_v4()));
-        let foreground_marker =
-            std::env::temp_dir().join(format!("sail-foreground-child-{}", uuid::Uuid::new_v4()));
-        let mut shell = Command::new("/bin/sh")
-            .args(["-c", "(sleep 1; touch \"$1\") &", "sh"])
-            .arg(&shell_marker)
-            .process_group(0)
+        let marker =
+            std::env::temp_dir().join(format!("sail-interactive-job-{}", uuid::Uuid::new_v4()));
+        let unrelated_marker = std::env::temp_dir().join(format!(
+            "sail-unrelated-session-job-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut unrelated = Command::new("/bin/sh")
+            .args(["-c", "(sleep 0.5; touch \"$1\") & wait", "sh"])
+            .arg(&unrelated_marker)
             .spawn()
-            .expect("spawn shell group");
+            .expect("spawn job in unrelated process session");
+        let job_pid_file = marker.with_extension("pid");
+        let mut shell = isolated_test_shell(
+            "set -m; (sleep 1; touch \"$1\") & echo $! > \"$2\"; wait",
+            &marker,
+            Some(&job_pid_file),
+        );
         let shell_pid = shell.id();
-        observe_exit_without_reaping(&mut shell);
-        let mut foreground = Command::new("/bin/sh")
-            .args(["-c", "(sleep 1; touch \"$1\") &", "sh"])
-            .arg(&foreground_marker)
-            .process_group(0)
-            .spawn()
-            .expect("spawn foreground job group");
-        let foreground_pid = foreground.id();
-        observe_exit_without_reaping(&mut foreground);
-        assert!(
-            !shell_marker.exists(),
-            "shell group fixture exited too late"
+        let job_pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&job_pid_file) {
+                break pid.trim().parse::<u32>().expect("background job PID");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            unsafe { nix::libc::getsid(job_pid as nix::libc::pid_t) },
+            shell_pid as nix::libc::pid_t,
+            "background job belongs to the owned shell session"
         );
-        assert!(
-            !foreground_marker.exists(),
-            "foreground group fixture exited too late"
+        assert_ne!(
+            unsafe { nix::libc::getpgid(job_pid as nix::libc::pid_t) },
+            shell_pid as nix::libc::pid_t,
+            "interactive background job has a separate process group"
         );
+        assert!(!marker.exists(), "background job fixture exited too late");
 
-        kill_terminal_process_groups(shell_pid, Some(foreground_pid as i32))
-            .expect("kill both owned terminal process groups");
-        shell.wait().expect("reap shell after group cleanup");
-        foreground
-            .wait()
-            .expect("reap foreground after group cleanup");
+        kill_terminal_process_groups(shell_pid).expect("kill all groups in owned shell session");
+        shell.wait().expect("reap shell after session cleanup");
+        unrelated.wait().expect("wait for unrelated session job");
         std::thread::sleep(std::time::Duration::from_millis(1200));
 
-        assert!(!shell_marker.exists(), "shell group child survived stop");
+        assert!(!marker.exists(), "interactive background job survived stop");
         assert!(
-            !foreground_marker.exists(),
-            "foreground job child survived stop"
+            unrelated_marker.exists(),
+            "stop killed a process from an unrelated session"
         );
+        let _ = std::fs::remove_file(job_pid_file);
+        let _ = std::fs::remove_file(unrelated_marker);
     }
 
     #[cfg(unix)]
     #[test]
-    fn stop_kills_shell_group_when_foreground_group_is_gone() {
+    fn stop_kills_background_job_after_shell_exits() {
         use super::kill_terminal_process_groups;
-        use std::os::unix::process::CommandExt;
-        use std::process::Command;
         use std::time::Duration;
 
         let marker =
             std::env::temp_dir().join(format!("sail-exited-shell-child-{}", uuid::Uuid::new_v4()));
-        let mut shell = Command::new("/bin/sh")
-            .args(["-c", "(sleep 1; touch \"$1\") &", "sh"])
-            .arg(&marker)
-            .process_group(0)
-            .spawn()
-            .expect("spawn shell group");
+        let mut shell =
+            isolated_test_shell("set -m; (sleep 1; touch \"$1\") & exit 0", &marker, None);
         let shell_pid = shell.id();
         let mut status = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
         let waited = unsafe {
@@ -233,7 +265,7 @@ mod tests {
         assert_eq!(unsafe { status.si_pid() }, shell_pid as i32);
         assert!(!marker.exists(), "shell group fixture exited too late");
 
-        kill_terminal_process_groups(shell_pid, None)
+        kill_terminal_process_groups(shell_pid)
             .expect("kill shell group after its foreground group disappeared");
         shell.wait().expect("reap shell after group cleanup");
         std::thread::sleep(Duration::from_millis(1200));
@@ -242,18 +274,28 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn observe_exit_without_reaping(child: &mut std::process::Child) {
-        let mut status = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
-        let waited = unsafe {
-            nix::libc::waitid(
-                nix::libc::P_PID,
-                child.id(),
-                &mut status,
-                nix::libc::WEXITED | nix::libc::WNOWAIT,
-            )
-        };
-        assert_eq!(waited, 0, "observe child exit without releasing its PID");
-        assert_eq!(unsafe { status.si_pid() }, child.id() as i32);
+    fn isolated_test_shell(
+        script: &str,
+        marker: &Path,
+        extra_argument: Option<&Path>,
+    ) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", script, "sh"]).arg(marker);
+        if let Some(extra_argument) = extra_argument {
+            command.arg(extra_argument);
+        }
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        command.spawn().expect("spawn isolated terminal shell")
     }
 
     #[test]
@@ -743,8 +785,7 @@ fn spawn(
     let process_id = child.process_id();
     let process_group_stop = Arc::new(Mutex::new(()));
     let background_process_group_stop = Arc::clone(&process_group_stop);
-    let master = Arc::new(Mutex::new(pair.master));
-    let background_master = Arc::clone(&master);
+    let master = Mutex::new(pair.master);
     #[cfg(windows)]
     let killer = child.clone_killer();
     let child = Arc::new(Mutex::new(child));
@@ -774,22 +815,33 @@ fn spawn(
                 }
             }
         }
+        #[cfg(unix)]
+        let _process_group_stop = if let Some(process_id) = process_id {
+            loop {
+                let guard = background_process_group_stop
+                    .lock()
+                    .expect("terminal process group stop lock");
+                match kill_terminal_process_groups(process_id) {
+                    Ok(()) => break guard,
+                    Err(error) => {
+                        crate::diagnostics::record(
+                            "terminal_process_group_stop_failed",
+                            serde_json::json!({"id":&id,"error":error}),
+                        );
+                        drop(guard);
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        } else {
+            background_process_group_stop
+                .lock()
+                .expect("terminal process group stop lock")
+        };
+        #[cfg(windows)]
         let _process_group_stop = background_process_group_stop
             .lock()
             .expect("terminal process group stop lock");
-        #[cfg(unix)]
-        if let Some(process_id) = process_id {
-            let foreground_group = background_master
-                .lock()
-                .ok()
-                .and_then(|master| master.process_group_leader());
-            if let Err(error) = kill_terminal_process_groups(process_id, foreground_group) {
-                crate::diagnostics::record(
-                    "terminal_process_group_stop_failed",
-                    serde_json::json!({"id":&id,"error":error}),
-                );
-            }
-        }
         let code = background_child
             .lock()
             .ok()

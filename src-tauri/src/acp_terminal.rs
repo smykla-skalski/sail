@@ -423,7 +423,7 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     }
     #[cfg(unix)]
     {
-        kill_terminal_process_group(child.id())?;
+        crate::terminal::kill_terminal_process_groups(child.id())?;
         child
             .wait()
             .map_err(|error| format!("Cannot wait for terminal process to stop: {error}"))?;
@@ -455,21 +455,6 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     }
     terminal.stopped.store(true, Ordering::Release);
     Ok(())
-}
-
-#[cfg(unix)]
-fn kill_terminal_process_group(process_id: u32) -> Result<(), String> {
-    use nix::sys::signal::{killpg, Signal};
-    use nix::unistd::Pid;
-
-    let group = Pid::from_raw(process_id as i32);
-    if group.as_raw() <= 0 || group == nix::unistd::getpgrp() {
-        return Err("Cannot identify terminal process group.".to_string());
-    }
-    match killpg(group, Signal::SIGKILL) {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-        Err(error) => Err(format!("Cannot stop terminal process: {error}")),
-    }
 }
 
 #[cfg(unix)]
@@ -543,7 +528,15 @@ pub fn handle(
             let mut command = Command::new(&params.command);
             command.args(&params.args).current_dir(directory);
             #[cfg(unix)]
-            command.process_group(0);
+            unsafe {
+                command.pre_exec(|| {
+                    if nix::libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
             for variable in params.env {
                 command.env(variable.name, variable.value);
             }
@@ -1154,12 +1147,19 @@ mod tests {
 
         let marker =
             std::env::temp_dir().join(format!("sail-terminal-survivor-{}", uuid::Uuid::new_v4()));
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "(sleep 1; touch \"$1\") &", "sh"])
-            .arg(&marker)
-            .process_group(0)
-            .spawn()
-            .expect("spawn terminal leader and child");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "set -m; (sleep 1; touch \"$1\") & exit 0", "sh"]);
+        command.arg(&marker);
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().expect("spawn terminal leader and job");
         let process_id = child.id();
         let mut status = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
         let waited = unsafe {
@@ -1173,7 +1173,8 @@ mod tests {
         assert_eq!(waited, 0, "observe leader exit without releasing its PID");
         assert_eq!(unsafe { status.si_pid() }, process_id as i32);
 
-        kill_terminal_process_group(process_id).expect("stop the surviving process group");
+        crate::terminal::kill_terminal_process_groups(process_id)
+            .expect("stop every group in the surviving terminal session");
         child.wait().expect("reap leader after group cleanup");
         std::thread::sleep(Duration::from_millis(1200));
 
