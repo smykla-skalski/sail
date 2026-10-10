@@ -416,6 +416,7 @@
     acp,
     acpDisconnectAffectsSession,
     acpDisconnectedSessionIds,
+    acpEventMatchesSession,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
     applyLiveTranscriptUpdate,
@@ -5692,32 +5693,37 @@
   }
 
   async function recoverAcpSpawnResult(receipt: SpawnReceipt) {
-    if (!receipt.targetId || !receipt.targetDirectory || !receipt.prompt || !receipt.turnId) return;
+    const targetDirectory = receipt.targetDirectory;
+    if (
+      !receipt.targetId ||
+      typeof targetDirectory !== 'string' ||
+      !receipt.prompt ||
+      !receipt.turnId
+    )
+      return;
+    const worktreeDirectory: string = targetDirectory;
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
     async function isLatestFinishedTurn() {
-      if (!receipt.targetDirectory) return false;
-      const activity = await acp.activity(receipt.targetDirectory).catch(() => null);
+      const activity = await acp.activity(worktreeDirectory).catch(() => null);
       return receiptIsLatestFinishedTurn(receipt, activity?.[receipt.provider], sessionId);
     }
     const replay: AgentEntry[] = [];
     const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
-      if (payload.agent !== receipt.provider || payload.message.method !== 'session/update') return;
-      const params = payload.message.params;
-      if (params?.sessionId !== sessionId) return;
-      const update = params.update;
+      if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId)) return;
+      const update = payload.message.params?.update;
       if (update && typeof update === 'object')
         updateEntriesInPlace(replay, update as Record<string, unknown>);
     });
-    setAgentReplay(receipt.provider, receipt.targetDirectory, sessionId, true);
+    setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
     try {
-      await acp.connect(receipt.provider, receipt.targetDirectory);
+      await acp.connect(receipt.provider, worktreeDirectory);
       await acp.load(
         receipt.provider,
-        receipt.targetDirectory,
+        worktreeDirectory,
         sessionId,
         capabilityProfileForAcpSession(
           receipt.provider,
-          receipt.targetDirectory,
+          worktreeDirectory,
           sessionId,
           receipt.validation ? 'review' : undefined,
         ),
@@ -5728,7 +5734,7 @@
     } catch {
       return;
     } finally {
-      setAgentReplay(receipt.provider, receipt.targetDirectory, sessionId, false);
+      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
       unlisten();
     }
   }
@@ -11224,7 +11230,7 @@
     if (event.message.method === '$/cancel_request') {
       const requestID = event.message.params?.id;
       if (typeof requestID === 'string' || typeof requestID === 'number')
-        removeStructuredQuestion(event.agent, requestID);
+        removeStructuredQuestion(event.agent, eventDirectory, requestID);
     }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;
@@ -11312,7 +11318,7 @@
           .filter((child) => child.agent === event.agent && child.directory === eventDirectory)
           .map((child) => child.sessionId);
       for (const sessionId of disconnectedSessionIds)
-        clearStructuredQuestions(event.agent, sessionId);
+        clearStructuredQuestions(event.agent, eventDirectory, sessionId);
       nativeSubagents = disconnectNativeSubagents(
         nativeSubagents,
         event.agent,

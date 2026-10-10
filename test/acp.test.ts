@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acpDisconnectAffectsSession,
+  acpEventMatchesSession,
   applyLiveTranscriptUpdate,
   forgetRecentTranscript,
   forgetSessionState,
@@ -40,6 +41,17 @@ void test('scoped ACP disconnect only affects sessions from the exited connectio
   assert.equal(acpDisconnectAffectsSession(message, 'build-session', 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'review'), true);
+});
+
+void test('ACP replay ignores updates from a sibling worktree with the same session ID', () => {
+  const event: AgentEvent = {
+    agent: 'codex',
+    directory: '/sibling-repo',
+    worktree: '/sibling-repo',
+    message: { method: 'session/update', params: { sessionId: 'shared-session', update: {} } },
+  };
+  assert.equal(acpEventMatchesSession(event, 'codex', '/repo', 'shared-session'), false);
+  assert.equal(acpEventMatchesSession(event, 'codex', '/sibling-repo', 'shared-session'), true);
 });
 
 void test('ACP chunks stream into one assistant message and tool updates keep their place', () => {

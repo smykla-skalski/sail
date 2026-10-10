@@ -1193,6 +1193,18 @@ fn runtime_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
     environment
 }
 
+fn prepare_runtime_directories(data_directory: &Path) -> Result<(), String> {
+    for directory in [
+        data_directory.join("tmp"),
+        data_directory.join("cache"),
+        data_directory.join("build"),
+        data_directory.join("build/go-tmp"),
+    ] {
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 pub struct AgentManager(Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>);
 
@@ -2826,8 +2838,7 @@ fn connect_blocking_inner(
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
     let data_directory = crate::register_worktree_terminal_data(&cache_directory, worktree)?;
-    let build_directory = data_directory.join("build");
-    std::fs::create_dir_all(&build_directory).map_err(|error| error.to_string())?;
+    prepare_runtime_directories(&data_directory)?;
     for (name, value) in runtime_environment(&data_directory) {
         command.env(name, value);
     }
@@ -3197,7 +3208,7 @@ fn connect_blocking_inner(
             json!({"agent":agent_id,"profile":profile.as_str(),"sessionIds":session_ids}),
         );
         app.state::<crate::acp_terminal::AcpTerminalManager>()
-            .stop_sessions(&agent_id, profile, &session_ids);
+            .stop_sessions(&agent_id, profile, &reader.worktree, &session_ids);
         reader.ready.notify_all();
         if let Ok(mut state) = reader.permission_state.lock() {
             state.pending.clear();
@@ -4361,6 +4372,8 @@ mod session_config_tests {
         let cache = scratch.join("app-cache");
         let first_data = crate::acp_terminal::worktree_data_directory(&cache, &first);
         let second_data = crate::acp_terminal::worktree_data_directory(&cache, &second);
+        prepare_runtime_directories(&first_data).unwrap();
+        prepare_runtime_directories(&second_data).unwrap();
         let first_environment = runtime_environment(&first_data);
         let second_environment = runtime_environment(&second_data);
         let path = |environment: &[(&str, PathBuf)], name| {
@@ -4381,6 +4394,20 @@ mod session_config_tests {
             assert_ne!(
                 path(&first_environment, name),
                 path(&second_environment, name)
+            );
+        }
+        for directory in [
+            first_data.join("tmp"),
+            first_data.join("cache"),
+            first_data.join("build/go-tmp"),
+            second_data.join("tmp"),
+            second_data.join("cache"),
+            second_data.join("build/go-tmp"),
+        ] {
+            assert!(
+                directory.is_dir(),
+                "{} was not created",
+                directory.display()
             );
         }
         for name in [

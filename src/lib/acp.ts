@@ -261,6 +261,20 @@ export interface AgentEvent {
   };
 }
 
+export function acpEventMatchesSession(
+  event: AgentEvent,
+  agent: string,
+  directory: string,
+  sessionId: string,
+): boolean {
+  return (
+    event.agent === agent &&
+    (event.directory ?? event.worktree) === directory &&
+    event.message.method === 'session/update' &&
+    event.message.params?.sessionId === sessionId
+  );
+}
+
 export function acpDisconnectedSessionIds(message: AgentEvent['message']): string[] | null {
   if (message.method !== 'sail/disconnected') return null;
   const sessionIds = message.params?.sessionIds;

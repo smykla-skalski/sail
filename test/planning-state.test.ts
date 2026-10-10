@@ -106,7 +106,7 @@ await test('cancelling a question preserves unrelated session state', () => {
     { id: 5, sessionId: child.sessionId, message: 'Child?', schema: {} },
   ]);
 
-  removeStructuredQuestion('codex', 4);
+  removeStructuredQuestion('codex', parent.directory, 4);
   assert.deepEqual(loadStructuredQuestions(parent), []);
   assert.deepEqual(
     loadStructuredQuestions(child).map((item) => item.message),
@@ -126,8 +126,28 @@ await test('disconnect clears questions but retains the replayable plan', () => 
     { id: 6, sessionId: parent.sessionId, message: 'Parent?', schema: {} },
   ]);
 
-  clearStructuredQuestions(parent.agent, parent.sessionId);
+  clearStructuredQuestions(parent.agent, parent.directory, parent.sessionId);
   assert.equal(loadNativePlan(parent)?.markdown, '# Parent plan');
   assert.deepEqual(loadStructuredQuestions(parent), []);
   forgetPlanningState(parent);
+});
+
+await test('question cancellation and disconnect stay within one worktree', () => {
+  const sibling = { ...parent, directory: '/sibling-repo' };
+  const question = (sessionId: string) => [
+    { id: 42, sessionId, message: `${sibling.directory} question`, schema: {} },
+  ];
+  saveStructuredQuestions(parent, question(parent.sessionId));
+  saveStructuredQuestions(sibling, question(sibling.sessionId));
+
+  removeStructuredQuestion(parent.agent, parent.directory, 42);
+  assert.deepEqual(loadStructuredQuestions(parent), []);
+  assert.equal(loadStructuredQuestions(sibling)[0]?.message, `${sibling.directory} question`);
+
+  saveStructuredQuestions(parent, question(parent.sessionId));
+  clearStructuredQuestions(parent.agent, parent.directory, parent.sessionId);
+  assert.deepEqual(loadStructuredQuestions(parent), []);
+  assert.equal(loadStructuredQuestions(sibling)[0]?.message, `${sibling.directory} question`);
+  forgetPlanningState(parent);
+  forgetPlanningState(sibling);
 });
