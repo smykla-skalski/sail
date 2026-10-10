@@ -5085,7 +5085,10 @@ mod session_config_tests {
             .iter()
             .any(|root| root == &json!(common.join("logs/refs"))));
         assert!(!roots.iter().any(|root| root == &json!(common)));
-        assert_eq!(worktree_identity(&linked), linked.canonicalize().unwrap());
+        assert_eq!(
+            worktree_identity(&linked),
+            crate::acp_terminal::stable_worktree_identity(&linked.canonicalize().unwrap())
+        );
         let build_cache = root.join("task-build-cache");
         let profile: Value = serde_json::from_str(
             &codex_permission_profile_config(
