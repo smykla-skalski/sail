@@ -216,6 +216,7 @@ pub mod hook_activity;
 mod hook_inspector;
 pub mod memory;
 mod memory_capture;
+mod memory_import;
 mod memory_install;
 mod memory_provider;
 mod opencode_config;
@@ -2436,6 +2437,8 @@ pub fn run() {
             memory::memory_inspect,
             memory::memory_forget,
             memory::memory_rate,
+            memory_import::preview_memory_import,
+            memory_import::import_agent_memories,
             memory_provider::memory_provider_status,
             memory_provider::verify_memory_provider,
             memory_provider::set_memory_provider,

@@ -26,6 +26,8 @@ fn main() {
             "memory_inspect",
             "memory_forget",
             "memory_rate",
+            "preview_memory_import",
+            "import_agent_memories",
             "memory_provider_status",
             "verify_memory_provider",
             "set_memory_provider",

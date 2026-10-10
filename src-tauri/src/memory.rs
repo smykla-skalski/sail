@@ -29,6 +29,8 @@ pub enum MemoryKind {
 pub struct MemoryProvenance {
     pub agent: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -475,6 +477,53 @@ pub fn remember(
     Ok(memory)
 }
 
+pub(crate) fn remember_unique_batch(
+    app: &tauri::AppHandle,
+    directory: &str,
+    inputs: Vec<MemoryInput>,
+) -> Result<Vec<MemoryRecord>, String> {
+    let inputs = inputs
+        .into_iter()
+        .map(validate)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (root, key) = context(app, directory)?;
+    let paths = paths(&root, &key);
+    let _lock = lock_store(&paths)?;
+    let mut store = read_store(&paths)?;
+    let mut imported = Vec::new();
+    for input in inputs {
+        if store.memories.iter().any(|memory| {
+            memory.forgotten_at.is_none()
+                && (memory.content == input.content
+                    || input
+                        .tags
+                        .as_ref()
+                        .is_some_and(|tags| tags.iter().any(|tag| memory.tags.contains(tag))))
+        }) {
+            continue;
+        }
+        let timestamp = now();
+        let memory = MemoryRecord {
+            id: Uuid::new_v4().to_string(),
+            content: input.content,
+            kind: input.kind.unwrap_or_default(),
+            tags: input.tags.unwrap_or_default(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            provenance: input.provenance.unwrap_or_default(),
+            rating: None,
+            forgotten_at: None,
+        };
+        store.memories.push(memory.clone());
+        imported.push(memory);
+    }
+    if !imported.is_empty() {
+        write_store(&paths, &store)?;
+        crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    }
+    Ok(imported)
+}
+
 pub fn search(
     app: &tauri::AppHandle,
     directory: &str,
@@ -665,6 +714,7 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
             input.provenance = Some(MemoryProvenance {
                 agent: std::env::var("SAIL_MEMORY_AGENT").ok(),
                 session_id: session.map(str::to_string),
+                source: None,
             });
             let memory = remember_at(&root, &key, input)?;
             crate::memory_provider::sync_standalone_later(
@@ -811,6 +861,7 @@ mod tests {
             provenance: Some(MemoryProvenance {
                 agent: Some("codex".into()),
                 session_id: Some("session".into()),
+                source: None,
             }),
         }
     }
