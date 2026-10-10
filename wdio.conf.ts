@@ -130,7 +130,15 @@ export const config = {
           if (typeof requestId !== 'string' && typeof requestId !== 'number')
             throw new Error('Pending elicitation has no request ID');
           return invoke('acp_elicitation', {
-            params: { agent, directory, sessionId, profile, requestId, action: 'cancel', content: null },
+            params: {
+              agent,
+              directory,
+              sessionId,
+              profile,
+              requestId,
+              action: 'cancel',
+              content: null,
+            },
           });
         }
         if (method === 'session/request_permission') {
