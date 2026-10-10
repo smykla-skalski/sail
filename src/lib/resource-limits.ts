@@ -19,6 +19,10 @@ export const resourceLimitKeys = {
 export const defaultResourceLimits = { agent: 4, browser: 2, e2e: 1 } as const;
 const checkingReason = 'Checking machine pressure…';
 
+export function isCheckingMachinePressure(reason: string | null): boolean {
+  return reason === checkingReason;
+}
+
 let pressureThresholds: PressureThresholds = {
   memoryFreePercent: parsePressureThreshold(
     typeof localStorage === 'undefined'

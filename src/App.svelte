@@ -503,6 +503,7 @@
   } from './lib/settings';
   import {
     defaultResourceLimits,
+    isCheckingMachinePressure,
     parseResourceLimit,
     resourceLimitKeys,
     setResourceLimit,
@@ -5572,6 +5573,7 @@
         query: receipt.prompt,
         sessionKey: `acp:${receipt.provider}:${sessionId}`,
       });
+      let queued = false;
       const turn = dispatchAuthorizedDirectShipPrompt(authorization, () =>
         acp.prompt(
           receipt.provider,
@@ -5579,7 +5581,9 @@
           recalledPrompt,
           receipt.turnId!,
           [],
-          undefined,
+          (limit) => {
+            queued = limit !== null;
+          },
           false,
           receipt.targetDirectory ?? '',
         ),
@@ -5609,10 +5613,14 @@
           return undefined;
         },
       );
-      await awaitCoordinationStart(turn, async () => {
-        const current = (await acp.activity())[receipt.provider];
-        return current?.activeTurns[sessionId] === receipt.turnId;
-      });
+      await awaitCoordinationStart(
+        turn,
+        async () => {
+          const current = (await acp.activity())[receipt.provider];
+          return current?.activeTurns[sessionId] === receipt.turnId;
+        },
+        () => queued,
+      );
       const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
       if (current?.state === 'starting')
         updateSpawnReceipt(receipt.receiptId, { state: 'working' });
@@ -7360,6 +7368,23 @@
     const queuedResponse = new Promise<Record<string, unknown>>((resolve) => {
       resolveQueuedResponse = resolve;
     });
+    const onPressureQueue = (limit: number | null, reason: string | null) => {
+      if (limit !== null && !isCheckingMachinePressure(reason)) {
+        pressureQueuedAt ??= Date.now();
+        updateSpawnReceipt(receiptId, { state: 'queued' });
+        resolveQueuedResponse?.({
+          status: 'queued',
+          receiptId,
+          accessKey: receiptAccessKey,
+          sourceId,
+          reason: reason ?? 'Waiting for agent capacity.',
+        });
+        resolveQueuedResponse = null;
+      } else if (pressureQueuedAt !== null && limit === null) {
+        responseDeadline += Date.now() - pressureQueuedAt;
+        pressureQueuedAt = null;
+      }
+    };
     let releaseSpawnQueue: (() => void) | null = null;
     const launched = (async () => {
       await coordinationSource(request);
@@ -7380,23 +7405,7 @@
         (await invoke<string>('worktree_pressure_directory', { repository: project }));
       await acp.connect(chosenProvider, undefined, {
         directory: pressureDirectory,
-        onQueue: (limit, reason) => {
-          if (limit !== null && reason?.startsWith('Waiting for machine pressure:')) {
-            pressureQueuedAt ??= Date.now();
-            updateSpawnReceipt(receiptId, { state: 'queued' });
-            resolveQueuedResponse?.({
-              status: 'queued',
-              receiptId,
-              accessKey: receiptAccessKey,
-              sourceId,
-              reason,
-            });
-            resolveQueuedResponse = null;
-          } else if (pressureQueuedAt !== null) {
-            responseDeadline += Date.now() - pressureQueuedAt;
-            pressureQueuedAt = null;
-          }
-        },
+        onQueue: onPressureQueue,
       });
       updateSpawnReceipt(receiptId, { state: 'starting' });
       const previousSpawn = agentSpawnQueue;
@@ -7502,6 +7511,12 @@
         receiptId,
         false,
         requireResponseTime,
+        undefined,
+        undefined,
+        (limit, reason) => {
+          onPressureQueue(limit, reason);
+          if (limit === null) updateSpawnReceipt(receiptId, { state: 'working' });
+        },
       );
       activeSpawnRequests.delete(receiptId);
       return {
@@ -7538,6 +7553,7 @@
     beforePrompt?: () => Promise<void>,
     nativeGeneration?: number,
     promptAuthorization?: DirectShipAuthorization,
+    onPromptQueue?: (limit: number | null, reason: string | null) => void,
   ) {
     const requestedModel =
       validation && source.model && hasUnresolvedModelAlias(source.model)
@@ -7690,8 +7706,9 @@
             recalledPrompt,
             turnId,
             [],
-            (limit) => {
+            (limit, reason) => {
               pressureQueued = limit !== null;
+              onPromptQueue?.(limit, reason);
             },
             false,
             created.path,
@@ -10711,13 +10728,16 @@
             query: turn.text,
             sessionKey: `acp:${turn.agent}:${turn.sessionId}`,
           });
+          let queued = false;
           const continued = acp.prompt(
             turn.agent,
             turn.sessionId,
             recalledPrompt,
             turn.turnId,
             [],
-            undefined,
+            (limit) => {
+              queued = limit !== null;
+            },
             false,
             turn.directory,
           );
@@ -10747,10 +10767,14 @@
               }
             }
           })();
-          await awaitCoordinationStart(continued, async () => {
-            const state = (await acp.activity())[turn.agent];
-            return !!state?.active.includes(turn.sessionId);
-          });
+          await awaitCoordinationStart(
+            continued,
+            async () => {
+              const state = (await acp.activity())[turn.agent];
+              return !!state?.active.includes(turn.sessionId);
+            },
+            () => queued,
+          );
         } catch (cause) {
           if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
           else {
