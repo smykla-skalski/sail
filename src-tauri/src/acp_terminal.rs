@@ -734,12 +734,12 @@ pub fn handle(
                     "Terminal working directory must be an existing absolute folder.".to_string(),
                 );
             }
-            let data_directory = worktree_data_directory(
+            let data_directory = crate::register_worktree_terminal_data(
                 &app.path()
                     .app_cache_dir()
                     .map_err(|error| error.to_string())?,
                 worktree,
-            );
+            )?;
             let temp_directory = data_directory.join("tmp");
             let cache_directory = data_directory.join("cache");
             std::fs::create_dir_all(&temp_directory).map_err(|error| error.to_string())?;

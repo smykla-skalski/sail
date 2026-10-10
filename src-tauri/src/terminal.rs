@@ -545,7 +545,8 @@ mod tests {
         let manager = Arc::new(TerminalManager::default());
         let worktree =
             std::env::temp_dir().join(format!("sail-terminal-fence-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&worktree).unwrap();
+        let nested_worktree = worktree.join("nested");
+        std::fs::create_dir_all(&nested_worktree).unwrap();
         let (creating_tx, creating_rx) = mpsc::channel();
         let (finish_create_tx, finish_create_rx) = mpsc::channel();
         let creator_manager = Arc::clone(&manager);
@@ -571,6 +572,8 @@ mod tests {
 
         creator.join().unwrap().unwrap();
         deleter.join().unwrap().unwrap();
+        let nested_create = manager.with_worktree_creation(&nested_worktree, || Ok(()));
+        assert_eq!(nested_create.unwrap_err(), "Worktree is being removed.");
         std::fs::remove_dir_all(&worktree).unwrap();
         let mut created_after_removal = false;
         let create_after_stop = manager.with_worktree_creation(&worktree, || {
@@ -756,7 +759,10 @@ impl TerminalManager {
     ) -> Result<T, String> {
         let worktree = crate::acp_terminal::stable_worktree_identity(worktree);
         let operations = self.1.lock().map_err(|error| error.to_string())?;
-        if operations.contains(&worktree) {
+        if operations
+            .iter()
+            .any(|removed| crate::acp_terminal::worktree_contains(removed, &worktree))
+        {
             return Err("Worktree is being removed.".into());
         }
         let current = dunce::canonicalize(&worktree)
@@ -1042,8 +1048,7 @@ fn spawn(
             .path()
             .app_cache_dir()
             .map_err(|error| error.to_string())?;
-        let data_directory =
-            crate::acp_terminal::worktree_data_directory(&cache_directory, &worktree);
+        let data_directory = crate::register_worktree_terminal_data(&cache_directory, &worktree)?;
         for (key, value) in crate::acp_terminal::terminal_environment(&data_directory) {
             std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
             command.env(key, value);

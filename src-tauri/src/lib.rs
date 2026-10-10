@@ -1860,9 +1860,12 @@ async fn delete_worktree(
         };
         let mut removed_from_git = false;
         let result = (|| {
+            let persisted_roots =
+                discover_nested_worktree_terminal_roots(&cache_directory, &directory)?;
             let roots = acp_roots
                 .into_iter()
                 .chain(terminal_roots)
+                .chain(persisted_roots)
                 .collect::<Vec<_>>();
             let managed_data = persist_worktree_data_manifest(
                 &cache_directory,
@@ -1936,8 +1939,136 @@ fn remove_worktree_then_terminal_data_many<T>(
     Ok(result)
 }
 
-const NESTED_WORKTREE_MANIFEST_PREFIX: &str = "nested-worktrees-";
+const NESTED_WORKTREE_MANIFEST_PREFIX: &str = "nw-";
 const NESTED_WORKTREE_MANIFEST_HEADER: &str = "sail-terminal-worktrees-v1";
+const WORKTREE_DATA_OWNER_FILE: &str = "worktree-owner-v1";
+
+pub(crate) fn register_worktree_terminal_data(
+    cache_directory: &Path,
+    worktree: &Path,
+) -> Result<PathBuf, String> {
+    let worktree = acp_terminal::stable_worktree_identity(worktree);
+    let data_directory = acp_terminal::worktree_data_directory(cache_directory, &worktree);
+    std::fs::create_dir_all(&data_directory).map_err(|error| error.to_string())?;
+    let owner_file = data_directory.join(WORKTREE_DATA_OWNER_FILE);
+    let contents = format!(
+        "{NESTED_WORKTREE_MANIFEST_HEADER}\n{}\n",
+        encode_manifest_path(&worktree)
+    );
+    if owner_file.exists() {
+        validate_worktree_data_owner(&owner_file, &worktree)?;
+        return Ok(data_directory);
+    }
+    let temporary = data_directory.join(format!(".owner-{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = (|| {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(contents.as_bytes())
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        rename_without_replace(&temporary, &owner_file).map_err(|error| error.to_string())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        if owner_file.exists() {
+            validate_worktree_data_owner(&owner_file, &worktree)?;
+            return Ok(data_directory);
+        }
+    }
+    write_result?;
+    Ok(data_directory)
+}
+
+fn validate_worktree_data_owner(owner_file: &Path, expected: &Path) -> Result<(), String> {
+    if !owner_file
+        .symlink_metadata()
+        .map_err(|error| error.to_string())?
+        .file_type()
+        .is_file()
+    {
+        return Err("Terminal cache owner metadata is not a regular file.".into());
+    }
+    let contents = std::fs::read_to_string(owner_file).map_err(|error| error.to_string())?;
+    let mut lines = contents.lines();
+    if lines.next() != Some(NESTED_WORKTREE_MANIFEST_HEADER) {
+        return Err("Terminal cache owner metadata is malformed.".into());
+    }
+    let stored = decode_manifest_path(
+        lines
+            .next()
+            .ok_or("Terminal cache owner metadata is incomplete.")?,
+    )?;
+    if lines.next().is_some()
+        || acp_terminal::stable_worktree_identity(&stored)
+            != acp_terminal::stable_worktree_identity(expected)
+    {
+        return Err("Terminal cache owner metadata does not match its worktree.".into());
+    }
+    Ok(())
+}
+
+fn discover_nested_worktree_terminal_roots(
+    cache_directory: &Path,
+    outer_worktree: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let outer_worktree = acp_terminal::stable_worktree_identity(outer_worktree);
+    let cache_root = cache_directory.join("terminal-worktrees");
+    let entries = match std::fs::read_dir(&cache_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut roots = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let owner_file = entry.path().join(WORKTREE_DATA_OWNER_FILE);
+        let owner_metadata = match owner_file.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !owner_metadata.file_type().is_file() {
+            return Err("Terminal cache owner metadata is not a regular file.".into());
+        }
+        let contents = std::fs::read_to_string(&owner_file).map_err(|error| error.to_string())?;
+        let mut lines = contents.lines();
+        if lines.next() != Some(NESTED_WORKTREE_MANIFEST_HEADER) {
+            return Err("Terminal cache owner metadata is malformed.".into());
+        }
+        let root = acp_terminal::stable_worktree_identity(&decode_manifest_path(
+            lines
+                .next()
+                .ok_or("Terminal cache owner metadata is incomplete.")?,
+        )?);
+        if lines.next().is_some()
+            || acp_terminal::worktree_data_directory(cache_directory, &root) != entry.path()
+        {
+            return Err("Terminal cache owner metadata does not match its directory.".into());
+        }
+        if root != outer_worktree && root.starts_with(&outer_worktree) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
 
 fn persist_worktree_data_manifest(
     cache_directory: &Path,
@@ -2156,12 +2287,12 @@ fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
-    let source = source
+    let source = extended_windows_path(source)
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let destination = destination
+    let destination = extended_windows_path(destination)
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
@@ -2174,6 +2305,32 @@ fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+#[cfg(windows)]
+fn extended_windows_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let slash = b'\\' as u16;
+    let question = b'?' as u16;
+    let prefix = [slash, slash, question, slash];
+    if wide.starts_with(&prefix) {
+        return path.to_path_buf();
+    }
+
+    let mut extended = Vec::new();
+    if wide.starts_with(&[slash, slash]) {
+        extended.extend([slash, slash, question, slash]);
+        extended.extend("UNC\\".encode_utf16());
+        extended.extend(wide.iter().skip(2));
+    } else if wide.len() >= 3 && wide[1] == b':' as u16 && wide[2] == slash {
+        extended.extend(prefix);
+        extended.extend(wide);
+    } else {
+        return path.to_path_buf();
+    }
+    PathBuf::from(std::ffi::OsString::from_wide(&extended))
 }
 
 fn rollback_staged_archive(
@@ -2897,9 +3054,10 @@ mod tests {
     use super::working_tree_generation;
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
-        encode_manifest_path, existing_shipping_worktree, git_change_action, git_patch,
-        git_reference, normalize_picker_path, parse_registered_worktrees,
-        persist_worktree_data_manifest, registered_worktrees, remove_worktree,
+        discover_nested_worktree_terminal_roots, encode_manifest_path, existing_shipping_worktree,
+        git_change_action, git_patch, git_reference, normalize_picker_path,
+        parse_registered_worktrees, persist_worktree_data_manifest,
+        register_worktree_terminal_data, registered_worktrees, remove_worktree,
         remove_worktree_then_terminal_data, remove_worktree_then_terminal_data_many,
         remove_worktree_with_hook, remove_worktree_with_hooks, repository_namespace,
         shipping_base_revision, shipping_changed_paths, shipping_default_branch,
@@ -2955,19 +3113,20 @@ mod tests {
         let nested = outer.join("nested");
         fs::create_dir_all(&nested).unwrap();
         let outer_data = crate::acp_terminal::worktree_data_directory(&cache, &outer);
-        let nested_data = crate::acp_terminal::worktree_data_directory(&cache, &nested);
-        fs::create_dir_all(&nested_data).unwrap();
+        let nested_data = register_worktree_terminal_data(&cache, &nested).unwrap();
         fs::write(nested_data.join("cache"), "nested terminal data").unwrap();
         fs::create_dir_all(&outer_data).unwrap();
         fs::write(outer_data.join("cache"), "outer terminal data").unwrap();
 
-        let first_attempt = persist_worktree_data_manifest(
-            &cache,
-            &outer_data,
-            &outer,
-            std::slice::from_ref(&nested),
-        )
-        .expect("persist roots before stopping terminals");
+        let discovered_roots = discover_nested_worktree_terminal_roots(&cache, &outer)
+            .expect("find nested terminal caches without active sessions");
+        assert_eq!(
+            discovered_roots,
+            vec![crate::acp_terminal::stable_worktree_identity(&nested)]
+        );
+        let first_attempt =
+            persist_worktree_data_manifest(&cache, &outer_data, &outer, &discovered_roots)
+                .expect("persist roots before stopping terminals");
         let error = remove_worktree_then_terminal_data_many(&first_attempt, || {
             Err::<(), _>("second terminal stop failed".to_string())
         })
@@ -3003,7 +3162,7 @@ mod tests {
         fs::create_dir_all(&outer_data).unwrap();
         fs::create_dir_all(&outside_data).unwrap();
         fs::write(outside_data.join("cache"), "unrelated cache").unwrap();
-        let manifest = outer_data.join("nested-worktrees-invalid.manifest");
+        let manifest = outer_data.join("nw-invalid.manifest");
         fs::write(
             &manifest,
             format!(
