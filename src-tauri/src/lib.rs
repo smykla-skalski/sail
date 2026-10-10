@@ -2785,7 +2785,13 @@ mod tests {
             &["worktree", "list", "--porcelain", "-z"],
         )
         .expect("list registered worktrees");
-        assert!(listed.contains(&worktree));
+        let registered = parse_registered_worktrees(&listed);
+        assert!(
+            registered
+                .iter()
+                .any(|entry| entry.branch.as_deref() == Some("child") && !entry.present),
+            "Git must still list the missing child worktree"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

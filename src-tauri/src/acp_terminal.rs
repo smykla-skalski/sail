@@ -25,7 +25,7 @@ pub struct AcpTerminalManager {
 }
 
 pub fn worktree_data_directory(cache_directory: &Path, worktree: &Path) -> PathBuf {
-    let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let worktree = stable_worktree_identity(worktree);
     #[cfg(unix)]
     let identity = {
         use std::os::unix::ffi::OsStrExt;
@@ -48,6 +48,38 @@ pub fn worktree_data_directory(cache_directory: &Path, worktree: &Path) -> PathB
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     cache_directory.join("terminal-worktrees").join(name)
+}
+
+fn stable_worktree_identity(worktree: &Path) -> PathBuf {
+    if let Ok(canonical) = dunce::canonicalize(worktree) {
+        return canonical;
+    }
+
+    let absolute = if worktree.is_absolute() {
+        worktree.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(worktree))
+            .unwrap_or_else(|_| worktree.to_path_buf())
+    };
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = dunce::canonicalize(ancestor) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = ancestor.file_name() else {
+            return absolute;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return absolute;
+        };
+        ancestor = parent;
+    }
 }
 
 pub(crate) fn terminal_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
@@ -1194,6 +1226,27 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, second);
         assert!(first.starts_with(cache.join("terminal-worktrees")));
+    }
+
+    #[test]
+    fn missing_worktree_retry_keeps_canonical_parent_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-terminal-identity-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let parent = root.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let worktree = parent.join("removed-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let cache = root.join("cache");
+        let before_removal = worktree_data_directory(&cache, &worktree);
+        let canonical_parent = dunce::canonicalize(&parent).unwrap();
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let after_removal =
+            worktree_data_directory(&cache, &canonical_parent.join("removed-worktree"));
+
+        assert_eq!(before_removal, after_removal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
