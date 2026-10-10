@@ -88,9 +88,75 @@ export const config = {
       process.off('SIGTERM', cancelOnTerminate);
     }
   },
-  /** New profiles follow the OS appearance. Pin it so color and screenshot checks give the same
-   * result on light and dark machines; specs that need dark set `sai-theme` or the appearance. */
+  /** Specs share one app process. Clear state left by earlier specs before pinning appearance. */
   async before() {
+    await browser.switchToWindow('main');
+    await browser.setWindowSize(1280, 850);
+    const needsReload = await browser.execute(async () => {
+      const tauri: unknown = Reflect.get(window, '__TAURI__');
+      const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
+      const invoke: unknown = core && typeof core === 'object' ? Reflect.get(core, 'invoke') : null;
+      if (typeof invoke !== 'function')
+        throw new Error('Tauri API missing; cannot reset E2E state');
+      const windows: unknown = await invoke('plugin:wdio|list_windows');
+      if (!Array.isArray(windows) || !windows.every((label) => typeof label === 'string'))
+        throw new Error('Invalid Tauri window list');
+      const hadSettingsWindow = windows.includes('settings');
+      if (hadSettingsWindow) await invoke('plugin:window|close', { label: 'settings' });
+      const response: unknown = await invoke('acp_pending_inbox');
+      if (!Array.isArray(response)) throw new Error('Invalid pending inbox response');
+      const pending: unknown[] = response;
+      const resolutions = pending.map((item) => {
+        if (!item || typeof item !== 'object') throw new Error('Invalid pending inbox item');
+        const agent: unknown = Reflect.get(item, 'agent');
+        const directory: unknown = Reflect.get(item, 'directory');
+        const profile: unknown = Reflect.get(item, 'profile');
+        const message: unknown = Reflect.get(item, 'message');
+        if (
+          typeof agent !== 'string' ||
+          typeof directory !== 'string' ||
+          typeof profile !== 'string' ||
+          !message ||
+          typeof message !== 'object'
+        )
+          throw new Error('Invalid pending inbox request');
+        const method: unknown = Reflect.get(message, 'method');
+        const params: unknown = Reflect.get(message, 'params');
+        const sessionId: unknown =
+          params && typeof params === 'object' ? Reflect.get(params, 'sessionId') : null;
+        if (typeof sessionId !== 'string') throw new Error('Pending request has no session');
+        if (method === 'elicitation/create') {
+          const requestId: unknown = Reflect.get(message, 'id');
+          if (typeof requestId !== 'string' && typeof requestId !== 'number')
+            throw new Error('Pending elicitation has no request ID');
+          return invoke('acp_elicitation', {
+            params: {
+              agent,
+              directory,
+              sessionId,
+              profile,
+              requestId,
+              action: 'cancel',
+              content: null,
+            },
+          });
+        }
+        if (method === 'session/request_permission') {
+          return invoke('acp_cancel', { agent, directory, sessionId, turnId: null });
+        }
+        throw new Error(`Unexpected pending request: ${String(method)}`);
+      });
+      await Promise.all(resolutions);
+      const remaining: unknown = await invoke('acp_pending_inbox');
+      if (!Array.isArray(remaining) || remaining.length > 0)
+        throw new Error('E2E setup left pending agent requests');
+      sessionStorage.removeItem('sail-e2e-settings');
+      const hadQuery = !!location.search;
+      if (hadQuery) history.replaceState(null, '', location.pathname);
+      return hadSettingsWindow || hadQuery || pending.length > 0;
+    });
+    if (needsReload) await browser.refresh();
+
     await browser.execute(async (value) => {
       const tauri: unknown = Reflect.get(window, '__TAURI__');
       const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;

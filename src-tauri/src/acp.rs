@@ -833,6 +833,7 @@ fn resolve_session_permissions(
 pub struct PendingPermissionInfo {
     agent: String,
     directory: String,
+    profile: String,
     message: Value,
     received_at: u64,
 }
@@ -2194,6 +2195,7 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                profile: runtime.profile.as_str().to_string(),
                 directory: runtime
                     .session_directories
                     .lock()
@@ -2220,6 +2222,7 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                profile: runtime.profile.as_str().to_string(),
                 directory: runtime
                     .session_directories
                     .lock()
