@@ -870,7 +870,7 @@ fn verify_identity_removed(identity: &WorktreeIdentity) -> Result<bool, &'static
     if identity.root.exists() {
         return Ok(false);
     }
-    let common = fs::canonicalize(&identity.common_dir)
+    let common = dunce::canonicalize(&identity.common_dir)
         .map_err(|_| "git-common-dir-missing-or-unreadable")?;
     if common != identity.common_dir {
         return Ok(false);
@@ -1441,6 +1441,30 @@ mod tests {
 
         assert!(!directory.exists());
         assert!(pending.is_empty(), "remaining: {pending:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removed_worktree_cleanup_accepts_windows_verbatim_common_dir_alias() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let identity = read_owner(&directory).unwrap();
+        lease.mark_started();
+        lease.release_clean().unwrap();
+        drop(lease);
+        fixture.remove(&fixture.first);
+
+        let std_canonical = fs::canonicalize(&identity.common_dir).unwrap();
+        let normalized_canonical = dunce::canonicalize(&identity.common_dir).unwrap();
+        assert_eq!(normalized_canonical, identity.common_dir);
+        assert!(
+            std_canonical != normalized_canonical,
+            "Windows std canonicalize should expose its verbatim prefix"
+        );
+        assert!(verify_identity_removed(&identity).unwrap());
+
+        remove_after_worktree_removal(&fixture.cache, std::slice::from_ref(&directory)).unwrap();
+        assert!(!directory.exists());
     }
 
     #[test]
