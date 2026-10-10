@@ -101,6 +101,7 @@ pub fn preview(
     check_index_state(&root, destination)?;
     let revision = git(&root, &["rev-parse", "--verify", "HEAD"])?;
     let before = read_document(&target)?;
+    reject_content_attributes(&root, destination)?;
     if !git(
         &root,
         &[
@@ -451,6 +452,7 @@ fn delete_tree_ref(root: &Path, reference: &str, tree: &str) -> Result<(), Strin
 fn check_source(root: &Path, proposal: &Proposal) -> Result<(), String> {
     let target = checked_target(root, &proposal.destination)?;
     check_index_state(root, &proposal.destination)?;
+    reject_content_attributes(root, &proposal.destination)?;
     if git(root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
         || read_document(&target)? != proposal.before
         || !git(
@@ -546,6 +548,7 @@ fn check_git_content(
     before: &str,
     after: &str,
 ) -> Result<(), String> {
+    reject_content_attributes(root, destination)?;
     let relative = destination.to_str().ok_or("Invalid destination.")?;
     let blob = git_command()
         .arg("-C")
@@ -556,10 +559,7 @@ fn check_git_content(
     if !blob.status.success() {
         return Err("Cannot inspect tracked destination content.".into());
     }
-    if blob.stdout != before.as_bytes()
-        || hash_content(root, None, after.as_bytes())?
-            != hash_content(root, Some(relative), after.as_bytes())?
-    {
+    if blob.stdout != before.as_bytes() || after.contains('\r') {
         return Err(
             "Destination uses Git content conversion; choose a file without filters.".into(),
         );
@@ -567,34 +567,38 @@ fn check_git_content(
     Ok(())
 }
 
-fn hash_content(root: &Path, path: Option<&str>, content: &[u8]) -> Result<String, String> {
-    use std::io::Write;
-    let mut command = git_command();
-    command.arg("-C").arg(root).arg("hash-object");
-    if let Some(path) = path {
-        command.arg(format!("--path={path}"));
-    }
-    let mut child = command
-        .arg("--stdin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|_| "Cannot inspect Git content conversion.")?;
-    child
-        .stdin
-        .take()
-        .ok_or("Cannot inspect Git content conversion.")?
-        .write_all(content)
-        .map_err(|_| "Cannot inspect Git content conversion.")?;
-    let output = child
-        .wait_with_output()
+fn reject_content_attributes(root: &Path, destination: &Path) -> Result<(), String> {
+    let relative = destination.to_str().ok_or("Invalid destination.")?;
+    let attributes = ["filter", "ident", "working-tree-encoding"];
+    let output = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["check-attr", "-z"])
+        .args(attributes)
+        .args(["--", relative])
+        .output()
         .map_err(|_| "Cannot inspect Git content conversion.")?;
     if !output.status.success() {
         return Err("Cannot inspect Git content conversion.".into());
     }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim_end().to_owned())
-        .map_err(|_| "Invalid Git content conversion response.".into())
+    let fields: Vec<_> = output.stdout.split(|byte| *byte == 0).collect();
+    if fields.len() != attributes.len() * 3 + 1
+        || !fields.last().is_some_and(|value| value.is_empty())
+    {
+        return Err("Invalid Git content conversion response.".into());
+    }
+    for (index, attribute) in attributes.iter().enumerate() {
+        let field = index * 3;
+        if fields[field] != relative.as_bytes() || fields[field + 1] != attribute.as_bytes() {
+            return Err("Invalid Git content conversion response.".into());
+        }
+        if fields[field + 2] != b"unspecified" && fields[field + 2] != b"unset" {
+            return Err(
+                "Destination uses Git content conversion; choose a file without filters.".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -799,6 +803,48 @@ mod tests {
         assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn preview_rejects_filter_without_running_its_command() {
+        let repo = Repo::new();
+        fs::write(
+            repo.0.join(".gitattributes"),
+            "AGENTS.md filter=sail-test\n",
+        )
+        .unwrap();
+        repo.git(&["add", ".gitattributes"]);
+        repo.git(&["commit", "-qm", "set filter"]);
+        let marker = repo.0.join("filter-ran");
+        repo.git(&[
+            "config",
+            "filter.sail-test.clean",
+            &format!("touch {}; cat", marker.display()),
+        ]);
+
+        assert!(preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "change",
+            true,
+        )
+        .is_err());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn proposed_carriage_return_is_rejected() {
+        let repo = Repo::new();
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "## New rule\r\nbody",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("Git content conversion"), "{error}");
     }
 
     #[test]
