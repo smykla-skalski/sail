@@ -12,6 +12,8 @@
     "allow-install-memory-agents",
     "allow-uninstall-memory-agent",
     "allow-save-setting",
+    "allow-worktree-storage-cleanup-status",
+    "allow-retry-worktree-storage-cleanup",
     "allow-inspect-agent-hooks",
     "allow-inspect-hook-integration",
     "allow-enable-hook-integration",
