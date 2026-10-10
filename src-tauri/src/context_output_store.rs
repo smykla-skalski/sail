@@ -330,11 +330,10 @@ impl OutputStore {
             {
                 let item = item.map_err(|_| StoreWarning::StorageUnavailable)?;
                 let path = item.path();
-                if !item
+                let kind = item
                     .file_type()
-                    .map_err(|_| StoreWarning::StorageUnavailable)?
-                    .is_file()
-                {
+                    .map_err(|_| StoreWarning::StorageUnavailable)?;
+                if !kind.is_file() && !kind.is_symlink() {
                     return Err(StoreWarning::StorageUnavailable);
                 }
                 if path.extension().is_some_and(|ext| ext == "tmp") {
@@ -364,7 +363,7 @@ impl OutputStore {
                 _ => {
                     let metadata = fs::symlink_metadata(&path)
                         .map_err(|_| StoreWarning::StorageUnavailable)?;
-                    if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    if !metadata.is_file() && !metadata.file_type().is_symlink() {
                         return Err(StoreWarning::StorageUnavailable);
                     }
                     metadata.len()
@@ -576,11 +575,11 @@ impl OutputStore {
         let key = scope.key()?;
         let _lock = self.lock()?;
         let directory = self.scope_dir(&key);
-        if !directory.exists() {
-            return Ok(0);
-        }
-        let metadata =
-            fs::symlink_metadata(&directory).map_err(|_| StoreWarning::StorageUnavailable)?;
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(_) => return Err(StoreWarning::StorageUnavailable),
+        };
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(StoreWarning::StorageUnavailable);
         }
@@ -588,11 +587,10 @@ impl OutputStore {
         for entry in fs::read_dir(&directory).map_err(|_| StoreWarning::StorageUnavailable)? {
             let entry = entry.map_err(|_| StoreWarning::StorageUnavailable)?;
             let path = entry.path();
-            if !entry
+            let kind = entry
                 .file_type()
-                .map_err(|_| StoreWarning::StorageUnavailable)?
-                .is_file()
-            {
+                .map_err(|_| StoreWarning::StorageUnavailable)?;
+            if !kind.is_file() && !kind.is_symlink() {
                 return Err(StoreWarning::StorageUnavailable);
             }
             match path.extension().and_then(|extension| extension.to_str()) {
@@ -833,17 +831,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_items_are_rejected() {
+    fn symlinked_item_is_isolated_and_purgeable() {
         use std::os::unix::fs::symlink;
         let root = TestRoot::new();
         let store = OutputStore::open(root.0.clone(), OutputLimits::default()).unwrap();
         let saved = store.put(&scope(), b"secret").unwrap();
+        let mut other = scope();
+        other.session = "healthy-session".into();
+        let healthy = store.put(&other, b"healthy").unwrap();
         let id = Uuid::parse_str(saved.reference.strip_prefix("out:v1:").unwrap()).unwrap();
         let path = store.item_path(&scope().key().unwrap(), id);
         fs::remove_file(&path).unwrap();
         symlink(root.0.join(".lock"), &path).unwrap();
         assert_eq!(
             store.read_range(&scope(), &saved.reference, 0, 6),
+            Err(StoreWarning::StorageUnavailable)
+        );
+        assert_eq!(store.usage(Some(&other)).unwrap().items, 1);
+        assert_eq!(store.usage(None).unwrap().items, 2);
+        assert_eq!(
+            store
+                .read_range(&other, &healthy.reference, 0, 7)
+                .unwrap()
+                .bytes,
+            b"healthy"
+        );
+        store.put(&other, b"new").unwrap();
+        assert_eq!(store.purge_scope(&scope()), Ok(1));
+        assert!(root.0.join(".lock").is_file());
+        assert_eq!(store.usage(None).unwrap().items, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_scope_directory_cannot_be_purged() {
+        use std::os::unix::fs::symlink;
+        let root = TestRoot::new();
+        let store = OutputStore::open(root.0.clone(), OutputLimits::default()).unwrap();
+        let directory = store.scope_dir(&scope().key().unwrap());
+        symlink(root.0.join("missing"), directory).unwrap();
+        assert_eq!(
+            store.purge_scope(&scope()),
             Err(StoreWarning::StorageUnavailable)
         );
     }
