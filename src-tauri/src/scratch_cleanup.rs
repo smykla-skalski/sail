@@ -24,7 +24,10 @@ pub(crate) fn sweep_on_startup() {
 }
 
 pub(crate) fn owner_identity() -> Option<String> {
-    let pid = std::process::id();
+    owner_identity_for_pid(std::process::id())
+}
+
+pub(crate) fn owner_identity_for_pid(pid: u32) -> Option<String> {
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
@@ -508,6 +511,23 @@ mod tests {
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
         sweep(&temp, future, |_| Some(false)).unwrap();
         assert!(active.exists());
+    }
+
+    #[test]
+    fn a_child_owner_becomes_sweepable_after_it_exits() {
+        let temp = fixture();
+        let root = temp.join("sail-339-target.child");
+        fs::create_dir(&root).unwrap();
+        let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let owner = owner_identity_for_pid(child.id()).unwrap();
+        fs::write(root.join(MARKER), owner).unwrap();
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        sweep(&temp, future, |_| Some(false)).unwrap();
+        assert!(root.exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        sweep(&temp, future, |_| Some(false)).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]

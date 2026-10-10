@@ -356,6 +356,7 @@ pub fn handle(
     method: &str,
     params: Value,
     session_directory: Option<PathBuf>,
+    scratch_owner: Option<&str>,
 ) -> Result<Value, String> {
     if method == "terminal/create" {
         let params: CreateParams =
@@ -391,8 +392,13 @@ pub fn handle(
             command.env(variable.name, variable.value);
         }
         #[cfg(unix)]
-        let mut command = crate::scratch_cleanup::wrap_command(command)
-            .map_err(|error| format!("Could not prepare terminal owner: {error}"))?;
+        if let Some(owner) = scratch_owner {
+            command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
+        } else {
+            command.env_remove("SAIL_SCRATCH_OWNER_IDENTITY");
+        }
+        #[cfg(not(unix))]
+        let _ = scratch_owner;
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command

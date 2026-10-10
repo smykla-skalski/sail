@@ -380,6 +380,8 @@ struct Connection {
     profile: CapabilityProfile,
     child: Mutex<Child>,
     #[cfg(unix)]
+    scratch_owner: Option<String>,
+    #[cfg(unix)]
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
     stopped: AtomicBool,
     input: Mutex<ChildStdin>,
@@ -2616,6 +2618,8 @@ fn connect_blocking(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Could not start {}: {error}", definition.name))?;
+    #[cfg(unix)]
+    let scratch_owner = crate::scratch_cleanup::owner_identity_for_pid(child.id());
     if !is_test_agent {
         observe_agent_with_reef(&agent, child.id());
     }
@@ -2646,6 +2650,8 @@ fn connect_blocking(
         agent: agent.clone(),
         profile,
         child: Mutex::new(child),
+        #[cfg(unix)]
+        scratch_owner,
         #[cfg(unix)]
         watchdog: Mutex::new(watchdog),
         stopped: AtomicBool::new(false),
@@ -2814,6 +2820,10 @@ fn connect_blocking(
                                     .or_else(|| runtime.pending_directory.lock().ok()?.clone());
                                 let manager =
                                     app.state::<crate::acp_terminal::AcpTerminalManager>();
+                                #[cfg(unix)]
+                                let scratch_owner = runtime.scratch_owner.as_deref();
+                                #[cfg(not(unix))]
+                                let scratch_owner = None;
                                 let response = match crate::acp_terminal::handle(
                                     &app,
                                     &manager,
@@ -2822,6 +2832,7 @@ fn connect_blocking(
                                     &method,
                                     params,
                                     directory,
+                                    scratch_owner,
                                 ) {
                                     Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
                                     Err(error) => {
