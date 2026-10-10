@@ -12,9 +12,6 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -68,7 +65,7 @@ struct TerminalSession {
     writer: Mutex<Box<dyn Write + Send>>,
     write_busy: AtomicBool,
     #[cfg(windows)]
-    process_handle: OwnedHandle,
+    job: crate::acp_terminal::WindowsTerminalJob,
     output: Arc<Mutex<TerminalOutput>>,
     changed: Arc<Condvar>,
 }
@@ -79,17 +76,17 @@ impl TerminalSession {
             .process_group_stop
             .lock()
             .map_err(|error| error.to_string())?;
-        if self
-            .output
-            .lock()
-            .map_err(|error| error.to_string())?
-            .exit_code
-            .is_some()
-        {
-            return Ok(());
-        }
         #[cfg(unix)]
         {
+            if self
+                .output
+                .lock()
+                .map_err(|error| error.to_string())?
+                .exit_code
+                .is_some()
+            {
+                return Ok(());
+            }
             kill_terminal_process_groups(
                 self.process_id
                     .ok_or("Cannot identify terminal process group.")?,
@@ -97,44 +94,10 @@ impl TerminalSession {
         }
         #[cfg(windows)]
         {
-            stop_owned_windows_process(&self.process_handle)?;
+            self.job.stop()?;
         }
         Ok(())
     }
-}
-
-#[cfg(windows)]
-fn open_owned_windows_process(process_id: u32) -> Result<OwnedHandle, String> {
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
-
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, process_id) }
-        .map_err(|error| format!("Cannot retain terminal process handle: {error}"))?;
-    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
-}
-
-#[cfg(windows)]
-fn stop_owned_windows_process(handle: &OwnedHandle) -> Result<(), String> {
-    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-
-    let process = windows::Win32::Foundation::HANDLE(handle.as_raw_handle() as _);
-    let termination = unsafe { TerminateProcess(process, 1) };
-    let wait = unsafe { WaitForSingleObject(process, 5_000) };
-    if wait == windows::Win32::Foundation::WAIT_OBJECT_0 {
-        return Ok(());
-    }
-    if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
-        return Err(format!(
-            "Cannot confirm terminal process stopped: {}",
-            termination
-                .err()
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| "process remained active".to_string())
-        ));
-    }
-    Err(format!(
-        "Cannot inspect terminal process state: {}",
-        std::io::Error::last_os_error()
-    ))
 }
 
 #[cfg(unix)]
@@ -224,29 +187,129 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn worktree_removal_stops_live_owned_terminal_on_first_attempt() {
-        use super::{open_owned_windows_process, stop_owned_windows_process};
-        use std::process::{Command, Stdio};
+    fn worktree_removal_stops_owned_pty_descendant_on_first_attempt() {
+        use crate::acp_terminal::WindowsTerminalJob;
+        use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize, SlavePty};
+        use std::io::Write;
 
         let managed = tempfile::tempdir().expect("managed terminal data directory");
         std::fs::write(managed.path().join("cache-entry"), "private cache")
             .expect("create managed cache entry");
-        let mut child = Command::new("ping.exe")
-            .args(["-n", "60", "127.0.0.1"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start live terminal child");
-        let process = open_owned_windows_process(child.id())
-            .expect("retain the owned terminal process handle");
+        let job = WindowsTerminalJob::new().expect("create owned terminal job");
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open ConPTY");
+        let mut command = CommandBuilder::new(super::shell());
+        command.set_job_handle(job.raw_handle());
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn cmd.exe in the Job Object");
+        drop(pair.slave);
+        let mut writer = pair.master.take_writer().expect("take ConPTY writer");
+        writer
+            .write_all(b"start \"\" /B ping -n 60 127.0.0.1\r\n")
+            .expect("start a descendant from the owned shell");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let active = job.active_processes().expect("inspect terminal job");
+            if active > 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd.exe did not start a background descendant"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
-        let result = crate::remove_worktree_then_terminal_data(managed.path(), || {
-            stop_owned_windows_process(&process)
-        });
+        let result = crate::remove_worktree_then_terminal_data(managed.path(), || job.stop());
         assert!(result.is_ok(), "first removal failed: {result:?}");
         assert!(!managed.path().exists(), "managed data was retained");
-        child.wait().expect("reap stopped terminal child");
+        assert_eq!(job.active_processes().unwrap(), 0);
+        child.wait().expect("reap stopped terminal shell");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worktree_removal_stops_pty_descendant_after_shell_exits() {
+        use crate::acp_terminal::WindowsTerminalJob;
+        use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize, SlavePty};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let managed = tempfile::tempdir().expect("managed terminal data directory");
+        std::fs::write(managed.path().join("cache-entry"), "private cache")
+            .expect("create managed cache entry");
+        let job = WindowsTerminalJob::new().expect("create owned terminal job");
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open ConPTY");
+        let mut command = CommandBuilder::new(super::shell());
+        command.arg("/C");
+        command.arg("start \"\" /B ping -n 60 127.0.0.1 & exit");
+        command.set_job_handle(job.raw_handle());
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn shell with descendant in the Job Object");
+        drop(pair.slave);
+        let writer = pair.master.take_writer().expect("take ConPTY writer");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if child.try_wait().expect("poll terminal shell").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cmd.exe did not exit after starting its descendant"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            job.active_processes().unwrap() > 0,
+            "descendant left the job"
+        );
+
+        let process_id = child.process_id();
+        let session = super::TerminalSession {
+            inspect_id: "windows-owned-terminal-test".to_string(),
+            owner: None,
+            directory: managed.path().to_path_buf(),
+            worktree: managed.path().to_path_buf(),
+            process_id,
+            master: Mutex::new(pair.master),
+            process_group_stop: Arc::new(Mutex::new(())),
+            writer: Mutex::new(writer),
+            write_busy: AtomicBool::new(false),
+            job,
+            output: Arc::new(Mutex::new(super::TerminalOutput {
+                history: VecDeque::new(),
+                start: 0,
+                current_directory: managed.path().to_path_buf(),
+                osc_tail: Vec::new(),
+                exit_code: Some(0),
+                subscriber: None,
+            })),
+            changed: Arc::new(Condvar::new()),
+        };
+
+        let result = crate::remove_worktree_then_terminal_data(managed.path(), || session.stop());
+        assert!(result.is_ok(), "first removal failed: {result:?}");
+        assert!(!managed.path().exists(), "managed data was retained");
+        assert_eq!(session.job.active_processes().unwrap(), 0);
+        child.wait().expect("reap exited terminal shell");
     }
 
     #[cfg(target_os = "macos")]
@@ -923,6 +986,12 @@ fn spawn(
     command.env("COLORTERM", "truecolor");
     #[cfg(windows)]
     command.env("PROMPT", "$E]9;9;$P$E\\$P$G");
+    #[cfg(windows)]
+    let job = {
+        let job = crate::acp_terminal::WindowsTerminalJob::new()?;
+        command.set_job_handle(job.raw_handle());
+        job
+    };
     let child = pair
         .slave
         .spawn_command(command)
@@ -948,24 +1017,6 @@ fn spawn(
     }));
     let changed = Arc::new(Condvar::new());
     let process_id = child.process_id();
-    #[cfg(windows)]
-    let mut child = child;
-    #[cfg(windows)]
-    let process_handle = match process_id {
-        Some(process_id) => match open_owned_windows_process(process_id) {
-            Ok(handle) => handle,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        },
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("Cannot identify terminal process.".to_string());
-        }
-    };
     let process_group_stop = Arc::new(Mutex::new(()));
     let background_process_group_stop = Arc::clone(&process_group_stop);
     let master = Mutex::new(pair.master);
@@ -1050,7 +1101,7 @@ fn spawn(
         writer: Mutex::new(writer),
         write_busy: AtomicBool::new(false),
         #[cfg(windows)]
-        process_handle,
+        job,
         output,
         changed,
     })

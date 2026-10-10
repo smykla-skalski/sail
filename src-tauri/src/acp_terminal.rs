@@ -103,14 +103,14 @@ pub(crate) fn terminal_environment(data_directory: &Path) -> Vec<(&'static str, 
 }
 
 #[cfg(windows)]
-struct WindowsTerminalJob(OwnedHandle);
+pub(crate) struct WindowsTerminalJob(OwnedHandle);
 
 #[cfg(windows)]
 unsafe impl Send for WindowsTerminalJob {}
 
 #[cfg(windows)]
 impl WindowsTerminalJob {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         use windows::Win32::System::JobObjects::{
             CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -131,6 +131,10 @@ impl WindowsTerminalJob {
         }
         .map_err(|error| format!("Cannot configure terminal process job: {error}"))?;
         Ok(Self(handle))
+    }
+
+    pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.0.as_raw_handle()
     }
 
     fn assign_and_resume(&self, child: &std::process::Child) -> Result<(), String> {
@@ -214,7 +218,7 @@ impl WindowsTerminalJob {
         Ok((child, job))
     }
 
-    fn stop(&self) -> Result<(), String> {
+    pub(crate) fn stop(&self) -> Result<(), String> {
         use windows::Win32::System::JobObjects::TerminateJobObject;
 
         if self.active_processes()? == 0 {
@@ -236,7 +240,7 @@ impl WindowsTerminalJob {
         Err("Cannot confirm terminal process job stopped.".to_string())
     }
 
-    fn active_processes(&self) -> Result<usize, String> {
+    pub(crate) fn active_processes(&self) -> Result<usize, String> {
         use windows::Win32::System::JobObjects::{
             JobObjectBasicAccountingInformation, QueryInformationJobObject,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
