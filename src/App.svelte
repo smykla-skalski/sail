@@ -7345,7 +7345,7 @@
     if (routeSelection?.reason)
       throw new Error(routeSelection.reason ?? 'No eligible model route.');
     const route = routeSelection?.route;
-    const selectedProvider = route?.provider ?? provider;
+    const selectedProvider = route?.provider ?? provider ?? source.agent;
     const chosenProvider: SpawnReceipt['provider'] =
       selectedProvider === 'claude'
         ? 'claude'
