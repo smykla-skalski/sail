@@ -14,6 +14,8 @@ struct ProcessRecord {
     run: String,
     pid: u32,
     group: u32,
+    #[serde(default)]
+    session: bool,
     started: u64,
     recorded: u64,
 }
@@ -115,6 +117,10 @@ fn stop_process(record: &ProcessRecord) -> Result<bool, String> {
             return Ok(false);
         }
     }
+    if record.session {
+        crate::terminal::kill_terminal_process_groups(record.pid)?;
+        return Ok(true);
+    }
     let group = nix::unistd::Pid::from_raw(record.group as i32);
     if group.as_raw() <= 0 || group == nix::unistd::getpgrp() {
         return Err("Refusing to stop the Sail process group.".into());
@@ -163,7 +169,16 @@ impl Registry {
         write_file(&self.file, state)
     }
 
+    #[cfg(test)]
     fn register(&self, run: &str, pid: u32, group: u32) -> Result<(), String> {
+        self.register_kind(run, pid, group, false)
+    }
+
+    fn register_session(&self, run: &str, pid: u32, group: u32) -> Result<(), String> {
+        self.register_kind(run, pid, group, true)
+    }
+
+    fn register_kind(&self, run: &str, pid: u32, group: u32, session: bool) -> Result<(), String> {
         if group == 0 || group > i32::MAX as u32 {
             return Err("Invalid owned process group.".into());
         }
@@ -180,6 +195,7 @@ impl Registry {
             run: run.to_string(),
             pid,
             group,
+            session,
             started,
             recorded: now(),
         };
@@ -336,11 +352,11 @@ pub fn init(directory: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-pub fn register(run: &str, pid: u32, group: u32) -> Result<(), String> {
+pub fn register_session(run: &str, pid: u32, group: u32) -> Result<(), String> {
     REGISTRY
         .get()
         .ok_or("Owned process registry is unavailable.")?
-        .register(run, pid, group)
+        .register_session(run, pid, group)
 }
 
 pub fn stop_run(run: &str) -> Result<(), String> {
@@ -459,6 +475,7 @@ mod tests {
                 run: "reused-pid".into(),
                 pid: reused.0.id(),
                 group: reused.0.id(),
+                session: true,
                 started: 0,
                 recorded: now() - RECOVERY_GRACE.as_secs(),
             });
@@ -535,10 +552,58 @@ mod tests {
         let pid = child.process_id().unwrap();
         let group = pair.master.process_group_leader().unwrap() as u32;
 
-        registry.register("owned-pty", pid, group).unwrap();
+        registry.register_session("owned-pty", pid, group).unwrap();
         registry.stop_pid("owned-pty", pid).unwrap();
         assert!(!child.wait().unwrap().success());
         assert!(registry.state.lock().unwrap().processes.is_empty());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn recovery_stops_background_groups_in_a_recorded_session() {
+        use std::time::Instant;
+
+        let path = directory();
+        let marker = path.join("survived");
+        let ready = path.join("ready");
+        let registry = new_registry(&path, process_started(std::process::id()).unwrap());
+        let previous = new_registry(&path, 0);
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "set -m; (sleep 1; touch \"$1\") & touch \"$2\"; wait",
+                "sh",
+            ])
+            .arg(&marker)
+            .arg(&ready);
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut shell = command.spawn().unwrap();
+        previous
+            .register_session("crashed-session", shell.id(), shell.id())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "background job did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        {
+            let mut state = previous.state.lock().unwrap();
+            state.processes[0].recorded = now() - RECOVERY_GRACE.as_secs();
+            previous.save(&state).unwrap();
+        }
+        registry.recover().unwrap();
+        shell.wait().unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(!marker.exists(), "background group survived crash recovery");
         std::fs::remove_dir_all(path).unwrap();
     }
 

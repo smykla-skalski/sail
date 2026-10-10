@@ -889,27 +889,59 @@
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
       </section>
       <section class="settings-card">
+        <h2>Concurrent jobs</h2>
+        <p>
+          Extra work waits in launch order. Zero pauses new work. Lowering a limit leaves active
+          work running. The E2E limit applies to this repository's WebdriverIO runner.
+        </p>
+        {#each [['agent', 'Running agent turns'], ['browser', 'Browser tabs'], ['e2e', 'E2E test runs']] as const as [kind, label] (kind)}
+          <label for={`resource-limit-${kind}`}>{label}</label>
+          <input
+            id={`resource-limit-${kind}`}
+            type="number"
+            min="0"
+            max="32"
+            step="1"
+            value={snapshot?.resourceLimits[kind] ?? 0}
+            onchange={(event) =>
+              send({ type: 'resource-limit', kind, value: Number(event.currentTarget.value) })}
+          />
+        {/each}
+      </section>
+      <section class="settings-card">
+        <h2>Machine pressure</h2>
+        <p>
+          New agent turns and browser tabs wait when a threshold is reached. Active work continues.
+          Jobs start automatically when readings recover. Zero disables a threshold.
+        </p>
+        {#each [['memoryFreePercent', 'Minimum free memory (%)'], ['swapUsedPercent', 'Maximum swap use (%)'], ['diskFreePercent', 'Minimum free disk (%)']] as const as [kind, label] (kind)}
+          <label for={`pressure-threshold-${kind}`}>{label}</label>
+          <input
+            id={`pressure-threshold-${kind}`}
+            type="number"
+            min="0"
+            max="100"
+            step="1"
+            value={snapshot?.pressureThresholds[kind] ?? 0}
+            onchange={(event) =>
+              send({
+                type: 'pressure-threshold',
+                kind,
+                value: Number(event.currentTarget.value),
+              })}
+          />
+        {/each}
+      </section>
+      <section class="settings-card">
         <h2>Ship It cross-validation</h2>
         <p>
           Select the agents and exact models allowed to review and test changes. Model IDs must
           match the agent's model selector.
         </p>
-        <label class="attention-setting">
-          <input
-            type="checkbox"
-            checked={snapshot?.crossValidation.strictDifferentModel ?? false}
-            onchange={(event) =>
-              snapshot &&
-              send({
-                type: 'cross-validation',
-                value: {
-                  ...snapshot.crossValidation,
-                  strictDifferentModel: event.currentTarget.checked,
-                },
-              })}
-          />
-          Require a model different from every implementation model
-        </label>
+        <p>
+          Every review and test gate runs in a fresh subagent session. It may use the implementation
+          model.
+        </p>
         {#each snapshot?.crossValidation.choices ?? [] as choice (`${choice.agent}:${choice.model}`)}
           <p class="runtime-binary">
             <strong>{choice.agent} · {choice.model}</strong>
@@ -919,7 +951,8 @@
             <Button size="sm" onclick={() => removeValidationChoice(choice)}>Remove</Button>
           </p>
         {:else}<p role="status">
-            No cross-validation models selected. Gates use the implementation agent and model.
+            No validation models selected. Gates use the implementation provider and model in a
+            fresh session.
           </p>{/each}
         <label for="validation-agent">Agent</label>
         <select id="validation-agent" bind:value={validationAgent}>
@@ -986,29 +1019,7 @@
             ? evaluateModelRouting(snapshot.modelRouting).failuresPrevented
             : 0}/{snapshot ? evaluateModelRouting(snapshot.modelRouting).failureTotal : 0} prevented
         </p>
-        <p>Require independent review for:</p>
-        {#each shipRiskLevels as risk (risk)}
-          <label class="attention-setting">
-            <input
-              type="checkbox"
-              checked={snapshot?.modelRouting.independentReviewRisks.includes(risk) ?? false}
-              onchange={(event) =>
-                snapshot &&
-                send({
-                  type: 'model-routing',
-                  value: {
-                    ...snapshot.modelRouting,
-                    independentReviewRisks: event.currentTarget.checked
-                      ? [...new Set([...snapshot.modelRouting.independentReviewRisks, risk])]
-                      : snapshot.modelRouting.independentReviewRisks.filter(
-                          (candidate) => candidate !== risk,
-                        ),
-                  },
-                })}
-            />
-            {risk}
-          </label>
-        {/each}
+        <p>Review routes run in fresh subagent sessions. The implementation model is allowed.</p>
       </section>
       <section class="settings-card">
         <h2>Ship merging</h2>

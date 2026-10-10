@@ -49,9 +49,7 @@
   import {
     appendShipEvent,
     beginLatestRefresh,
-    completedInlineShipGate,
     nextValidationReservation,
-    reserveInlineValidation,
     gateSnapshot,
     currentShipBlockedReason,
     loadShipRunStore,
@@ -273,7 +271,7 @@
   import {
     hasUnresolvedModelAlias,
     selectValidationChoice,
-    type ValidationChoice,
+    type ValidationRoute,
   } from './lib/cross-validation';
   import {
     abandonImplementationTurn,
@@ -346,6 +344,7 @@
     answeredPermissionKey,
     permissionAlreadyAnswered,
     permissionResolution,
+    shipOwnedTargetKey,
     stoppableSubagents,
     subagentStop,
     type AnsweredPermission,
@@ -417,6 +416,7 @@
     acp,
     acpDisconnectAffectsSession,
     acpDisconnectedSessionIds,
+    acpEventMatchesSession,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
     applyLiveTranscriptUpdate,
@@ -435,6 +435,7 @@
     updateEntriesInPlace,
     type AgentCommand,
     type AgentConfigOption,
+    type AgentActivity,
     type AgentEntry,
     type AgentAvailability,
     type AgentEvent,
@@ -503,6 +504,19 @@
     setSettingDurable,
     settingsError,
   } from './lib/settings';
+  import {
+    defaultResourceLimits,
+    isCheckingMachinePressure,
+    parseResourceLimit,
+    resourceLimitKeys,
+    setResourceLimit,
+    setPressureThresholds,
+  } from './lib/resource-limits';
+  import {
+    defaultPressureThresholds,
+    parsePressureThreshold,
+    pressureThresholdKeys,
+  } from './lib/machine-pressure';
   import {
     parseThemePreference,
     resolveTheme,
@@ -847,13 +861,17 @@
   let spawnReceipts = $state<SpawnReceipt[]>(initialSpawnReceipts);
   const spawnOutput = new SvelteMap<string, string>();
   const activeSpawnTargets = new SvelteMap<string, string>();
+  const spawnTargetKey = (path: string, targetId: string) => JSON.stringify([path, targetId]);
   for (const receipt of initialSpawnReceipts) {
     if (
       receipt.targetId &&
       receipt.turnId &&
       (receipt.state === 'working' || receipt.state === 'waiting')
     )
-      activeSpawnTargets.set(receipt.targetId, receipt.receiptId);
+      activeSpawnTargets.set(
+        spawnTargetKey(receipt.targetDirectory ?? '', receipt.targetId),
+        receipt.receiptId,
+      );
   }
   const activeSpawnRequests = new SvelteSet<string>();
   const coordinationDeliveries = new SvelteMap<string, Promise<void>>();
@@ -1137,6 +1155,28 @@
     setSetting(notificationPrefsKey, JSON.stringify(notificationLoad.prefs));
   let crossValidation = $state(parseValidationSettings(getSetting(validationSettingsKey)));
   let modelRouting = $state(parseModelRoutingSettings(getSetting(modelRoutingSettingsKey)));
+  let resourceLimits = $state({
+    agent: parseResourceLimit(getSetting(resourceLimitKeys.agent), defaultResourceLimits.agent),
+    browser: parseResourceLimit(
+      getSetting(resourceLimitKeys.browser),
+      defaultResourceLimits.browser,
+    ),
+    e2e: parseResourceLimit(getSetting(resourceLimitKeys.e2e), defaultResourceLimits.e2e),
+  });
+  let pressureThresholds = $state({
+    memoryFreePercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.memoryFreePercent),
+      defaultPressureThresholds.memoryFreePercent,
+    ),
+    swapUsedPercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.swapUsedPercent),
+      defaultPressureThresholds.swapUsedPercent,
+    ),
+    diskFreePercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.diskFreePercent),
+      defaultPressureThresholds.diskFreePercent,
+    ),
+  });
   let contextHandoffThreshold = $state(
     parseContextHandoffThreshold(getSetting('sai-context-handoff-threshold')),
   );
@@ -1636,13 +1676,17 @@
   });
   function recordAnsweredPermission(
     agentId: string,
+    worktreeDirectory: string,
     sessionId: string,
     params: Record<string, unknown> | undefined,
   ) {
     const requestId = params?.requestId;
     if (typeof requestId !== 'string' && typeof requestId !== 'number') return;
-    const inboxKey = `acp:${agentId}:${sessionId}:${requestId}`;
-    const key = answeredPermissionKey(agentId, sessionId, requestId, params);
+    const inboxKey = `acp:${worktreeDirectory}:${agentId}:${sessionId}:${requestId}`;
+    const key = JSON.stringify([
+      worktreeDirectory,
+      answeredPermissionKey(agentId, sessionId, requestId, params),
+    ]);
     const title =
       inboxItems.find((item) => item.key === inboxKey)?.permissionTitle ??
       permissionTitles.get(inboxKey) ??
@@ -1651,25 +1695,34 @@
     if (answeredPermissions.some((item) => item.key === key)) return;
     answeredPermissions = [
       ...answeredPermissions,
-      { key, agentId, sessionId, title, outcome: permissionResolution(params) },
+      {
+        key,
+        agentId,
+        directory: worktreeDirectory,
+        sessionId,
+        title,
+        outcome: permissionResolution(params),
+      },
     ].slice(-50);
   }
   const shipOwnedThreads = $derived.by(() => {
     const owned = new SvelteSet<string>();
     for (const issue of shipRuns.flatMap((run) => run.issues)) {
-      if (issue.threadId) owned.add(issue.threadId);
-      for (const id of issue.checkpointThreadIds ?? []) owned.add(id);
+      if (!issue.path) continue;
+      if (issue.threadId) owned.add(shipOwnedTargetKey(issue.path, issue.threadId));
+      for (const id of issue.checkpointThreadIds ?? [])
+        owned.add(shipOwnedTargetKey(issue.path, id));
     }
     return owned;
   });
   async function stopSubagent(receipt: SpawnReceipt) {
     const policy = subagentStop(receipt, shipOwnedThreads);
     if (policy === 'parent-turn') throw new Error(parentTurnStopHint);
-    if (policy !== 'stop' || !receipt.targetId)
+    if (policy !== 'stop' || !receipt.targetId || !receipt.targetDirectory)
       throw new Error('This subagent stops through Stop run.');
     const match = /^acp:([^:]+):(.+)$/.exec(receipt.targetId);
     if (!match) throw new Error('This subagent cannot be stopped safely.');
-    await acp.cancel(match[1]!, match[2]!, receipt.turnId);
+    await acp.cancel(match[1]!, receipt.targetDirectory, match[2]!, receipt.turnId);
     updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
   }
   async function stopAllSubagents(receipts: SpawnReceipt[]) {
@@ -2019,6 +2072,8 @@
       mergeOwner,
       shipArchiveDelay,
       contextHandoffThreshold,
+      resourceLimits,
+      pressureThresholds,
     };
   }
 
@@ -2154,7 +2209,7 @@
           closingMain = true;
           void (async () => {
             try {
-              const agentActivity = await acp.activity();
+              const agentActivity = await acp.activity(directory);
               if (Object.values(agentActivity).some((agent) => agent.active.length > 0)) {
                 if (
                   !(await confirmInApp(
@@ -2244,6 +2299,18 @@
                     issue.contextPercent,
                     Math.max(0, contextHandoffThreshold - contextCheckpointLead - 1),
                   ).catch((cause) => (error = describe(cause)));
+        } else if (action.type === 'resource-limit') {
+          if (Number.isSafeInteger(action.value) && action.value >= 0 && action.value <= 32) {
+            resourceLimits = { ...resourceLimits, [action.kind]: action.value };
+            setSetting(resourceLimitKeys[action.kind], String(action.value));
+            if (action.kind !== 'e2e') setResourceLimit(action.kind, action.value);
+          }
+        } else if (action.type === 'pressure-threshold') {
+          if (Number.isSafeInteger(action.value) && action.value >= 0 && action.value <= 100) {
+            pressureThresholds = { ...pressureThresholds, [action.kind]: action.value };
+            setSetting(pressureThresholdKeys[action.kind], String(action.value));
+            setPressureThresholds(pressureThresholds);
+          }
         } else if (action.type === 'detect-agents') void detectAgents();
         else if (action.type === 'cross-validation') {
           crossValidation = action.value;
@@ -2957,7 +3024,7 @@
     if (shippingWorkerSettled(current)) return current;
     const match = /^acp:([^:]+):(.+)$/.exec(threadId);
     if (!match) throw new Error('A task worker identity cannot be stopped safely.');
-    await acp.cancel(match[1], match[2], null);
+    await acp.cancel(match[1], issue.path ?? '', match[2], null);
     return waitForSettledShipWorker(issue, threadId);
   }
 
@@ -3026,7 +3093,12 @@
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
     try {
       return acpReplacementDispatchAction(
-        await acp.turnEvidence(receipt.provider, sessionId, receipt.turnId),
+        await acp.turnEvidence(
+          receipt.provider,
+          receipt.targetDirectory,
+          sessionId,
+          receipt.turnId,
+        ),
       );
     } catch {
       return 'inspect';
@@ -3039,7 +3111,13 @@
     handoff: NonNullable<ShipIssue['contextHandoffs']>[number],
   ): Promise<void> {
     const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
-    if (!receipt || !receipt.targetId || !receipt.turnId || !handoffReceiptNeedsResolution(receipt))
+    if (
+      !receipt ||
+      !receipt.targetId ||
+      !receipt.targetDirectory ||
+      !receipt.turnId ||
+      !handoffReceiptNeedsResolution(receipt)
+    )
       throw new Error('This handoff no longer needs provider inspection.');
     const confirmed = await confirmInApp(
       'Cancel and retry context handoff?',
@@ -3048,7 +3126,7 @@
     );
     if (!confirmed) return;
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
-    await acp.cancel(receipt.provider, sessionId, receipt.turnId);
+    await acp.cancel(receipt.provider, receipt.targetDirectory, sessionId, receipt.turnId);
     updateSpawnReceipt(receipt.receiptId, {
       state: 'interrupted',
       error: 'Cancelled after provider inspection before a safe retry.',
@@ -3986,15 +4064,12 @@
       const available = (await acp.agents()).find((agent) => agent.id === run.provider);
       if (!available?.available)
         throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
-      await acp.connect(run.provider);
+      await acp.connect(run.provider, created.path);
       ensureClaimHeld();
-      const inlineGates = !crossValidation.choices.length && !crossValidation.strictDifferentModel;
-      const gateExecution = inlineGates
-        ? 'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run exactly those gates in this Ship It session with the implementation agent and model. Do not call validation_gate or require agent coordination.'
-        : 'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run exactly those gates in fresh subagent sessions. If a gate session cannot launch, pause and report the reason in this thread.';
-      const gateReporting = inlineGates
-        ? 'Before every adversary pass, read the checkpoint revision. After the pass, use ship_progress with that revision, its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, validator economics counters, and reason when blocked or failed.'
-        : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
+      const gateExecution =
+        'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
+      const gateReporting =
+        'Each validation session reports its own gate verdict through ship_progress; do not report review or test verdicts from this implementation session.';
       const target = shippingTarget;
       const prompt = shipWorkerPrompt({
         issueUrl: issue.url,
@@ -4237,12 +4312,13 @@
 
   async function waitForAcpWorkerTermination(
     agent: string,
+    worktreeDirectory: string,
     sessionId: string,
     turnId: string | null,
     deadline: number,
   ): Promise<void> {
     const [agentActivity, interrupted] = await Promise.all([
-      acp.activity(),
+      acp.activity(worktreeDirectory),
       acp.interruptedTurns(),
     ]);
     if (acpWorkerTerminationConfirmed(agentActivity[agent], interrupted, agent, sessionId, turnId))
@@ -4250,7 +4326,7 @@
     if (monotonicDeadlineExpired(performance.now(), deadline))
       throw new Error('ACP worker did not confirm termination after cancellation.');
     await new Promise((resolve) => setTimeout(resolve, 100));
-    return waitForAcpWorkerTermination(agent, sessionId, turnId, deadline);
+    return waitForAcpWorkerTermination(agent, worktreeDirectory, sessionId, turnId, deadline);
   }
 
   async function stopShippingThread(issue: ShipIssue, threadId: string): Promise<void> {
@@ -4266,8 +4342,14 @@
     const [, agent, sessionId] = match;
     const turnId = receipt?.turnId ?? null;
     try {
-      await acp.cancel(agent, sessionId, turnId);
-      await waitForAcpWorkerTermination(agent, sessionId, turnId, performance.now() + 5_000);
+      await acp.cancel(agent, issue.path ?? '', sessionId, turnId);
+      await waitForAcpWorkerTermination(
+        agent,
+        issue.path ?? '',
+        sessionId,
+        turnId,
+        performance.now() + 5_000,
+      );
     } catch (cause) {
       if (!shippingWorkerGone(cause)) throw cause;
     }
@@ -4396,11 +4478,6 @@
 
   const shippingPullRequests = new SvelteMap<string, ShippingPullRequest | null>();
   const shippingPullRequestGenerations = new Map<string, number>();
-  const inlineValidationReservations = new Map<
-    string,
-    { sequence: number; evidenceSequence: number }
-  >();
-
   async function refreshShippingPullRequest(
     run: ShipRun,
     issue: ShipIssue,
@@ -4543,7 +4620,7 @@
     const [, agent, sessionId] = match;
     try {
       const [agentActivity, interrupted] = await Promise.all([
-        acp.activity(),
+        acp.activity(issue.path ?? ''),
         acp.interruptedTurns(),
       ]);
       const state = agentActivity[agent];
@@ -5480,7 +5557,7 @@
       updateSpawnReceipt(receipt.receiptId, { state: 'unavailable' });
       return spawnReceipts.find((item) => item.receiptId === receipt.receiptId) ?? receipt;
     }
-    const receiptActivity = await acp.activity().then(
+    const receiptActivity = await acp.activity(receipt.targetDirectory).then(
       (states) => states[receipt.provider],
       () => null,
     );
@@ -5493,14 +5570,15 @@
     authorization: DirectShipAuthorization,
   ): Promise<void> {
     if (!receipt.targetId || !receipt.targetDirectory || !receipt.turnId || !receipt.prompt) return;
-    const agentActivity = await acp.activity();
+    const targetDirectory = receipt.targetDirectory;
+    const agentActivity = await acp.activity(targetDirectory);
     const state = agentActivity[receipt.provider];
     if (acpPromptHasBackendEvidence(receipt, state ?? null)) return;
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
     if (await reconcileDurableAcpTurn(receipt, sessionId)) return;
     activeSpawnRequests.add(receipt.receiptId);
     try {
-      const info = await acp.connect(receipt.provider);
+      const info = await acp.connect(receipt.provider, targetDirectory);
       const capabilities = info.agentCapabilities;
       const sessionCapabilities =
         capabilities && typeof capabilities === 'object' && 'sessionCapabilities' in capabilities
@@ -5512,14 +5590,14 @@
         'resume' in sessionCapabilities;
       const capabilityProfile = capabilityProfileForAcpSession(
         receipt.provider,
-        receipt.targetDirectory,
+        targetDirectory,
         sessionId,
         receipt.validation ? 'review' : undefined,
       );
       if (canResume)
-        await acp.resume(receipt.provider, receipt.targetDirectory, sessionId, capabilityProfile);
-      else await acp.load(receipt.provider, receipt.targetDirectory, sessionId, capabilityProfile);
-      const restoredActivity = (await acp.activity())[receipt.provider] ?? null;
+        await acp.resume(receipt.provider, targetDirectory, sessionId, capabilityProfile);
+      else await acp.load(receipt.provider, targetDirectory, sessionId, capabilityProfile);
+      const restoredActivity = (await acp.activity(targetDirectory))[receipt.provider] ?? null;
       if (acpPromptHasBackendEvidence(receipt, restoredActivity)) {
         reconcileAcpSpawnReceipt(receipt, restoredActivity);
         return;
@@ -5527,15 +5605,27 @@
       if (await reconcileDurableAcpTurn(receipt, sessionId, true)) return;
       requireSpawnPromptDispatch(receipt.receiptId);
       const recalledPrompt = await withAutomaticMemoryRecall({
-        directory: receipt.targetDirectory,
+        directory: targetDirectory,
         prompt: receipt.prompt,
         query: receipt.prompt,
         sessionKey: `acp:${receipt.provider}:${sessionId}`,
       });
+      let queued = false;
       const turn = dispatchAuthorizedDirectShipPrompt(authorization, () =>
-        acp.prompt(receipt.provider, sessionId, recalledPrompt, receipt.turnId!),
+        acp.prompt(
+          receipt.provider,
+          targetDirectory,
+          sessionId,
+          recalledPrompt,
+          receipt.turnId!,
+          [],
+          (limit) => {
+            queued = limit !== null;
+          },
+          false,
+        ),
       );
-      activeSpawnTargets.set(receipt.targetId, receipt.receiptId);
+      activeSpawnTargets.set(spawnTargetKey(targetDirectory, receipt.targetId), receipt.receiptId);
       void turn.then(
         (outcome) => {
           const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
@@ -5544,8 +5634,11 @@
             result: spawnOutput.get(receipt.receiptId) ?? current?.result ?? null,
           });
           spawnOutput.delete(receipt.receiptId);
-          if (activeSpawnTargets.get(receipt.targetId!) === receipt.receiptId)
-            activeSpawnTargets.delete(receipt.targetId!);
+          if (
+            activeSpawnTargets.get(spawnTargetKey(targetDirectory, receipt.targetId!)) ===
+            receipt.receiptId
+          )
+            activeSpawnTargets.delete(spawnTargetKey(targetDirectory, receipt.targetId!));
           return undefined;
         },
         async (cause) => {
@@ -5555,15 +5648,22 @@
               error: `Prompt dispatch can be retried: ${describe(cause)}`,
             });
           spawnOutput.delete(receipt.receiptId);
-          if (activeSpawnTargets.get(receipt.targetId!) === receipt.receiptId)
-            activeSpawnTargets.delete(receipt.targetId!);
+          if (
+            activeSpawnTargets.get(spawnTargetKey(targetDirectory, receipt.targetId!)) ===
+            receipt.receiptId
+          )
+            activeSpawnTargets.delete(spawnTargetKey(targetDirectory, receipt.targetId!));
           return undefined;
         },
       );
-      await awaitCoordinationStart(turn, async () => {
-        const current = (await acp.activity())[receipt.provider];
-        return current?.activeTurns[sessionId] === receipt.turnId;
-      });
+      await awaitCoordinationStart(
+        turn,
+        async () => {
+          const current = (await acp.activity(targetDirectory))[receipt.provider];
+          return current?.activeTurns[sessionId] === receipt.turnId;
+        },
+        () => queued,
+      );
       const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
       if (current?.state === 'starting')
         updateSpawnReceipt(receipt.receiptId, { state: 'working' });
@@ -5577,8 +5677,13 @@
     sessionId: string,
     providerRestored = false,
   ): Promise<boolean> {
-    if (!receipt.turnId) return false;
-    const evidence = await acp.turnEvidence(receipt.provider, sessionId, receipt.turnId);
+    if (!receipt.targetDirectory || !receipt.turnId) return false;
+    const evidence = await acp.turnEvidence(
+      receipt.provider,
+      receipt.targetDirectory,
+      sessionId,
+      receipt.turnId,
+    );
     if (acpTurnPromptCanRetry(evidence)) return false;
     if (acpTurnNeedsProviderInspection(evidence) && !providerRestored) return false;
     const state = acpTurnEvidenceState(evidence);
@@ -5605,7 +5710,10 @@
       return;
     if (state === 'working' || state === 'waiting') {
       updateSpawnReceipt(receipt.receiptId, { state });
-      activeSpawnTargets.set(receipt.targetId!, receipt.receiptId);
+      activeSpawnTargets.set(
+        spawnTargetKey(receipt.targetDirectory ?? '', receipt.targetId!),
+        receipt.receiptId,
+      );
     } else {
       const sessionId = receipt.targetId?.slice(`acp:${receipt.provider}:`.length);
       const outcome = sessionId ? agentActivity?.finished[sessionId] : undefined;
@@ -5619,37 +5727,47 @@
       });
       if (state === 'completed' && !spawnOutput.has(receipt.receiptId))
         void recoverAcpSpawnResult(receipt).catch(() => undefined);
-      if (receipt.targetId && activeSpawnTargets.get(receipt.targetId) === receipt.receiptId)
-        activeSpawnTargets.delete(receipt.targetId);
+      if (
+        receipt.targetId &&
+        activeSpawnTargets.get(spawnTargetKey(receipt.targetDirectory ?? '', receipt.targetId)) ===
+          receipt.receiptId
+      )
+        activeSpawnTargets.delete(spawnTargetKey(receipt.targetDirectory ?? '', receipt.targetId));
     }
   }
 
   async function recoverAcpSpawnResult(receipt: SpawnReceipt) {
-    if (!receipt.targetId || !receipt.targetDirectory || !receipt.prompt || !receipt.turnId) return;
+    const targetDirectory = receipt.targetDirectory;
+    if (
+      !receipt.targetId ||
+      typeof targetDirectory !== 'string' ||
+      !receipt.prompt ||
+      !receipt.turnId
+    )
+      return;
+    const worktreeDirectory: string = targetDirectory;
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
     async function isLatestFinishedTurn() {
-      const activity = await acp.activity().catch(() => null);
+      const activity = await acp.activity(worktreeDirectory).catch(() => null);
       return receiptIsLatestFinishedTurn(receipt, activity?.[receipt.provider], sessionId);
     }
     const replay: AgentEntry[] = [];
     const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
-      if (payload.agent !== receipt.provider || payload.message.method !== 'session/update') return;
-      const params = payload.message.params;
-      if (params?.sessionId !== sessionId) return;
-      const update = params.update;
+      if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId)) return;
+      const update = payload.message.params?.update;
       if (update && typeof update === 'object')
         updateEntriesInPlace(replay, update as Record<string, unknown>);
     });
-    setAgentReplay(receipt.provider, sessionId, true);
+    setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
     try {
-      await acp.connect(receipt.provider);
+      await acp.connect(receipt.provider, worktreeDirectory);
       await acp.load(
         receipt.provider,
-        receipt.targetDirectory,
+        worktreeDirectory,
         sessionId,
         capabilityProfileForAcpSession(
           receipt.provider,
-          receipt.targetDirectory,
+          worktreeDirectory,
           sessionId,
           receipt.validation ? 'review' : undefined,
         ),
@@ -5660,7 +5778,7 @@
     } catch {
       return;
     } finally {
-      setAgentReplay(receipt.provider, sessionId, false);
+      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
       unlisten();
     }
   }
@@ -5680,7 +5798,7 @@
     if (matches.length > 1) throw new Error('The source agent session is ambiguous.');
     const thread = matches[0];
     if (!thread) throw new Error('The source agent session is unavailable.');
-    const runtime = (await acp.activity())[thread.agent];
+    const runtime = (await acp.activity(thread.directory))[thread.agent];
     if (!runtime?.alive || !runtime.sessions.includes(thread.sessionId))
       throw new Error('The source agent session is unavailable.');
     return { kind: 'acp', agent: thread.agent, title: thread.title };
@@ -5754,8 +5872,8 @@
             target.id === `acp:${item.agent}:${item.sessionId}`,
         );
         if (!thread) throw new Error('The receiving thread is unavailable.');
-        const info = await acp.connect(thread.agent);
-        const agentActivity = (await acp.activity())[thread.agent];
+        const info = await acp.connect(thread.agent, thread.directory);
+        const agentActivity = (await acp.activity(thread.directory))[thread.agent];
         if (!agentActivity?.sessions.includes(thread.sessionId)) {
           const capabilities = info.agentCapabilities;
           const sessionCapabilities =
@@ -5802,6 +5920,7 @@
           shippingReceipt = receipt;
         }
         let turn: ReturnType<typeof acp.prompt>;
+        let queued = false;
         try {
           if (owner && shippingReceipt) {
             const originalReceipt = { ...shippingReceipt };
@@ -5817,19 +5936,49 @@
                   error: null,
                   updated: Date.now(),
                 });
-                activeSpawnTargets.set(target.id, shippingReceipt!.receiptId);
+                activeSpawnTargets.set(
+                  spawnTargetKey(target.directory, target.id),
+                  shippingReceipt!.receiptId,
+                );
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
               async () => {
-                if (activeSpawnTargets.get(target.id) === shippingReceipt!.receiptId)
-                  activeSpawnTargets.delete(target.id);
+                if (
+                  activeSpawnTargets.get(spawnTargetKey(target.directory, target.id)) ===
+                  shippingReceipt!.receiptId
+                )
+                  activeSpawnTargets.delete(spawnTargetKey(target.directory, target.id));
                 saveSpawnReceipt(originalReceipt);
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
-              () => acp.prompt(thread.agent, thread.sessionId, recalledText, turnId),
+              () =>
+                acp.prompt(
+                  thread.agent,
+                  thread.directory,
+                  thread.sessionId,
+                  recalledText,
+                  turnId,
+                  [],
+                  (limit) => {
+                    queued = limit !== null;
+                  },
+                  false,
+                ),
             );
             turn = started.turn;
-          } else turn = acp.prompt(thread.agent, thread.sessionId, recalledText, turnId);
+          } else
+            turn = acp.prompt(
+              thread.agent,
+              thread.directory,
+              thread.sessionId,
+              recalledText,
+              turnId,
+              [],
+              (limit) => {
+                queued = limit !== null;
+              },
+              false,
+            );
         } catch {
           abandonImplementationTurn(thread.directory, tracking);
           return;
@@ -5854,8 +6003,11 @@
                     spawnOutput.get(shippingReceipt.receiptId) ?? shippingReceipt.result ?? null,
                 });
                 spawnOutput.delete(shippingReceipt.receiptId);
-                if (activeSpawnTargets.get(target.id) === shippingReceipt.receiptId)
-                  activeSpawnTargets.delete(target.id);
+                if (
+                  activeSpawnTargets.get(spawnTargetKey(target.directory, target.id)) ===
+                  shippingReceipt.receiptId
+                )
+                  activeSpawnTargets.delete(spawnTargetKey(target.directory, target.id));
               }
               return undefined;
             },
@@ -5868,6 +6020,7 @@
                 return undefined;
               const interrupted = await acpFailedPromptInterrupted(
                 thread.agent,
+                thread.directory,
                 thread.sessionId,
                 turnId,
               );
@@ -5878,8 +6031,11 @@
                   error: interrupted ? null : describe(cause),
                 });
                 spawnOutput.delete(shippingReceipt.receiptId);
-                if (activeSpawnTargets.get(target.id) === shippingReceipt.receiptId)
-                  activeSpawnTargets.delete(target.id);
+                if (
+                  activeSpawnTargets.get(spawnTargetKey(target.directory, target.id)) ===
+                  shippingReceipt.receiptId
+                )
+                  activeSpawnTargets.delete(spawnTargetKey(target.directory, target.id));
               }
               if (!interrupted) error = `Agent message turn failed: ${describe(cause)}`;
               return undefined;
@@ -5889,10 +6045,14 @@
             abandonImplementationTurn(thread.directory, tracking);
             error = `Could not track agent message turn: ${describe(cause)}`;
           });
-        await awaitCoordinationStart(turn, async () => {
-          const state = (await acp.activity())[thread.agent];
-          return !!state?.active.includes(thread.sessionId);
-        });
+        await awaitCoordinationStart(
+          turn,
+          async () => {
+            const state = (await acp.activity(thread.directory))[thread.agent];
+            return !!state?.active.includes(thread.sessionId);
+          },
+          () => queued,
+        );
         finishCoordinationDelivery(message);
         return undefined;
       });
@@ -5909,7 +6069,7 @@
 
   async function waitForCoordinationThread(thread: AgentThread): Promise<void> {
     if (disposed) return;
-    const agentActivity = (await acp.activity())[thread.agent];
+    const agentActivity = (await acp.activity(thread.directory))[thread.agent];
     if (!agentActivity?.active.includes(thread.sessionId)) return;
     await new Promise((resolve) => setTimeout(resolve, 1000));
     return waitForCoordinationThread(thread);
@@ -6723,137 +6883,10 @@
           item.targetId === sourceId &&
           item.targetDirectory === request.directory,
       );
-      if (!receipt?.validation) {
-        requireValidatorEconomics(report, false);
-        if (crossValidation.choices.length || crossValidation.strictDifferentModel)
-          throw new Error(
-            'Inline gate verdicts are disabled while cross-validation is configured.',
-          );
-        if (!('gate' in report))
-          throw new Error('The implementation session must identify the completed inline gate.');
-        const owner = shipOwner(shipRuns, request.directory, sourceId);
-        if (!owner)
-          throw new Error('Only the assigned Ship worker can report inline gate verdicts.');
-        const { sequence, evidenceSequence } = reserveInlineValidation(
-          inlineValidationReservations,
-          `${owner.run.id}:${owner.issue.id}`,
-          owner.issue.gates ?? [],
-          owner.issue.evidenceManifests ?? [],
+      if (!receipt?.validation)
+        throw new Error(
+          'Ship It gate verdicts must come from a fresh validation subagent session.',
         );
-        const policy = owner.issue.validationPolicy;
-        const shippingTarget = await shippingTargetFor(owner.run, owner.issue, request.directory);
-        const [revision, baseRevision] = await Promise.all([
-          invoke<string>('working_tree_revision', { path: request.directory }),
-          invoke<string>('shipping_base_revision', {
-            path: request.directory,
-            baseRef: shippingTarget.baseRef,
-          }),
-        ]);
-        assertShipGateAllowed(policy, report.gate, revision, baseRevision);
-        validateGateVerdict(report.gate, report.verdict);
-        const now = Date.now();
-        const model = resolvedWorkerModel(owner.issue) ?? null;
-        const gateId = `inline:${sourceId}:${report.gate}:${crypto.randomUUID()}`;
-        await commitRevisionBoundValidation({
-          expectedRevision: policy?.revision,
-          expectedMutationGeneration: policy?.mutationGeneration,
-          expectedBaseRevision: policy?.baseRevision,
-          readRevision: () => invoke<string>('working_tree_revision', { path: request.directory }),
-          readMutationGeneration: () =>
-            invoke<string>('working_tree_generation', { path: request.directory }),
-          readBaseRevision: () =>
-            invoke<string>('shipping_base_revision', {
-              path: request.directory,
-              baseRef: shippingTarget.baseRef,
-            }),
-          prepare: async () => {
-            const evidenceChanges = await recordGateEvidence(
-              owner,
-              report.gate,
-              report.verdict,
-              owner.run.provider,
-              model,
-              report.criteria,
-              report.untestedCriteria,
-              report.outputReference,
-              `thread:${sourceId}`,
-              report.revision,
-              baseRevision,
-              {
-                id: `gate:${gateId}`,
-                timestamp: now,
-                sequence: evidenceSequence,
-              },
-              report.economics,
-            );
-            requireEvidenceBaseRevision(
-              evidenceChanges.evidenceRevision!,
-              owner.issue.evidenceRevision,
-            );
-            return evidenceChanges;
-          },
-          commit: async (evidenceChanges, registerRollback) => {
-            const previous = validationIssueSnapshot(owner.issue);
-            let committed = previous;
-            registerRollback(async () => {
-              Object.assign(
-                owner.issue,
-                rollbackValidationIssue(owner.issue, previous, committed, `gate:${gateId}`, gateId),
-              );
-              await saveShipRuns();
-            });
-            const { evidenceSequence: recordedEvidenceSequence, ...issueEvidenceChanges } =
-              evidenceChanges;
-            await updateShipIssue(
-              owner.run,
-              owner.issue,
-              {
-                ...issueEvidenceChanges,
-                stage: report.gate === 'test-adversary' ? 'testing' : 'reviewing',
-                reportedStatus: 'running',
-                blockedReason: report.verdict === 'BLOCKED' ? report.reason : null,
-                gates: [
-                  ...(owner.issue.gates ?? []),
-                  completedInlineShipGate(
-                    {
-                      id: gateId,
-                      gate: report.gate,
-                      requestedModel: model ?? 'implementation session',
-                      sequence,
-                      provider: owner.run.provider,
-                      model,
-                      threadId: sourceId,
-                      directory: request.directory,
-                      error: null,
-                      verdict: report.verdict,
-                      reason: report.reason,
-                      revision,
-                      mutationGeneration: policy?.mutationGeneration,
-                      baseRevision,
-                      evidenceSequence: recordedEvidenceSequence,
-                      evidenceCriteria: report.criteria ?? [],
-                      evidenceUntestedCriteria: report.untestedCriteria ?? [],
-                      evidenceOutputReference: report.outputReference ?? `thread:${sourceId}`,
-                      evidenceTimestamp: now,
-                      evidenceEconomics: report.economics,
-                    },
-                    now,
-                  ),
-                ],
-                events: appendShipEvent(
-                  owner.issue.events,
-                  `${report.gate}: ${report.verdict}`,
-                  report.reason,
-                ),
-              },
-              false,
-            );
-            committed = validationIssueSnapshot(owner.issue);
-            await saveShipRuns();
-          },
-        });
-        return { status: 'recorded' };
-      }
       const validation = receipt.validation;
       if (shippingWorkerSettled(receipt.state))
         throw new Error('This validation attempt has already finished.');
@@ -7024,55 +7057,54 @@
     sourceId: string,
   ) {
     if (!agentWorktreesEnabled) throw new Error('Agent coordination is disabled in settings.');
-    const { gate, prompt, implementingModels } = request.arguments;
-    if (!['code-adversary', 'findings-adversary', 'test-adversary'].includes(String(gate)))
+    const { gate, prompt } = request.arguments;
+    if (
+      !['inline-review', 'code-adversary', 'findings-adversary', 'test-adversary'].includes(
+        String(gate),
+      )
+    )
       throw new Error('Choose a Ship It validation gate.');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Gate prompt must be 1–8000 characters.');
     const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. A PASS (partial) must also provide untestedCriteria as exact criterion and environmental blocker pairs, disjoint from criteria. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
-    if (
-      !Array.isArray(implementingModels) ||
-      !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
-    )
-      throw new Error('List every implementation model.');
     await recoverImplementationModels(request.directory);
     const activeModels = await activeImplementationModels(request.directory, sourceId);
     if (!activeModels)
-      throw new Error('The active implementation model is unknown. Wait for the turn to finish.');
-    const usedModels = [
-      ...new Set([
-        ...implementationModels(request.directory),
-        ...activeModels,
-        ...implementingModels,
-      ]),
-    ];
-    if (implementationAttributionUncertain(request.directory))
-      throw new Error('Concurrent agent turns prevent reliable implementation model attribution.');
+      throw new Error('Implementation activity is still unresolved. Wait for the turn to finish.');
     const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
     const routeRisk = gateOwner?.issue.validationPolicy?.risk ?? 'medium';
-    const configuredReviewRoute = modelRouting.routes.find(
-      (candidate) => candidate.role === 'review' && candidate.risk === routeRisk,
+    const routeRole = gate === 'test-adversary' ? 'testing' : 'review';
+    const configuredGateRoute = modelRouting.routes.find(
+      (candidate) => candidate.role === routeRole && candidate.risk === routeRisk,
     );
-    const reviewSelection = configuredReviewRoute
-      ? selectModelRoute(modelRouting, {
-          role: 'review',
-          risk: routeRisk,
-          implementingModels: usedModels,
-        })
+    const routeSelection = configuredGateRoute
+      ? selectModelRoute(modelRouting, { role: routeRole, risk: routeRisk })
       : null;
-    if (reviewSelection && !reviewSelection.route)
-      throw new Error(reviewSelection.reason ?? 'No eligible review route.');
-    const validationSettings = reviewSelection?.route
-      ? {
-          choices: [
-            {
-              agent: reviewSelection.route.provider,
-              model: reviewSelection.route.model,
-            },
-          ],
-          strictDifferentModel: reviewSelection.independentReviewRequired,
-        }
+    if (routeSelection && !routeSelection.route)
+      throw new Error(routeSelection.reason ?? `No eligible ${routeRole} route.`);
+    const validationSettings = routeSelection?.route
+      ? { choices: [{ agent: routeSelection.route.provider, model: routeSelection.route.model }] }
       : crossValidation;
+    const sourceThread = agentThreads.find(
+      (thread) =>
+        thread.directory === request.directory &&
+        thread.sessionId === request.sessionId &&
+        thread.agent === request.sourceAgent,
+    );
+    const defaultAgent = gateOwner?.run.provider ?? request.sourceAgent;
+    if (!defaultAgent || !['claude', 'codex', 'opencode'].includes(defaultAgent))
+      throw new Error('The assigned Ship worker provider is unavailable.');
+    const implementationModel =
+      (gateOwner ? resolvedWorkerModel(gateOwner.issue) : undefined) ?? sourceThread?.model;
+    const defaultGateRoute: ValidationRoute = {
+      agent: defaultAgent,
+      ...(implementationModel && !hasUnresolvedModelAlias(implementationModel)
+        ? { model: implementationModel }
+        : {}),
+    };
+    const gateRoutes: ValidationRoute[] = validationSettings.choices.length
+      ? validationSettings.choices
+      : [defaultGateRoute];
     const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
       repository: project,
       paths: [request.directory],
@@ -7081,27 +7113,27 @@
     if (!worktree) throw new Error('Source worktree is no longer registered with Git.');
     const branch = worktree.branch ?? '';
     const agents = await acp.agents();
-    const available = validationSettings.choices.filter((choice) =>
+    const available = gateRoutes.filter((choice) =>
       agents.some((agent) => agent.id === choice.agent && agent.available),
     );
-    async function tryChoice(candidates: ValidationChoice[], reasons: string[]): Promise<unknown> {
+    async function tryChoice(candidates: ValidationRoute[], reasons: string[]): Promise<unknown> {
       const currentCandidates = candidates.filter((candidate) =>
-        validationSettings.choices.some(
+        gateRoutes.some(
           (selected) => selected.agent === candidate.agent && selected.model === candidate.model,
         ),
       );
       if (!currentCandidates.length) {
-        const unavailable = selectValidationChoice(validationSettings, [], usedModels);
+        const unavailable = selectValidationChoice({ choices: gateRoutes }, []);
         throw new Error([unavailable.reason, ...reasons].filter(Boolean).join(' '));
       }
-      const route = selectValidationChoice(validationSettings, currentCandidates, usedModels);
+      const route = selectValidationChoice({ choices: gateRoutes }, currentCandidates);
       if (!route.choice) throw new Error(route.reason ?? 'No eligible validation model.');
-      const choice: ValidationChoice = route.choice;
+      const choice: ValidationRoute = route.choice;
       const gateSource: CoordinationSource = {
         kind: 'acp',
         agent: choice.agent,
-        model: acpModelId(choice.agent, choice.model),
-        variant: reviewSelection?.route?.variant,
+        ...(choice.model ? { model: acpModelId(choice.agent, choice.model) } : {}),
+        variant: routeSelection?.route?.variant,
         title: String(gate),
       };
       const receiptId = crypto.randomUUID();
@@ -7128,23 +7160,16 @@
       );
       const ensureSelected = async () => {
         const selectedCandidates = currentCandidates.filter((candidate) =>
-          validationSettings.choices.some(
+          gateRoutes.some(
             (selected) => selected.agent === candidate.agent && selected.model === candidate.model,
           ),
         );
         const active = await activeImplementationModels(request.directory, sourceId);
-        if (!active || implementationAttributionUncertain(request.directory))
+        if (!active)
           throw new Error(
-            'Concurrent agent turns prevent reliable implementation model attribution.',
+            'Implementation activity is still unresolved. Wait for the turn to finish.',
           );
-        const latestModels = [
-          ...new Set([...implementationModels(request.directory), ...active, ...usedModels]),
-        ];
-        const current = selectValidationChoice(
-          validationSettings,
-          selectedCandidates,
-          latestModels,
-        ).choice;
+        const current = selectValidationChoice({ choices: gateRoutes }, selectedCandidates).choice;
         if (current?.agent !== choice.agent || current.model !== choice.model)
           throw new Error('Validation model selection changed before launch. Retry the gate.');
       };
@@ -7163,26 +7188,22 @@
         prompt: gatePrompt,
         validation: {
           gate: gate as import('./lib/ship-progress').GateName,
-          requestedModel: choice.model,
+          requestedModel: choice.model ?? 'implementation model',
           sequence,
           evidenceSequence,
           protocolVersion: 2,
         },
-        ...(reviewSelection?.route
-          ? {
-              routing: {
-                role: 'review' as const,
-                risk: routeRisk,
-                independentReviewRequired: reviewSelection.independentReviewRequired,
-                requested: {
-                  provider: reviewSelection.route.provider,
-                  model: reviewSelection.route.model,
-                  variant: reviewSelection.route.variant ?? null,
-                },
-                actual: null,
-              },
-            }
-          : {}),
+        routing: {
+          role: routeRole,
+          risk: routeRisk,
+          contextIsolationRequired: true,
+          requested: {
+            provider: choice.agent as SpawnReceipt['provider'],
+            model: choice.model ?? null,
+            variant: routeSelection?.route?.variant ?? null,
+          },
+          actual: null,
+        },
         state: 'starting',
         created: Date.now(),
         updated: Date.now(),
@@ -7193,7 +7214,7 @@
       await saveShipRuns();
       try {
         try {
-          await acp.connect(choice.agent);
+          await acp.connect(choice.agent, request.directory);
         } catch (cause) {
           throw new ValidationCandidateUnavailable(
             `Provider ${choice.agent} is unavailable`,
@@ -7214,7 +7235,7 @@
         updateSpawnReceipt(receiptId, {
           validation: {
             gate: gate as import('./lib/ship-progress').GateName,
-            requestedModel: choice.model,
+            requestedModel: choice.model ?? 'implementation model',
             sequence,
             evidenceSequence,
             revision,
@@ -7259,7 +7280,7 @@
           sourceId,
           targetId: started.threadId,
           provider: choice.agent,
-          model: choice.model,
+          model: choice.model ?? null,
           gate,
           status: 'started',
         };
@@ -7268,7 +7289,10 @@
         if (!(cause instanceof ValidationCandidateUnavailable)) throw cause;
         return tryChoice(
           candidates.filter((item) => item !== choice),
-          [...reasons, `${choice.agent} / ${choice.model}: ${describe(cause)}`],
+          [
+            ...reasons,
+            `${choice.agent} / ${choice.model ?? 'implementation default'}: ${describe(cause)}`,
+          ],
         );
       }
     }
@@ -7304,7 +7328,9 @@
     if (
       routed &&
       (typeof role !== 'string' ||
-        !['exploration', 'implementation', 'debugging', 'review', 'ci-triage'].includes(role) ||
+        !['exploration', 'implementation', 'debugging', 'review', 'testing', 'ci-triage'].includes(
+          role,
+        ) ||
         typeof risk !== 'string' ||
         !shipRiskLevels.includes(risk as ShipRisk))
     )
@@ -7338,8 +7364,6 @@
       ? selectModelRoute(modelRouting, {
           role: role as ModelRouteRole,
           risk: risk as ShipRisk,
-          implementingModels:
-            role === 'review' ? implementationModels(request.directory) : undefined,
         })
       : null;
     if (routeSelection?.reason)
@@ -7405,7 +7429,7 @@
             routing: {
               role: role as ModelRouteRole,
               risk: risk as ShipRisk,
-              independentReviewRequired: routeSelection.independentReviewRequired,
+              contextIsolationRequired: routeSelection.contextIsolationRequired,
               requested: {
                 provider: chosenProvider,
                 model: route?.model ?? null,
@@ -7421,9 +7445,56 @@
     if (Date.now() >= request.expiresAt)
       throw new Error('The agent spawn request expired before launch.');
     // Return before the backend's five-minute coordination timeout.
-    const responseDeadline = request.expiresAt + 180_000;
-    const previousSpawn = agentSpawnQueue;
+    let responseDeadline = request.expiresAt + 180_000;
+    let pressureQueuedAt: number | null = null;
+    let resolveQueuedResponse: ((value: Record<string, unknown>) => void) | null = null;
+    const queuedResponse = new Promise<Record<string, unknown>>((resolve) => {
+      resolveQueuedResponse = resolve;
+    });
+    const onPressureQueue = (limit: number | null, reason: string | null) => {
+      if (limit !== null && !isCheckingMachinePressure(reason)) {
+        pressureQueuedAt ??= Date.now();
+        updateSpawnReceipt(receiptId, { state: 'queued' });
+        resolveQueuedResponse?.({
+          status: 'queued',
+          receiptId,
+          accessKey: receiptAccessKey,
+          sourceId,
+          reason: reason ?? 'Waiting for agent capacity.',
+        });
+        resolveQueuedResponse = null;
+      } else if (pressureQueuedAt !== null && limit === null) {
+        responseDeadline += Date.now() - pressureQueuedAt;
+        pressureQueuedAt = null;
+      }
+    };
+    let releaseSpawnQueue: (() => void) | null = null;
     const launched = (async () => {
+      await coordinationSource(request);
+      updateSpawnReceipt(receiptId, { state: 'starting' });
+
+      if (destination) {
+        const targetPath = destination.path;
+        const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+          repository: project,
+          paths: [targetPath],
+        });
+        if (!registered.some((worktree) => worktree.path === targetPath))
+          throw new Error('Target worktree is no longer registered with Git.');
+      }
+
+      const pressureDirectory =
+        destination?.path ??
+        (await invoke<string>('worktree_pressure_directory', { repository: project }));
+      await acp.connect(chosenProvider, destination?.path ?? request.directory, undefined, {
+        directory: pressureDirectory,
+        onQueue: onPressureQueue,
+      });
+      updateSpawnReceipt(receiptId, { state: 'starting' });
+      const previousSpawn = agentSpawnQueue;
+      agentSpawnQueue = new Promise<void>((resolve) => {
+        releaseSpawnQueue = resolve;
+      });
       const queueRemaining = responseDeadline - Date.now();
       if (queueRemaining <= 0) throw new Error('Agent spawn timed out while waiting to launch.');
       await new Promise<void>((resolve, reject) => {
@@ -7441,20 +7512,6 @@
       });
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out while waiting to launch.');
-      await coordinationSource(request);
-      updateSpawnReceipt(receiptId, { state: 'starting' });
-
-      if (destination) {
-        const targetPath = destination.path;
-        const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
-          repository: project,
-          paths: [targetPath],
-        });
-        if (!registered.some((worktree) => worktree.path === targetPath))
-          throw new Error('Target worktree is no longer registered with Git.');
-      }
-
-      await acp.connect(chosenProvider);
       if (!destination) {
         const created = await invoke<{ path: string; branch: string; setup: string }>(
           'create_worktree',
@@ -7537,6 +7594,12 @@
         receiptId,
         false,
         requireResponseTime,
+        undefined,
+        undefined,
+        (limit, reason) => {
+          onPressureQueue(limit, reason);
+          if (limit === null) updateSpawnReceipt(receiptId, { state: 'working' });
+        },
       );
       activeSpawnRequests.delete(receiptId);
       return {
@@ -7547,13 +7610,21 @@
         sourceId,
         targetId: started.threadId,
         ...(routeSelection
-          ? { independentReviewRequired: routeSelection.independentReviewRequired }
+          ? { contextIsolationRequired: routeSelection.contextIsolationRequired }
           : {}),
         status: 'started',
       };
     })();
-    agentSpawnQueue = launched.catch(() => undefined);
-    return launched;
+    const trackedLaunch = launched
+      .finally(() => releaseSpawnQueue?.())
+      .catch((cause) => {
+        const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+        if (receipt && !receiptIsSettled(receipt.state))
+          updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        activeSpawnRequests.delete(receiptId);
+        throw cause;
+      });
+    return Promise.race([trackedLaunch, queuedResponse]);
   }
 
   async function startCoordinatedThread(
@@ -7565,21 +7636,23 @@
     beforePrompt?: () => Promise<void>,
     nativeGeneration?: number,
     promptAuthorization?: DirectShipAuthorization,
+    onPromptQueue?: (limit: number | null, reason: string | null) => void,
   ) {
-    if (validation) {
-      const model = source.model;
-      if (!model || hasUnresolvedModelAlias(model))
-        throw new ValidationCandidateUnavailable(
-          'Cannot verify the actual validation model behind an alias. Select a concrete model ID.',
-        );
-    }
+    const requestedModel =
+      validation && source.model && hasUnresolvedModelAlias(source.model)
+        ? undefined
+        : source.model;
     if (!validation)
       await beginShipItRun(created.path, prompt, promptSkill(skills, prompt)?.name ?? null);
     const routingRole = receiptId
       ? spawnReceipts.find((item) => item.receiptId === receiptId)?.routing?.role
       : undefined;
     const routedProfile: CapabilityProfile =
-      routingRole === 'exploration' ? 'explore' : routingRole === 'review' ? 'review' : 'build';
+      routingRole === 'exploration'
+        ? 'explore'
+        : ['review', 'testing'].includes(routingRole ?? '')
+          ? 'review'
+          : 'build';
     const capabilityProfile: CapabilityProfile = validation
       ? 'review'
       : routingRole
@@ -7596,26 +7669,26 @@
       const reportedModel = configOptions.find(
         (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
       )?.currentValue;
-      if (source.model) {
+      if (requestedModel) {
         const modelOption = configOptions.find(
           (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
         );
-        if (!modelOption?.options.some((option) => option.value === source.model)) {
-          const message = `Model ${source.model} is unavailable in ${source.agent}.`;
+        if (!modelOption?.options.some((option) => option.value === requestedModel)) {
+          const message = `Model ${requestedModel} is unavailable in ${source.agent}.`;
           throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
         }
         const changed = await acp
-          .setConfig(source.agent, session.sessionId, modelOption.id, source.model)
+          .setConfig(source.agent, created.path, session.sessionId, modelOption.id, requestedModel)
           .catch((cause) => {
             if (!validation) throw cause;
             throw new ValidationCandidateUnavailable(
-              `${source.agent} / ${source.model} is unavailable`,
+              `${source.agent} / ${requestedModel} is unavailable`,
               cause,
             );
           });
         const actual = changed.configOptions?.find((option) => option.id === modelOption.id);
-        if (actual?.currentValue !== source.model) {
-          const message = `Cannot verify ${source.agent} selected model ${source.model}.`;
+        if (actual?.currentValue !== requestedModel) {
+          const message = `Cannot verify ${source.agent} selected model ${requestedModel}.`;
           throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
         }
         configOptions = changed.configOptions ?? configOptions;
@@ -7635,6 +7708,7 @@
           throw new Error(`Variant ${source.variant} is unavailable in ${source.agent}.`);
         const changed = await acp.setConfig(
           source.agent,
+          created.path,
           session.sessionId,
           variantOption.id,
           source.variant,
@@ -7645,7 +7719,7 @@
       }
       const thread: AgentThread = {
         agent: source.agent,
-        model: source.model ?? reportedModel,
+        model: requestedModel ?? reportedModel,
         sessionId: session.sessionId,
         directory: created.path,
         title: prompt.slice(0, 60),
@@ -7657,7 +7731,7 @@
         const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
         updateSpawnReceipt(receiptId, {
           targetId: `acp:${source.agent}:${session.sessionId}`,
-          model: source.model ?? reportedModel,
+          model: requestedModel ?? reportedModel,
           targetDirectory: created.path,
           worktreeId: created.path,
           ...(receipt?.routing
@@ -7666,7 +7740,7 @@
                   ...receipt.routing,
                   actual: {
                     provider: source.agent as 'claude' | 'codex' | 'opencode',
-                    model: source.model ?? reportedModel ?? null,
+                    model: requestedModel ?? reportedModel ?? null,
                     variant: source.variant ?? reportedVariant ?? null,
                   },
                 },
@@ -7685,7 +7759,7 @@
         ? null
         : await beginImplementationTurn(
             created.path,
-            source.model ?? reportedModel,
+            requestedModel ?? reportedModel,
             `acp:${source.agent}:${session.sessionId}`,
           );
       updateAgentThreadStatus(thread, 'working');
@@ -7702,17 +7776,33 @@
         query: prompt,
         sessionKey: `acp:${source.agent}:${session.sessionId}`,
       });
+      let pressureQueued = false;
       const turn = dispatchAuthorizedDirectShipPrompt(promptAuthorization, () => {
         const targetId = `acp:${source.agent}:${session.sessionId}`;
         if (receiptId) {
           updateSpawnReceipt(receiptId, { state: 'working', dispatchPending: false });
-          activeSpawnTargets.set(targetId, receiptId);
+          activeSpawnTargets.set(spawnTargetKey(created.path, targetId), receiptId);
         }
         try {
-          return acp.prompt(source.agent, session.sessionId, recalledPrompt, turnId);
+          return acp.prompt(
+            source.agent,
+            created.path,
+            session.sessionId,
+            recalledPrompt,
+            turnId,
+            [],
+            (limit, reason) => {
+              pressureQueued = limit !== null;
+              onPromptQueue?.(limit, reason);
+            },
+            false,
+          );
         } catch (cause) {
-          if (receiptId && activeSpawnTargets.get(targetId) === receiptId)
-            activeSpawnTargets.delete(targetId);
+          if (
+            receiptId &&
+            activeSpawnTargets.get(spawnTargetKey(created.path, targetId)) === receiptId
+          )
+            activeSpawnTargets.delete(spawnTargetKey(created.path, targetId));
           throw cause;
         }
       });
@@ -7721,7 +7811,11 @@
       const finished = turn.then(
         async (outcome) => {
           if (tracking)
-            await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
+            await recordImplementationModel(
+              created.path,
+              requestedModel ?? reportedModel,
+              tracking,
+            );
           updateAgentThreadStatus(thread, acpPromptInterrupted(outcome) ? 'interrupted' : 'done');
           if (receiptId) {
             const current = spawnReceipts.find((item) => item.receiptId === receiptId);
@@ -7730,16 +7824,27 @@
               result: spawnOutput.get(receiptId) ?? current?.result ?? null,
             });
             spawnOutput.delete(receiptId);
-            if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
-              activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
+            if (
+              activeSpawnTargets.get(
+                spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
+              ) === receiptId
+            )
+              activeSpawnTargets.delete(
+                spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
+              );
           }
           return undefined;
         },
         async (cause) => {
           if (tracking)
-            await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
+            await recordImplementationModel(
+              created.path,
+              requestedModel ?? reportedModel,
+              tracking,
+            );
           const interrupted = await acpFailedPromptInterrupted(
             source.agent,
+            created.path,
             session.sessionId,
             turnId,
           );
@@ -7750,8 +7855,14 @@
               error: interrupted ? null : describe(cause),
             });
             spawnOutput.delete(receiptId);
-            if (activeSpawnTargets.get(`acp:${source.agent}:${session.sessionId}`) === receiptId)
-              activeSpawnTargets.delete(`acp:${source.agent}:${session.sessionId}`);
+            if (
+              activeSpawnTargets.get(
+                spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
+              ) === receiptId
+            )
+              activeSpawnTargets.delete(
+                spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
+              );
           }
           if (!interrupted) error = describe(cause);
           throw cause;
@@ -7759,13 +7870,17 @@
       );
       await awaitCoordinationStart(
         finished.catch(async (cause) => {
-          if (await acpFailedPromptInterrupted(source.agent, session.sessionId, turnId)) return;
+          if (
+            await acpFailedPromptInterrupted(source.agent, created.path, session.sessionId, turnId)
+          )
+            return;
           throw cause;
         }),
         async () => {
-          const state = (await acp.activity())[source.agent];
+          const state = (await acp.activity(created.path))[source.agent];
           return !!state?.active.includes(session.sessionId);
         },
+        () => pressureQueued,
       );
       void finished.catch(() => undefined);
       return {
@@ -7774,9 +7889,9 @@
         threadId: `acp:${source.agent}:${session.sessionId}`,
       };
     } catch (cause) {
-      await acp.cancel(source.agent, session.sessionId, null).catch(() => undefined);
+      await acp.cancel(source.agent, created.path, session.sessionId, null).catch(() => undefined);
       if (nativeGeneration !== undefined)
-        await acp.releaseSessionFence(source.agent, session.sessionId);
+        await acp.releaseSessionFence(source.agent, created.path, session.sessionId);
       throw cause;
     }
   }
@@ -7790,11 +7905,13 @@
   async function awaitCoordinationStart(
     turn: Promise<unknown>,
     isActive: () => Promise<boolean>,
+    isQueued: () => boolean = () => false,
   ): Promise<void> {
     let stopped = false;
-    const deadline = Date.now() + 30_000;
+    let deadline = Date.now() + 30_000;
     async function poll(): Promise<void> {
       if (stopped || disposed) return;
+      if (isQueued()) deadline = Date.now() + 30_000;
       if (await isActive().catch(() => false)) return;
       if (Date.now() >= deadline) throw new Error('Agent prompt did not start within 30 seconds.');
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -7905,7 +8022,10 @@
               acpResult.value.map(async (pending) => {
                 const sessionId = pending.message.params?.sessionId;
                 const thread = [...agentThreads, ...nativeChildThreads].find(
-                  (item) => item.agent === pending.agent && item.sessionId === sessionId,
+                  (item) =>
+                    item.agent === pending.agent &&
+                    item.sessionId === sessionId &&
+                    item.directory === pending.directory,
                 );
                 const trust = thread
                   ? await acp
@@ -7927,18 +8047,22 @@
         const requestId = pending.message.id;
         if (typeof sessionId !== 'string' || requestId == null) continue;
         const thread = [...agentThreads, ...nativeChildThreads].find(
-          (item) => item.agent === pending.agent && item.sessionId === sessionId,
+          (item) =>
+            item.agent === pending.agent &&
+            item.sessionId === sessionId &&
+            item.directory === pending.directory,
         );
         if (!thread) continue;
         const location = byDirectory.get(thread.directory);
         if (!location) continue;
-        const nativeChild = nativeSubagents[nativeSubagentId(pending.agent, sessionId)];
+        const nativeChild =
+          nativeSubagents[nativeSubagentId(pending.agent, pending.directory, sessionId)];
         if (pending.message.method === 'elicitation/create') {
           const message = pending.message.params?.message;
           const schema = pending.message.params?.requestedSchema;
           items.push({
             ...location,
-            key: `elicitation:${pending.agent}:${sessionId}:${requestId}`,
+            key: `elicitation:${pending.directory}:${pending.agent}:${sessionId}:${requestId}`,
             kind: 'question',
             agent: `${agentAvailability.find((item) => item.id === pending.agent)?.name ?? pending.agent}${nativeChild ? ` · ${nativeChild.name}` : ''}`,
             agentId: pending.agent,
@@ -7979,7 +8103,7 @@
           options,
           resourceTrust,
         });
-        const key = `acp:${pending.agent}:${sessionId}:${requestId}`;
+        const key = `acp:${pending.directory}:${pending.agent}:${sessionId}:${requestId}`;
         const rawPermissionGeneration = pending.message.params?.sailPermissionGeneration;
         const permissionGeneration =
           typeof rawPermissionGeneration === 'number'
@@ -8035,6 +8159,7 @@
             );
             await acp.permission(
               pending.agent,
+              thread.directory,
               requestId,
               optionId,
               sessionId,
@@ -8895,7 +9020,8 @@
     );
     // OpenCode's session/list has no parent marker, so only children Sail has seen are hidden.
     return threads.filter(
-      (thread) => !nativeSubagents[nativeSubagentId('opencode', thread.sessionId)],
+      (thread) =>
+        !nativeSubagents[nativeSubagentId('opencode', thread.directory, thread.sessionId)],
     );
   }
 
@@ -9794,6 +9920,7 @@
         respond: (resolvedOptionId: string | null) =>
           acp.permission(
             thread.agent,
+            thread.directory,
             item.requestId!,
             resolvedOptionId,
             item.sessionId,
@@ -10664,7 +10791,7 @@
         const recoveredThread = thread;
         const handoffReceipt = handoffReceiptForInterruptedTurn(turn, spawnReceipts);
         const alreadyActive = async () => {
-          const current = (await acp.activity())[turn.agent];
+          const current = (await acp.activity(turn.directory))[turn.agent];
           return current?.activeTurns[turn.sessionId] === turn.turnId;
         };
         try {
@@ -10677,7 +10804,7 @@
             updateAgentThreadStatus(recoveredThread, 'working');
             return;
           }
-          const info = await acp.connect(turn.agent);
+          const info = await acp.connect(turn.agent, turn.directory);
           const capabilities = info.agentCapabilities;
           const sessionCapabilities =
             capabilities &&
@@ -10714,7 +10841,19 @@
             query: turn.text,
             sessionKey: `acp:${turn.agent}:${turn.sessionId}`,
           });
-          const continued = acp.prompt(turn.agent, turn.sessionId, recalledPrompt, turn.turnId);
+          let queued = false;
+          const continued = acp.prompt(
+            turn.agent,
+            turn.directory,
+            turn.sessionId,
+            recalledPrompt,
+            turn.turnId,
+            [],
+            (limit) => {
+              queued = limit !== null;
+            },
+            false,
+          );
           void (async () => {
             try {
               const outcome = await continued;
@@ -10731,6 +10870,7 @@
                 else {
                   const interrupted = await acpFailedPromptInterrupted(
                     turn.agent,
+                    turn.directory,
                     turn.sessionId,
                     turn.turnId,
                   );
@@ -10741,15 +10881,20 @@
               }
             }
           })();
-          await awaitCoordinationStart(continued, async () => {
-            const state = (await acp.activity())[turn.agent];
-            return !!state?.active.includes(turn.sessionId);
-          });
+          await awaitCoordinationStart(
+            continued,
+            async () => {
+              const state = (await acp.activity(turn.directory))[turn.agent];
+              return !!state?.active.includes(turn.sessionId);
+            },
+            () => queued,
+          );
         } catch (cause) {
           if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
           else {
             const interrupted = await acpFailedPromptInterrupted(
               turn.agent,
+              turn.directory,
               turn.sessionId,
               turn.turnId,
             );
@@ -10765,7 +10910,21 @@
   async function restoreAgentActivity(attempt = 0) {
     const revision = attentionRevision;
     try {
-      const backendActivity = await acp.activity();
+      const activityDirectories = [
+        ...new Set([
+          ...agentThreads.map((thread) => thread.directory),
+          ...spawnReceipts.flatMap((item) => (item.targetDirectory ? [item.targetDirectory] : [])),
+          directory,
+        ]),
+      ];
+      const backendActivity: Record<string, AgentActivity> = {};
+      await Promise.all(
+        activityDirectories.map(async (path) => {
+          const scoped = await acp.activity(path);
+          for (const [agent, state] of Object.entries(scoped))
+            backendActivity[JSON.stringify([path, agent])] = state;
+        }),
+      );
       if (disposed) return;
       for (const receipt of spawnReceipts.filter(
         (item) =>
@@ -10774,7 +10933,10 @@
           item.turnId &&
           !receiptIsSettled(item.state),
       ))
-        reconcileAcpSpawnReceipt(receipt, backendActivity[receipt.provider]);
+        reconcileAcpSpawnReceipt(
+          receipt,
+          backendActivity[JSON.stringify([receipt.targetDirectory, receipt.provider])],
+        );
       if (revision !== attentionRevision) {
         if (attempt < 2) await restoreAgentActivity(attempt + 1);
         return;
@@ -10784,6 +10946,7 @@
         threadAttention,
         agentThreads.map((thread) => ({
           agent: thread.agent,
+          directory: thread.directory,
           sessionId: thread.sessionId,
           key: threadKey(thread),
           viewed: threadIsViewed(threadKey(thread)),
@@ -10975,14 +11138,35 @@
   }
 
   function handleAgentEvent(event: AgentEvent) {
+    if (event.message.method === 'sail/disconnected' && !event.directory) {
+      const sessionDirectories = event.message.params?.sessionDirectories;
+      if (sessionDirectories && typeof sessionDirectories === 'object') {
+        const groups = new SvelteMap<string, string[]>();
+        for (const [sessionId, path] of Object.entries(sessionDirectories)) {
+          if (typeof path !== 'string') continue;
+          groups.set(path, [...(groups.get(path) ?? []), sessionId]);
+        }
+        for (const [path, sessionIds] of groups)
+          handleAgentEvent({
+            ...event,
+            directory: path,
+            message: { ...event.message, params: { ...event.message.params, sessionIds } },
+          });
+      }
+      return;
+    }
+    const eventDirectory = event.directory ?? event.worktree;
+    if (!eventDirectory) return;
     const eventSessionId = event.message.params?.sessionId;
     const eventThread =
       typeof eventSessionId === 'string'
         ? [...agentThreads, ...nativeChildThreads].find(
-            (thread) => thread.agent === event.agent && thread.sessionId === eventSessionId,
+            (thread) =>
+              thread.agent === event.agent &&
+              thread.sessionId === eventSessionId &&
+              thread.directory === eventDirectory,
           )
         : undefined;
-    const eventDirectory = eventThread?.directory ?? directory;
     const eventProfile = capabilityProfileFromMetadata(
       event.message.params,
       eventThread?.capabilityProfile ?? 'build',
@@ -10994,8 +11178,9 @@
       eventDirectory,
       Date.now(),
       typeof eventSessionId === 'string' &&
-        (!!replayingAgentSessions[JSON.stringify([event.agent, eventSessionId])] ||
-          !!nativeSubagents[nativeSubagentId(event.agent, eventSessionId)]?.restored),
+        (!!replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, eventSessionId])] ||
+          !!nativeSubagents[nativeSubagentId(event.agent, eventDirectory, eventSessionId)]
+            ?.restored),
       eventProfile,
     );
     if (nativeSubagents !== previousNativeSubagents) nativeSubagentGeneration += 1;
@@ -11019,11 +11204,12 @@
     )
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
-      recordAnsweredPermission(event.agent, eventSessionId, event.message.params);
+      recordAnsweredPermission(event.agent, eventDirectory, eventSessionId, event.message.params);
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       nativeSubagents = setNativeSubagentWaiting(
         nativeSubagents,
         event.agent,
+        eventDirectory,
         eventSessionId,
         false,
       );
@@ -11035,7 +11221,10 @@
         if (update && typeof update === 'object') {
           const data = update as Record<string, unknown>;
           const thread = [...agentThreads, ...nativeChildThreads].find(
-            (item) => item.agent === event.agent && item.sessionId === sessionId,
+            (item) =>
+              item.agent === event.agent &&
+              item.sessionId === sessionId &&
+              item.directory === eventDirectory,
           );
           const planDirectory = thread?.directory ?? eventDirectory;
           const priorPlan = loadNativePlan({
@@ -11046,21 +11235,21 @@
           const plan = nativePlanUpdate(event.agent, data, priorPlan);
           if (plan)
             saveNativePlan({ agent: event.agent, directory: planDirectory, sessionId }, plan);
-          if (replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
-            invalidateLiveTranscript(event.agent, sessionId);
-          else if (tracksLiveTranscript(event.agent, sessionId)) {
-            applyLiveTranscriptUpdate(event.agent, sessionId, data);
+          if (replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])])
+            invalidateLiveTranscript(event.agent, eventDirectory, sessionId);
+          else if (tracksLiveTranscript(event.agent, eventDirectory, sessionId)) {
+            applyLiveTranscriptUpdate(event.agent, eventDirectory, sessionId, data);
             acpPlans().observe({ agent: event.agent, directory: planDirectory, sessionId }, data);
           }
           if (data.sessionUpdate === 'config_option_update' && Array.isArray(data.configOptions))
-            rememberSessionState(event.agent, sessionId, {
+            rememberSessionState(event.agent, eventDirectory, sessionId, {
               configOptions: data.configOptions as AgentConfigOption[],
             });
           if (
             data.sessionUpdate === 'available_commands_update' &&
             Array.isArray(data.availableCommands)
           )
-            rememberSessionState(event.agent, sessionId, {
+            rememberSessionState(event.agent, eventDirectory, sessionId, {
               availableCommands: data.availableCommands as AgentCommand[],
             });
         }
@@ -11077,11 +11266,17 @@
           typeof content.text === 'string'
             ? content.text
             : null;
-        if (text && !replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
+        if (
+          text &&
+          !replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])]
+        )
           for (const receipt of spawnReceipts.filter(
             (item) =>
               item.targetId === `acp:${event.agent}:${sessionId}` &&
-              activeSpawnTargets.get(item.targetId) === item.receiptId &&
+              item.targetDirectory === eventDirectory &&
+              item.targetDirectory === eventDirectory &&
+              activeSpawnTargets.get(spawnTargetKey(eventDirectory, item.targetId)) ===
+                item.receiptId &&
               !receiptIsSettled(item.state),
           )) {
             const result = `${receipt.result ?? ''}${text}`.slice(-16_000);
@@ -11097,21 +11292,31 @@
           typeof update.title === 'string'
             ? update.title
             : null;
-        if (toolTitle && !replayingAgentSessions[JSON.stringify([event.agent, sessionId])])
+        if (
+          toolTitle &&
+          !replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])]
+        )
           for (const receipt of spawnReceipts.filter(
             (item) =>
               item.targetId === `acp:${event.agent}:${sessionId}` &&
-              activeSpawnTargets.get(item.targetId) === item.receiptId &&
+              item.targetDirectory === eventDirectory &&
+              item.targetDirectory === eventDirectory &&
+              activeSpawnTargets.get(spawnTargetKey(eventDirectory, item.targetId)) ===
+                item.receiptId &&
               !receiptIsSettled(item.state),
           ))
             updateSpawnReceipt(receipt.receiptId, { activity: toolTitle });
         const usage = acpUsage(params?.update);
-        const replaying = !!replayingAgentSessions[JSON.stringify([event.agent, sessionId])];
+        const replaying =
+          !!replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])];
         if (usage?.rates && !replaying) agentRates = { ...agentRates, [event.agent]: usage.rates };
         if (usage) {
           const nextUsage = { ...agentUsage };
           const matchingThreads = [...agentThreads, ...nativeChildThreads].filter(
-            (item) => item.agent === event.agent && item.sessionId === sessionId,
+            (item) =>
+              item.agent === event.agent &&
+              item.sessionId === sessionId &&
+              item.directory === eventDirectory,
           );
           for (const thread of matchingThreads) {
             nextUsage[threadKey(thread)] = { context: usage.context };
@@ -11131,7 +11336,10 @@
             : '';
         if (!replaying && /compact|retry/i.test(updateKind)) {
           const matchingThread = [...agentThreads, ...nativeChildThreads].find(
-            (item) => item.agent === event.agent && item.sessionId === sessionId,
+            (item) =>
+              item.agent === event.agent &&
+              item.sessionId === sessionId &&
+              item.directory === eventDirectory,
           );
           if (matchingThread)
             void recordShipContextEvent(
@@ -11145,7 +11353,7 @@
     }
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
       // The scheduled refresh lags; the thread header already shows the request answered.
-      const resolvedKey = `acp:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
+      const resolvedKey = `acp:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
       resolvedDuringRefresh.set(resolvedKey, inboxGeneration);
       if (inboxItems.some((item) => item.key === resolvedKey))
         inboxItems = inboxItems.filter((item) => item.key !== resolvedKey);
@@ -11160,8 +11368,12 @@
       scheduleInboxRefresh();
     if (event.message.method === '$/cancel_request') {
       const requestID = event.message.params?.id;
-      if (typeof requestID === 'string' || typeof requestID === 'number')
-        removeStructuredQuestion(event.agent, requestID);
+      const sessionId = event.message.params?.sessionId;
+      if (
+        (typeof requestID === 'string' || typeof requestID === 'number') &&
+        typeof sessionId === 'string'
+      )
+        removeStructuredQuestion(event.agent, eventDirectory, sessionId, requestID);
     }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;
@@ -11178,13 +11390,19 @@
         event.message.params?.notify !== false
       ) {
         const thread = agentThreads.find(
-          (item) => item.agent === event.agent && item.sessionId === sessionId,
+          (item) =>
+            item.agent === event.agent &&
+            item.sessionId === sessionId &&
+            item.directory === eventDirectory,
         );
         if (thread)
           void runCompletedChecks(thread.directory, `acp:${event.agent}:${sessionId}`, turnId);
       }
       for (const thread of agentThreads.filter(
-        (item) => item.agent === event.agent && item.sessionId === sessionId,
+        (item) =>
+          item.agent === event.agent &&
+          item.sessionId === sessionId &&
+          item.directory === eventDirectory,
       )) {
         updateAgentThreadStatus(thread, status, event.message.params?.notify !== false);
         if (
@@ -11197,6 +11415,7 @@
       for (const receipt of spawnReceipts.filter(
         (item) =>
           item.targetId === `acp:${event.agent}:${sessionId}` &&
+          item.targetDirectory === eventDirectory &&
           item.turnId === turnId &&
           !receiptIsSettled(item.state),
       ))
@@ -11212,15 +11431,26 @@
     } else if (event.message.method === 'session/request_permission') {
       const sessionId = event.message.params?.sessionId;
       if (typeof sessionId !== 'string') return;
-      nativeSubagents = setNativeSubagentWaiting(nativeSubagents, event.agent, sessionId, true);
+      nativeSubagents = setNativeSubagentWaiting(
+        nativeSubagents,
+        event.agent,
+        eventDirectory,
+        sessionId,
+        true,
+      );
       for (const thread of agentThreads.filter(
-        (item) => item.agent === event.agent && item.sessionId === sessionId,
+        (item) =>
+          item.agent === event.agent &&
+          item.sessionId === sessionId &&
+          item.directory === eventDirectory,
       ))
         updateAgentThreadStatus(thread, 'waiting');
       for (const receipt of spawnReceipts.filter(
         (item) =>
           item.targetId === `acp:${event.agent}:${sessionId}` &&
-          activeSpawnTargets.get(item.targetId) === item.receiptId &&
+          item.targetDirectory === eventDirectory &&
+          activeSpawnTargets.get(spawnTargetKey(eventDirectory, item.targetId)) ===
+            item.receiptId &&
           !receiptIsSettled(item.state),
       ))
         updateSpawnReceipt(receipt.receiptId, { state: 'waiting' });
@@ -11228,18 +11458,20 @@
       const disconnectedSessionIds =
         acpDisconnectedSessionIds(event.message) ??
         Object.values(nativeSubagents)
-          .filter((child) => child.agent === event.agent)
+          .filter((child) => child.agent === event.agent && child.directory === eventDirectory)
           .map((child) => child.sessionId);
       for (const sessionId of disconnectedSessionIds)
-        clearStructuredQuestions(event.agent, sessionId);
+        clearStructuredQuestions(event.agent, eventDirectory, sessionId);
       nativeSubagents = disconnectNativeSubagents(
         nativeSubagents,
         event.agent,
+        eventDirectory,
         disconnectedSessionIds,
       );
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
+          item.directory === eventDirectory &&
           acpDisconnectAffectsSession(
             event.message,
             item.sessionId,
@@ -11255,6 +11487,7 @@
           : null;
         return (
           item.provider === event.agent &&
+          item.targetDirectory === eventDirectory &&
           acpDisconnectAffectsSession(event.message, sessionId) &&
           !receiptIsSettled(item.state)
         );
@@ -11263,16 +11496,26 @@
     }
   }
 
-  function setAgentReplay(agent: AgentId, sessionId: string | null, replaying: boolean) {
+  function setAgentReplay(
+    agent: AgentId,
+    worktreeDirectory: string,
+    sessionId: string | null,
+    replaying: boolean,
+  ) {
     if (!sessionId) return;
-    const key = JSON.stringify([agent, sessionId]);
+    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
     const next = { ...replayingAgentSessions };
     const count = (next[key] ?? 0) + (replaying ? 1 : -1);
     if (count > 0) next[key] = count;
     else delete next[key];
     replayingAgentSessions = next;
     if (!replaying && sessionId)
-      nativeSubagents = finalizeNativeSubagentRestore(nativeSubagents, agent, sessionId);
+      nativeSubagents = finalizeNativeSubagentRestore(
+        nativeSubagents,
+        agent,
+        worktreeDirectory,
+        sessionId,
+      );
   }
 
   function invalidatePaneSelection(id: string) {
@@ -11810,12 +12053,15 @@
                 {subagentControl}
                 childPrompts={acpThread
                   ? nativeSubagentAcceptsPrompts(
-                      nativeSubagents[nativeSubagentId(acpThread.agent, acpThread.sessionId)],
+                      nativeSubagents[
+                        nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                      ],
                     )
                   : false}
                 nativeEntries={acpThread
-                  ? nativeSubagents[nativeSubagentId(acpThread.agent, acpThread.sessionId)]
-                      ?.transcript
+                  ? nativeSubagents[
+                      nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                    ]?.transcript
                   : undefined}
                 focusPrompt={promptFocusPane === 'main'}
                 picked={pickedAttachments.main}

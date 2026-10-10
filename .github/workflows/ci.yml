@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      agentmemory_stress:
+        description: Run 1000 AgentMemory loopback test repetitions on Ubuntu
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -123,3 +128,26 @@ jobs:
       - name: Test Rust
         if: env.RUN_RUST == 'true'
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+  agentmemory-stress:
+    name: AgentMemory loopback stress (Ubuntu)
+    if: github.event_name == 'workflow_dispatch' && inputs.agentmemory_stress
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Repeat both affected tests 1000 times
+        run: bash scripts/stress-agentmemory.sh 1000

@@ -29,6 +29,8 @@ pub struct InterruptedAgentTurn {
 #[serde(rename_all = "camelCase")]
 pub struct AcpTurnEvidence {
     pub agent: String,
+    #[serde(default)]
+    pub directory: String,
     pub session_id: String,
     pub turn_id: String,
     pub status: String,
@@ -63,10 +65,10 @@ fn unsettled_acp_evidence(status: &str) -> bool {
     matches!(status, "prepared" | "dispatch_uncertain" | "dispatched")
 }
 
-fn protected_acp_turns(settings: &Settings) -> HashSet<(String, String, String)> {
+fn protected_acp_turns(settings: &Settings) -> HashSet<(String, String, String, String)> {
     let mut protected = interrupted_turns(settings)
         .into_iter()
-        .map(|turn| (turn.agent, turn.session_id, turn.turn_id))
+        .map(|turn| (turn.agent, turn.directory, turn.session_id, turn.turn_id))
         .collect::<HashSet<_>>();
     let receipts = settings
         .get("sai-agent-spawn-receipts")
@@ -93,8 +95,13 @@ fn protected_acp_turns(settings: &Settings) -> HashSet<(String, String, String)>
         let Some(session_id) = target_id.strip_prefix(&format!("acp:{agent}:")) else {
             continue;
         };
+        let directory = receipt
+            .get("targetDirectory")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         protected.insert((
             agent.to_string(),
+            directory.to_string(),
             session_id.to_string(),
             turn_id.to_string(),
         ));
@@ -113,10 +120,12 @@ fn merge_acp_turn_evidence_at(
     if item.status == "prepared" {
         evidence.retain(|saved| {
             saved.agent != item.agent
+                || saved.directory != item.directory
                 || saved.session_id != item.session_id
                 || !unsettled_acp_evidence(&saved.status)
                 || protected.contains(&(
                     saved.agent.clone(),
+                    saved.directory.clone(),
                     saved.session_id.clone(),
                     saved.turn_id.clone(),
                 ))
@@ -124,6 +133,7 @@ fn merge_acp_turn_evidence_at(
     }
     evidence.retain(|saved| {
         saved.agent != item.agent
+            || saved.directory != item.directory
             || saved.session_id != item.session_id
             || saved.turn_id != item.turn_id
     });
@@ -132,6 +142,7 @@ fn merge_acp_turn_evidence_at(
         !unsettled_acp_evidence(&saved.status)
             || protected.contains(&(
                 saved.agent.clone(),
+                saved.directory.clone(),
                 saved.session_id.clone(),
                 saved.turn_id.clone(),
             ))
@@ -178,6 +189,7 @@ pub fn record_acp_turn_evidence(
 pub fn get_acp_turn_evidence(
     app: tauri::AppHandle,
     agent: String,
+    directory: String,
     session_id: String,
     turn_id: String,
 ) -> Result<Option<AcpTurnEvidence>, String> {
@@ -186,7 +198,10 @@ pub fn get_acp_turn_evidence(
     Ok(acp_turn_evidence(&read_settings(&path)?)
         .into_iter()
         .find(|item| {
-            item.agent == agent && item.session_id == session_id && item.turn_id == turn_id
+            item.agent == agent
+                && item.directory == directory
+                && item.session_id == session_id
+                && item.turn_id == turn_id
         }))
 }
 
@@ -231,12 +246,16 @@ fn merge_interrupted_turns(
 fn remove_interrupted_turn(
     settings: &mut Settings,
     agent: &str,
+    directory: &str,
     session_id: &str,
     turn_id: &str,
 ) -> Result<(), String> {
     let mut turns = interrupted_turns(settings);
     turns.retain(|turn| {
-        turn.agent != agent || turn.session_id != session_id || turn.turn_id != turn_id
+        turn.agent != agent
+            || turn.directory != directory
+            || turn.session_id != session_id
+            || turn.turn_id != turn_id
     });
     write_interrupted_turns(settings, &turns)
 }
@@ -258,6 +277,7 @@ pub fn record_interrupted_turns(
 pub fn clear_interrupted_turn(
     app: &tauri::AppHandle,
     agent: &str,
+    directory: &str,
     session_id: &str,
     turn_id: &str,
 ) -> Result<(), String> {
@@ -267,7 +287,7 @@ pub fn clear_interrupted_turn(
     if !settings.contains_key(INTERRUPTED_TURNS_KEY) {
         return Ok(());
     }
-    remove_interrupted_turn(&mut settings, agent, session_id, turn_id)?;
+    remove_interrupted_turn(&mut settings, agent, directory, session_id, turn_id)?;
     write_settings(&path, &settings)
 }
 
@@ -284,10 +304,11 @@ pub fn list_interrupted_agent_turns(
 pub fn finish_interrupted_agent_turn(
     app: tauri::AppHandle,
     agent: String,
+    directory: String,
     session_id: String,
     turn_id: String,
 ) -> Result<(), String> {
-    clear_interrupted_turn(&app, &agent, &session_id, &turn_id)
+    clear_interrupted_turn(&app, &agent, &directory, &session_id, &turn_id)
 }
 
 pub(crate) fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -779,6 +800,7 @@ mod tests {
     fn acp_turn_evidence_is_provider_correlated_replaced_and_bounded() {
         let evidence = |agent: &str, session: &str, turn: &str, status: &str| AcpTurnEvidence {
             agent: agent.into(),
+            directory: "/repo".into(),
             session_id: session.into(),
             turn_id: turn.into(),
             status: status.into(),
@@ -840,6 +862,7 @@ mod tests {
     fn acp_turn_evidence_never_prunes_unsettled_dispatches() {
         let evidence = |turn: &str, status: &str| AcpTurnEvidence {
             agent: "codex".into(),
+            directory: "/repo".into(),
             session_id: "session".into(),
             turn_id: turn.into(),
             status: status.into(),
@@ -865,6 +888,7 @@ mod tests {
     fn abandoned_dispatch_evidence_expires_but_owned_work_stays_protected() {
         let evidence = |session: &str, turn: &str, status: &str| AcpTurnEvidence {
             agent: "codex".into(),
+            directory: "/repo".into(),
             session_id: session.into(),
             turn_id: turn.into(),
             status: status.into(),
@@ -889,6 +913,7 @@ mod tests {
             serde_json::json!([{
                 "provider": "codex",
                 "targetId": "acp:codex:owned",
+                "targetDirectory": "/repo",
                 "turnId": "protected",
                 "state": "unavailable"
             }])
@@ -912,6 +937,7 @@ mod tests {
     fn a_new_prompt_retires_uncertain_evidence_for_the_same_session() {
         let evidence = |turn: &str, status: &str| AcpTurnEvidence {
             agent: "claude".into(),
+            directory: "/repo".into(),
             session_id: "session".into(),
             turn_id: turn.into(),
             status: status.into(),
@@ -931,27 +957,38 @@ mod tests {
 
     #[test]
     fn interrupted_turns_replace_previous_attempt_without_losing_other_threads() {
-        let turn = |session: &str, attempt: &str| InterruptedAgentTurn {
+        let turn = |directory: &str, session: &str, attempt: &str| InterruptedAgentTurn {
             agent: "claude".into(),
             session_id: session.into(),
-            directory: "/repo".into(),
+            directory: directory.into(),
             turn_id: attempt.into(),
             text: "Continue the work".into(),
         };
         let mut settings = Settings::new();
         merge_interrupted_turns(
             &mut settings,
-            vec![turn("one", "old"), turn("two", "other")],
+            vec![turn("/repo", "one", "old"), turn("/repo", "two", "other")],
         )
         .unwrap();
-        merge_interrupted_turns(&mut settings, vec![turn("one", "new")]).unwrap();
-        remove_interrupted_turn(&mut settings, "claude", "one", "old").unwrap();
+        merge_interrupted_turns(&mut settings, vec![turn("/repo", "one", "new")]).unwrap();
+        merge_interrupted_turns(&mut settings, vec![turn("/sibling", "one", "new")]).unwrap();
+        remove_interrupted_turn(&mut settings, "claude", "/repo", "one", "old").unwrap();
         assert_eq!(
             interrupted_turns(&settings),
-            vec![turn("two", "other"), turn("one", "new")]
+            vec![
+                turn("/repo", "two", "other"),
+                turn("/repo", "one", "new"),
+                turn("/sibling", "one", "new")
+            ]
         );
-        remove_interrupted_turn(&mut settings, "claude", "one", "new").unwrap();
-        assert_eq!(interrupted_turns(&settings), vec![turn("two", "other")]);
+        remove_interrupted_turn(&mut settings, "claude", "/repo", "one", "new").unwrap();
+        assert_eq!(
+            interrupted_turns(&settings),
+            vec![
+                turn("/repo", "two", "other"),
+                turn("/sibling", "one", "new")
+            ]
+        );
     }
 
     #[test]

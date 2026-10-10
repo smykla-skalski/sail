@@ -11,6 +11,7 @@ import {
   nextValidationReservation,
   reserveInlineValidation,
   shipGatesSettled,
+  gateVerdictPassed,
   shipCleanupRequest,
   shipEvidenceReadiness,
   shipTaskThreadsSettled,
@@ -48,6 +49,13 @@ import {
   validateGateVerdict,
   validationRevisionDrifted,
 } from '../src/lib/ship-progress.ts';
+
+void test('inline review is a fresh-session review gate with review verdicts', () => {
+  assert.equal(gateVerdictPassed('inline-review', 'CLEAN'), true);
+  assert.equal(gateVerdictPassed('inline-review', 'NEEDS_FIXES'), false);
+  assert.doesNotThrow(() => validateGateVerdict('inline-review', 'CLEAN'));
+  assert.throws(() => validateGateVerdict('inline-review', 'PASS'));
+});
 import {
   loadSpawnReceipts,
   saveBoundedReceipt,

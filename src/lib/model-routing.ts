@@ -7,6 +7,7 @@ export const modelRouteRoles = [
   'implementation',
   'debugging',
   'review',
+  'testing',
   'ci-triage',
 ] as const;
 export type ModelRouteRole = (typeof modelRouteRoles)[number];
@@ -17,18 +18,11 @@ export type ModelRoute = {
   model: string;
   variant?: string;
 };
-export type ModelRoutingSettings = {
-  routes: ModelRoute[];
-  independentReviewRisks: ShipRisk[];
-};
-export type ModelRouteRequest = {
-  role: ModelRouteRole;
-  risk: ShipRisk;
-  implementingModels?: string[];
-};
+export type ModelRoutingSettings = { routes: ModelRoute[] };
+export type ModelRouteRequest = { role: ModelRouteRole; risk: ShipRisk };
 export type ModelRouteSelection = {
   route: ModelRoute | null;
-  independentReviewRequired: boolean;
+  contextIsolationRequired: boolean;
   reason: string | null;
 };
 
@@ -69,33 +63,18 @@ export function acpModelId(agent: string, model: string): string {
   return agent === 'opencode' && /^[^/:]+:/.test(model) ? model.replace(':', '/') : model;
 }
 
-function normalizedModel(value: string): string {
-  return value.replace(/^[^/:]+[:/]/, '').toLowerCase();
-}
-
 export function parseModelRoutingSettings(raw: string | null): ModelRoutingSettings {
-  if (raw === null) return { routes: [], independentReviewRisks: [] };
+  if (raw === null) return { routes: [] };
   try {
     const value: unknown = JSON.parse(raw ?? 'null');
     if (!value || typeof value !== 'object') throw new Error('Invalid settings');
     if (!('routes' in value) || !Array.isArray(value.routes)) throw new Error('Invalid routes');
     if (!value.routes.every(isModelRoute)) throw new Error('Invalid route');
     const routes = value.routes;
-    if (
-      'independentReviewRisks' in value &&
-      (!Array.isArray(value.independentReviewRisks) || !value.independentReviewRisks.every(isRisk))
-    )
-      throw new Error('Invalid review risks');
     const deduplicated = new Map(routes.map((route) => [`${route.role}\0${route.risk}`, route]));
-    const independentReviewRisks: ShipRisk[] =
-      'independentReviewRisks' in value && Array.isArray(value.independentReviewRisks)
-        ? [...new Set(value.independentReviewRisks.filter(isRisk))]
-        : routes.length > 0
-          ? ['medium', 'high']
-          : [];
-    return { routes: [...deduplicated.values()], independentReviewRisks };
+    return { routes: [...deduplicated.values()] };
   } catch {
-    return { routes: [], independentReviewRisks: [...shipRiskLevels] };
+    return { routes: [] };
   }
 }
 
@@ -103,61 +82,32 @@ export function selectModelRoute(
   settings: ModelRoutingSettings,
   request: ModelRouteRequest,
 ): ModelRouteSelection {
-  const independentReviewRequired = settings.independentReviewRisks.includes(request.risk);
+  const contextIsolationRequired = request.role === 'review' || request.role === 'testing';
   const route = settings.routes.find(
     (candidate) => candidate.role === request.role && candidate.risk === request.risk,
   );
   if (!route)
     return {
       route: null,
-      independentReviewRequired,
+      contextIsolationRequired,
       reason:
-        settings.routes.length === 0 && !independentReviewRequired
+        settings.routes.length === 0
           ? null
           : `No ${request.risk}-risk ${request.role} model route is configured.`,
     };
   if (hasUnresolvedModelAlias(route.model))
     return {
       route: null,
-      independentReviewRequired,
+      contextIsolationRequired,
       reason: `The ${request.role} route must use an exact model ID, not ${route.model}.`,
     };
   if (route.provider === 'opencode' && !/[:/]/.test(route.model))
     return {
       route: null,
-      independentReviewRequired,
+      contextIsolationRequired,
       reason: 'OpenCode routes require an exact provider/model ID.',
     };
-  if (request.role !== 'review' && independentReviewRequired) {
-    const review = settings.routes.find(
-      (candidate) => candidate.role === 'review' && candidate.risk === request.risk,
-    );
-    if (
-      !review ||
-      hasUnresolvedModelAlias(review.model) ||
-      normalizedModel(review.model) === normalizedModel(route.model)
-    )
-      return {
-        route: null,
-        independentReviewRequired,
-        reason: `${request.risk}-risk ${request.role} work requires an exact independent review route.`,
-      };
-  }
-  if (
-    request.role === 'review' &&
-    independentReviewRequired &&
-    (request.implementingModels ?? []).some(
-      (model) =>
-        hasUnresolvedModelAlias(model) || normalizedModel(model) === normalizedModel(route.model),
-    )
-  )
-    return {
-      route: null,
-      independentReviewRequired,
-      reason:
-        'Independent review requires an exact model different from every implementation model.',
-    };
-  return { route, independentReviewRequired, reason: null };
+  return { route, contextIsolationRequired, reason: null };
 }
 
 export type RoutingEvaluation = {
@@ -176,7 +126,6 @@ export function evaluateModelRouting(settings: ModelRoutingSettings): RoutingEva
       selectModelRoute(settings, {
         role: task.role,
         risk: task.risk,
-        implementingModels: 'implementingModels' in task ? task.implementingModels : undefined,
       }).route,
   ).length;
   const failuresPrevented = corpus.failureCases.filter((failure) => {
@@ -193,7 +142,6 @@ export function evaluateModelRouting(settings: ModelRoutingSettings): RoutingEva
     return !selectModelRoute(next, {
       role: failure.role,
       risk: failure.risk,
-      implementingModels: 'implementingModels' in failure ? failure.implementingModels : undefined,
     }).route;
   }).length;
   return {

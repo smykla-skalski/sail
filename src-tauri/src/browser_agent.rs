@@ -1997,11 +1997,10 @@ pub fn run_mcp_stdio() {
                     return json!({"name":name,"description":description,"inputSchema":{
                         "type":"object",
                         "properties":{
-                            "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
+                            "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "prompt":{"type":"string"},
-                            "implementingModels":{"type":"array","items":{"type":"string"}}
                         },
-                        "required":["gate","prompt","implementingModels"]
+                        "required":["gate","prompt"]
                     }});
                 }
                 if *name == "validation_policy" {
@@ -2016,7 +2015,7 @@ pub fn run_mcp_stdio() {
                         "type":"object","properties":{
                             "stage":{"type":"string","enum":["implementing","reviewing","testing","pull_request","ci","merging","awaiting_merge"]},
                             "status":{"type":"string","enum":["running","blocked"]},
-                            "gate":{"type":"string","enum":["code-adversary","findings-adversary","test-adversary"]},
+                            "gate":{"type":"string","enum":["inline-review","code-adversary","findings-adversary","test-adversary"]},
                             "verdict":{"type":"string","enum":["CLEAN","NEEDS_FIXES","PASS","PASS (partial)","FAIL","BLOCKED"]},
                             "reason":{"type":"string","maxLength":2000},
                             "criteria":{"type":"array","items":{"type":"string","minLength":1,"maxLength":2000},"maxItems":100},

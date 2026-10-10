@@ -107,10 +107,17 @@ export function saveStructuredQuestions(
   update(scope, { questions });
 }
 
-export function removeStructuredQuestion(agent: string, requestID: string | number): void {
+export function removeStructuredQuestion(
+  agent: string,
+  directory: string,
+  sessionId: string,
+  requestID: string | number,
+): void {
   const states = savedStates().flatMap((state) => {
     if (
       state.agent !== agent ||
+      state.directory !== directory ||
+      state.sessionId !== sessionId ||
       !state.questions?.some((item) => String(item.id) === String(requestID))
     )
       return [state];
@@ -120,9 +127,14 @@ export function removeStructuredQuestion(agent: string, requestID: string | numb
   save(states);
 }
 
-export function clearStructuredQuestions(agent: string, sessionId: string): void {
+export function clearStructuredQuestions(
+  agent: string,
+  directory: string,
+  sessionId: string,
+): void {
   const states = savedStates().flatMap((state) => {
-    if (state.agent !== agent || state.sessionId !== sessionId) return [state];
+    if (state.agent !== agent || state.directory !== directory || state.sessionId !== sessionId)
+      return [state];
     return state.plan ? [{ ...state, questions: [] }] : [];
   });
   save(states);

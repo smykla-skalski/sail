@@ -27,6 +27,10 @@ const parent: PlanningStateScope = {
   sessionId: 'parent',
 };
 
+function questionFor(sessionId: string) {
+  return [{ id: 42, sessionId, message: `${sessionId} question`, schema: {} }];
+}
+
 await test('native plans remain scoped to their exact session', () => {
   saveNativePlan(parent, {
     provider: 'codex',
@@ -106,7 +110,7 @@ await test('cancelling a question preserves unrelated session state', () => {
     { id: 5, sessionId: child.sessionId, message: 'Child?', schema: {} },
   ]);
 
-  removeStructuredQuestion('codex', 4);
+  removeStructuredQuestion('codex', parent.directory, parent.sessionId, 4);
   assert.deepEqual(loadStructuredQuestions(parent), []);
   assert.deepEqual(
     loadStructuredQuestions(child).map((item) => item.message),
@@ -126,8 +130,36 @@ await test('disconnect clears questions but retains the replayable plan', () => 
     { id: 6, sessionId: parent.sessionId, message: 'Parent?', schema: {} },
   ]);
 
-  clearStructuredQuestions(parent.agent, parent.sessionId);
+  clearStructuredQuestions(parent.agent, parent.directory, parent.sessionId);
   assert.equal(loadNativePlan(parent)?.markdown, '# Parent plan');
   assert.deepEqual(loadStructuredQuestions(parent), []);
   forgetPlanningState(parent);
+});
+
+await test('question cancellation and disconnect stay within one worktree', () => {
+  const sibling = { ...parent, directory: '/sibling-repo' };
+  const otherSession = { ...parent, sessionId: 'other-session' };
+  saveStructuredQuestions(parent, questionFor(parent.sessionId));
+  saveStructuredQuestions(sibling, questionFor(sibling.sessionId));
+  saveStructuredQuestions(otherSession, questionFor(otherSession.sessionId));
+
+  removeStructuredQuestion(parent.agent, parent.directory, parent.sessionId, 42);
+  assert.deepEqual(loadStructuredQuestions(parent), []);
+  assert.equal(loadStructuredQuestions(sibling)[0]?.message, `${sibling.sessionId} question`);
+  assert.equal(
+    loadStructuredQuestions(otherSession)[0]?.message,
+    `${otherSession.sessionId} question`,
+  );
+
+  saveStructuredQuestions(parent, questionFor(parent.sessionId));
+  clearStructuredQuestions(parent.agent, parent.directory, parent.sessionId);
+  assert.deepEqual(loadStructuredQuestions(parent), []);
+  assert.equal(loadStructuredQuestions(sibling)[0]?.message, `${sibling.sessionId} question`);
+  assert.equal(
+    loadStructuredQuestions(otherSession)[0]?.message,
+    `${otherSession.sessionId} question`,
+  );
+  forgetPlanningState(parent);
+  forgetPlanningState(sibling);
+  forgetPlanningState(otherSession);
 });

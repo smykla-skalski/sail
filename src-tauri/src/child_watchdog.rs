@@ -1,7 +1,6 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::time::{Duration, Instant};
 
 pub struct ChildWatchdog {
     child: Option<Child>,
@@ -13,11 +12,13 @@ impl ChildWatchdog {
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("cat >/dev/null; kill -9 0")
+            .arg("cat >/dev/null; kill -9 -\"$1\"")
+            .arg("terminal-watchdog")
+            .arg(group.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        command.process_group(group as i32);
+            .stderr(Stdio::null())
+            .process_group(0);
         let mut child = command.spawn()?;
         let input = child
             .stdin
@@ -31,29 +32,11 @@ impl ChildWatchdog {
 
     pub fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            let group = nix::unistd::Pid::from_raw(child.id() as i32);
+            let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
             let _ = child.wait();
         }
-    }
-
-    pub fn kill_group(&mut self) {
-        drop(self._input.take());
-        if let Some(mut child) = self.child.take() {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    _ => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                }
-            }
-        }
+        self._input.take();
     }
 }
 
@@ -71,9 +54,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn parent_pipe_closure_kills_process_group() {
+    fn parent_pipe_closure_kills_terminal_process_group() {
         let mut command = Command::new("sleep");
-        command.arg("30").process_group(0);
+        command.arg("30");
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
         let mut server = command.spawn().unwrap();
         let group = nix::unistd::Pid::from_raw(server.id() as i32);
         let mut watchdog = ChildWatchdog::start(server.id()).unwrap();
@@ -92,22 +84,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         watchdog.stop();
-        assert!(matches!(
-            nix::sys::signal::killpg(group, None),
-            Err(nix::errno::Errno::ESRCH)
-        ));
-    }
-
-    #[test]
-    fn explicit_cleanup_kills_process_group() {
-        let mut command = Command::new("sleep");
-        command.arg("30").process_group(0);
-        let mut server = command.spawn().unwrap();
-        let group = nix::unistd::Pid::from_raw(server.id() as i32);
-        let mut watchdog = ChildWatchdog::start(server.id()).unwrap();
-
-        watchdog.kill_group();
-        assert!(!server.wait().unwrap().success());
         assert!(matches!(
             nix::sys::signal::killpg(group, None),
             Err(nix::errno::Errno::ESRCH)

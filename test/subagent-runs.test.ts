@@ -116,6 +116,7 @@ await test('the higher-precedence source sets the state and others fill missing 
   const disconnected = disconnectNativeSubagents(
     nativeStore(spawned('task-1')),
     'claude',
+    '/repo',
     ['task-1'],
     9,
   );

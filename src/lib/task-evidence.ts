@@ -434,7 +434,7 @@ function normalizeGateEconomics(entry: TaskEvidence): TaskEvidence {
   const phase =
     entry.name === 'test-adversary'
       ? 'test'
-      : ['code-adversary', 'findings-adversary'].includes(entry.name)
+      : ['inline-review', 'code-adversary', 'findings-adversary'].includes(entry.name)
         ? 'review'
         : undefined;
   return phase ? { ...entry, economics: { ...entry.economics, role: 'validator', phase } } : entry;
