@@ -275,6 +275,22 @@ export function acpEventMatchesSession(
   );
 }
 
+export function acpCancelMatchesSession(
+  event: AgentEvent,
+  agent: string,
+  directory: string,
+  profile: CapabilityProfile,
+  sessionId: string,
+): boolean {
+  return (
+    event.agent === agent &&
+    event.directory === directory &&
+    event.message.method === '$/cancel_request' &&
+    event.message.params?.sessionId === sessionId &&
+    event.message.params?.sailCapabilityProfile === profile
+  );
+}
+
 export function acpDisconnectedSessionIds(message: AgentEvent['message']): string[] | null {
   if (message.method !== 'sail/disconnected') return null;
   const sessionIds = message.params?.sessionIds;
@@ -962,16 +978,30 @@ export const acp = {
     }),
   pendingPermissions: (agent: AgentId, directory: string, sessionId: string) =>
     invoke<AgentEvent['message'][]>('acp_pending_permissions', { agent, directory, sessionId }),
-  pendingElicitations: (agent: AgentId, directory: string, sessionId: string) =>
-    invoke<AgentEvent['message'][]>('acp_pending_elicitations', { agent, directory, sessionId }),
+  pendingElicitations: (
+    agent: AgentId,
+    directory: string,
+    sessionId: string,
+    profile: CapabilityProfile,
+  ) =>
+    invoke<AgentEvent['message'][]>('acp_pending_elicitations', {
+      agent,
+      directory,
+      sessionId,
+      profile,
+    }),
   elicitation: (
     agent: AgentId,
     directory: string,
+    sessionId: string,
+    profile: CapabilityProfile,
     requestId: string | number,
     action: 'accept' | 'decline' | 'cancel',
     content?: Record<string, unknown>,
   ) =>
-    invoke<void>('acp_elicitation', { params: { agent, directory, requestId, action, content } }),
+    invoke<void>('acp_elicitation', {
+      params: { agent, directory, sessionId, profile, requestId, action, content },
+    }),
   pendingInbox: () => invoke<AcpPendingInboxItem[]>('acp_pending_inbox'),
   activity: (directory: string) =>
     invoke<Record<AgentId, AgentActivity>>('acp_activity', { directory }),

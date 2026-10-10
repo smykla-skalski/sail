@@ -110,12 +110,14 @@ export function saveStructuredQuestions(
 export function removeStructuredQuestion(
   agent: string,
   directory: string,
+  sessionId: string,
   requestID: string | number,
 ): void {
   const states = savedStates().flatMap((state) => {
     if (
       state.agent !== agent ||
       state.directory !== directory ||
+      state.sessionId !== sessionId ||
       !state.questions?.some((item) => String(item.id) === String(requestID))
     )
       return [state];

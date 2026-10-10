@@ -76,6 +76,7 @@
     type QueuedAgentMessage,
   } from './lib/agent-queue';
   import {
+    acpCancelMatchesSession,
     acp,
     acpDisconnectAffectsSession,
     acpFinishedPromptStatus,
@@ -1192,6 +1193,8 @@
       await acp.elicitation(
         agent,
         directory,
+        elicitation.sessionId,
+        activeCapabilityProfile,
         elicitation.id,
         action,
         action === 'accept' ? content : undefined,
@@ -1363,10 +1366,12 @@
           () => current === generation && activeSessionId === id,
         );
         if (waiting) for (const request of waiting) queuePermission(request);
-        const pendingElicitations = await acp.pendingElicitations(agent, directory, id).then(
-          (requests) => ({ requests, available: true }),
-          () => ({ requests: [], available: false }),
-        );
+        const pendingElicitations = await acp
+          .pendingElicitations(agent, directory, id, activeCapabilityProfile)
+          .then(
+            (requests) => ({ requests, available: true }),
+            () => ({ requests: [], available: false }),
+          );
         if (current === generation && activeSessionId === id && pendingElicitations.available) {
           const pendingIDs = new Set(
             pendingElicitations.requests.flatMap((request) =>
@@ -1572,7 +1577,17 @@
       }
       if (message.method === '$/cancel_request') {
         const id = params?.id;
-        if (typeof id === 'string' || typeof id === 'number') {
+        if (
+          activeSessionId &&
+          acpCancelMatchesSession(
+            payload,
+            agent,
+            directory,
+            activeCapabilityProfile,
+            activeSessionId,
+          ) &&
+          (typeof id === 'string' || typeof id === 'number')
+        ) {
           elicitations = elicitations.filter((item) => String(item.id) !== String(id));
           delete elicitationDrafts[String(id)];
           if (activeSessionId)

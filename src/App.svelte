@@ -11229,8 +11229,12 @@
       scheduleInboxRefresh();
     if (event.message.method === '$/cancel_request') {
       const requestID = event.message.params?.id;
-      if (typeof requestID === 'string' || typeof requestID === 'number')
-        removeStructuredQuestion(event.agent, eventDirectory, requestID);
+      const sessionId = event.message.params?.sessionId;
+      if (
+        (typeof requestID === 'string' || typeof requestID === 'number') &&
+        typeof sessionId === 'string'
+      )
+        removeStructuredQuestion(event.agent, eventDirectory, sessionId, requestID);
     }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;

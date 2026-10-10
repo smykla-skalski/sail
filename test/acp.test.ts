@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   acpDisconnectAffectsSession,
+  acpCancelMatchesSession,
   acpEventMatchesSession,
   applyLiveTranscriptUpdate,
   forgetRecentTranscript,
@@ -52,6 +53,31 @@ void test('ACP replay ignores updates from a sibling worktree with the same sess
   };
   assert.equal(acpEventMatchesSession(event, 'codex', '/repo', 'shared-session'), false);
   assert.equal(acpEventMatchesSession(event, 'codex', '/sibling-repo', 'shared-session'), true);
+});
+
+void test('ACP cancellation matches session, worktree, and runtime profile', () => {
+  const event: AgentEvent = {
+    agent: 'codex',
+    directory: '/repo/subdir',
+    worktree: '/repo',
+    message: {
+      method: '$/cancel_request',
+      params: { id: 7, sessionId: 'shared-session', sailCapabilityProfile: 'review' },
+    },
+  };
+  assert.equal(
+    acpCancelMatchesSession(event, 'codex', '/repo/subdir', 'review', 'shared-session'),
+    true,
+  );
+  assert.equal(
+    acpCancelMatchesSession(event, 'codex', '/repo/subdir', 'build', 'shared-session'),
+    false,
+  );
+  assert.equal(acpCancelMatchesSession(event, 'codex', '/repo', 'review', 'shared-session'), false);
+  assert.equal(
+    acpCancelMatchesSession(event, 'codex', '/repo/subdir', 'review', 'other-session'),
+    false,
+  );
 });
 
 void test('ACP chunks stream into one assistant message and tool updates keep their place', () => {

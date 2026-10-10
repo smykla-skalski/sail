@@ -531,6 +531,24 @@ struct PendingElicitation {
     received_at: u64,
 }
 
+fn attach_cancelled_elicitation_session(
+    message: &mut Value,
+    pending: &Mutex<HashMap<String, PendingElicitation>>,
+) -> Option<String> {
+    let request_id = message.pointer("/params/id")?.to_string();
+    let request = pending.lock().ok()?.remove(&request_id)?;
+    let session_id = request
+        .message
+        .pointer("/params/sessionId")?
+        .as_str()?
+        .to_string();
+    let params = message.get_mut("params")?.as_object_mut()?;
+    params
+        .entry("sessionId")
+        .or_insert_with(|| Value::String(session_id.clone()));
+    Some(session_id)
+}
+
 #[cfg(test)]
 fn claim_pending_permission(
     permissions: &Mutex<HashMap<String, PendingPermission>>,
@@ -2493,6 +2511,45 @@ fn connection_for_profile(
         .ok_or_else(|| "Agent is not connected.".into())
 }
 
+fn connection_for_elicitation(
+    manager: &AgentManager,
+    agent: &str,
+    profile: CapabilityProfile,
+    directory: &Path,
+    session_id: &str,
+) -> Result<Arc<Connection>, String> {
+    let runtime = connection_for_profile(manager, agent, profile, directory)?;
+    let sessions = runtime
+        .session_profiles
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if sessions.get(session_id) != Some(&profile) {
+        return Err("Agent session is not connected in this profile and worktree.".into());
+    }
+    drop(sessions);
+    Ok(runtime)
+}
+
+fn claim_pending_elicitation(
+    pending: &Mutex<HashMap<String, PendingElicitation>>,
+    request_key: &str,
+    session_id: &str,
+) -> Result<PendingElicitation, String> {
+    let mut pending = pending.lock().map_err(|error| error.to_string())?;
+    if !pending.get(request_key).is_some_and(|request| {
+        request
+            .message
+            .pointer("/params/sessionId")
+            .and_then(Value::as_str)
+            == Some(session_id)
+    }) {
+        return Err("Elicitation request is no longer pending for this session.".into());
+    }
+    pending
+        .remove(request_key)
+        .ok_or_else(|| "Elicitation request is no longer pending.".to_string())
+}
+
 fn unique_session_owner(
     profiles: impl IntoIterator<Item = CapabilityProfile>,
 ) -> Result<Option<CapabilityProfile>, String> {
@@ -3071,11 +3128,10 @@ fn connect_blocking_inner(
                     }
                 }
                 if message.get("method").and_then(Value::as_str) == Some("$/cancel_request") {
-                    if let Some(id) = message.pointer("/params/id") {
-                        if let Ok(mut elicitations) = reader.elicitation_state.lock() {
-                            elicitations.remove(&id.to_string());
-                        }
-                    }
+                    let _ = attach_cancelled_elicitation_session(
+                        &mut message,
+                        &reader.elicitation_state,
+                    );
                 }
                 if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
                     if let Some(id) = message.get("id").cloned() {
@@ -3294,8 +3350,16 @@ pub fn acp_pending_elicitations(
     agent: String,
     directory: String,
     session_id: String,
+    profile: String,
 ) -> Result<Vec<Value>, String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
+    let profile = parse_profile(Some(&profile))?;
+    let runtime = connection_for_elicitation(
+        &manager,
+        &agent,
+        profile,
+        Path::new(&directory),
+        &session_id,
+    )?;
     let pending = runtime
         .elicitation_state
         .lock()
@@ -3318,6 +3382,8 @@ pub fn acp_pending_elicitations(
 pub struct AcpElicitationParams {
     agent: String,
     directory: String,
+    session_id: String,
+    profile: String,
     request_id: Value,
     action: String,
     content: Option<Value>,
@@ -3328,24 +3394,16 @@ pub fn acp_elicitation(
     manager: State<'_, AgentManager>,
     params: AcpElicitationParams,
 ) -> Result<(), String> {
-    let runtime = manager
-        .0
-        .lock()
-        .map_err(|error| error.to_string())?
-        .values()
-        .find(|runtime| {
-            runtime.agent == params.agent
-                && runtime.worktree == worktree_identity(Path::new(&params.directory))
-        })
-        .cloned()
-        .ok_or_else(|| "Agent is not connected.".to_string())?;
+    let profile = parse_profile(Some(&params.profile))?;
+    let runtime = connection_for_elicitation(
+        &manager,
+        &params.agent,
+        profile,
+        Path::new(&params.directory),
+        &params.session_id,
+    )?;
     let key = params.request_id.to_string();
-    let pending = runtime
-        .elicitation_state
-        .lock()
-        .map_err(|error| error.to_string())?
-        .remove(&key)
-        .ok_or_else(|| "Elicitation request is no longer pending.".to_string())?;
+    let pending = claim_pending_elicitation(&runtime.elicitation_state, &key, &params.session_id)?;
     let mut result = json!({"action":params.action});
     if let Some(content) = params.content {
         result["content"] = content;
@@ -4357,6 +4415,59 @@ mod session_config_tests {
         }
     }
 
+    #[cfg(unix)]
+    fn test_runtime(
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_id: &str,
+    ) -> Arc<Connection> {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("test ACP runtime should start");
+        let input = child.stdin.take().expect("test runtime stdin");
+        let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
+            .expect("test runtime watchdog should start");
+        Arc::new(Connection {
+            agent: agent.to_owned(),
+            profile,
+            worktree: worktree.to_path_buf(),
+            child: Mutex::new(child),
+            watchdog: Mutex::new(watchdog),
+            stopped: AtomicBool::new(false),
+            input: Mutex::new(input),
+            pending: Mutex::new(HashMap::new()),
+            reader_progress: ReaderProgress::default(),
+            permission_state: Mutex::new(PermissionState::default()),
+            elicitation_state: Mutex::new(HashMap::from([(
+                "7".to_string(),
+                PendingElicitation {
+                    message: json!({"method":"elicitation/create","id":7,"params":{"sessionId":session_id}}),
+                    received_at: 1,
+                },
+            )])),
+            next_permission_generation: AtomicU64::new(1),
+            prompt_state: Mutex::new(PromptState::default()),
+            cancelled_prompts: Mutex::new(HashSet::new()),
+            next_id: AtomicU64::new(1),
+            alive: AtomicBool::new(true),
+            capabilities: Mutex::new(Value::Null),
+            session_directories: Mutex::new(HashMap::from([(
+                session_id.to_owned(),
+                worktree.to_path_buf(),
+            )])),
+            session_configs: Mutex::new(HashMap::new()),
+            native_subagents: Mutex::new(NativeSubagentRegistry::default()),
+            session_profiles: Mutex::new(HashMap::from([(session_id.to_owned(), profile)])),
+            pending_directory: Mutex::new(None),
+            session_creation: Mutex::new(()),
+            ready: Condvar::new(),
+        })
+    }
+
     #[test]
     fn runtime_keys_and_build_caches_are_private_per_worktree() {
         let scratch = scratch("runtime-cache");
@@ -4424,6 +4535,93 @@ mod session_config_tests {
             );
         }
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_elicitation_ids_route_to_the_requested_profile_and_session() {
+        let scratch = scratch("elicitation-owner");
+        let worktree = scratch.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let build = test_runtime(
+            "codex",
+            CapabilityProfile::Build,
+            &worktree,
+            "build-session",
+        );
+        let review = test_runtime(
+            "codex",
+            CapabilityProfile::Review,
+            &worktree,
+            "review-session",
+        );
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key("codex", CapabilityProfile::Build, &worktree),
+            Arc::clone(&build),
+        );
+        manager.0.lock().unwrap().insert(
+            connection_key("codex", CapabilityProfile::Review, &worktree),
+            Arc::clone(&review),
+        );
+
+        let selected = connection_for_elicitation(
+            &manager,
+            "codex",
+            CapabilityProfile::Review,
+            &worktree,
+            "review-session",
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&selected, &review));
+        assert!(connection_for_elicitation(
+            &manager,
+            "codex",
+            CapabilityProfile::Review,
+            &worktree,
+            "build-session",
+        )
+        .is_err());
+        assert!(
+            claim_pending_elicitation(&selected.elicitation_state, "7", "build-session",).is_err()
+        );
+        let response =
+            claim_pending_elicitation(&selected.elicitation_state, "7", "review-session").unwrap();
+        assert_eq!(
+            response
+                .message
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str),
+            Some("review-session")
+        );
+        assert!(build.elicitation_state.lock().unwrap().contains_key("7"));
+
+        manager.shutdown();
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn cancelled_elicitation_emits_its_original_session_id() {
+        let pending = Mutex::new(HashMap::from([(
+            "7".to_string(),
+            PendingElicitation {
+                message: json!({"method":"elicitation/create","id":7,"params":{"sessionId":"nested-session"}}),
+                received_at: 1,
+            },
+        )]));
+        let mut cancelled = json!({"method":"$/cancel_request","params":{"id":7}});
+
+        assert_eq!(
+            attach_cancelled_elicitation_session(&mut cancelled, &pending).as_deref(),
+            Some("nested-session")
+        );
+        assert_eq!(
+            cancelled
+                .pointer("/params/sessionId")
+                .and_then(Value::as_str),
+            Some("nested-session")
+        );
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]
