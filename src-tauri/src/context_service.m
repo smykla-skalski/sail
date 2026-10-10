@@ -214,6 +214,21 @@ int sail_context_service_main(void) {
                     } else if ([op isEqualToString:@"end"]) {
                         closeSession(sessions, key);
                         xpc_dictionary_set_bool(reply, "ended", true);
+                    } else if ([op isEqualToString:@"revoke"]) {
+                        NSString *projectKey = field(message, "projectKey");
+                        NSCharacterSet *hex = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"];
+                        if (projectKey.length != 64 ||
+                            [[projectKey stringByTrimmingCharactersInSet:hex] length] != 0) {
+                            xpc_dictionary_set_string(reply, "error", "Invalid context project key.");
+                        } else {
+                            for (NSValue *sessionKey in [sessions.allKeys copy]) {
+                                if ([sessions[sessionKey][@"projectKey"] isEqualToString:projectKey]) {
+                                    closeSession(sessions, sessionKey);
+                                }
+                            }
+                            sail_context_provider_stop(projectKey.UTF8String);
+                            xpc_dictionary_set_bool(reply, "stopped", true);
+                        }
                     } else {
                         xpc_dictionary_set_string(reply, "error", "Invalid context request.");
                     }
@@ -297,6 +312,51 @@ void *sail_context_session_open(const char *directory, char *error, size_t error
         }
         writeError(error, errorLength, @"Context service requires macOS 13 or later.");
         return NULL;
+    }
+}
+
+bool sail_context_provider_revoke_remote(const char *projectKey, char *error, size_t errorLength) {
+    @autoreleasepool {
+        if (@available(macOS 13.0, *)) {
+            if (!projectKey || strlen(projectKey) != 64) {
+                writeError(error, errorLength, @"Invalid context project key.");
+                return false;
+            }
+            SMAppService *service = [SMAppService agentServiceWithPlistName:servicePlist()];
+            if (service.status != SMAppServiceStatusEnabled) return true;
+            NSString *hash = selfCodeHash();
+            if (!hash) {
+                writeError(error, errorLength, @"Sail code signature unavailable.");
+                return false;
+            }
+            xpc_connection_t connection = xpc_connection_create_mach_service(serviceLabel().UTF8String, NULL, 0);
+            NSString *requirement = [NSString stringWithFormat:@"cdhash H\"%@\"", hash];
+            if (xpc_connection_set_peer_code_signing_requirement(connection, requirement.UTF8String) != 0) {
+                xpc_connection_set_event_handler(connection, ^(xpc_object_t ignored) { (void)ignored; });
+                xpc_connection_resume(connection);
+                xpc_connection_cancel(connection);
+                writeError(error, errorLength, @"Cannot verify context service signature.");
+                return false;
+            }
+            xpc_connection_set_event_handler(connection, ^(xpc_object_t ignored) { (void)ignored; });
+            xpc_connection_resume(connection);
+            xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+            xpc_dictionary_set_string(request, "op", "revoke");
+            xpc_dictionary_set_string(request, "projectKey", projectKey);
+            xpc_object_t reply = xpc_connection_send_message_with_reply_sync(connection, request);
+            bool valid = xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+                [senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)];
+            bool stopped = valid && xpc_dictionary_get_bool(reply, "stopped");
+            if (!stopped) {
+                const char *reason = valid ? xpc_dictionary_get_string(reply, "error") : NULL;
+                writeError(error, errorLength, reason ? [NSString stringWithUTF8String:reason]
+                    : @"Context service signature or path rejected.");
+            }
+            xpc_connection_cancel(connection);
+            return stopped;
+        }
+        writeError(error, errorLength, @"Context service requires macOS 13 or later.");
+        return false;
     }
 }
 

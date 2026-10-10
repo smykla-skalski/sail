@@ -40,6 +40,7 @@ const port = await new Promise((resolve, reject) => {
 const root = mkdtempSync(join(scratch, 'sail-553-native-'));
 const project = join(root, 'project');
 const broken = join(root, 'broken');
+const revoked = join(root, 'revoked');
 const empty = join(root, 'empty');
 const provider = join(root, 'provider');
 const clients = [];
@@ -152,9 +153,22 @@ async function waitForReady(attempt = 0) {
   return waitForReady(attempt + 1);
 }
 
+async function waitForProcessExit(pid, attempt = 0) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error.code === 'ESRCH') return;
+    throw error;
+  }
+  if (attempt === 100) throw new Error(`Revoked provider ${pid} stayed alive`);
+  await delay(100);
+  return waitForProcessExit(pid, attempt + 1);
+}
+
 try {
   makeProject(project, 'fixture-provider');
   makeProject(broken, 'broken-provider');
+  makeProject(revoked, 'fixture-provider');
   mkdirSync(empty);
   run('git', ['init', '-q', empty]);
   run('cc', [
@@ -202,6 +216,19 @@ try {
   assert.equal(a.result.pid, b.result.pid, 'one provider process serves both agents');
   assert.equal(a.result.initializeCount, 1);
   assert.equal(b.result.initializeCount, 1, 'second agent reuses the provider handshake');
+
+  assert.equal(
+    run(binary, ['--context-auth-approve-probe', revoked, 'fixture-provider', provider]),
+    'approved',
+  );
+  const idle = startClient(revoked);
+  const idlePid = (await idle.request(9, 'initialize')).result.pid;
+  assert.ok(idlePid > 0);
+  assert.equal(run(binary, ['--context-auth-revoke-probe', revoked]), 'revoked');
+  await waitForProcessExit(idlePid);
+  await assert.rejects(idle.request(10));
+  await idle.waitForExit();
+  assert.match(idle.stderr(), /revoked|approval changed/i);
 
   writeFileSync(
     join(project, '.sail', 'context.json'),
@@ -264,7 +291,7 @@ try {
   await noContext.waitForExit();
   assert.match(noContext.stderr(), /approval unavailable/i);
   console.log(
-    'PASS: native MCP forwarding, one provider across agents, revocation, failure isolation, no-context',
+    'PASS: native MCP forwarding, one provider across agents, idle revocation cleanup, failure isolation, no-context',
   );
 } finally {
   for (const client of clients) if (!client.killed) client.kill('SIGTERM');

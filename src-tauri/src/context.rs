@@ -588,10 +588,17 @@ pub fn context_approve_provider(
 
 #[tauri::command]
 pub fn context_revoke_provider(app: tauri::AppHandle, directory: String) -> Result<(), String> {
-    locked_store(&store_path(&app)?, |store| {
+    let removed = locked_store(&store_path(&app)?, |store| {
         let removed = revoke(Path::new(&directory), store)?;
-        Ok(((), removed))
-    })
+        Ok((removed, removed))
+    })?;
+    #[cfg(target_os = "macos")]
+    if removed {
+        stop_revoked_provider(Path::new(&directory))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = removed;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -629,10 +636,30 @@ pub fn prepare_e2e_approval(
 
 #[cfg(all(target_os = "macos", feature = "e2e"))]
 pub fn revoke_e2e_approval(directory: &Path) -> Result<(), String> {
-    locked_store(&service_store_path()?, |store| {
+    let removed = locked_store(&service_store_path()?, |store| {
         let changed = revoke(directory, store)?;
-        Ok(((), changed))
-    })
+        Ok((changed, changed))
+    })?;
+    if removed {
+        stop_revoked_provider(directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn stop_revoked_provider(directory: &Path) -> Result<(), String> {
+    let key = std::ffi::CString::new(project_key(directory)?)
+        .map_err(|_| "Invalid context project key.".to_string())?;
+    let mut error = [0_i8; 512];
+    if unsafe { sail_context_provider_revoke_remote(key.as_ptr(), error.as_mut_ptr(), error.len()) }
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Approval revoked, but provider stop failed: {}",
+            unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -725,6 +752,11 @@ unsafe extern "C" {
         request: *const std::ffi::c_char,
         output: *mut std::ffi::c_char,
         output_length: usize,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> bool;
+    fn sail_context_provider_revoke_remote(
+        key: *const std::ffi::c_char,
         error: *mut std::ffi::c_char,
         error_length: usize,
     ) -> bool;
@@ -1290,7 +1322,14 @@ fn provider_request_at(
         return Err("Context session revoked before provider launch.".into());
     }
     if provider.is_none() {
-        *provider = Some(spawn_provider(&canonical, &current, &data_root.join(&key))?);
+        match spawn_provider(&canonical, &current, &data_root.join(&key)) {
+            Ok(process) => *provider = Some(process),
+            Err(error) => {
+                drop(provider);
+                forget_provider(&key, &slot);
+                return Err(error);
+            }
+        }
     }
     if !session_active()? {
         provider.take();
@@ -1739,6 +1778,37 @@ mod tests {
             &repository.0.join("data"),
         );
         assert!(result.is_err());
+        assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_spawn_failure_releases_project_slot() {
+        let repository = Repository::new("runtime-spawn-failure");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let data_root = repository.0.join("file-instead-of-directory");
+        fs::write(&data_root, "occupied").unwrap();
+        let error = provider_request_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &store_path,
+            &data_root,
+        )
+        .unwrap_err();
+        assert!(error.contains("Not a directory") || error.contains("not a directory"));
         assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
     }
 
