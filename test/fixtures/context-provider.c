@@ -27,6 +27,13 @@ int main(void) {
         char *end = NULL;
         long value = strtol(id + 1, &end, 10);
         if (end == id + 1) continue;
+        if (strstr(line, "\"name\":\"get\"")) {
+            printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"content\":\"", value);
+            for (size_t index = 0; index < 2 * 1024 * 1024; index++) putchar('x');
+            puts("\"}}");
+            fflush(stdout);
+            continue;
+        }
         printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"pid\":%ld,\"initializeCount\":%d}}\n",
                value, (long)getpid(), initialization_count);
         fflush(stdout);

@@ -6,6 +6,29 @@ use serde_json::{json, Value};
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const PAGE_BYTES: usize = 1024;
 
+struct ToolError {
+    message: &'static str,
+    source: Option<String>,
+}
+
+impl From<&'static str> for ToolError {
+    fn from(message: &'static str) -> Self {
+        Self {
+            message,
+            source: None,
+        }
+    }
+}
+
+impl ToolError {
+    fn for_source(message: &'static str, source: &str) -> Self {
+        Self {
+            message,
+            source: Some(source.to_owned()),
+        }
+    }
+}
+
 pub struct BrokerMcp {
     provider: String,
     scope: OutputScope,
@@ -80,17 +103,19 @@ impl BrokerMcp {
         arguments: &Value,
         provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ()>,
     ) -> Value {
-        let outcome = match name {
-            "sail_context_sources" => self.sources(provider_call),
-            "sail_context_search" => self.search(arguments, provider_call),
+        let outcome: Result<Value, ToolError> = match name {
+            "sail_context_sources" => self.sources(provider_call).map_err(Into::into),
+            "sail_context_search" => self.search(arguments, provider_call).map_err(Into::into),
             "sail_context_get" => self.get(arguments, provider_call),
-            "sail_context_health" => self.health(provider_call),
-            _ => Err("Context tool is unavailable."),
+            "sail_context_health" => self.health(provider_call).map_err(Into::into),
+            _ => Err("Context tool is unavailable.".into()),
         };
         match outcome {
             Ok(value) => tool_result(value, false),
-            Err(message) => tool_result(
-                json!({"provider":self.provider,"source":self.provider,"error":message}),
+            Err(error) => tool_result(
+                json!({"provider":self.provider,
+                    "source":error.source.unwrap_or_else(|| self.provider.clone()),
+                    "error":error.message}),
                 true,
             ),
         }
@@ -279,7 +304,7 @@ impl BrokerMcp {
         &self,
         arguments: &Value,
         provider_call: &mut impl FnMut(&str, Value) -> Result<Value, ()>,
-    ) -> Result<Value, &'static str> {
+    ) -> Result<Value, ToolError> {
         let offset = match arguments.get("offset") {
             Some(value) => value.as_u64().ok_or("Read offset is invalid.")?,
             None => 0,
@@ -290,16 +315,16 @@ impl BrokerMcp {
         };
         let length = usize::try_from(length).map_err(|_| "Read length is invalid.")?;
         if length == 0 || length > PAGE_BYTES {
-            return Err("Read length is invalid.");
+            return Err("Read length is invalid.".into());
         }
         if let Some(reference) = arguments.get("reference").and_then(Value::as_str) {
             if arguments.get("id").is_some() {
-                return Err("Choose an ID or a reference.");
+                return Err("Choose an ID or a reference.".into());
             }
-            return self.read(reference, offset, length);
+            return self.read(reference, offset, length).map_err(Into::into);
         }
         if offset != 0 {
-            return Err("Read an ID from offset zero.");
+            return Err("Read an ID from offset zero.".into());
         }
         let id = arguments
             .get("id")
@@ -308,27 +333,29 @@ impl BrokerMcp {
             .ok_or("Result ID is invalid.")?;
         let names = self.available_tools(provider_call)?;
         if !names.iter().any(|name| name == "get") {
-            return Err("Provider get is unavailable.");
+            return Err("Provider get is unavailable.".into());
         }
         let response = provider_call("tools/call", json!({"name":"get","arguments":{"id":id}}))
             .map_err(|_| "Provider source unavailable.")?;
         let content = result_content(&response)?;
         let hit = parse_hit(content)?;
         if hit.id != id {
-            return Err("Provider source unavailable.");
+            return Err("Provider source unavailable.".into());
         }
         let source = content
             .get("sourceUri")
             .and_then(Value::as_str)
             .ok_or("Provider source unavailable.")?;
         if source.len() > 256 || source.is_empty() {
-            return Err("Provider source unavailable.");
+            return Err("Provider source unavailable.".into());
         }
         let stored = self
             .store
             .put(&self.scope, &hit.content)
-            .map_err(|warning| warning.message())?;
-        let section = self.read(&stored.reference, 0, length)?;
+            .map_err(|warning| ToolError::for_source(warning.message(), source))?;
+        let section = self
+            .read(&stored.reference, 0, length)
+            .map_err(|message| ToolError::for_source(message, source))?;
         Ok(json!({
             "id": id,
             "provider": self.provider,
@@ -383,7 +410,7 @@ fn parse_hit(item: &Value) -> Result<RawHit, &'static str> {
         || revision.is_empty()
         || revision.len() > 128
         || timestamp_ms == 0
-        || content.len() > 16 * 1024 * 1024
+        || content.len() > 8 * 1024 * 1024
         || [id, source, revision]
             .iter()
             .any(|field| field.chars().any(char::is_control))
@@ -577,7 +604,7 @@ mod tests {
     #[test]
     fn get_stores_full_result_and_reads_exact_scoped_bytes() {
         let fixture = Fixture::new("one");
-        let content = "a".repeat(3000);
+        let content = "a".repeat(2 * 1024 * 1024);
         let (_, body) = fixture.call("sail_context_get", json!({"id":"doc"}), |method, params| {
             if method == "tools/list" {
                 return Ok(available());
@@ -588,7 +615,7 @@ mod tests {
         });
         let reference = body["section"]["reference"].as_str().unwrap();
         assert_eq!(body["sha256"].as_str().unwrap().len(), 64);
-        assert_eq!(body["section"]["totalBytes"], 3000);
+        assert_eq!(body["section"]["totalBytes"], 2 * 1024 * 1024);
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(body["section"]["bytesBase64"].as_str().unwrap())
             .unwrap();
@@ -651,6 +678,7 @@ mod tests {
             Ok(json!({"result":{"structuredContent":item("doc", "private secret")}}))
         });
         assert_eq!(body["error"], "Output storage is unavailable.");
+        assert_eq!(body["source"], "file:///project/notes");
         assert!(!body.to_string().contains("private secret"));
     }
 }

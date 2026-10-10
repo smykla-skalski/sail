@@ -12,6 +12,10 @@ use tauri::Manager;
 
 const CONFIG: &str = ".sail/worktree.json";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "macos")]
+const DEFAULT_PROVIDER_RESPONSE_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "macos")]
+const LARGE_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -838,9 +842,12 @@ impl ContextSession {
     }
 
     pub fn request(&self, message: &str) -> Result<Option<String>, String> {
+        let response_limit = serde_json::from_str::<serde_json::Value>(message)
+            .map(|request| provider_response_limit(&request))
+            .unwrap_or(DEFAULT_PROVIDER_RESPONSE_BYTES);
         let message = std::ffi::CString::new(message)
             .map_err(|_| "Context MCP request contains a NUL byte.".to_string())?;
-        let mut output = vec![0_i8; 1024 * 1024 + 1];
+        let mut output = vec![0_i8; response_limit + 1];
         let mut error = [0_i8; 512];
         if !unsafe {
             sail_context_session_request(
@@ -932,6 +939,20 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn provider_response_limit(request: &serde_json::Value) -> usize {
+    if request.get("method").and_then(serde_json::Value::as_str) == Some("tools/call")
+        && request
+            .pointer("/params/name")
+            .and_then(serde_json::Value::as_str)
+            == Some("get")
+    {
+        LARGE_PROVIDER_RESPONSE_BYTES
+    } else {
+        DEFAULT_PROVIDER_RESPONSE_BYTES
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1387,6 +1408,7 @@ fn provider_request_at(
     {
         return Err("Invalid context MCP JSON-RPC request.".into());
     }
+    let response_limit = provider_response_limit(&request);
     let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
     let key = project_key(&canonical)?;
     let providers = PROVIDERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
@@ -1501,7 +1523,10 @@ fn provider_request_at(
         let result = (|| -> Result<String, String> {
             let mut messages = String::new();
             for _ in 0..32 {
-                let line = read_bounded_line(&mut reader, 1024 * 1024 - messages.len())?;
+                let remaining = response_limit
+                    .checked_sub(messages.len())
+                    .ok_or("Provider response exceeds its limit.")?;
+                let line = read_bounded_line(&mut reader, remaining)?;
                 let value: serde_json::Value = serde_json::from_str(line.trim_end())
                     .map_err(|_| "Provider returned invalid JSON-RPC.".to_string())?;
                 if value.get("jsonrpc").and_then(|version| version.as_str()) != Some("2.0") {
@@ -1577,7 +1602,7 @@ fn read_bounded_line(reader: &mut impl std::io::BufRead, limit: usize) -> Result
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |position| position + 1);
         if output.len() + count > limit {
-            return Err("MCP message exceeds 1 MiB.".into());
+            return Err("MCP message exceeds its limit.".into());
         }
         let done = available[count - 1] == b'\n';
         output.extend_from_slice(&available[..count]);
@@ -1835,6 +1860,45 @@ mod tests {
         repository.commit();
         assert!(call().unwrap_err().contains("approval changed"));
         assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn approved_get_reads_a_large_provider_result() {
+        let repository = Repository::new("runtime-large-get");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key);
+        let store_path = repository.0.join("approvals.json");
+        let executable = repository.provider_fixture();
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
+        let request = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{"name":"get","arguments":{"id":"large"}}});
+        assert_eq!(
+            provider_response_limit(&request),
+            LARGE_PROVIDER_RESPONSE_BYTES
+        );
+        let response = provider_request_at(
+            &repository.0,
+            &fingerprint,
+            None,
+            &request.to_string(),
+            &store_path,
+            &repository.0.join("data"),
+        )
+        .unwrap()
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["content"].as_str().unwrap().len(),
+            2 * 1024 * 1024
+        );
     }
 
     #[cfg(target_os = "macos")]
