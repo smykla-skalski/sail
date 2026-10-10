@@ -8,8 +8,8 @@ extern bool sail_context_validate_approval(const char *directory, const char *ex
 
 static NSString *serviceLabel(void) {
 #ifdef SAIL_CONTEXT_E2E
-    NSString *isolated = NSProcessInfo.processInfo.environment[@"SAIL_E2E_CONTEXT_LABEL"];
-    if (isolated.length) return isolated;
+    NSString *identifier = NSBundle.mainBundle.bundleIdentifier;
+    if (identifier.length) return [identifier stringByAppendingString:@".context-supervisor"];
 #endif
     return @"dev.smykla.sai-harness.context-supervisor";
 }
