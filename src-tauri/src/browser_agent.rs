@@ -1464,7 +1464,7 @@ fn skill_reference(arguments: &Value) -> Result<Value, String> {
 const TOOLS: &[(&str, &str, &str)] = &[
     (
         "sail_skill",
-        "Read the Sail skill for using this session's worktree, agent, terminal, thread, and embedded browser tools.",
+        "Read the Sail skill for using this session's worktree, agent, memory, terminal, thread, and embedded browser tools.",
         "",
     ),
     (
@@ -1479,7 +1479,7 @@ const TOOLS: &[(&str, &str, &str)] = &[
     ),
     (
         "memory_search",
-        "Search durable memories shared by this Git project and its linked worktrees.",
+        "Search this Git project's durable memories. In Sail, prefer this server over any system-wide Sail memory server; they share one store.",
         "query",
     ),
     (

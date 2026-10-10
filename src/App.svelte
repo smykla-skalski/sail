@@ -5820,16 +5820,18 @@
                   error: null,
                   updated: Date.now(),
                 });
+                activeSpawnTargets.set(target.id, shippingReceipt!.receiptId);
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
               async () => {
+                if (activeSpawnTargets.get(target.id) === shippingReceipt!.receiptId)
+                  activeSpawnTargets.delete(target.id);
                 saveSpawnReceipt(originalReceipt);
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
               () => acp.prompt(thread.agent, thread.sessionId, recalledText, turnId),
             );
             turn = started.turn;
-            activeSpawnTargets.set(target.id, shippingReceipt.receiptId);
           } else turn = acp.prompt(thread.agent, thread.sessionId, recalledText, turnId);
         } catch {
           abandonImplementationTurn(thread.directory, tracking);
@@ -6205,7 +6207,11 @@
         await new Promise((resolve) => setTimeout(resolve, Math.min(250, deadline - Date.now())));
         return awaitReceipt(await boundedReceipt(current));
       }
-      const current = await awaitReceipt(await boundedReceipt(receipt));
+      let current = await awaitReceipt(await boundedReceipt(receipt));
+      if (request.name === 'agent_result' && current.state === 'completed' && !current.result) {
+        await recoverAcpSpawnResult(current);
+        current = spawnReceipts.find((item) => item.receiptId === current.receiptId) ?? current;
+      }
       const status = {
         receiptId: current.receiptId,
         requestId: current.requestId,
@@ -7699,13 +7705,15 @@
         query: prompt,
         sessionKey: `acp:${source.agent}:${session.sessionId}`,
       });
+      if (receiptId) {
+        updateSpawnReceipt(receiptId, { state: 'working', dispatchPending: false });
+        activeSpawnTargets.set(`acp:${source.agent}:${session.sessionId}`, receiptId);
+      }
       const turn = dispatchAuthorizedDirectShipPrompt(promptAuthorization, () =>
         acp.prompt(source.agent, session.sessionId, recalledPrompt, turnId),
       );
-      if (receiptId) updateSpawnReceipt(receiptId, { state: 'working', dispatchPending: false });
       if (receiptId)
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
-      if (receiptId) activeSpawnTargets.set(`acp:${source.agent}:${session.sessionId}`, receiptId);
       const finished = turn.then(
         async (outcome) => {
           if (tracking)
