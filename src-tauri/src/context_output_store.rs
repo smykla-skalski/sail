@@ -359,14 +359,21 @@ impl OutputStore {
             if scope.is_some_and(|key| key != directory_key) {
                 continue;
             }
-            let (_, record) = open_record(&path)?;
-            if record.header.scope != directory_key {
-                return Err(StoreWarning::StorageUnavailable);
-            }
+            let bytes = match open_record(&path) {
+                Ok((_, record)) if record.header.scope == directory_key => record.header.bytes,
+                _ => {
+                    let metadata = fs::symlink_metadata(&path)
+                        .map_err(|_| StoreWarning::StorageUnavailable)?;
+                    if !metadata.is_file() || metadata.file_type().is_symlink() {
+                        return Err(StoreWarning::StorageUnavailable);
+                    }
+                    metadata.len()
+                }
+            };
             usage.items += 1;
             usage.bytes = usage
                 .bytes
-                .checked_add(record.header.bytes)
+                .checked_add(bytes)
                 .ok_or(StoreWarning::StorageUnavailable)?;
         }
         Ok(usage)
@@ -545,11 +552,10 @@ impl OutputStore {
         let mut removed = 0;
         let mut touched = std::collections::HashSet::new();
         for (path, key) in self.entries()? {
-            let (_, record) = open_record(&path)?;
-            if record.header.scope != key {
-                return Err(StoreWarning::StorageUnavailable);
-            }
-            if record.header.expires_at_ms <= now {
+            let Ok((_, record)) = open_record(&path) else {
+                continue;
+            };
+            if record.header.scope == key && record.header.expires_at_ms <= now {
                 fs::remove_file(&path).map_err(|_| StoreWarning::StorageUnavailable)?;
                 touched.insert(key);
                 removed += 1;
@@ -579,11 +585,22 @@ impl OutputStore {
             return Err(StoreWarning::StorageUnavailable);
         }
         let mut removed = 0;
-        for (path, directory_key) in self.entries()? {
-            if directory_key == key {
-                fs::remove_file(path).map_err(|_| StoreWarning::StorageUnavailable)?;
-                removed += 1;
+        for entry in fs::read_dir(&directory).map_err(|_| StoreWarning::StorageUnavailable)? {
+            let entry = entry.map_err(|_| StoreWarning::StorageUnavailable)?;
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .map_err(|_| StoreWarning::StorageUnavailable)?
+                .is_file()
+            {
+                return Err(StoreWarning::StorageUnavailable);
             }
+            match path.extension().and_then(|extension| extension.to_str()) {
+                Some("out") => removed += 1,
+                Some("tmp") => {}
+                _ => return Err(StoreWarning::StorageUnavailable),
+            }
+            fs::remove_file(path).map_err(|_| StoreWarning::StorageUnavailable)?;
         }
         fs::remove_dir(directory).map_err(|_| StoreWarning::StorageUnavailable)?;
         Ok(removed)
@@ -747,6 +764,48 @@ mod tests {
         assert_eq!(store.usage(None), Ok(OutputUsage { items: 1, bytes: 6 }));
         assert!(!directory.join("interrupted.tmp").exists());
         assert_eq!(store.purge_scope(&scope()), Ok(1));
+    }
+
+    #[test]
+    fn corrupt_record_does_not_block_another_scope() {
+        let root = TestRoot::new();
+        let store = OutputStore::open(root.0.clone(), OutputLimits::default()).unwrap();
+        let damaged = store.put(&scope(), b"damaged").unwrap();
+        let damaged_id =
+            Uuid::parse_str(damaged.reference.strip_prefix("out:v1:").unwrap()).unwrap();
+        fs::write(
+            store.item_path(&scope().key().unwrap(), damaged_id),
+            b"corrupt",
+        )
+        .unwrap();
+
+        let mut other = scope();
+        other.session = "healthy-session".into();
+        let healthy = store.put(&other, b"healthy").unwrap();
+        assert_eq!(
+            store
+                .read_range(&other, &healthy.reference, 0, 7)
+                .unwrap()
+                .bytes,
+            b"healthy"
+        );
+        assert_eq!(store.usage(None).unwrap().items, 2);
+        assert_eq!(
+            store.read_range(&scope(), &damaged.reference, 0, 7),
+            Err(StoreWarning::StorageUnavailable)
+        );
+        assert_eq!(store.purge_scope(&scope()), Ok(1));
+        assert_eq!(store.usage(None).unwrap().items, 1);
+    }
+
+    #[test]
+    fn purging_an_empty_scope_succeeds() {
+        let root = TestRoot::new();
+        let store = OutputStore::open(root.0.clone(), OutputLimits::default()).unwrap();
+        let directory = store.scope_dir(&scope().key().unwrap());
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(store.purge_scope(&scope()), Ok(0));
+        assert!(!directory.exists());
     }
 
     #[test]
