@@ -30,7 +30,8 @@
             "wdio:default",
             "wdio-webdriver:default",
             "core:window:allow-set-theme",
-            "allow-acp-reset-test-runtimes"
+            "allow-acp-reset-test-runtimes",
+            "allow-reset-test-settings"
           ]
         }
       ]

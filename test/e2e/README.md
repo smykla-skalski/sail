@@ -1,6 +1,6 @@
 # E2E suite observations
 
-Run WebdriverIO against a private Sail build and app profile as described in the repository `AGENTS.md`. The fixture specs and later app specs share one app process, so the WebdriverIO `before` hook selects the main window, closes a leftover settings window, resolves pending agent requests, terminates fixture ACP runtimes, clears browser storage and fixture navigation, then reloads the app before each spec. The E2E-only runtime reset prevents fixture processes from exhausting the app’s file descriptors in a full suite.
+Run WebdriverIO against a private Sail build and app profile as described in the repository `AGENTS.md`. The fixture specs and later app specs share one app process, so the WebdriverIO `before` hook selects the main window, closes a leftover settings window, resolves pending agent requests, terminates fixture ACP runtimes, clears browser storage, disk-backed fixture settings, and fixture navigation, then reloads the app before each spec. The E2E-only runtime reset prevents fixture processes from exhausting the app’s file descriptors in a full suite.
 
 The E2E build accepts `SAIL_E2E_MACHINE_READING=healthy` to supply fixed healthy host memory and swap readings to the normal machine-pressure guard while keeping the real disk reading. Production builds ignore this variable. For an attached macOS app, pass it and a private `CLAUDE_CONFIG_DIR` through `open --env` and to WebdriverIO. The runner sets both automatically when it starts the app itself.
 

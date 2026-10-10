@@ -154,6 +154,7 @@ export const config = {
       await invoke('acp_reset_test_runtimes');
       localStorage.clear();
       sessionStorage.clear();
+      await invoke('reset_test_settings');
       if (location.search) history.replaceState(null, '', location.pathname);
     });
     await browser.refresh();

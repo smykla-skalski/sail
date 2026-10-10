@@ -2979,6 +2979,7 @@ pub fn run() {
             diagnostics::diagnostic_event,
             worktree_storage_cleanup_status,
             retry_worktree_storage_cleanup,
+            settings::reset_test_settings,
             settings::load_settings,
             settings::migrate_settings,
             settings::save_setting,

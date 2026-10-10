@@ -681,6 +681,22 @@ pub fn string_setting(app: &tauri::AppHandle, key: &str) -> Result<Option<String
     Ok(read_settings(&path)?.remove(key))
 }
 
+/// Clear disk-backed fixture settings between E2E specs under the normal settings lock.
+#[tauri::command]
+pub fn reset_test_settings(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        let path = settings_path(&app)?;
+        let _lock = lock_settings(&path)?;
+        write_settings(&path, &Settings::new())
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let _ = app;
+        Err("Settings reset requires the E2E build".into())
+    }
+}
+
 #[tauri::command]
 pub fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
     let path = settings_path(&app)?;

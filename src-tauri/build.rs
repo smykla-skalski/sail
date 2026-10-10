@@ -27,6 +27,7 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "diagnostic_event",
+            "reset_test_settings",
             "load_settings",
             "machine_pressure",
             "migrate_settings",
