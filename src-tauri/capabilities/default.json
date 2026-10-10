@@ -6,6 +6,7 @@
   "permissions": [
     "allow-diagnostic-event",
     "allow-load-settings",
+    "allow-machine-pressure",
     "allow-migrate-settings",
     "allow-save-setting",
     "allow-memory-agent-status",
@@ -46,6 +47,7 @@
     "allow-git-change-action",
     "allow-diff-file-contents",
     "allow-create-worktree",
+    "allow-worktree-pressure-directory",
     "allow-create-shipping-worktree",
     "allow-find-shipping-worktree",
     "allow-run-shipping-setup",

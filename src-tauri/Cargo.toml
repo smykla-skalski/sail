@@ -37,7 +37,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 httpdate = "1"
 nix = { version = "0.31", features = ["signal"] }
 netstat2 = "0.11.2"
-sysinfo = { version = "0.39.0", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39.0", default-features = false, features = ["disk", "system"] }
 wait-timeout = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 
