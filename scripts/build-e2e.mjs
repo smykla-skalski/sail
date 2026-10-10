@@ -17,7 +17,7 @@ try {
       import.meta.url,
     );
     const template = readFileSync(templatePath, 'utf8');
-    const service = e2eContextService(identity, template);
+    const service = e2eContextService(identity, template, process.env.SAIL_E2E_CONFIG_DIR);
     contextDir = mkdtempSync(join(tmpdir(), 'sail-e2e-context-'));
     const source = join(contextDir, `${service.label}.plist`);
     writeFileSync(source, service.plist);

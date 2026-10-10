@@ -23,11 +23,33 @@ await test('private E2E app bundles a matching context service plist', () => {
     'src-tauri/macos/dev.smykla.sai-harness.context-supervisor.plist',
     'utf8',
   );
-  const service = e2eContextService(identity, template);
+  const service = e2eContextService(identity, template, '/tmp/sail-private-config');
 
   assert.equal(service.label, `${identity.identifier}.context-supervisor`);
   assert.equal(service.destination, `Library/LaunchAgents/${service.label}.plist`);
   assert.ok(service.plist.includes(`<key>Label</key><string>${service.label}</string>`));
   assert.ok(service.plist.includes(`<key>${service.label}</key>`));
+  assert.ok(
+    service.plist.includes(
+      '<key>SAIL_E2E_CONFIG_DIR</key><string>/tmp/sail-private-config</string>',
+    ),
+  );
   assert.doesNotMatch(service.plist, /dev\.smykla\.sai-harness\.context-supervisor/);
+});
+
+await test('private service refuses a missing or relative approval store', () => {
+  const identity = e2eIdentity();
+  const template = readFileSync(
+    'src-tauri/macos/dev.smykla.sai-harness.context-supervisor.plist',
+    'utf8',
+  );
+
+  assert.throws(
+    () => e2eContextService(identity, template, undefined),
+    /absolute private SAIL_E2E_CONFIG_DIR/,
+  );
+  assert.throws(
+    () => e2eContextService(identity, template, 'relative/config'),
+    /absolute private SAIL_E2E_CONFIG_DIR/,
+  );
 });

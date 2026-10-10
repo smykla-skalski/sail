@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+#[cfg(not(feature = "e2e"))]
 use tauri::Manager;
 
 const CONFIG: &str = ".sail/worktree.json";
@@ -430,16 +431,30 @@ fn register(store: &mut ApprovalStore, command: &str, executable: &Path) {
         .insert(command.into(), executable.to_string_lossy().into_owned());
 }
 
-fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    #[cfg(feature = "e2e")]
-    if let Some(root) = std::env::var_os("SAIL_E2E_CONFIG_DIR") {
-        return Ok(PathBuf::from(root).join("context-providers.json"));
+#[cfg(feature = "e2e")]
+fn e2e_store_path() -> Result<PathBuf, String> {
+    let root = std::env::var_os("SAIL_E2E_CONFIG_DIR")
+        .ok_or("Set a private SAIL_E2E_CONFIG_DIR for context tests.")?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err("SAIL_E2E_CONFIG_DIR must be an absolute private path.".into());
     }
-    let config = app
-        .path()
-        .config_dir()
-        .map_err(|error| format!("Cannot locate Sail configuration: {error}"))?;
-    Ok(config.join("sail").join("context-providers.json"))
+    Ok(root.join("context-providers.json"))
+}
+
+fn store_path(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    #[cfg(feature = "e2e")]
+    {
+        e2e_store_path()
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let config = _app
+            .path()
+            .config_dir()
+            .map_err(|error| format!("Cannot locate Sail configuration: {error}"))?;
+        Ok(config.join("sail").join("context-providers.json"))
+    }
 }
 
 fn locked_store<T>(
@@ -558,11 +573,14 @@ pub fn context_revoke_provider(app: tauri::AppHandle, directory: String) -> Resu
 #[cfg(target_os = "macos")]
 fn service_store_path() -> Result<PathBuf, String> {
     #[cfg(feature = "e2e")]
-    if let Some(root) = std::env::var_os("SAIL_E2E_CONFIG_DIR") {
-        return Ok(PathBuf::from(root).join("context-providers.json"));
+    {
+        e2e_store_path()
     }
-    let config = dirs::config_dir().ok_or("Cannot locate Sail configuration.")?;
-    Ok(config.join("sail").join("context-providers.json"))
+    #[cfg(not(feature = "e2e"))]
+    {
+        let config = dirs::config_dir().ok_or("Cannot locate Sail configuration.")?;
+        Ok(config.join("sail").join("context-providers.json"))
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "e2e"))]
