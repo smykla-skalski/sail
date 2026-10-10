@@ -17,6 +17,10 @@ on:
         description: Run the one-off signed private context auth fixture
         type: boolean
         default: false
+      context_provider_553:
+        description: Run the one-off signed private provider relay fixture
+        type: boolean
+        default: false
   push:
     branches: [main]
     tags: ['v*']
@@ -26,7 +30,7 @@ permissions:
 
 jobs:
   package:
-    if: github.event_name != 'workflow_dispatch' || !inputs.context_auth_514
+    if: github.event_name != 'workflow_dispatch' || (!inputs.context_auth_514 && !inputs.context_provider_553)
     name: Package (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     permissions:
@@ -303,6 +307,86 @@ jobs:
         run: |
           private="$RUNNER_TEMP/sail-514-$GITHUB_RUN_ID"
           if [[ -n "$private" && "$private" == "$RUNNER_TEMP"/sail-514-* ]]; then
+            security delete-keychain "$private/signing.keychain-db" 2>/dev/null || true
+            rm -rf "$private"
+          fi
+
+  context-provider-553:
+    name: Signed private provider relay fixture
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.context_provider_553 &&
+      github.ref == 'refs/heads/feat/issue-553-provider-bridge' && github.actor == 'Automaat'
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure private fixture paths
+        shell: bash
+        run: |
+          private="$RUNNER_TEMP/sail-553-$GITHUB_RUN_ID"
+          {
+            echo "SAIL_E2E_CONFIG_DIR=$private/config"
+            echo "SAIL_TEST_SCRATCH=$private/test"
+            echo "CARGO_TARGET_DIR=$private/target"
+            echo "npm_config_cache=$private/npm-cache"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '24'
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Import existing Apple signing certificate
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_CERTIFICATE"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY"
+          private="$RUNNER_TEMP/sail-553-$GITHUB_RUN_ID"
+          mkdir -p "$private"
+          certificate="$private/certificate.p12"
+          keychain="$private/signing.keychain-db"
+          password="$(openssl rand -hex 24)"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$password" "$keychain"
+          security default-keychain -s "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security set-keychain-settings -t 3600 -u "$keychain"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain"
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build signed private app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$SAIL_E2E_CONFIG_DIR" "$SAIL_TEST_SCRATCH"
+          npm run build:e2e
+          apps=("$CARGO_TARGET_DIR"/debug/bundle/macos/*.app)
+          test "${#apps[@]}" -eq 1
+          codesign --verify --deep --strict "${apps[0]}"
+          test "$(codesign -dv --verbose=4 "${apps[0]}" 2>&1 | sed -n 's/^Signature=//p')" != 'adhoc'
+          echo "SAIL_E2E_APP=${apps[0]}" >> "$GITHUB_ENV"
+
+      - name: Exercise signed provider relay
+        run: node test/context-provider-native.mjs
+
+      - name: Remove private signing material and state
+        if: always()
+        shell: bash
+        run: |
+          private="$RUNNER_TEMP/sail-553-$GITHUB_RUN_ID"
+          if [[ -n "$private" && "$private" == "$RUNNER_TEMP"/sail-553-* ]]; then
             security delete-keychain "$private/signing.keychain-db" 2>/dev/null || true
             rm -rf "$private"
           fi

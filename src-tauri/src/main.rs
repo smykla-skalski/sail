@@ -92,6 +92,17 @@ fn main() {
     if sail_lib::context::is_service_process() {
         std::process::exit(sail_lib::context::service_main());
     }
+    #[cfg(target_os = "macos")]
+    if std::env::args().nth(1).as_deref() == Some("--context-mcp") {
+        let Some(directory) = std::env::args().nth(2) else {
+            std::process::exit(64);
+        };
+        if let Err(error) = sail_lib::context::run_mcp_stdio(std::path::Path::new(&directory)) {
+            eprintln!("context MCP: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--hook-deliver") {
         sail_lib::hook_activity::deliver_from_stdin();
         return;
