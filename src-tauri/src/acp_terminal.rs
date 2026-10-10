@@ -315,7 +315,19 @@ impl AcpTerminalManager {
             .unwrap_or_default()
     }
 
-    pub fn stop_sessions(&self, agent: &str, profile: CapabilityProfile, session_ids: &[String]) {
+    pub fn stop_sessions(
+        &self,
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_ids: &[String],
+    ) {
+        let scope = TerminalConnectionScope {
+            agent,
+            profile,
+            worktree,
+            session_ids,
+        };
         let terminals = self
             .active
             .lock()
@@ -328,9 +340,8 @@ impl AcpTerminalManager {
                             &terminal.agent,
                             terminal.profile,
                             &terminal.session_id,
-                            agent,
-                            profile,
-                            session_ids,
+                            &terminal.directory,
+                            &scope,
                         )
                     })
                     .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
@@ -455,17 +466,25 @@ impl AcpTerminalManager {
     }
 }
 
+struct TerminalConnectionScope<'a> {
+    agent: &'a str,
+    profile: CapabilityProfile,
+    worktree: &'a Path,
+    session_ids: &'a [String],
+}
+
 fn terminal_belongs_to_connection(
     terminal_agent: &str,
     terminal_profile: CapabilityProfile,
     terminal_session_id: &str,
-    agent: &str,
-    profile: CapabilityProfile,
-    session_ids: &[String],
+    terminal_worktree: &Path,
+    scope: &TerminalConnectionScope<'_>,
 ) -> bool {
-    terminal_agent == agent
-        && terminal_profile == profile
-        && session_ids
+    terminal_agent == scope.agent
+        && terminal_profile == scope.profile
+        && stable_worktree_identity(terminal_worktree) == stable_worktree_identity(scope.worktree)
+        && scope
+            .session_ids
             .iter()
             .any(|session_id| session_id == terminal_session_id)
 }
@@ -1665,38 +1684,47 @@ mod tests {
     #[test]
     fn connection_cleanup_only_matches_its_agent_sessions() {
         let disconnected = vec!["review-session".to_string(), "review-child".to_string()];
+        let scope = TerminalConnectionScope {
+            agent: "codex",
+            profile: CapabilityProfile::Review,
+            worktree: Path::new("/repo/a"),
+            session_ids: &disconnected,
+        };
 
         assert!(terminal_belongs_to_connection(
             "codex",
             CapabilityProfile::Review,
             "review-session",
-            "codex",
-            CapabilityProfile::Review,
-            &disconnected,
+            Path::new("/repo/a"),
+            &scope,
         ));
         assert!(!terminal_belongs_to_connection(
             "codex",
             CapabilityProfile::Build,
             "review-session",
-            "codex",
-            CapabilityProfile::Review,
-            &disconnected,
+            Path::new("/repo/a"),
+            &scope,
         ));
         assert!(!terminal_belongs_to_connection(
             "codex",
             CapabilityProfile::Review,
             "build-session",
-            "codex",
-            CapabilityProfile::Review,
-            &disconnected,
+            Path::new("/repo/a"),
+            &scope,
         ));
         assert!(!terminal_belongs_to_connection(
             "claude",
             CapabilityProfile::Review,
             "review-session",
+            Path::new("/repo/a"),
+            &scope,
+        ));
+        assert!(!terminal_belongs_to_connection(
             "codex",
             CapabilityProfile::Review,
-            &disconnected,
+            "review-session",
+            Path::new("/repo/b"),
+            &scope,
         ));
     }
 }

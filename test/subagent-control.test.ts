@@ -8,6 +8,7 @@ import {
   permissionAlreadyAnswered,
   permissionResolution,
   permissionResolutionLabel,
+  shipOwnedTargetKey,
   stoppableSubagents,
   subagentStop,
 } from '../src/lib/subagent-control.ts';
@@ -62,7 +63,27 @@ void test('Ship gates and Ship workers are managed by Stop run', () => {
     ),
     'ship-managed',
   );
-  assert.equal(subagentStop(receipt('worker'), new Set(['acp:codex:worker'])), 'ship-managed');
+  assert.equal(
+    subagentStop(receipt('worker'), new Set([shipOwnedTargetKey('/a', 'acp:codex:worker')])),
+    'ship-managed',
+  );
+  assert.equal(
+    subagentStop(
+      receipt('same-session', { targetId: 'acp:codex:same' }),
+      new Set([shipOwnedTargetKey('/a', 'acp:codex:same')]),
+    ),
+    'ship-managed',
+  );
+  assert.equal(
+    subagentStop(
+      receipt('sibling-session', {
+        targetId: 'acp:codex:same',
+        targetDirectory: '/b',
+      }),
+      new Set([shipOwnedTargetKey('/a', 'acp:codex:same')]),
+    ),
+    'stop',
+  );
 });
 
 void test('MCP and OpenCode children stop individually', () => {
@@ -79,7 +100,9 @@ void test('stop all skips native, Ship-managed and settled children', () => {
     receipt('d'),
   ];
   assert.deepEqual(
-    stoppableSubagents(receipts, new Set(['acp:codex:d'])).map((item) => item.receiptId),
+    stoppableSubagents(receipts, new Set([shipOwnedTargetKey('/a', 'acp:codex:d')])).map(
+      (item) => item.receiptId,
+    ),
     ['a'],
   );
 });

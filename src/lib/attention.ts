@@ -16,13 +16,14 @@ export type ActivitySnapshot = Record<
 
 export function reconcileAttention(
   current: AttentionMap,
-  threads: { agent: string; sessionId: string; key: string; viewed: boolean }[],
+  threads: { agent: string; directory?: string; sessionId: string; key: string; viewed: boolean }[],
   activity: ActivitySnapshot,
 ): AttentionMap {
   const next = { ...current };
   for (const thread of threads) {
     const previous = current[thread.key];
-    const runtime = activity[thread.agent];
+    const runtime =
+      activity[thread.directory ? JSON.stringify([thread.directory, thread.agent]) : thread.agent];
     const active = runtime?.alive && runtime.active.includes(thread.sessionId);
     if (!active && previous?.status !== 'working' && previous?.status !== 'waiting') continue;
     const waiting = active && (runtime?.waiting.includes(thread.sessionId) ?? false);

@@ -180,7 +180,7 @@ void test('cancelled agent connection never reaches process startup', async () =
   );
   const controller = new AbortController();
   try {
-    const pending = acp.connect('codex', undefined, { signal: controller.signal });
+    const pending = acp.connect('codex', '/repo', undefined, { signal: controller.signal });
     assert.equal(await settled(pending), false);
     controller.abort();
     await assert.rejects(pending, /cancelled/);
@@ -198,9 +198,11 @@ void test('queued agent startup can be cancelled before acquiring a slot', async
   resourceQueues.agent.setLimit(0);
   const limits: (number | null)[] = [];
   try {
-    const pending = acp.acquireTurnSlot('queued-startup', (limit) => limits.push(limit));
+    const pending = acp.prompt('codex', '/repo', 'queued-startup', 'prompt', 'turn', [], (limit) =>
+      limits.push(limit),
+    );
     assert.equal(await settled(pending), false);
-    assert.equal(acp.cancelQueuedTurn('queued-startup'), true);
+    assert.equal(acp.cancelQueuedTurn('codex', '/repo', 'queued-startup', 'turn'), true);
     await assert.rejects(pending, /cancelled/);
     assert.equal(limits[0], 0);
     assert.equal(limits.at(-1), null);

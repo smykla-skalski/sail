@@ -7,6 +7,7 @@ import {
   finalizeNativeSubagentRestore,
   nativeMessageLimit,
   nativeSubagentAcceptsPrompts,
+  nativeSubagentId,
   nativeSubagentCounts,
   nativeSubagentReceipts,
   nativeSubagentThreads,
@@ -37,7 +38,36 @@ await test('backend snapshot exposes a child before its queued frontend event ru
   assert.equal(receipts[0].sourceId, 'acp:codex:owner');
   assert.equal(receipts[0].targetId, 'acp:codex:late-child');
   assert.equal(receipts[0].state, 'working');
-  assert.equal(store['codex:late-child'].capabilityProfile, 'review');
+  assert.equal(
+    store[nativeSubagentId('codex', '/worktree', 'late-child')].capabilityProfile,
+    'review',
+  );
+});
+
+await test('native receipts stay distinct when sibling worktrees reuse a session id', () => {
+  const store = reconcileNativeSubagents(
+    {},
+    ['/repo/one', '/repo/two'].map((directory) => ({
+      agent: 'codex',
+      capabilityProfile: 'build' as const,
+      sessionId: 'same-child',
+      parentSessionId: 'same-parent',
+      directory,
+      outcome: 'working',
+    })),
+    10,
+  );
+
+  const receipts = nativeSubagentReceipts(store);
+  assert.equal(receipts.length, 2);
+  assert.notEqual(receipts[0]?.receiptId, receipts[1]?.receiptId);
+  assert.notEqual(receipts[0]?.requestId, receipts[1]?.requestId);
+  assert.deepEqual(
+    receipts
+      .map((receipt) => receipt.targetDirectory)
+      .toSorted((left, right) => left.localeCompare(right)),
+    ['/repo/one', '/repo/two'],
+  );
 });
 
 function event(sessionId: string, update: Record<string, unknown>): AgentEvent {
@@ -87,18 +117,21 @@ await test('native lifecycle keeps nested sessions and transcripts distinct', ()
     3,
   );
 
-  assert.equal(store['codex:child'].rootSessionId, 'parent');
-  assert.equal(store['codex:grandchild'].parentSessionId, 'child');
-  assert.equal(store['codex:grandchild'].rootSessionId, 'parent');
-  assert.equal(store['codex:child'].capabilityProfile, 'review');
-  assert.equal(store['codex:grandchild'].capabilityProfile, 'review');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'child')].rootSessionId, 'parent');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'grandchild')].parentSessionId, 'child');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'grandchild')].rootSessionId, 'parent');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'child')].capabilityProfile, 'review');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'grandchild')].capabilityProfile, 'review');
   assert.equal(
     nativeSubagentThreads(store).find((thread) => thread.sessionId === 'grandchild')
       ?.capabilityProfile,
     'review',
   );
-  assert.equal(store['codex:child'].transcript.at(-1)?.type, 'assistant');
-  assert.equal(store['codex:grandchild'].transcript.length, 0);
+  assert.equal(
+    store[nativeSubagentId('codex', '/repo', 'child')].transcript.at(-1)?.type,
+    'assistant',
+  );
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'grandchild')].transcript.length, 0);
   assert.equal(nativeSubagentReceipts(store)[0].result, null);
   assert.deepEqual(nativeSubagentCounts(store, 'codex', 'parent'), { active: 1, waiting: 0 });
 });
@@ -138,10 +171,10 @@ await test('a long-running child keeps its prompt and the newest bounded transcr
       steps + 2,
     );
 
-  const transcript = store['codex:child'].transcript;
+  const transcript = store[nativeSubagentId('codex', '/repo', 'child')].transcript;
   assert.equal(transcript.length, nativeTranscriptLimit);
   assert.deepEqual(transcript[0], {
-    id: 'codex:child:prompt',
+    id: `${nativeSubagentId('codex', '/repo', 'child')}:prompt`,
     type: 'user',
     text: 'Start here',
     created: 1,
@@ -175,7 +208,7 @@ await test('a capped message never starts inside a surrogate pair', () => {
       '/repo',
       2,
     );
-    const last = store['codex:child'].transcript.at(-1);
+    const last = store[nativeSubagentId('codex', '/repo', 'child')].transcript.at(-1);
     assert.ok(last?.type === 'assistant');
     assert.ok(last.text.isWellFormed());
     assert.ok(last.text.length <= nativeMessageLimit);
@@ -206,7 +239,10 @@ await test('an update that changes nothing leaves a long spawn prompt whole', ()
     store = updateNativeSubagents(store, event('child', update), '/repo', 2);
 
   assert.deepEqual(
-    store['codex:child'].transcript.map((entry) => [entry.type, 'text' in entry && entry.text]),
+    store[nativeSubagentId('codex', '/repo', 'child')].transcript.map((entry) => [
+      entry.type,
+      'text' in entry && entry.text,
+    ]),
     [
       ['user', prompt],
       ['assistant', 'Working'],
@@ -225,10 +261,16 @@ await test('replayed lifecycle deduplicates and unfinished history disconnects',
   let store = updateNativeSubagents({}, spawn, '/repo', 1, true);
   store = updateNativeSubagents(store, spawn, '/repo', 2, true);
   assert.equal(Object.keys(store).length, 1);
-  assert.equal(store['codex:parent:replay-subagent:child'].created, 1);
+  assert.equal(
+    store[nativeSubagentId('codex', '/repo', 'parent:replay-subagent:child')].created,
+    1,
+  );
 
-  store = finalizeNativeSubagentRestore(store, 'codex', 'parent', 3);
-  assert.equal(store['codex:parent:replay-subagent:child'].outcome, 'unknown');
+  store = finalizeNativeSubagentRestore(store, 'codex', '/repo', 'parent', 3);
+  assert.equal(
+    store[nativeSubagentId('codex', '/repo', 'parent:replay-subagent:child')].outcome,
+    'unknown',
+  );
   assert.equal(nativeSubagentReceipts(store)[0].state, 'unavailable');
 });
 
@@ -267,9 +309,9 @@ await test('terminal outcomes stay distinct and disconnect only affects live chi
     '/repo',
     3,
   );
-  store = disconnectNativeSubagents(store, 'codex', ['live'], 4);
-  assert.equal(store['codex:done'].outcome, 'interrupted');
-  assert.equal(store['codex:live'].outcome, 'unknown');
+  store = disconnectNativeSubagents(store, 'codex', '/repo', ['live'], 4);
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'done')].outcome, 'interrupted');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'live')].outcome, 'unknown');
 });
 
 await test('disconnect leaves children from another capability connection live', () => {
@@ -300,10 +342,10 @@ await test('disconnect leaves children from another capability connection live',
     'build',
   );
 
-  store = disconnectNativeSubagents(store, 'codex', ['review-parent', 'review-child'], 3);
+  store = disconnectNativeSubagents(store, 'codex', '/repo', ['review-parent', 'review-child'], 3);
 
-  assert.equal(store['codex:review-child'].outcome, 'unknown');
-  assert.equal(store['codex:build-child'].outcome, 'working');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'review-child')].outcome, 'unknown');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'build-child')].outcome, 'working');
 });
 
 await test('review native child keeps medium-risk actions denied', () => {
@@ -396,8 +438,11 @@ await test('late and duplicate events cannot revive a terminal child', () => {
   );
   store = updateNativeSubagents(store, spawn, '/repo', 4);
 
-  assert.equal(store['codex:done'].outcome, 'completed');
-  assert.equal(store['codex:done'].transcript.at(-1)?.text, 'Late output');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'done')].outcome, 'completed');
+  assert.equal(
+    store[nativeSubagentId('codex', '/repo', 'done')].transcript.at(-1)?.text,
+    'Late output',
+  );
   assert.equal(nativeSubagentReceipts(store)[0].result, 'Late output');
 });
 
@@ -461,11 +506,11 @@ await test('resolved child permission clears its waiting activity', () => {
     '/repo',
     1,
   );
-  store = setNativeSubagentWaiting(store, 'codex', 'child', true, 2);
-  assert.equal(store['codex:child'].activity, 'Needs permission');
-  store = setNativeSubagentWaiting(store, 'codex', 'child', false, 3);
-  assert.equal(store['codex:child'].outcome, 'working');
-  assert.equal(store['codex:child'].activity, 'Working…');
+  store = setNativeSubagentWaiting(store, 'codex', '/repo', 'child', true, 2);
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'child')].activity, 'Needs permission');
+  store = setNativeSubagentWaiting(store, 'codex', '/repo', 'child', false, 3);
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'child')].outcome, 'working');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'child')].activity, 'Working…');
 });
 
 await test('malformed and self-referential lifecycle events leave parents intact', () => {
@@ -493,7 +538,7 @@ await test('malformed and self-referential lifecycle events leave parents intact
     true,
   );
   assert.equal(
-    restored['codex:parent:replay-subagent:broken'].error,
+    restored[nativeSubagentId('codex', '/repo', 'parent:replay-subagent:broken')].error,
     'Incomplete subagent history',
   );
 });
@@ -526,7 +571,7 @@ await test('a replay of a live session does not duplicate its live children', ()
     false,
   );
   assert.equal(nested, live);
-  const finalized = finalizeNativeSubagentRestore(nested, 'codex', 'root', 4);
+  const finalized = finalizeNativeSubagentRestore(nested, 'codex', '/repo', 'root', 4);
   assert.deepEqual(
     Object.values(finalized).map((child) => [child.sessionId, child.outcome]),
     [['task-1', 'working']],
@@ -536,18 +581,18 @@ await test('a replay of a live session does not duplicate its live children', ()
 await test('a claude child spawned while its session replays stays live', () => {
   const live = { ...spawnEvent('root', 'root:live-child'), agent: 'claude' as const };
   const store = updateNativeSubagents({}, live, '/repo', 1, true);
-  const child = store['claude:root:live-child'];
+  const child = store[nativeSubagentId('claude', '/repo', 'root:live-child')];
   assert.equal(child?.restored, false);
   assert.equal(child?.outcome, 'working');
-  assert.equal(finalizeNativeSubagentRestore(store, 'claude', 'root', 2), store);
+  assert.equal(finalizeNativeSubagentRestore(store, 'claude', '/repo', 'root', 2), store);
 });
 
 await test('an adapter without replay markers still restores its children', () => {
   const store = updateNativeSubagents({}, spawnEvent('root', 'thread-7'), '/repo', 1, true);
-  assert.equal(store['codex:thread-7']?.restored, true);
-  const finalized = finalizeNativeSubagentRestore(store, 'codex', 'root', 2);
-  assert.equal(finalized['codex:thread-7']?.outcome, 'unknown');
-  assert.equal(finalized['codex:thread-7']?.activity, 'Disconnected');
+  assert.equal(store[nativeSubagentId('codex', '/repo', 'thread-7')]?.restored, true);
+  const finalized = finalizeNativeSubagentRestore(store, 'codex', '/repo', 'root', 2);
+  assert.equal(finalized[nativeSubagentId('codex', '/repo', 'thread-7')]?.outcome, 'unknown');
+  assert.equal(finalized[nativeSubagentId('codex', '/repo', 'thread-7')]?.activity, 'Disconnected');
 });
 
 await test('a first replay still restores historical children', () => {
@@ -564,7 +609,7 @@ await test('a first replay still restores historical children', () => {
     1,
     true,
   );
-  const child = restored['codex:root:replay-subagent:toolu_1'];
+  const child = restored[nativeSubagentId('codex', '/repo', 'root:replay-subagent:toolu_1')];
   assert.equal(child?.restored, true);
   assert.equal(child?.rootSessionId, 'root');
 });
@@ -600,13 +645,18 @@ await test('tool output is capped even when the tool is not the newest entry', (
   ])
     store = updateNativeSubagents(store, event('child', update), '/repo', 2);
 
-  const tool = store['codex:child'].transcript.find((entry) => entry.id === 'shell');
+  const tool = store[nativeSubagentId('codex', '/repo', 'child')].transcript.find(
+    (entry) => entry.id === 'shell',
+  );
   assert.ok(tool?.type === 'tool');
   assert.equal(tool.status, 'completed');
   assert.equal(tool.content.length, nativeMessageLimit);
   assert.ok(tool.content.startsWith('…o'));
   assert.ok(typeof tool.output !== 'string' || tool.output.length <= nativeMessageLimit);
-  assert.equal(store['codex:child'].transcript.at(-1)?.type, 'assistant');
+  assert.equal(
+    store[nativeSubagentId('codex', '/repo', 'child')].transcript.at(-1)?.type,
+    'assistant',
+  );
 });
 
 await test('an update for a tool the bound evicted adds no stub entry', () => {
@@ -623,7 +673,7 @@ await test('an update for a tool the bound evicted adds no stub entry', () => {
       '/repo',
       index + 2,
     );
-  const before = store['codex:child'].transcript;
+  const before = store[nativeSubagentId('codex', '/repo', 'child')].transcript;
   assert.ok(!before.some((entry) => entry.id === 'tool-0'));
 
   store = updateNativeSubagents(
@@ -637,7 +687,7 @@ await test('an update for a tool the bound evicted adds no stub entry', () => {
     999,
   );
 
-  const after = store['codex:child'].transcript;
+  const after = store[nativeSubagentId('codex', '/repo', 'child')].transcript;
   assert.equal(after, before);
   store = updateNativeSubagents(
     store,
@@ -649,7 +699,7 @@ await test('an update for a tool the bound evicted adds no stub entry', () => {
     '/repo',
     1000,
   );
-  const last = store['codex:child'].transcript.at(-1);
+  const last = store[nativeSubagentId('codex', '/repo', 'child')].transcript.at(-1);
   assert.ok(last?.type === 'tool');
   assert.equal(last.status, 'completed');
 });
@@ -666,7 +716,7 @@ await test('a chunk appended to a long spawn prompt keeps the prompt start', () 
     2,
   );
 
-  const first = store['codex:child'].transcript[0];
+  const first = store[nativeSubagentId('codex', '/repo', 'child')].transcript[0];
   assert.ok(first.type === 'user');
   assert.ok(first.text.startsWith('START'));
   assert.ok(first.text.endsWith('more'));
@@ -687,7 +737,9 @@ await test('structured tool input and output are capped as text', () => {
     2,
   );
 
-  const tool = store['codex:child'].transcript.find((entry) => entry.id === 'write');
+  const tool = store[nativeSubagentId('codex', '/repo', 'child')].transcript.find(
+    (entry) => entry.id === 'write',
+  );
   assert.ok(tool?.type === 'tool');
   assert.ok(typeof tool.input === 'string' && tool.input.length === nativeMessageLimit);
   assert.ok(tool.input.startsWith('{"command":"write"'));
@@ -709,7 +761,9 @@ await test('small structured tool values stay structured', () => {
     2,
   );
 
-  const tool = store['codex:child'].transcript.find((entry) => entry.id === 'read');
+  const tool = store[nativeSubagentId('codex', '/repo', 'child')].transcript.find(
+    (entry) => entry.id === 'read',
+  );
   assert.ok(tool?.type === 'tool');
   assert.deepEqual(tool.input, { path: '/repo/a.ts' });
   assert.deepEqual(tool.output, { lines: 3 });
@@ -854,7 +908,7 @@ function spawnWithCapabilities(capabilities: Record<string, unknown>) {
     1,
     false,
     'build',
-  )['codex:child'];
+  )[nativeSubagentId('codex', '/repo', 'child')];
 }
 
 await test('a child accepts prompts only when its adapter advertises the capability', () => {
@@ -923,14 +977,14 @@ await test('a resumed OpenCode child re-arms after completing and keeps failure 
     1,
   );
   store = updateNativeSubagents(store, state('completed'), '/worktree', 2);
-  assert.equal(store['opencode:child'].outcome, 'completed');
+  assert.equal(store[nativeSubagentId('opencode', '/worktree', 'child')].outcome, 'completed');
   store = updateNativeSubagents(store, state('working'), '/worktree', 3);
-  assert.equal(store['opencode:child'].outcome, 'working');
+  assert.equal(store[nativeSubagentId('opencode', '/worktree', 'child')].outcome, 'working');
   store = updateNativeSubagents(store, state('failed', 'boom'), '/worktree', 4);
-  assert.equal(store['opencode:child'].error, 'boom');
+  assert.equal(store[nativeSubagentId('opencode', '/worktree', 'child')].error, 'boom');
   store = updateNativeSubagents(store, state('working'), '/worktree', 5);
   store = updateNativeSubagents(store, state('completed'), '/worktree', 6);
-  assert.equal(store['opencode:child'].error, undefined);
+  assert.equal(store[nativeSubagentId('opencode', '/worktree', 'child')].error, undefined);
   assert.equal(nativeSubagentReceipts(store)[0].error, null);
 });
 
@@ -953,5 +1007,8 @@ await test('a state update keeps the incomplete-history marker on restored child
     2,
     true,
   );
-  assert.equal(store['codex:k'].error, 'Incomplete subagent history');
+  assert.equal(
+    store[nativeSubagentId('codex', '/worktree', 'k')].error,
+    'Incomplete subagent history',
+  );
 });
