@@ -10,6 +10,7 @@ export function isolatedPaths(
     Object.entries({
       SAIL_WORKTREE_ROOT: 'worktrees',
       SAIL_E2E_CONFIG_DIR: 'config',
+      CLAUDE_CONFIG_DIR: 'claude',
       XDG_CONFIG_HOME: 'config',
       XDG_DATA_HOME: 'data',
       XDG_CACHE_HOME: 'cache',

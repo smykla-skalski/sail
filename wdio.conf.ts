@@ -25,7 +25,9 @@ process.once('exit', () => {
 });
 const attach = process.env.SAIL_E2E_ATTACH === '1';
 Object.assign(process.env, isolatedPaths(state, attach, process.env));
-if (!attach) process.env.CLAUDE_CONFIG_DIR = join(state, 'claude');
+if (attach && process.env.SAIL_E2E_MACHINE_READING !== 'healthy')
+  throw new Error('Attach mode requires SAIL_E2E_MACHINE_READING=healthy in the app and runner.');
+if (!attach) process.env.SAIL_E2E_MACHINE_READING = 'healthy';
 process.env.SAIL_E2E_OPEN_URL_LOG = attach
   ? (process.env.SAIL_E2E_OPEN_URL_LOG ?? join(state, 'external-link.log'))
   : join(state, 'external-link.log');

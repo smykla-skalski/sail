@@ -2,6 +2,8 @@
 
 Run WebdriverIO against a private Sail build and app profile as described in the repository `AGENTS.md`. The fixture specs and later app specs share one app process, so the WebdriverIO `before` hook selects the main window, closes a leftover settings window, and resets the window size, fixture navigation, pending agent requests, and the durable E2E settings flag between specs.
 
+The E2E build accepts `SAIL_E2E_MACHINE_READING=healthy` to supply fixed healthy host memory and swap readings to the normal machine-pressure guard while keeping the real disk reading. Production builds ignore this variable. For an attached macOS app, pass it and a private `CLAUDE_CONFIG_DIR` through `open --env` and to WebdriverIO. The runner sets both automatically when it starts the app itself.
+
 ## Clean macOS run on 2026-10-10
 
 The full suite on `7e0fc1f8` reached its 30-minute limit after 50 of 51 spec files: 23 passed, 27 failed, and `zoom.spec.ts` did not start. `activity-history.spec.ts` followed by `agent-questions.spec.ts` passed both in this run and when selected alone.
