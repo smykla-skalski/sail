@@ -424,10 +424,53 @@ fn mcp_server(config: &crate::browser_agent::McpConfig) -> Value {
 
 fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]) -> Value {
     let mut params = json!({"cwd":cwd,"mcpServers":servers});
+    if let Some(common_dir) = linked_worktree_git_common_dir(cwd) {
+        params["additionalDirectories"] = json!([common_dir]);
+    }
     if let Some(session_id) = session_id {
         params["sessionId"] = json!(session_id);
     }
     params
+}
+
+fn linked_worktree_git_common_dir(cwd: &str) -> Option<String> {
+    let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args([
+            "-C",
+            cwd,
+            "rev-parse",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut paths = stdout.lines();
+    let top_level = PathBuf::from(paths.next()?).canonicalize().ok()?;
+    if top_level != PathBuf::from(cwd).canonicalize().ok()? {
+        return None;
+    }
+    let resolve = |path: &str| {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path.canonicalize().ok()
+        } else {
+            PathBuf::from(cwd).join(path).canonicalize().ok()
+        }
+    };
+    let git_dir = resolve(paths.next()?)?;
+    let common_dir = resolve(paths.next()?)?;
+    if git_dir == common_dir || !git_dir.starts_with(common_dir.join("worktrees")) {
+        return None;
+    }
+    Some(common_dir.to_string_lossy().into_owned())
 }
 
 fn session_servers(browser: Value, memory: Option<Value>) -> Vec<Value> {
@@ -4103,6 +4146,65 @@ mod session_config_tests {
         assert_eq!(request["mcpServers"].as_array().unwrap().len(), 2);
         assert_eq!(request["mcpServers"][1]["name"], "sail-memory");
         assert!(optional_memory_server(Err("store unavailable".into())).is_none());
+    }
+
+    #[test]
+    fn linked_worktree_session_grants_only_its_git_common_directory() {
+        let root = scratch("linked-git");
+        let main = root.join("main");
+        let linked = root.join("linked");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(&main)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&main)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&main)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&linked)
+            .status()
+            .unwrap()
+            .success());
+
+        let request = session_request_params(linked.to_str().unwrap(), None, &[]);
+        assert_eq!(request["additionalDirectories"], json!([main.join(".git")]));
+        let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
+        assert_eq!(
+            restored["additionalDirectories"],
+            request["additionalDirectories"]
+        );
+        assert!(session_request_params(main.to_str().unwrap(), None, &[])
+            .get("additionalDirectories")
+            .is_none());
+
+        std::fs::create_dir(linked.join("nested")).unwrap();
+        assert!(
+            session_request_params(linked.join("nested").to_str().unwrap(), None, &[])
+                .get("additionalDirectories")
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
