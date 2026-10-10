@@ -569,7 +569,7 @@ fn check_git_content(
 
 fn reject_content_attributes(root: &Path, destination: &Path) -> Result<(), String> {
     let relative = destination.to_str().ok_or("Invalid destination.")?;
-    let attributes = ["filter", "ident", "working-tree-encoding"];
+    let attributes = ["filter", "ident", "working-tree-encoding", "diff"];
     let output = git_command()
         .arg("-C")
         .arg(root)
@@ -591,6 +591,11 @@ fn reject_content_attributes(root: &Path, destination: &Path) -> Result<(), Stri
         let field = index * 3;
         if fields[field] != relative.as_bytes() || fields[field + 1] != attribute.as_bytes() {
             return Err("Invalid Git content conversion response.".into());
+        }
+        if *attribute == "diff" && fields[field + 2] != b"unspecified" {
+            return Err(
+                "Destination has a Git diff override; choose a file with a text diff.".into(),
+            );
         }
         if fields[field + 2] != b"unspecified" && fields[field + 2] != b"unset" {
             return Err(
@@ -845,6 +850,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("Git content conversion"), "{error}");
+    }
+
+    #[test]
+    fn hidden_or_custom_git_diff_is_rejected() {
+        for attribute in ["-diff", "diff=custom"] {
+            let repo = Repo::new();
+            fs::write(
+                repo.0.join(".gitattributes"),
+                format!("AGENTS.md {attribute}\n"),
+            )
+            .unwrap();
+            repo.git(&["add", ".gitattributes"]);
+            repo.git(&["commit", "-qm", "set diff override"]);
+
+            let error = preview(
+                &repo.0,
+                Repo::memory(),
+                Path::new("AGENTS.md"),
+                "## New rule",
+                true,
+            )
+            .unwrap_err();
+            assert!(error.contains("Git diff override"), "{attribute}: {error}");
+            assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]
