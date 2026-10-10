@@ -97,12 +97,52 @@ function setPressureState(reason: string | null, directoryReasons: Map<string, s
   updateMonitor();
 }
 
+export function pressureReasonsForResults(
+  results: PromiseSettledResult<MachineReading>[],
+  directories: string[],
+  thresholds: PressureThresholds,
+): { reason: string | null; directoryReasons: Map<string, string> } {
+  const hostEnabled = thresholds.memoryFreePercent > 0 || thresholds.swapUsedPercent > 0;
+  const diskEnabled = thresholds.diskFreePercent > 0;
+  const hostReasons = new Set<string>();
+  const directoryReasons = new Map<string, string>();
+  let validHostReading = false;
+  for (const [index, result] of results.entries()) {
+    const directory = directories[index];
+    if (result.status === 'rejected') {
+      if (diskEnabled)
+        directoryReasons.set(directory, `${directory || 'Workspace'}: machine reading unavailable`);
+      continue;
+    }
+    validHostReading = true;
+    const blockers = pressureBlockers(result.value, thresholds);
+    for (const blocker of blockers.host) hostReasons.add(blocker);
+    if (blockers.disk)
+      directoryReasons.set(directory, `${directory || 'Workspace'}: ${blockers.disk}`);
+  }
+  const reason =
+    hostEnabled && !validHostReading
+      ? 'Waiting for machine pressure: host readings unavailable.'
+      : hostReasons.size
+        ? `Waiting for machine pressure: ${[...hostReasons].join('; ')}.`
+        : null;
+  return { reason, directoryReasons };
+}
+
 async function refreshPressure(): Promise<void> {
   if (refreshing || !pendingWork()) return;
   refreshing = true;
   const generation = readingGeneration;
   const directories = pendingDirectories();
   try {
+    if (
+      pressureThresholds.memoryFreePercent === 0 &&
+      pressureThresholds.swapUsedPercent === 0 &&
+      pressureThresholds.diskFreePercent === 0
+    ) {
+      setPressureState(null, new Map());
+      return;
+    }
     const results = await Promise.allSettled(
       directories.map((directory) =>
         invoke<MachineReading>('machine_pressure', { directory: directory || null }),
@@ -113,30 +153,30 @@ async function refreshPressure(): Promise<void> {
       pendingDirectories().some((directory) => !directories.includes(directory))
     )
       return;
-    const hostReasons = new Set<string>();
-    const directoryReasons = new Map<string, string>();
-    let validHostReading = false;
-    for (const [index, result] of results.entries()) {
-      const directory = directories[index];
-      if (result.status === 'rejected') {
-        directoryReasons.set(directory, `${directory || 'Workspace'}: machine reading unavailable`);
-        continue;
-      }
-      validHostReading = true;
-      const blockers = pressureBlockers(result.value, pressureThresholds);
-      for (const blocker of blockers.host) hostReasons.add(blocker);
-      if (blockers.disk)
-        directoryReasons.set(directory, `${directory || 'Workspace'}: ${blockers.disk}`);
-    }
-    const reason = !validHostReading
-      ? 'Waiting for machine pressure: host readings unavailable.'
-      : hostReasons.size
-        ? `Waiting for machine pressure: ${[...hostReasons].join('; ')}.`
-        : null;
+    const { reason, directoryReasons } = pressureReasonsForResults(
+      results,
+      directories,
+      pressureThresholds,
+    );
     setPressureState(reason, directoryReasons);
   } catch {
-    if (generation === readingGeneration)
-      setPressureState('Waiting for machine pressure: host readings unavailable.', new Map());
+    if (generation === readingGeneration) {
+      const hostEnabled =
+        pressureThresholds.memoryFreePercent > 0 || pressureThresholds.swapUsedPercent > 0;
+      const directoryReasons =
+        pressureThresholds.diskFreePercent > 0
+          ? new Map(
+              directories.map((directory) => [
+                directory,
+                `${directory || 'Workspace'}: machine reading unavailable`,
+              ]),
+            )
+          : new Map<string, string>();
+      setPressureState(
+        hostEnabled ? 'Waiting for machine pressure: host readings unavailable.' : null,
+        directoryReasons,
+      );
+    }
   } finally {
     refreshing = false;
     updateMonitor();

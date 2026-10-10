@@ -5859,6 +5859,7 @@
           shippingReceipt = receipt;
         }
         let turn: ReturnType<typeof acp.prompt>;
+        let queued = false;
         try {
           if (owner && shippingReceipt) {
             const originalReceipt = { ...shippingReceipt };
@@ -5890,7 +5891,9 @@
                   recalledText,
                   turnId,
                   [],
-                  undefined,
+                  (limit) => {
+                    queued = limit !== null;
+                  },
                   false,
                   thread.directory,
                 ),
@@ -5903,7 +5906,9 @@
               recalledText,
               turnId,
               [],
-              undefined,
+              (limit) => {
+                queued = limit !== null;
+              },
               false,
               thread.directory,
             );
@@ -5966,10 +5971,14 @@
             abandonImplementationTurn(thread.directory, tracking);
             error = `Could not track agent message turn: ${describe(cause)}`;
           });
-        await awaitCoordinationStart(turn, async () => {
-          const state = (await acp.activity())[thread.agent];
-          return !!state?.active.includes(thread.sessionId);
-        });
+        await awaitCoordinationStart(
+          turn,
+          async () => {
+            const state = (await acp.activity())[thread.agent];
+            return !!state?.active.includes(thread.sessionId);
+          },
+          () => queued,
+        );
         finishCoordinationDelivery(message);
         return undefined;
       });

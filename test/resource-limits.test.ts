@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { ResourceQueue } from '../src/lib/resource-queue.ts';
 import { isSetting } from '../src/lib/settings.ts';
 import { acp } from '../src/lib/acp.ts';
-import { resourceQueues } from '../src/lib/resource-limits.ts';
+import { pressureReasonsForResults, resourceQueues } from '../src/lib/resource-limits.ts';
 import {
   defaultPressureThresholds,
   parsePressureThreshold,
@@ -93,6 +93,43 @@ void test('configured thresholds parse strictly and zero disables each threshold
       { memoryFreePercent: 0, swapUsedPercent: 70, diskFreePercent: 0 },
     ),
     { host: ['swap reading unavailable'], disk: null },
+  );
+});
+
+void test('failed readings block only enabled pressure checks', () => {
+  const failed: PromiseSettledResult<MachineReading>[] = [
+    { status: 'rejected', reason: new Error('unavailable') },
+  ];
+  const directory = ['/workspace'];
+  assert.deepEqual(
+    pressureReasonsForResults(failed, directory, {
+      memoryFreePercent: 0,
+      swapUsedPercent: 0,
+      diskFreePercent: 0,
+    }),
+    { reason: null, directoryReasons: new Map() },
+  );
+  assert.deepEqual(
+    pressureReasonsForResults(failed, directory, {
+      memoryFreePercent: 0,
+      swapUsedPercent: 0,
+      diskFreePercent: 2,
+    }),
+    {
+      reason: null,
+      directoryReasons: new Map([['/workspace', '/workspace: machine reading unavailable']]),
+    },
+  );
+  assert.deepEqual(
+    pressureReasonsForResults(failed, directory, {
+      memoryFreePercent: 10,
+      swapUsedPercent: 0,
+      diskFreePercent: 0,
+    }),
+    {
+      reason: 'Waiting for machine pressure: host readings unavailable.',
+      directoryReasons: new Map(),
+    },
   );
 });
 
