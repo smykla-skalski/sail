@@ -221,6 +221,8 @@ mod memory_install;
 mod memory_provider;
 mod opencode_config;
 mod post_turn_checks;
+#[cfg(unix)]
+mod scratch_cleanup;
 mod settings;
 mod shell_command;
 mod ship_actions;
@@ -2403,6 +2405,8 @@ pub fn run() {
             if let Err(error) = diagnostics::init(_app.handle()) {
                 eprintln!("Sail diagnostics unavailable: {error}");
             }
+            #[cfg(unix)]
+            std::thread::spawn(scratch_cleanup::sweep_on_startup);
             browser_agent::start_bridge(_app.handle())?;
             if let Err(error) = hook_activity::start_bridge(_app.handle()) {
                 eprintln!("Sail hook receiver unavailable: {error}");
