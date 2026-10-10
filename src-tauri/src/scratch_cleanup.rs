@@ -300,7 +300,10 @@ fn has_open_files(path: &Path) -> Option<bool> {
         return None;
     }
     use std::os::unix::ffi::OsStrExt;
-    let root = path.as_os_str().as_bytes();
+    // macOS lsof reports canonical paths even when TMPDIR begins with /var,
+    // which is a symlink to /private/var.
+    let canonical = fs::canonicalize(path).ok()?;
+    let root = canonical.as_os_str().as_bytes();
     let active = unlinked.stdout.split(|byte| *byte == b'\n').any(|line| {
         line.strip_prefix(b"n").is_some_and(|name| {
             name == root || (name.starts_with(root) && name.get(root.len()) == Some(&b'/'))
