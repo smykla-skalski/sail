@@ -60,9 +60,10 @@ struct TerminalSession {
     directory: PathBuf,
     worktree: PathBuf,
     process_id: Option<u32>,
+    writer: Mutex<Box<dyn Write + Send>>,
+    // Close ConPTY input before closing the pseudoconsole master.
     master: Mutex<Box<dyn MasterPty + Send>>,
     process_group_stop: Arc<Mutex<()>>,
-    writer: Mutex<Box<dyn Write + Send>>,
     write_busy: AtomicBool,
     #[cfg(windows)]
     job: crate::acp_terminal::WindowsTerminalJob,
