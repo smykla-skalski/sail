@@ -41,6 +41,7 @@ struct ProbeAgent {
         _ = chmod(socketPath, 0o600)
         let serviceGeneration = UUID().uuidString
         var children: [String: Child] = [:]
+        var previousExits: [String: [String: Any]] = [:]
         var queued: [String: QueuedWork] = [:]
         while true {
             let connection = accept(fd, nil, nil)
@@ -60,14 +61,28 @@ struct ProbeAgent {
                         answer["error"] = "unknown project key"
                         break
                     }
+                    answer["previousProviderExit"] = previousExits[scope]
                     if let child = children[scope] {
                         var status: Int32 = 0
-                        if waitpid(child.pid, &status, WNOHANG) == 0 {
+                        let reaped = waitpid(child.pid, &status, WNOHANG)
+                        if reaped == 0 {
                             answer["provider"] = child.generation
                             answer["providerPid"] = child.pid
                             answer["heartbeat"] = child.heartbeatFile
                             break
                         }
+                        guard reaped == child.pid else {
+                            answer["error"] = "provider wait failed: \(errno)"
+                            break
+                        }
+                        let exitStatus: [String: Any] = [
+                            "pid": child.pid,
+                            "generation": child.generation,
+                            "rawStatus": status,
+                            "signal": status & 0x7f,
+                        ]
+                        previousExits[scope] = exitStatus
+                        answer["previousProviderExit"] = exitStatus
                         children.removeValue(forKey: scope)
                     }
                     let generation = UUID().uuidString

@@ -27,6 +27,10 @@ The `--sdk` value is host-specific. On the evidence host, the active Command Lin
 - One long-lived signed app fixture self-`SIGKILL` left the other app process on the same service and provider. A provider fixture self-`SIGKILL` was reaped and replaced. Fixture-only cancellation reaped its direct child and rejected an actual queued file effect from its stale generation; a fresh generation's queued effect executed. A service fixture self-`SIGKILL` was restarted by launchd with a valid new service generation; a deliberately failed socket response could not satisfy the restart check. The prior provider's heartbeat stopped and its executable was absent before new admission. The surviving app then obtained a new live provider.
 - The generated launch agent used `RunAtLoad=true`, `KeepAlive=true`, and `AbandonProcessGroup=false`. Final `SMAppService.unregister()` returned `notRegistered`; `launchctl print` found no service under the unique label, no observed provider executable remained, and all observed heartbeats stopped. The final report recorded `cleanup: unregistered`, `preserve: false`, and `verdict: GO`.
 
+## Crash-exit follow-up on 2026-10-10
+
+The signed private-app probe returned GO after adding exit evidence to the crash trials. The service reaped the self-`SIGKILL` provider and recorded its PID, generation, raw `waitpid` status `9`, and signal `9` before replacement. For the service crash, `launchctl print` reported `last terminating signal = Killed: 9` for the unique launchd label; the new service had a different PID. The window crash recorded `SIGKILL`, and cancellation recorded child status `15`. All mandatory findings passed, `cleanup` was `unregistered`, and `preserve` was `false`.
+
 The probe uses direct signed app executable invocations, not full Sail GUI windows. Its fixture Unix socket is deliberately unauthenticated and must never be reused for production. The result establishes this host's launchd and Seatbelt behavior only; it does not establish durable service authorization, production protocol safety, or cross-platform parity.
 
 ## Failure policy

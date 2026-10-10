@@ -429,6 +429,7 @@ async function sandboxTrials(project) {
 }
 
 async function serviceTrials(project) {
+  const uid = process.getuid();
   registrationAttempted = true;
   const registration = run(executable, ['register', plistName]);
   const registeredStatus =
@@ -491,8 +492,14 @@ async function serviceTrials(project) {
     }, 8_000);
     finding(
       'provider-restart',
-      Boolean(restarted),
-      'fixture provider self-SIGKILL is reaped and restarted with new generation',
+      Boolean(
+        restarted &&
+        restarted.previousProviderExit?.pid === first.providerPid &&
+        restarted.previousProviderExit?.generation === first.provider &&
+        restarted.previousProviderExit?.rawStatus === 9 &&
+        restarted.previousProviderExit?.signal === 9,
+      ),
+      'fixture provider self-SIGKILL exit status is recorded before restart',
       { before: first, after: restarted },
     );
 
@@ -535,6 +542,10 @@ async function serviceTrials(project) {
       const value = await windowB.send({ op: 'ping' });
       return isNewServiceResponse(value, beforeKill.service) ? value : null;
     }, 15_000);
+    const launchdStatus = run('launchctl', ['print', `gui/${uid}/${label}`]);
+    const serviceExitSignal = Number(
+      launchdStatus.stdout.match(/last terminating signal = [^\n]*: (\d+)/)?.[1],
+    );
     const firstHeartbeat = existsSync(active.heartbeat)
       ? readFileSync(active.heartbeat, 'utf8')
       : null;
@@ -545,13 +556,28 @@ async function serviceTrials(project) {
     const oldProcess = run('ps', ['-p', String(active.providerPid), '-o', 'command=']);
     const oldProcessAbsent = !oldProcess.stdout.includes(provider);
     const stopped = Boolean(
-      afterKill && firstHeartbeat && firstHeartbeat === secondHeartbeat && oldProcessAbsent,
+      afterKill &&
+        afterKill.servicePid !== beforeKill.servicePid &&
+        launchdStatus.status === 0 &&
+        serviceExitSignal === 9 &&
+        firstHeartbeat &&
+        firstHeartbeat === secondHeartbeat &&
+        oldProcessAbsent,
     );
     finding(
       'service-restart-cleanup',
       stopped,
-      'launchd restarts service and previously live provider heartbeat and owned executable disappear before new admission',
-      { beforeKill, afterKill, firstHeartbeat, secondHeartbeat, oldProcess, oldProcessAbsent },
+      'launchd records service SIGKILL exit and restarts without the old provider before new admission',
+      {
+        beforeKill,
+        afterKill,
+        launchdStatus,
+        serviceExitSignal,
+        firstHeartbeat,
+        secondHeartbeat,
+        oldProcess,
+        oldProcessAbsent,
+      },
     );
     if (!stopped) preserve = true;
     if (afterKill) {
