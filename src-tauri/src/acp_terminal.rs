@@ -348,6 +348,11 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     Ok(())
 }
 
+pub struct TerminalContext<'a> {
+    pub directory: Option<PathBuf>,
+    pub scratch_owner: Option<&'a str>,
+}
+
 pub fn handle(
     app: &AppHandle,
     manager: &AcpTerminalManager,
@@ -355,8 +360,7 @@ pub fn handle(
     profile: CapabilityProfile,
     method: &str,
     params: Value,
-    session_directory: Option<PathBuf>,
-    scratch_owner: Option<&str>,
+    context: TerminalContext<'_>,
 ) -> Result<Value, String> {
     if method == "terminal/create" {
         let params: CreateParams =
@@ -376,7 +380,8 @@ pub fn handle(
         {
             return Err("Command arguments or environment are invalid.".to_string());
         }
-        let fallback = session_directory
+        let fallback = context
+            .directory
             .ok_or("Unknown agent session.")?
             .canonicalize()
             .map_err(|error| error.to_string())?;
@@ -392,13 +397,13 @@ pub fn handle(
             command.env(variable.name, variable.value);
         }
         #[cfg(unix)]
-        if let Some(owner) = scratch_owner {
+        if let Some(owner) = context.scratch_owner {
             command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
         } else {
             command.env_remove("SAIL_SCRATCH_OWNER_IDENTITY");
         }
         #[cfg(not(unix))]
-        let _ = scratch_owner;
+        let _ = context.scratch_owner;
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command

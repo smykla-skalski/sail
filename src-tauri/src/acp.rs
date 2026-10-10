@@ -2831,8 +2831,10 @@ fn connect_blocking(
                                     runtime.profile,
                                     &method,
                                     params,
-                                    directory,
-                                    scratch_owner,
+                                    crate::acp_terminal::TerminalContext {
+                                        directory,
+                                        scratch_owner,
+                                    },
                                 ) {
                                     Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
                                     Err(error) => {
@@ -4370,6 +4372,7 @@ mod native_subagent_fence_tests {
             agent: "opencode".into(),
             profile: CapabilityProfile::Build,
             child: Mutex::new(child),
+            scratch_owner: None,
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
             input: Mutex::new(input),
