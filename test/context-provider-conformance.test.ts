@@ -64,6 +64,15 @@ for (const secret of ['ab"cd', 'ab\\cd', 'ab\ncd', 'ab\u0001cd']) {
   });
 }
 
+for (const secret of ['ab"cd', 'ab\\cd', 'ab\ncd', 'ab\u0001cd']) {
+  void test(`rejects JSON-encoded secret in error object key ${JSON.stringify(secret)}`, () => {
+    const result = run(profile('echo-encoded-key-secret'), secret);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Error response exposes the secret/);
+    assert.equal(result.stdout, '');
+  });
+}
+
 void test('rejects an error probe that does not send the secret', () => {
   const config = profile();
   config.errorProbe.arguments = {};
@@ -126,7 +135,7 @@ void test('inherited object properties cannot satisfy provenance', () => {
   assert.match(result.stderr, /source provenance differs/);
 });
 
-async function runHttp(mode: string) {
+async function runHttp(mode: string, secret = 'fixture-secret-123') {
   const server = spawn(process.execPath, [httpFixture, mode], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -159,7 +168,7 @@ async function runHttp(mode: string) {
         encoding: 'utf8',
         env: {
           ...process.env,
-          SAIL_CONFORMANCE_SECRET: 'fixture-secret-123',
+          SAIL_CONFORMANCE_SECRET: secret,
           SAIL_CONFORMANCE_TOKEN: 'Bearer fixture-token',
         },
         timeout: 10_000,
@@ -171,6 +180,13 @@ async function runHttp(mode: string) {
     server.kill();
   }
 }
+
+void test('HTTP rejects JSON-encoded secret in error object key', async () => {
+  const result = await runHttp('echo-encoded-key-secret', 'ab"cd');
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Error response exposes the secret/);
+  assert.equal(result.stdout, '');
+});
 
 for (const mode of ['json', 'sse', 'sse-open']) {
   void test(`offline Streamable HTTP provider passes with ${mode} responses`, async () => {

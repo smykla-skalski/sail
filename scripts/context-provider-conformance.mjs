@@ -420,13 +420,14 @@ async function run(config) {
       },
     });
     assert(error?.id === id && (error.error || error.result?.isError), 'Error probe did not fail.');
+    const containsSecretText = (text) =>
+      text.includes(secret) || text.includes(JSON.stringify(secret).slice(1, -1));
     const containsSecret = (value) => {
-      if (typeof value === 'string')
-        return value.includes(secret) || value.includes(JSON.stringify(secret).slice(1, -1));
+      if (typeof value === 'string') return containsSecretText(value);
       if (Array.isArray(value)) return value.some(containsSecret);
       if (value && typeof value === 'object')
         return Object.entries(value).some(
-          ([key, item]) => key.includes(secret) || containsSecret(item),
+          ([key, item]) => containsSecretText(key) || containsSecret(item),
         );
       return false;
     };

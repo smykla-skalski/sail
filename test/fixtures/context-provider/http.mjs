@@ -35,6 +35,10 @@ const server = createServer(async (request, response) => {
     };
   } else if (message.params.name === 'fixture_error') {
     result = { isError: true, content: [{ type: 'text', text: 'Request denied.' }] };
+    if (mode === 'echo-encoded-key-secret')
+      result['_meta'] = {
+        [JSON.stringify(message.params.arguments.secret).slice(1, -1)]: 'fixture marker',
+      };
   } else {
     result = {
       content: [{ type: 'text', text: 'One bounded result.' }],

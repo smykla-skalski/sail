@@ -50,6 +50,10 @@ for await (const line of createInterface({ input: process.stdin })) {
         },
       ],
     };
+    if (mode === 'echo-encoded-key-secret')
+      reply.result['_meta'] = {
+        [JSON.stringify(message.params.arguments.secret).slice(1, -1)]: 'fixture marker',
+      };
   } else if (message.method === 'tools/call') {
     reply.result = {
       content: [{ type: 'text', text: 'One bounded result.' }],
