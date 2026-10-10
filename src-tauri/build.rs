@@ -13,6 +13,7 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "diagnostic_event",
             "load_settings",
+            "machine_pressure",
             "migrate_settings",
             "save_setting",
             "list_interrupted_agent_turns",
@@ -53,6 +54,7 @@ fn main() {
             "git_change_action",
             "diff_file_contents",
             "create_worktree",
+            "worktree_pressure_directory",
             "create_shipping_worktree",
             "find_shipping_worktree",
             "run_shipping_setup",
