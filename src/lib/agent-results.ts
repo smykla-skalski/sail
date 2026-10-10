@@ -204,6 +204,18 @@ export function receiptMatchesTurn(
   return receipt?.turnId === turnId;
 }
 
+export function receiptIsLatestFinishedTurn(
+  receipt: Pick<SpawnReceipt, 'turnId'>,
+  activity: Pick<AgentActivity, 'activeTurns' | 'finished'> | null | undefined,
+  sessionId: string,
+): boolean {
+  return (
+    !!receipt.turnId &&
+    !activity?.activeTurns[sessionId] &&
+    activity?.finished[sessionId]?.turnId === receipt.turnId
+  );
+}
+
 export function receiptIsSettled(state: SpawnState): boolean {
   return ['completed', 'failed', 'interrupted', 'unavailable'].includes(state);
 }

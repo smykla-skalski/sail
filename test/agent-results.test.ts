@@ -17,6 +17,7 @@ import {
   isSubagentThread,
   loadSpawnReceipts,
   receiptForSource,
+  receiptIsLatestFinishedTurn,
   receiptMatchesTurn,
   receiptNeedsRefresh,
   promptConflictTurnId,
@@ -60,6 +61,37 @@ void test('receipt settlement is correlated to its current turn', () => {
   assert.equal(receiptMatchesTurn(receipt, 'turn-one'), true);
   assert.equal(receiptMatchesTurn({ ...receipt, turnId: 'turn-two' }, 'turn-one'), false);
   assert.equal(receiptMatchesTurn(undefined, 'turn-one'), false);
+});
+
+void test('transcript recovery belongs only to the latest finished turn', () => {
+  const activity = {
+    activeTurns: {},
+    finished: { target: { status: 'done' as const, notify: true, turnId: 'turn-one' } },
+  };
+  assert.equal(receiptIsLatestFinishedTurn(receipt, activity, 'target'), true);
+  assert.equal(
+    receiptIsLatestFinishedTurn(
+      receipt,
+      {
+        ...activity,
+        activeTurns: { target: 'turn-two' },
+      },
+      'target',
+    ),
+    false,
+  );
+  assert.equal(
+    receiptIsLatestFinishedTurn(
+      receipt,
+      {
+        ...activity,
+        finished: { target: { ...activity.finished.target, turnId: 'turn-two' } },
+      },
+      'target',
+    ),
+    false,
+  );
+  assert.equal(receiptIsLatestFinishedTurn(receipt, null, 'target'), false);
 });
 
 await test('spawn receipts stay scoped to the launching source and project', () => {

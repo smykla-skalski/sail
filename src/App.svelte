@@ -468,6 +468,7 @@
     handoffPromptNeedsRecovery,
     loadSpawnReceipts,
     receiptForSource,
+    receiptIsLatestFinishedTurn,
     receiptMatchesTurn,
     receiptNeedsRefresh,
     receiptIsSettled,
@@ -5623,8 +5624,13 @@
   }
 
   async function recoverAcpSpawnResult(receipt: SpawnReceipt) {
-    if (!receipt.targetId || !receipt.targetDirectory || !receipt.prompt) return;
+    if (!receipt.targetId || !receipt.targetDirectory || !receipt.prompt || !receipt.turnId) return;
     const sessionId = receipt.targetId.slice(`acp:${receipt.provider}:`.length);
+    async function isLatestFinishedTurn() {
+      const activity = await acp.activity().catch(() => null);
+      return receiptIsLatestFinishedTurn(receipt, activity?.[receipt.provider], sessionId);
+    }
+    if (!(await isLatestFinishedTurn())) return;
     const replay: AgentEntry[] = [];
     const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
       if (payload.agent !== receipt.provider || payload.message.method !== 'session/update') return;
@@ -5659,7 +5665,8 @@
         .flatMap((entry) => (entry.type === 'assistant' ? [entry.text] : []))
         .join('\n')
         .slice(-16_000);
-      if (result) updateSpawnReceipt(receipt.receiptId, { result }, true);
+      if (result && (await isLatestFinishedTurn()))
+        updateSpawnReceipt(receipt.receiptId, { result }, true);
     } catch {
       return;
     } finally {
