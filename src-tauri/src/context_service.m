@@ -5,6 +5,25 @@
 
 extern bool sail_context_validate_approval(const char *directory, const char *expected,
                                            char *output, size_t length);
+extern bool sail_context_provider_request(const char *directory, const char *expected,
+                                          const char *capability, const char *request,
+                                          char *output, size_t length);
+extern void sail_context_provider_stop(const char *projectKey);
+extern bool sail_context_session_activate(const char *capability);
+extern void sail_context_session_deactivate(const char *capability);
+
+static void closeSession(NSMutableDictionary<NSValue *, NSDictionary *> *sessions, NSValue *key) {
+    NSDictionary *session = sessions[key];
+    NSString *capability = session[@"capability"];
+    if (capability) sail_context_session_deactivate(capability.UTF8String);
+    [sessions removeObjectForKey:key];
+    NSString *projectKey = session[@"projectKey"];
+    if (!projectKey) return;
+    for (NSDictionary *other in sessions.allValues) {
+        if ([other[@"projectKey"] isEqualToString:projectKey]) return;
+    }
+    sail_context_provider_stop(projectKey.UTF8String);
+}
 
 static NSString *serviceLabel(void) {
 #ifdef SAIL_CONTEXT_E2E
@@ -62,7 +81,7 @@ static NSString *senderBundlePath(xpc_object_t message) {
 }
 
 static NSDictionary *approval(NSString *directory, NSString *expected) {
-    char buffer[4096] = {0};
+    char buffer[16384] = {0};
     if (!sail_context_validate_approval(directory.UTF8String, expected.UTF8String,
                                         buffer, sizeof(buffer))) return nil;
     NSData *bytes = [[NSString stringWithUTF8String:buffer] dataUsingEncoding:NSUTF8StringEncoding];
@@ -120,7 +139,7 @@ int sail_context_service_main(void) {
             xpc_connection_set_target_queue(peer, queue);
             xpc_connection_set_event_handler(peer, ^(xpc_object_t message) {
                 if (xpc_get_type(message) == XPC_TYPE_ERROR) {
-                    [sessions removeObjectForKey:key];
+                    closeSession(sessions, key);
                     return;
                 }
                 if (xpc_get_type(message) != XPC_TYPE_DICTIONARY) return;
@@ -136,7 +155,8 @@ int sail_context_service_main(void) {
                         NSString *directory = field(message, "directory");
                         NSDictionary *binding = directory.length <= 4096 ? approval(directory, nil) : nil;
                         NSString *capability = binding ? randomCapability() : nil;
-                        if (!session && binding && capability) {
+                        if (!session && binding && capability &&
+                            sail_context_session_activate(capability.UTF8String)) {
                             sessions[key] = @{ @"directory": directory,
                                                @"projectKey": binding[@"projectKey"],
                                                @"fingerprint": binding[@"fingerprint"],
@@ -153,12 +173,62 @@ int sail_context_service_main(void) {
                             [binding[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
                             xpc_dictionary_set_bool(reply, "authorized", true);
                         } else {
-                            [sessions removeObjectForKey:key];
+                            closeSession(sessions, key);
                             xpc_dictionary_set_string(reply, "error", "Context session revoked.");
                         }
+                    } else if ([op isEqualToString:@"request"]) {
+                        NSString *capability = field(message, "capability");
+                        NSDictionary *binding = session ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                        NSString *request = field(message, "request");
+                        if (!session || !equalCapability(capability, session[@"capability"]) ||
+                            ![binding[@"projectKey"] isEqualToString:session[@"projectKey"]] ||
+                            !request || request.length > 1024 * 1024) {
+                            closeSession(sessions, key);
+                            xpc_dictionary_set_string(reply, "error", "Context session revoked.");
+                        } else {
+                            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                                char *output = calloc(1024 * 1024 + 1, 1);
+                                bool success = output && sail_context_provider_request(
+                                    [session[@"directory"] UTF8String],
+                                    [session[@"fingerprint"] UTF8String],
+                                    [session[@"capability"] UTF8String], request.UTF8String,
+                                    output, 1024 * 1024 + 1);
+                                dispatch_async(queue, ^{
+                                    NSDictionary *latest = sessions[key] == session
+                                        ? approval(session[@"directory"], session[@"fingerprint"]) : nil;
+                                    if (![latest[@"projectKey"] isEqualToString:session[@"projectKey"]]) {
+                                        if (sessions[key] == session) closeSession(sessions, key);
+                                        xpc_dictionary_set_string(reply, "error", "Context session revoked.");
+                                    } else if (success) {
+                                        xpc_dictionary_set_string(reply, "response", output);
+                                    } else {
+                                        xpc_dictionary_set_string(reply, "error", output && output[0]
+                                            ? output : "Provider request failed.");
+                                    }
+                                    xpc_connection_send_message(peer, reply);
+                                    free(output);
+                                });
+                            });
+                            return;
+                        }
                     } else if ([op isEqualToString:@"end"]) {
-                        [sessions removeObjectForKey:key];
+                        closeSession(sessions, key);
                         xpc_dictionary_set_bool(reply, "ended", true);
+                    } else if ([op isEqualToString:@"revoke"]) {
+                        NSString *projectKey = field(message, "projectKey");
+                        NSCharacterSet *hex = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"];
+                        if (projectKey.length != 64 ||
+                            [[projectKey stringByTrimmingCharactersInSet:hex] length] != 0) {
+                            xpc_dictionary_set_string(reply, "error", "Invalid context project key.");
+                        } else {
+                            for (NSValue *sessionKey in [sessions.allKeys copy]) {
+                                if ([sessions[sessionKey][@"projectKey"] isEqualToString:projectKey]) {
+                                    closeSession(sessions, sessionKey);
+                                }
+                            }
+                            sail_context_provider_stop(projectKey.UTF8String);
+                            xpc_dictionary_set_bool(reply, "stopped", true);
+                        }
                     } else {
                         xpc_dictionary_set_string(reply, "error", "Invalid context request.");
                     }
@@ -245,6 +315,51 @@ void *sail_context_session_open(const char *directory, char *error, size_t error
     }
 }
 
+bool sail_context_provider_revoke_remote(const char *projectKey, char *error, size_t errorLength) {
+    @autoreleasepool {
+        if (@available(macOS 13.0, *)) {
+            if (!projectKey || strlen(projectKey) != 64) {
+                writeError(error, errorLength, @"Invalid context project key.");
+                return false;
+            }
+            SMAppService *service = [SMAppService agentServiceWithPlistName:servicePlist()];
+            if (service.status != SMAppServiceStatusEnabled) return true;
+            NSString *hash = selfCodeHash();
+            if (!hash) {
+                writeError(error, errorLength, @"Sail code signature unavailable.");
+                return false;
+            }
+            xpc_connection_t connection = xpc_connection_create_mach_service(serviceLabel().UTF8String, NULL, 0);
+            NSString *requirement = [NSString stringWithFormat:@"cdhash H\"%@\"", hash];
+            if (xpc_connection_set_peer_code_signing_requirement(connection, requirement.UTF8String) != 0) {
+                xpc_connection_set_event_handler(connection, ^(xpc_object_t ignored) { (void)ignored; });
+                xpc_connection_resume(connection);
+                xpc_connection_cancel(connection);
+                writeError(error, errorLength, @"Cannot verify context service signature.");
+                return false;
+            }
+            xpc_connection_set_event_handler(connection, ^(xpc_object_t ignored) { (void)ignored; });
+            xpc_connection_resume(connection);
+            xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+            xpc_dictionary_set_string(request, "op", "revoke");
+            xpc_dictionary_set_string(request, "projectKey", projectKey);
+            xpc_object_t reply = xpc_connection_send_message_with_reply_sync(connection, request);
+            bool valid = xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+                [senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)];
+            bool stopped = valid && xpc_dictionary_get_bool(reply, "stopped");
+            if (!stopped) {
+                const char *reason = valid ? xpc_dictionary_get_string(reply, "error") : NULL;
+                writeError(error, errorLength, reason ? [NSString stringWithUTF8String:reason]
+                    : @"Context service signature or path rejected.");
+            }
+            xpc_connection_cancel(connection);
+            return stopped;
+        }
+        writeError(error, errorLength, @"Context service requires macOS 13 or later.");
+        return false;
+    }
+}
+
 bool sail_context_session_check(void *handle, char *error, size_t errorLength) {
     @autoreleasepool {
         if (!handle) return false;
@@ -262,6 +377,35 @@ bool sail_context_session_check(void *handle, char *error, size_t errorLength) {
             ? xpc_dictionary_get_string(reply, "error") : NULL;
         writeError(error, errorLength, reason ? [NSString stringWithUTF8String:reason]
                                           : @"Context service disconnected.");
+        return false;
+    }
+}
+
+bool sail_context_session_request(void *handle, const char *message,
+                                  char *output, size_t outputLength,
+                                  char *error, size_t errorLength) {
+    @autoreleasepool {
+        if (!handle || !message || !output || !outputLength) return false;
+        SailContextSession *session = (__bridge SailContextSession *)handle;
+        xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(request, "op", "request");
+        xpc_dictionary_set_string(request, "capability", session.capability.UTF8String);
+        xpc_dictionary_set_string(request, "request", message);
+        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(session.connection, request);
+        if (![senderBundlePath(reply) isEqualToString:canonicalPath(NSBundle.mainBundle.bundlePath)]) {
+            writeError(error, errorLength, @"Context service signature or path rejected.");
+            return false;
+        }
+        const char *response = xpc_get_type(reply) == XPC_TYPE_DICTIONARY
+            ? xpc_dictionary_get_string(reply, "response") : NULL;
+        if (response && strlen(response) < outputLength) {
+            strlcpy(output, response, outputLength);
+            return true;
+        }
+        const char *reason = xpc_get_type(reply) == XPC_TYPE_DICTIONARY
+            ? xpc_dictionary_get_string(reply, "error") : NULL;
+        writeError(error, errorLength, reason ? [NSString stringWithUTF8String:reason]
+                                          : @"Context service disconnected or response too large.");
         return false;
     }
 }
