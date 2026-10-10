@@ -4,7 +4,6 @@ import {
   failedCheckOutcome,
   inboxPermissionDecisionTitle,
   inboxLocations,
-  inboxOpenRoute,
   persistedInboxKinds,
   repositoryName,
   inboxTurnMessageIndex,
@@ -22,6 +21,7 @@ const item = (key: string, receivedAt: number): InboxItem => ({
   receivedAt,
   kind: 'question',
   agent: 'OpenCode',
+  agentId: 'opencode',
   directory: '/projects/alpha',
   project: 'alpha',
   worktree: null,
@@ -120,7 +120,7 @@ void test('rejected inbox permissions record the actual outcome', () => {
 void test('allowed inbox permissions record the actual outcome', () => {
   const permission: InboxItem = {
     ...item('permission-allowed', 123),
-    kind: 'opencode-permission',
+    kind: 'acp-permission',
     permissionTitle: 'Inspect repository',
     text: 'review · unknown risk · policy 2026-10-07.1 — Awaiting approval',
     policy: {
@@ -147,14 +147,6 @@ void test('completed turn navigation stays between its user message and the next
   assert.equal(inboxTurnMessageIndex(messages, 999), 2);
   assert.equal(inboxTurnMessageIndex(messages, 1002), 4);
   assert.equal(inboxTurnMessageIndex([{ kind: 'user', created: 100 }], 101), 0);
-});
-
-void test('inbox opens each kind through its own route', () => {
-  assert.equal(inboxOpenRoute({ kind: 'acp-permission' }), 'acp-request');
-  assert.equal(inboxOpenRoute({ kind: 'opencode-permission' }), 'opencode-request');
-  assert.equal(inboxOpenRoute({ kind: 'question' }), 'opencode-request');
-  assert.equal(inboxOpenRoute({ kind: 'turn-completed' }), 'outcome');
-  assert.equal(inboxOpenRoute({ kind: 'check-failed' }), 'outcome');
 });
 
 const outcome = (kind: string) => ({

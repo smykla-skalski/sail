@@ -93,7 +93,7 @@ export function sessionRequestCandidates(items: InboxItem[]): AttentionCandidate
     if (isInboxOutcome(item)) return [];
     const target: AttentionTarget = {
       type: 'thread',
-      agentId: item.agentId ?? 'opencode',
+      agentId: item.agentId,
       directory: item.directory,
       sessionId: item.sessionId,
       ...(item.requestId === undefined ? {} : { requestId: item.requestId }),
