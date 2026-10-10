@@ -2,7 +2,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -21,6 +21,7 @@ static NEXT_TERMINAL: AtomicU64 = AtomicU64::new(1);
 pub struct AcpTerminalManager {
     active: Mutex<HashMap<String, Arc<AcpTerminal>>>,
     archived: Mutex<VecDeque<(String, TerminalSnapshot)>>,
+    worktrees_being_removed: Mutex<HashSet<PathBuf>>,
 }
 
 pub fn worktree_data_directory(cache_directory: &Path, worktree: &Path) -> PathBuf {
@@ -68,7 +69,13 @@ impl AcpTerminalManager {
                 active
                     .values()
                     .filter_map(|terminal| {
+                        #[allow(unused_mut)]
                         let mut child = terminal.child.lock().ok()?;
+                        #[cfg(unix)]
+                        if exited_without_reaping(&child).ok()? {
+                            return None;
+                        }
+                        #[cfg(not(unix))]
                         if child.try_wait().ok()?.is_some() {
                             return None;
                         }
@@ -108,6 +115,11 @@ impl AcpTerminalManager {
 
     pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
         let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let mut blocked = self
+            .worktrees_being_removed
+            .lock()
+            .map_err(|error| error.to_string())?;
+        blocked.insert(worktree.clone());
         let terminals = self
             .active
             .lock()
@@ -121,9 +133,35 @@ impl AcpTerminalManager {
             .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
             .collect::<Vec<_>>();
         for (id, terminal) in terminals {
-            self.archive(id, &terminal)?;
+            if let Err(error) = self.archive(id, &terminal) {
+                blocked.remove(&worktree);
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    pub fn allow_worktree_terminals(&self, worktree: &Path) {
+        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        if let Ok(mut blocked) = self.worktrees_being_removed.lock() {
+            blocked.remove(&worktree);
+        }
+    }
+
+    fn with_worktree_creation<T>(
+        &self,
+        worktree: &Path,
+        create: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let blocked = self
+            .worktrees_being_removed
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if blocked.contains(&worktree) {
+            return Err("Worktree is being removed.".to_string());
+        }
+        create()
     }
 
     fn archive(&self, id: String, terminal: &AcpTerminal) -> Result<(), String> {
@@ -364,11 +402,11 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
         return Ok(());
     }
     let mut child = terminal.child.lock().map_err(|error| error.to_string())?;
+    if terminal.stopped.load(Ordering::Acquire) {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
-        child
-            .try_wait()
-            .map_err(|error| format!("Cannot inspect terminal process: {error}"))?;
         kill_terminal_process_group(child.id())?;
         child
             .wait()
@@ -418,6 +456,26 @@ fn kill_terminal_process_group(process_id: u32) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
+fn exited_without_reaping(child: &std::process::Child) -> Result<bool, String> {
+    let mut status = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
+    let result = unsafe {
+        nix::libc::waitid(
+            nix::libc::P_PID,
+            child.id(),
+            &mut status,
+            nix::libc::WEXITED | nix::libc::WNOWAIT | nix::libc::WNOHANG,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "Cannot inspect terminal process: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { status.si_pid() } == child.id() as i32)
+}
+
 pub fn handle(
     app: &AppHandle,
     manager: &AcpTerminalManager,
@@ -449,151 +507,177 @@ pub fn handle(
             .ok_or("Unknown agent session.")?
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        let directory = params.cwd.as_deref().map(Path::new).unwrap_or(&fallback);
-        if !directory.is_absolute() || !directory.is_dir() {
-            return Err(
-                "Terminal working directory must be an existing absolute folder.".to_string(),
-            );
-        }
-        let data_directory = worktree_data_directory(
-            &app.path()
-                .app_cache_dir()
-                .map_err(|error| error.to_string())?,
-            &fallback,
-        );
-        let temp_directory = data_directory.join("tmp");
-        let cache_directory = data_directory.join("cache");
-        std::fs::create_dir_all(&temp_directory).map_err(|error| error.to_string())?;
-        std::fs::create_dir_all(&cache_directory).map_err(|error| error.to_string())?;
-        let mut command = Command::new(&params.command);
-        command.args(&params.args).current_dir(directory);
-        #[cfg(unix)]
-        command.process_group(0);
-        for variable in params.env {
-            command.env(variable.name, variable.value);
-        }
-        for (name, value) in terminal_environment(&data_directory) {
-            command.env(name, value);
-        }
-        let mut child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("Cannot start command: {error}"))?;
-        #[cfg(unix)]
-        let watchdog =
-            crate::child_watchdog::ChildWatchdog::start(child.id()).map_err(|error| {
-                use nix::sys::signal::{killpg, Signal};
-                use nix::unistd::Pid;
-                let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
-                let _ = child.wait();
-                format!("Cannot start command watchdog: {error}")
-            })?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("Command stdout is unavailable.")?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or("Command stderr is unavailable.")?;
-        let id = format!(
-            "{}-{}",
-            std::process::id(),
-            NEXT_TERMINAL.fetch_add(1, Ordering::Relaxed)
-        );
-        let terminal = Arc::new(AcpTerminal {
-            agent: agent.to_string(),
-            profile,
-            session_id: params.session_id.clone(),
-            directory: fallback.clone(),
-            child: Mutex::new(child),
-            #[cfg(unix)]
-            watchdog: Mutex::new(watchdog),
-            stopped: AtomicBool::new(false),
-            output: Mutex::new(TerminalOutput {
-                bytes: VecDeque::new(),
-                start: 0,
-                truncated: false,
-                exit: None,
-                output_complete: false,
-                released: false,
-            }),
-            changed: Condvar::new(),
-            limit: params
-                .output_byte_limit
-                .unwrap_or(1024 * 1024)
-                .min(16 * 1024 * 1024),
-        });
-        manager
-            .active
-            .lock()
-            .map_err(|error| error.to_string())?
-            .insert(id.clone(), Arc::clone(&terminal));
-        let readers_done = Arc::new(AtomicU64::new(0));
-        for mut stream in [Box::new(stdout) as Box<dyn Read + Send>, Box::new(stderr)] {
-            let terminal = Arc::clone(&terminal);
-            let done = Arc::clone(&readers_done);
-            std::thread::spawn(move || {
-                let mut buffer = [0; 8192];
-                loop {
-                    match stream.read(&mut buffer) {
-                        Ok(0) | Err(_) => break,
-                        Ok(size) => append(&terminal, &buffer[..size]),
-                    }
-                }
-                if done.fetch_add(1, Ordering::AcqRel) == 1 {
-                    if let Ok(mut output) = terminal.output.lock() {
-                        output.output_complete = true;
-                        terminal.changed.notify_all();
-                    }
-                }
-            });
-        }
-        let waiting = Arc::clone(&terminal);
-        std::thread::spawn(move || loop {
-            let status = waiting
-                .child
-                .lock()
-                .ok()
-                .and_then(|mut child| child.try_wait().ok())
-                .flatten();
-            if let Some(status) = status {
-                let _ = stop(&waiting);
-                for _ in 0..20 {
-                    if readers_done.load(Ordering::Acquire) == 2 {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                #[cfg(unix)]
-                let signal = std::os::unix::process::ExitStatusExt::signal(&status)
-                    .and_then(|signal| nix::sys::signal::Signal::try_from(signal).ok())
-                    .map(|signal| format!("{signal:?}"));
-                #[cfg(not(unix))]
-                let signal = None;
-                if let Ok(mut output) = waiting.output.lock() {
-                    output.exit = Some(ExitStatus {
-                        exit_code: status.code(),
-                        signal,
-                    });
-                    waiting.changed.notify_all();
-                }
-                break;
+        return manager.with_worktree_creation(&fallback, || {
+            let directory = params.cwd.as_deref().map(Path::new).unwrap_or(&fallback);
+            if !directory.is_absolute() || !directory.is_dir() {
+                return Err(
+                    "Terminal working directory must be an existing absolute folder.".to_string(),
+                );
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let data_directory = worktree_data_directory(
+                &app.path()
+                    .app_cache_dir()
+                    .map_err(|error| error.to_string())?,
+                &fallback,
+            );
+            let temp_directory = data_directory.join("tmp");
+            let cache_directory = data_directory.join("cache");
+            std::fs::create_dir_all(&temp_directory).map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(&cache_directory).map_err(|error| error.to_string())?;
+            let mut command = Command::new(&params.command);
+            command.args(&params.args).current_dir(directory);
+            #[cfg(unix)]
+            command.process_group(0);
+            for variable in params.env {
+                command.env(variable.name, variable.value);
+            }
+            for (name, value) in terminal_environment(&data_directory) {
+                command.env(name, value);
+            }
+            let mut child = command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|error| format!("Cannot start command: {error}"))?;
+            #[cfg(unix)]
+            let watchdog =
+                crate::child_watchdog::ChildWatchdog::start(child.id()).map_err(|error| {
+                    use nix::sys::signal::{killpg, Signal};
+                    use nix::unistd::Pid;
+                    let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+                    let _ = child.wait();
+                    format!("Cannot start command watchdog: {error}")
+                })?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or("Command stdout is unavailable.")?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or("Command stderr is unavailable.")?;
+            let id = format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT_TERMINAL.fetch_add(1, Ordering::Relaxed)
+            );
+            let terminal = Arc::new(AcpTerminal {
+                agent: agent.to_string(),
+                profile,
+                session_id: params.session_id.clone(),
+                directory: fallback.clone(),
+                child: Mutex::new(child),
+                #[cfg(unix)]
+                watchdog: Mutex::new(watchdog),
+                stopped: AtomicBool::new(false),
+                output: Mutex::new(TerminalOutput {
+                    bytes: VecDeque::new(),
+                    start: 0,
+                    truncated: false,
+                    exit: None,
+                    output_complete: false,
+                    released: false,
+                }),
+                changed: Condvar::new(),
+                limit: params
+                    .output_byte_limit
+                    .unwrap_or(1024 * 1024)
+                    .min(16 * 1024 * 1024),
+            });
+            manager
+                .active
+                .lock()
+                .map_err(|error| error.to_string())?
+                .insert(id.clone(), Arc::clone(&terminal));
+            let readers_done = Arc::new(AtomicU64::new(0));
+            for mut stream in [Box::new(stdout) as Box<dyn Read + Send>, Box::new(stderr)] {
+                let terminal = Arc::clone(&terminal);
+                let done = Arc::clone(&readers_done);
+                std::thread::spawn(move || {
+                    let mut buffer = [0; 8192];
+                    loop {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(size) => append(&terminal, &buffer[..size]),
+                        }
+                    }
+                    if done.fetch_add(1, Ordering::AcqRel) == 1 {
+                        if let Ok(mut output) = terminal.output.lock() {
+                            output.output_complete = true;
+                            terminal.changed.notify_all();
+                        }
+                    }
+                });
+            }
+            let waiting = Arc::clone(&terminal);
+            std::thread::spawn(move || loop {
+                #[cfg(unix)]
+                let status = {
+                    let exited = waiting
+                        .child
+                        .lock()
+                        .ok()
+                        .and_then(|child| exited_without_reaping(&child).ok())
+                        .unwrap_or(false);
+                    if exited || waiting.stopped.load(Ordering::Acquire) {
+                        if exited {
+                            let _ = stop(&waiting);
+                        }
+                        waiting
+                            .child
+                            .lock()
+                            .ok()
+                            .and_then(|mut child| child.try_wait().ok())
+                            .flatten()
+                    } else {
+                        None
+                    }
+                };
+                #[cfg(not(unix))]
+                let status = waiting
+                    .child
+                    .lock()
+                    .ok()
+                    .and_then(|mut child| child.try_wait().ok())
+                    .flatten();
+                if let Some(status) = status {
+                    #[cfg(not(unix))]
+                    let _ = stop(&waiting);
+                    for _ in 0..20 {
+                        if readers_done.load(Ordering::Acquire) == 2 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    #[cfg(unix)]
+                    let signal = std::os::unix::process::ExitStatusExt::signal(&status)
+                        .and_then(|signal| nix::sys::signal::Signal::try_from(signal).ok())
+                        .map(|signal| format!("{signal:?}"));
+                    #[cfg(not(unix))]
+                    let signal = None;
+                    if let Ok(mut output) = waiting.output.lock() {
+                        output.exit = Some(ExitStatus {
+                            exit_code: status.code(),
+                            signal,
+                        });
+                        waiting.changed.notify_all();
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            });
+            let _ = app.emit(
+                "acp-terminal-created",
+                json!({
+                    "agent": agent,
+                    "sessionId": params.session_id,
+                    "terminalId": id,
+                    "command": params.command,
+                    "directory": directory,
+                }),
+            );
+            Ok(json!({"terminalId":id}))
         });
-        let _ = app.emit(
-            "acp-terminal-created",
-            json!({
-                "agent": agent,
-                "sessionId": params.session_id,
-                "terminalId": id,
-                "command": params.command,
-                "directory": directory,
-            }),
-        );
-        return Ok(json!({"terminalId":id}));
     }
     let terminal_id = params
         .get("terminalId")
@@ -1007,6 +1091,46 @@ pub async fn acp_terminal_inspect_wait(
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_terminal_creation_is_serialized_with_worktree_stop() {
+        let manager = Arc::new(AcpTerminalManager::default());
+        let worktree =
+            std::env::temp_dir().join(format!("sail-acp-terminal-fence-{}", uuid::Uuid::new_v4()));
+        let (creating_tx, creating_rx) = std::sync::mpsc::channel();
+        let (finish_create_tx, finish_create_rx) = std::sync::mpsc::channel();
+        let creator_manager = Arc::clone(&manager);
+        let creator_worktree = worktree.clone();
+        let creator = std::thread::spawn(move || {
+            creator_manager.with_worktree_creation(&creator_worktree, || {
+                creating_tx.send(()).unwrap();
+                finish_create_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        creating_rx.recv().unwrap();
+
+        let (stopping_tx, stopping_rx) = std::sync::mpsc::channel();
+        let stopping_manager = Arc::clone(&manager);
+        let stopping_worktree = worktree.clone();
+        let stopper = std::thread::spawn(move || {
+            stopping_tx.send(()).unwrap();
+            stopping_manager.stop_worktree(&stopping_worktree)
+        });
+        stopping_rx.recv().unwrap();
+        finish_create_tx.send(()).unwrap();
+
+        creator.join().unwrap().unwrap();
+        stopper.join().unwrap().unwrap();
+        assert_eq!(
+            manager
+                .with_worktree_creation(&worktree, || Ok(()))
+                .unwrap_err(),
+            "Worktree is being removed."
+        );
+        manager.allow_worktree_terminals(&worktree);
+        assert!(manager.with_worktree_creation(&worktree, || Ok(())).is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn stop_kills_process_group_after_its_leader_exits() {
@@ -1021,9 +1145,20 @@ mod tests {
             .spawn()
             .expect("spawn terminal leader and child");
         let process_id = child.id();
-        child.wait().expect("terminal leader exits");
+        let mut status = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
+        let waited = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                process_id,
+                &mut status,
+                nix::libc::WEXITED | nix::libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "observe leader exit without releasing its PID");
+        assert_eq!(unsafe { status.si_pid() }, process_id as i32);
 
         kill_terminal_process_group(process_id).expect("stop the surviving process group");
+        child.wait().expect("reap leader after group cleanup");
         std::thread::sleep(Duration::from_millis(1200));
 
         assert!(

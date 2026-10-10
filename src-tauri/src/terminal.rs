@@ -3,7 +3,7 @@ use base64::Engine;
 use portable_pty::ChildKiller;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,7 +61,8 @@ struct TerminalSession {
     owner: Option<String>,
     directory: PathBuf,
     process_id: Option<u32>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    process_group_stop: Arc<Mutex<()>>,
     writer: Mutex<Box<dyn Write + Send>>,
     write_busy: AtomicBool,
     #[cfg(windows)]
@@ -72,6 +73,19 @@ struct TerminalSession {
 
 impl TerminalSession {
     fn stop(&self) -> Result<(), String> {
+        let _process_group_stop = self
+            .process_group_stop
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if self
+            .output
+            .lock()
+            .map_err(|error| error.to_string())?
+            .exit_code
+            .is_some()
+        {
+            return Ok(());
+        }
         #[cfg(unix)]
         {
             let master = self.master.lock().map_err(|error| error.to_string())?;
@@ -144,7 +158,6 @@ mod tests {
         use super::kill_terminal_process_groups;
         use std::os::unix::process::CommandExt;
         use std::process::Command;
-        use std::time::Duration;
 
         let shell_marker =
             std::env::temp_dir().join(format!("sail-shell-child-{}", uuid::Uuid::new_v4()));
@@ -157,7 +170,7 @@ mod tests {
             .spawn()
             .expect("spawn shell group");
         let shell_pid = shell.id();
-        shell.wait().expect("shell leader exits");
+        observe_exit_without_reaping(&mut shell);
         let mut foreground = Command::new("/bin/sh")
             .args(["-c", "(sleep 1; touch \"$1\") &", "sh"])
             .arg(&foreground_marker)
@@ -165,7 +178,7 @@ mod tests {
             .spawn()
             .expect("spawn foreground job group");
         let foreground_pid = foreground.id();
-        foreground.wait().expect("foreground leader exits");
+        observe_exit_without_reaping(&mut foreground);
         assert!(
             !shell_marker.exists(),
             "shell group fixture exited too late"
@@ -177,7 +190,11 @@ mod tests {
 
         kill_terminal_process_groups(shell_pid, Some(foreground_pid as i32))
             .expect("kill both owned terminal process groups");
-        std::thread::sleep(Duration::from_millis(1200));
+        shell.wait().expect("reap shell after group cleanup");
+        foreground
+            .wait()
+            .expect("reap foreground after group cleanup");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
 
         assert!(!shell_marker.exists(), "shell group child survived stop");
         assert!(
@@ -203,14 +220,80 @@ mod tests {
             .spawn()
             .expect("spawn shell group");
         let shell_pid = shell.id();
-        shell.wait().expect("shell leader exits before stop");
+        let mut status = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
+        let waited = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                shell_pid,
+                &mut status,
+                nix::libc::WEXITED | nix::libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "observe shell exit without releasing its PID");
+        assert_eq!(unsafe { status.si_pid() }, shell_pid as i32);
         assert!(!marker.exists(), "shell group fixture exited too late");
 
         kill_terminal_process_groups(shell_pid, None)
             .expect("kill shell group after its foreground group disappeared");
+        shell.wait().expect("reap shell after group cleanup");
         std::thread::sleep(Duration::from_millis(1200));
 
         assert!(!marker.exists(), "shell group child survived stop");
+    }
+
+    #[cfg(unix)]
+    fn observe_exit_without_reaping(child: &mut std::process::Child) {
+        let mut status = unsafe { std::mem::zeroed::<nix::libc::siginfo_t>() };
+        let waited = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                child.id(),
+                &mut status,
+                nix::libc::WEXITED | nix::libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "observe child exit without releasing its PID");
+        assert_eq!(unsafe { status.si_pid() }, child.id() as i32);
+    }
+
+    #[test]
+    fn owned_terminal_creation_is_serialized_with_worktree_stop() {
+        use super::TerminalManager;
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        let manager = Arc::new(TerminalManager::default());
+        let worktree =
+            std::env::temp_dir().join(format!("sail-terminal-fence-{}", uuid::Uuid::new_v4()));
+        let (creating_tx, creating_rx) = mpsc::channel();
+        let (finish_create_tx, finish_create_rx) = mpsc::channel();
+        let creator_manager = Arc::clone(&manager);
+        let creator_worktree = worktree.clone();
+        let creator = std::thread::spawn(move || {
+            creator_manager.with_worktree_creation(&creator_worktree, || {
+                creating_tx.send(()).unwrap();
+                finish_create_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        creating_rx.recv().unwrap();
+
+        let (deleting_tx, deleting_rx) = mpsc::channel();
+        let deleting_manager = Arc::clone(&manager);
+        let deleting_worktree = worktree.clone();
+        let deleter = std::thread::spawn(move || {
+            deleting_tx.send(()).unwrap();
+            deleting_manager.stop_worktree(&deleting_worktree)
+        });
+        deleting_rx.recv().unwrap();
+        finish_create_tx.send(()).unwrap();
+
+        creator.join().unwrap().unwrap();
+        deleter.join().unwrap().unwrap();
+        let create_after_stop = manager.with_worktree_creation(&worktree, || Ok(()));
+        assert_eq!(create_after_stop.unwrap_err(), "Worktree is being removed.");
+        manager.allow_worktree_terminals(&worktree);
+        assert!(manager.with_worktree_creation(&worktree, || Ok(())).is_ok());
     }
 
     #[test]
@@ -273,7 +356,10 @@ fn editor_program(program: &str) -> PathBuf {
 }
 
 #[derive(Default)]
-pub struct TerminalManager(Mutex<HashMap<String, Arc<TerminalSession>>>);
+pub struct TerminalManager(
+    Mutex<HashMap<String, Arc<TerminalSession>>>,
+    Mutex<HashSet<PathBuf>>,
+);
 
 impl Drop for TerminalManager {
     fn drop(&mut self) {
@@ -301,6 +387,8 @@ impl TerminalManager {
 
     pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
         let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let mut worktree_operations = self.1.lock().map_err(|error| error.to_string())?;
+        worktree_operations.insert(worktree.clone());
         let sessions = self
             .0
             .lock()
@@ -315,13 +403,36 @@ impl TerminalManager {
             .map(|(id, session)| (id.clone(), Arc::clone(session)))
             .collect::<Vec<_>>();
         for (id, session) in sessions {
-            session.stop()?;
+            if let Err(error) = session.stop() {
+                worktree_operations.remove(&worktree);
+                return Err(error);
+            }
             self.0
                 .lock()
                 .map_err(|error| error.to_string())?
                 .remove(&id);
         }
         Ok(())
+    }
+
+    pub fn allow_worktree_terminals(&self, worktree: &Path) {
+        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        if let Ok(mut operations) = self.1.lock() {
+            operations.remove(&worktree);
+        }
+    }
+
+    fn with_worktree_creation<T>(
+        &self,
+        worktree: &Path,
+        create: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let worktree = dunce::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+        let operations = self.1.lock().map_err(|error| error.to_string())?;
+        if operations.contains(&worktree) {
+            return Err("Worktree is being removed.".into());
+        }
+        create()
     }
 
     pub fn server_roots(&self) -> Vec<(PathBuf, u32)> {
@@ -630,6 +741,10 @@ fn spawn(
     }));
     let changed = Arc::new(Condvar::new());
     let process_id = child.process_id();
+    let process_group_stop = Arc::new(Mutex::new(()));
+    let background_process_group_stop = Arc::clone(&process_group_stop);
+    let master = Arc::new(Mutex::new(pair.master));
+    let background_master = Arc::clone(&master);
     #[cfg(windows)]
     let killer = child.clone_killer();
     let child = Arc::new(Mutex::new(child));
@@ -659,6 +774,22 @@ fn spawn(
                 }
             }
         }
+        let _process_group_stop = background_process_group_stop
+            .lock()
+            .expect("terminal process group stop lock");
+        #[cfg(unix)]
+        if let Some(process_id) = process_id {
+            let foreground_group = background_master
+                .lock()
+                .ok()
+                .and_then(|master| master.process_group_leader());
+            if let Err(error) = kill_terminal_process_groups(process_id, foreground_group) {
+                crate::diagnostics::record(
+                    "terminal_process_group_stop_failed",
+                    serde_json::json!({"id":&id,"error":error}),
+                );
+            }
+        }
         let code = background_child
             .lock()
             .ok()
@@ -680,7 +811,8 @@ fn spawn(
         owner,
         directory,
         process_id,
-        master: Mutex::new(pair.master),
+        master,
+        process_group_stop,
         writer: Mutex::new(writer),
         write_busy: AtomicBool::new(false),
         #[cfg(windows)]
@@ -729,7 +861,7 @@ pub fn terminal_open(
             return Err("Command is empty".to_string());
         }
         let session = Arc::new(spawn(
-            directory,
+            directory.clone(),
             cols,
             rows,
             command.as_deref(),
@@ -858,22 +990,24 @@ pub fn terminal_owned_create(
     if !directory.is_dir() {
         return Err("Terminal directory is not a folder.".into());
     }
-    let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
-    if sessions.contains_key(&pane_id) {
-        return Err("Terminal pane already exists.".into());
-    }
-    let session = Arc::new(spawn(
-        directory,
-        80,
-        24,
-        Some(&command),
-        pane_id.clone(),
-        app,
-        Some(owner),
-    )?);
-    let terminal_id = format!("shell:{}", session.inspect_id);
-    sessions.insert(pane_id, session);
-    Ok(terminal_id)
+    manager.with_worktree_creation(&directory, || {
+        let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
+        if sessions.contains_key(&pane_id) {
+            return Err("Terminal pane already exists.".into());
+        }
+        let session = Arc::new(spawn(
+            directory.clone(),
+            80,
+            24,
+            Some(&command),
+            pane_id.clone(),
+            app,
+            Some(owner),
+        )?);
+        let terminal_id = format!("shell:{}", session.inspect_id);
+        sessions.insert(pane_id, session);
+        Ok(terminal_id)
+    })
 }
 
 #[tauri::command]

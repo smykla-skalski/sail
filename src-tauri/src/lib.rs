@@ -1833,29 +1833,33 @@ async fn delete_worktree(
             fence.stop_sessions_in(&app, &agents, &directory)?;
         }
         fence.cleanup(&agents, &directory, native_generation, || {
-            app.state::<terminal::TerminalManager>()
-                .inner()
-                .stop_worktree(&directory)?;
-            terminals.stop_worktree(&directory)?;
-            remove_worktree_then_terminal_data(&managed_terminal_data, || {
-                if archive_ignored == Some(true) {
-                    archive_ignored_and_remove(
-                        checked,
-                        worktree,
-                        expected_revision,
-                        expected_branch,
-                    )
-                } else {
-                    remove_worktree(
-                        checked,
-                        worktree,
-                        force,
-                        expected_revision.as_deref(),
-                        expected_branch.as_deref(),
-                    )?;
-                    Ok(None)
-                }
-            })
+            let terminal_manager = app.state::<terminal::TerminalManager>();
+            let result = (|| {
+                terminal_manager.stop_worktree(&directory)?;
+                terminals.stop_worktree(&directory)?;
+                remove_worktree_then_terminal_data(&managed_terminal_data, || {
+                    if archive_ignored == Some(true) {
+                        archive_ignored_and_remove(
+                            checked,
+                            worktree,
+                            expected_revision,
+                            expected_branch,
+                        )
+                    } else {
+                        remove_worktree(
+                            checked,
+                            worktree,
+                            force,
+                            expected_revision.as_deref(),
+                            expected_branch.as_deref(),
+                        )?;
+                        Ok(None)
+                    }
+                })
+            })();
+            terminal_manager.allow_worktree_terminals(&directory);
+            terminals.allow_worktree_terminals(&directory);
+            result
         })
     })
     .await
