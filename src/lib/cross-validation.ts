@@ -1,5 +1,6 @@
 export type ValidationChoice = { agent: string; model: string };
-export type ValidationSettings = { choices: ValidationChoice[]; strictDifferentModel: boolean };
+export type ValidationRoute = { agent: string; model?: string };
+export type ValidationSettings = { choices: ValidationChoice[] };
 
 export const validationSettingsKey = 'sai-cross-validation';
 
@@ -33,49 +34,23 @@ export function parseValidationSettings(raw: string | null): ValidationSettings 
       choices: [
         ...new Map(choices.map((choice) => [`${choice.agent}\0${choice.model}`, choice])).values(),
       ],
-      strictDifferentModel: 'strictDifferentModel' in value && value.strictDifferentModel === true,
     };
   } catch {
-    return { choices: [], strictDifferentModel: false };
+    return { choices: [] };
   }
 }
 
 export function selectValidationChoice(
-  settings: ValidationSettings,
-  available: ValidationChoice[],
-  implementingModels: string[],
-): { choice: ValidationChoice | null; reason: string | null } {
+  settings: { choices: ValidationRoute[] },
+  available: ValidationRoute[],
+): { choice: ValidationRoute | null; reason: string | null } {
   if (!settings.choices.length)
-    return { choice: null, reason: 'Select cross-validation agents and models in Settings.' };
+    return { choice: null, reason: 'No validation model is available.' };
   const eligible = settings.choices.filter((choice) =>
     available.some((item) => item.agent === choice.agent && item.model === choice.model),
   );
   if (!eligible.length)
     return { choice: null, reason: 'None of the selected cross-validation models is available.' };
-  if (settings.strictDifferentModel && implementingModels.some(hasUnresolvedModelAlias))
-    return {
-      choice: null,
-      reason:
-        'Cannot verify the actual implementation model behind an alias. Choose concrete model IDs before strict validation.',
-    };
-  const verified = eligible.filter((choice) => !hasUnresolvedModelAlias(choice.model));
-  if (settings.strictDifferentModel && !verified.length)
-    return {
-      choice: null,
-      reason:
-        'Cannot verify the actual selected model behind an alias. Select a concrete model ID for strict validation.',
-    };
-  const used = new Set(implementingModels.map(modelId));
-  const different = implementingModels.some(hasUnresolvedModelAlias)
-    ? undefined
-    : verified.find((choice) => !used.has(modelId(choice.model)));
-  if (different) return { choice: different, reason: null };
-  if (settings.strictDifferentModel)
-    return {
-      choice: null,
-      reason:
-        'Strict different-model routing is enabled, but no selected available model differs from every implementation model.',
-    };
   return { choice: eligible[0], reason: null };
 }
 
@@ -83,12 +58,12 @@ export function validationInstructions(
   settings: ValidationSettings,
   currentModel?: string,
 ): string {
-  if (!settings.choices.length && !settings.strictDifferentModel)
+  if (!settings.choices.length)
     return [
-      'Sail cross-validation is disabled.',
-      currentModel ? `Current implementation model: ${currentModel}.` : '',
-      'Run every review and test gate in this Ship It session with the implementation agent and model.',
-      'Do not call validation_gate or pause because no validation pool is configured.',
+      'No validation model pool is configured.',
+      currentModel ? `Implementation model: ${currentModel}.` : '',
+      'For every review and test attempt, use validation_gate to start a fresh subagent session. Use the assigned Ship worker provider and model by default when available; a different model is optional.',
+      'If the provider cannot start a fresh session, pause and report the missing capability. Unresolved model metadata does not block a gate when its fresh execution identity is known.',
     ]
       .filter(Boolean)
       .join('\n');
@@ -98,10 +73,9 @@ export function validationInstructions(
   return [
     'Sail cross-validation policy:',
     `Selected agent and model pool:\n${pool}`,
-    `Strict different-model routing: ${settings.strictDifferentModel ? 'on' : 'off'}.`,
     currentModel ? `Current implementation model: ${currentModel}.` : '',
-    'Before each gate, collect every model that implemented the issue and check current availability of the selected pool. Choose a selected available model different from every implementation model when one exists. If strict routing is on and none exists, pause with the exact reason.',
-    'In Sail, use the validation_gate tool for each pass in order, with gate, prompt, and the complete implementingModels list. Wait for its receipt before starting the next pass. The tool selects the configured provider/model and starts a fresh session. If the tool is unavailable or cannot verify its actual model, pause the gate. Never launch an unselected agent or model as a substitute. Report the actual provider and model returned for each pass.',
+    'Before each gate, check current availability of the selected pool and choose a selected available model. A validation session must be fresh, but its model may match the implementation model.',
+    'In Sail, use the validation_gate tool for each pass in order, with the gate and prompt. Wait for its receipt before starting the next pass. The tool selects the configured route when present and starts a fresh session. If the tool is unavailable or cannot start a fresh session, pause the gate. Never launch an unselected agent or model as a substitute. Report actual route metadata when available.',
   ]
     .filter(Boolean)
     .join('\n');

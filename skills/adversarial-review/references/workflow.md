@@ -25,12 +25,12 @@ The second pass exists because an unrefuted adversary nit-bombs. It sees only th
 
 Paths in this file are relative to the skill directory (the one holding this SKILL.md). The workflow is written for Claude Code; on other agents, or when a Claude feature is missing, use these fallbacks:
 
-| Claude Code feature                                                     | Fallback                                                                                                                                                                     |
-| :---------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Argument substitution                                                   | If the "Parse from" line under Arguments shows no value or an unreplaced placeholder, take the PR URL, diff file, `--base` and `--context` from the user's request           |
-| Named agents `adversarial-review:code-adversary` / `findings-adversary` | Spawn a generic subagent with the matching mandate file from `references/` prepended (see [Spawning a clean-context subagent](#spawning-a-clean-context-subagent))           |
-| Subagent tool (Agent)                                                   | Codex: `spawn_agent`; opencode: `task`; Copilot CLI: its task/subagent tool. With no subagent tool at all, run both passes inline (see [Fallback](#fallback---no-subagents)) |
-| AskUserQuestion, `context: fork`                                        | Not used                                                                                                                                                                     |
+| Claude Code feature                                                     | Fallback                                                                                                                                                           |
+| :---------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Argument substitution                                                   | If the "Parse from" line under Arguments shows no value or an unreplaced placeholder, take the PR URL, diff file, `--base` and `--context` from the user's request |
+| Named agents `adversarial-review:code-adversary` / `findings-adversary` | Spawn a generic subagent with the matching mandate file from `references/` prepended (see [Spawning a clean-context subagent](#spawning-a-clean-context-subagent)) |
+| Subagent tool (Agent)                                                   | Codex: `spawn_agent`; opencode: `task`; Copilot CLI: its task/subagent tool. If no subagent tool is available or spawning fails twice, block the review            |
+| AskUserQuestion, `context: fork`                                        | Not used                                                                                                                                                           |
 
 The two passes always run sequentially, so the skill never needs more than one extra subagent at a time.
 
@@ -91,14 +91,14 @@ An adversary lives for exactly one verdict. Start it with no forked or inherited
 
 **Copilot CLI.** The plugin registers the same named agents (`adversarial-review:code-adversary`, `adversarial-review:findings-adversary`); use them through its subagent tool when offered, otherwise a fresh generic subagent with the mandate prepended.
 
-**Other agents** with a subagent tool: spawn a fresh generic subagent with the mandate prepended. Without a subagent tool, use the inline Fallback.
+**Other agents** with a subagent tool: spawn a fresh generic subagent with the mandate prepended. Without a subagent tool, block the review.
 
 **Verdict check and retry.** Validate every reply before using it. The last non-empty line must match the pass's documented format exactly:
 
 - Code Adversary: `^CODE_ADVERSARY_VERDICT: (FOUND BLOCKING \(\d+\)|FOUND ISSUES \(\d+\)|MINOR ONLY \(\d+\)|CLEAN)$`. The keyword must agree with the labels of the `F<n>` findings in the reply and the count must equal their number: `CLEAN` has no findings; `MINOR ONLY` has findings labelled only `suggestion:` or `question:`; `FOUND ISSUES` has at least one `issue:` and no `blocking:`; `FOUND BLOCKING` has at least one `blocking:`.
 - Findings Adversary: `^FINDINGS_ADVERSARY_VERDICT: (SOUND|CORRECTED|ESCAPED_BUG)$`, preceded by one `F<n> —` line for every input finding.
 
-An empty reply, a missing or malformed verdict line, a keyword that disagrees with the labels, a count that does not match, or a missing `F<n>` line is a malformed verdict. Close that subagent, spawn one fresh subagent for the same pass, and validate again. A second malformed reply is a gate failure: output `Review Verdict: FAILED` (see Output) and stop. Do not run the pass inline to rescue it. The inline Fallback is only for a runtime with no subagent tool or a spawn call that itself errors twice.
+An empty reply, a missing or malformed verdict line, a keyword that disagrees with the labels, a count that does not match, or a missing `F<n>` line is a malformed verdict. Close that subagent, spawn one fresh subagent for the same pass, and validate again. A second malformed reply is a gate failure: output `Review Verdict: FAILED` (see Output) and stop. Do not run the pass inline to rescue it. If both spawn attempts fail, report a gate failure.
 
 ## Phase 2 - Code Adversary
 
@@ -157,7 +157,7 @@ End with one line: `Adversaries: code <CODE_ADVERSARY_VERDICT|malformed> · find
 
 ## Fallback - no subagents
 
-If the runtime has no subagent tool, or the spawn call itself errors on both attempts, run each pass inline as a separate labelled section, following the mandate files linked above. A malformed verdict is not a spawn error and is never rescued inline. Run the inline Findings pass only when the inline Code pass found a `blocking:` or `issue:`. In the Findings pass you MUST re-open every cited `file:line` and re-derive the claim from the source - never verify from memory of having written it. Assume your own mistakes are there. Note `inline` in the final Adversaries line.
+There is no inline fallback. If a fresh subagent cannot launch after one retry, report `Review Verdict: BLOCKED` and name the failed pass and launch error.
 
 ## Anti-patterns
 

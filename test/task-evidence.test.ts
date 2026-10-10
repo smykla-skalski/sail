@@ -2075,6 +2075,16 @@ void test('normalizes known gate economics to validator context', () => {
     'revision',
     criteria,
     evidence({
+      id: 'inline-review-gate',
+      name: 'inline-review',
+      economics: { ...emptyTaskEconomics('guardian', 'complete'), checks: 1 },
+    }),
+  );
+  manifests = recordTaskEvidence(
+    manifests,
+    'revision',
+    criteria,
+    evidence({
       id: 'test-gate',
       name: 'test-adversary',
       economics: { ...emptyTaskEconomics('guardian', 'complete'), checks: 1 },
@@ -2083,6 +2093,7 @@ void test('normalizes known gate economics to validator context', () => {
   assert.deepEqual(
     manifests[0].evidence.map((entry) => [entry.economics?.role, entry.economics?.phase]),
     [
+      ['validator', 'review'],
       ['validator', 'review'],
       ['validator', 'test'],
     ],

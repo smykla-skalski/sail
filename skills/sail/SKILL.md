@@ -78,8 +78,9 @@ reason, and policy revision; unknown and high-risk actions require a person.
 - Keep the `receiptId` and `accessKey` returned by `agent_spawn` together. Pass
   both to `agent_status`, `agent_wait`, or `agent_result`. Wait for completion
   before relying on another agent's work. Inspect the receipt's requested and
-  actual provider, model, and variant. When it marks independent review as
-  required, launch the configured review route before treating the task as done.
+  actual provider, model, and variant. A fresh validation session satisfies
+  review and test context isolation; its provider and model may match the
+  implementation worker. Do not launch a second review route for that receipt.
 - Use `project_threads` and `thread_message` to contact another thread in the
   same project. Use `worktree_status` for a short sidebar status comment.
 - On the first substantive task turn, once you understand the work, call

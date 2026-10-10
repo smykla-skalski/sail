@@ -195,7 +195,7 @@ const stageLabels: Record<(typeof stages)[number], string> = {
 };
 
 const gateSelectors: Partial<Record<(typeof stages)[number], string[]>> = {
-  reviewing: ['code-adversary', 'findings-adversary'],
+  reviewing: ['inline-review', 'code-adversary', 'findings-adversary'],
   testing: ['test-adversary'],
 };
 
@@ -226,7 +226,11 @@ function gateSummary(issue: ShipIssue): string[] {
   const gates = currentShipGates(issue);
   const verdict = (name: string) => gates.find((gate) => gate.gate === name)?.verdict;
   const parts: string[] = [];
-  const review = [verdict('code-adversary'), verdict('findings-adversary')].filter(Boolean);
+  const review = [
+    verdict('inline-review'),
+    verdict('code-adversary'),
+    verdict('findings-adversary'),
+  ].filter(Boolean);
   if (review.length) {
     if (review.includes('NEEDS_FIXES')) parts.push('review needs fixes');
     else if (review.includes('BLOCKED')) parts.push('review blocked');

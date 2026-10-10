@@ -49,9 +49,7 @@
   import {
     appendShipEvent,
     beginLatestRefresh,
-    completedInlineShipGate,
     nextValidationReservation,
-    reserveInlineValidation,
     gateSnapshot,
     currentShipBlockedReason,
     loadShipRunStore,
@@ -273,7 +271,7 @@
   import {
     hasUnresolvedModelAlias,
     selectValidationChoice,
-    type ValidationChoice,
+    type ValidationRoute,
   } from './lib/cross-validation';
   import {
     abandonImplementationTurn,
@@ -3988,13 +3986,10 @@
         throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
       await acp.connect(run.provider);
       ensureClaimHeld();
-      const inlineGates = !crossValidation.choices.length && !crossValidation.strictDifferentModel;
-      const gateExecution = inlineGates
-        ? 'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run exactly those gates in this Ship It session with the implementation agent and model. Do not call validation_gate or require agent coordination.'
-        : 'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run exactly those gates in fresh subagent sessions. If a gate session cannot launch, pause and report the reason in this thread.';
-      const gateReporting = inlineGates
-        ? 'Before every adversary pass, read the checkpoint revision. After the pass, use ship_progress with that revision, its gate (code-adversary, findings-adversary, or test-adversary), actual verdict, validator economics counters, and reason when blocked or failed.'
-        : 'Validation sessions report their own gate verdicts through ship_progress; do not report them from this implementation session.';
+      const gateExecution =
+        'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
+      const gateReporting =
+        'Each validation session reports its own gate verdict through ship_progress; do not report review or test verdicts from this implementation session.';
       const target = shippingTarget;
       const prompt = shipWorkerPrompt({
         issueUrl: issue.url,
@@ -4396,11 +4391,6 @@
 
   const shippingPullRequests = new SvelteMap<string, ShippingPullRequest | null>();
   const shippingPullRequestGenerations = new Map<string, number>();
-  const inlineValidationReservations = new Map<
-    string,
-    { sequence: number; evidenceSequence: number }
-  >();
-
   async function refreshShippingPullRequest(
     run: ShipRun,
     issue: ShipIssue,
@@ -6723,137 +6713,10 @@
           item.targetId === sourceId &&
           item.targetDirectory === request.directory,
       );
-      if (!receipt?.validation) {
-        requireValidatorEconomics(report, false);
-        if (crossValidation.choices.length || crossValidation.strictDifferentModel)
-          throw new Error(
-            'Inline gate verdicts are disabled while cross-validation is configured.',
-          );
-        if (!('gate' in report))
-          throw new Error('The implementation session must identify the completed inline gate.');
-        const owner = shipOwner(shipRuns, request.directory, sourceId);
-        if (!owner)
-          throw new Error('Only the assigned Ship worker can report inline gate verdicts.');
-        const { sequence, evidenceSequence } = reserveInlineValidation(
-          inlineValidationReservations,
-          `${owner.run.id}:${owner.issue.id}`,
-          owner.issue.gates ?? [],
-          owner.issue.evidenceManifests ?? [],
+      if (!receipt?.validation)
+        throw new Error(
+          'Ship It gate verdicts must come from a fresh validation subagent session.',
         );
-        const policy = owner.issue.validationPolicy;
-        const shippingTarget = await shippingTargetFor(owner.run, owner.issue, request.directory);
-        const [revision, baseRevision] = await Promise.all([
-          invoke<string>('working_tree_revision', { path: request.directory }),
-          invoke<string>('shipping_base_revision', {
-            path: request.directory,
-            baseRef: shippingTarget.baseRef,
-          }),
-        ]);
-        assertShipGateAllowed(policy, report.gate, revision, baseRevision);
-        validateGateVerdict(report.gate, report.verdict);
-        const now = Date.now();
-        const model = resolvedWorkerModel(owner.issue) ?? null;
-        const gateId = `inline:${sourceId}:${report.gate}:${crypto.randomUUID()}`;
-        await commitRevisionBoundValidation({
-          expectedRevision: policy?.revision,
-          expectedMutationGeneration: policy?.mutationGeneration,
-          expectedBaseRevision: policy?.baseRevision,
-          readRevision: () => invoke<string>('working_tree_revision', { path: request.directory }),
-          readMutationGeneration: () =>
-            invoke<string>('working_tree_generation', { path: request.directory }),
-          readBaseRevision: () =>
-            invoke<string>('shipping_base_revision', {
-              path: request.directory,
-              baseRef: shippingTarget.baseRef,
-            }),
-          prepare: async () => {
-            const evidenceChanges = await recordGateEvidence(
-              owner,
-              report.gate,
-              report.verdict,
-              owner.run.provider,
-              model,
-              report.criteria,
-              report.untestedCriteria,
-              report.outputReference,
-              `thread:${sourceId}`,
-              report.revision,
-              baseRevision,
-              {
-                id: `gate:${gateId}`,
-                timestamp: now,
-                sequence: evidenceSequence,
-              },
-              report.economics,
-            );
-            requireEvidenceBaseRevision(
-              evidenceChanges.evidenceRevision!,
-              owner.issue.evidenceRevision,
-            );
-            return evidenceChanges;
-          },
-          commit: async (evidenceChanges, registerRollback) => {
-            const previous = validationIssueSnapshot(owner.issue);
-            let committed = previous;
-            registerRollback(async () => {
-              Object.assign(
-                owner.issue,
-                rollbackValidationIssue(owner.issue, previous, committed, `gate:${gateId}`, gateId),
-              );
-              await saveShipRuns();
-            });
-            const { evidenceSequence: recordedEvidenceSequence, ...issueEvidenceChanges } =
-              evidenceChanges;
-            await updateShipIssue(
-              owner.run,
-              owner.issue,
-              {
-                ...issueEvidenceChanges,
-                stage: report.gate === 'test-adversary' ? 'testing' : 'reviewing',
-                reportedStatus: 'running',
-                blockedReason: report.verdict === 'BLOCKED' ? report.reason : null,
-                gates: [
-                  ...(owner.issue.gates ?? []),
-                  completedInlineShipGate(
-                    {
-                      id: gateId,
-                      gate: report.gate,
-                      requestedModel: model ?? 'implementation session',
-                      sequence,
-                      provider: owner.run.provider,
-                      model,
-                      threadId: sourceId,
-                      directory: request.directory,
-                      error: null,
-                      verdict: report.verdict,
-                      reason: report.reason,
-                      revision,
-                      mutationGeneration: policy?.mutationGeneration,
-                      baseRevision,
-                      evidenceSequence: recordedEvidenceSequence,
-                      evidenceCriteria: report.criteria ?? [],
-                      evidenceUntestedCriteria: report.untestedCriteria ?? [],
-                      evidenceOutputReference: report.outputReference ?? `thread:${sourceId}`,
-                      evidenceTimestamp: now,
-                      evidenceEconomics: report.economics,
-                    },
-                    now,
-                  ),
-                ],
-                events: appendShipEvent(
-                  owner.issue.events,
-                  `${report.gate}: ${report.verdict}`,
-                  report.reason,
-                ),
-              },
-              false,
-            );
-            committed = validationIssueSnapshot(owner.issue);
-            await saveShipRuns();
-          },
-        });
-        return { status: 'recorded' };
-      }
       const validation = receipt.validation;
       if (shippingWorkerSettled(receipt.state))
         throw new Error('This validation attempt has already finished.');
@@ -7024,55 +6887,54 @@
     sourceId: string,
   ) {
     if (!agentWorktreesEnabled) throw new Error('Agent coordination is disabled in settings.');
-    const { gate, prompt, implementingModels } = request.arguments;
-    if (!['code-adversary', 'findings-adversary', 'test-adversary'].includes(String(gate)))
+    const { gate, prompt } = request.arguments;
+    if (
+      !['inline-review', 'code-adversary', 'findings-adversary', 'test-adversary'].includes(
+        String(gate),
+      )
+    )
       throw new Error('Choose a Ship It validation gate.');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 8000)
       throw new Error('Gate prompt must be 1–8000 characters.');
     const gatePrompt = `${prompt.trim()}\n\nBefore finishing, call ship_progress with your structured verdict, the exact acceptance criterion strings this pass verified, a bounded output reference, and privacy-safe economics counters for your validator activity. For review passes use CLEAN, NEEDS_FIXES, or BLOCKED; for manual testing use PASS, PASS (partial), FAIL, or BLOCKED. A PASS (partial) must also provide untestedCriteria as exact criterion and environmental blocker pairs, disjoint from criteria. Report only your own pass. A failed or blocked verdict requires a concrete reason.`;
-    if (
-      !Array.isArray(implementingModels) ||
-      !implementingModels.every((model) => typeof model === 'string' && !!model.trim())
-    )
-      throw new Error('List every implementation model.');
     await recoverImplementationModels(request.directory);
     const activeModels = await activeImplementationModels(request.directory, sourceId);
     if (!activeModels)
-      throw new Error('The active implementation model is unknown. Wait for the turn to finish.');
-    const usedModels = [
-      ...new Set([
-        ...implementationModels(request.directory),
-        ...activeModels,
-        ...implementingModels,
-      ]),
-    ];
-    if (implementationAttributionUncertain(request.directory))
-      throw new Error('Concurrent agent turns prevent reliable implementation model attribution.');
+      throw new Error('Implementation activity is still unresolved. Wait for the turn to finish.');
     const gateOwner = shipOwner(shipRuns, request.directory, sourceId);
     const routeRisk = gateOwner?.issue.validationPolicy?.risk ?? 'medium';
-    const configuredReviewRoute = modelRouting.routes.find(
-      (candidate) => candidate.role === 'review' && candidate.risk === routeRisk,
+    const routeRole = gate === 'test-adversary' ? 'testing' : 'review';
+    const configuredGateRoute = modelRouting.routes.find(
+      (candidate) => candidate.role === routeRole && candidate.risk === routeRisk,
     );
-    const reviewSelection = configuredReviewRoute
-      ? selectModelRoute(modelRouting, {
-          role: 'review',
-          risk: routeRisk,
-          implementingModels: usedModels,
-        })
+    const routeSelection = configuredGateRoute
+      ? selectModelRoute(modelRouting, { role: routeRole, risk: routeRisk })
       : null;
-    if (reviewSelection && !reviewSelection.route)
-      throw new Error(reviewSelection.reason ?? 'No eligible review route.');
-    const validationSettings = reviewSelection?.route
-      ? {
-          choices: [
-            {
-              agent: reviewSelection.route.provider,
-              model: reviewSelection.route.model,
-            },
-          ],
-          strictDifferentModel: reviewSelection.independentReviewRequired,
-        }
+    if (routeSelection && !routeSelection.route)
+      throw new Error(routeSelection.reason ?? `No eligible ${routeRole} route.`);
+    const validationSettings = routeSelection?.route
+      ? { choices: [{ agent: routeSelection.route.provider, model: routeSelection.route.model }] }
       : crossValidation;
+    const sourceThread = agentThreads.find(
+      (thread) =>
+        thread.directory === request.directory &&
+        thread.sessionId === request.sessionId &&
+        thread.agent === request.sourceAgent,
+    );
+    const defaultAgent = gateOwner?.run.provider ?? request.sourceAgent;
+    if (!defaultAgent || !['claude', 'codex', 'opencode'].includes(defaultAgent))
+      throw new Error('The assigned Ship worker provider is unavailable.');
+    const implementationModel =
+      (gateOwner ? resolvedWorkerModel(gateOwner.issue) : undefined) ?? sourceThread?.model;
+    const defaultGateRoute: ValidationRoute = {
+      agent: defaultAgent,
+      ...(implementationModel && !hasUnresolvedModelAlias(implementationModel)
+        ? { model: implementationModel }
+        : {}),
+    };
+    const gateRoutes: ValidationRoute[] = validationSettings.choices.length
+      ? validationSettings.choices
+      : [defaultGateRoute];
     const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
       repository: project,
       paths: [request.directory],
@@ -7081,27 +6943,27 @@
     if (!worktree) throw new Error('Source worktree is no longer registered with Git.');
     const branch = worktree.branch ?? '';
     const agents = await acp.agents();
-    const available = validationSettings.choices.filter((choice) =>
+    const available = gateRoutes.filter((choice) =>
       agents.some((agent) => agent.id === choice.agent && agent.available),
     );
-    async function tryChoice(candidates: ValidationChoice[], reasons: string[]): Promise<unknown> {
+    async function tryChoice(candidates: ValidationRoute[], reasons: string[]): Promise<unknown> {
       const currentCandidates = candidates.filter((candidate) =>
-        validationSettings.choices.some(
+        gateRoutes.some(
           (selected) => selected.agent === candidate.agent && selected.model === candidate.model,
         ),
       );
       if (!currentCandidates.length) {
-        const unavailable = selectValidationChoice(validationSettings, [], usedModels);
+        const unavailable = selectValidationChoice({ choices: gateRoutes }, []);
         throw new Error([unavailable.reason, ...reasons].filter(Boolean).join(' '));
       }
-      const route = selectValidationChoice(validationSettings, currentCandidates, usedModels);
+      const route = selectValidationChoice({ choices: gateRoutes }, currentCandidates);
       if (!route.choice) throw new Error(route.reason ?? 'No eligible validation model.');
-      const choice: ValidationChoice = route.choice;
+      const choice: ValidationRoute = route.choice;
       const gateSource: CoordinationSource = {
         kind: 'acp',
         agent: choice.agent,
-        model: acpModelId(choice.agent, choice.model),
-        variant: reviewSelection?.route?.variant,
+        ...(choice.model ? { model: acpModelId(choice.agent, choice.model) } : {}),
+        variant: routeSelection?.route?.variant,
         title: String(gate),
       };
       const receiptId = crypto.randomUUID();
@@ -7128,23 +6990,16 @@
       );
       const ensureSelected = async () => {
         const selectedCandidates = currentCandidates.filter((candidate) =>
-          validationSettings.choices.some(
+          gateRoutes.some(
             (selected) => selected.agent === candidate.agent && selected.model === candidate.model,
           ),
         );
         const active = await activeImplementationModels(request.directory, sourceId);
-        if (!active || implementationAttributionUncertain(request.directory))
+        if (!active)
           throw new Error(
-            'Concurrent agent turns prevent reliable implementation model attribution.',
+            'Implementation activity is still unresolved. Wait for the turn to finish.',
           );
-        const latestModels = [
-          ...new Set([...implementationModels(request.directory), ...active, ...usedModels]),
-        ];
-        const current = selectValidationChoice(
-          validationSettings,
-          selectedCandidates,
-          latestModels,
-        ).choice;
+        const current = selectValidationChoice({ choices: gateRoutes }, selectedCandidates).choice;
         if (current?.agent !== choice.agent || current.model !== choice.model)
           throw new Error('Validation model selection changed before launch. Retry the gate.');
       };
@@ -7163,26 +7018,22 @@
         prompt: gatePrompt,
         validation: {
           gate: gate as import('./lib/ship-progress').GateName,
-          requestedModel: choice.model,
+          requestedModel: choice.model ?? 'implementation model',
           sequence,
           evidenceSequence,
           protocolVersion: 2,
         },
-        ...(reviewSelection?.route
-          ? {
-              routing: {
-                role: 'review' as const,
-                risk: routeRisk,
-                independentReviewRequired: reviewSelection.independentReviewRequired,
-                requested: {
-                  provider: reviewSelection.route.provider,
-                  model: reviewSelection.route.model,
-                  variant: reviewSelection.route.variant ?? null,
-                },
-                actual: null,
-              },
-            }
-          : {}),
+        routing: {
+          role: routeRole,
+          risk: routeRisk,
+          contextIsolationRequired: true,
+          requested: {
+            provider: choice.agent as SpawnReceipt['provider'],
+            model: choice.model ?? null,
+            variant: routeSelection?.route?.variant ?? null,
+          },
+          actual: null,
+        },
         state: 'starting',
         created: Date.now(),
         updated: Date.now(),
@@ -7214,7 +7065,7 @@
         updateSpawnReceipt(receiptId, {
           validation: {
             gate: gate as import('./lib/ship-progress').GateName,
-            requestedModel: choice.model,
+            requestedModel: choice.model ?? 'implementation model',
             sequence,
             evidenceSequence,
             revision,
@@ -7259,7 +7110,7 @@
           sourceId,
           targetId: started.threadId,
           provider: choice.agent,
-          model: choice.model,
+          model: choice.model ?? null,
           gate,
           status: 'started',
         };
@@ -7268,7 +7119,10 @@
         if (!(cause instanceof ValidationCandidateUnavailable)) throw cause;
         return tryChoice(
           candidates.filter((item) => item !== choice),
-          [...reasons, `${choice.agent} / ${choice.model}: ${describe(cause)}`],
+          [
+            ...reasons,
+            `${choice.agent} / ${choice.model ?? 'implementation default'}: ${describe(cause)}`,
+          ],
         );
       }
     }
@@ -7304,7 +7158,9 @@
     if (
       routed &&
       (typeof role !== 'string' ||
-        !['exploration', 'implementation', 'debugging', 'review', 'ci-triage'].includes(role) ||
+        !['exploration', 'implementation', 'debugging', 'review', 'testing', 'ci-triage'].includes(
+          role,
+        ) ||
         typeof risk !== 'string' ||
         !shipRiskLevels.includes(risk as ShipRisk))
     )
@@ -7338,8 +7194,6 @@
       ? selectModelRoute(modelRouting, {
           role: role as ModelRouteRole,
           risk: risk as ShipRisk,
-          implementingModels:
-            role === 'review' ? implementationModels(request.directory) : undefined,
         })
       : null;
     if (routeSelection?.reason)
@@ -7405,7 +7259,7 @@
             routing: {
               role: role as ModelRouteRole,
               risk: risk as ShipRisk,
-              independentReviewRequired: routeSelection.independentReviewRequired,
+              contextIsolationRequired: routeSelection.contextIsolationRequired,
               requested: {
                 provider: chosenProvider,
                 model: route?.model ?? null,
@@ -7547,7 +7401,7 @@
         sourceId,
         targetId: started.threadId,
         ...(routeSelection
-          ? { independentReviewRequired: routeSelection.independentReviewRequired }
+          ? { contextIsolationRequired: routeSelection.contextIsolationRequired }
           : {}),
         status: 'started',
       };
@@ -7566,20 +7420,21 @@
     nativeGeneration?: number,
     promptAuthorization?: DirectShipAuthorization,
   ) {
-    if (validation) {
-      const model = source.model;
-      if (!model || hasUnresolvedModelAlias(model))
-        throw new ValidationCandidateUnavailable(
-          'Cannot verify the actual validation model behind an alias. Select a concrete model ID.',
-        );
-    }
+    const requestedModel =
+      validation && source.model && hasUnresolvedModelAlias(source.model)
+        ? undefined
+        : source.model;
     if (!validation)
       await beginShipItRun(created.path, prompt, promptSkill(skills, prompt)?.name ?? null);
     const routingRole = receiptId
       ? spawnReceipts.find((item) => item.receiptId === receiptId)?.routing?.role
       : undefined;
     const routedProfile: CapabilityProfile =
-      routingRole === 'exploration' ? 'explore' : routingRole === 'review' ? 'review' : 'build';
+      routingRole === 'exploration'
+        ? 'explore'
+        : ['review', 'testing'].includes(routingRole ?? '')
+          ? 'review'
+          : 'build';
     const capabilityProfile: CapabilityProfile = validation
       ? 'review'
       : routingRole
@@ -7596,26 +7451,26 @@
       const reportedModel = configOptions.find(
         (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
       )?.currentValue;
-      if (source.model) {
+      if (requestedModel) {
         const modelOption = configOptions.find(
           (option) => option.type === 'select' && /model/i.test(`${option.id} ${option.name}`),
         );
-        if (!modelOption?.options.some((option) => option.value === source.model)) {
-          const message = `Model ${source.model} is unavailable in ${source.agent}.`;
+        if (!modelOption?.options.some((option) => option.value === requestedModel)) {
+          const message = `Model ${requestedModel} is unavailable in ${source.agent}.`;
           throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
         }
         const changed = await acp
-          .setConfig(source.agent, session.sessionId, modelOption.id, source.model)
+          .setConfig(source.agent, session.sessionId, modelOption.id, requestedModel)
           .catch((cause) => {
             if (!validation) throw cause;
             throw new ValidationCandidateUnavailable(
-              `${source.agent} / ${source.model} is unavailable`,
+              `${source.agent} / ${requestedModel} is unavailable`,
               cause,
             );
           });
         const actual = changed.configOptions?.find((option) => option.id === modelOption.id);
-        if (actual?.currentValue !== source.model) {
-          const message = `Cannot verify ${source.agent} selected model ${source.model}.`;
+        if (actual?.currentValue !== requestedModel) {
+          const message = `Cannot verify ${source.agent} selected model ${requestedModel}.`;
           throw validation ? new ValidationCandidateUnavailable(message) : new Error(message);
         }
         configOptions = changed.configOptions ?? configOptions;
@@ -7645,7 +7500,7 @@
       }
       const thread: AgentThread = {
         agent: source.agent,
-        model: source.model ?? reportedModel,
+        model: requestedModel ?? reportedModel,
         sessionId: session.sessionId,
         directory: created.path,
         title: prompt.slice(0, 60),
@@ -7657,7 +7512,7 @@
         const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
         updateSpawnReceipt(receiptId, {
           targetId: `acp:${source.agent}:${session.sessionId}`,
-          model: source.model ?? reportedModel,
+          model: requestedModel ?? reportedModel,
           targetDirectory: created.path,
           worktreeId: created.path,
           ...(receipt?.routing
@@ -7666,7 +7521,7 @@
                   ...receipt.routing,
                   actual: {
                     provider: source.agent as 'claude' | 'codex' | 'opencode',
-                    model: source.model ?? reportedModel ?? null,
+                    model: requestedModel ?? reportedModel ?? null,
                     variant: source.variant ?? reportedVariant ?? null,
                   },
                 },
@@ -7685,7 +7540,7 @@
         ? null
         : await beginImplementationTurn(
             created.path,
-            source.model ?? reportedModel,
+            requestedModel ?? reportedModel,
             `acp:${source.agent}:${session.sessionId}`,
           );
       updateAgentThreadStatus(thread, 'working');
@@ -7721,7 +7576,11 @@
       const finished = turn.then(
         async (outcome) => {
           if (tracking)
-            await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
+            await recordImplementationModel(
+              created.path,
+              requestedModel ?? reportedModel,
+              tracking,
+            );
           updateAgentThreadStatus(thread, acpPromptInterrupted(outcome) ? 'interrupted' : 'done');
           if (receiptId) {
             const current = spawnReceipts.find((item) => item.receiptId === receiptId);
@@ -7737,7 +7596,11 @@
         },
         async (cause) => {
           if (tracking)
-            await recordImplementationModel(created.path, source.model ?? reportedModel, tracking);
+            await recordImplementationModel(
+              created.path,
+              requestedModel ?? reportedModel,
+              tracking,
+            );
           const interrupted = await acpFailedPromptInterrupted(
             source.agent,
             session.sessionId,

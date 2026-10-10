@@ -54,7 +54,7 @@ function fixture(count = 4): ShipRun {
 }
 
 function gate(
-  name: 'code-adversary' | 'findings-adversary' | 'test-adversary',
+  name: 'inline-review' | 'code-adversary' | 'findings-adversary' | 'test-adversary',
   verdict: 'CLEAN' | 'NEEDS_FIXES' | 'PASS' | 'PASS (partial)' | 'FAIL' | 'BLOCKED',
   updated: number,
 ) {
@@ -339,6 +339,26 @@ void test('gates a risk policy did not select show as not required', () => {
   assert.equal(states.ci, 'upcoming', 'CI is not a validation gate');
   assert.equal(states.testing, 'upcoming');
   assert.equal(states.implementing, 'current');
+});
+
+void test('inline-review selects the reviewing stage and contributes to its summary', () => {
+  const run = fixture(1);
+  const issue = working(run.issues[0], 'reviewing', {
+    validationPolicy: {
+      risk: 'low',
+      requiredGates: ['inline-review'],
+      sources: ['default'],
+      revision: 'r',
+      changedPaths: [],
+      selectedAt: 1,
+      history: [],
+    },
+    gates: [gate('inline-review', 'CLEAN', 2)],
+  });
+  const indicator = shipStageIndicator(issue);
+  assert.equal(indicator.steps.find((step) => step.id === 'reviewing')?.state, 'current');
+  assert.equal(indicator.steps.find((step) => step.id === 'testing')?.state, 'not-required');
+  assert.match(indicator.label, /review passed/);
 });
 
 void test('requiredGates from a touched checkpoint also select stages', () => {
