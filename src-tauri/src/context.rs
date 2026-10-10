@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+#[cfg(not(feature = "e2e"))]
 use tauri::Manager;
 
 const CONFIG: &str = ".sail/worktree.json";
@@ -430,16 +431,30 @@ fn register(store: &mut ApprovalStore, command: &str, executable: &Path) {
         .insert(command.into(), executable.to_string_lossy().into_owned());
 }
 
-fn store_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    #[cfg(feature = "e2e")]
-    if let Some(root) = std::env::var_os("SAIL_E2E_CONFIG_DIR") {
-        return Ok(PathBuf::from(root).join("context-providers.json"));
+#[cfg(feature = "e2e")]
+fn e2e_store_path() -> Result<PathBuf, String> {
+    let root = std::env::var_os("SAIL_E2E_CONFIG_DIR")
+        .ok_or("Set a private SAIL_E2E_CONFIG_DIR for context tests.")?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err("SAIL_E2E_CONFIG_DIR must be an absolute private path.".into());
     }
-    let config = app
-        .path()
-        .config_dir()
-        .map_err(|error| format!("Cannot locate Sail configuration: {error}"))?;
-    Ok(config.join("sail").join("context-providers.json"))
+    Ok(root.join("context-providers.json"))
+}
+
+fn store_path(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    #[cfg(feature = "e2e")]
+    {
+        e2e_store_path()
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let config = _app
+            .path()
+            .config_dir()
+            .map_err(|error| format!("Cannot locate Sail configuration: {error}"))?;
+        Ok(config.join("sail").join("context-providers.json"))
+    }
 }
 
 fn locked_store<T>(
@@ -553,6 +568,211 @@ pub fn context_revoke_provider(app: tauri::AppHandle, directory: String) -> Resu
         let removed = revoke(Path::new(&directory), store)?;
         Ok(((), removed))
     })
+}
+
+#[cfg(target_os = "macos")]
+fn service_store_path() -> Result<PathBuf, String> {
+    #[cfg(feature = "e2e")]
+    {
+        e2e_store_path()
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let config = dirs::config_dir().ok_or("Cannot locate Sail configuration.")?;
+        Ok(config.join("sail").join("context-providers.json"))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "e2e"))]
+pub fn prepare_e2e_approval(
+    directory: &Path,
+    command: &str,
+    executable: &Path,
+) -> Result<(), String> {
+    let executable =
+        dunce::canonicalize(executable).map_err(|_| "Provider executable is unavailable.")?;
+    executable_hash(&executable)?;
+    locked_store(&service_store_path()?, |store| {
+        register(store, command, &executable);
+        let current = status(directory, store);
+        let fingerprint = current
+            .fingerprint
+            .ok_or_else(|| current.reason.unwrap_or("Provider unavailable.".into()))?;
+        approve(directory, store, &fingerprint)?;
+        Ok(((), true))
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "e2e"))]
+pub fn revoke_e2e_approval(directory: &Path) -> Result<(), String> {
+    locked_store(&service_store_path()?, |store| {
+        let changed = revoke(directory, store)?;
+        Ok(((), changed))
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `directory` and non-null `expected` must point to valid NUL-terminated strings.
+/// `output` must point to a writable buffer of at least `length` bytes.
+pub unsafe extern "C" fn sail_context_validate_approval(
+    directory: *const std::ffi::c_char,
+    expected: *const std::ffi::c_char,
+    output: *mut std::ffi::c_char,
+    length: usize,
+) -> bool {
+    use std::ffi::CStr;
+
+    if directory.is_null() || output.is_null() || length == 0 {
+        return false;
+    }
+    let directory = match unsafe { CStr::from_ptr(directory) }.to_str() {
+        Ok(directory) => directory,
+        Err(_) => return false,
+    };
+    let expected = if expected.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(expected) }.to_str() {
+            Ok(value) => Some(value),
+            Err(_) => return false,
+        }
+    };
+    let Ok(directory) = dunce::canonicalize(directory) else {
+        return false;
+    };
+    let Ok(store_path) = service_store_path() else {
+        return false;
+    };
+    let Ok(Some((project_key, fingerprint))) = locked_store(&store_path, |store| {
+        let current = status(&directory, store);
+        if current.state != "approved"
+            || expected.is_some_and(|value| current.fingerprint.as_deref() != Some(value))
+        {
+            return Ok((None, false));
+        }
+        Ok((
+            Some((project_key(&directory)?, current.fingerprint.unwrap())),
+            false,
+        ))
+    }) else {
+        return false;
+    };
+    let Ok(serialized) = serde_json::to_vec(&serde_json::json!({
+        "projectKey": project_key,
+        "fingerprint": fingerprint,
+    })) else {
+        return false;
+    };
+    if serialized.len() >= length {
+        return false;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(serialized.as_ptr(), output.cast::<u8>(), serialized.len());
+        *output.add(serialized.len()) = 0;
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn sail_context_service_main() -> i32;
+    fn sail_context_session_open(
+        directory: *const std::ffi::c_char,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> *mut std::ffi::c_void;
+    fn sail_context_session_check(
+        handle: *mut std::ffi::c_void,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> bool;
+    fn sail_context_session_close(handle: *mut std::ffi::c_void);
+    #[cfg(feature = "e2e")]
+    fn sail_context_probe_replay(
+        directory: *const std::ffi::c_char,
+        error: *mut std::ffi::c_char,
+        error_length: usize,
+    ) -> bool;
+    #[cfg(feature = "e2e")]
+    fn sail_context_service_unregister(error: *mut std::ffi::c_char, error_length: usize) -> bool;
+}
+
+#[cfg(target_os = "macos")]
+pub fn service_main() -> i32 {
+    unsafe { sail_context_service_main() }
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_service_process() -> bool {
+    std::env::args().nth(1).as_deref() == Some("--sail-context-service")
+}
+
+#[cfg(all(target_os = "macos", feature = "e2e"))]
+pub fn unregister_e2e_service() -> Result<(), String> {
+    let mut error = [0_i8; 512];
+    if unsafe { sail_context_service_unregister(error.as_mut_ptr(), error.len()) } {
+        Ok(())
+    } else {
+        Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "e2e"))]
+pub fn probe_e2e_replay(directory: &Path) -> Result<(), String> {
+    let directory = std::ffi::CString::new(directory.to_string_lossy().as_bytes())
+        .map_err(|_| "Invalid context directory.".to_string())?;
+    let mut error = [0_i8; 512];
+    if unsafe { sail_context_probe_replay(directory.as_ptr(), error.as_mut_ptr(), error.len()) } {
+        Ok(())
+    } else {
+        Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub struct ContextSession(*mut std::ffi::c_void);
+
+#[cfg(target_os = "macos")]
+impl ContextSession {
+    pub fn open(directory: &Path) -> Result<Self, String> {
+        let directory = std::ffi::CString::new(directory.to_string_lossy().as_bytes())
+            .map_err(|_| "Invalid context directory.".to_string())?;
+        let mut error = [0_i8; 512];
+        let handle = unsafe {
+            sail_context_session_open(directory.as_ptr(), error.as_mut_ptr(), error.len())
+        };
+        if handle.is_null() {
+            return Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        Ok(Self(handle))
+    }
+
+    pub fn check(&self) -> Result<(), String> {
+        let mut error = [0_i8; 512];
+        if unsafe { sail_context_session_check(self.0, error.as_mut_ptr(), error.len()) } {
+            Ok(())
+        } else {
+            Err(unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ContextSession {
+    fn drop(&mut self) {
+        unsafe { sail_context_session_close(self.0) };
+    }
 }
 
 #[cfg(test)]

@@ -955,6 +955,30 @@
         {/each}
       </section>
       <section class="settings-card">
+        <h2>Machine pressure</h2>
+        <p>
+          New agent turns and browser tabs wait when a threshold is reached. Active work continues.
+          Jobs start automatically when readings recover. Zero disables a threshold.
+        </p>
+        {#each [['memoryFreePercent', 'Minimum free memory (%)'], ['swapUsedPercent', 'Maximum swap use (%)'], ['diskFreePercent', 'Minimum free disk (%)']] as const as [kind, label] (kind)}
+          <label for={`pressure-threshold-${kind}`}>{label}</label>
+          <input
+            id={`pressure-threshold-${kind}`}
+            type="number"
+            min="0"
+            max="100"
+            step="1"
+            value={snapshot?.pressureThresholds[kind] ?? 0}
+            onchange={(event) =>
+              send({
+                type: 'pressure-threshold',
+                kind,
+                value: Number(event.currentTarget.value),
+              })}
+          />
+        {/each}
+      </section>
+      <section class="settings-card">
         <h2>Ship It cross-validation</h2>
         <p>
           Select the agents and exact models allowed to review and test changes. Model IDs must

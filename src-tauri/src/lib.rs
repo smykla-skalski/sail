@@ -208,13 +208,14 @@ mod browser;
 pub mod browser_agent;
 #[cfg(unix)]
 mod child_watchdog;
-mod context;
+pub mod context;
 pub mod context_output_store;
 mod dev_servers;
 mod diagnostics;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
+mod machine_pressure;
 pub mod memory;
 mod memory_capture;
 mod memory_import;
@@ -1519,6 +1520,34 @@ fn allow_worktree_terminal_creation(app: &AppHandle, worktree: &Path) {
         .allow_worktree_terminals(worktree);
 }
 
+fn default_worktree_parent(repository: &Path) -> Result<PathBuf, String> {
+    let root = if let Some(root) = std::env::var_os("SAIL_WORKTREE_ROOT") {
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            return Err("SAIL_WORKTREE_ROOT must be an absolute path.".to_string());
+        }
+        root
+    } else {
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .ok_or("Home directory is unavailable. Choose a worktree destination.")?;
+        Path::new(&home).join("sail").join("worktrees")
+    };
+    Ok(root.join(repository_namespace(repository)))
+}
+
+#[tauri::command]
+async fn worktree_pressure_directory(repository: String) -> Result<String, String> {
+    let repository = validate_repository(repository)?;
+    let mut path = default_worktree_parent(Path::new(&repository))?;
+    while !path.try_exists().map_err(|error| error.to_string())? {
+        path = path
+            .parent()
+            .ok_or("Worktree destination has no existing parent.")?
+            .to_path_buf();
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 async fn create_worktree(
     app: AppHandle,
@@ -1711,20 +1740,7 @@ fn add_worktree(
             }
             parent
         }
-        None => {
-            let root = if let Some(root) = std::env::var_os("SAIL_WORKTREE_ROOT") {
-                let root = PathBuf::from(root);
-                if !root.is_absolute() {
-                    return Err("SAIL_WORKTREE_ROOT must be an absolute path.".to_string());
-                }
-                root
-            } else {
-                let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-                    .ok_or("Home directory is unavailable. Choose a worktree destination.")?;
-                Path::new(&home).join("sail").join("worktrees")
-            };
-            root.join(repository_namespace(repository))
-        }
+        None => default_worktree_parent(repository)?,
     };
     let path = parent.join(name);
     if path.exists() {
@@ -2966,6 +2982,7 @@ pub fn run() {
             settings::load_settings,
             settings::migrate_settings,
             settings::save_setting,
+            machine_pressure::machine_pressure,
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,
             settings::get_acp_turn_evidence,
@@ -3003,6 +3020,7 @@ pub fn run() {
             git_change_action,
             diff_file_contents,
             create_worktree,
+            worktree_pressure_directory,
             create_shipping_worktree,
             find_shipping_worktree,
             run_shipping_setup,

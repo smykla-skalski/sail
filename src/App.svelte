@@ -506,10 +506,17 @@
   } from './lib/settings';
   import {
     defaultResourceLimits,
+    isCheckingMachinePressure,
     parseResourceLimit,
     resourceLimitKeys,
     setResourceLimit,
+    setPressureThresholds,
   } from './lib/resource-limits';
+  import {
+    defaultPressureThresholds,
+    parsePressureThreshold,
+    pressureThresholdKeys,
+  } from './lib/machine-pressure';
   import {
     parseThemePreference,
     resolveTheme,
@@ -1155,6 +1162,20 @@
       defaultResourceLimits.browser,
     ),
     e2e: parseResourceLimit(getSetting(resourceLimitKeys.e2e), defaultResourceLimits.e2e),
+  });
+  let pressureThresholds = $state({
+    memoryFreePercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.memoryFreePercent),
+      defaultPressureThresholds.memoryFreePercent,
+    ),
+    swapUsedPercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.swapUsedPercent),
+      defaultPressureThresholds.swapUsedPercent,
+    ),
+    diskFreePercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.diskFreePercent),
+      defaultPressureThresholds.diskFreePercent,
+    ),
   });
   let contextHandoffThreshold = $state(
     parseContextHandoffThreshold(getSetting('sai-context-handoff-threshold')),
@@ -2052,6 +2073,7 @@
       shipArchiveDelay,
       contextHandoffThreshold,
       resourceLimits,
+      pressureThresholds,
     };
   }
 
@@ -2282,6 +2304,12 @@
             resourceLimits = { ...resourceLimits, [action.kind]: action.value };
             setSetting(resourceLimitKeys[action.kind], String(action.value));
             if (action.kind !== 'e2e') setResourceLimit(action.kind, action.value);
+          }
+        } else if (action.type === 'pressure-threshold') {
+          if (Number.isSafeInteger(action.value) && action.value >= 0 && action.value <= 100) {
+            pressureThresholds = { ...pressureThresholds, [action.kind]: action.value };
+            setSetting(pressureThresholdKeys[action.kind], String(action.value));
+            setPressureThresholds(pressureThresholds);
           }
         } else if (action.type === 'detect-agents') void detectAgents();
         else if (action.type === 'cross-validation') {
@@ -5582,8 +5610,20 @@
         query: receipt.prompt,
         sessionKey: `acp:${receipt.provider}:${sessionId}`,
       });
+      let queued = false;
       const turn = dispatchAuthorizedDirectShipPrompt(authorization, () =>
-        acp.prompt(receipt.provider, targetDirectory, sessionId, recalledPrompt, receipt.turnId!),
+        acp.prompt(
+          receipt.provider,
+          targetDirectory,
+          sessionId,
+          recalledPrompt,
+          receipt.turnId!,
+          [],
+          (limit) => {
+            queued = limit !== null;
+          },
+          false,
+        ),
       );
       activeSpawnTargets.set(spawnTargetKey(targetDirectory, receipt.targetId), receipt.receiptId);
       void turn.then(
@@ -5616,10 +5656,14 @@
           return undefined;
         },
       );
-      await awaitCoordinationStart(turn, async () => {
-        const current = (await acp.activity(targetDirectory))[receipt.provider];
-        return current?.activeTurns[sessionId] === receipt.turnId;
-      });
+      await awaitCoordinationStart(
+        turn,
+        async () => {
+          const current = (await acp.activity(targetDirectory))[receipt.provider];
+          return current?.activeTurns[sessionId] === receipt.turnId;
+        },
+        () => queued,
+      );
       const current = spawnReceipts.find((item) => item.receiptId === receipt.receiptId);
       if (current?.state === 'starting')
         updateSpawnReceipt(receipt.receiptId, { state: 'working' });
@@ -5876,6 +5920,7 @@
           shippingReceipt = receipt;
         }
         let turn: ReturnType<typeof acp.prompt>;
+        let queued = false;
         try {
           if (owner && shippingReceipt) {
             const originalReceipt = { ...shippingReceipt };
@@ -5907,7 +5952,18 @@
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
               () =>
-                acp.prompt(thread.agent, thread.directory, thread.sessionId, recalledText, turnId),
+                acp.prompt(
+                  thread.agent,
+                  thread.directory,
+                  thread.sessionId,
+                  recalledText,
+                  turnId,
+                  [],
+                  (limit) => {
+                    queued = limit !== null;
+                  },
+                  false,
+                ),
             );
             turn = started.turn;
           } else
@@ -5917,6 +5973,11 @@
               thread.sessionId,
               recalledText,
               turnId,
+              [],
+              (limit) => {
+                queued = limit !== null;
+              },
+              false,
             );
         } catch {
           abandonImplementationTurn(thread.directory, tracking);
@@ -5984,10 +6045,14 @@
             abandonImplementationTurn(thread.directory, tracking);
             error = `Could not track agent message turn: ${describe(cause)}`;
           });
-        await awaitCoordinationStart(turn, async () => {
-          const state = (await acp.activity(thread.directory))[thread.agent];
-          return !!state?.active.includes(thread.sessionId);
-        });
+        await awaitCoordinationStart(
+          turn,
+          async () => {
+            const state = (await acp.activity(thread.directory))[thread.agent];
+            return !!state?.active.includes(thread.sessionId);
+          },
+          () => queued,
+        );
         finishCoordinationDelivery(message);
         return undefined;
       });
@@ -7380,9 +7445,56 @@
     if (Date.now() >= request.expiresAt)
       throw new Error('The agent spawn request expired before launch.');
     // Return before the backend's five-minute coordination timeout.
-    const responseDeadline = request.expiresAt + 180_000;
-    const previousSpawn = agentSpawnQueue;
+    let responseDeadline = request.expiresAt + 180_000;
+    let pressureQueuedAt: number | null = null;
+    let resolveQueuedResponse: ((value: Record<string, unknown>) => void) | null = null;
+    const queuedResponse = new Promise<Record<string, unknown>>((resolve) => {
+      resolveQueuedResponse = resolve;
+    });
+    const onPressureQueue = (limit: number | null, reason: string | null) => {
+      if (limit !== null && !isCheckingMachinePressure(reason)) {
+        pressureQueuedAt ??= Date.now();
+        updateSpawnReceipt(receiptId, { state: 'queued' });
+        resolveQueuedResponse?.({
+          status: 'queued',
+          receiptId,
+          accessKey: receiptAccessKey,
+          sourceId,
+          reason: reason ?? 'Waiting for agent capacity.',
+        });
+        resolveQueuedResponse = null;
+      } else if (pressureQueuedAt !== null && limit === null) {
+        responseDeadline += Date.now() - pressureQueuedAt;
+        pressureQueuedAt = null;
+      }
+    };
+    let releaseSpawnQueue: (() => void) | null = null;
     const launched = (async () => {
+      await coordinationSource(request);
+      updateSpawnReceipt(receiptId, { state: 'starting' });
+
+      if (destination) {
+        const targetPath = destination.path;
+        const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+          repository: project,
+          paths: [targetPath],
+        });
+        if (!registered.some((worktree) => worktree.path === targetPath))
+          throw new Error('Target worktree is no longer registered with Git.');
+      }
+
+      const pressureDirectory =
+        destination?.path ??
+        (await invoke<string>('worktree_pressure_directory', { repository: project }));
+      await acp.connect(chosenProvider, destination?.path ?? request.directory, undefined, {
+        directory: pressureDirectory,
+        onQueue: onPressureQueue,
+      });
+      updateSpawnReceipt(receiptId, { state: 'starting' });
+      const previousSpawn = agentSpawnQueue;
+      agentSpawnQueue = new Promise<void>((resolve) => {
+        releaseSpawnQueue = resolve;
+      });
       const queueRemaining = responseDeadline - Date.now();
       if (queueRemaining <= 0) throw new Error('Agent spawn timed out while waiting to launch.');
       await new Promise<void>((resolve, reject) => {
@@ -7400,20 +7512,6 @@
       });
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out while waiting to launch.');
-      await coordinationSource(request);
-      updateSpawnReceipt(receiptId, { state: 'starting' });
-
-      if (destination) {
-        const targetPath = destination.path;
-        const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
-          repository: project,
-          paths: [targetPath],
-        });
-        if (!registered.some((worktree) => worktree.path === targetPath))
-          throw new Error('Target worktree is no longer registered with Git.');
-      }
-
-      await acp.connect(chosenProvider, destination?.path ?? request.directory);
       if (!destination) {
         const created = await invoke<{ path: string; branch: string; setup: string }>(
           'create_worktree',
@@ -7496,6 +7594,12 @@
         receiptId,
         false,
         requireResponseTime,
+        undefined,
+        undefined,
+        (limit, reason) => {
+          onPressureQueue(limit, reason);
+          if (limit === null) updateSpawnReceipt(receiptId, { state: 'working' });
+        },
       );
       activeSpawnRequests.delete(receiptId);
       return {
@@ -7511,8 +7615,16 @@
         status: 'started',
       };
     })();
-    agentSpawnQueue = launched.catch(() => undefined);
-    return launched;
+    const trackedLaunch = launched
+      .finally(() => releaseSpawnQueue?.())
+      .catch((cause) => {
+        const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+        if (receipt && !receiptIsSettled(receipt.state))
+          updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        activeSpawnRequests.delete(receiptId);
+        throw cause;
+      });
+    return Promise.race([trackedLaunch, queuedResponse]);
   }
 
   async function startCoordinatedThread(
@@ -7524,6 +7636,7 @@
     beforePrompt?: () => Promise<void>,
     nativeGeneration?: number,
     promptAuthorization?: DirectShipAuthorization,
+    onPromptQueue?: (limit: number | null, reason: string | null) => void,
   ) {
     const requestedModel =
       validation && source.model && hasUnresolvedModelAlias(source.model)
@@ -7663,6 +7776,7 @@
         query: prompt,
         sessionKey: `acp:${source.agent}:${session.sessionId}`,
       });
+      let pressureQueued = false;
       const turn = dispatchAuthorizedDirectShipPrompt(promptAuthorization, () => {
         const targetId = `acp:${source.agent}:${session.sessionId}`;
         if (receiptId) {
@@ -7670,7 +7784,19 @@
           activeSpawnTargets.set(spawnTargetKey(created.path, targetId), receiptId);
         }
         try {
-          return acp.prompt(source.agent, created.path, session.sessionId, recalledPrompt, turnId);
+          return acp.prompt(
+            source.agent,
+            created.path,
+            session.sessionId,
+            recalledPrompt,
+            turnId,
+            [],
+            (limit, reason) => {
+              pressureQueued = limit !== null;
+              onPromptQueue?.(limit, reason);
+            },
+            false,
+          );
         } catch (cause) {
           if (
             receiptId &&
@@ -7754,6 +7880,7 @@
           const state = (await acp.activity(created.path))[source.agent];
           return !!state?.active.includes(session.sessionId);
         },
+        () => pressureQueued,
       );
       void finished.catch(() => undefined);
       return {
@@ -7778,11 +7905,13 @@
   async function awaitCoordinationStart(
     turn: Promise<unknown>,
     isActive: () => Promise<boolean>,
+    isQueued: () => boolean = () => false,
   ): Promise<void> {
     let stopped = false;
-    const deadline = Date.now() + 30_000;
+    let deadline = Date.now() + 30_000;
     async function poll(): Promise<void> {
       if (stopped || disposed) return;
+      if (isQueued()) deadline = Date.now() + 30_000;
       if (await isActive().catch(() => false)) return;
       if (Date.now() >= deadline) throw new Error('Agent prompt did not start within 30 seconds.');
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -10712,12 +10841,18 @@
             query: turn.text,
             sessionKey: `acp:${turn.agent}:${turn.sessionId}`,
           });
+          let queued = false;
           const continued = acp.prompt(
             turn.agent,
             turn.directory,
             turn.sessionId,
             recalledPrompt,
             turn.turnId,
+            [],
+            (limit) => {
+              queued = limit !== null;
+            },
+            false,
           );
           void (async () => {
             try {
@@ -10746,10 +10881,14 @@
               }
             }
           })();
-          await awaitCoordinationStart(continued, async () => {
-            const state = (await acp.activity(turn.directory))[turn.agent];
-            return !!state?.active.includes(turn.sessionId);
-          });
+          await awaitCoordinationStart(
+            continued,
+            async () => {
+              const state = (await acp.activity(turn.directory))[turn.agent];
+              return !!state?.active.includes(turn.sessionId);
+            },
+            () => queued,
+          );
         } catch (cause) {
           if (await alreadyActive()) updateAgentThreadStatus(recoveredThread, 'working');
           else {
