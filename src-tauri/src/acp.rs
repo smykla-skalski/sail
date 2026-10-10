@@ -470,6 +470,18 @@ fn linked_worktree_git_directories(cwd: &str) -> Option<Vec<String>> {
     if git_dir == common_dir || !git_dir.starts_with(common_dir.join("worktrees")) {
         return None;
     }
+    // A copied .git pointer makes Git report the copied directory as its
+    // worktree, even though the linked Git directory belongs to another one.
+    let backlink = std::fs::read_to_string(git_dir.join("gitdir")).ok()?;
+    let backlink = PathBuf::from(backlink.trim());
+    let backlink = if backlink.is_absolute() {
+        backlink
+    } else {
+        git_dir.join(backlink)
+    };
+    if backlink.canonicalize().ok()? != PathBuf::from(cwd).join(".git").canonicalize().ok()? {
+        return None;
+    }
     let directories = [
         git_dir,
         common_dir.join("objects"),
@@ -4201,7 +4213,7 @@ mod session_config_tests {
             .success());
 
         let request = session_request_params(linked.to_str().unwrap(), None, &[]);
-        let common = main.join(".git");
+        let common = main.join(".git").canonicalize().unwrap();
         let roots = request["additionalDirectories"].as_array().unwrap();
         assert_eq!(roots.len(), 4);
         assert!(roots
@@ -4221,6 +4233,13 @@ mod session_config_tests {
             request["additionalDirectories"]
         );
         assert!(session_request_params(main.to_str().unwrap(), None, &[])
+            .get("additionalDirectories")
+            .is_none());
+
+        let copied = root.join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::copy(linked.join(".git"), copied.join(".git")).unwrap();
+        assert!(session_request_params(copied.to_str().unwrap(), None, &[])
             .get("additionalDirectories")
             .is_none());
 
