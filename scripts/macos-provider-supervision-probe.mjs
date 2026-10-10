@@ -18,6 +18,7 @@ if (providedRoot < 0 || !process.argv[providedRoot + 1])
 const root = realpathSync(resolve(process.argv[providedRoot + 1]));
 const sdkFlag = process.argv.indexOf('--sdk');
 const sdk = sdkFlag >= 0 ? resolve(process.argv[sdkFlag + 1] ?? '') : null;
+const waiveRegistrationDenial = process.argv.includes('--waive-registration-denial');
 if (!basename(root).startsWith('sail-497-spike.'))
   throw new Error('scratch root must be a sail-497-spike.* directory');
 if (!existsSync(root)) throw new Error('scratch root does not exist');
@@ -679,11 +680,11 @@ async function main() {
     } else {
       cleanup = 'not-attempted';
     }
-    finding(
-      'registration-denial',
-      false,
-      'a genuine user-denied registration was not exercised on this host',
-    );
+    findings.push({
+      id: 'registration-denial',
+      status: waiveRegistrationDenial ? 'WAIVED' : 'NO-GO',
+      detail: 'a genuine user-denied registration was not exercised on this host',
+    });
     const mandatory = [
       'build-app',
       'build-agent',
@@ -720,7 +721,16 @@ async function main() {
     const verdict =
       !failure &&
       Date.now() <= deadline &&
-      mandatory.every((id) => findings.some((item) => item.id === id && item.status === 'PASS')) &&
+      mandatory.every((id) =>
+        findings.some(
+          (item) =>
+            item.id === id &&
+            (item.status === 'PASS' ||
+              (id === 'registration-denial' &&
+                waiveRegistrationDenial &&
+                item.status === 'WAIVED')),
+        ),
+      ) &&
       !preserve
         ? 'GO'
         : 'NO-GO';
@@ -738,9 +748,20 @@ async function main() {
       preserve,
       failure,
       verdict,
+      waivers: waiveRegistrationDenial
+        ? [
+            {
+              id: 'registration-denial',
+              authorization: 'user waiver for issue #497',
+              tested: false,
+            },
+          ]
+        : [],
       findings,
       limits: [
-        'user-denied registration remains untested; issue-level result is NO-GO',
+        waiveRegistrationDenial
+          ? 'user-denied registration remains untested; GO applies only under the explicit user waiver for #497'
+          : 'user-denied registration remains untested; issue-level result is NO-GO',
         'fixture-only service and cancellation semantics',
         'no peer pairing or production call authorization proof',
         'no Linux or Windows proof',
