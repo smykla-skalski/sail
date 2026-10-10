@@ -58,7 +58,11 @@ const server = createServer(async (request, response) => {
   const malformed = mode === `malformed-json-${phase}` || mode === `malformed-sse-${phase}`;
   const reply = malformed
     ? `{"jsonrpc":"2.0","id":${message.id},"result":{"secret":"fixture-secret-123",}`
-    : JSON.stringify({ jsonrpc: '2.0', id: message.id, result });
+    : JSON.stringify({
+        ...(mode === 'missing-error-jsonrpc' && phase === 'error' ? {} : { jsonrpc: '2.0' }),
+        id: message.id,
+        result,
+      });
   const headers = message.method === 'initialize' ? { 'mcp-session-id': 'fixture-session' } : {};
   if (message.method !== 'initialize' && request.headers['mcp-session-id'] !== 'fixture-session') {
     response.writeHead(400).end();

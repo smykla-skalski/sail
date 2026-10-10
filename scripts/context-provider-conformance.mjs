@@ -445,7 +445,8 @@ async function run(config) {
         arguments: errorArguments,
       },
     });
-    assert(error?.id === id && (error.error || error.result?.isError), 'Error probe did not fail.');
+    assert(error?.jsonrpc === '2.0' && error.id === id, 'Invalid error probe JSON-RPC response.');
+    assert(error.error || error.result?.isError, 'Error probe did not fail.');
     const containsSecretText = (text) =>
       text.includes(secret) || text.includes(JSON.stringify(secret).slice(1, -1));
     const containsSecret = (value) => {
@@ -457,7 +458,10 @@ async function run(config) {
         );
       return value !== undefined && containsSecretText(JSON.stringify(value));
     };
-    assert(!containsSecret(error), 'Error response exposes the secret.');
+    const providerFields = Object.fromEntries(
+      Object.entries(error).filter(([key]) => key !== 'jsonrpc' && key !== 'id'),
+    );
+    assert(!containsSecret(providerFields), 'Error response exposes the secret.');
     checks.push('error', 'secret-redaction');
     return { status: 'pass', profileVersion: 1, protocolVersion: PROTOCOL_VERSION, checks };
   } finally {

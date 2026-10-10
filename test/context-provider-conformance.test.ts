@@ -121,6 +121,12 @@ void test('rejects an unset stdio credential source', () => {
   assert.match(result.stderr, /Stdio environment SAIL_CONFORMANCE_UNSET_TOKEN is unset/);
 });
 
+void test('does not match a secret against the JSON-RPC envelope', () => {
+  const result = run(profile(), '2');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).status, 'pass');
+});
+
 void test('offline stdio provider passes the versioned profile', () => {
   const result = run(profile());
   assert.equal(result.status, 0, result.stderr);
@@ -219,6 +225,13 @@ async function runHttp(mode: string, secret = 'fixture-secret-123') {
     server.kill();
   }
 }
+
+void test('HTTP rejects an error reply without JSON-RPC 2.0', async () => {
+  const result = await runHttp('missing-error-jsonrpc');
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Invalid error probe JSON-RPC response/);
+  assert.equal(result.stdout, '');
+});
 
 void test('HTTP rejects JSON-encoded secret in error object key', async () => {
   const result = await runHttp('echo-encoded-key-secret', 'ab"cd');
