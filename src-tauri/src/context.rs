@@ -543,8 +543,6 @@ pub fn provider_mcp_server(app: &tauri::AppHandle, directory: &Path) -> Option<s
     if current.state != "approved" {
         return None;
     }
-    let session = ContextSession::open(&canonical).ok()?;
-    session.check().ok()?;
     let executable = std::env::current_exe().ok()?;
     Some(serde_json::json!({
         "name": current.id?,
@@ -865,6 +863,17 @@ struct ProviderProcess {
     stdin: std::process::ChildStdin,
     stdout: Option<std::io::BufReader<std::process::ChildStdout>>,
     stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    staged_executable: Option<StagedExecutable>,
+}
+
+#[cfg(target_os = "macos")]
+struct StagedExecutable(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for StagedExecutable {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -894,6 +903,7 @@ impl Drop for ProviderProcess {
             let _ = killpg(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
         }
         let _ = self.child.wait();
+        self.staged_executable.take();
     }
 }
 
@@ -901,7 +911,7 @@ impl Drop for ProviderProcess {
 type ProviderSlot = std::sync::Arc<std::sync::Mutex<Option<ProviderProcess>>>;
 
 #[cfg(target_os = "macos")]
-static PROVIDERS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, ProviderSlot>>> =
+static PROVIDERS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<ProviderSlot>>>> =
     std::sync::OnceLock::new();
 
 #[cfg(target_os = "macos")]
@@ -963,12 +973,22 @@ pub unsafe extern "C" fn sail_context_provider_stop(key: *const std::ffi::c_char
     };
     if let Some(providers) = PROVIDERS.get() {
         if let Ok(mut providers) = providers.lock() {
-            let removed = providers.remove(key);
+            let removed = providers.get_mut(key).and_then(Option::take);
             drop(providers);
             if let Some(slot) = removed {
-                if let Ok(mut provider) = slot.lock() {
-                    provider.take();
-                }
+                let key = key.to_owned();
+                std::thread::spawn(move || {
+                    if let Ok(mut provider) = slot.lock() {
+                        provider.take();
+                    }
+                    if let Some(providers) = PROVIDERS.get() {
+                        if let Ok(mut providers) = providers.lock() {
+                            if providers.get(&key).is_some_and(Option::is_none) {
+                                providers.remove(&key);
+                            }
+                        }
+                    }
+                });
             }
         }
     }
@@ -980,6 +1000,7 @@ fn forget_provider(key: &str, slot: &ProviderSlot) {
         if let Ok(mut providers) = providers.lock() {
             if providers
                 .get(key)
+                .and_then(Option::as_ref)
                 .is_some_and(|current| std::sync::Arc::ptr_eq(current, slot))
             {
                 providers.remove(key);
@@ -993,6 +1014,38 @@ fn seatbelt_literal(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn staged_provider(
+    executable: &Path,
+    expected_hash: &str,
+    data_root: &Path,
+) -> Result<Option<StagedExecutable>, String> {
+    if ["/System/Library", "/usr/bin", "/bin", "/sbin"]
+        .iter()
+        .any(|root| executable.starts_with(root))
+    {
+        return Ok(None);
+    }
+    let staging = data_root
+        .parent()
+        .ok_or("Provider data directory has no parent.")?
+        .join("executables");
+    fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    let staging = dunce::canonicalize(staging).map_err(|error| error.to_string())?;
+    let path = staging.join(format!("provider-{}", uuid::Uuid::new_v4()));
+    fs::copy(executable, &path)
+        .map_err(|error| format!("Cannot stage provider executable: {error}"))?;
+    let staged = StagedExecutable(path);
+    fs::set_permissions(&staged.0, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    if executable_hash(&staged.0)? != expected_hash {
+        return Err("Provider executable changed before launch.".into());
+    }
+    Ok(Some(staged))
 }
 
 #[cfg(target_os = "macos")]
@@ -1012,6 +1065,17 @@ fn spawn_provider(
     fs::set_permissions(data_root, fs::Permissions::from_mode(0o700))
         .map_err(|error| error.to_string())?;
     let data_root = dunce::canonicalize(data_root).map_err(|error| error.to_string())?;
+    let staged = staged_provider(
+        &executable,
+        current
+            .executable_sha256
+            .as_deref()
+            .ok_or("Provider hash missing.")?,
+        &data_root,
+    )?;
+    let launch = staged
+        .as_ref()
+        .map_or(executable.as_path(), |value| value.0.as_path());
     let profile = format!(
         "(version 1)\n(deny default)\n(allow file-read-data (literal \"/\"))\n\
          (allow file-read* (subpath \"/System\") (subpath \"/usr/lib\") \
@@ -1021,11 +1085,11 @@ fn spawn_provider(
          (allow process-exec (literal \"{}\"))\n\
          (allow sysctl-read (sysctl-name \"kern.bootargs\") \
          (sysctl-name \"security.mac.lockdown_mode_state\"))\n",
-        seatbelt_literal(&executable),
+        seatbelt_literal(launch),
         seatbelt_literal(directory),
         seatbelt_literal(&data_root),
         seatbelt_literal(&data_root),
-        seatbelt_literal(&executable),
+        seatbelt_literal(launch),
     );
     if !Path::new("/usr/bin/sandbox-exec").is_file() {
         return Err("Provider confinement is unavailable on this macOS installation.".into());
@@ -1033,7 +1097,7 @@ fn spawn_provider(
     let mut child = Command::new("/usr/bin/sandbox-exec")
         .arg("-p")
         .arg(profile)
-        .arg(&executable)
+        .arg(launch)
         .current_dir(directory)
         .env_clear()
         .env("HOME", &data_root)
@@ -1077,6 +1141,7 @@ fn spawn_provider(
         stdin,
         stdout: Some(std::io::BufReader::new(stdout)),
         stderr_tail,
+        staged_executable: staged,
     })
 }
 
@@ -1137,8 +1202,9 @@ fn provider_request_at(
         .lock()
         .map_err(|error| error.to_string())?
         .entry(key.clone())
-        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
-        .clone();
+        .or_insert_with(|| Some(std::sync::Arc::new(std::sync::Mutex::new(None))))
+        .clone()
+        .ok_or("Provider is stopping; retry.")?;
     let mut provider = slot.lock().map_err(|error| error.to_string())?;
     let sessions = active_sessions()
         .lock()
@@ -1481,7 +1547,7 @@ mod tests {
             id: Some("fixture".into()),
             command: Some("fixture".into()),
             executable: Some(executable.to_string_lossy().into_owned()),
-            executable_sha256: None,
+            executable_sha256: Some(executable_hash(&executable).unwrap()),
             capabilities: vec!["get".into()],
             fingerprint: Some("fixture-fingerprint".into()),
             revision: None,
@@ -1641,6 +1707,66 @@ mod tests {
         fs::rename(replacement, executable).unwrap();
         assert!(call().unwrap_err().contains("approval changed"));
         assert!(!PROVIDERS.get().unwrap().lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn executable_replacement_between_check_and_launch_is_rejected() {
+        let repository = Repository::new("runtime-launch-race");
+        repository.configure();
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let current = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((status(&repository.0, store), true))
+        })
+        .unwrap();
+        let replacement = repository.0.join("replacement");
+        fs::copy("/usr/bin/false", &replacement).unwrap();
+        fs::rename(replacement, executable).unwrap();
+        let error = spawn_provider(&repository.0, &current, &repository.0.join("data"))
+            .err()
+            .unwrap();
+        assert!(error.contains("changed before launch"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stopping_a_busy_provider_does_not_wait_on_its_project_lock() {
+        let repository = Repository::new("runtime-stop-busy");
+        repository.configure();
+        let key = project_key(&repository.0).unwrap();
+        let slot: ProviderSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        PROVIDERS
+            .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Some(slot.clone()));
+        let guard = slot.lock().unwrap();
+        let key = std::ffi::CString::new(key).unwrap();
+        let start = std::time::Instant::now();
+        unsafe { sail_context_provider_stop(key.as_ptr()) };
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+        assert!(PROVIDERS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get(key.to_str().unwrap())
+            .is_some_and(Option::is_none));
+        let error = provider_request_at(
+            &repository.0,
+            "unused",
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            &repository.0.join("approvals.json"),
+            &repository.0.join("data"),
+        )
+        .unwrap_err();
+        assert!(error.contains("Provider is stopping"));
+        drop(guard);
     }
 
     #[cfg(target_os = "macos")]
