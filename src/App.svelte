@@ -506,7 +506,13 @@
     parseResourceLimit,
     resourceLimitKeys,
     setResourceLimit,
+    setPressureThresholds,
   } from './lib/resource-limits';
+  import {
+    defaultPressureThresholds,
+    parsePressureThreshold,
+    pressureThresholdKeys,
+  } from './lib/machine-pressure';
   import {
     parseThemePreference,
     resolveTheme,
@@ -1148,6 +1154,20 @@
       defaultResourceLimits.browser,
     ),
     e2e: parseResourceLimit(getSetting(resourceLimitKeys.e2e), defaultResourceLimits.e2e),
+  });
+  let pressureThresholds = $state({
+    memoryFreePercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.memoryFreePercent),
+      defaultPressureThresholds.memoryFreePercent,
+    ),
+    swapUsedPercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.swapUsedPercent),
+      defaultPressureThresholds.swapUsedPercent,
+    ),
+    diskFreePercent: parsePressureThreshold(
+      getSetting(pressureThresholdKeys.diskFreePercent),
+      defaultPressureThresholds.diskFreePercent,
+    ),
   });
   let contextHandoffThreshold = $state(
     parseContextHandoffThreshold(getSetting('sai-context-handoff-threshold')),
@@ -2032,6 +2052,7 @@
       shipArchiveDelay,
       contextHandoffThreshold,
       resourceLimits,
+      pressureThresholds,
     };
   }
 
@@ -2262,6 +2283,12 @@
             resourceLimits = { ...resourceLimits, [action.kind]: action.value };
             setSetting(resourceLimitKeys[action.kind], String(action.value));
             if (action.kind !== 'e2e') setResourceLimit(action.kind, action.value);
+          }
+        } else if (action.type === 'pressure-threshold') {
+          if (Number.isSafeInteger(action.value) && action.value >= 0 && action.value <= 100) {
+            pressureThresholds = { ...pressureThresholds, [action.kind]: action.value };
+            setSetting(pressureThresholdKeys[action.kind], String(action.value));
+            setPressureThresholds(pressureThresholds);
           }
         } else if (action.type === 'detect-agents') void detectAgents();
         else if (action.type === 'cross-validation') {
@@ -4005,7 +4032,7 @@
       const available = (await acp.agents()).find((agent) => agent.id === run.provider);
       if (!available?.available)
         throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
-      await acp.connect(run.provider);
+      await acp.connect(run.provider, undefined, { directory: created.path });
       ensureClaimHeld();
       const gateExecution =
         'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
@@ -5511,7 +5538,9 @@
     if (await reconcileDurableAcpTurn(receipt, sessionId)) return;
     activeSpawnRequests.add(receipt.receiptId);
     try {
-      const info = await acp.connect(receipt.provider);
+      const info = await acp.connect(receipt.provider, undefined, {
+        directory: receipt.targetDirectory,
+      });
       const capabilities = info.agentCapabilities;
       const sessionCapabilities =
         capabilities && typeof capabilities === 'object' && 'sessionCapabilities' in capabilities
@@ -5544,7 +5573,16 @@
         sessionKey: `acp:${receipt.provider}:${sessionId}`,
       });
       const turn = dispatchAuthorizedDirectShipPrompt(authorization, () =>
-        acp.prompt(receipt.provider, sessionId, recalledPrompt, receipt.turnId!),
+        acp.prompt(
+          receipt.provider,
+          sessionId,
+          recalledPrompt,
+          receipt.turnId!,
+          [],
+          undefined,
+          false,
+          receipt.targetDirectory ?? '',
+        ),
       );
       activeSpawnTargets.set(receipt.targetId, receipt.receiptId);
       void turn.then(
@@ -5653,7 +5691,7 @@
     });
     setAgentReplay(receipt.provider, sessionId, true);
     try {
-      await acp.connect(receipt.provider);
+      await acp.connect(receipt.provider, undefined, { directory: receipt.targetDirectory });
       await acp.load(
         receipt.provider,
         receipt.targetDirectory,
@@ -5765,7 +5803,7 @@
             target.id === `acp:${item.agent}:${item.sessionId}`,
         );
         if (!thread) throw new Error('The receiving thread is unavailable.');
-        const info = await acp.connect(thread.agent);
+        const info = await acp.connect(thread.agent, undefined, { directory: thread.directory });
         const agentActivity = (await acp.activity())[thread.agent];
         if (!agentActivity?.sessions.includes(thread.sessionId)) {
           const capabilities = info.agentCapabilities;
@@ -5837,10 +5875,30 @@
                 saveSpawnReceipt(originalReceipt);
                 await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
               },
-              () => acp.prompt(thread.agent, thread.sessionId, recalledText, turnId),
+              () =>
+                acp.prompt(
+                  thread.agent,
+                  thread.sessionId,
+                  recalledText,
+                  turnId,
+                  [],
+                  undefined,
+                  false,
+                  thread.directory,
+                ),
             );
             turn = started.turn;
-          } else turn = acp.prompt(thread.agent, thread.sessionId, recalledText, turnId);
+          } else
+            turn = acp.prompt(
+              thread.agent,
+              thread.sessionId,
+              recalledText,
+              turnId,
+              [],
+              undefined,
+              false,
+              thread.directory,
+            );
         } catch {
           abandonImplementationTurn(thread.directory, tracking);
           return;
@@ -7065,7 +7123,7 @@
       await saveShipRuns();
       try {
         try {
-          await acp.connect(choice.agent);
+          await acp.connect(choice.agent, undefined, { directory: request.directory });
         } catch (cause) {
           throw new ValidationCandidateUnavailable(
             `Provider ${choice.agent} is unavailable`,
@@ -7329,7 +7387,7 @@
           throw new Error('Target worktree is no longer registered with Git.');
       }
 
-      await acp.connect(chosenProvider);
+      await acp.connect(chosenProvider, undefined, { directory: destination?.path ?? project });
       if (!destination) {
         const created = await invoke<{ path: string; branch: string; setup: string }>(
           'create_worktree',
@@ -7585,7 +7643,16 @@
           activeSpawnTargets.set(targetId, receiptId);
         }
         try {
-          return acp.prompt(source.agent, session.sessionId, recalledPrompt, turnId);
+          return acp.prompt(
+            source.agent,
+            session.sessionId,
+            recalledPrompt,
+            turnId,
+            [],
+            undefined,
+            false,
+            created.path,
+          );
         } catch (cause) {
           if (receiptId && activeSpawnTargets.get(targetId) === receiptId)
             activeSpawnTargets.delete(targetId);
@@ -10561,7 +10628,7 @@
             updateAgentThreadStatus(recoveredThread, 'working');
             return;
           }
-          const info = await acp.connect(turn.agent);
+          const info = await acp.connect(turn.agent, undefined, { directory: turn.directory });
           const capabilities = info.agentCapabilities;
           const sessionCapabilities =
             capabilities &&
@@ -10598,7 +10665,16 @@
             query: turn.text,
             sessionKey: `acp:${turn.agent}:${turn.sessionId}`,
           });
-          const continued = acp.prompt(turn.agent, turn.sessionId, recalledPrompt, turn.turnId);
+          const continued = acp.prompt(
+            turn.agent,
+            turn.sessionId,
+            recalledPrompt,
+            turn.turnId,
+            [],
+            undefined,
+            false,
+            turn.directory,
+          );
           void (async () => {
             try {
               const outcome = await continued;

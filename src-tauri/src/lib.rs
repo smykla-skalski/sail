@@ -215,6 +215,7 @@ mod diagnostics;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
+mod machine_pressure;
 pub mod memory;
 mod memory_capture;
 mod memory_import;
@@ -2427,6 +2428,7 @@ pub fn run() {
             settings::load_settings,
             settings::migrate_settings,
             settings::save_setting,
+            machine_pressure::machine_pressure,
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,
             settings::get_acp_turn_evidence,

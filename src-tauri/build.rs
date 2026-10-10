@@ -13,6 +13,7 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "diagnostic_event",
             "load_settings",
+            "machine_pressure",
             "migrate_settings",
             "save_setting",
             "list_interrupted_agent_turns",

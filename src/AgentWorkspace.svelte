@@ -288,6 +288,8 @@
   let ready = $state(false);
   let busy = $state(false);
   let queuedLimit = $state<number | null>(null);
+  let queuedReason = $state<string | null>(null);
+  let connectAbort: AbortController | null = null;
   let connecting = $state(false);
   let sessionWarmupAttempted = $state(false);
   function failedDraftKey() {
@@ -1201,6 +1203,8 @@
   }
 
   async function activate(id: string | null) {
+    connectAbort?.abort();
+    connectAbort = null;
     rememberTranscript();
     const previousSessionId = activeSessionId;
     // Opening a native child leaves the parent running too, so its transcript keeps updating.
@@ -1283,7 +1287,17 @@
       return;
     }
     try {
-      const info = await acp.connect(agent, activeCapabilityProfile);
+      const controller = new AbortController();
+      connectAbort = controller;
+      const info = await acp.connect(agent, activeCapabilityProfile, {
+        directory,
+        signal: controller.signal,
+        onQueue: (limit, reason) => {
+          if (current !== generation) return;
+          queuedLimit = limit;
+          queuedReason = reason;
+        },
+      });
       if (current !== generation) return;
       authMethods = (info.authMethods as AgentAuthMethod[] | undefined) ?? [];
       if (id) {
@@ -1381,6 +1395,7 @@
         if (thread) onstatus(thread, 'failed');
       }
     } finally {
+      if (current === generation) connectAbort = null;
       if (current === generation) connecting = false;
     }
     if (current === generation) {
@@ -1658,6 +1673,7 @@
       if (activeSessionId && !nativeEntries && !ephemeral)
         trackLiveTranscript(agent, activeSessionId, entries, historyLoaded);
       generation++;
+      connectAbort?.abort();
       clearTimeout(updateTimer);
       unlisten?.();
       if (ephemeral && activeSessionId) {
@@ -1787,7 +1803,14 @@
     ];
     void follow();
     try {
-      releaseSlot = await acp.acquireTurnSlot(turnId, (limit) => (queuedLimit = limit));
+      releaseSlot = await acp.acquireTurnSlot(
+        turnId,
+        (limit, reason) => {
+          queuedLimit = limit;
+          queuedReason = reason;
+        },
+        turnDirectory,
+      );
       if (stopRequested) throw new Error('Agent turn was cancelled.');
       if (!activeSessionId || !activityThread)
         activityThread = await ensureSession(text.slice(0, 60) || 'Attached files', true);
@@ -1995,6 +2018,7 @@
       if (deliverySessionId) discardSteeredAttachments(deliverySessionId);
       if (activeTurnId === turnId) activeTurnId = null;
       queuedLimit = null;
+      queuedReason = null;
       // Clear busy first so the header and the status bar settle in the same frame.
       if (current === generation) {
         busy = false;
@@ -2610,7 +2634,8 @@
             </section>{/if}
           {#if shownBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
               <div class="agent-busy" role="status">
-                {#if queuedLimit !== null}Waiting for agent slot (limit {queuedLimit}){:else}<ActivityStatus
+                {#if queuedLimit !== null}{queuedReason ??
+                    `Waiting for agent slot (limit ${queuedLimit})`}{:else}<ActivityStatus
                     status={visibleStatus}
                   />{/if}{#if !nativeEntries}<Button size="sm" variant="secondary" onclick={stop}
                     >Stop</Button
@@ -2643,6 +2668,9 @@
         </p>{/if}
       {#if error}<p class="agent-error" role="alert">
           {error} <button onclick={() => void activate(activeSessionId)}>Retry</button>
+        </p>{/if}
+      {#if connecting && queuedReason}<p class="agent-warning" role="status">
+          {queuedReason}
         </p>{/if}
       {#if authNeeded}
         <div class="agent-auth" role="group" aria-label="Agent sign in">
