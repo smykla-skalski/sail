@@ -394,8 +394,12 @@ async function run(config) {
 
     const secret = process.env[config.errorProbe.secretEnvironment];
     assert(secret, 'Error probe secret environment variable is unset.');
+    let insertedSecret = false;
     const insertSecret = (value) => {
-      if (typeof value === 'string') return value.replaceAll('$SECRET', secret);
+      if (typeof value === 'string') {
+        if (value.includes('$SECRET')) insertedSecret = true;
+        return value.replaceAll('$SECRET', secret);
+      }
       if (Array.isArray(value)) return value.map(insertSecret);
       if (value && typeof value === 'object')
         return Object.fromEntries(
@@ -403,6 +407,8 @@ async function run(config) {
         );
       return value;
     };
+    const errorArguments = insertSecret(config.errorProbe.arguments);
+    assert(insertedSecret, 'Error probe arguments must include $SECRET.');
     id += 1;
     const error = await transport.send({
       jsonrpc: '2.0',
@@ -410,12 +416,13 @@ async function run(config) {
       method: 'tools/call',
       params: {
         name: config.errorProbe.tool,
-        arguments: insertSecret(config.errorProbe.arguments),
+        arguments: errorArguments,
       },
     });
     assert(error?.id === id && (error.error || error.result?.isError), 'Error probe did not fail.');
     const containsSecret = (value) => {
-      if (typeof value === 'string') return value.includes(secret);
+      if (typeof value === 'string')
+        return value.includes(secret) || value.includes(JSON.stringify(secret).slice(1, -1));
       if (Array.isArray(value)) return value.some(containsSecret);
       if (value && typeof value === 'object')
         return Object.entries(value).some(

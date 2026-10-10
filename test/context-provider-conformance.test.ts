@@ -54,6 +54,25 @@ for (const secret of ['ab"cd', 'ab\\cd', 'ab\ncd', 'ab\u0001cd']) {
   });
 }
 
+for (const secret of ['ab"cd', 'ab\\cd', 'ab\ncd', 'ab\u0001cd']) {
+  void test(`rejects JSON-encoded secret echo ${JSON.stringify(secret)}`, () => {
+    const result = run(profile('echo-encoded-secret'), secret);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Error response exposes the secret/);
+    assert.equal(result.stdout, '');
+    assert.doesNotMatch(result.stderr, /Request denied/);
+  });
+}
+
+void test('rejects an error probe that does not send the secret', () => {
+  const config = profile();
+  config.errorProbe.arguments = {};
+  const result = run(config);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Error probe arguments must include \$SECRET/);
+  assert.equal(result.stdout, '');
+});
+
 void test('offline stdio provider passes the versioned profile', () => {
   const result = run(profile());
   assert.equal(result.status, 0, result.stderr);

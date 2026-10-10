@@ -44,7 +44,9 @@ for await (const line of createInterface({ input: process.stdin })) {
           text:
             mode === 'echo-secret'
               ? `Request denied: ${message.params.arguments.secret}`
-              : 'Request denied.',
+              : mode === 'echo-encoded-secret'
+                ? `Request denied: ${JSON.stringify({ secret: message.params.arguments.secret })}`
+                : 'Request denied.',
         },
       ],
     };
