@@ -473,6 +473,15 @@ fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]
 }
 
 fn linked_worktree_git_directories(cwd: &str) -> Option<Vec<String>> {
+    // The pointer must be the worktree's own file. Canonicalizing a symlink
+    // here would make a sibling's backlink appear to refer to this worktree.
+    if !std::fs::symlink_metadata(Path::new(cwd).join(".git"))
+        .ok()?
+        .file_type()
+        .is_file()
+    {
+        return None;
+    }
     let output = Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
@@ -549,7 +558,7 @@ fn codex_permission_profile_config(
         .to_path_buf();
     let mut writable = vec![
         scope.to_path_buf(),
-        git_dir,
+        git_dir.clone(),
         objects,
         temp.to_path_buf(),
         common_dir.join("packed-refs.lock"),
@@ -571,6 +580,27 @@ fn codex_permission_profile_config(
     if branch.status.success() {
         let reference = String::from_utf8(branch.stdout).map_err(|error| error.to_string())?;
         let reference = reference.trim();
+        // HEAD is writable through the assigned Git directory. A task may
+        // change it, so refuse to grant a branch currently checked out by
+        // another worktree when the adapter reconnects.
+        let mut checked_out_elsewhere = std::fs::read_to_string(common_dir.join("HEAD"))
+            .map_err(|error| error.to_string())?
+            .trim()
+            == format!("ref: {reference}");
+        for entry in
+            std::fs::read_dir(common_dir.join("worktrees")).map_err(|error| error.to_string())?
+        {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path == git_dir {
+                continue;
+            }
+            let head =
+                std::fs::read_to_string(path.join("HEAD")).map_err(|error| error.to_string())?;
+            checked_out_elsewhere |= head.trim() == format!("ref: {reference}");
+        }
+        if checked_out_elsewhere {
+            return Err("Assigned branch is checked out in another worktree.".into());
+        }
         let branch_name = reference
             .strip_prefix("refs/heads/")
             .ok_or("Invalid assigned branch reference.")?;
@@ -5102,13 +5132,14 @@ mod session_config_tests {
         let overrides = profile["configOverrides"].as_array().unwrap();
         assert!(overrides.iter().any(|value| value
             .as_str()
-            .is_some_and(|value| value.contains("refs/heads/sail/test"))));
+            .is_some_and(|value| value.replace("\\\\", "/").contains("refs/heads/sail/test"))));
         assert!(overrides.iter().all(|value| !value
             .as_str()
             .is_some_and(|value| value.contains("filesystem.\""))));
         assert!(overrides.iter().any(|value| {
             value.as_str().is_some_and(|value| {
-                value.contains("filesystem") && value.contains("worktrees/linked")
+                value.contains("filesystem")
+                    && value.replace("\\\\", "/").contains("worktrees/linked")
             })
         }));
         assert!(overrides.iter().any(|value| value
@@ -5129,6 +5160,49 @@ mod session_config_tests {
         assert!(session_request_params(copied.to_str().unwrap(), None, &[])
             .get("additionalDirectories")
             .is_none());
+
+        let sibling = root.join("sibling");
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&main)
+            .args(["worktree", "add", "-q", "-b", "sail/sibling"])
+            .arg(&sibling)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&linked)
+            .args(["symbolic-ref", "HEAD", "refs/heads/sail/sibling"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(
+            codex_permission_profile_config(&linked, &root.join("task-tmp"), &[])
+                .unwrap_err()
+                .contains("checked out in another worktree")
+        );
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&linked)
+            .args(["symbolic-ref", "HEAD", "refs/heads/sail/test"])
+            .status()
+            .unwrap()
+            .success());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let pointer = linked.join(".git");
+            let original = linked.join(".git-original");
+            std::fs::rename(&pointer, &original).unwrap();
+            symlink(sibling.join(".git"), &pointer).unwrap();
+            assert!(session_request_params(linked.to_str().unwrap(), None, &[])
+                .get("additionalDirectories")
+                .is_none());
+            assert!(codex_permission_profile_config(&linked, &root.join("task-tmp"), &[]).is_err());
+            std::fs::remove_file(&pointer).unwrap();
+            std::fs::rename(&original, &pointer).unwrap();
+        }
 
         std::fs::create_dir(linked.join("nested")).unwrap();
         assert!(
