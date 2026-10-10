@@ -502,6 +502,12 @@
     settingsError,
   } from './lib/settings';
   import {
+    defaultResourceLimits,
+    parseResourceLimit,
+    resourceLimitKeys,
+    setResourceLimit,
+  } from './lib/resource-limits';
+  import {
     parseThemePreference,
     resolveTheme,
     systemDarkQuery,
@@ -1135,6 +1141,14 @@
     setSetting(notificationPrefsKey, JSON.stringify(notificationLoad.prefs));
   let crossValidation = $state(parseValidationSettings(getSetting(validationSettingsKey)));
   let modelRouting = $state(parseModelRoutingSettings(getSetting(modelRoutingSettingsKey)));
+  let resourceLimits = $state({
+    agent: parseResourceLimit(getSetting(resourceLimitKeys.agent), defaultResourceLimits.agent),
+    browser: parseResourceLimit(
+      getSetting(resourceLimitKeys.browser),
+      defaultResourceLimits.browser,
+    ),
+    e2e: parseResourceLimit(getSetting(resourceLimitKeys.e2e), defaultResourceLimits.e2e),
+  });
   let contextHandoffThreshold = $state(
     parseContextHandoffThreshold(getSetting('sai-context-handoff-threshold')),
   );
@@ -2017,6 +2031,7 @@
       mergeOwner,
       shipArchiveDelay,
       contextHandoffThreshold,
+      resourceLimits,
     };
   }
 
@@ -2242,6 +2257,12 @@
                     issue.contextPercent,
                     Math.max(0, contextHandoffThreshold - contextCheckpointLead - 1),
                   ).catch((cause) => (error = describe(cause)));
+        } else if (action.type === 'resource-limit') {
+          if (Number.isSafeInteger(action.value) && action.value >= 0 && action.value <= 32) {
+            resourceLimits = { ...resourceLimits, [action.kind]: action.value };
+            setSetting(resourceLimitKeys[action.kind], String(action.value));
+            if (action.kind !== 'e2e') setResourceLimit(action.kind, action.value);
+          }
         } else if (action.type === 'detect-agents') void detectAgents();
         else if (action.type === 'cross-validation') {
           crossValidation = action.value;

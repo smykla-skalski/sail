@@ -281,6 +281,7 @@
   const promptLocation = $derived(composerTaskLocation(taskLocation, directory, thread?.directory));
   let ready = $state(false);
   let busy = $state(false);
+  let queuedLimit = $state<number | null>(null);
   let connecting = $state(false);
   let sessionWarmupAttempted = $state(false);
   function failedDraftKey() {
@@ -1779,6 +1780,7 @@
             recalledPrompt,
             turnId,
             promptImagePaths(sentImages, sentClipboard),
+            (limit) => (queuedLimit = limit),
           ),
         );
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
@@ -1885,6 +1887,7 @@
       if (!keepImages) discardAttachments(sentImages, sentClipboard);
       if (deliverySessionId) discardSteeredAttachments(deliverySessionId);
       if (activeTurnId === turnId) activeTurnId = null;
+      queuedLimit = null;
       // Clear busy first so the header and the status bar settle in the same frame.
       if (current === generation) {
         busy = false;
@@ -2487,10 +2490,10 @@
             </section>{/if}
           {#if shownBusy}<ChatMessage kind="assistant" author={name} provider={agent}>
               <div class="agent-busy" role="status">
-                <ActivityStatus status={visibleStatus} />{#if !nativeEntries}<Button
-                    size="sm"
-                    variant="secondary"
-                    onclick={stop}>Stop</Button
+                {#if queuedLimit !== null}Waiting for agent slot (limit {queuedLimit}){:else}<ActivityStatus
+                    status={visibleStatus}
+                  />{/if}{#if !nativeEntries}<Button size="sm" variant="secondary" onclick={stop}
+                    >Stop</Button
                   >{/if}
               </div>
             </ChatMessage>{/if}
