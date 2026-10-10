@@ -52,7 +52,10 @@
     "active": true,
     "targets": "all",
     "macOS": {
-      "entitlements": "./Entitlements.plist"
+      "entitlements": "./Entitlements.plist",
+      "files": {
+        "Library/LaunchAgents/dev.smykla.sai-harness.context-supervisor.plist": "macos/dev.smykla.sai-harness.context-supervisor.plist"
+      }
     },
     "icon": [
       "icons/32x32.png",
