@@ -52,8 +52,7 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../vendor/codex-acp/dist/index.js": "codex-acp/index.js",
-      "../vendor/codex-acp/package.json": "codex-acp/package.json",
+      "../vendor/codex-acp/dist/index.js.txt": "codex-acp/index.js.txt",
       "../vendor/codex-acp/LICENSE": "codex-acp/LICENSE"
     },
     "macOS": {

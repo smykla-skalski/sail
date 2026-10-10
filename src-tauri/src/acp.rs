@@ -2743,14 +2743,14 @@ fn vendored_codex_adapter(app: &AppHandle) -> Result<PathBuf, String> {
         .path()
         .resource_dir()
         .map_err(|error| error.to_string())?
-        .join("codex-acp/index.js");
+        .join("codex-acp/index.js.txt");
     if bundled.is_file() {
         return Ok(bundled);
     }
     #[cfg(debug_assertions)]
     {
         let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/codex-acp/dist/index.js");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/codex-acp/dist/index.js.txt");
         if source.is_file() {
             return Ok(source);
         }
@@ -2848,18 +2848,21 @@ fn connect_blocking(
             Launch::VendoredCodex => {
                 let node = find_executable("node").ok_or("Node.js not found.")?;
                 paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
+                let temp = OwnedTempDir::create()?;
+                let adapter = temp.0.join("index.mjs");
+                std::fs::copy(vendored_codex_adapter(&app)?, &adapter)
+                    .map_err(|error| format!("Could not stage Codex ACP adapter: {error}"))?;
                 let mut command = Command::new(node);
-                command.arg(vendored_codex_adapter(&app)?);
+                command.arg(adapter);
                 command.env_remove("CODEX_ACP_PERMISSION_PROFILE_CONFIG");
                 if let Some(scope) = scope.as_ref() {
-                    let temp = OwnedTempDir::create()?;
                     let profile_config = codex_permission_profile_config(scope, &temp.0)?;
                     command.env("CODEX_ACP_PERMISSION_PROFILE_CONFIG", profile_config);
                     for variable in ["TMPDIR", "TMP", "TEMP"] {
                         command.env(variable, &temp.0);
                     }
-                    owned_temp = Some(temp);
                 }
+                owned_temp = Some(temp);
                 command
             }
         }
