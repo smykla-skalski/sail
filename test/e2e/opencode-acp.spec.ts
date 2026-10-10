@@ -80,7 +80,7 @@ describe('OpenCode in the ACP pane', () => {
 
     await expect($('.agent-header')).toHaveText(expect.stringContaining('OpenCode'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Started in terminal'));
-    await expect($('.agent-composer textarea')).toBeEnabled();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
 
     const migrated = await browser.execute(() => ({
       marker: localStorage.getItem('sai-opencode-acp-migrated'),
@@ -109,7 +109,7 @@ describe('OpenCode in the ACP pane', () => {
   it('switches the pane on click and keeps a Sail-local rename', async () => {
     await $('.project-agent-row[aria-label*="Third outside"]').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Third outside'));
-    await expect($('.agent-composer textarea')).toBeEnabled();
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
     await expect($('.agent-error')).not.toExist();
 
     await chooseTopbarAction('More actions', 'Rename');
@@ -169,7 +169,7 @@ describe('OpenCode in the ACP pane', () => {
     }, path);
     await browser.refresh();
     await browser.waitUntil(async () => (await $$('.pane-leaf')).length === 2);
-    expect((await $$('.pane-leaf .agent-composer textarea')).length).toBe(2);
+    expect((await $$('.pane-leaf .agent-composer [data-pane-prompt]')).length).toBe(2);
     await expect($('.pane-leaf[data-pane-id="right"] .agent-header')).toHaveText(
       expect.stringContaining('Second outside'),
     );

@@ -95,7 +95,7 @@ describe('ACP agent threads', () => {
     await expect(
       $('.agent-picker-controls .option-trigger[aria-label^="Effort:"]'),
     ).toBeDisplayed();
-    await $('.agent-composer textarea').setValue('/');
+    await $('.agent-composer [data-pane-prompt]').setValue('/');
     await expect($('.skill-menu')).toHaveText(
       expect.stringContaining('Implement and ship a GitHub issue'),
     );
@@ -105,8 +105,8 @@ describe('ACP agent threads', () => {
     await $(
       "//div[contains(@class,'skill-menu')]//button[strong[normalize-space()='/review']]",
     ).click();
-    expect(await $('.agent-composer textarea').getValue()).toBe('/review ');
-    await $('.agent-composer textarea').setValue('/model');
+    expect(await $('.agent-composer [data-pane-prompt]').getText()).toBe('/review ');
+    await $('.agent-composer [data-pane-prompt]').setValue('/model');
     await browser.keys('Enter');
     await expect($('.option-menu[role="listbox"]')).toBeDisplayed();
     await expect($('.option-menu button[role="option"]:nth-child(2)')).toBeDisplayed();
@@ -117,31 +117,31 @@ describe('ACP agent threads', () => {
     );
     await $('.option-trigger[aria-label^="Model:"]').click();
     await $('.option-menu button[role="option"]:nth-child(3)').click();
-    await $('.agent-composer textarea').setValue('Keep this draft');
+    await $('.agent-composer [data-pane-prompt]').setValue('Keep this draft');
     await $(sendButton).click();
     await expect($('.agent-error')).toHaveText(expect.stringContaining('Model change rejected'));
-    await expect($('.agent-composer textarea')).toHaveValue('Keep this draft');
+    await expect($('.agent-composer [data-pane-prompt]')).toHaveText('Keep this draft');
     await expect($('.agent-conversation')).not.toHaveText(
       expect.stringContaining('Keep this draft'),
     );
     await $('.option-trigger[aria-label^="Model:"]').click();
     await $('.option-menu button[role="option"]:nth-child(2)').click();
-    await $('.agent-composer textarea').setValue('');
-    await $('.agent-composer textarea').setValue('/effort');
+    await $('.agent-composer [data-pane-prompt]').setValue('');
+    await $('.agent-composer [data-pane-prompt]').setValue('/effort');
     await browser.keys('Enter');
     await browser.keys('ArrowDown');
     await browser.keys('Enter');
     await expect($('.option-trigger[aria-label^="Effort:"]')).toHaveText(
       expect.stringContaining('High'),
     );
-    await $('.agent-composer textarea').setValue('Do a small thing');
+    await $('.agent-composer [data-pane-prompt]').setValue('Do a small thing');
     await $(sendButton).click();
     await expect($('.agent-permission')).toHaveText(expect.stringContaining('Run test action'));
     await $('.agent-permission button').click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Done: Do a small thing'),
     );
-    await $('.agent-composer textarea').setValue('Ask structured question');
+    await $('.agent-composer [data-pane-prompt]').setValue('Ask structured question');
     await $(sendButton).click();
     await expect($('[aria-label="Agent question"]')).toHaveText(
       expect.stringContaining('Choose the delivery approach'),
@@ -196,7 +196,7 @@ describe('ACP agent threads', () => {
     await signInToCodex(true);
     await expect($('.option-trigger[aria-label^="Model:"]')).toHaveText('Test model');
     await expect($('.option-trigger[aria-label^="Effort:"]')).toHaveText('Medium');
-    await $('.agent-composer textarea').setValue('Try Codex');
+    await $('.agent-composer [data-pane-prompt]').setValue('Try Codex');
     await $(sendButton).click();
     await $('.agent-permission button').click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Done: Try Codex'));
@@ -254,7 +254,7 @@ describe('ACP agent threads', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Delayed approval');
+    await $('.agent-composer [data-pane-prompt]').setValue('Delayed approval');
     await $(sendButton).click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
     const working = $(
@@ -272,7 +272,7 @@ describe('ACP agent threads', () => {
       expect.stringContaining('Done: Delayed approval'),
     );
 
-    await $('.agent-composer textarea').setValue('Escape stop');
+    await $('.agent-composer [data-pane-prompt]').setValue('Escape stop');
     await $(sendButton).click();
     await expect($('.agent-permission')).toBeDisplayed();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Needs input'));
@@ -281,7 +281,7 @@ describe('ACP agent threads', () => {
     await expect($('.agent-busy')).not.toBeDisplayed();
     await expect($(latestToolGroup)).toHaveText(expect.stringContaining('Interrupted'));
 
-    await $('.agent-composer textarea').setValue('Slow cancel');
+    await $('.agent-composer [data-pane-prompt]').setValue('Slow cancel');
     await $(sendButton).click();
     await expect($('.agent-permission')).toBeDisplayed();
     await browser.keys('Escape');
@@ -297,7 +297,7 @@ describe('ACP agent threads', () => {
     await expect($(latestToolGroup)).toHaveText(expect.stringContaining('Interrupted'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
 
-    await $('.agent-composer textarea').setValue('Long answer');
+    await $('.agent-composer [data-pane-prompt]').setValue('Long answer');
     await $(sendButton).click();
     await expect($('.agent-permission')).toBeDisplayed();
     const beforeReply = await browser.execute(() => {
@@ -319,7 +319,7 @@ describe('ACP agent threads', () => {
       await browser.execute(() => document.querySelector('.agent-conversation')?.scrollTop ?? -1),
     ).toBeGreaterThan(beforeReply);
 
-    await $('.agent-composer textarea').setValue('Activity demo');
+    await $('.agent-composer [data-pane-prompt]').setValue('Activity demo');
     await $(sendButton).click();
     await expect($('.agent-tool-current')).toBeDisplayed();
     await browser.execute(() => {
@@ -339,23 +339,23 @@ describe('ACP agent threads', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await expect($('.agent-composer textarea')).toBeEnabled();
-    await $('.agent-composer textarea').setValue('Cancel creation');
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
+    await $('.agent-composer [data-pane-prompt]').setValue('Cancel creation');
     await $(sendButton).click();
     await browser.keys('Escape');
     await expect($('.agent-busy')).not.toBeDisplayed();
-    await expect($('.agent-composer textarea')).toHaveValue('Cancel creation');
+    await expect($('.agent-composer [data-pane-prompt]')).toHaveText('Cancel creation');
     await expect($('.agent-conversation')).not.toHaveText(
       expect.stringContaining('Cancel creation'),
     );
 
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Disable effort');
+    await $('.agent-composer [data-pane-prompt]').setValue('Disable effort');
     await $(sendButton).click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Disable effort'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('/effort');
+    await $('.agent-composer [data-pane-prompt]').setValue('/effort');
     await browser.keys('Enter');
     await expect($('.option-menu')).toHaveText(
       expect.stringContaining('No choices available for this model or agent.'),
@@ -375,7 +375,7 @@ describe('ACP agent threads', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Automatic policy');
+    await $('.agent-composer [data-pane-prompt]').setValue('Automatic policy');
     await $(sendButton).click();
     const decision = $('.transcript-decision');
     await expect(decision).toHaveText(expect.stringMatching(/(Allowed|Rejected) automatically/));
@@ -398,7 +398,7 @@ describe('ACP agent threads', () => {
     await expect($('.agent-launches')).toHaveText(expect.stringContaining('Claude'));
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Plan revision fixture');
+    await $('.agent-composer [data-pane-prompt]').setValue('Plan revision fixture');
     await $(sendButton).click();
     await expect($('[aria-label="Native plan"]')).toHaveText(
       expect.stringContaining('Initial plan'),
@@ -440,7 +440,7 @@ describe('ACP agent threads', () => {
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Codex'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await signInToCodex(false);
-    await $('.agent-composer textarea').setValue('Plan revision fixture');
+    await $('.agent-composer [data-pane-prompt]').setValue('Plan revision fixture');
     await $(sendButton).click();
     await expect($('[aria-label="Native plan"]')).toHaveText(
       expect.stringContaining('Initial plan'),
@@ -467,8 +467,8 @@ describe('ACP agent threads', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await expect($('.agent-composer textarea')).toBeEnabled();
-    await $('.agent-composer textarea').setValue('Slow plan revision fixture');
+    await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
+    await $('.agent-composer [data-pane-prompt]').setValue('Slow plan revision fixture');
     await $(sendButton).click();
     await expect($('[aria-label="Native plan"]')).toHaveText(
       expect.stringContaining('Initial plan'),
@@ -499,7 +499,7 @@ describe('ACP agent threads', () => {
 
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Slow plan revision fixture');
+    await $('.agent-composer [data-pane-prompt]').setValue('Slow plan revision fixture');
     await $(sendButton).click();
     await expect($('[aria-label="Native plan"]')).toHaveText(
       expect.stringContaining('Initial plan'),
@@ -512,7 +512,7 @@ describe('ACP agent threads', () => {
 
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Plan revision fixture');
+    await $('.agent-composer [data-pane-prompt]').setValue('Plan revision fixture');
     await $(sendButton).click();
     await expect($('[aria-label="Native plan"]')).toHaveText(
       expect.stringContaining('Initial plan'),
@@ -539,7 +539,7 @@ describe('ACP agent threads', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
-    await $('.agent-composer textarea').setValue('Native subagents');
+    await $('.agent-composer [data-pane-prompt]').setValue('Native subagents');
     await $(sendButton).click();
     await expect($('button[aria-label*="for Native subagents"]')).toHaveText(
       expect.stringContaining('1 historical'),
@@ -590,10 +590,10 @@ describe('ACP agent threads', () => {
   it('queues a typed message until the current ACP turn finishes', async () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Delayed approval');
+    await $('.agent-composer [data-pane-prompt]').setValue('Delayed approval');
     await $(sendButton).click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
-    await $('.agent-composer textarea').setValue('Queued follow-up');
+    await $('.agent-composer [data-pane-prompt]').setValue('Queued follow-up');
     await $(sendButton).click();
     await expect($('.agent-conversation .queued-messages')).toHaveText(
       expect.stringContaining('Queued follow-up'),
@@ -624,7 +624,7 @@ describe('ACP agent threads', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Keep running during close');
+    await $('.agent-composer [data-pane-prompt]').setValue('Keep running during close');
     await $(sendButton).click();
     await expect($('.agent-permission')).toBeDisplayed();
 
@@ -654,15 +654,15 @@ describe('ACP agent threads', () => {
   it('steers a queued message into the running ACP turn after a tool call', async () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Steer demo');
+    await $('.agent-composer [data-pane-prompt]').setValue('Steer demo');
     await $(sendButton).click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
-    await $('.agent-composer textarea').setValue('Steer follow-up');
+    await $('.agent-composer [data-pane-prompt]').setValue('Steer follow-up');
     await $(sendButton).click();
     await expect($('.agent-conversation .queued-messages')).toHaveText(
       expect.stringContaining('Steer follow-up'),
     );
-    await expect($('.agent-composer textarea')).toHaveValue('');
+    await expect($('.agent-composer [data-pane-prompt]')).toHaveText('');
     await expect($('.agent-composer')).not.toHaveText(expect.stringContaining('Steer follow-up'));
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Steered: Steer follow-up'),
@@ -695,10 +695,10 @@ describe('ACP agent threads', () => {
     }, path);
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Steer new-turn demo');
+    await $('.agent-composer [data-pane-prompt]').setValue('Steer new-turn demo');
     await $(sendButton).click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
-    await $('.agent-composer textarea').setValue('Detached steer follow-up');
+    await $('.agent-composer [data-pane-prompt]').setValue('Detached steer follow-up');
     await $(sendButton).click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Detached steering turn started.'),
@@ -731,10 +731,10 @@ describe('ACP agent threads', () => {
   it('waits for both parallel tools before steering once', async () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Steer parallel demo');
+    await $('.agent-composer [data-pane-prompt]').setValue('Steer parallel demo');
     await $(sendButton).click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
-    await $('.agent-composer textarea').setValue('Steer parallel follow-up');
+    await $('.agent-composer [data-pane-prompt]').setValue('Steer parallel follow-up');
     await $(sendButton).click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('First parallel tool finished.'),
@@ -763,10 +763,10 @@ describe('ACP agent threads', () => {
   it('sends a queued message when the prompt finishes before steering replies', async () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Steer no-response demo');
+    await $('.agent-composer [data-pane-prompt]').setValue('Steer no-response demo');
     await $(sendButton).click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
-    await $('.agent-composer textarea').setValue('Steer no-response follow-up');
+    await $('.agent-composer [data-pane-prompt]').setValue('Steer no-response follow-up');
     await $(sendButton).click();
     await expect($('.agent-conversation .queued-messages')).toHaveText(
       expect.stringContaining('Steer no-response follow-up'),
@@ -796,7 +796,7 @@ describe('ACP agent threads', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Activity failure demo');
+    await $('.agent-composer [data-pane-prompt]').setValue('Activity failure demo');
     await $(sendButton).click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('I recovered from the read failure'),
@@ -827,16 +827,16 @@ describe('ACP agent threads', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Hook failure demo');
+    await $('.agent-composer [data-pane-prompt]').setValue('Hook failure demo');
     await $(sendButton).click();
     await expect($('.agent-tool-failure')).toBeDisplayed();
     await expect($$('.agent-tool-failure')).toBeElementsArrayOfSize(1);
     await expect($('.agent-tool-failure')).toHaveText(expect.stringContaining('GIT010'));
     await expect($('.agent-tool-failure')).toHaveText(expect.stringContaining('Add -s -S flags'));
-    await $('.agent-composer textarea').setValue('Keep this context.');
+    await $('.agent-composer [data-pane-prompt]').setValue('Keep this context.');
     await $('.agent-tool-failure button').click();
     await $('.agent-tool-failure button').click();
-    const prepared = await $('.agent-composer textarea').getValue();
+    const prepared = await $('.agent-composer [data-pane-prompt]').getText();
     expect(prepared).toContain('Keep this context.');
     expect(prepared.match(/Rule or hook: GIT010/g)).toHaveLength(1);
     await $(sendButton).click();
@@ -860,13 +860,13 @@ describe('ACP agent threads', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Post-hook failure demo');
+    await $('.agent-composer [data-pane-prompt]').setValue('Post-hook failure demo');
     await $(sendButton).click();
     await expect($('.agent-tool-failure')).toHaveText(
       expect.stringContaining('Post-action hook failed'),
     );
     await $('.agent-tool-failure button').click();
-    const prepared = await $('.agent-composer textarea').getValue();
+    const prepared = await $('.agent-composer [data-pane-prompt]').getText();
     expect(prepared).toContain('Check the action result before retrying it');
     expect(prepared).not.toContain('hook-blocked action');
   });
@@ -884,7 +884,7 @@ describe('ACP agent threads', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Activity demo');
+    await $('.agent-composer [data-pane-prompt]').setValue('Activity demo');
     await $(sendButton).click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('The checks passed.'),
@@ -911,7 +911,7 @@ describe('ACP agent threads', () => {
     }, realpathSync(repository));
     await browser.refresh();
     await $('.agent-launches button').click();
-    await $('.agent-composer textarea').setValue('Main action');
+    await $('.agent-composer [data-pane-prompt]').setValue('Main action');
     await $(sendButton).click();
     await expect($('.agent-permission button')).toBeDisplayed();
     await $('.agent-permission button').click();
@@ -919,7 +919,7 @@ describe('ACP agent threads', () => {
     await browser.keys(['Meta', 'd']);
     await expect($('.pane-leaf.focused [data-pane-picker]')).toBeDisplayed();
     await $('.agent-launches button').click();
-    await $('.pane-leaf.focused .agent-composer textarea').setValue('Split action');
+    await $('.pane-leaf.focused .agent-composer [data-pane-prompt]').setValue('Split action');
     await $(`.pane-leaf.focused ${sendButton}`).click();
     await expect($('.pane-leaf.focused .agent-permission button')).toBeDisplayed();
     await $('.pane-leaf.focused .agent-permission button').click();

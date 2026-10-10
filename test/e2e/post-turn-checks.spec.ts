@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 async function completeTurn(text: string) {
-  await $('.agent-composer textarea').setValue(text);
+  await $('.agent-composer [data-pane-prompt]').setValue(text);
   await $('.agent-actions button').click();
   await expect($('.agent-permission')).toBeDisplayed();
   await $('.agent-permission button').click();

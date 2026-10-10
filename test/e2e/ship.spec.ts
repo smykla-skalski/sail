@@ -719,7 +719,7 @@ describe('native Ship run history', () => {
     await $('.agent-launches button').waitForExist({ timeout: 30_000 });
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer textarea').setValue('Do a small thing');
+    await $('.agent-composer [data-pane-prompt]').setValue('Do a small thing');
     await $('.agent-actions button').click();
     await $('.agent-permission button').waitForExist({ timeout: 20_000 });
     await $('.agent-permission button').click();
@@ -757,7 +757,7 @@ describe('native Ship run history', () => {
     // The isolated app has no GitHub login, so claim recovery can replace the fixture blocker.
     const blocker = await $('.ship-issue-detail .ship-error').getText();
     await $('.ship-issue-detail .ship-actions').$('button=Reply to worker').click();
-    const composer = $('.agent-composer textarea');
+    const composer = $('.agent-composer [data-pane-prompt]');
     const quoted = blocker
       .split('\n')
       .map((line) => `> ${line}`.trimEnd())

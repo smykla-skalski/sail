@@ -54,12 +54,16 @@ describe('clipboard chat attachments', () => {
     });
     expect(copied.join(' ')).toContain('Ready');
 
-    await $('.agent-composer textarea').setValue('Clipboard fixture');
+    await $('.agent-composer [data-pane-prompt]').setValue('Clipboard fixture');
     await browser.execute(() => {
-      const input = document.querySelector<HTMLTextAreaElement>('.agent-composer textarea');
+      const input = document.querySelector<HTMLElement>('.agent-composer [data-pane-prompt]');
       if (!input) throw new Error('No composer');
       input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
+      const range = document.createRange();
+      range.selectNodeContents(input);
+      range.collapse(false);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
       const data = new DataTransfer();
       data.setData('text/plain', ' mixed');
       data.items.add(new File(['file body'], 'notes.txt', { type: 'text/plain' }));
@@ -81,9 +85,9 @@ describe('clipboard chat attachments', () => {
       timeoutMsg: 'Sent file was not removed',
     });
 
-    await $('.agent-composer textarea').setValue('Clipboard fixture image');
+    await $('.agent-composer [data-pane-prompt]').setValue('Clipboard fixture image');
     await browser.execute(async () => {
-      const input = document.querySelector<HTMLTextAreaElement>('.agent-composer textarea');
+      const input = document.querySelector<HTMLElement>('.agent-composer [data-pane-prompt]');
       if (!input) throw new Error('No composer');
       const canvas = document.createElement('canvas');
       canvas.width = canvas.height = 2;
@@ -110,9 +114,9 @@ describe('clipboard chat attachments', () => {
     );
     expect(imageConversation).toContain('["pixel.png"]');
 
-    await $('.agent-composer textarea').setValue('');
+    await $('.agent-composer [data-pane-prompt]').setValue('');
     await browser.execute(() => {
-      const input = document.querySelector<HTMLTextAreaElement>('.agent-composer textarea');
+      const input = document.querySelector<HTMLElement>('.agent-composer [data-pane-prompt]');
       if (!input) throw new Error('No composer');
       const data = new DataTransfer();
       data.items.add(new File(['remove me'], 'remove.txt', { type: 'text/plain' }));
