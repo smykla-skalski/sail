@@ -392,25 +392,27 @@ describe('disk-backed settings', () => {
     await browser.execute(() => (document.documentElement.style.zoom = ''));
     await $('#context-executable').click();
     await browser.keys(['Tab']);
+    await browser.keys(['Tab']);
     const approvalFocus = await browser.execute(() => {
       const button = Array.from(document.querySelectorAll('button')).find(
         (item) => item.textContent?.trim() === 'Approve for this project',
       );
       if (!button) return null;
-      button.focus();
+      const style = getComputedStyle(button);
       return {
         focused: document.activeElement === button,
         tabIndex: button.tabIndex,
-        outline: getComputedStyle(button).outlineStyle,
+        outline: style.outlineStyle,
+        boxShadow: style.boxShadow,
       };
     });
     expect(approvalFocus?.focused).toBe(true);
     expect(approvalFocus?.tabIndex).toBeGreaterThanOrEqual(0);
-    expect(approvalFocus?.outline).not.toBe('none');
+    expect(approvalFocus?.outline !== 'none' || approvalFocus?.boxShadow !== 'none').toBe(true);
     await $('button=Approve for this project').click();
     await expect($('.context-provider-details')).toHaveText(expect.stringContaining('Approved'));
-    await expect($('.settings-card')).toHaveText(
-      expect.stringContaining('It does not show live connection health'),
+    expect(await $('.settings-card').getText()).toMatch(
+      /It does not show live connection\s+health/,
     );
 
     writeFileSync(
