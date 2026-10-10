@@ -424,8 +424,8 @@ fn mcp_server(config: &crate::browser_agent::McpConfig) -> Value {
 
 fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]) -> Value {
     let mut params = json!({"cwd":cwd,"mcpServers":servers});
-    if let Some(common_dir) = linked_worktree_git_common_dir(cwd) {
-        params["additionalDirectories"] = json!([common_dir]);
+    if let Some(git_directories) = linked_worktree_git_directories(cwd) {
+        params["additionalDirectories"] = json!(git_directories);
     }
     if let Some(session_id) = session_id {
         params["sessionId"] = json!(session_id);
@@ -433,7 +433,7 @@ fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]
     params
 }
 
-fn linked_worktree_git_common_dir(cwd: &str) -> Option<String> {
+fn linked_worktree_git_directories(cwd: &str) -> Option<Vec<String>> {
     let output = Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
@@ -470,7 +470,20 @@ fn linked_worktree_git_common_dir(cwd: &str) -> Option<String> {
     if git_dir == common_dir || !git_dir.starts_with(common_dir.join("worktrees")) {
         return None;
     }
-    Some(common_dir.to_string_lossy().into_owned())
+    let directories = [
+        git_dir,
+        common_dir.join("objects"),
+        common_dir.join("refs"),
+        common_dir.join("logs").join("refs"),
+    ];
+    Some(
+        directories
+            .into_iter()
+            .filter_map(|directory| directory.canonicalize().ok())
+            .filter(|directory| directory.starts_with(&common_dir))
+            .map(|directory| directory.to_string_lossy().into_owned())
+            .collect(),
+    )
 }
 
 fn session_servers(browser: Value, memory: Option<Value>) -> Vec<Value> {
@@ -4149,7 +4162,7 @@ mod session_config_tests {
     }
 
     #[test]
-    fn linked_worktree_session_grants_only_its_git_common_directory() {
+    fn linked_worktree_session_grants_only_its_git_paths() {
         let root = scratch("linked-git");
         let main = root.join("main");
         let linked = root.join("linked");
@@ -4188,7 +4201,20 @@ mod session_config_tests {
             .success());
 
         let request = session_request_params(linked.to_str().unwrap(), None, &[]);
-        assert_eq!(request["additionalDirectories"], json!([main.join(".git")]));
+        let common = main.join(".git");
+        let roots = request["additionalDirectories"].as_array().unwrap();
+        assert_eq!(roots.len(), 4);
+        assert!(roots
+            .iter()
+            .any(|root| root == &json!(common.join("worktrees/linked"))));
+        assert!(roots
+            .iter()
+            .any(|root| root == &json!(common.join("objects"))));
+        assert!(roots.iter().any(|root| root == &json!(common.join("refs"))));
+        assert!(roots
+            .iter()
+            .any(|root| root == &json!(common.join("logs/refs"))));
+        assert!(!roots.iter().any(|root| root == &json!(common)));
         let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
         assert_eq!(
             restored["additionalDirectories"],
