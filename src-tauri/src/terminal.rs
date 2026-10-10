@@ -59,6 +59,7 @@ struct TerminalSession {
     owner: Option<String>,
     directory: PathBuf,
     worktree: PathBuf,
+    _storage_lease: Option<std::sync::Arc<crate::worktree_storage::WorktreeDataLease>>,
     process_id: Option<u32>,
     writer: Mutex<Box<dyn Write + Send>>,
     // Close ConPTY input before closing the pseudoconsole master.
@@ -79,15 +80,6 @@ impl TerminalSession {
             .map_err(|error| error.to_string())?;
         #[cfg(unix)]
         {
-            if self
-                .output
-                .lock()
-                .map_err(|error| error.to_string())?
-                .exit_code
-                .is_some()
-            {
-                return Ok(());
-            }
             kill_terminal_process_groups(
                 self.process_id
                     .ok_or("Cannot identify terminal process group.")?,
@@ -96,6 +88,9 @@ impl TerminalSession {
         #[cfg(windows)]
         {
             self.job.stop()?;
+        }
+        if let Some(lease) = &self._storage_lease {
+            lease.release_clean()?;
         }
         Ok(())
     }
@@ -397,6 +392,7 @@ mod tests {
             owner: None,
             directory: managed.clone(),
             worktree: managed.clone(),
+            _storage_lease: None,
             process_id,
             master: Mutex::new(pair.master),
             process_group_stop: Arc::new(Mutex::new(())),
@@ -1105,12 +1101,15 @@ fn spawn(
         command.arg(script);
     }
     command.cwd(&directory);
+    let mut storage_lease = None;
     if owner.is_some() {
         let cache_directory = app
             .path()
             .app_cache_dir()
             .map_err(|error| error.to_string())?;
-        let data_directory = crate::register_worktree_terminal_data(&cache_directory, &worktree)?;
+        let (data_directory, lease) =
+            crate::register_worktree_storage(&cache_directory, &worktree)?;
+        storage_lease = Some(lease);
         for (key, value) in crate::acp_terminal::terminal_environment(&data_directory) {
             std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
             command.env(key, value);
@@ -1130,6 +1129,9 @@ fn spawn(
         .slave
         .spawn_command(command)
         .map_err(|error| error.to_string())?;
+    if let Some(lease) = &storage_lease {
+        lease.mark_started();
+    }
     drop(pair.slave);
     let mut reader = pair
         .master
@@ -1229,6 +1231,7 @@ fn spawn(
         owner,
         directory,
         worktree,
+        _storage_lease: storage_lease,
         process_id,
         master,
         process_group_stop,

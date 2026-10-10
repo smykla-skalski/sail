@@ -500,6 +500,7 @@ struct AcpTerminal {
     profile: CapabilityProfile,
     session_id: String,
     directory: PathBuf,
+    _storage_lease: Option<std::sync::Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(windows)]
     job: WindowsTerminalJob,
@@ -668,11 +669,17 @@ fn session(
 
 fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     if terminal.stopped.load(Ordering::Acquire) {
-        return Ok(());
+        return terminal
+            ._storage_lease
+            .as_ref()
+            .map_or(Ok(()), |lease| lease.release_clean());
     }
     let mut child = terminal.child.lock().map_err(|error| error.to_string())?;
     if terminal.stopped.load(Ordering::Acquire) {
-        return Ok(());
+        return terminal
+            ._storage_lease
+            .as_ref()
+            .map_or(Ok(()), |lease| lease.release_clean());
     }
     #[cfg(unix)]
     {
@@ -692,6 +699,9 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
         watchdog.stop();
     }
     terminal.stopped.store(true, Ordering::Release);
+    if let Some(lease) = &terminal._storage_lease {
+        lease.release_clean()?;
+    }
     Ok(())
 }
 
@@ -753,7 +763,7 @@ pub fn handle(
                     "Terminal working directory must be an existing absolute folder.".to_string(),
                 );
             }
-            let data_directory = crate::register_worktree_terminal_data(
+            let (data_directory, storage_lease) = crate::register_worktree_storage(
                 &app.path()
                     .app_cache_dir()
                     .map_err(|error| error.to_string())?,
@@ -788,6 +798,7 @@ pub fn handle(
             let mut child = command
                 .spawn()
                 .map_err(|error| format!("Cannot start command: {error}"))?;
+            storage_lease.mark_started();
             #[cfg(unix)]
             let watchdog =
                 crate::child_watchdog::ChildWatchdog::start(child.id()).map_err(|error| {
@@ -815,6 +826,7 @@ pub fn handle(
                 profile,
                 session_id: params.session_id.clone(),
                 directory: worktree.to_path_buf(),
+                _storage_lease: Some(storage_lease),
                 child: Mutex::new(child),
                 #[cfg(windows)]
                 job,
@@ -1509,6 +1521,7 @@ mod tests {
             profile: CapabilityProfile::Review,
             session_id: "nested-session".to_string(),
             directory: nested.clone(),
+            _storage_lease: None,
             child: Mutex::new(child),
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),

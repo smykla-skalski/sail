@@ -229,6 +229,7 @@ mod stderr_log;
 mod terminal;
 mod worktree_config;
 mod worktree_snapshots;
+mod worktree_storage;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1840,7 +1841,9 @@ async fn delete_worktree(
             .app_cache_dir()
             .map_err(|error| error.to_string())?;
         let managed_terminal_data =
-            acp_terminal::worktree_data_directory(&cache_directory, &directory);
+            worktree_storage::data_directory_for_root(&cache_directory, &directory).unwrap_or_else(
+                || acp_terminal::worktree_data_directory(&cache_directory, &directory),
+            );
         let terminals = app.state::<acp_terminal::AcpTerminalManager>().inner();
         let terminal_manager = app.state::<terminal::TerminalManager>();
         let acp_roots = match terminals.begin_worktree_removal(&directory) {
@@ -1882,7 +1885,7 @@ async fn delete_worktree(
                 terminal_manager.stop_worktree(&directory)?;
                 terminals.stop_worktree(&directory)?;
                 agents.stop_worktree(&directory)?;
-                remove_worktree_then_terminal_data_many(&managed_data, || {
+                remove_worktree_then_private_data_many(&cache_directory, &managed_data, || {
                     let result = if archive_ignored == Some(true) {
                         archive_ignored_and_remove(
                             checked,
@@ -1917,6 +1920,16 @@ async fn delete_worktree(
     .map_err(|error| error.to_string())?
 }
 
+fn remove_worktree_then_private_data_many<T>(
+    cache_directory: &Path,
+    managed_data: &[PathBuf],
+    remove_worktree: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let result = remove_worktree()?;
+    worktree_storage::remove_after_worktree_removal(cache_directory, managed_data)?;
+    Ok(result)
+}
+
 #[cfg(test)]
 fn remove_worktree_then_terminal_data<T>(
     managed_data: &Path,
@@ -1925,6 +1938,7 @@ fn remove_worktree_then_terminal_data<T>(
     remove_worktree_then_terminal_data_many(&[managed_data.to_path_buf()], remove_worktree)
 }
 
+#[cfg(test)]
 fn remove_worktree_then_terminal_data_many<T>(
     managed_data: &[PathBuf],
     remove_worktree: impl FnOnce() -> Result<T, String>,
@@ -1946,6 +1960,7 @@ const NESTED_WORKTREE_MANIFEST_PREFIX: &str = "nw-";
 const NESTED_WORKTREE_MANIFEST_HEADER: &str = "sail-terminal-worktrees-v1";
 const WORKTREE_DATA_OWNER_FILE: &str = "worktree-owner-v1";
 
+#[cfg(test)]
 pub(crate) fn register_worktree_terminal_data(
     cache_directory: &Path,
     worktree: &Path,
@@ -1986,6 +2001,14 @@ pub(crate) fn register_worktree_terminal_data(
     Ok(data_directory)
 }
 
+pub(crate) fn register_worktree_storage(
+    cache_directory: &Path,
+    worktree: &Path,
+) -> Result<(PathBuf, std::sync::Arc<worktree_storage::WorktreeDataLease>), String> {
+    worktree_storage::register(cache_directory, worktree)
+}
+
+#[cfg(test)]
 fn validate_worktree_data_owner(owner_file: &Path, expected: &Path) -> Result<(), String> {
     if !owner_file
         .symlink_metadata()
@@ -2199,13 +2222,15 @@ fn persist_worktree_data_manifest(
         }
         write_result?;
     }
-    let mut data = nested
-        .iter()
-        .map(|root| acp_terminal::worktree_data_directory(cache_directory, root))
-        .collect::<Vec<_>>();
-    data.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    data.push(outer_data.to_path_buf());
-    Ok(data)
+    let _ = nested;
+    if worktree_storage::is_managed_directory(outer_data) {
+        Ok(worktree_storage::discover_data_directories(
+            cache_directory,
+            &outer_worktree,
+        ))
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 fn validate_nested_worktree_root(outer: &Path, candidate: &Path) -> Result<(), String> {
@@ -2883,6 +2908,9 @@ pub fn run() {
             if let Err(error) = diagnostics::init(_app.handle()) {
                 eprintln!("Sail diagnostics unavailable: {error}");
             }
+            if let Ok(cache_directory) = _app.path().app_cache_dir() {
+                worktree_storage::reconcile(&cache_directory);
+            }
             browser_agent::start_bridge(_app.handle())?;
             if let Err(error) = hook_activity::start_bridge(_app.handle()) {
                 eprintln!("Sail hook receiver unavailable: {error}");
@@ -2903,6 +2931,8 @@ pub fn run() {
         .manage(hook_activity::HookActivityManager::default())
         .invoke_handler(tauri::generate_handler![
             diagnostics::diagnostic_event,
+            worktree_storage_cleanup_status,
+            retry_worktree_storage_cleanup,
             settings::load_settings,
             settings::migrate_settings,
             settings::save_setting,
@@ -3089,6 +3119,28 @@ pub fn run() {
         });
 }
 
+#[tauri::command]
+fn worktree_storage_cleanup_status(
+    app: tauri::AppHandle,
+) -> Result<Vec<worktree_storage::CleanupPending>, String> {
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    Ok(worktree_storage::cleanup_status(&cache))
+}
+
+#[tauri::command]
+fn retry_worktree_storage_cleanup(
+    app: tauri::AppHandle,
+) -> Result<Vec<worktree_storage::CleanupPending>, String> {
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    Ok(worktree_storage::retry_cleanup(&cache))
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(any(unix, windows))]
@@ -3107,6 +3159,7 @@ mod tests {
         WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
+    use crate::worktree_storage;
     use crate::GitCanonical;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3145,7 +3198,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_terminal_data_manifest_survives_partial_stop_and_retries_after_removal() {
+    fn legacy_nested_terminal_data_survives_partial_stop_and_is_reported_pending() {
         let root = std::env::temp_dir().join(format!(
             "sail-nested-terminal-cleanup-test-{}",
             uuid::Uuid::new_v4()
@@ -3180,11 +3233,15 @@ mod tests {
         fs::remove_dir_all(&outer).unwrap();
         let retry = persist_worktree_data_manifest(&cache, &outer_data, &outer, &[])
             .expect("retry should recover roots from the manifest");
-        assert!(retry.iter().any(|path| path == &nested_data));
+        assert!(
+            retry.is_empty(),
+            "legacy caches have no durable Git identity"
+        );
         remove_worktree_then_terminal_data_many(&retry, || Ok(()))
-            .expect("clean nested data after successful removal");
-        assert!(!nested_data.exists());
-        assert!(!outer_data.exists());
+            .expect("unknown legacy caches should remain untouched");
+        assert!(nested_data.join("cache").exists());
+        assert!(outer_data.join("cache").exists());
+        assert!(!worktree_storage::cleanup_status(&cache).is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3223,7 +3280,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_unrelated_terminal_owner_does_not_block_selected_cleanup() {
+    fn unverifiable_legacy_nested_terminal_owners_are_retained_and_reported() {
         let root = std::env::temp_dir().join(format!(
             "sail-nested-terminal-owner-corruption-{}",
             uuid::Uuid::new_v4()
@@ -3270,10 +3327,11 @@ mod tests {
         )
         .unwrap();
         remove_worktree_then_terminal_data_many(&cleanup, || Ok(()))
-            .expect("unrelated corrupt metadata must not block selected cleanup");
-        assert!(!nested_data.exists());
-        assert!(!active_data.exists());
+            .expect("unknown legacy metadata must not be deleted");
+        assert!(nested_data.join("cache").exists());
+        assert!(active_data.join("cache").exists());
         assert!(unrelated_data.join("cache").exists());
+        assert!(!worktree_storage::cleanup_status(&cache).is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
