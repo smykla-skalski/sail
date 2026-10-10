@@ -139,16 +139,17 @@ function startClient(directory) {
   };
 }
 
-async function waitForReady() {
-  for (let attempt = 0; attempt < 60; attempt++) {
-    try {
-      if ((await fetch(`http://127.0.0.1:${port}/status`)).ok) return;
-    } catch {
-      /* Private app is starting. */
-    }
-    await delay(1000);
+async function waitForReady(attempt = 0) {
+  if (attempt === 60) {
+    throw new Error('Private Sail app did not expose its WebDriver status endpoint');
   }
-  throw new Error('Private Sail app did not expose its WebDriver status endpoint');
+  try {
+    if ((await fetch(`http://127.0.0.1:${port}/status`)).ok) return;
+  } catch {
+    /* Private app is starting. */
+  }
+  await delay(1000);
+  return waitForReady(attempt + 1);
 }
 
 try {
