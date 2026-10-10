@@ -9,6 +9,7 @@ import process from 'node:process';
 const PROTOCOL_VERSION = '2025-06-18';
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const TIMEOUT_MS = 5000;
+const STDIO_FINAL_OUTPUT_MS = 100;
 
 class ConformanceError extends Error {}
 
@@ -311,6 +312,10 @@ function stdioTransport(command, args, environment) {
         child.stdin.write(encoded);
       });
     },
+    async verify() {
+      await new Promise((resolve) => setTimeout(resolve, STDIO_FINAL_OUTPUT_MS));
+      if (failed) throw failed;
+    },
     async close() {
       if (child.exitCode !== null) return;
       if (process.platform !== 'win32' && child.pid !== undefined) {
@@ -463,6 +468,7 @@ async function run(config) {
     );
     assert(!containsSecret(providerFields), 'Error response exposes the secret.');
     checks.push('error', 'secret-redaction');
+    await transport.verify?.();
     return { status: 'pass', profileVersion: 1, protocolVersion: PROTOCOL_VERSION, checks };
   } finally {
     await transport.close();

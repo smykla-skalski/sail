@@ -77,4 +77,8 @@ for await (const line of createInterface({ input: process.stdin })) {
     reply.error = { code: -32601, message: 'Method not found.' };
   }
   output(reply);
+  if (message.method === 'tools/call' && message.params.name === 'fixture_error') {
+    if (mode === 'trailing-stdout') process.stdout.write('ready\n');
+    if (mode === 'delayed-trailing-stdout') setTimeout(() => process.stdout.write('ready\n'), 10);
+  }
 }

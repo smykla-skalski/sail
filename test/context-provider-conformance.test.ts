@@ -127,6 +127,15 @@ void test('does not match a secret against the JSON-RPC envelope', () => {
   assert.equal(JSON.parse(result.stdout).status, 'pass');
 });
 
+for (const mode of ['trailing-stdout', 'delayed-trailing-stdout']) {
+  void test(`rejects ${mode} after the final response`, () => {
+    const result = run(profile(mode));
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Non-MCP output on provider stdout/);
+    assert.equal(result.stdout, '');
+  });
+}
+
 void test('offline stdio provider passes the versioned profile', () => {
   const result = run(profile());
   assert.equal(result.status, 0, result.stderr);
