@@ -13,6 +13,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
 use crate::browser_agent::CapabilityProfile;
 
 static NEXT_TERMINAL: AtomicU64 = AtomicU64::new(1);
@@ -83,12 +86,176 @@ fn stable_worktree_identity(worktree: &Path) -> PathBuf {
 }
 
 pub(crate) fn terminal_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
+    let shared_download_cache = data_directory
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(data_directory)
+        .join("terminal-package-downloads");
     vec![
         ("TMPDIR", data_directory.join("tmp")),
         ("TEMP", data_directory.join("tmp")),
         ("TMP", data_directory.join("tmp")),
         ("XDG_CACHE_HOME", data_directory.join("cache")),
+        ("PIP_CACHE_DIR", shared_download_cache.join("pip")),
+        ("UV_CACHE_DIR", shared_download_cache.join("uv")),
+        ("POETRY_CACHE_DIR", shared_download_cache.join("poetry")),
     ]
+}
+
+#[cfg(windows)]
+struct WindowsTerminalJob(OwnedHandle);
+
+#[cfg(windows)]
+unsafe impl Send for WindowsTerminalJob {}
+
+#[cfg(windows)]
+impl WindowsTerminalJob {
+    fn new() -> Result<Self, String> {
+        use windows::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let handle = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }
+            .map_err(|error| format!("Cannot create terminal process job: {error}"))?;
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                windows::Win32::Foundation::HANDLE(handle.as_raw_handle() as _),
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        }
+        .map_err(|error| format!("Cannot configure terminal process job: {error}"))?;
+        Ok(Self(handle))
+    }
+
+    fn assign_and_resume(&self, child: &std::process::Child) -> Result<(), String> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+        use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+        unsafe {
+            AssignProcessToJobObject(
+                windows::Win32::Foundation::HANDLE(self.0.as_raw_handle() as _),
+                windows::Win32::Foundation::HANDLE(child.as_raw_handle() as _),
+            )
+        }
+        .map_err(|error| format!("Cannot assign terminal process job: {error}"))?;
+
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+            .map_err(|error| format!("Cannot inspect terminal process threads: {error}"))?;
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.0) };
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut first = true;
+        let thread_id = loop {
+            let result = unsafe {
+                if first {
+                    first = false;
+                    Thread32First(
+                        windows::Win32::Foundation::HANDLE(snapshot.as_raw_handle() as _),
+                        &mut entry,
+                    )
+                } else {
+                    Thread32Next(
+                        windows::Win32::Foundation::HANDLE(snapshot.as_raw_handle() as _),
+                        &mut entry,
+                    )
+                }
+            };
+            if result.is_err() {
+                break None;
+            }
+            if entry.th32OwnerProcessID == child.id() {
+                break Some(entry.th32ThreadID);
+            }
+        }
+        .ok_or("Cannot find terminal process primary thread.")?;
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
+            .map_err(|error| format!("Cannot resume terminal process: {error}"))?;
+        let thread = unsafe { OwnedHandle::from_raw_handle(thread.0) };
+        if unsafe {
+            ResumeThread(windows::Win32::Foundation::HANDLE(
+                thread.as_raw_handle() as _
+            ))
+        } == u32::MAX
+        {
+            return Err(format!(
+                "Cannot resume terminal process: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    fn spawn(command: &mut Command) -> Result<(Child, Self), String> {
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::System::Threading::CREATE_SUSPENDED;
+
+        let job = Self::new()?;
+        command.creation_flags(CREATE_SUSPENDED.0);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("Cannot start command: {error}"))?;
+        if let Err(error) = job.assign_and_resume(&child) {
+            let _ = child.kill();
+            let _ = job.stop();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok((child, job))
+    }
+
+    fn stop(&self) -> Result<(), String> {
+        use windows::Win32::System::JobObjects::TerminateJobObject;
+
+        if self.active_processes()? == 0 {
+            return Ok(());
+        }
+        unsafe {
+            TerminateJobObject(
+                windows::Win32::Foundation::HANDLE(self.0.as_raw_handle() as _),
+                1,
+            )
+        }
+        .map_err(|error| format!("Cannot stop terminal process job: {error}"))?;
+        for _ in 0..100 {
+            if self.active_processes()? == 0 {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err("Cannot confirm terminal process job stopped.".to_string())
+    }
+
+    fn active_processes(&self) -> Result<usize, String> {
+        use windows::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        unsafe {
+            QueryInformationJobObject(
+                Some(windows::Win32::Foundation::HANDLE(
+                    self.0.as_raw_handle() as _
+                )),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&accounting) as u32,
+                None,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(accounting.ActiveProcesses as usize)
+    }
 }
 
 impl AcpTerminalManager {
@@ -282,6 +449,8 @@ struct AcpTerminal {
     session_id: String,
     directory: PathBuf,
     child: Mutex<Child>,
+    #[cfg(windows)]
+    job: WindowsTerminalJob,
     #[cfg(unix)]
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
     stopped: AtomicBool,
@@ -461,22 +630,7 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
             .map_err(|error| format!("Cannot wait for terminal process to stop: {error}"))?;
     }
     #[cfg(windows)]
-    if child
-        .try_wait()
-        .map_err(|error| error.to_string())?
-        .is_none()
-    {
-        let output = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .output()
-            .map_err(|error| format!("Cannot stop terminal process: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "Cannot stop terminal process: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
+    terminal.job.stop()?;
     #[cfg(windows)]
     child
         .wait()
@@ -575,9 +729,11 @@ pub fn handle(
             for (name, value) in terminal_environment(&data_directory) {
                 command.env(name, value);
             }
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            #[cfg(windows)]
+            let (mut child, job) = WindowsTerminalJob::spawn(&mut command)?;
+            #[cfg(not(windows))]
             let mut child = command
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|error| format!("Cannot start command: {error}"))?;
             #[cfg(unix)]
@@ -608,6 +764,8 @@ pub fn handle(
                 session_id: params.session_id.clone(),
                 directory: fallback.clone(),
                 child: Mutex::new(child),
+                #[cfg(windows)]
+                job,
                 #[cfg(unix)]
                 watchdog: Mutex::new(watchdog),
                 stopped: AtomicBool::new(false),
@@ -1265,18 +1423,60 @@ mod tests {
     }
 
     #[test]
-    fn terminal_environment_changes_only_worktree_temp_and_cache() {
+    fn terminal_environment_keeps_package_download_caches_shared() {
         let root = Path::new("/sail-cache/terminal-worktrees/worktree");
         let environment = terminal_environment(root);
 
         assert!(environment.contains(&("TMPDIR", root.join("tmp"))));
         assert!(environment.contains(&("XDG_CACHE_HOME", root.join("cache"))));
+        let shared = Path::new("/sail-cache/terminal-package-downloads");
+        assert!(environment.contains(&("PIP_CACHE_DIR", shared.join("pip"))));
+        assert!(environment.contains(&("UV_CACHE_DIR", shared.join("uv"))));
+        assert!(environment.contains(&("POETRY_CACHE_DIR", shared.join("poetry"))));
         assert!(!environment.iter().any(|(name, _)| {
             matches!(
                 *name,
                 "HOME" | "XDG_CONFIG_HOME" | "NPM_CONFIG_CACHE" | "CARGO_HOME"
             )
         }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_terminal_job_stops_descendant_after_direct_child_exits() {
+        let marker = std::env::temp_dir().join(format!(
+            "sail-windows-terminal-descendant-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let marker_literal = marker.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 5; Set-Content -LiteralPath ''{marker_literal}'' done'); exit 0"
+        );
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-Command", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (mut child, job) = WindowsTerminalJob::spawn(&mut command).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal command did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            job.active_processes().unwrap() > 0,
+            "descendant remains in job"
+        );
+
+        job.stop()
+            .expect("terminate descendants after direct child exit");
+        assert_eq!(job.active_processes().unwrap(), 0);
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(!marker.exists(), "descendant survived terminal stop");
+        let _ = std::fs::remove_file(marker);
     }
 
     #[test]

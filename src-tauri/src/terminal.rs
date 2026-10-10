@@ -400,6 +400,22 @@ mod tests {
     }
 
     #[test]
+    fn failed_terminal_close_keeps_session_for_retry() {
+        let mut sessions =
+            std::collections::HashMap::from([("terminal".to_string(), std::sync::Arc::new(()))]);
+        let error = super::stop_then_remove(&mut sessions, "terminal", |_| {
+            Err("terminal stop failed".to_string())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "terminal stop failed");
+        assert!(sessions.contains_key("terminal"));
+
+        super::stop_then_remove(&mut sessions, "terminal", |_| Ok(())).unwrap();
+        assert!(!sessions.contains_key("terminal"));
+    }
+
+    #[test]
     fn default_editor_path_survives_argument_parsing() {
         let editor = default_editor();
         let parts = shell_words::split(&editor).expect("valid default editor");
@@ -1202,14 +1218,19 @@ pub fn terminal_resize(
 
 #[tauri::command]
 pub fn terminal_close(manager: State<'_, TerminalManager>, id: String) -> Result<(), String> {
-    let session = manager
-        .0
-        .lock()
-        .map_err(|error| error.to_string())?
-        .remove(&id);
-    if let Some(session) = session {
-        session.stop()?;
+    let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
+    stop_then_remove(&mut sessions, &id, TerminalSession::stop)
+}
+
+fn stop_then_remove<T>(
+    sessions: &mut HashMap<String, Arc<T>>,
+    id: &str,
+    stop: impl FnOnce(&T) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(session) = sessions.get(id) {
+        stop(session)?;
     }
+    sessions.remove(id);
     Ok(())
 }
 
