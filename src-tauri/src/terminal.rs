@@ -189,11 +189,13 @@ mod tests {
     #[test]
     fn worktree_removal_stops_owned_pty_descendant_on_first_attempt() {
         use crate::acp_terminal::WindowsTerminalJob;
-        use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize, SlavePty};
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         use std::io::Write;
 
-        let managed = tempfile::tempdir().expect("managed terminal data directory");
-        std::fs::write(managed.path().join("cache-entry"), "private cache")
+        let managed =
+            std::env::temp_dir().join(format!("sail-owned-terminal-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&managed).expect("managed terminal data directory");
+        std::fs::write(managed.join("cache-entry"), "private cache")
             .expect("create managed cache entry");
         let job = WindowsTerminalJob::new().expect("create owned terminal job");
         let pair = native_pty_system()
@@ -228,9 +230,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        let result = crate::remove_worktree_then_terminal_data(managed.path(), || job.stop());
+        let result = crate::remove_worktree_then_terminal_data(&managed, || job.stop());
         assert!(result.is_ok(), "first removal failed: {result:?}");
-        assert!(!managed.path().exists(), "managed data was retained");
+        assert!(!managed.exists(), "managed data was retained");
         assert_eq!(job.active_processes().unwrap(), 0);
         child.wait().expect("reap stopped terminal shell");
     }
@@ -239,12 +241,14 @@ mod tests {
     #[test]
     fn worktree_removal_stops_pty_descendant_after_shell_exits() {
         use crate::acp_terminal::WindowsTerminalJob;
-        use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize, SlavePty};
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         use std::sync::atomic::AtomicBool;
         use std::sync::{Arc, Condvar, Mutex};
 
-        let managed = tempfile::tempdir().expect("managed terminal data directory");
-        std::fs::write(managed.path().join("cache-entry"), "private cache")
+        let managed =
+            std::env::temp_dir().join(format!("sail-owned-terminal-data-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&managed).expect("managed terminal data directory");
+        std::fs::write(managed.join("cache-entry"), "private cache")
             .expect("create managed cache entry");
         let job = WindowsTerminalJob::new().expect("create owned terminal job");
         let pair = native_pty_system()
@@ -286,8 +290,8 @@ mod tests {
         let session = super::TerminalSession {
             inspect_id: "windows-owned-terminal-test".to_string(),
             owner: None,
-            directory: managed.path().to_path_buf(),
-            worktree: managed.path().to_path_buf(),
+            directory: managed.clone(),
+            worktree: managed.clone(),
             process_id,
             master: Mutex::new(pair.master),
             process_group_stop: Arc::new(Mutex::new(())),
@@ -297,7 +301,7 @@ mod tests {
             output: Arc::new(Mutex::new(super::TerminalOutput {
                 history: VecDeque::new(),
                 start: 0,
-                current_directory: managed.path().to_path_buf(),
+                current_directory: managed.clone(),
                 osc_tail: Vec::new(),
                 exit_code: Some(0),
                 subscriber: None,
@@ -305,9 +309,9 @@ mod tests {
             changed: Arc::new(Condvar::new()),
         };
 
-        let result = crate::remove_worktree_then_terminal_data(managed.path(), || session.stop());
+        let result = crate::remove_worktree_then_terminal_data(&managed, || session.stop());
         assert!(result.is_ok(), "first removal failed: {result:?}");
-        assert!(!managed.path().exists(), "managed data was retained");
+        assert!(!managed.exists(), "managed data was retained");
         assert_eq!(session.job.active_processes().unwrap(), 0);
         child.wait().expect("reap exited terminal shell");
     }
@@ -1254,7 +1258,7 @@ fn owned_session(
     Ok(session)
 }
 
-fn git_worktree_root(directory: &Path) -> PathBuf {
+pub(crate) fn git_worktree_root(directory: &Path) -> PathBuf {
     let output = Command::new("git")
         .arg("-C")
         .arg(directory)

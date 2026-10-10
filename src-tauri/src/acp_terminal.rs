@@ -53,6 +53,10 @@ pub fn worktree_data_directory(cache_directory: &Path, worktree: &Path) -> PathB
     cache_directory.join("terminal-worktrees").join(name)
 }
 
+fn terminal_worktree_root(directory: &Path) -> PathBuf {
+    crate::terminal::git_worktree_root(directory)
+}
+
 pub(crate) fn stable_worktree_identity(worktree: &Path) -> PathBuf {
     if let Ok(canonical) = dunce::canonicalize(worktree) {
         return canonical;
@@ -345,9 +349,8 @@ impl AcpTerminalManager {
             .map_err(|error| error.to_string())?
             .iter()
             .filter(|(_, terminal)| {
-                dunce::canonicalize(&terminal.directory)
-                    .unwrap_or_else(|_| terminal.directory.clone())
-                    == worktree
+                let terminal_directory = stable_worktree_identity(&terminal.directory);
+                terminal_directory == worktree || terminal_directory.starts_with(&worktree)
             })
             .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
             .collect::<Vec<_>>();
@@ -369,15 +372,18 @@ impl AcpTerminalManager {
 
     fn with_worktree_creation<T>(
         &self,
-        worktree: &Path,
-        create: impl FnOnce() -> Result<T, String>,
+        directory: &Path,
+        create: impl FnOnce(&Path) -> Result<T, String>,
     ) -> Result<T, String> {
-        let worktree = stable_worktree_identity(worktree);
         let blocked = self
             .worktrees_being_removed
             .lock()
             .map_err(|error| error.to_string())?;
-        if blocked.contains(&worktree) {
+        let worktree = stable_worktree_identity(&terminal_worktree_root(directory));
+        if blocked
+            .iter()
+            .any(|removed| worktree == *removed || worktree.starts_with(removed))
+        {
             return Err("Worktree is being removed.".to_string());
         }
         let current = dunce::canonicalize(&worktree)
@@ -385,7 +391,7 @@ impl AcpTerminalManager {
         if !current.is_dir() || current != worktree {
             return Err("Worktree folder changed while creating terminal.".to_string());
         }
-        create()
+        create(&worktree)
     }
 
     fn archive(&self, id: String, terminal: &AcpTerminal) -> Result<(), String> {
@@ -703,7 +709,7 @@ pub fn handle(
             .ok_or("Unknown agent session.")?
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        return manager.with_worktree_creation(&fallback, || {
+        return manager.with_worktree_creation(&fallback, |worktree| {
             let directory = params.cwd.as_deref().map(Path::new).unwrap_or(&fallback);
             if !directory.is_absolute() || !directory.is_dir() {
                 return Err(
@@ -714,7 +720,7 @@ pub fn handle(
                 &app.path()
                     .app_cache_dir()
                     .map_err(|error| error.to_string())?,
-                &fallback,
+                worktree,
             );
             let temp_directory = data_directory.join("tmp");
             let cache_directory = data_directory.join("cache");
@@ -771,7 +777,7 @@ pub fn handle(
                 agent: agent.to_string(),
                 profile,
                 session_id: params.session_id.clone(),
-                directory: fallback.clone(),
+                directory: worktree.to_path_buf(),
                 child: Mutex::new(child),
                 #[cfg(windows)]
                 job,
@@ -1312,7 +1318,7 @@ mod tests {
         let creator_manager = Arc::clone(&manager);
         let creator_worktree = worktree.clone();
         let creator = std::thread::spawn(move || {
-            creator_manager.with_worktree_creation(&creator_worktree, || {
+            creator_manager.with_worktree_creation(&creator_worktree, |_| {
                 creating_tx.send(()).unwrap();
                 finish_create_rx.recv().unwrap();
                 Ok(())
@@ -1334,7 +1340,7 @@ mod tests {
         stopper.join().unwrap().unwrap();
         std::fs::remove_dir_all(&worktree).unwrap();
         let mut created_after_removal = false;
-        let create_after_stop = manager.with_worktree_creation(&worktree, || {
+        let create_after_stop = manager.with_worktree_creation(&worktree, |_| {
             assert!(external_cwd.is_dir());
             created_after_removal = true;
             Ok(())
@@ -1342,7 +1348,7 @@ mod tests {
         assert_eq!(create_after_stop.unwrap_err(), "Worktree is being removed.");
         assert!(!created_after_removal);
         std::fs::create_dir_all(&worktree).unwrap();
-        let blocked_recreation = manager.with_worktree_creation(&worktree, || {
+        let blocked_recreation = manager.with_worktree_creation(&worktree, |_| {
             created_after_removal = true;
             Ok(())
         });
@@ -1352,7 +1358,9 @@ mod tests {
         );
         assert!(!created_after_removal);
         manager.allow_worktree_terminals(&worktree);
-        assert!(manager.with_worktree_creation(&worktree, || Ok(())).is_ok());
+        assert!(manager
+            .with_worktree_creation(&worktree, |_| Ok(()))
+            .is_ok());
         std::fs::remove_dir_all(worktree).unwrap();
         std::fs::remove_dir_all(external_cwd).unwrap();
     }
@@ -1411,6 +1419,93 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, second);
         assert!(first.starts_with(cache.join("terminal-worktrees")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_agent_terminal_uses_root_cache_and_stops_with_worktree() {
+        use std::os::unix::process::CommandExt;
+
+        let scratch =
+            std::env::temp_dir().join(format!("sail-acp-nested-worktree-{}", uuid::Uuid::new_v4()));
+        let worktree = scratch.join("worktree");
+        let nested = worktree.join("subdir");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&worktree)
+            .status()
+            .unwrap()
+            .success());
+
+        let canonical_root = dunce::canonicalize(&worktree).unwrap();
+        let session_worktree = terminal_worktree_root(&nested);
+        assert_eq!(session_worktree, canonical_root);
+        let cache = scratch.join("cache");
+        let session_data = worktree_data_directory(&cache, &session_worktree);
+        let deletion_data = worktree_data_directory(&cache, &canonical_root);
+        assert_eq!(session_data, deletion_data);
+        assert_ne!(
+            session_data,
+            worktree_data_directory(&cache, &nested),
+            "nested cwd must not create a second cache identity"
+        );
+
+        let marker = scratch.join("surviving-process-marker");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 2; touch \"$1\"", "sh"]);
+        command.arg(&marker);
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let child = command.spawn().unwrap();
+        let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id()).unwrap();
+        let terminal = Arc::new(AcpTerminal {
+            agent: "codex".to_string(),
+            profile: CapabilityProfile::Review,
+            session_id: "nested-session".to_string(),
+            directory: nested.clone(),
+            child: Mutex::new(child),
+            watchdog: Mutex::new(watchdog),
+            stopped: AtomicBool::new(false),
+            output: Mutex::new(TerminalOutput {
+                bytes: VecDeque::new(),
+                start: 0,
+                truncated: false,
+                exit: None,
+                output_complete: false,
+                released: false,
+            }),
+            changed: Condvar::new(),
+            limit: 1024,
+        });
+        let manager = AcpTerminalManager::default();
+        manager
+            .active
+            .lock()
+            .unwrap()
+            .insert("nested-terminal".to_string(), terminal);
+
+        manager.stop_worktree(&canonical_root).unwrap();
+        assert!(manager.active.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(worktree.join(".git")).unwrap();
+        let mut created_after_stop = false;
+        let create_after_stop = manager.with_worktree_creation(&nested, |_| {
+            created_after_stop = true;
+            Ok(())
+        });
+        assert_eq!(create_after_stop.unwrap_err(), "Worktree is being removed.");
+        assert!(!created_after_stop);
+        std::thread::sleep(Duration::from_millis(2_200));
+        assert!(!marker.exists(), "nested terminal process survived removal");
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[test]
