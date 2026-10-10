@@ -3117,8 +3117,13 @@ pub async fn acp_new_session(
     tauri::async_runtime::spawn_blocking(move || {
         connect_blocking(app.clone(), &manager, agent.clone(), profile)?;
         let runtime = connection_for_profile(&manager, &agent, profile)?;
-        let config =
-            browser.config_for_profile(&cwd, None, Some(&agent), Some(profile.as_str()))?;
+        let config = browser.config_for_profile(
+            &cwd,
+            None,
+            Some(&agent),
+            Some(profile.as_str()),
+            crate::background_priority::enabled(&app),
+        )?;
         let servers = session_servers(mcp_server(&config));
         let _serial = runtime
             .session_creation
@@ -3370,6 +3375,7 @@ async fn restore_session(
                         Some(&session_id),
                         Some(&agent),
                         Some(profile.as_str()),
+                        crate::background_priority::enabled(&app),
                     )
                 },
                 |token| browser.release(token),

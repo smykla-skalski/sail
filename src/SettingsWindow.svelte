@@ -849,6 +849,21 @@
           </label>
           <p>Selecting text outside inputs copies it and announces "Copied".</p>
         </section>
+        <section class="settings-card">
+          <h2>Performance</h2>
+          <label class="attention-setting">
+            <input
+              type="checkbox"
+              checked={snapshot.backgroundPriorityEnabled}
+              onchange={(event) =>
+                send({ type: 'background-priority', value: event.currentTarget.checked })}
+            />
+            Run agent commands and browser tools at background priority
+          </label>
+          <p>
+            Turn this off to troubleshoot slow agent commands. New jobs use the changed setting.
+          </p>
+        </section>
       {:else}<p role="status">Loading settings…</p>{/if}
     {:else if selectedSection === 'opencode'}
       <h1>OpenCode</h1>

@@ -451,6 +451,17 @@ fn spawn(
             pixel_height: 0,
         })
         .map_err(|error| error.to_string())?;
+    let background = owner.is_some() && crate::background_priority::enabled(&app);
+    #[cfg(unix)]
+    let mut command = if let Some(nice) = crate::background_priority::nice_program(background) {
+        let mut command = CommandBuilder::new(nice);
+        command.args(["-n", "10"]);
+        command.arg(shell());
+        command
+    } else {
+        CommandBuilder::new(shell())
+    };
+    #[cfg(windows)]
     let mut command = CommandBuilder::new(shell());
     #[cfg(not(windows))]
     if let Some(script) = script {
@@ -494,6 +505,14 @@ fn spawn(
     }));
     let changed = Arc::new(Condvar::new());
     let process_id = child.process_id();
+    #[cfg(windows)]
+    if background {
+        if let Some(pid) = process_id {
+            crate::background_priority::lower_process(pid);
+        } else {
+            eprintln!("Background priority unavailable: terminal process ID is missing; continuing at normal priority");
+        }
+    }
     let killer = child.clone_killer();
     let child = Arc::new(Mutex::new(child));
     let background_output = Arc::clone(&output);
