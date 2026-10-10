@@ -197,8 +197,10 @@ fn legacy_data_directory(cache_directory: &Path, root: &Path) -> Result<PathBuf,
 fn has_git_metadata(path: &Path) -> bool {
     let mut current = Some(path);
     while let Some(directory) = current {
-        if directory.join(".git").exists() {
-            return true;
+        match fs::symlink_metadata(directory.join(".git")) {
+            Ok(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
         }
         current = directory.parent();
     }
@@ -610,7 +612,7 @@ fn git_path(directory: &Path, arguments: &[&str]) -> Result<PathBuf, String> {
         return Err("Cannot verify Git worktree identity.".into());
     }
     let path = strip_final_newline(output.stdout);
-    let path = path_from_bytes(path)?;
+    let path = git_path_from_bytes(path)?;
     if !path.is_absolute() {
         return Err("Git returned a non-absolute worktree identity path.".into());
     }
@@ -625,6 +627,19 @@ fn strip_final_newline(mut bytes: Vec<u8>) -> Vec<u8> {
         }
     }
     bytes
+}
+
+fn git_path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        String::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|error| format!("Git returned an invalid UTF-8 path: {error}"))
+    }
+    #[cfg(not(windows))]
+    {
+        path_from_bytes(bytes)
+    }
 }
 
 #[cfg(unix)]
@@ -879,7 +894,7 @@ fn git_worktrees(common_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for field in output.stdout.split(|byte| *byte == 0) {
         if let Some(path) = field.strip_prefix(b"worktree ") {
-            paths.push(path_from_bytes(path.to_vec())?);
+            paths.push(git_path_from_bytes(path.to_vec())?);
         }
     }
     Ok(paths)
@@ -1270,6 +1285,66 @@ mod tests {
     fn lexical_identity_does_not_follow_a_reused_path() {
         let root = Path::new("/tmp/worktree/../worktree");
         assert_eq!(lexical_absolute(root), Path::new("/tmp/worktree"));
+    }
+
+    #[test]
+    fn git_paths_decode_utf8_output_separately_from_owner_path_bytes() {
+        let path = git_path_from_bytes("/tmp/café-工作".as_bytes().to_vec()).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/café-工作"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_git_metadata_does_not_reopen_legacy_storage() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "sail-dangling-git-metadata-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let worktree = root.join("worktree");
+        let cache = root.join("cache");
+        fs::create_dir_all(&worktree).unwrap();
+        symlink(worktree.join("missing-git-dir"), worktree.join(".git")).unwrap();
+        let legacy = legacy_data_directory(&cache, &stable_worktree_identity(&worktree)).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("sentinel"), "retain").unwrap();
+
+        let error = register(&cache, &worktree)
+            .err()
+            .expect("dangling Git metadata must block legacy fallback");
+
+        assert!(error.contains("Git identity cannot be verified"));
+        assert_eq!(
+            fs::read_to_string(legacy.join("sentinel")).unwrap(),
+            "retain"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unicode_git_worktree_paths_register_and_clean() {
+        let fixture = GitFixture::new();
+        let worktree = fixture.root.join("café-工作");
+        GitFixture::git(
+            &fixture.repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let (directory, lease) = register(&fixture.cache, &worktree).unwrap();
+        lease.mark_started();
+        lease.release_clean().unwrap();
+        fixture.remove(&worktree);
+
+        remove_after_worktree_removal(&fixture.cache, std::slice::from_ref(&directory)).unwrap();
+
+        assert!(!directory.exists());
     }
 
     #[test]
