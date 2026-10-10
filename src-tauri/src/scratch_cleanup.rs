@@ -40,14 +40,21 @@ fn sweep(
             continue;
         }
         if let Some(original_name) = private_quarantine_name(&name) {
-            let root = path.join("root");
-            if !root.exists() {
-                if now.duration_since(metadata.modified()?).unwrap_or_default() >= IDLE_AGE {
-                    let _ = fs::remove_dir(&path);
-                }
+            if now.duration_since(metadata.modified()?).unwrap_or_default() < IDLE_AGE {
                 continue;
             }
-            if now.duration_since(metadata.modified()?).unwrap_or_default() < IDLE_AGE {
+            let Ok(root) = private_child(&path) else {
+                continue;
+            };
+            let Some(old_root) = root else {
+                let _ = fs::remove_dir(&path);
+                continue;
+            };
+            // A process may have seen the old child name during recovery's
+            // brief directory listing. Rename it after hiding the parent so
+            // only the new, unlisted path is used for the safety check.
+            let root = path.join(uuid::Uuid::new_v4().to_string());
+            if fs::rename(&old_root, &root).is_err() {
                 continue;
             }
             let original = temp.join(original_name);
@@ -90,7 +97,10 @@ fn sweep(
             let _ = fs::remove_dir(&private);
             continue;
         }
-        let quarantine = private.join("root");
+        // The child name is independent of the visible parent name. A process
+        // can list the temp directory, but cannot list this 0300 directory or
+        // derive the child path during the final open-file check and deletion.
+        let quarantine = private.join(uuid::Uuid::new_v4().to_string());
         if fs::rename(&path, &quarantine).is_err() {
             let _ = fs::remove_dir(&private);
             continue;
@@ -114,6 +124,20 @@ fn sweep(
         freed += bytes;
     }
     Ok(freed)
+}
+
+fn private_child(parent: &Path) -> std::io::Result<Option<PathBuf>> {
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let entries = fs::read_dir(parent).and_then(|entries| {
+        let mut entries = entries.collect::<std::io::Result<Vec<_>>>()?;
+        if entries.len() > 1 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        Ok(entries.pop().map(|entry| entry.path()))
+    });
+    let hidden = fs::set_permissions(parent, fs::Permissions::from_mode(0o300));
+    hidden?;
+    entries
 }
 
 fn restore(quarantine: &Path, original: &Path) {
@@ -400,6 +424,8 @@ mod tests {
                     0o300
                 );
                 assert!(fs::read_dir(private).is_err());
+                assert_ne!(path.file_name().unwrap(), "root");
+                assert!(fs::File::create(private.join("root").join("late")).is_err());
             }
             Some(false)
         })
@@ -416,7 +442,7 @@ mod tests {
             "sail-cleanup-private-{}-{name}",
             uuid::Uuid::new_v4()
         ));
-        let root = private.join("root");
+        let root = private.join(uuid::Uuid::new_v4().to_string());
         fs::create_dir(&private).unwrap();
         fs::create_dir(&root).unwrap();
         cargo_artifacts(&root);
