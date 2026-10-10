@@ -1651,6 +1651,7 @@
     let directClaim = '';
     let directAuthorization: DirectShipAuthorization | undefined;
     let deliverySessionId = activeSessionId;
+    let releaseSlot: (() => void) | null = null;
     busy = true;
     if (activityThread) onstatus(activityThread, 'working');
     stopRequested = false;
@@ -1684,6 +1685,8 @@
     ];
     void follow();
     try {
+      releaseSlot = await acp.acquireTurnSlot(turnId, (limit) => (queuedLimit = limit));
+      if (stopRequested) throw new Error('Agent turn was cancelled.');
       if (!activeSessionId || !activityThread)
         activityThread = await ensureSession(text.slice(0, 60) || 'Attached files', true);
       if (activityThread?.title === 'New thread')
@@ -1780,7 +1783,8 @@
             recalledPrompt,
             turnId,
             promptImagePaths(sentImages, sentClipboard),
-            (limit) => (queuedLimit = limit),
+            undefined,
+            true,
           ),
         );
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
@@ -1881,6 +1885,7 @@
       }
       if (external && !queuedMessage) throw cause;
     } finally {
+      releaseSlot?.();
       if (inFlightSteer?.sessionId === deliverySessionId && inFlightSteer.turnId === turnId)
         inFlightSteer.finish();
       if (current === generation) rememberTranscript();
@@ -2146,6 +2151,7 @@
 
   async function stop() {
     stopRequested = true;
+    if (activeTurnId) acp.cancelQueuedTurn(activeTurnId);
     if (activePlanRevision)
       reportPlanRevision(activePlanRevision.id, 'Plan revision was cancelled.');
     diagnostic('stop_requested');

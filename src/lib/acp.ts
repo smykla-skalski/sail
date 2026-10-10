@@ -771,6 +771,24 @@ function restoreSession(
 
 const queuedPrompts = new Map<string, { agent: string; sessionId: string }>();
 
+async function acquireTurnSlot(
+  turnId: string,
+  onQueue?: (limit: number | null) => void,
+): Promise<() => void> {
+  const queue = resourceQueues.agent;
+  if (queue.status.active >= queue.status.limit || queue.status.waiting)
+    onQueue?.(queue.status.limit);
+  const unsubscribe = queue.subscribe(() => {
+    if (queue.isQueued(turnId)) onQueue?.(queue.status.limit);
+  });
+  try {
+    return await queue.acquire(turnId);
+  } finally {
+    unsubscribe();
+    onQueue?.(null);
+  }
+}
+
 async function limitedPrompt(
   agent: AgentId,
   sessionId: string,
@@ -778,21 +796,18 @@ async function limitedPrompt(
   turnId: string,
   imagePaths: string[],
   onQueue?: (limit: number | null) => void,
+  slotHeld = false,
 ): Promise<AcpPromptOutcome> {
-  const queue = resourceQueues.agent;
-  if (queue.status.active >= queue.status.limit || queue.status.waiting)
-    onQueue?.(queue.status.limit);
+  if (slotHeld)
+    return invoke<AcpPromptOutcome>('acp_prompt', {
+      params: { agent, sessionId, text, turnId, imagePaths },
+    });
   queuedPrompts.set(turnId, { agent, sessionId });
-  const unsubscribe = queue.subscribe(() => {
-    if (queue.isQueued(turnId)) onQueue?.(queue.status.limit);
-  });
   let release: () => void;
   try {
-    release = await queue.acquire(turnId);
+    release = await acquireTurnSlot(turnId, onQueue);
   } finally {
-    unsubscribe();
     queuedPrompts.delete(turnId);
-    onQueue?.(null);
   }
   try {
     return await invoke<AcpPromptOutcome>('acp_prompt', {
@@ -839,7 +854,10 @@ export const acp = {
     turnId: string,
     imagePaths: string[] = [],
     onQueue?: (limit: number | null) => void,
-  ) => limitedPrompt(agent, sessionId, text, turnId, imagePaths, onQueue),
+    slotHeld = false,
+  ) => limitedPrompt(agent, sessionId, text, turnId, imagePaths, onQueue, slotHeld),
+  acquireTurnSlot,
+  cancelQueuedTurn: (turnId: string) => resourceQueues.agent.cancel(turnId),
   steer: (agent: AgentId, sessionId: string, text: string, imagePaths: string[] = []) =>
     invoke<{ outcome: 'injected' | 'startedNewTurn' | 'promptRequired' | 'failed' }>('acp_steer', {
       params: { agent, sessionId, text, imagePaths },

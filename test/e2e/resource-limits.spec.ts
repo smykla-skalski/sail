@@ -73,6 +73,9 @@ describe('concurrent job settings', () => {
     await setLimit('browser', 3);
     await setLimit('e2e', 2);
     await returnToWorkspace();
+    await browser.execute(() => sessionStorage.setItem('sail-e2e-settings', 'enabled'));
+    await browser.refresh();
+    await $('[aria-label="Settings"]').waitForDisplayed();
     await openSettings();
     await $('button=Agents').click();
     await expect($('#resource-limit-agent')).toHaveValue('0');

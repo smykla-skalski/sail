@@ -1,6 +1,29 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ResourceQueue } from '../src/lib/resource-queue.ts';
+import { isSetting } from '../src/lib/settings.ts';
+import { acp } from '../src/lib/acp.ts';
+import { resourceQueues } from '../src/lib/resource-limits.ts';
+
+void test('E2E job limit loads with user settings, unlike test-only E2E keys', () => {
+  assert.equal(isSetting('sai-e2e-job-limit'), true);
+  assert.equal(isSetting('sai-e2e-delete-worktree'), false);
+});
+
+void test('queued agent startup can be cancelled before acquiring a slot', async () => {
+  resourceQueues.agent.setLimit(0);
+  const limits: (number | null)[] = [];
+  try {
+    const pending = acp.acquireTurnSlot('queued-startup', (limit) => limits.push(limit));
+    assert.equal(await settled(pending), false);
+    assert.equal(acp.cancelQueuedTurn('queued-startup'), true);
+    await assert.rejects(pending, /cancelled/);
+    assert.deepEqual(limits, [0, 0, null]);
+    assert.equal(resourceQueues.agent.status.active, 0);
+  } finally {
+    resourceQueues.agent.setLimit(4);
+  }
+});
 
 async function settled(promise: Promise<unknown>): Promise<boolean> {
   return Promise.race([
