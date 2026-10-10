@@ -182,9 +182,9 @@ fn default_editor() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        canonical_terminal_paths, default_editor, git_worktree_root, output_page, TerminalOutput,
-    };
+    #[cfg(unix)]
+    use super::git_worktree_root;
+    use super::{canonical_terminal_paths, default_editor, output_page, TerminalOutput};
     use std::collections::VecDeque;
     use std::path::Path;
 
