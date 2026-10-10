@@ -947,6 +947,9 @@ static PROVIDERS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Option<P
     std::sync::OnceLock::new();
 
 #[cfg(target_os = "macos")]
+static PROVIDER_STOPPED: std::sync::Condvar = std::sync::Condvar::new();
+
+#[cfg(target_os = "macos")]
 static ACTIVE_SESSIONS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::OnceLock::new();
 
@@ -1017,6 +1020,7 @@ pub unsafe extern "C" fn sail_context_provider_stop(key: *const std::ffi::c_char
                         if let Ok(mut providers) = providers.lock() {
                             if providers.get(&key).is_some_and(Option::is_none) {
                                 providers.remove(&key);
+                                PROVIDER_STOPPED.notify_all();
                             }
                         }
                     }
@@ -1281,13 +1285,25 @@ fn provider_request_at(
     let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
     let key = project_key(&canonical)?;
     let providers = PROVIDERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
-    let slot = providers
-        .lock()
-        .map_err(|error| error.to_string())?
-        .entry(key.clone())
-        .or_insert_with(|| Some(std::sync::Arc::new(std::sync::Mutex::new(None))))
-        .clone()
-        .ok_or("Provider is stopping; retry.")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(35);
+    let mut registry = providers.lock().map_err(|error| error.to_string())?;
+    let slot = loop {
+        if let Some(slot) = registry
+            .entry(key.clone())
+            .or_insert_with(|| Some(std::sync::Arc::new(std::sync::Mutex::new(None))))
+            .clone()
+        {
+            break slot;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("Provider stop timed out during session handoff.".into());
+        }
+        (registry, _) = PROVIDER_STOPPED
+            .wait_timeout(registry, remaining)
+            .map_err(|error| error.to_string())?;
+    };
+    drop(registry);
     let mut provider = slot.lock().map_err(|error| error.to_string())?;
     let session_active = || -> Result<bool, String> {
         let sessions = active_sessions()
@@ -1878,6 +1894,16 @@ mod tests {
         let repository = Repository::new("runtime-stop-busy");
         repository.configure();
         let key = project_key(&repository.0).unwrap();
+        let _stop = StopProvider(key.clone());
+        let executable = repository.provider_fixture();
+        let store_path = repository.0.join("approvals.json");
+        let fingerprint = locked_store(&store_path, |store| {
+            register(store, "fixture-provider", &executable);
+            let fingerprint = status(&repository.0, store).fingerprint.unwrap();
+            approve(&repository.0, store, &fingerprint)?;
+            Ok((fingerprint, true))
+        })
+        .unwrap();
         let slot: ProviderSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
         PROVIDERS
             .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
@@ -1896,17 +1922,31 @@ mod tests {
             .unwrap()
             .get(key.to_str().unwrap())
             .is_some_and(Option::is_none));
-        let error = provider_request_at(
-            &repository.0,
-            "unused",
-            None,
-            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
-            &repository.0.join("approvals.json"),
-            &repository.0.join("data"),
-        )
-        .unwrap_err();
-        assert!(error.contains("Provider is stopping"));
-        drop(guard);
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let result = provider_request_at(
+                    &repository.0,
+                    &fingerprint,
+                    None,
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                    &store_path,
+                    &repository.0.join("data"),
+                );
+                send.send(result).unwrap();
+            });
+            assert!(receive
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err());
+            drop(guard);
+            let response = receive
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(value["id"], 1);
+        });
     }
 
     #[cfg(target_os = "macos")]
