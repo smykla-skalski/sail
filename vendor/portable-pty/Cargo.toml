@@ -97,7 +97,7 @@ serde_support = [
 ]
 
 [target."cfg(windows)".dependencies.bitflags]
-version = "1.3"
+version = "2.0"
 
 [target."cfg(windows)".dependencies.lazy_static]
 version = "1.4"
