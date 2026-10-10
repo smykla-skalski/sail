@@ -3052,6 +3052,7 @@ pub fn acp_pending_elicitations(
 #[serde(rename_all = "camelCase")]
 pub struct AcpElicitationParams {
     agent: String,
+    session_id: Option<String>,
     request_id: Value,
     action: String,
     content: Option<Value>,
@@ -3062,14 +3063,18 @@ pub fn acp_elicitation(
     manager: State<'_, AgentManager>,
     params: AcpElicitationParams,
 ) -> Result<(), String> {
-    let runtime = manager
-        .0
-        .lock()
-        .map_err(|error| error.to_string())?
-        .values()
-        .find(|runtime| runtime.agent == params.agent)
-        .cloned()
-        .ok_or_else(|| "Agent is not connected.".to_string())?;
+    let runtime = if let Some(session_id) = params.session_id.as_deref() {
+        connection_for_session(&manager, &params.agent, session_id)?
+    } else {
+        manager
+            .0
+            .lock()
+            .map_err(|error| error.to_string())?
+            .values()
+            .find(|runtime| runtime.agent == params.agent)
+            .cloned()
+            .ok_or_else(|| "Agent is not connected.".to_string())?
+    };
     let key = params.request_id.to_string();
     let pending = runtime
         .elicitation_state

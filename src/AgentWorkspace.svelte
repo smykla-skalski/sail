@@ -1188,6 +1188,7 @@
         elicitation.id,
         action,
         action === 'accept' ? content : undefined,
+        activeSessionId ?? undefined,
       );
       elicitations = elicitations.filter((item) => String(item.id) !== id);
       delete elicitationDrafts[id];

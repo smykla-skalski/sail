@@ -1,6 +1,6 @@
 # E2E suite observations
 
-Run WebdriverIO against a private Sail build and app profile as described in the repository `AGENTS.md`. The fixture specs and later app specs share one app process, so the WebdriverIO `before` hook resets the window size, fixture navigation, pending agent requests, and the durable E2E settings flag between specs.
+Run WebdriverIO against a private Sail build and app profile as described in the repository `AGENTS.md`. The fixture specs and later app specs share one app process, so the WebdriverIO `before` hook selects the main window, closes a leftover settings window, and resets the window size, fixture navigation, pending agent requests, and the durable E2E settings flag between specs.
 
 ## Clean macOS run on 2026-10-10
 

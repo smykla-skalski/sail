@@ -61,6 +61,7 @@ export const config = {
   connectionRetryTimeout: 90_000,
   /** Specs share one app process. Clear state left by earlier specs before pinning appearance. */
   async before() {
+    await browser.switchToWindow('main');
     await browser.setWindowSize(1280, 850);
     const needsReload = await browser.execute(async () => {
       const tauri: unknown = Reflect.get(window, '__TAURI__');
@@ -68,6 +69,11 @@ export const config = {
       const invoke: unknown = core && typeof core === 'object' ? Reflect.get(core, 'invoke') : null;
       if (typeof invoke !== 'function')
         throw new Error('Tauri API missing; cannot reset E2E state');
+      const windows: unknown = await invoke('plugin:wdio|list_windows');
+      if (!Array.isArray(windows) || !windows.every((label) => typeof label === 'string'))
+        throw new Error('Invalid Tauri window list');
+      const hadSettingsWindow = windows.includes('settings');
+      if (hadSettingsWindow) await invoke('plugin:window|close', { label: 'settings' });
       const response: unknown = await invoke('acp_pending_inbox');
       if (!Array.isArray(response)) throw new Error('Invalid pending inbox response');
       const pending: unknown[] = response;
@@ -87,7 +93,7 @@ export const config = {
           if (typeof requestId !== 'string' && typeof requestId !== 'number')
             throw new Error('Pending elicitation has no request ID');
           return invoke('acp_elicitation', {
-            params: { agent, requestId, action: 'cancel', content: null },
+            params: { agent, sessionId, requestId, action: 'cancel', content: null },
           });
         }
         if (method === 'session/request_permission') {
@@ -102,7 +108,7 @@ export const config = {
       sessionStorage.removeItem('sail-e2e-settings');
       const hadQuery = !!location.search;
       if (hadQuery) history.replaceState(null, '', location.pathname);
-      return hadQuery || pending.length > 0;
+      return hadSettingsWindow || hadQuery || pending.length > 0;
     });
     if (needsReload) await browser.refresh();
 

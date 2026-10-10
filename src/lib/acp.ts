@@ -845,7 +845,9 @@ export const acp = {
     requestId: string | number,
     action: 'accept' | 'decline' | 'cancel',
     content?: Record<string, unknown>,
-  ) => invoke<void>('acp_elicitation', { params: { agent, requestId, action, content } }),
+    sessionId?: string,
+  ) =>
+    invoke<void>('acp_elicitation', { params: { agent, sessionId, requestId, action, content } }),
   pendingInbox: () => invoke<AcpPendingInboxItem[]>('acp_pending_inbox'),
   activity: () => invoke<Record<AgentId, AgentActivity>>('acp_activity'),
   nativeSubagents: (directory: string) =>
