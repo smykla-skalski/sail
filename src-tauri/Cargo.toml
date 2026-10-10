@@ -42,7 +42,12 @@ wait-timeout = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
-keyring = { version = "4.0.0", features = ["apple-native", "windows-native", "sync-secret-service"] }
+keyring = { version = "4.0.0", default-features = false, features = [
+  "v1",
+  "apple-native-keyring-store",
+  "windows-native-keyring-store",
+  "dbus-secret-service-keyring-store",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
