@@ -1,5 +1,4 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,7 +118,7 @@ pub fn accept(
     repository: &Path,
     proposal: &Proposal,
     has_write_access: bool,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     if !has_write_access {
         return Err("Repository write access is required.".into());
     }
@@ -129,12 +128,70 @@ pub fn accept(
     if root != proposal.repository {
         return Err("Proposal belongs to another repository; review it there.".into());
     }
-    let target = checked_target(&root, &proposal.destination)?;
-    check_index_state(&root, &proposal.destination)?;
-    if git(&root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
+    check_source(&root, proposal)?;
+    if proposal.after == proposal.before
+        || proposal.diff != unified_diff(&proposal.destination, &proposal.before, &proposal.after)
+    {
+        return Err("Proposal changed after preview.".into());
+    }
+    let parent = root.parent().ok_or("Repository has no parent directory.")?;
+    let review = loop {
+        let path = parent.join(format!(
+            ".sail-knowledge-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => break path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Cannot create review worktree: {error}")),
+        }
+    };
+    let mut attached = false;
+    let result = (|| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["worktree", "add", "--detach"])
+            .arg(&review)
+            .arg(&proposal.revision)
+            .status()
+            .map_err(|error| format!("Cannot prepare review worktree: {error}"))?;
+        if !status.success() {
+            return Err("Cannot prepare review worktree.".into());
+        }
+        attached = true;
+        check_source(&root, proposal)?;
+        let target = checked_target(&review, &proposal.destination)?;
+        if read_document(&target)? != proposal.before {
+            return Err("Review worktree differs from the previewed document.".into());
+        }
+        fs::write(&target, proposal.after.as_bytes())
+            .map_err(|error| format!("Cannot prepare proposal: {error}"))?;
+        check_source(&root, proposal)?;
+        Ok(review.clone())
+    })();
+    if result.is_err() {
+        if attached {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["worktree", "remove", "--force"])
+                .arg(&review)
+                .status();
+        }
+        let _ = fs::remove_dir(&review);
+    }
+    result
+}
+
+fn check_source(root: &Path, proposal: &Proposal) -> Result<(), String> {
+    let target = checked_target(root, &proposal.destination)?;
+    check_index_state(root, &proposal.destination)?;
+    if git(root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
         || read_document(&target)? != proposal.before
         || !git(
-            &root,
+            root,
             &[
                 "status",
                 "--porcelain",
@@ -149,45 +206,7 @@ pub fn accept(
     {
         return Err("Destination changed after preview; review a new proposal.".into());
     }
-    if proposal.after == proposal.before
-        || proposal.diff != unified_diff(&proposal.destination, &proposal.before, &proposal.after)
-    {
-        return Err("Proposal changed after preview.".into());
-    }
-    let parent = target.parent().ok_or("Invalid destination.")?;
-    let name = format!(
-        ".sail-knowledge-{}-{}.tmp",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    );
-    let temporary = parent.join(name);
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| format!("Cannot prepare proposal: {error}"))?;
-        let permissions = fs::metadata(&target)
-            .map_err(|error| error.to_string())?
-            .permissions();
-        file.set_permissions(permissions)
-            .map_err(|error| error.to_string())?;
-        file.write_all(proposal.after.as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("Cannot prepare proposal: {error}"))?;
-        if checked_target(&root, &proposal.destination)? != target
-            || check_index_state(&root, &proposal.destination).is_err()
-            || read_document(&target)? != proposal.before
-            || git(&root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
-        {
-            return Err("Destination changed after preview; review a new proposal.".into());
-        }
-        fs::rename(&temporary, &target).map_err(|error| format!("Cannot accept proposal: {error}"))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    Ok(())
 }
 
 fn checked_target(root: &Path, destination: &Path) -> Result<PathBuf, String> {
@@ -305,8 +324,9 @@ fn unified_diff(path: &Path, before: &str, after: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
-    struct Repo(PathBuf);
+    struct Repo(PathBuf, RefCell<Vec<PathBuf>>);
 
     impl Repo {
         fn new() -> Self {
@@ -316,7 +336,7 @@ mod tests {
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
-            let repo = Self(path);
+            let repo = Self(path, RefCell::new(Vec::new()));
             repo.git(&["init", "-q"]);
             repo.git(&["config", "user.name", "Sail Test"]);
             repo.git(&["config", "user.email", "sail-test@example.invalid"]);
@@ -353,10 +373,27 @@ mod tests {
             )
             .unwrap()
         }
+        fn accept(&self, proposal: &Proposal, has_write_access: bool) -> Result<PathBuf, String> {
+            let result = accept(&self.0, proposal, has_write_access);
+            if let Ok(path) = &result {
+                self.1.borrow_mut().push(path.clone());
+            }
+            result
+        }
     }
 
     impl Drop for Repo {
         fn drop(&mut self) {
+            for review in self.1.borrow().iter() {
+                assert!(Command::new("git")
+                    .arg("-C")
+                    .arg(&self.0)
+                    .args(["worktree", "remove", "--force"])
+                    .arg(review)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
             fs::remove_dir_all(&self.0).unwrap();
         }
     }
@@ -379,19 +416,24 @@ mod tests {
     }
 
     #[test]
-    fn accept_writes_only_the_explicit_destination_as_uncommitted_change() {
+    fn accept_prepares_only_the_reviewed_destination_in_an_isolated_worktree() {
         let repo = Repo::new();
         let proposal = repo.preview();
-        accept(&repo.0, &proposal, true).unwrap();
-        let content = fs::read_to_string(repo.0.join("AGENTS.md")).unwrap();
+        let review = repo.accept(&proposal, true).unwrap();
+        let content = fs::read_to_string(review.join("AGENTS.md")).unwrap();
         assert!(content.ends_with("## New rule\n\nCheck output.\n"));
         assert!(!content.contains("private observation"));
         assert_eq!(
-            fs::read_to_string(repo.0.join("docs/project.md")).unwrap(),
+            fs::read_to_string(review.join("docs/project.md")).unwrap(),
             "# Project\n"
         );
         assert_eq!(
-            git(&repo.0, &["status", "--porcelain"]).unwrap(),
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "# Rules\n"
+        );
+        assert!(git(&repo.0, &["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(
+            git(&review, &["status", "--porcelain"]).unwrap(),
             " M AGENTS.md"
         );
     }
@@ -408,12 +450,32 @@ mod tests {
         )
         .is_err());
         let proposal = repo.preview();
-        assert!(accept(&repo.0, &proposal, false).is_err());
+        assert!(repo.accept(&proposal, false).is_err());
         fs::write(repo.0.join("AGENTS.md"), "updated elsewhere\n").unwrap();
-        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert!(repo.accept(&proposal, true).is_err());
         assert_eq!(
             fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
             "updated elsewhere\n"
+        );
+    }
+
+    #[test]
+    fn editor_save_after_review_does_not_change_the_prepared_diff() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let review = repo.accept(&proposal, true).unwrap();
+        fs::write(repo.0.join("AGENTS.md"), "editor's newer text\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "editor's newer text\n"
+        );
+        assert_eq!(
+            fs::read_to_string(review.join("AGENTS.md")).unwrap(),
+            "# Rules\n\n## New rule\n\nCheck output.\n"
+        );
+        assert_eq!(
+            git(&review, &["status", "--porcelain"]).unwrap(),
+            " M AGENTS.md"
         );
     }
 
@@ -424,7 +486,7 @@ mod tests {
         fs::write(repo.0.join("docs/project.md"), "new version\n").unwrap();
         repo.git(&["add", "docs/project.md"]);
         repo.git(&["commit", "-qm", "next"]);
-        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert!(repo.accept(&proposal, true).is_err());
         assert_eq!(
             fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
             "# Rules\n"
@@ -460,7 +522,7 @@ mod tests {
         let repo = Repo::new();
         let proposal = repo.preview();
         repo.git(&["update-index", "--assume-unchanged", "AGENTS.md"]);
-        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert!(repo.accept(&proposal, true).is_err());
         assert!(preview(
             &repo.0,
             Repo::memory(),
@@ -471,7 +533,7 @@ mod tests {
         .is_err());
         repo.git(&["update-index", "--no-assume-unchanged", "AGENTS.md"]);
         repo.git(&["update-index", "--skip-worktree", "AGENTS.md"]);
-        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert!(repo.accept(&proposal, true).is_err());
         assert_eq!(
             fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
             "# Rules\n"
@@ -536,7 +598,7 @@ mod tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("docs/project.md", repo.0.join("AGENTS.md")).unwrap();
-            assert!(accept(&repo.0, &proposal, true).is_err());
+            assert!(repo.accept(&proposal, true).is_err());
             assert_eq!(
                 fs::read_to_string(repo.0.join("docs/project.md")).unwrap(),
                 "# Project\n"
@@ -562,13 +624,12 @@ mod tests {
         repo.git(&["add", name]);
         repo.git(&["commit", "-qm", "add unicode document"]);
         let proposal = preview(&repo.0, Repo::memory(), Path::new(name), "  code\n", true).unwrap();
-        accept(&repo.0, &proposal, true).unwrap();
+        let review = repo.accept(&proposal, true).unwrap();
         assert_eq!(
-            fs::read_to_string(repo.0.join(name)).unwrap(),
+            fs::read_to_string(review.join(name)).unwrap(),
             "# Café\n\n  code\n"
         );
-        repo.git(&["add", name]);
-        repo.git(&["commit", "-qm", "accept unicode document"]);
+        assert_eq!(fs::read_to_string(repo.0.join(name)).unwrap(), "# Café\n");
 
         repo.git(&["update-index", "--assume-unchanged", name]);
         assert!(preview(&repo.0, Repo::memory(), Path::new(name), "add", true).is_err());
@@ -604,9 +665,9 @@ mod tests {
             preview(&repo.0, Repo::memory(), Path::new("AGENTS.md"), text, true).unwrap();
         assert!(proposal.diff().contains("+    indented code  \n"));
         assert!(proposal.diff().contains("+  next line\t\n+\n"));
-        accept(&repo.0, &proposal, true).unwrap();
+        let review = repo.accept(&proposal, true).unwrap();
         assert_eq!(
-            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            fs::read_to_string(review.join("AGENTS.md")).unwrap(),
             format!("# Rules\n\n{text}")
         );
         assert!(preview(
