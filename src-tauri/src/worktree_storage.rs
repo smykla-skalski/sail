@@ -694,13 +694,14 @@ fn path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
 #[cfg(windows)]
 fn path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
     use std::os::windows::ffi::OsStringExt;
-    if bytes.len() % 2 != 0 {
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err("Git returned an invalid worktree identity path.".into());
     }
     Ok(PathBuf::from(std::ffi::OsString::from_wide(
-        &bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        &pairs
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>(),
     )))
 }
@@ -1334,6 +1335,19 @@ mod tests {
     fn git_paths_decode_utf8_output_separately_from_owner_path_bytes() {
         let path = git_path_from_bytes("/tmp/café-工作".as_bytes().to_vec()).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/café-工作"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_git_identity_path_decodes_utf16_bytes_and_rejects_odd_length() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let path = path_from_bytes(vec![b'C', 0, b':', 0, b'\\', 0, 0x3d, 0xd8]).unwrap();
+        assert_eq!(
+            path.as_os_str().encode_wide().collect::<Vec<_>>(),
+            [u16::from(b'C'), u16::from(b':'), u16::from(b'\\'), 0xd83d]
+        );
+        assert!(path_from_bytes(vec![b'C']).is_err());
     }
 
     #[cfg(unix)]
