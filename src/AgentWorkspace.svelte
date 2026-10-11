@@ -1084,7 +1084,7 @@
       void showEarlier();
   }
 
-  async function loadHistory() {
+  async function loadHistory(requested = false) {
     const id = activeSessionId;
     if (
       !id ||
@@ -1093,11 +1093,12 @@
       busy ||
       running ||
       liveTurn ||
-      attachedCodexSession ||
+      (attachedCodexSession && !requested) ||
       historyAttempted
     )
       return;
     const current = generation;
+    attachedCodexSession = false;
     historyAttempted = true;
     historyLoading = true;
     if (!historyLoaded) liveMessageBoundary.pending = true;
@@ -1145,7 +1146,13 @@
       )
         void showEarlier();
     } catch (cause) {
-      if (current === generation) error = describe(cause);
+      if (current === generation) {
+        error = describe(cause);
+        if (requested) {
+          attachedCodexSession = true;
+          historyAttempted = false;
+        }
+      }
     } finally {
       if (current === generation) {
         setReplaying(false);
@@ -2791,6 +2798,13 @@
           role="note"
         >
           Earlier messages load when this turn ends.
+        </div>{:else if attachedCodexSession && !historyLoaded && !nativeEntries}<div
+          class="agent-history-status agent-history-gap"
+          role="note"
+        >
+          <p>Earlier messages are hidden while this Codex thread stays connected.</p>
+          <p>Wait for background work to finish. Loading history can restart work still running.</p>
+          <Button size="sm" onclick={() => void loadHistory(true)}>Load earlier messages</Button>
         </div>{/if}
       {#snippet failureTool(item: TranscriptTool)}
         {@const tool = item.raw as AgentTool}
@@ -3125,6 +3139,12 @@
   .agent-history-status {
     display: block;
     margin: 12px auto 20px;
+  }
+  .agent-history-gap {
+    max-width: 650px;
+  }
+  .agent-history-gap p {
+    margin: 0 0 8px;
   }
   .agent-welcome {
     max-width: 650px;

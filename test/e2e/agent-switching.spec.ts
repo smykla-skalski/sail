@@ -594,7 +594,7 @@ describe('agent sessions survive thread switches', () => {
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     const before = restarts(codex);
     rmSync(join(codex, 'codex-background-release.txt'), { force: true });
-    await sendPrompt('Background task');
+    await sendPrompt('Background task with history');
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Background task started.'),
     );
@@ -604,11 +604,20 @@ describe('agent sessions survive thread switches', () => {
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await browser.pause(500);
     expect(restarts(codex)).toBe(before);
+    await expect($('.agent-history-gap')).toHaveText(
+      expect.stringContaining('Loading history can restart work still running.'),
+    );
+    expect(await conversationText()).not.toContain('History marker 1.');
     writeFileSync(join(codex, 'codex-background-release.txt'), 'release\n');
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Background task finished.'),
       { wait: 15_000 },
     );
+    expect(restarts(codex)).toBe(before);
+    const loadEarlier = $('.agent-history-gap button');
+    await loadEarlier.click();
+    await expect($('.agent-history-gap')).not.toBeExisting();
+    expect(await conversationText()).toContain('History marker 1.');
     expect(restarts(codex)).toBe(before);
   });
 

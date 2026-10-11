@@ -882,7 +882,20 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
       continue;
     }
-    if (text === 'Background task') {
+    if (text === 'Background task' || text === 'Background task with history') {
+      if (text === 'Background task with history')
+        for (let index = 1; index <= 60; index += 1) {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'tool_call',
+            toolCallId: `background-history-${message.id}-${index}`,
+            title: `History step ${index}`,
+            status: 'completed',
+          });
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `History marker ${index}. ` },
+          });
+        }
       recordUpdate(sessionId, sessionId, {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Background task started.' },
