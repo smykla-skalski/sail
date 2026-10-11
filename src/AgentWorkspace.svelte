@@ -1646,7 +1646,8 @@
         settledElsewhere = removeResolvedAcpPermission(waiting, resolvedIdentity);
         for (const gone of waiting)
           if (!settledElsewhere.includes(gone)) noteAnswered(gone, outcome);
-        if (thread && running && permissions.length === 0) onstatus(thread, 'working');
+        if (thread && running && permissions.length === 0 && elicitations.length === 0)
+          onstatus(thread, 'working');
       } else if (message.method === 'session/update') {
         const update = params.update;
         if (!update || typeof update !== 'object') return;

@@ -1276,6 +1276,7 @@
   let inboxError = $state('');
   let inboxDialog: HTMLDialogElement;
   let inboxRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingStatusRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let inboxGeneration = 0;
   // Requests resolved since a refresh started; that refresh's stale list must not bring them back.
   const resolvedDuringRefresh = new SvelteMap<string, number>();
@@ -2466,6 +2467,7 @@
       for (const timer of shipClaimLeaseFenceTimers.values()) clearTimeout(timer);
       shipClaimLeaseFenceTimers.clear();
       clearTimeout(inboxRefreshTimer);
+      clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
       clearInterval(sidebarRefreshTimer);
@@ -8104,6 +8106,9 @@
           )
         : new Map();
     if (generation !== inboxGeneration || disposed) return;
+    clearTimeout(pendingStatusRetryTimer);
+    if (acpResult.status === 'rejected' && pendingStatusRetries.size)
+      pendingStatusRetryTimer = setTimeout(() => scheduleInboxRefresh(), 1000);
     if (acpResult.status === 'fulfilled') {
       for (const retry of pendingStatusRetries.values())
         reconcilePendingSessionStatus(
