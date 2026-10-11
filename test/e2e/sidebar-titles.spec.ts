@@ -117,7 +117,7 @@ describe('sidebar agent rows', () => {
     expect(rows.every((row) => row.title === '' && row.status > 0)).toBe(true);
     await expect($('.project-agent-row[data-depth="2"]')).toBeDisplayed();
     await expect($('.project-agent-row[data-reference="true"]')).toBeDisplayed();
-    const longStatus = $('.project-agent-row[aria-label*="3 active, 3 waiting"]');
+    const longStatus = $('.project-agent-row[aria-label*="4 active, 3 waiting"]');
     await expect(longStatus).toBeDisplayed();
     expect(await longStatus.getAttribute('data-depth')).toBe('1');
     await expect(longStatus.$('.project-subagent-tag')).toHaveText('Subagent');
