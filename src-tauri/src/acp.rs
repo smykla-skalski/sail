@@ -3466,6 +3466,7 @@ pub struct AcpElicitationParams {
 
 #[tauri::command]
 pub fn acp_elicitation(
+    app: AppHandle,
     manager: State<'_, AgentManager>,
     params: AcpElicitationParams,
 ) -> Result<(), String> {
@@ -3493,6 +3494,17 @@ pub fn acp_elicitation(
             .insert(key, pending);
         return Err(error);
     }
+    let _ = app.emit(
+        "acp-event",
+        AgentEvent {
+            agent: params.agent,
+            directory: Some(params.directory),
+            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+            message: json!({"method":"sail/elicitation_resolved","params":{
+                "sessionId":params.session_id,"requestId":params.request_id
+            }}),
+        },
+    );
     Ok(())
 }
 

@@ -1204,7 +1204,8 @@
       elicitations = elicitations.filter((item) => String(item.id) !== id);
       delete elicitationDrafts[id];
       if (activeSessionId)
-        saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
+        if (activeSessionId)
+          saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
       if (thread && !elicitations.length && !permissions.length) onstatus(thread, 'working');
     } catch (cause) {
       error = describe(cause);
@@ -1611,7 +1612,14 @@
         return;
       }
       if (!params || params.sessionId !== activeSessionId) return;
-      if (message.method === 'sail/permission_resolved') {
+      if (message.method === 'sail/elicitation_resolved') {
+        const requestId = params.requestId;
+        if (typeof requestId !== 'string' && typeof requestId !== 'number') return;
+        elicitations = elicitations.filter((item) => String(item.id) !== String(requestId));
+        delete elicitationDrafts[String(requestId)];
+        if (activeSessionId)
+          saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
+      } else if (message.method === 'sail/permission_resolved') {
         if (
           (typeof params.requestId !== 'string' && typeof params.requestId !== 'number') ||
           typeof params.sessionId !== 'string'

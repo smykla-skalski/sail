@@ -254,5 +254,15 @@ describe('subagent navigation and control', () => {
       'waiting',
     );
     await expect($('.agent-status-bar')).toHaveText(expect.stringContaining('1 need attention'));
+    await $('button.spawn-open').click();
+    await expect($('.elicitation')).toBeDisplayed();
+    await $('.elicitation').$('button=Decline').click();
+    await expect($('.elicitation')).not.toExist();
+    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
+      'data-state',
+      'waiting',
+    );
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
+    await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
   });
 });

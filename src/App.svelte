@@ -1709,6 +1709,52 @@
       },
     ].slice(-50);
   }
+  function reconcilePendingSessionStatus(
+    agent: AgentId,
+    worktreeDirectory: string,
+    sessionId: string,
+  ) {
+    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
+    const revision = permissionStatusRevisions.get(key);
+    void acp
+      .pendingInbox()
+      .then((pending) => {
+        if (
+          pending.some(
+            (item) =>
+              item.agent === agent &&
+              item.directory === worktreeDirectory &&
+              item.message.params?.sessionId === sessionId,
+          ) ||
+          permissionStatusRevisions.get(key) !== revision
+        )
+          return undefined;
+        nativeSubagents = setNativeSubagentWaiting(
+          nativeSubagents,
+          agent,
+          worktreeDirectory,
+          sessionId,
+          false,
+        );
+        for (const thread of agentThreads.filter(
+          (item) =>
+            item.agent === agent &&
+            item.sessionId === sessionId &&
+            item.directory === worktreeDirectory &&
+            threadAttention[threadKey(item)]?.status === 'waiting',
+        ))
+          updateAgentThreadStatus(thread, 'working');
+        for (const receipt of spawnReceipts.filter(
+          (item) =>
+            item.targetId === `acp:${agent}:${sessionId}` &&
+            item.targetDirectory === worktreeDirectory &&
+            item.state === 'waiting',
+        ))
+          updateSpawnReceipt(receipt.receiptId, { state: 'working' });
+        return undefined;
+      })
+      .catch(() => scheduleInboxRefresh());
+  }
   const shipOwnedThreads = $derived.by(() => {
     const owned = new SvelteSet<string>();
     for (const issue of shipRuns.flatMap((run) => run.issues)) {
@@ -11209,6 +11255,7 @@
       permissionStatusKey &&
       (event.message.method === 'session/request_permission' ||
         event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved' ||
         event.message.method === 'elicitation/create' ||
         event.message.method === '$/cancel_request')
     )
@@ -11263,47 +11310,12 @@
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       recordAnsweredPermission(event.agent, eventDirectory, eventSessionId, event.message.params);
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
-      const revision = permissionStatusRevisions.get(permissionStatusKey!);
-      void acp
-        .pendingInbox()
-        .then((pending) => {
-          if (
-            pending.some(
-              (item) =>
-                item.agent === event.agent &&
-                item.directory === eventDirectory &&
-                item.message.params?.sessionId === eventSessionId,
-            ) ||
-            permissionStatusRevisions.get(permissionStatusKey!) !== revision
-          )
-            return undefined;
-          nativeSubagents = setNativeSubagentWaiting(
-            nativeSubagents,
-            event.agent,
-            eventDirectory,
-            eventSessionId,
-            false,
-          );
-          for (const thread of agentThreads.filter(
-            (item) =>
-              item.agent === event.agent &&
-              item.sessionId === eventSessionId &&
-              item.directory === eventDirectory &&
-              threadAttention[threadKey(item)]?.status === 'waiting',
-          ))
-            updateAgentThreadStatus(thread, 'working');
-          for (const receipt of spawnReceipts.filter(
-            (item) =>
-              item.targetId === `acp:${event.agent}:${eventSessionId}` &&
-              item.targetDirectory === eventDirectory &&
-              item.state === 'waiting',
-          ))
-            updateSpawnReceipt(receipt.receiptId, { state: 'working' });
-          return undefined;
-        })
-        .catch(() => scheduleInboxRefresh());
-    }
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved') &&
+      typeof eventSessionId === 'string'
+    )
+      reconcilePendingSessionStatus(event.agent, eventDirectory, eventSessionId);
     if (event.message.method === 'session/update') {
       const params = event.message.params;
       const sessionId = params?.sessionId;
@@ -11442,9 +11454,14 @@
         }
       }
     }
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved') &&
+      typeof eventSessionId === 'string'
+    ) {
       // The scheduled refresh lags; the thread header already shows the request answered.
-      const resolvedKey = `acp:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
+      const prefix = event.message.method === 'sail/permission_resolved' ? 'acp' : 'elicitation';
+      const resolvedKey = `${prefix}:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
       resolvedDuringRefresh.set(resolvedKey, inboxGeneration);
       if (inboxItems.some((item) => item.key === resolvedKey))
         inboxItems = inboxItems.filter((item) => item.key !== resolvedKey);
@@ -11454,6 +11471,7 @@
       event.message.method === 'elicitation/create' ||
       event.message.method === '$/cancel_request' ||
       event.message.method === 'sail/permission_resolved' ||
+      event.message.method === 'sail/elicitation_resolved' ||
       event.message.method === 'sail/disconnected'
     )
       scheduleInboxRefresh();
