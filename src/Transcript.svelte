@@ -92,6 +92,7 @@
     title={tool.title}
     status={tool.status}
     activityId={activityScope ? `${activityScope}:${tool.id}` : tool.id}
+    toolId={tool.id}
     input={tool.input}
     output={tool.output}
     error={tool.error}
