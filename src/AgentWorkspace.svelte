@@ -32,6 +32,7 @@
   import { activityForSession, parseHookActivity, type HookActivity } from './lib/hook-activity';
   import { toolInput } from './lib/tool-display';
   import { agentHeaderStatus } from './lib/agent-status';
+  import { AgentReplay } from './lib/agent-replay';
   import {
     acpToolFailure,
     prepareAcpFailureDraft,
@@ -500,11 +501,10 @@
       visibleCount += total - seenEntryCount;
     seenEntryCount = total;
   });
-  let replaying = false;
+  const replay = new AgentReplay();
   function setReplaying(value: boolean) {
-    if (replaying === value) return;
-    replaying = value;
-    onreplaychange?.(agent, directory, activeSessionId, value);
+    const sessionId = replay.set(value, activeSessionId);
+    if (sessionId) onreplaychange?.(agent, directory, sessionId, value);
   }
   let replayEntries: AgentEntry[] = [];
   let pendingUpdates: Record<string, unknown>[] = [];
@@ -985,7 +985,7 @@
     const previousPlan = nativePlan;
     nativePlan = nativePlanUpdate(agent, update, nativePlan);
     if (
-      !replaying &&
+      !replay.active &&
       nativePlan !== previousPlan &&
       activePlanRevision?.acceptingUpdates &&
       activePlanRevision.sessionId === activeSessionId
@@ -993,10 +993,10 @@
       activePlanRevision.revisedPlanSeen = true;
     if (activeSessionId && nativePlan)
       saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
-    if (activeSessionId && !replaying)
+    if (activeSessionId && !replay.active)
       acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
     onnativeplan?.(nativePlan);
-    if (replaying) {
+    if (replay.active) {
       updateEntriesInPlace(replayEntries, update);
       return;
     }
@@ -1664,7 +1664,7 @@
           Array.isArray(data.availableCommands)
         )
           updateSkills(data.availableCommands);
-        if (data.sessionUpdate !== 'user_message_chunk' || replaying) applyUpdate(data);
+        if (data.sessionUpdate !== 'user_message_chunk' || replay.active) applyUpdate(data);
         if (
           data.sessionUpdate === 'tool_call_update' &&
           (data.status === 'completed' || data.status === 'failed')
