@@ -822,6 +822,34 @@ await test('many medium-sized fields stay within the structured output limit', (
   assert.equal(acpToolFailure(tool)?.action, 'git status');
 });
 
+await test('a long reason before rule metadata keeps the rule on the failure card', () => {
+  const store = updateNativeSubagents(
+    spawnedChild(),
+    event('child', {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'failure',
+      title: 'Run command',
+      status: 'failed',
+      rawInput: { command: 'git status' },
+      rawOutput: {
+        reason: 'x'.repeat(100_000),
+        ruleName: 'GIT010',
+        hookName: 'klaudiush',
+      },
+    }),
+    '/repo',
+    2,
+  );
+  const tool = store[nativeSubagentId('codex', '/repo', 'child')].transcript.find(
+    (entry) => entry.id === 'failure',
+  );
+  assert.ok(tool?.type === 'tool');
+  assert.ok(JSON.stringify(tool.output).length <= nativeMessageLimit);
+  assert.equal(acpToolFailure(tool)?.kind, 'hook');
+  assert.equal(acpToolFailure(tool)?.rule, 'GIT010');
+  assert.equal(acpToolFailure(tool)?.action, 'git status');
+});
+
 await test('small structured tool values stay structured', () => {
   const store = updateNativeSubagents(
     spawnedChild(),

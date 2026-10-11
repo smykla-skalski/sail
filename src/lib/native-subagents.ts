@@ -119,7 +119,7 @@ function messageHead(text: string, limit = nativeMessageLimit): string {
   return `${text.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end)}…`;
 }
 
-const toolMetadataFields = new Set([
+const toolIdentityFields = new Set([
   'command',
   'hookName',
   'hook_name',
@@ -131,11 +131,9 @@ const toolMetadataFields = new Set([
   'ruleName',
   'rule_name',
   'rule',
-  'reason',
-  'error',
-  'message',
-  'name',
 ]);
+const toolReasonFields = new Set(['reason', 'error', 'message', 'name']);
+const metadataFieldLimit = 1_000;
 
 function visitStrings(
   value: unknown,
@@ -188,7 +186,7 @@ function boundValue(value: unknown, cut: (text: string, limit: number) => string
           Object.fromEntries(
             Object.entries(value).filter(
               ([key, item]) =>
-                toolMetadataFields.has(key) &&
+                (toolIdentityFields.has(key) || toolReasonFields.has(key)) &&
                 (typeof item === 'string' || typeof item === 'number'),
             ),
           ),
@@ -196,18 +194,29 @@ function boundValue(value: unknown, cut: (text: string, limit: number) => string
         );
 
   const available = nativeMessageLimit - skeleton.length;
-  let metadataLength = 0;
+  let identityLength = 0;
+  let reasonLength = 0;
   visitStrings(value, (text, key) => {
-    if (toolMetadataFields.has(key)) metadataLength += encodedLength(text);
+    if (toolIdentityFields.has(key))
+      identityLength += Math.min(encodedLength(text), metadataFieldLimit);
+    else if (toolReasonFields.has(key))
+      reasonLength += Math.min(encodedLength(text), metadataFieldLimit);
     return '';
   });
-  let metadataBudget = Math.min(metadataLength, available);
-  let otherBudget = available - metadataBudget;
+  let identityBudget = Math.min(identityLength, available);
+  let reasonBudget = Math.min(reasonLength, available - identityBudget);
+  let otherBudget = available - identityBudget - reasonBudget;
   return visitStrings(value, (text, key) => {
-    const metadata = toolMetadataFields.has(key);
-    const budget = metadata ? metadataBudget : otherBudget;
-    const bounded = fitString(text, budget, cut);
-    if (metadata) metadataBudget -= encodedLength(bounded);
+    const identity = toolIdentityFields.has(key);
+    const reason = toolReasonFields.has(key);
+    const budget = identity ? identityBudget : reason ? reasonBudget : otherBudget;
+    const bounded = fitString(
+      text,
+      identity || reason ? Math.min(budget, metadataFieldLimit) : budget,
+      cut,
+    );
+    if (identity) identityBudget -= encodedLength(bounded);
+    else if (reason) reasonBudget -= encodedLength(bounded);
     else otherBudget -= encodedLength(bounded);
     return bounded;
   });
