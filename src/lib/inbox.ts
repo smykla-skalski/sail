@@ -151,6 +151,26 @@ export function repositoryName(path: string): string {
   return path.split(/[\\/]/).findLast((part) => !!part) ?? path;
 }
 
+export function inboxRepositoryLabel(repository: string, repositories: string[]): string {
+  const name = repositoryName(repository);
+  const duplicates = repositories.filter(
+    (other) => other !== repository && repositoryName(other) === name,
+  );
+  if (!duplicates.length) return name;
+  const parents = repository.split(/[\\/]/).filter(Boolean).slice(0, -1);
+  for (let depth = 1; depth <= parents.length; depth++) {
+    const suffix = parents.slice(-depth).join('/');
+    if (
+      duplicates.every(
+        (other) =>
+          other.split(/[\\/]/).filter(Boolean).slice(0, -1).slice(-depth).join('/') !== suffix,
+      )
+    )
+      return `${name} · ${suffix}`;
+  }
+  return repository;
+}
+
 export function inboxLocations(catalog: ProjectCatalog): InboxLocation[] {
   return catalog.repositories.flatMap((repository) => [
     {

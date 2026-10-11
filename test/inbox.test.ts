@@ -4,6 +4,7 @@ import {
   failedCheckOutcome,
   inboxPermissionDecisionTitle,
   inboxLocations,
+  inboxRepositoryLabel,
   persistedInboxKinds,
   repositoryName,
   inboxTurnMessageIndex,
@@ -65,6 +66,14 @@ void test('inbox covers repositories and worktrees with their parent project', (
       },
     ],
   );
+});
+
+void test('duplicate repository headings use the shortest distinct parent path', () => {
+  const repositories = ['/tmp/one/app', '/tmp/two/app', '/work/one/app', '/tmp/tool'];
+  assert.equal(inboxRepositoryLabel(repositories[0], repositories), 'app · tmp/one');
+  assert.equal(inboxRepositoryLabel(repositories[1], repositories), 'app · two');
+  assert.equal(inboxRepositoryLabel(repositories[2], repositories), 'app · work/one');
+  assert.equal(inboxRepositoryLabel(repositories[3], repositories), 'tool');
 });
 
 void test('recent outcomes deduplicate provider events and preserve read state', () => {

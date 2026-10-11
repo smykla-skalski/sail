@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AttentionItem, AttentionKind, AttentionSnooze } from './lib/attention-items';
-  import { isInboxOutcome, type InboxItem } from './lib/inbox';
+  import { inboxRepositoryLabel, isInboxOutcome, type InboxItem } from './lib/inbox';
 
   interface Props {
     items: InboxItem[];
@@ -93,9 +93,10 @@
   {#if !loading && !total && !loadError}<p class="inbox-empty">Nothing needs your input.</p>{/if}
   {#each groups as group (group.repository)}
     <h3 class="inbox-group-heading">
-      {groups.some((other) => other !== group && other.repo === group.repo)
-        ? group.repository
-        : group.repo}
+      {inboxRepositoryLabel(
+        group.repository,
+        groups.map((entry) => entry.repository),
+      )}
     </h3>
     <ol class="inbox-list">
       {#each pending.filter((item) => item.repository === group.repository) as item (item.key)}
@@ -149,12 +150,12 @@
       {@const first = groupItems?.[0]}
       {#if first}
         <h3 class="inbox-group-heading">
-          {Object.values(recentGroups).some(
-            (items) =>
-              items?.[0]?.repository !== first.repository && items?.[0]?.project === first.project,
-          )
-            ? first.repository
-            : first.project}{first.worktree ? ` · ${first.worktree}` : ' · main'}
+          {inboxRepositoryLabel(
+            first.repository,
+            Object.values(recentGroups).flatMap((items) =>
+              items?.[0] ? [items[0].repository] : [],
+            ),
+          )}{first.worktree ? ` · ${first.worktree}` : ' · main'}
         </h3>
         <ol class="inbox-list">
           {#each groupItems ?? [] as item (item.key)}

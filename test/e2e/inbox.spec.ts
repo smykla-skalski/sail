@@ -68,8 +68,8 @@ describe('pending requests across projects', () => {
     await $('[data-topbar-inbox]').click();
     const headings = await $$('.inbox-group-heading');
     await expect(headings).toBeElementsArrayOfSize(2);
-    await expect(headings[0]).toHaveText(paths[0]);
-    await expect(headings[1]).toHaveText(paths[1]);
+    await expect(headings[0]).toHaveText(`app · ${dirname(paths[0]).split('/').at(-1)}`);
+    await expect(headings[1]).toHaveText(`app · ${dirname(paths[1]).split('/').at(-1)}`);
     const entries = await $$('.inbox-item');
     await expect(entries).toBeElementsArrayOfSize(2);
     await expect(entries[0]).toHaveText(expect.stringContaining(first.split('/').at(-1)!));
