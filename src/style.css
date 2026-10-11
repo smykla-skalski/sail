@@ -403,7 +403,7 @@ button:disabled {
 .project-agent-row {
   display: grid;
   flex: 1;
-  grid-template-columns: minmax(0, 1fr) minmax(0, max-content);
+  grid-template-columns: minmax(0, 1fr) fit-content(50%);
   min-width: 0;
   width: 100%;
   min-height: 32px;
