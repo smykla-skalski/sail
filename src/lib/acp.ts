@@ -761,6 +761,15 @@ export function markLiveMessageBoundary(
   return { ...update, sailStartNewMessage: true };
 }
 
+/** A restore's live-turn snapshot can become stale before the webview receives it. */
+export function restoredLiveTurnIsCurrent(
+  turnId: string,
+  activeTurnId: string | undefined,
+  finishedTurnIds: readonly string[],
+): boolean {
+  return activeTurnId === turnId && !finishedTurnIds.includes(turnId);
+}
+
 function isConfigOption(value: unknown): value is AgentConfigOption {
   return (
     !!value &&

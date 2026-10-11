@@ -84,6 +84,7 @@
     groupAgentEntries,
     liveSessionView,
     markLiveMessageBoundary,
+    restoredLiveTurnIsCurrent,
     loadRecentTranscript,
     restoreEntryTimes,
     saveRecentTranscript,
@@ -691,6 +692,7 @@
     }),
   );
   let liveTurn = $state(false);
+  let finishedTurnIds: string[] = [];
   // The app marks a thread done from the turn-finished event, before this pane's prompt call
   // returns; the header follows that event so both settle in the same frame.
   let turnEnded = $state(false);
@@ -1056,8 +1058,15 @@
       restoreToken = reservation.restoreToken;
       if (current !== generation) return;
       if (reservation.liveTurn) {
+        const turnId = reservation.liveTurn;
+        const latest = (await acp.activity(directory))[agent];
+        if (current !== generation) return;
+        if (!restoredLiveTurnIsCurrent(turnId, latest?.activeTurns[id], finishedTurnIds)) {
+          historyAttempted = false;
+          return;
+        }
         liveTurn = true;
-        activeTurnId = reservation.liveTurn;
+        activeTurnId = turnId;
         historyAttempted = false;
         return;
       }
@@ -1298,6 +1307,7 @@
     liveTurn = false;
     stopRequested = false;
     activeTurnId = null;
+    finishedTurnIds = [];
     turnEnded = false;
     error = '';
     ready = false;
@@ -1356,7 +1366,10 @@
           if (availableCommands) updateSkills(availableCommands);
           if (commandUpdates[id]) updateSkills(commandUpdates[id]);
           const latest = (await acp.activity(directory).catch(() => null))?.[agent];
-          if (current === generation && latest?.activeTurns[id] !== turnId) {
+          if (
+            current === generation &&
+            !restoredLiveTurnIsCurrent(turnId, latest?.activeTurns[id], finishedTurnIds)
+          ) {
             liveTurn = false;
             activeTurnId = null;
           }
@@ -1621,6 +1634,10 @@
           commandUpdates[params.sessionId] = update.availableCommands;
       }
       if (message.method === 'sail/prompt_finished' && typeof params?.sessionId === 'string') {
+        if (params.sessionId === activeSessionId && typeof params.turnId === 'string') {
+          if (!finishedTurnIds.includes(params.turnId)) finishedTurnIds.push(params.turnId);
+          if (finishedTurnIds.length > 32) finishedTurnIds.shift();
+        }
         if (
           busy &&
           params.sessionId === activeSessionId &&

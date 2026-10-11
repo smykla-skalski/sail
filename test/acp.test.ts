@@ -12,6 +12,7 @@ import {
   invalidateLiveTranscript,
   liveSessionView,
   markLiveMessageBoundary,
+  restoredLiveTurnIsCurrent,
   liveTranscriptLimit,
   loadRecentTranscript,
   rememberSessionState,
@@ -236,6 +237,24 @@ void test('a workspace load does not join a concurrent background resume', async
     if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
     else Reflect.deleteProperty(globalThis, 'window');
   }
+});
+
+void test('a finished event overtakes a live restore snapshot without reviving its turn', async () => {
+  const finished: string[] = [];
+  let returnActivity!: (turnId: string) => void;
+  const activity = new Promise<string>((resolve) => {
+    returnActivity = resolve;
+  });
+  const reconcile = async () => restoredLiveTurnIsCurrent('turn-1', await activity, finished);
+  const pending = reconcile();
+  // The backend sampled turn-1 while it was active; its finish event reaches the webview
+  // before the activity result does.
+  finished.push('turn-1');
+  returnActivity('turn-1');
+  assert.equal(await pending, false);
+  assert.equal(restoredLiveTurnIsCurrent('turn-1', 'turn-1', []), true);
+  assert.equal(restoredLiveTurnIsCurrent('turn-1', undefined, []), false);
+  assert.equal(restoredLiveTurnIsCurrent('turn-1', 'turn-1', ['turn-2']), true);
 });
 
 void test('ACP tool calls keep terminal references across updates', () => {
