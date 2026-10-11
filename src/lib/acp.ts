@@ -806,23 +806,15 @@ function restoreSession(
   profile: CapabilityProfile,
   restoreToken?: string,
 ) {
-  const key = JSON.stringify([agent, cwd, sessionId, profile]);
-  const existing = restoringSessions.get(key);
-  if (existing) {
-    if (restoreToken)
-      void invoke('acp_end_session_restore', {
-        agent,
-        directory: cwd,
-        sessionId,
-        restoreToken,
-      });
-    return existing;
-  }
+  // Explicit reservations have their own replay consumer and must never join another restore.
+  const key = restoreToken ? null : JSON.stringify([method, agent, cwd, sessionId, profile]);
+  const existing = key === null ? undefined : restoringSessions.get(key);
+  if (existing) return existing;
   const live = sessionKey(agent, cwd, sessionId);
   const request = async () => {
     let token = restoreToken;
     let ownsToken = false;
-    if (method === 'acp_load_session' && !token) {
+    if (!token) {
       const reservation = await invoke<{ liveTurn?: string; restoreToken?: string }>(
         'acp_begin_session_restore',
         { agent, cwd, sessionId, profile },
@@ -856,12 +848,14 @@ function restoreSession(
     }
   };
   const pending = request();
-  restoringSessions.set(key, pending);
-  void pending
-    .finally(() => {
-      if (restoringSessions.get(key) === pending) restoringSessions.delete(key);
-    })
-    .catch(() => undefined);
+  if (key !== null) {
+    restoringSessions.set(key, pending);
+    void pending
+      .finally(() => {
+        if (restoringSessions.get(key) === pending) restoringSessions.delete(key);
+      })
+      .catch(() => undefined);
+  }
   return pending;
 }
 

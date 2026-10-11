@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  acp,
   acpDisconnectAffectsSession,
   acpCancelMatchesSession,
   acpEventMatchesSession,
@@ -168,6 +169,73 @@ void test('a live chunk arriving before restore reservation keeps the cached mes
     entries.map((entry) => entry.type === 'assistant' && entry.text),
     ['Historical answer', 'Live answer'],
   );
+});
+
+void test('a workspace load does not join a concurrent background resume', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const calls: string[] = [];
+  let held = false;
+  let nextToken = 0;
+  const waiting: Array<() => void> = [];
+  let resumeStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resumeStarted = resolve;
+  });
+  let finishResume!: (value: Record<string, unknown>) => void;
+  const resumeResponse = new Promise<Record<string, unknown>>((resolve) => {
+    finishResume = resolve;
+  });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string) => {
+          calls.push(command);
+          if (command === 'acp_begin_session_restore') {
+            if (held) await new Promise<void>((resolve) => waiting.push(resolve));
+            held = true;
+            return { restoreToken: `token-${++nextToken}` };
+          }
+          if (command === 'acp_end_session_restore') {
+            held = false;
+            waiting.shift()?.();
+            return undefined;
+          }
+          if (command === 'acp_resume_session') {
+            resumeStarted();
+            return resumeResponse;
+          }
+          if (command === 'acp_load_session') return { configOptions: [], history: 'replayed' };
+          throw new Error(`Unexpected command: ${command}`);
+        },
+      },
+    },
+  });
+  try {
+    const resume = acp.resume('claude', '/repo', 'shared-session', 'build');
+    await started;
+    const reservation = acp.beginRestore('claude', '/repo', 'shared-session', 'build');
+    finishResume({ configOptions: [], history: 'resume-only' });
+    assert.equal((await resume).history, 'resume-only');
+    const token = (await reservation).restoreToken;
+    assert.equal(token, 'token-2');
+    assert.equal(
+      (await acp.load('claude', '/repo', 'shared-session', 'build', token)).history,
+      'replayed',
+    );
+    await acp.endRestore('claude', '/repo', 'shared-session', token);
+    assert.deepEqual(calls, [
+      'acp_begin_session_restore',
+      'acp_resume_session',
+      'acp_begin_session_restore',
+      'acp_end_session_restore',
+      'acp_load_session',
+      'acp_end_session_restore',
+    ]);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
 });
 
 void test('ACP tool calls keep terminal references across updates', () => {
