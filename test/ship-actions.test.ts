@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   shipArchiveAction,
   shipArchiveConfirmation,
+  shipCheckpointCommit,
   shipMergeAction,
   shipMergeConfirmation,
   shipMergeRetryDelay,
@@ -159,9 +160,23 @@ void test('reopen warns when the live head differs from the saved checkpoint', (
   const checkpoint = '0123456789abcdef0123456789abcdef01234567';
   const moved = 'fedcba9876543210fedcba9876543210fedcba98';
   assert.equal(shipReopenHeadWarning(checkpoint, checkpoint), '');
-  assert.match(shipReopenHeadWarning(moved, checkpoint), /differs from checkpoint revision/);
+  assert.match(shipReopenHeadWarning(moved, checkpoint), /differs from checkpoint commit/);
   assert.match(shipReopenHeadWarning(moved, checkpoint), /fedcba98/);
   assert.match(shipReopenHeadWarning(moved, checkpoint), /01234567/);
+  assert.match(shipReopenHeadWarning(moved, null), /no Git commit to compare/);
+});
+
+void test('legacy checkpoints recover only a commit recorded for their exact digest', () => {
+  const issue = mergeable();
+  issue.checkpoint!.revision = '0123456789abcdef';
+  issue.checkpoint!.commit = null;
+  issue.evidenceRevision = '0123456789abcdef';
+  issue.evidenceCommit = 'a'.repeat(40);
+  assert.equal(shipCheckpointCommit(issue), issue.evidenceCommit);
+  issue.evidenceRevision = 'fedcba9876543210';
+  assert.equal(shipCheckpointCommit(issue), null);
+  issue.checkpoint!.commit = 'b'.repeat(40);
+  assert.equal(shipCheckpointCommit(issue), 'b'.repeat(40));
 });
 
 void test('stop needs live work and archive needs a stopped run', () => {

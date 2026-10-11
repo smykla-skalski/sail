@@ -1663,7 +1663,7 @@ fn replacement_worktree_at_checkpoint(
     destination_parent: Option<String>,
 ) -> Result<CreatedWorktree, String> {
     if issue_number == 0
-        || checkpoint_revision.len() != 40
+        || (checkpoint_revision.len() != 40 && checkpoint_revision.len() != 64)
         || !checkpoint_revision
             .chars()
             .all(|character| character.is_ascii_hexdigit())

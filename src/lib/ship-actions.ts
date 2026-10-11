@@ -154,12 +154,22 @@ export function shipReplacementConfirmation(issue: ShipIssue, remote: string): S
   };
 }
 
+export function shipCheckpointCommit(issue: ShipIssue): string | null {
+  const revision = issue.checkpoint?.revision;
+  const commit =
+    issue.checkpoint?.commit ??
+    (revision && issue.evidenceRevision === revision ? issue.evidenceCommit : null);
+  return commit && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commit) ? commit : null;
+}
+
 export function shipReopenHeadWarning(
   head: string,
-  checkpointRevision: string | null | undefined,
+  checkpointCommit: string | null | undefined,
 ): string {
-  if (!checkpointRevision || head.toLowerCase() === checkpointRevision.toLowerCase()) return '';
-  return ` Warning: reopened head ${head.slice(0, 8)} differs from checkpoint revision ${checkpointRevision.slice(0, 8)}. Review the changed commits before continuing.`;
+  if (!checkpointCommit)
+    return ` Warning: the saved checkpoint has no Git commit to compare with reopened head ${head.slice(0, 8)}. Review the pull request before continuing.`;
+  if (head.toLowerCase() === checkpointCommit.toLowerCase()) return '';
+  return ` Warning: reopened head ${head.slice(0, 8)} differs from checkpoint commit ${checkpointCommit.slice(0, 8)}. Review the changed commits before continuing.`;
 }
 
 export function shipStopConfirmation(run: ShipRun): ShipConfirmation {

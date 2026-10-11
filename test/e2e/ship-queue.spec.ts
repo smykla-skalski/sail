@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ShipIssue, ShipRun } from '../../src/lib/issue-shipping';
+import { initialTaskCheckpoint, prepareTaskCheckpointUpdate } from '../../src/lib/task-checkpoint';
 import { fixture, withMergeEvidence } from '../ship-fixtures';
 import { chooseTopbarAction } from './topbar';
 
@@ -151,6 +152,7 @@ describe('Ship queue, archive and actions', () => {
   const root = mkdtempSync(join(tmpdir(), 'sail-ship-queue-'));
   const repository = realpathSync(root);
   let checkpointCommit = '';
+  let checkpointRevision = '';
   let replacementPath = '';
 
   before(async () => {
@@ -186,6 +188,16 @@ describe('Ship queue, archive and actions', () => {
     checkpointCommit = execFileSync('git', ['-C', repository, 'rev-parse', 'HEAD'], {
       encoding: 'utf8',
     }).trim();
+    const recorded = await browser.tauri.execute(
+      async ({ core }, path) => ({
+        revision: await core.invoke<string>('working_tree_revision', { path }),
+        commit: await core.invoke<string | null>('working_tree_commit', { path }),
+      }),
+      repository,
+    );
+    checkpointRevision = recorded.revision;
+    expect(checkpointRevision).toHaveLength(16);
+    expect(recorded.commit).toBe(checkpointCommit);
     writeFileSync(join(fakeGh, 'calls.jsonl'), '');
     writeFileSync(
       join(fakeGh, 'state.json'),
@@ -205,14 +217,17 @@ describe('Ship queue, archive and actions', () => {
       }),
     );
     const now = Date.now();
-    const checkpoint = (issue: ShipIssue, status: 'active' | 'failed' | 'cancelled') => ({
-      ...fixture().issues[0].checkpoint!,
-      taskId: issue.id,
-      sequence: 3,
-      revision: head,
-      status,
-      phase: 'implement' as const,
-    });
+    const checkpoint = (issue: ShipIssue, status: 'active' | 'failed' | 'cancelled') =>
+      prepareTaskCheckpointUpdate(
+        initialTaskCheckpoint({ id: issue.id, url: issue.url, title: issue.title }, now),
+        { status, phase: 'implement', nextAction: 'Continue the saved task.' },
+        checkpointRevision,
+        0,
+        null,
+        true,
+        now,
+        checkpointCommit,
+      );
     const failed: ShipIssue = {
       ...fixture().issues[1],
       id: 'failed',
@@ -420,7 +435,7 @@ describe('Ship queue, archive and actions', () => {
       .issues.find((item) => item.id === 'failed')!;
     expect(issue.error).toBeNull();
     expect(issue.checkpoint?.status).toBe('active');
-    expect(issue.checkpoint?.sequence).toBe(4);
+    expect(issue.checkpoint?.sequence).toBe(2);
     await expect(row('failed').$('[data-ship-action="retry"]')).not.toExist();
   });
 
@@ -487,7 +502,6 @@ describe('Ship queue, archive and actions', () => {
         workerSettled: true,
       });
       issue.checkpoint.status = 'cancelled';
-      issue.checkpoint.revision = commit;
       await core.invoke('save_setting', { key: 'sai-ship-runs', value: JSON.stringify(runs) });
     }, checkpointCommit);
     await browser.refresh();
@@ -528,7 +542,8 @@ describe('Ship queue, archive and actions', () => {
       .issues.find((item) => item.id === 'closed')!;
     expect(issue.branch).toBe('ship-issue-15-replacement-9');
     expect(issue.pullRequest).toBeNull();
-    expect(issue.checkpoint?.revision).toBe(checkpointCommit);
+    expect(issue.checkpoint?.revision).toBe(checkpointRevision);
+    expect(issue.checkpoint?.commit).toBe(checkpointCommit);
     expect(issue.path).toBeTruthy();
     replacementPath = issue.path!;
     expect(

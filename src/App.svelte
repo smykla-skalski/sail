@@ -99,6 +99,7 @@
   import {
     shipArchiveAction,
     shipArchiveConfirmation,
+    shipCheckpointCommit,
     shipMergeAction,
     shipMergeConfirmation,
     shipReopenAction,
@@ -2616,6 +2617,14 @@
       );
   }
 
+  async function cleanCheckpointCommit(path: string, revision: string): Promise<string | null> {
+    const commit = await invoke<string | null>('working_tree_commit', { path });
+    const after = await invoke<string>('working_tree_revision', { path });
+    if (after !== revision)
+      throw new Error('The worktree changed while recording the checkpoint commit. Retry.');
+    return commit;
+  }
+
   /** Stops leftovers and queues a fresh worker that resumes from the saved checkpoint. */
   async function restartShipIssue(
     run: ShipRun,
@@ -2695,6 +2704,21 @@
       const revision = issue.checkpoint?.revision;
       if (!revision)
         throw new Error('The saved checkpoint has no revision for a replacement.', { cause });
+      let commit = shipCheckpointCommit(issue);
+      if (!commit && issue.path) {
+        const current = await invoke<string>('working_tree_revision', { path: issue.path });
+        if (current !== revision)
+          throw new Error(
+            'The source worktree differs from the saved checkpoint. Reconcile it before replacement.',
+            { cause },
+          );
+        commit = await cleanCheckpointCommit(issue.path, revision);
+      }
+      if (!commit)
+        throw new Error(
+          'The saved checkpoint has no clean Git commit for a replacement. Restore and bind a clean source worktree first.',
+          { cause },
+        );
       if (!(await confirmShipAction(shipReplacementConfirmation(issue, run.remote)))) return '';
       const stillReady = shipReopenAction(issue);
       if (!stillReady.enabled)
@@ -2708,7 +2732,7 @@
         expectedRepository: run.remote,
         issueNumber: issue.number,
         pullRequest: issue.pullRequest,
-        checkpointRevision: revision,
+        checkpointRevision: commit,
       });
       saveProjectCatalog(addWorktree(projectCatalog, run.repository, created));
       const key = `${run.id}:${issue.id}`;
@@ -2717,7 +2741,7 @@
       await restartShipIssue(
         run,
         issue,
-        `The closed pull request ${issue.pullRequest} could not reopen. Continue from checkpoint ${revision.slice(0, 8)} on replacement branch ${created.branch} and publish a new pull request.`,
+        `The closed pull request ${issue.pullRequest} could not reopen. Continue from checkpoint commit ${commit.slice(0, 8)} on replacement branch ${created.branch} and publish a new pull request.`,
         {
           branch: created.branch,
           path: created.path,
@@ -2734,7 +2758,7 @@
           ciTriages: undefined,
         },
       );
-      return `Replacement pull request queued on ${created.branch} from checkpoint ${revision.slice(0, 8)}. The original pull request stays closed.`;
+      return `Replacement pull request queued on ${created.branch} from checkpoint commit ${commit.slice(0, 8)}. The original pull request stays closed.`;
     }
     if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
       await stopShippingWorker(issue);
@@ -2743,7 +2767,7 @@
     beginLatestRefresh(shippingPullRequestGenerations, key);
     const cached = shippingPullRequests.get(key);
     if (cached) shippingPullRequests.set(key, { ...cached, state: 'OPEN' });
-    const warning = shipReopenHeadWarning(outcome.head, issue.checkpoint?.revision);
+    const warning = shipReopenHeadWarning(outcome.head, shipCheckpointCommit(issue));
     await restartShipIssue(
       run,
       issue,
@@ -6593,6 +6617,7 @@
           request.arguments.expectedRevision,
           request.arguments.rebindRevision,
           Date.now(),
+          await cleanCheckpointCommit(request.directory, execution.revision),
         );
         await updateShipIssue(owner.run, owner.issue, { checkpoint: updated });
       } else if (!owner.issue.checkpoint) {
@@ -6710,6 +6735,7 @@
         checkpointBeforePolicy.revision,
         true,
         Date.now(),
+        await cleanCheckpointCommit(request.directory, revision),
       );
       const evidenceManifests = syncEvidenceManifest(
         owner.issue.evidenceManifests ?? [],
