@@ -155,10 +155,8 @@ export function shipWorkerRequest(issue: ShipIssue): string | null {
   const lines = [
     ...new Set(
       [
+        issue.reportedStatus === 'blocked' ? issue.workerRequest : null,
         issue.checkpoint?.status === 'blocked' ? issue.checkpoint.blocker : null,
-        issue.reportedStatus === 'blocked' && issue.checkpoint?.status !== 'blocked'
-          ? issue.workerRequest
-          : null,
         ...(issue.checkpoint?.unresolvedQuestions ?? []),
       ]
         .map((line) => line?.trim())

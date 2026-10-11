@@ -163,10 +163,16 @@ void test('a worker thread opens with its pending request quoted for the reply',
     '> Which theme token?\n> Pick one.\n> Keep the old label?\n> Which theme token?\n\n',
   );
   touched(issue, { status: 'blocked', blocker: 'Need a decision', unresolvedQuestions: [] }, 6);
-  assert.equal(shipWorkerRequest(issue), '> Need a decision\n\n');
+  assert.equal(
+    shipWorkerRequest(issue),
+    '> Which theme token?\n> Pick one.\n> Need a decision\n\n',
+  );
   issue.workerState = 'interrupted';
   issue.blockedReason = 'Shipping claim recovery failed: GitHub is unavailable.';
-  assert.equal(shipWorkerRequest(issue), '> Need a decision\n\n');
+  assert.equal(
+    shipWorkerRequest(issue),
+    '> Which theme token?\n> Pick one.\n> Need a decision\n\n',
+  );
   touched(issue, { status: 'active', blocker: null, unresolvedQuestions: [] }, 7);
   issue.workerRequest = null;
   assert.equal(shipWorkerRequest(issue), null);
@@ -194,6 +200,38 @@ void test('a Sail gate error cannot replace the worker request in a reply', () =
   assert.equal(shipWorkerRequest(restored), '> Which theme token?\n\n');
   Object.assign(restored, shipWorkerProgressChanges('running'));
   assert.equal(shipWorkerRequest(restored), null);
+});
+
+void test('legacy blocked reports recover only worker-authored requests', () => {
+  const run = fixture(1);
+  const [issue] = run.issues;
+  issue.threadId = 'acp:opencode:s1';
+  working(issue, 'reviewing', {
+    reportedStatus: 'blocked',
+    blockedReason: 'Which token?',
+    events: [{ at: 1, stage: 'reviewing', reason: 'Which token?' }],
+  });
+  const restored = parseShipRuns(JSON.stringify([run]))[0].issues[0];
+  assert.equal(restored.workerRequest, 'Which token?');
+  assert.equal(shipWorkerRequest(restored), '> Which token?\n\n');
+
+  issue.blockedReason = 'Select validation risk before starting a gate.';
+  issue.events?.push({ at: 2, stage: 'code-adversary', reason: issue.blockedReason });
+  const afterError = parseShipRuns(JSON.stringify([run]))[0].issues[0];
+  assert.equal(shipWorkerRequest(afterError), '> Which token?\n\n');
+
+  issue.events = [{ at: 2, stage: 'code-adversary', reason: issue.blockedReason }];
+  const uncertain = parseShipRuns(JSON.stringify([run]))[0].issues[0];
+  assert.equal(shipWorkerRequest(uncertain), null);
+});
+
+void test('a new worker request remains beside a different checkpoint blocker', () => {
+  const [issue] = fixture(1).issues;
+  issue.threadId = 'acp:opencode:s1';
+  working(issue, 'reviewing');
+  touched(issue, { status: 'blocked', blocker: 'CI unavailable' }, 5);
+  Object.assign(issue, shipWorkerProgressChanges('blocked', 'Should I retry?'));
+  assert.equal(shipWorkerRequest(issue), '> Should I retry?\n> CI unavailable\n\n');
 });
 
 void test('group mapping covers every presentation status', () => {

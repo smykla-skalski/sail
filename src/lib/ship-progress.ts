@@ -1649,7 +1649,13 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
       unparsed.push(item);
       continue;
     }
-    for (const issue of parsed.data.issues)
+    for (const issue of parsed.data.issues) {
+      if (issue.workerRequest === undefined && issue.reportedStatus === 'blocked') {
+        const workerEvent = issue.events?.findLast(
+          (event) => stages.some((stage) => stage === event.stage) && !!event.reason?.trim(),
+        );
+        if (workerEvent) issue.workerRequest = workerEvent.reason;
+      }
       issue.contextHandoffs = issue.contextHandoffs?.map((handoff) =>
         handoff.outcome === 'pending' &&
         !handoff.toThreadId &&
@@ -1660,6 +1666,7 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
             })
           : handoff,
       );
+    }
     runs.push(parsed.data);
   }
   return { runs, unparsed };
