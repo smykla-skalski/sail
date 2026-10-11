@@ -74,6 +74,7 @@ fn main() {
             "create_worktree",
             "worktree_pressure_directory",
             "create_shipping_worktree",
+            "create_shipping_replacement_worktree",
             "find_shipping_worktree",
             "run_shipping_setup",
             "registered_worktrees",

@@ -332,10 +332,6 @@ pub(crate) fn reopen_pull_request(
     if details["merged"] == true {
         return Err("The pull request is already merged.".to_string());
     }
-    let head = details["head"]["sha"]
-        .as_str()
-        .ok_or("GitHub returned a pull request without a head revision.")?
-        .to_string();
     let already_open = details["state"] == "open";
     if !already_open {
         github(vec![
@@ -352,6 +348,19 @@ pub(crate) fn reopen_pull_request(
             )
         })?;
     }
+    let details = github(vec![
+        "api".to_string(),
+        format!("repos/{target}/pulls/{number}"),
+    ])?;
+    let details: serde_json::Value = serde_json::from_str(&details)
+        .map_err(|_| "GitHub returned invalid pull request details after reopening.".to_string())?;
+    if details["state"] != "open" || details["merged"] == true {
+        return Err("The pull request did not remain open after reopening.".to_string());
+    }
+    let head = details["head"]["sha"]
+        .as_str()
+        .ok_or("GitHub returned a pull request without a head revision.")?
+        .to_string();
     Ok(ShipReopenOutcome {
         head,
         pull_request: request.pull_request.clone(),
@@ -467,8 +476,10 @@ mod tests {
                 calls.push(arguments.join(" "));
                 Ok(if calls.len() == 1 {
                     closed.clone()
-                } else {
+                } else if calls.len() == 2 {
                     "{}".to_string()
+                } else {
+                    open_pull_request(HEAD)
                 })
             },
         )
@@ -480,6 +491,7 @@ mod tests {
             [
                 "api repos/owner/repo/pulls/7",
                 "api --method PATCH repos/owner/repo/pulls/7 -f state=open",
+                "api repos/owner/repo/pulls/7",
             ]
         );
     }
@@ -535,7 +547,28 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.already_open);
-        assert_eq!(calls, 1);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn reopen_returns_the_head_seen_after_github_accepts_the_patch() {
+        let closed = format!(r#"{{"state":"closed","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
+        let moved = "fedcba9876543210fedcba9876543210fedcba98";
+        let mut calls = 0;
+        let outcome = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                Ok(if calls == 1 {
+                    closed.clone()
+                } else {
+                    open_pull_request(moved)
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(outcome.head, moved);
     }
 
     #[test]

@@ -1634,6 +1634,100 @@ async fn create_shipping_worktree(
     .map_err(|error| error.to_string())?
 }
 
+fn replacement_shipping_worktree(
+    repository: &Path,
+    expected_repository: &str,
+    issue_number: u64,
+    pull_request: &str,
+    checkpoint_revision: &str,
+) -> Result<CreatedWorktree, String> {
+    github::require_target_repository(repository, expected_repository)?;
+    let (target, pull_number) = ship_actions::parse_pull_request_url(pull_request)?;
+    if !target.eq_ignore_ascii_case(expected_repository) {
+        return Err("The closed pull request belongs to another repository.".to_string());
+    }
+    replacement_worktree_at_checkpoint(
+        repository,
+        issue_number,
+        pull_number,
+        checkpoint_revision,
+        None,
+    )
+}
+
+fn replacement_worktree_at_checkpoint(
+    repository: &Path,
+    issue_number: u64,
+    pull_number: u64,
+    checkpoint_revision: &str,
+    destination_parent: Option<String>,
+) -> Result<CreatedWorktree, String> {
+    if issue_number == 0
+        || checkpoint_revision.len() != 40
+        || !checkpoint_revision
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err("The checkpoint has no full Git revision for a replacement.".to_string());
+    }
+    let commit = git_reference(
+        repository,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{checkpoint_revision}^{{commit}}"),
+        ],
+    )
+    .ok_or("The saved checkpoint commit is unavailable in this repository.")?;
+    if !commit.eq_ignore_ascii_case(checkpoint_revision) {
+        return Err("The checkpoint revision no longer identifies the saved commit.".to_string());
+    }
+    let name = format!("ship-issue-{issue_number}-replacement-{pull_number}");
+    if let Some(existing) = existing_shipping_worktree(repository, &name)? {
+        let head = git_reference(Path::new(&existing.path), &["rev-parse", "HEAD"])
+            .ok_or("Cannot inspect the existing replacement worktree.")?;
+        if head.eq_ignore_ascii_case(checkpoint_revision) {
+            return Ok(existing);
+        }
+        return Err("The replacement worktree already exists at another revision. Inspect it before retrying.".to_string());
+    }
+    add_worktree(
+        repository.to_string_lossy().into_owned(),
+        name,
+        destination_parent,
+        Some(checkpoint_revision.to_string()),
+    )
+}
+
+#[tauri::command]
+async fn create_shipping_replacement_worktree(
+    app: AppHandle,
+    operation_locks: State<'_, WorktreeOperationLocks>,
+    repository: String,
+    expected_repository: String,
+    issue_number: u64,
+    pull_request: String,
+    checkpoint_revision: String,
+) -> Result<CreatedWorktree, String> {
+    let operation_locks = operation_locks.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = validate_repository(repository)?;
+        let path = Path::new(&repository);
+        let _lock = operation_locks.lock(path)?;
+        let created = replacement_shipping_worktree(
+            path,
+            &expected_repository,
+            issue_number,
+            &pull_request,
+            &checkpoint_revision,
+        )?;
+        allow_worktree_terminal_creation(&app, Path::new(&created.path));
+        Ok(created)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 async fn find_shipping_worktree(
     repository: String,
@@ -3027,6 +3121,7 @@ pub fn run() {
             create_worktree,
             worktree_pressure_directory,
             create_shipping_worktree,
+            create_shipping_replacement_worktree,
             find_shipping_worktree,
             run_shipping_setup,
             registered_worktrees,
@@ -3211,11 +3306,11 @@ mod tests {
         parse_registered_worktrees, persist_worktree_data_manifest,
         register_worktree_terminal_data, registered_worktrees, remove_worktree,
         remove_worktree_then_terminal_data, remove_worktree_then_terminal_data_many,
-        remove_worktree_with_hook, remove_worktree_with_hooks, repository_namespace,
-        shipping_base_revision, shipping_changed_paths, shipping_default_branch,
-        shipping_fetch_source, version_is_compatible, version_number, working_tree_diff,
-        worktree_overviews, WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER,
-        WORKTREE_DATA_OWNER_FILE,
+        remove_worktree_with_hook, remove_worktree_with_hooks, replacement_worktree_at_checkpoint,
+        repository_namespace, shipping_base_revision, shipping_changed_paths,
+        shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
+        working_tree_diff, worktree_overviews, WorktreeOperationLocks,
+        NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::worktree_storage;
@@ -4048,6 +4143,85 @@ mod tests {
         let expected =
             tauri::async_runtime::block_on(working_tree_revision(created.path.clone())).unwrap();
         (root, repository_path, created.path, expected)
+    }
+
+    #[test]
+    fn replacement_worktree_uses_the_saved_commit_and_recovers_after_a_retry() {
+        let root = std::env::temp_dir().join(format!("sail-replacement-{}", uuid::Uuid::new_v4()));
+        let repository = root.join("repository");
+        let parent = root.join("worktrees");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&parent).unwrap();
+        let repository = repository.git_canonical().unwrap();
+        let repo = repository.to_string_lossy().into_owned();
+        git(&repo, &["init", "-q"]);
+        fs::write(repository.join("saved.txt"), "checkpoint").unwrap();
+        git(&repo, &["add", "saved.txt"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "checkpoint",
+            ],
+        );
+        let checkpoint = git_reference(&repository, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(repository.join("later.txt"), "later").unwrap();
+        git(&repo, &["add", "later.txt"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "later",
+            ],
+        );
+        let destination = Some(parent.to_string_lossy().into_owned());
+        let created = replacement_worktree_at_checkpoint(
+            &repository,
+            15,
+            9,
+            &checkpoint,
+            destination.clone(),
+        )
+        .unwrap();
+        assert_eq!(created.branch, "ship-issue-15-replacement-9");
+        assert_eq!(
+            git_reference(Path::new(&created.path), &["rev-parse", "HEAD"]),
+            Some(checkpoint.clone())
+        );
+        assert!(!Path::new(&created.path).join("later.txt").exists());
+        let retried = replacement_worktree_at_checkpoint(
+            &repository,
+            15,
+            9,
+            &checkpoint,
+            destination.clone(),
+        )
+        .unwrap();
+        assert_eq!(retried.path, created.path);
+        assert!(replacement_worktree_at_checkpoint(
+            &repository,
+            15,
+            10,
+            "not-a-revision",
+            destination,
+        )
+        .is_err());
+        git(&repo, &["worktree", "remove", &created.path]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

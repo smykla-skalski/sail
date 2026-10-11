@@ -150,6 +150,8 @@ function finishedRun(id: string, at: number): ShipRun {
 describe('Ship queue, archive and actions', () => {
   const root = mkdtempSync(join(tmpdir(), 'sail-ship-queue-'));
   const repository = realpathSync(root);
+  let checkpointCommit = '';
+  let replacementPath = '';
 
   before(async () => {
     execFileSync('git', ['init', '-q', repository]);
@@ -167,6 +169,24 @@ describe('Ship queue, archive and actions', () => {
       join(repository, 'AGENTS.md'),
       'Merge by posting a PR comment with exact body `squash`; the bot merges.\n',
     );
+    execFileSync('git', ['-C', repository, 'add', 'AGENTS.md']);
+    execFileSync('git', [
+      '-C',
+      repository,
+      '-c',
+      'user.name=Sail Test',
+      '-c',
+      'user.email=sail@example.test',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '-qm',
+      'fixture checkpoint',
+    ]);
+    checkpointCommit = execFileSync('git', ['-C', repository, 'rev-parse', 'HEAD'], {
+      encoding: 'utf8',
+    }).trim();
+    writeFileSync(join(fakeGh, 'calls.jsonl'), '');
     writeFileSync(
       join(fakeGh, 'state.json'),
       JSON.stringify({
@@ -294,6 +314,8 @@ describe('Ship queue, archive and actions', () => {
       sessionStorage.removeItem('sail-e2e-settings');
       localStorage.clear();
     });
+    if (replacementPath)
+      execFileSync('git', ['-C', repository, 'worktree', 'remove', replacementPath]);
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -438,6 +460,82 @@ describe('Ship queue, archive and actions', () => {
     expect(issue.checkpoint?.status).toBe('active');
     expect(issue.checkpoint?.nextAction).toContain('was reopened');
     await expect(row('closed').$('[data-ship-action="reopen"]')).not.toExist();
+  });
+
+  it('offers a replacement from the saved commit after GitHub refuses Reopen', async () => {
+    const state = JSON.parse(readFileSync(join(fakeGh, 'state.json'), 'utf8'));
+    state.pulls['fixture/repo#9'] = {
+      ...state.pulls['fixture/repo#9'],
+      state: 'closed',
+      head: checkpointCommit,
+      reopenRefused: true,
+    };
+    writeFileSync(join(fakeGh, 'state.json'), JSON.stringify(state));
+    await browser.tauri.execute(async ({ core }, commit) => {
+      const settings = await core.invoke<Record<string, string>>('load_settings');
+      const runs = JSON.parse(settings['sai-ship-runs']);
+      const issue = runs
+        .find((run: ShipRun) => run.id === 'active-run')
+        .issues.find((item: ShipIssue) => item.id === 'closed');
+      Object.assign(issue, {
+        state: 'failed',
+        error: 'Pull request closed without merging.',
+        pullRequestState: 'CLOSED',
+        pullRequestHead: commit,
+        branch: 'closed',
+        path: null,
+        workerSettled: true,
+      });
+      issue.checkpoint.status = 'cancelled';
+      issue.checkpoint.revision = commit;
+      await core.invoke('save_setting', { key: 'sai-ship-runs', value: JSON.stringify(runs) });
+    }, checkpointCommit);
+    await browser.refresh();
+    await row('closed').$('[data-ship-action="reopen"]').click();
+    await expect($('.confirmation-dialog h2')).toHaveText(
+      expect.stringMatching(/Reopen pull request #9 for #15 Closed fixture\?/),
+    );
+    await $('.confirmation-dialog .confirmation-primary').click();
+    const replacement = $('.confirmation-dialog');
+    await expect(replacement).toBeDisplayed();
+    await expect(replacement.$('h2')).toHaveText(expect.stringContaining('Start a replacement'));
+    await expect(replacement).toHaveText(expect.stringContaining('pull request #9'));
+    await expect(replacement).toHaveText(
+      expect.stringContaining('replacement pull request for #15'),
+    );
+    await captureThemes(2560, 1440, 'ship-queue-replacement');
+    await captureThemes(1920, 1200, 'ship-queue-replacement');
+    await browser.setWindowSize(390, 850);
+    expect(
+      await browser.execute(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+    ).toBe(true);
+    await browser.setWindowSize(1920, 1200);
+    const zoomFits = await browser.execute(() => {
+      document.documentElement.style.zoom = '2';
+      const fits = document.documentElement.scrollWidth <= document.documentElement.clientWidth;
+      document.documentElement.style.zoom = '';
+      return fits;
+    });
+    expect(zoomFits).toBe(true);
+    await replacement.$('.confirmation-primary').click();
+    await expect($('[data-ship-result]')).toHaveText(
+      expect.stringContaining('Replacement pull request queued'),
+    );
+    const issue = (await storedRuns())
+      .find((run) => run.id === 'active-run')!
+      .issues.find((item) => item.id === 'closed')!;
+    expect(issue.branch).toBe('ship-issue-15-replacement-9');
+    expect(issue.pullRequest).toBeNull();
+    expect(issue.checkpoint?.revision).toBe(checkpointCommit);
+    expect(issue.path).toBeTruthy();
+    replacementPath = issue.path!;
+    expect(
+      execFileSync('git', ['-C', replacementPath, 'rev-parse', 'HEAD'], {
+        encoding: 'utf8',
+      }).trim(),
+    ).toBe(checkpointCommit);
   });
 
   it('stop run cancels every unfinished issue, then archive hides the run', async () => {

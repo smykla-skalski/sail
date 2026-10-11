@@ -11,6 +11,8 @@ import {
   shipPoolUsage,
   shipReopenAction,
   shipReopenConfirmation,
+  shipReplacementConfirmation,
+  shipReopenHeadWarning,
   shipRetryAction,
   shipStopAction,
   shipStopConfirmation,
@@ -142,6 +144,24 @@ void test('the reopen confirmation names the pull request, issue and repository'
   assert.match(confirmation.title, /^Reopen pull request #9 for #\d+/);
   assert.match(confirmation.message, /pull request #9 in a\/b/);
   assert.equal(confirmation.confirmLabel, 'Reopen');
+});
+
+void test('a replacement confirmation names the closed and new pull requests', () => {
+  const issue = mergeable();
+  const confirmation = shipReplacementConfirmation(issue, 'a/b');
+  assert.match(confirmation.title, /replacement for pull request #9/);
+  assert.match(confirmation.message, /replacement pull request for #\d+/);
+  assert.match(confirmation.message, /saved checkpoint/);
+  assert.equal(confirmation.confirmLabel, 'Start replacement');
+});
+
+void test('reopen warns when the live head differs from the saved checkpoint', () => {
+  const checkpoint = '0123456789abcdef0123456789abcdef01234567';
+  const moved = 'fedcba9876543210fedcba9876543210fedcba98';
+  assert.equal(shipReopenHeadWarning(checkpoint, checkpoint), '');
+  assert.match(shipReopenHeadWarning(moved, checkpoint), /differs from checkpoint revision/);
+  assert.match(shipReopenHeadWarning(moved, checkpoint), /fedcba98/);
+  assert.match(shipReopenHeadWarning(moved, checkpoint), /01234567/);
 });
 
 void test('stop needs live work and archive needs a stopped run', () => {

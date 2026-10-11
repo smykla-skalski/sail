@@ -50,6 +50,7 @@
     "allow-create-worktree",
     "allow-worktree-pressure-directory",
     "allow-create-shipping-worktree",
+    "allow-create-shipping-replacement-worktree",
     "allow-find-shipping-worktree",
     "allow-run-shipping-setup",
     "allow-registered-worktrees",

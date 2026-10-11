@@ -143,6 +143,25 @@ export function shipReopenConfirmation(issue: ShipIssue, remote: string): ShipCo
   };
 }
 
+export function shipReplacementConfirmation(issue: ShipIssue, remote: string): ShipConfirmation {
+  const number = issue.pullRequest?.match(/\/pull\/(\d+)/)?.[1];
+  const closed = number ? `pull request #${number}` : 'the closed pull request';
+  return {
+    title: `Start a replacement for ${closed}?`,
+    message: `GitHub refused to reopen ${closed}. Sail keeps it closed and starts a replacement pull request for ${shipIssueTarget(issue)} in ${remote} on a new branch from the saved checkpoint. The replacement does not merge until you confirm Merge.`,
+    confirmLabel: 'Start replacement',
+    destructive: false,
+  };
+}
+
+export function shipReopenHeadWarning(
+  head: string,
+  checkpointRevision: string | null | undefined,
+): string {
+  if (!checkpointRevision || head.toLowerCase() === checkpointRevision.toLowerCase()) return '';
+  return ` Warning: reopened head ${head.slice(0, 8)} differs from checkpoint revision ${checkpointRevision.slice(0, 8)}. Review the changed commits before continuing.`;
+}
+
 export function shipStopConfirmation(run: ShipRun): ShipConfirmation {
   const live = run.issues.filter((issue) => liveStates.has(issue.state)).length;
   return {

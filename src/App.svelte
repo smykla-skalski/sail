@@ -103,6 +103,8 @@
     shipMergeConfirmation,
     shipReopenAction,
     shipReopenConfirmation,
+    shipReplacementConfirmation,
+    shipReopenHeadWarning,
     shipRetryAction,
     shipRetryConfirmation,
     shipStopAction,
@@ -2679,16 +2681,61 @@
     const ready = shipReopenAction(issue);
     if (!ready.enabled)
       throw new Error(ready.reason ?? 'This issue changed and cannot be reopened.');
-    const outcome = await invoke<{ head: string; pullRequest: string; alreadyOpen: boolean }>(
-      'ship_reopen_pull_request',
-      {
+    let outcome: { head: string; pullRequest: string; alreadyOpen: boolean };
+    try {
+      outcome = await invoke('ship_reopen_pull_request', {
         request: {
           repository: run.repository,
           expectedRepository: run.remote,
           pullRequest: issue.pullRequest,
         },
-      },
-    );
+      });
+    } catch (cause) {
+      if (!describe(cause).startsWith('GitHub could not reopen the pull request.')) throw cause;
+      const revision = issue.checkpoint?.revision;
+      if (!revision)
+        throw new Error('The saved checkpoint has no revision for a replacement.', { cause });
+      if (!(await confirmShipAction(shipReplacementConfirmation(issue, run.remote)))) return '';
+      const stillReady = shipReopenAction(issue);
+      if (!stillReady.enabled)
+        throw new Error(stillReady.reason ?? 'This issue changed and cannot start a replacement.', {
+          cause,
+        });
+      if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+        await stopShippingWorker(issue);
+      const created = await invoke<CreatedWorktree>('create_shipping_replacement_worktree', {
+        repository: run.repository,
+        expectedRepository: run.remote,
+        issueNumber: issue.number,
+        pullRequest: issue.pullRequest,
+        checkpointRevision: revision,
+      });
+      saveProjectCatalog(addWorktree(projectCatalog, run.repository, created));
+      const key = `${run.id}:${issue.id}`;
+      beginLatestRefresh(shippingPullRequestGenerations, key);
+      shippingPullRequests.delete(key);
+      await restartShipIssue(
+        run,
+        issue,
+        `The closed pull request ${issue.pullRequest} could not reopen. Continue from checkpoint ${revision.slice(0, 8)} on replacement branch ${created.branch} and publish a new pull request.`,
+        {
+          branch: created.branch,
+          path: created.path,
+          worktreeUnavailable: false,
+          setupStarted: false,
+          setupCompleted: false,
+          shippingTarget: created.shippingTarget ?? issue.shippingTarget,
+          pullRequest: null,
+          pullRequestState: undefined,
+          pullRequestHead: undefined,
+          pullRequestMergeable: undefined,
+          mergeRequested: undefined,
+          checks: undefined,
+          ciTriages: undefined,
+        },
+      );
+      return `Replacement pull request queued on ${created.branch} from checkpoint ${revision.slice(0, 8)}. The original pull request stays closed.`;
+    }
     if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
       await stopShippingWorker(issue);
     const key = `${run.id}:${issue.id}`;
@@ -2696,15 +2743,16 @@
     beginLatestRefresh(shippingPullRequestGenerations, key);
     const cached = shippingPullRequests.get(key);
     if (cached) shippingPullRequests.set(key, { ...cached, state: 'OPEN' });
+    const warning = shipReopenHeadWarning(outcome.head, issue.checkpoint?.revision);
     await restartShipIssue(
       run,
       issue,
-      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.`,
+      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.${warning}`,
       { pullRequestState: 'OPEN', pullRequestHead: outcome.head },
     );
     return outcome.alreadyOpen
-      ? 'The pull request was already open. A fresh worker resumes from the saved checkpoint.'
-      : 'Pull request reopened. A fresh worker resumes from the saved checkpoint.';
+      ? `The pull request was already open. A fresh worker resumes from the saved checkpoint.${warning}`
+      : `Pull request reopened. A fresh worker resumes from the saved checkpoint.${warning}`;
   }
 
   async function stopShipRun(run: ShipRun): Promise<string> {
