@@ -1667,6 +1667,7 @@
     goToSubagentTarget(direction < 0 ? subagentNav?.previous : subagentNav?.next);
   }
   let answeredPermissions = $state<AnsweredPermission[]>([]);
+  const permissionStatusRevisions = new SvelteMap<string, number>();
   // Inbox items can go before their resolution event arrives, so their titles are kept here.
   const permissionTitles = new SvelteMap<string, string>();
   $effect(() => {
@@ -11200,6 +11201,19 @@
     const eventDirectory = event.directory ?? event.worktree;
     if (!eventDirectory) return;
     const eventSessionId = event.message.params?.sessionId;
+    const permissionStatusKey =
+      typeof eventSessionId === 'string'
+        ? JSON.stringify([event.agent, eventDirectory, eventSessionId])
+        : null;
+    if (
+      permissionStatusKey &&
+      (event.message.method === 'session/request_permission' ||
+        event.message.method === 'sail/permission_resolved')
+    )
+      permissionStatusRevisions.set(
+        permissionStatusKey,
+        (permissionStatusRevisions.get(permissionStatusKey) ?? 0) + 1,
+      );
     const eventThread =
       typeof eventSessionId === 'string'
         ? [...agentThreads, ...nativeChildThreads].find(
@@ -11247,14 +11261,39 @@
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       recordAnsweredPermission(event.agent, eventDirectory, eventSessionId, event.message.params);
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
-      nativeSubagents = setNativeSubagentWaiting(
-        nativeSubagents,
-        event.agent,
-        eventDirectory,
-        eventSessionId,
-        false,
-      );
+    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
+      const revision = permissionStatusRevisions.get(permissionStatusKey!);
+      void acp
+        .pendingPermissions(event.agent, eventDirectory, eventSessionId)
+        .then((pending) => {
+          if (pending.length || permissionStatusRevisions.get(permissionStatusKey!) !== revision)
+            return undefined;
+          nativeSubagents = setNativeSubagentWaiting(
+            nativeSubagents,
+            event.agent,
+            eventDirectory,
+            eventSessionId,
+            false,
+          );
+          for (const thread of agentThreads.filter(
+            (item) =>
+              item.agent === event.agent &&
+              item.sessionId === eventSessionId &&
+              item.directory === eventDirectory &&
+              threadAttention[threadKey(item)]?.status === 'waiting',
+          ))
+            updateAgentThreadStatus(thread, 'working');
+          for (const receipt of spawnReceipts.filter(
+            (item) =>
+              item.targetId === `acp:${event.agent}:${eventSessionId}` &&
+              item.targetDirectory === eventDirectory &&
+              item.state === 'waiting',
+          ))
+            updateSpawnReceipt(receipt.receiptId, { state: 'working' });
+          return undefined;
+        })
+        .catch(() => scheduleInboxRefresh());
+    }
     if (event.message.method === 'session/update') {
       const params = event.message.params;
       const sessionId = params?.sessionId;

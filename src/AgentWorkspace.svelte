@@ -2864,7 +2864,7 @@
 <style>
   .agent-permission-answered,
   .agent-readonly {
-    margin: 0;
+    margin: 0 16px;
     color: var(--sui-muted);
     font-size: 0.8rem;
   }

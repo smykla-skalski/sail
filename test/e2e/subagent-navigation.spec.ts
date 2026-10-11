@@ -171,6 +171,13 @@ describe('subagent navigation and control', () => {
     await expect($('.agent-readonly')).toHaveText(
       expect.stringContaining("Read-only: the agent doesn't accept messages for subagents yet"),
     );
+    expect(
+      await browser.execute(() => {
+        const prompt = document.querySelector('.agent-composer [data-pane-prompt]')!;
+        const note = document.querySelector('.agent-readonly')!;
+        return Math.round(note.getBoundingClientRect().left - prompt.getBoundingClientRect().left);
+      }),
+    ).toBe(16);
     await expect($('.agent-busy button')).not.toExist();
     await expect($('.agent-composer [data-pane-prompt]')).toHaveAttribute(
       'contenteditable',
@@ -202,6 +209,19 @@ describe('subagent navigation and control', () => {
     await expect($('.agent-permission-answered')).not.toHaveText(
       expect.stringContaining('Answered'),
     );
+    expect(
+      await browser.execute(() => {
+        const prompt = document.querySelector('.agent-composer [data-pane-prompt]')!;
+        const note = document.querySelector('.agent-permission-answered')!;
+        return Math.round(note.getBoundingClientRect().left - prompt.getBoundingClientRect().left);
+      }),
+    ).toBe(16);
+    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
+      'data-state',
+      'waiting',
+    );
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
+    await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
     expect(await answerOutsideUi(request, 'allow')).toContain('no longer pending');
     await $('button[aria-label="Go to parent thread"]').click();
     await expect($('.spawn-permission-answered')).not.toHaveText(
