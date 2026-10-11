@@ -543,6 +543,25 @@ fn release_session_tokens(
     }
 }
 
+fn release_per_load_token(
+    tokens: &mut HashMap<String, Vec<String>>,
+    session_id: &str,
+    token: &str,
+    mut release: impl FnMut(&str),
+) {
+    let Some(session_tokens) = tokens.get_mut(session_id) else {
+        return;
+    };
+    let Some(index) = session_tokens.iter().position(|stored| stored == token) else {
+        return;
+    };
+    session_tokens.swap_remove(index);
+    if session_tokens.is_empty() {
+        tokens.remove(session_id);
+    }
+    release(token);
+}
+
 fn release_all_per_load_tokens(
     tokens: &mut HashMap<String, Vec<String>>,
     mut release: impl FnMut(&str),
@@ -554,14 +573,14 @@ fn release_all_per_load_tokens(
     }
 }
 
-/// Returns the parameters to send for a restored session. Reuse keeps the adapter's live session;
-/// `per_load` is the documented rollback switch and mints a fresh config for every load.
 struct RestoreConfigState<'a> {
     alive: &'a AtomicBool,
     configs: &'a mut HashMap<String, SessionConfig>,
     per_load_tokens: &'a mut HashMap<String, Vec<String>>,
 }
 
+/// Returns the parameters to send for a restored session. Reuse keeps the adapter's live session;
+/// `per_load` is the documented rollback switch and mints a fresh config for every load.
 fn restore_params(
     per_load: bool,
     state: RestoreConfigState<'_>,
@@ -569,10 +588,11 @@ fn restore_params(
     cwd: &str,
     mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
     release: impl FnMut(&str),
-) -> Result<Value, String> {
+) -> Result<(Value, Option<String>), String> {
     if per_load {
         let config = mint()?;
         let servers = session_servers(mcp_server(&config));
+        let token = config.token.clone();
         if !store_per_load_token(
             state.alive,
             state.per_load_tokens,
@@ -582,13 +602,15 @@ fn restore_params(
         ) {
             return Err("Agent process stopped. Reopen the thread to reconnect.".into());
         }
-        return Ok(session_request_params(cwd, Some(session_id), &servers));
+        return Ok((
+            session_request_params(cwd, Some(session_id), &servers),
+            Some(token),
+        ));
     }
     let config = reuse_session_config(state.configs, session_id, cwd, mint, release)?;
-    Ok(session_request_params(
-        &config.cwd,
-        Some(session_id),
-        &config.servers,
+    Ok((
+        session_request_params(&config.cwd, Some(session_id), &config.servers),
+        None,
     ))
 }
 
@@ -3810,7 +3832,7 @@ async fn restore_session(
         )?;
         let runtime =
             register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
-        let params = {
+        let (params, minted_token) = {
             let mut configs = runtime
                 .session_configs
                 .lock()
@@ -3846,6 +3868,15 @@ async fn restore_session(
         };
         let result = runtime.request(method, params, Duration::from_secs(60));
         if result.is_err() {
+            if let Some(token) = minted_token {
+                let mut tokens = runtime
+                    .per_load_tokens
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                release_per_load_token(&mut tokens, &session_id, &token, |token| {
+                    browser.release(token)
+                });
+            }
             runtime
                 .session_directories
                 .lock()
@@ -4966,7 +4997,41 @@ mod session_config_tests {
         assert_eq!(released, 0);
         assert!(configs.is_empty());
         assert_eq!(tokens["session"], ["first", "second"]);
+        assert_eq!(first.1.as_deref(), Some("first"));
+        assert_eq!(second.1.as_deref(), Some("second"));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn failed_restore_releases_only_its_new_token() {
+        let mut configs = HashMap::new();
+        let mut tokens = HashMap::from([("session".to_string(), vec!["older".to_string()])]);
+        let alive = AtomicBool::new(true);
+        let (_, minted_token) = restore_params(
+            true,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
+            "session",
+            "/work/repo",
+            || Ok(config("failed", &[])),
+            |_| unreachable!(),
+        )
+        .unwrap();
+
+        let mut released = Vec::new();
+        release_per_load_token(
+            &mut tokens,
+            "session",
+            minted_token.as_deref().unwrap(),
+            |token| released.push(token.to_string()),
+        );
+        assert_eq!(released, ["failed"]);
+        assert_eq!(tokens["session"], ["older"]);
+
+        release_per_load_token(&mut tokens, "session", "failed", |_| unreachable!());
     }
 
     #[test]
