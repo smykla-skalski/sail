@@ -153,7 +153,12 @@ void test('a worker thread that already shows a request is not counted twice', (
     now,
     requestThreads: threadRequestKeys(requests),
   });
-  assert.deepEqual(both, []);
+  assert.equal(both.length, 1);
+  assert.equal(both[0].suppressed, true);
+  assert.deepEqual(
+    applyAttentionLifecycle(emptyAttentionLedger, [...requests, ...both], now).items.length,
+    1,
+  );
   assert.deepEqual(kinds(shipAttentionCandidates([run], { mergeOwner: 'you', now })), [
     'ship-needs-input:ship-issue',
   ]);
@@ -278,6 +283,53 @@ void test('a changed Ship blocker reason restores a dismissed item', () => {
   assert.equal(second.id, first.id);
   view = applyAttentionLifecycle(stored, [second], now + 1);
   assert.equal(view.items[0].detail, 'Second reason');
+});
+
+void test('a pending worker request preserves the Ship dismissal it replaces', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, {
+    state: 'working',
+    workerState: 'waiting',
+    path: '/projects/alpha',
+    threadId: 'acp:claude:s1',
+  });
+  const options = { mergeOwner: 'you' as const, now };
+  const [blocked] = shipAttentionCandidates([run], options);
+  let view = applyAttentionLifecycle(emptyAttentionLedger, [blocked], now);
+  view = applyAttentionLifecycle(dismissAttention(view.ledger, view.items[0]), [blocked], now);
+
+  const requests = sessionRequestCandidates([{ ...permission('s1'), sessionId: 's1' }]);
+  const [suppressed] = shipAttentionCandidates([run], {
+    ...options,
+    requestThreads: threadRequestKeys(requests),
+  });
+  view = applyAttentionLifecycle(view.ledger, [...requests, suppressed], now + 1);
+  assert.deepEqual(
+    view.items.map((item) => item.kind),
+    ['permission'],
+  );
+  assert.ok(view.ledger.hidden[blocked.id]);
+
+  view = applyAttentionLifecycle(view.ledger, [blocked], now + 2);
+  assert.deepEqual(view.items, []);
+});
+
+void test('a saved dismissal without a state snapshot stays hidden until a change', () => {
+  const [ready] = shipAttentionCandidates([readyRun()], { mergeOwner: 'you', now });
+  const legacy = loadAttentionLedger(
+    JSON.stringify({
+      seen: { [ready.id]: now },
+      hidden: { [ready.id]: { mode: 'dismissed', since: now } },
+    }),
+  );
+  const view = applyAttentionLifecycle(legacy, [ready], now + 1);
+  assert.deepEqual(view.items, []);
+  assert.equal(typeof view.ledger.hidden[ready.id].state, 'string');
+  assert.equal(
+    applyAttentionLifecycle(view.ledger, [{ ...ready, detail: 'Changed' }], now + 2).items.length,
+    1,
+  );
 });
 
 void test('a dismissed item returns after resolving within the grace period', () => {

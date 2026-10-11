@@ -52,7 +52,11 @@ export type AttentionItem = {
   detail?: string;
 };
 
-export type AttentionCandidate = Omit<AttentionItem, 'since'> & { since?: number };
+export type AttentionCandidate = Omit<AttentionItem, 'since'> & {
+  since?: number;
+  /** Another request represents this state while it remains unresolved. */
+  suppressed?: boolean;
+};
 
 const severityOrder: Record<AttentionSeverity, number> = { critical: 0, warning: 1, info: 2 };
 
@@ -230,18 +234,18 @@ export function shipAttentionCandidates(
         );
       } else if (presentation.label === 'Needs input') {
         const worker = issue.threadId ? shipThreadParts(issue.threadId) : null;
-        if (
+        const suppressed = !!(
           worker &&
           issue.path &&
           options.requestThreads?.has(threadKeyOf(issue.path, worker.agentId, worker.sessionId))
-        )
-          continue;
+        );
         items.push(
           candidate('ship-needs-input', target, {
             ...common,
             severity: 'critical',
             title: issueRef(issue),
             detail: presentation.reason ?? presentation.nextAction,
+            ...(suppressed ? { suppressed: true } : {}),
           }),
         );
       }
@@ -442,14 +446,24 @@ export function applyAttentionLifecycle(
   for (const entry of unique.values()) {
     const since = entry.since ?? ledger.seen[entry.id] ?? now;
     if (entry.since === undefined) seen[entry.id] = since;
-    const item: AttentionItem = { ...entry, since };
+    const { suppressed, ...visibleEntry } = entry;
+    const item: AttentionItem = { ...visibleEntry, since };
     const hide = item.dismissible ? ledger.hidden[item.id] : undefined;
+    if (suppressed) {
+      if (hide) hidden[item.id] = hide;
+      continue;
+    }
     if (
       hide &&
       hide.since === since &&
-      (hide.mode === 'dismissed' ? hide.state === attentionState(item) : now < hide.until)
+      (hide.mode === 'dismissed'
+        ? hide.state === undefined || hide.state === attentionState(item)
+        : now < hide.until)
     ) {
-      hidden[item.id] = hide;
+      hidden[item.id] =
+        hide.mode === 'dismissed' && hide.state === undefined
+          ? { ...hide, state: attentionState(item) }
+          : hide;
       continue;
     }
     items.push(item);
