@@ -229,6 +229,7 @@ describe('disk-backed settings', () => {
     await forceAppearance(null, 'settings');
     await returnToWorkspace();
     await browser.waitUntil(async () => (await read())['sai-theme'] === 'system');
+    await forceAppearance('light');
     await expectTheme('light');
     await capture('desktop-system-theme-light');
     await forceAppearance('dark');
