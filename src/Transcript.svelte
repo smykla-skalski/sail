@@ -38,6 +38,7 @@
     items,
     busy = false,
     live = false,
+    activityScope = '',
     coordinationMessages = [],
     onopen,
     control,
@@ -52,6 +53,7 @@
     busy?: boolean;
     /** True once history has loaded, so tool cards that mount failed announce. */
     live?: boolean;
+    activityScope?: string;
     coordinationMessages?: CoordinationMessage[];
     onopen?: (receipt: SpawnReceipt) => Promise<void>;
     control?: SubagentControl;
@@ -89,13 +91,13 @@
   <ToolActivity
     title={tool.title}
     status={tool.status}
-    activityId={tool.id}
+    activityId={activityScope ? `${activityScope}:${tool.id}` : tool.id}
     input={tool.input}
     output={tool.output}
     error={tool.error}
     source={tool.source}
     expanded={revealed}
-    {live}
+    live={tool.live ?? live}
   >
     {#each tool.terminalIds as terminalId (terminalId)}
       <button onclick={() => onterminal?.(terminalId)}>Open terminal</button>

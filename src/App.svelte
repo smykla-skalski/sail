@@ -12105,6 +12105,11 @@
                       nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
                     ]?.transcript
                   : undefined}
+                nativeLive={acpThread
+                  ? nativeSubagents[
+                      nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                    ]?.outcome === 'working'
+                  : false}
                 focusPrompt={promptFocusPane === 'main'}
                 picked={pickedAttachments.main}
                 prefill={issuePrefills[directory]}

@@ -1,5 +1,6 @@
 import type { ActivityHistoryEvent } from './activity-history.ts';
 import type { AgentDisplayEntry, AgentTool } from './acp';
+import { acpToolFailure } from './acp-tool-failure.ts';
 import {
   receiptNeedsLiveActivity,
   withSpawnResponses,
@@ -19,6 +20,7 @@ export type TranscriptTool = {
   error: string;
   source: string;
   terminalIds: string[];
+  live?: boolean;
   /** The host's own tool record, handed back to host callbacks. */
   raw?: unknown;
 };
@@ -184,16 +186,17 @@ export function shellItems(runs: ShellRun[]): TranscriptItem[] {
   return runs.map((run) => ({ kind: 'shell', id: `shell:${run.id}`, run }));
 }
 
-export function nativeTool(tool: AgentTool, output: string): TranscriptTool {
+export function nativeTool(tool: AgentTool, output: string, live = false): TranscriptTool {
   return {
     id: tool.id,
     title: tool.title,
     status: tool.status,
     input: tool.input,
     output,
-    error: '',
+    error: acpToolFailure(tool)?.reason ?? '',
     source: '',
     terminalIds: tool.terminalIds,
+    live,
     raw: tool,
   };
 }
@@ -201,7 +204,12 @@ export function nativeTool(tool: AgentTool, output: string): TranscriptTool {
 export function nativeItems(
   entries: AgentDisplayEntry[],
   spawn: SpawnReceipt[],
-  host: { name: string; provider: string; toolOutput: (tool: AgentTool) => string },
+  host: {
+    name: string;
+    provider: string;
+    toolOutput: (tool: AgentTool) => string;
+    historicalToolIds?: ReadonlySet<string>;
+  },
 ): TranscriptItem[] {
   return withSpawnResponses(entries, spawn, (entry) => entry.created).map(
     (entry): TranscriptItem => {
@@ -212,7 +220,9 @@ export function nativeItems(
           kind: 'tools',
           id: entry.id,
           created: entry.created,
-          tools: entry.tools.map((tool) => nativeTool(tool, host.toolOutput(tool))),
+          tools: entry.tools.map((tool) =>
+            nativeTool(tool, host.toolOutput(tool), !host.historicalToolIds?.has(tool.id)),
+          ),
         };
       return {
         kind: 'message',

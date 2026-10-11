@@ -81,6 +81,36 @@ await test('native entries keep one entry per type with the right role and autho
   );
 });
 
+const failed = (id: string): AgentDisplayEntry => ({
+  id: `tool-group:${id}`,
+  type: 'tool-group',
+  tools: [
+    {
+      id,
+      type: 'tool',
+      title: 'Run',
+      status: 'failed',
+      content: 'Command failed',
+      terminalIds: [],
+    },
+  ],
+});
+
+await test('historical and live failed tools keep separate announcement state', () => {
+  const items = nativeItems([failed('older'), failed('current')], [], {
+    ...host,
+    historicalToolIds: new Set(['older']),
+  });
+  const tools = items.flatMap((item) => (item.kind === 'tools' ? item.tools : []));
+  assert.deepEqual(
+    tools.map((tool) => [tool.id, tool.live, tool.error]),
+    [
+      ['older', false, 'Command failed'],
+      ['current', true, 'Command failed'],
+    ],
+  );
+});
+
 const check = (id: string, updated: number) => ({
   id,
   updated,

@@ -225,6 +225,7 @@
       requireClaim?: boolean,
     ) => Promise<DirectShipAuthorization | undefined>;
     nativeEntries?: AgentEntry[];
+    nativeLive?: boolean;
     /** The child's adapter advertised a prompt capability, so its composer is enabled. */
     childPrompts?: boolean;
     subagentControl?: SubagentControl;
@@ -269,6 +270,7 @@
     onworkspaceactivity,
     onshipit,
     nativeEntries,
+    nativeLive = false,
     childPrompts = false,
     subagentControl,
     capabilityProfile = 'build',
@@ -490,6 +492,7 @@
   let historyLoaded = $state(true);
   let historyLoading = $state(false);
   let historyAttempted = $state(false);
+  let historicalToolIds = $state.raw<ReadonlySet<string>>(new Set());
   let showingEarlier = false;
   const visibleEntries = $derived(entries.slice(-visibleCount));
   let seenEntryCount = 0;
@@ -656,6 +659,7 @@
         name,
         provider: agent,
         toolOutput: (tool) => tool.content || toolInput(tool.output),
+        historicalToolIds,
       }),
       timed: [
         ...hookItems(visibleHookActivities),
@@ -1051,6 +1055,10 @@
     try {
       const session = await acp.load(agent, directory, id, activeCapabilityProfile);
       if (current !== generation) return;
+      historicalToolIds = new Set([
+        ...historicalToolIds,
+        ...replayEntries.filter((entry) => entry.type === 'tool').map((entry) => entry.id),
+      ]);
       if (!configOptions.length && Array.isArray(session.configOptions))
         configOptions = session.configOptions as AgentConfigOption[];
       entries = restoreEntryTimes(replayEntries, entries);
@@ -1248,6 +1256,11 @@
         ? liveSessionView(entries, kept, sessionState(agent, directory, id))
         : null;
     if (liveView) entries = liveView.entries;
+    historicalToolIds = new Set(
+      nativeEntries && nativeLive
+        ? []
+        : entries.filter((entry) => entry.type === 'tool').map((entry) => entry.id),
+    );
     visibleCount = 50;
     historyLoaded = !id;
     historyLoading = false;
@@ -1358,6 +1371,10 @@
               ? await acp.load(agent, directory, id, activeCapabilityProfile)
               : await acp.resume(agent, directory, id, activeCapabilityProfile);
           if (current === generation && (restoresSubagents || !canResume)) {
+            historicalToolIds = new Set([
+              ...historicalToolIds,
+              ...replayEntries.filter((entry) => entry.type === 'tool').map((entry) => entry.id),
+            ]);
             entries = restoreEntryTimes(replayEntries, entries);
             setReplaying(false);
             replayEntries = [];
@@ -2646,6 +2663,7 @@
       {/snippet}
       <Transcript
         items={transcriptItems}
+        activityScope={JSON.stringify([agent, directory, activeSessionId])}
         busy={shownBusy}
         {coordinationMessages}
         onopen={onopensubagent}
