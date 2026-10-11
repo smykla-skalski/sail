@@ -4,7 +4,9 @@ import {
   getSetting,
   initializeSettings,
   quiesceSettingsWrites,
+  removeSetting,
   setSetting,
+  setSettingDurable,
   trackSettingsMutation,
 } from '../src/lib/settings.ts';
 
@@ -86,7 +88,17 @@ void test('quiescence rejects a settings load that finishes after its write barr
     await initializing;
 
     assert.equal(getSetting('sai-quiescence-probe'), null);
+    storage.clear(); // The second E2E reset phase clears browser storage before native reset.
+    const staleShipRefresh = Promise.resolve().then(() =>
+      setSettingDurable('sai-ship-runs', 'stale run'),
+    );
+    await assert.rejects(staleShipRefresh, /quiesced/);
+    assert.equal(storage.getItem('sai-ship-runs'), null);
     setSetting('sai-quiescence-probe', 'new');
+    assert.equal(storage.getItem('sai-quiescence-probe'), null);
+    storage.setItem('sai-quiescence-probe', 'current');
+    removeSetting('sai-quiescence-probe');
+    assert.equal(storage.getItem('sai-quiescence-probe'), 'current');
     await Promise.resolve();
     assert.deepEqual(commands, ['load_settings']);
     let invoked = false;

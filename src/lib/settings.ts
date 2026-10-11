@@ -96,6 +96,7 @@ export function getSetting(key: string): string | null {
 }
 
 export function setSetting(key: string, value: string): void {
+  if (e2eQuiesced) return;
   localStorage.setItem(key, value);
   if (ready && values[key] === value) return;
   if (ready) values[key] = value;
@@ -103,6 +104,7 @@ export function setSetting(key: string, value: string): void {
 }
 
 export async function setSettingDurable(key: string, value: string): Promise<void> {
+  if (e2eQuiesced) throw new Error('E2E settings writes are quiesced');
   if (isTauri() && !ready && !e2eSettingsDisabled)
     throw new Error('Sail settings are unavailable.');
   setSetting(key, value);
@@ -110,6 +112,7 @@ export async function setSettingDurable(key: string, value: string): Promise<voi
 }
 
 export function removeSetting(key: string): void {
+  if (e2eQuiesced) return;
   localStorage.removeItem(key);
   if (ready && !(key in values)) return;
   if (ready) delete values[key];
