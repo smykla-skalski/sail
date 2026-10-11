@@ -947,8 +947,10 @@ export const acp = {
     slotHeld = false,
   ) => limitedPrompt(agent, directory, sessionId, text, turnId, imagePaths, onQueue, slotHeld),
   acquireTurnSlot,
-  cancelQueuedTurn: (agent: AgentId, directory: string, sessionId: string, turnId: string) =>
-    resourceQueues.agent.cancel(queuedPromptKey(agent, directory, sessionId, turnId)),
+  cancelQueuedTurn: (agent: AgentId, directory: string, sessionId: string | null, turnId: string) =>
+    resourceQueues.agent.cancel(turnId) ||
+    (sessionId !== null &&
+      resourceQueues.agent.cancel(queuedPromptKey(agent, directory, sessionId, turnId))),
   steer: (
     agent: AgentId,
     directory: string,

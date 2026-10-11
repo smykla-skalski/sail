@@ -103,25 +103,123 @@ export const nativeMessageLimit = 40_000;
 
 /** The newest text that fits the message limit after an ellipsis, never starting inside a
  * surrogate pair. */
-function messageTail(text: string): string {
-  const start = text.length + 1 - nativeMessageLimit;
+function messageTail(text: string, limit = nativeMessageLimit): string {
+  if (limit === 0) return '';
+  const start = text.length + 1 - limit;
   const code = text.charCodeAt(start);
   return `…${text.slice(code >= 0xdc00 && code <= 0xdfff ? start + 1 : start)}`;
 }
 
 /** The oldest text that fits the message limit before an ellipsis, never ending inside a
  * surrogate pair. */
-function messageHead(text: string): string {
-  const end = nativeMessageLimit - 1;
+function messageHead(text: string, limit = nativeMessageLimit): string {
+  if (limit === 0) return '';
+  const end = limit - 1;
   const code = text.charCodeAt(end - 1);
   return `${text.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end)}…`;
 }
 
-/** Caps a raw tool value. Structured values over the limit become their capped JSON text, so a
- * tool's input keeps its leading fields and its output keeps the newest text. */
-function boundValue(value: unknown, cut: (text: string) => string): unknown {
-  const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return typeof text === 'string' && text.length > nativeMessageLimit ? cut(text) : value;
+const toolIdentityFields = new Set([
+  'command',
+  'hookName',
+  'hook_name',
+  'hook',
+  'hookPhase',
+  'hook_phase',
+  'hookEvent',
+  'hook_event',
+  'ruleName',
+  'rule_name',
+  'rule',
+]);
+const toolReasonFields = new Set(['reason', 'error', 'message', 'name']);
+const metadataFieldLimit = 1_000;
+
+function visitStrings(
+  value: unknown,
+  visit: (text: string, key: string) => string,
+  key = '',
+): unknown {
+  if (typeof value === 'string') return visit(value, key);
+  if (Array.isArray(value)) return value.map((item) => visitStrings(item, visit));
+  if (value && typeof value === 'object')
+    return Object.fromEntries(
+      Object.entries(value).map(([name, item]) => [name, visitStrings(item, visit, name)]),
+    );
+  return value;
+}
+
+function encodedLength(text: string): number {
+  return JSON.stringify(text).length - 2;
+}
+
+function fitString(
+  text: string,
+  budget: number,
+  cut: (text: string, limit: number) => string,
+): string {
+  if (encodedLength(text) <= budget) return text;
+  let low = 0;
+  let high = Math.min(text.length, budget);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (encodedLength(cut(text, middle)) <= budget) low = middle;
+    else high = middle - 1;
+  }
+  return cut(text, low);
+}
+
+function boundValue(value: unknown, cut: (text: string, limit: number) => string): unknown {
+  if (typeof value === 'string')
+    return value.length > nativeMessageLimit ? cut(value, nativeMessageLimit) : value;
+  if (!value || typeof value !== 'object') return value;
+  const serialized = JSON.stringify(value);
+  if (!serialized || serialized.length <= nativeMessageLimit) return value;
+
+  const skeleton = JSON.stringify(value, (_key, item: unknown) =>
+    typeof item === 'string' ? '' : item,
+  );
+  if (skeleton.length > nativeMessageLimit)
+    return Array.isArray(value)
+      ? []
+      : boundValue(
+          Object.fromEntries(
+            Object.entries(value).filter(
+              ([key, item]) =>
+                (toolIdentityFields.has(key) || toolReasonFields.has(key)) &&
+                (typeof item === 'string' || typeof item === 'number'),
+            ),
+          ),
+          cut,
+        );
+
+  const available = nativeMessageLimit - skeleton.length;
+  let identityLength = 0;
+  let reasonLength = 0;
+  visitStrings(value, (text, key) => {
+    if (toolIdentityFields.has(key))
+      identityLength += Math.min(encodedLength(text), metadataFieldLimit);
+    else if (toolReasonFields.has(key))
+      reasonLength += Math.min(encodedLength(text), metadataFieldLimit);
+    return '';
+  });
+  let identityBudget = Math.min(identityLength, available);
+  let reasonBudget = Math.min(reasonLength, available - identityBudget);
+  let otherBudget = available - identityBudget - reasonBudget;
+  return visitStrings(value, (text, key) => {
+    const identity = toolIdentityFields.has(key);
+    const reason = toolReasonFields.has(key);
+    const budget = identity ? identityBudget : reason ? reasonBudget : otherBudget;
+    const bounded = fitString(
+      text,
+      identity || reason ? Math.min(budget, metadataFieldLimit) : budget,
+      cut,
+    );
+    if (identity) identityBudget -= encodedLength(bounded);
+    else if (reason) reasonBudget -= encodedLength(bounded);
+    else otherBudget -= encodedLength(bounded);
+    return bounded;
+  });
 }
 
 function boundEntry(entry: AgentEntry): AgentEntry {

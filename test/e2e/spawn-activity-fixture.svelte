@@ -81,10 +81,19 @@
         : receipt,
     );
   }
+
+  function shrinkFinished() {
+    receipts = receipts.map((receipt) =>
+      receipt.receiptId === 'finished'
+        ? Object.assign({}, receipt, { result: 'Short result' })
+        : receipt,
+    );
+  }
 </script>
 
 <textarea aria-label="Parent message" bind:value={draft}></textarea>
 <button aria-label="Update child" onclick={update}>Update child</button>
+<button aria-label="Shrink finished result" onclick={shrinkFinished}>Shrink finished result</button>
 <button aria-label="Settle without result" onclick={() => settleMissing(null)}>
   Settle without result
 </button>

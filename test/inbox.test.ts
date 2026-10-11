@@ -4,6 +4,7 @@ import {
   failedCheckOutcome,
   inboxPermissionDecisionTitle,
   inboxLocations,
+  inboxRepositoryLabel,
   persistedInboxKinds,
   repositoryName,
   inboxTurnMessageIndex,
@@ -23,6 +24,7 @@ const item = (key: string, receivedAt: number): InboxItem => ({
   agent: 'OpenCode',
   agentId: 'opencode',
   directory: '/projects/alpha',
+  repository: '/projects/alpha',
   project: 'alpha',
   worktree: null,
   sessionId: 'session',
@@ -38,12 +40,40 @@ void test('inbox covers repositories and worktrees with their parent project', (
       worktrees: { '/projects/alpha': [{ path: '/worktrees/feature', branch: 'feature' }] },
     }),
     [
-      { directory: '/projects/alpha', project: 'alpha', worktree: null },
-      { directory: '/worktrees/feature', project: 'alpha', worktree: 'feature' },
-      { directory: '/projects/beta', project: 'beta', worktree: null },
-      { directory: 'C:\\projects\\gamma', project: 'gamma', worktree: null },
+      {
+        directory: '/projects/alpha',
+        repository: '/projects/alpha',
+        project: 'alpha',
+        worktree: null,
+      },
+      {
+        directory: '/worktrees/feature',
+        repository: '/projects/alpha',
+        project: 'alpha',
+        worktree: 'feature',
+      },
+      {
+        directory: '/projects/beta',
+        repository: '/projects/beta',
+        project: 'beta',
+        worktree: null,
+      },
+      {
+        directory: 'C:\\projects\\gamma',
+        repository: 'C:\\projects\\gamma',
+        project: 'gamma',
+        worktree: null,
+      },
     ],
   );
+});
+
+void test('duplicate repository headings use the shortest distinct parent path', () => {
+  const repositories = ['/tmp/one/app', '/tmp/two/app', '/work/one/app', '/tmp/tool'];
+  assert.equal(inboxRepositoryLabel(repositories[0], repositories), 'app · tmp/one');
+  assert.equal(inboxRepositoryLabel(repositories[1], repositories), 'app · two');
+  assert.equal(inboxRepositoryLabel(repositories[2], repositories), 'app · work/one');
+  assert.equal(inboxRepositoryLabel(repositories[3], repositories), 'tool');
 });
 
 void test('recent outcomes deduplicate provider events and preserve read state', () => {

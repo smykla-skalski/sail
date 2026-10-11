@@ -47,6 +47,7 @@ function permission(sessionId: string, agentId = 'codex'): InboxItem {
     text: 'Run',
     receivedAt: 1,
     directory: '/a',
+    repository: '/a',
     project: '/a',
     worktree: null,
   };
