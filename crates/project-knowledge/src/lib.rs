@@ -339,16 +339,10 @@ fn materialize_worktree(root: &Path, proposal: &Proposal, worktree: &Path) -> Re
         }
         Ok(())
     })();
-    if result.is_err() {
-        if worktree.join(&proposal.destination).exists() {
-            fs::write(worktree.join(&proposal.destination), &proposal.before)
-                .map_err(|error| format!("Cannot reset rejected proposal worktree: {error}"))?;
-        }
-        remove_worktree(root, worktree)?;
-    }
     result
 }
 
+#[cfg(test)]
 fn remove_worktree(root: &Path, worktree: &Path) -> Result<(), String> {
     let output = git_command()
         .arg("-C")
@@ -1293,6 +1287,41 @@ mod tests {
             "?? extra.txt"
         );
         fs::remove_file(worktree.join("extra.txt")).unwrap();
+        remove_worktree(&repo.0, &worktree).unwrap();
+        fs::remove_dir_all(worktree.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_hook_destination_edit_is_retained_on_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = Repo::new();
+        let hook = repo.0.join(".git/hooks/post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'hook owns this edit\\n' > AGENTS.md\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = repo.accept(&repo.preview(), true).unwrap_err();
+        assert!(error.contains("retained"), "{error}");
+        assert_eq!(
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "# Rules\n"
+        );
+
+        let list = git(&repo.0, &["worktree", "list", "--porcelain"]).unwrap();
+        let worktree = PathBuf::from(
+            list.lines()
+                .filter_map(|line| line.strip_prefix("worktree "))
+                .nth(1)
+                .unwrap(),
+        );
+        assert_eq!(
+            fs::read_to_string(worktree.join("AGENTS.md")).unwrap(),
+            "hook owns this edit\n"
+        );
+        fs::write(worktree.join("AGENTS.md"), "# Rules\n").unwrap();
         remove_worktree(&repo.0, &worktree).unwrap();
         fs::remove_dir_all(worktree.parent().unwrap()).unwrap();
     }
