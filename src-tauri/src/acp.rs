@@ -3797,26 +3797,9 @@ pub async fn acp_load_session(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
-    agent: String,
-    cwd: String,
-    session_id: String,
-    profile: Option<String>,
-    restore_token: Option<String>,
+    params: RestoreSessionCommand,
 ) -> Result<Value, String> {
-    restore_session(
-        manager,
-        app,
-        browser,
-        RestoreSessionParams {
-            agent,
-            cwd,
-            session_id,
-            profile,
-            method: "session/load",
-            restore_token,
-        },
-    )
-    .await
+    restore_session(manager, app, browser, params, "session/load").await
 }
 
 #[tauri::command]
@@ -3824,26 +3807,9 @@ pub async fn acp_resume_session(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
-    agent: String,
-    cwd: String,
-    session_id: String,
-    profile: Option<String>,
-    restore_token: Option<String>,
+    params: RestoreSessionCommand,
 ) -> Result<Value, String> {
-    restore_session(
-        manager,
-        app,
-        browser,
-        RestoreSessionParams {
-            agent,
-            cwd,
-            session_id,
-            profile,
-            method: "session/resume",
-            restore_token,
-        },
-    )
-    .await
+    restore_session(manager, app, browser, params, "session/resume").await
 }
 
 /// One page of the agent's own session history for a working directory.
@@ -3878,12 +3844,13 @@ pub async fn acp_list_sessions(
     .map_err(|error| error.to_string())?
 }
 
-struct RestoreSessionParams {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreSessionCommand {
     agent: String,
     cwd: String,
     session_id: String,
     profile: Option<String>,
-    method: &'static str,
     restore_token: Option<String>,
 }
 
@@ -3891,14 +3858,14 @@ async fn restore_session(
     manager: State<'_, AgentManager>,
     app: AppHandle,
     browser: State<'_, crate::browser_agent::BrowserManager>,
-    params: RestoreSessionParams,
+    params: RestoreSessionCommand,
+    method: &'static str,
 ) -> Result<Value, String> {
-    let RestoreSessionParams {
+    let RestoreSessionCommand {
         agent,
         cwd,
         session_id,
         profile,
-        method,
         restore_token,
     } = params;
     let profile = parse_profile(profile.as_deref())?;

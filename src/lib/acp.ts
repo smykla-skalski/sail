@@ -825,11 +825,7 @@ function restoreSession(
     restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
     try {
       const session = await invoke<Record<string, unknown>>(method, {
-        agent,
-        cwd,
-        sessionId,
-        profile,
-        restoreToken: token,
+        params: { agent, cwd, sessionId, profile, restoreToken: token },
       });
       invalidateLiveTranscript(agent, cwd, sessionId);
       rememberRestoredState(agent, cwd, sessionId, session);
