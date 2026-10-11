@@ -1927,14 +1927,15 @@
                         memoryKind = 'handoff';
                         memorySupersedesId = record.id;
                         memoryTags = record.tags.join(', ');
-                        memoryExpiry = record.expiresAt
-                          ? new Date(
-                              record.expiresAt -
-                                new Date(record.expiresAt).getTimezoneOffset() * 60_000,
-                            )
-                              .toISOString()
-                              .slice(0, 16)
-                          : '';
+                        memoryExpiry =
+                          record.expiresAt != null
+                            ? new Date(
+                                record.expiresAt -
+                                  new Date(record.expiresAt).getTimezoneOffset() * 60_000,
+                              )
+                                .toISOString()
+                                .slice(0, 16)
+                            : '';
                         memoryCorrectionOriginalValue = memoryExpiry;
                         memoryCorrectionOriginalTimestamp = record.expiresAt ?? null;
                         document.getElementById('memory-content')?.focus();
