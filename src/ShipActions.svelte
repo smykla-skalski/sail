@@ -4,6 +4,7 @@
     shipArchiveAction,
     shipIssueTarget,
     shipMergeAction,
+    shipMergeRetryReason,
     shipReopenAction,
     shipRetryAction,
     shipRunTarget,
@@ -66,7 +67,7 @@
   {#if !shipRunArchived(run)}
     {#if issue.state === 'awaiting_merge' && merge}{@render action(
         'merge',
-        'Merge',
+        shipMergeRetryReason(issue) ? 'Request again' : 'Merge',
         shipIssueTarget(issue),
         merge,
       )}{/if}

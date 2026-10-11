@@ -5,6 +5,8 @@ import {
   shipArchiveConfirmation,
   shipMergeAction,
   shipMergeConfirmation,
+  shipMergeRetryDelay,
+  shipMergeRetryReason,
   shipPoolLabel,
   shipPoolUsage,
   shipReopenAction,
@@ -55,14 +57,43 @@ void test('merge is available only for a ready pull request at the checkpoint re
   assert.match(shipMergeAction(closed).reason!, /not open/);
 });
 
-void test('merge stays disabled after the bot comment until the pull request closes', () => {
+void test('a recent merge request blocks a duplicate comment', () => {
   const requested = mergeable();
-  requested.mergeRequested = { at: 1, head: 'revision-one', comment: 'squash' };
-  const state = shipMergeAction(requested);
+  const now = Date.now();
+  requested.mergeRequested = { at: now, head: 'revision-one', comment: 'squash' };
+  const state = shipMergeAction(requested, now);
   assert.equal(state.enabled, false);
   assert.match(state.reason!, /Merge already requested with “squash”/);
   requested.pullRequestState = 'MERGED';
   assert.match(shipMergeAction(requested).reason!, /not open/);
+});
+
+void test('a stale merge request can be confirmed again at the threshold', () => {
+  const requested = mergeable();
+  const now = Date.now();
+  requested.mergeRequested = {
+    at: now - shipMergeRetryDelay + 1,
+    head: 'revision-one',
+    comment: 'squash',
+  };
+  assert.equal(shipMergeAction(requested, now).enabled, false);
+  requested.mergeRequested.at -= 1;
+  assert.deepEqual(shipMergeAction(requested, now), { enabled: true, reason: null });
+  const confirmation = shipMergeConfirmation(requested, 'a/b');
+  assert.match(confirmation.title, /Request merge again/);
+  assert.match(confirmation.message, /post “squash”/);
+  assert.equal(confirmation.confirmLabel, 'Request again');
+  requested.checks = [{ name: 'test', state: 'FAILURE', url: 'https://example.test' }];
+  assert.equal(shipMergeAction(requested, now).enabled, false);
+});
+
+void test('a new reviewed head allows a fresh merge request', () => {
+  const requested = mergeable();
+  requested.mergeRequested = { at: Date.now(), head: 'previous-head', comment: 'squash' };
+  assert.match(shipMergeRetryReason(requested)!, /head changed/);
+  assert.equal(shipMergeAction(requested).enabled, true);
+  requested.pullRequestHead = 'unreviewed-head';
+  assert.equal(shipMergeAction(requested).enabled, false);
 });
 
 void test('retry applies to failed issues whose pull request is still usable', () => {
