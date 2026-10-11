@@ -2,19 +2,21 @@ import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 describe('pending requests across projects', () => {
-  const first = mkdtempSync(join(tmpdir(), 'sail-inbox-first-'));
-  const second = mkdtempSync(join(tmpdir(), 'sail-inbox-second-'));
+  const first = join(mkdtempSync(join(tmpdir(), 'sail-inbox-first-')), 'app');
+  const second = join(mkdtempSync(join(tmpdir(), 'sail-inbox-second-')), 'app');
 
   before(() => {
+    mkdirSync(first);
+    mkdirSync(second);
     execFileSync('git', ['init', '-q', first]);
     execFileSync('git', ['init', '-q', second]);
   });
   after(() => {
-    rmSync(first, { recursive: true, force: true });
-    rmSync(second, { recursive: true, force: true });
+    rmSync(dirname(first), { recursive: true, force: true });
+    rmSync(dirname(second), { recursive: true, force: true });
   });
 
   it('orders requests, answers inline, and opens the exact thread', async () => {
@@ -64,6 +66,10 @@ describe('pending requests across projects', () => {
     await $(`.project-default-worktree-select[title="${paths[0]}"]`).click();
 
     await $('[data-topbar-inbox]').click();
+    const headings = await $$('.inbox-group-heading');
+    await expect(headings).toBeElementsArrayOfSize(2);
+    await expect(headings[0]).toHaveText(`app · ${dirname(paths[0]).split('/').at(-1)}`);
+    await expect(headings[1]).toHaveText(`app · ${dirname(paths[1]).split('/').at(-1)}`);
     const entries = await $$('.inbox-item');
     await expect(entries).toBeElementsArrayOfSize(2);
     await expect(entries[0]).toHaveText(expect.stringContaining(first.split('/').at(-1)!));

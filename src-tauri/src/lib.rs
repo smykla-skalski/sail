@@ -204,6 +204,7 @@ fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 mod acp;
 mod acp_terminal;
 mod attention;
+pub mod background_priority;
 mod browser;
 pub mod browser_agent;
 #[cfg(unix)]

@@ -7,6 +7,7 @@
   import { terminalFileLinks } from './lib/terminal-links';
   import { terminalTheme } from './lib/terminal-theme';
   import { terminalRuntimeId } from './lib/panes';
+  import { terminalDivertsKey } from './lib/shortcuts';
 
   type TerminalEvent = { kind: 'output'; data: number[] } | { kind: 'exit'; code: number };
 
@@ -125,12 +126,7 @@
     terminal.open(container);
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') return true;
-      const key = event.key.toLowerCase();
-      const appShortcut =
-        (event.metaKey || event.ctrlKey) &&
-        ((!event.altKey && ['w', 'd', 't', 'k', 'n'].includes(key)) ||
-          (event.altKey && key.startsWith('arrow')));
-      if (!appShortcut && event.key !== 'F6') return true;
+      if (!terminalDivertsKey(event)) return true;
       onshortcut(event);
       event.stopPropagation();
       return false;

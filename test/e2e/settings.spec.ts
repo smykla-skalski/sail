@@ -223,9 +223,13 @@ describe('disk-backed settings', () => {
       'aria-label',
       expect.stringContaining('System'),
     );
+    await forceAppearance('light', 'settings');
+    await expectTheme('light');
     await capture('settings-theme-system');
+    await forceAppearance(null, 'settings');
     await returnToWorkspace();
     await browser.waitUntil(async () => (await read())['sai-theme'] === 'system');
+    await forceAppearance('light');
     await expectTheme('light');
     await capture('desktop-system-theme-light');
     await forceAppearance('dark');
