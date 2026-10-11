@@ -120,6 +120,8 @@ pub fn default_root() -> Result<PathBuf, StoreWarning> {
     let parent = dirs::data_dir()
         .ok_or(StoreWarning::StorageUnavailable)?
         .join("sail");
+    fs::create_dir_all(&parent).map_err(|_| StoreWarning::StorageUnavailable)?;
+    private_directory(&parent)?;
     Ok(parent.join("context-output"))
 }
 

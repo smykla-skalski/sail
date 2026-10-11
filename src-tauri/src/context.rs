@@ -872,7 +872,7 @@ impl ContextSession {
 
 #[cfg(target_os = "macos")]
 pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
-    use crate::context_output_store::{OutputLimits, OutputScope, OutputStore};
+    use crate::context_output_store::{default_root, OutputScope, OutputStore};
     use std::io::{BufRead, Write};
     let canonical = dunce::canonicalize(directory).map_err(|error| error.to_string())?;
     let provider = locked_store(&service_store_path()?, |store| {
@@ -898,17 +898,7 @@ pub fn run_mcp_stdio(directory: &Path) -> Result<(), String> {
         session: uuid::Uuid::new_v4().to_string(),
         revision,
     };
-    #[cfg(feature = "e2e")]
-    let data_root = PathBuf::from(
-        std::env::var_os("SAIL_E2E_CONFIG_DIR")
-            .ok_or("Set SAIL_E2E_CONFIG_DIR for isolated broker data.")?,
-    );
-    #[cfg(not(feature = "e2e"))]
-    let data_root = dirs::data_dir()
-        .ok_or("Cannot locate broker data directory.")?
-        .join("sail");
-    fs::create_dir_all(&data_root).map_err(|error| error.to_string())?;
-    let store = OutputStore::open(data_root.join("context-output"), OutputLimits::default())
+    let store = OutputStore::open_configured(default_root().map_err(|warning| warning.message())?)
         .map_err(|warning| warning.message().to_owned())?;
     let broker = crate::context_broker_mcp::BrokerMcp::new(provider_id, scope, store);
     let session = ContextSession::open(directory)?;
