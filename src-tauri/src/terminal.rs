@@ -244,7 +244,10 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn drain_conpty_output(master: &dyn portable_pty::MasterPty) -> std::thread::JoinHandle<()> {
+    fn drain_conpty_output(
+        master: &dyn portable_pty::MasterPty,
+        tail: Option<std::sync::Arc<std::sync::Mutex<VecDeque<u8>>>>,
+    ) -> std::thread::JoinHandle<()> {
         use std::io::Read;
 
         let mut reader = master
@@ -255,7 +258,15 @@ mod tests {
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(count) => {
+                        if let Some(tail) = &tail {
+                            let mut tail = tail.lock().expect("capture ConPTY output");
+                            tail.extend(buffer[..count].iter().copied());
+                            while tail.len() > 4096 {
+                                tail.pop_front();
+                            }
+                        }
+                    }
                 }
             }
         })
@@ -298,7 +309,7 @@ mod tests {
             })
             .expect("open ConPTY");
         let job = WindowsTerminalJob::new().expect("create owned terminal job");
-        let output_drain = drain_conpty_output(pair.master.as_ref());
+        let output_drain = drain_conpty_output(pair.master.as_ref(), None);
         let mut command = CommandBuilder::new(super::shell());
         command.set_job_handle(job.raw_handle());
         let mut child = pair
@@ -354,7 +365,9 @@ mod tests {
             })
             .expect("open ConPTY");
         let job = WindowsTerminalJob::new().expect("create owned terminal job");
-        let output_drain = drain_conpty_output(pair.master.as_ref());
+        let output_tail = Arc::new(Mutex::new(VecDeque::new()));
+        let output_drain =
+            drain_conpty_output(pair.master.as_ref(), Some(Arc::clone(&output_tail)));
         let mut command = CommandBuilder::new("powershell.exe");
         command.args([
             "-NoProfile",
@@ -370,15 +383,23 @@ mod tests {
         drop(pair.slave);
         let writer = pair.master.take_writer().expect("take ConPTY writer");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(10);
         loop {
             if child.try_wait().expect("poll terminal shell").is_some() {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cmd.exe did not exit after starting its descendant"
-            );
+            if std::time::Instant::now() >= deadline {
+                let tail = output_tail.lock().expect("read ConPTY output tail");
+                let output =
+                    String::from_utf8_lossy(&tail.iter().copied().collect::<Vec<_>>()).into_owned();
+                panic!(
+                    "PowerShell parent did not exit: pid={:?}, elapsed={:?}, job active processes={:?}, ConPTY output tail={output:?}",
+                    child.process_id(),
+                    started.elapsed(),
+                    job.active_processes(),
+                );
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(
