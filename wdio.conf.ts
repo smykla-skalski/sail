@@ -2,7 +2,12 @@ import { browser } from '@wdio/globals';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
-import { isolatedPaths, privatePort, PrivateEndpointGuard } from './test/e2e-isolation.ts';
+import {
+  assertPrivateE2eConfigRoot,
+  isolatedPaths,
+  privatePort,
+  PrivateEndpointGuard,
+} from './test/e2e-isolation.ts';
 import { E2eJobQueue, e2eJobLimit } from './test/e2e-concurrency.ts';
 
 const limitEnvironment = { ...process.env };
@@ -25,6 +30,7 @@ process.once('exit', () => {
 });
 const attach = process.env.SAIL_E2E_ATTACH === '1';
 Object.assign(process.env, isolatedPaths(state, attach, process.env));
+if (attach) assertPrivateE2eConfigRoot(process.env.SAIL_E2E_CONFIG_DIR, tmpdir());
 if (attach && process.env.SAIL_E2E_MACHINE_READING !== 'healthy')
   throw new Error('Attach mode requires SAIL_E2E_MACHINE_READING=healthy in the app and runner.');
 if (!attach) process.env.SAIL_E2E_MACHINE_READING = 'healthy';
