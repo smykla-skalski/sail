@@ -5774,14 +5774,18 @@
     if (reservation.liveTurn) return;
     if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
     const replay: AgentEntry[] = [];
-    const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
-      if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId)) return;
-      const update = payload.message.params?.update;
-      if (update && typeof update === 'object')
-        updateEntriesInPlace(replay, update as Record<string, unknown>);
-    });
-    setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
+    let unlisten: (() => void) | undefined;
+    let replaying = false;
     try {
+      unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
+        if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId))
+          return;
+        const update = payload.message.params?.update;
+        if (update && typeof update === 'object')
+          updateEntriesInPlace(replay, update as Record<string, unknown>);
+      });
+      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
+      replaying = true;
       await acp.load(
         receipt.provider,
         worktreeDirectory,
@@ -5795,14 +5799,20 @@
     } catch {
       return;
     } finally {
-      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
-      unlisten();
-      await acp.endRestore(
-        receipt.provider,
-        worktreeDirectory,
-        sessionId,
-        reservation.restoreToken,
-      );
+      try {
+        if (replaying) setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
+      } finally {
+        try {
+          unlisten?.();
+        } finally {
+          await acp.endRestore(
+            receipt.provider,
+            worktreeDirectory,
+            sessionId,
+            reservation.restoreToken,
+          );
+        }
+      }
     }
   }
 
