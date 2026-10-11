@@ -1,7 +1,6 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -24,6 +23,44 @@ pub struct Proposal {
     before: String,
     after: String,
     diff: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedChange {
+    repository: PathBuf,
+    artifact: PathBuf,
+    revision: String,
+    reference: String,
+    tree: String,
+}
+
+impl PreparedChange {
+    pub fn artifact(&self) -> &Path {
+        &self.artifact
+    }
+
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    pub fn review_diff(&self) -> Result<String, String> {
+        let output = git_command()
+            .arg("--git-dir")
+            .arg(&self.artifact)
+            .args(["diff", "--no-ext-diff", "--no-textconv", "--text"])
+            .arg(&self.revision)
+            .arg(&self.reference)
+            .output()
+            .map_err(|_| "Cannot inspect proposal diff.")?;
+        if !output.status.success() {
+            return Err("Cannot inspect proposal diff.".into());
+        }
+        String::from_utf8(output.stdout).map_err(|_| "Invalid proposal diff response.".into())
+    }
 }
 
 impl Proposal {
@@ -79,6 +116,7 @@ pub fn preview(
     check_index_state(&root, destination)?;
     let revision = git(&root, &["rev-parse", "--verify", "HEAD"])?;
     let before = read_document(&target)?;
+    reject_content_attributes(&root, destination)?;
     if !git(
         &root,
         &[
@@ -103,6 +141,7 @@ pub fn preview(
     if !after.ends_with('\n') {
         after.push('\n');
     }
+    check_git_content(&root, &revision, destination, &before, &after)?;
     let diff = unified_diff(destination, &before, &after);
     Ok(Proposal {
         repository: root,
@@ -119,7 +158,17 @@ pub fn accept(
     repository: &Path,
     proposal: &Proposal,
     has_write_access: bool,
-) -> Result<(), String> {
+) -> Result<PreparedChange, String> {
+    accept_with(repository, proposal, has_write_access, || {}, |_, _, _| {})
+}
+
+fn accept_with<F: FnOnce(), G: FnOnce(&Path, &str, &str)>(
+    repository: &Path,
+    proposal: &Proposal,
+    has_write_access: bool,
+    before_publish: F,
+    after_publish: G,
+) -> Result<PreparedChange, String> {
     if !has_write_access {
         return Err("Repository write access is required.".into());
     }
@@ -129,12 +178,301 @@ pub fn accept(
     if root != proposal.repository {
         return Err("Proposal belongs to another repository; review it there.".into());
     }
-    let target = checked_target(&root, &proposal.destination)?;
-    check_index_state(&root, &proposal.destination)?;
-    if git(&root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
+    check_source(&root, proposal)?;
+    if proposal.after == proposal.before
+        || proposal.diff != unified_diff(&proposal.destination, &proposal.before, &proposal.after)
+    {
+        return Err("Proposal changed after preview.".into());
+    }
+    check_git_content(
+        &root,
+        &proposal.revision,
+        &proposal.destination,
+        &proposal.before,
+        &proposal.after,
+    )?;
+    let scratch = reserve_artifact_directory()?;
+    let mut retain_artifact = false;
+    let result = (|| {
+        let artifact = scratch.join("repo.git");
+        init_artifact(&root, &artifact)?;
+        let index = scratch.join("index");
+        git_index(&artifact, &index, &["read-tree", &proposal.revision])?;
+        let blob = write_blob(&artifact, proposal.after.as_bytes())?;
+        let mode = tracked_mode(&root, &proposal.destination)?;
+        let relative = proposal
+            .destination
+            .to_str()
+            .ok_or("Invalid destination.")?;
+        git_index(
+            &artifact,
+            &index,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("{mode},{blob},{relative}"),
+            ],
+        )?;
+        let tree = git_index(&artifact, &index, &["write-tree"])?;
+        before_publish();
+        check_source(&root, proposal)?;
+        let reference = publish_tree(&artifact, &tree)?;
+        after_publish(&artifact, &reference, &tree);
+        if let Err(error) = check_source(&root, proposal) {
+            if delete_tree_ref(&artifact, &reference, &tree).is_err() {
+                retain_artifact = true;
+                return Err(format!(
+                    "{error} Proposal ref changed; artifact retained at {}.",
+                    artifact.display()
+                ));
+            }
+            return Err(error);
+        }
+        Ok(PreparedChange {
+            repository: root,
+            artifact,
+            revision: proposal.revision.clone(),
+            reference,
+            tree,
+        })
+    })();
+    match result {
+        Err(error) => {
+            if !retain_artifact {
+                fs::remove_dir_all(&scratch).map_err(|cleanup| {
+                    format!("Cannot remove rejected proposal artifact: {cleanup}")
+                })?;
+            }
+            Err(error)
+        }
+        Ok(prepared) => {
+            if let Err(error) = fs::remove_file(scratch.join("index")) {
+                delete_tree_ref(&prepared.artifact, &prepared.reference, &prepared.tree).map_err(
+                    |_| {
+                        format!(
+                            "Cannot remove temporary index; artifact retained at {}.",
+                            prepared.artifact.display()
+                        )
+                    },
+                )?;
+                fs::remove_dir_all(&scratch)
+                    .map_err(|cleanup| format!("Cannot remove proposal artifact: {cleanup}"))?;
+                return Err(format!("Cannot remove temporary proposal index: {error}"));
+            }
+            Ok(prepared)
+        }
+    }
+}
+
+pub fn discard(repository: &Path, prepared: &PreparedChange) -> Result<(), String> {
+    let root = repository
+        .canonicalize()
+        .map_err(|_| "Repository is unavailable.")?;
+    if root != prepared.repository {
+        return Err("Prepared change belongs to another repository.".into());
+    }
+    delete_tree_ref(&prepared.artifact, &prepared.reference, &prepared.tree)?;
+    fs::remove_dir_all(
+        prepared
+            .artifact
+            .parent()
+            .ok_or("Invalid proposal artifact.")?,
+    )
+    .map_err(|error| format!("Cannot remove proposal artifact: {error}"))
+}
+
+fn reserve_artifact_directory() -> Result<PathBuf, String> {
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "sail-knowledge-artifact-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Cannot create proposal artifact: {error}")),
+        }
+    }
+}
+
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    for variable in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_EXTERNAL_DIFF",
+    ] {
+        command.env_remove(variable);
+    }
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command
+}
+
+fn init_artifact(root: &Path, artifact: &Path) -> Result<(), String> {
+    let source_objects = git(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+    )?;
+    if !git_command()
+        .args(["init", "--bare", "--quiet"])
+        .arg(artifact)
+        .status()
+        .map_err(|_| "Cannot initialize proposal artifact.")?
+        .success()
+    {
+        return Err("Cannot initialize proposal artifact.".into());
+    }
+    fs::write(
+        artifact.join("objects/info/alternates"),
+        format!("{source_objects}\n"),
+    )
+    .map_err(|_| "Cannot link source objects to proposal artifact.".into())
+}
+
+fn git_index(artifact: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
+    let output = git_command()
+        .arg("--git-dir")
+        .arg(artifact)
+        .env("GIT_INDEX_FILE", index)
+        .args(args)
+        .output()
+        .map_err(|_| "Cannot prepare proposal tree.")?;
+    if !output.status.success() {
+        return Err("Cannot prepare proposal tree.".into());
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim_end().to_owned())
+        .map_err(|_| "Invalid proposal tree response.".into())
+}
+
+fn write_blob(artifact: &Path, content: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = git_command()
+        .arg("--git-dir")
+        .arg(artifact)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|_| "Cannot prepare proposal blob.")?;
+    child
+        .stdin
+        .take()
+        .ok_or("Cannot prepare proposal blob.")?
+        .write_all(content)
+        .map_err(|_| "Cannot prepare proposal blob.")?;
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "Cannot prepare proposal blob.")?;
+    if !output.status.success() {
+        return Err("Cannot prepare proposal blob.".into());
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim_end().to_owned())
+        .map_err(|_| "Invalid proposal blob response.".into())
+}
+
+fn tracked_mode(root: &Path, destination: &Path) -> Result<&'static str, String> {
+    let relative = destination.to_str().ok_or("Invalid destination.")?;
+    let output = git_command()
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--stage", "-z", "--", relative])
+        .output()
+        .map_err(|_| "Cannot inspect destination mode.")?;
+    if !output.status.success() {
+        return Err("Cannot inspect destination mode.".into());
+    }
+    let entry = output.stdout;
+    if !entry.ends_with(format!("\t{relative}\0").as_bytes())
+        || entry.iter().filter(|byte| **byte == 0).count() != 1
+    {
+        return Err("Invalid destination mode.".into());
+    }
+    match entry.split(|byte| *byte == b' ').next() {
+        Some(b"100644") => Ok("100644"),
+        Some(b"100755") => Ok("100755"),
+        _ => Err("Invalid destination mode.".into()),
+    }
+}
+
+fn publish_tree(root: &Path, tree: &str) -> Result<String, String> {
+    publish_tree_with(root, tree, || {
+        format!(
+            "refs/sail/knowledge/{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        )
+    })
+}
+
+fn publish_tree_with<F: FnMut() -> String>(
+    root: &Path,
+    tree: &str,
+    mut next_reference: F,
+) -> Result<String, String> {
+    loop {
+        let reference = next_reference();
+        let output = git_command()
+            .arg("-C")
+            .arg(root)
+            .args(["update-ref", &reference, tree, ""])
+            .output()
+            .map_err(|_| "Cannot publish proposal tree.")?;
+        if output.status.success() {
+            return Ok(reference);
+        }
+        if !git_command()
+            .arg("-C")
+            .arg(root)
+            .args(["show-ref", "--verify", "--quiet", &reference])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Err("Cannot publish proposal tree.".into());
+        }
+    }
+}
+
+fn delete_tree_ref(root: &Path, reference: &str, tree: &str) -> Result<(), String> {
+    let output = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["update-ref", "-d", reference, tree])
+        .output()
+        .map_err(|_| "Cannot remove proposal ref.")?;
+    if !output.status.success() {
+        return Err("Cannot remove proposal ref.".into());
+    }
+    Ok(())
+}
+
+fn check_source(root: &Path, proposal: &Proposal) -> Result<(), String> {
+    let target = checked_target(root, &proposal.destination)?;
+    check_index_state(root, &proposal.destination)?;
+    reject_content_attributes(root, &proposal.destination)?;
+    if git(root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
         || read_document(&target)? != proposal.before
         || !git(
-            &root,
+            root,
             &[
                 "status",
                 "--porcelain",
@@ -149,45 +487,7 @@ pub fn accept(
     {
         return Err("Destination changed after preview; review a new proposal.".into());
     }
-    if proposal.after == proposal.before
-        || proposal.diff != unified_diff(&proposal.destination, &proposal.before, &proposal.after)
-    {
-        return Err("Proposal changed after preview.".into());
-    }
-    let parent = target.parent().ok_or("Invalid destination.")?;
-    let name = format!(
-        ".sail-knowledge-{}-{}.tmp",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    );
-    let temporary = parent.join(name);
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| format!("Cannot prepare proposal: {error}"))?;
-        let permissions = fs::metadata(&target)
-            .map_err(|error| error.to_string())?
-            .permissions();
-        file.set_permissions(permissions)
-            .map_err(|error| error.to_string())?;
-        file.write_all(proposal.after.as_bytes())
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("Cannot prepare proposal: {error}"))?;
-        if checked_target(&root, &proposal.destination)? != target
-            || check_index_state(&root, &proposal.destination).is_err()
-            || read_document(&target)? != proposal.before
-            || git(&root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
-        {
-            return Err("Destination changed after preview; review a new proposal.".into());
-        }
-        fs::rename(&temporary, &target).map_err(|error| format!("Cannot accept proposal: {error}"))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    Ok(())
 }
 
 fn checked_target(root: &Path, destination: &Path) -> Result<PathBuf, String> {
@@ -216,7 +516,7 @@ fn checked_target(root: &Path, destination: &Path) -> Result<PathBuf, String> {
         return Err("Destination must be a regular repository file.".into());
     }
     let relative = destination.to_str().ok_or("Invalid destination.")?;
-    let output = Command::new("git")
+    let output = git_command()
         .arg("--literal-pathspecs")
         .arg("-C")
         .arg(root)
@@ -231,7 +531,7 @@ fn checked_target(root: &Path, destination: &Path) -> Result<PathBuf, String> {
 
 fn check_index_state(root: &Path, destination: &Path) -> Result<(), String> {
     let relative = destination.to_str().ok_or("Invalid destination.")?;
-    let output = Command::new("git")
+    let output = git_command()
         .arg("--literal-pathspecs")
         .arg("-C")
         .arg(root)
@@ -254,11 +554,79 @@ fn read_document(path: &Path) -> Result<String, String> {
         return Err("Destination is too large or is read-only.".into());
     }
     let bytes = fs::read(path).map_err(|_| "Cannot read destination.")?;
+    if bytes.contains(&0) {
+        return Err("Destination must be text Markdown without NUL bytes.".into());
+    }
     String::from_utf8(bytes).map_err(|_| "Destination must be UTF-8 Markdown.".into())
 }
 
+fn check_git_content(
+    root: &Path,
+    revision: &str,
+    destination: &Path,
+    before: &str,
+    after: &str,
+) -> Result<(), String> {
+    reject_content_attributes(root, destination)?;
+    let relative = destination.to_str().ok_or("Invalid destination.")?;
+    let blob = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "blob", &format!("{revision}:{relative}")])
+        .output()
+        .map_err(|_| "Cannot inspect tracked destination content.")?;
+    if !blob.status.success() {
+        return Err("Cannot inspect tracked destination content.".into());
+    }
+    if blob.stdout != before.as_bytes() || after.contains('\r') {
+        return Err(
+            "Destination uses Git content conversion; choose a file without filters.".into(),
+        );
+    }
+    Ok(())
+}
+
+fn reject_content_attributes(root: &Path, destination: &Path) -> Result<(), String> {
+    let relative = destination.to_str().ok_or("Invalid destination.")?;
+    let attributes = ["filter", "ident", "working-tree-encoding", "diff"];
+    let output = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["check-attr", "-z"])
+        .args(attributes)
+        .args(["--", relative])
+        .output()
+        .map_err(|_| "Cannot inspect Git content conversion.")?;
+    if !output.status.success() {
+        return Err("Cannot inspect Git content conversion.".into());
+    }
+    let fields: Vec<_> = output.stdout.split(|byte| *byte == 0).collect();
+    if fields.len() != attributes.len() * 3 + 1
+        || !fields.last().is_some_and(|value| value.is_empty())
+    {
+        return Err("Invalid Git content conversion response.".into());
+    }
+    for (index, attribute) in attributes.iter().enumerate() {
+        let field = index * 3;
+        if fields[field] != relative.as_bytes() || fields[field + 1] != attribute.as_bytes() {
+            return Err("Invalid Git content conversion response.".into());
+        }
+        if *attribute == "diff" && fields[field + 2] != b"unspecified" {
+            return Err(
+                "Destination has a Git diff override; choose a file with a text diff.".into(),
+            );
+        }
+        if fields[field + 2] != b"unspecified" && fields[field + 2] != b"unset" {
+            return Err(
+                "Destination uses Git content conversion; choose a file without filters.".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("--literal-pathspecs")
         .arg("-C")
         .arg(root)
@@ -305,8 +673,9 @@ fn unified_diff(path: &Path, before: &str, after: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
-    struct Repo(PathBuf);
+    struct Repo(PathBuf, RefCell<Vec<PreparedChange>>);
 
     impl Repo {
         fn new() -> Self {
@@ -316,7 +685,7 @@ mod tests {
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
-            let repo = Self(path);
+            let repo = Self(path, RefCell::new(Vec::new()));
             repo.git(&["init", "-q"]);
             repo.git(&["config", "user.name", "Sail Test"]);
             repo.git(&["config", "user.email", "sail-test@example.invalid"]);
@@ -353,10 +722,37 @@ mod tests {
             )
             .unwrap()
         }
+        fn accept(
+            &self,
+            proposal: &Proposal,
+            has_write_access: bool,
+        ) -> Result<PreparedChange, String> {
+            let result = accept(&self.0, proposal, has_write_access);
+            if let Ok(prepared) = &result {
+                self.1.borrow_mut().push(prepared.clone());
+            }
+            result
+        }
+        fn prepared_text(&self, prepared: &PreparedChange, destination: &str) -> String {
+            let output = Command::new("git")
+                .arg("--git-dir")
+                .arg(prepared.artifact())
+                .arg("show")
+                .arg(format!("{}:{destination}", prepared.reference()))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        }
     }
 
     impl Drop for Repo {
         fn drop(&mut self) {
+            for prepared in self.1.borrow().iter() {
+                if prepared.artifact().exists() {
+                    discard(&self.0, prepared).unwrap();
+                }
+            }
             fs::remove_dir_all(&self.0).unwrap();
         }
     }
@@ -379,21 +775,290 @@ mod tests {
     }
 
     #[test]
-    fn accept_writes_only_the_explicit_destination_as_uncommitted_change() {
+    fn crlf_working_copy_is_rejected_before_preview() {
+        let repo = Repo::new();
+        fs::write(repo.0.join(".gitattributes"), "AGENTS.md text eol=crlf\n").unwrap();
+        repo.git(&["add", ".gitattributes"]);
+        repo.git(&["commit", "-qm", "set line endings"]);
+        fs::write(repo.0.join("AGENTS.md"), "# Rules\r\n").unwrap();
+        repo.git(&["add", "AGENTS.md"]);
+        assert!(git(&repo.0, &["status", "--porcelain", "--", "AGENTS.md"])
+            .unwrap()
+            .is_empty());
+
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "## New rule",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("Git content conversion"), "{error}");
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn nul_in_tracked_markdown_is_rejected_before_artifact_creation() {
+        let repo = Repo::new();
+        fs::write(repo.0.join("AGENTS.md"), b"# Rules\n\0hidden\n").unwrap();
+        repo.git(&["add", "AGENTS.md"]);
+        repo.git(&["commit", "-qm", "track binary markdown"]);
+
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "## New rule",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("NUL bytes"), "{error}");
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn artifact_diff_shows_text_with_external_diff_configured() {
         let repo = Repo::new();
         let proposal = repo.preview();
-        accept(&repo.0, &proposal, true).unwrap();
-        let content = fs::read_to_string(repo.0.join("AGENTS.md")).unwrap();
+        let prepared = repo.accept(&proposal, true).unwrap();
+        let patch = prepared.review_diff().unwrap();
+        assert!(patch.contains("+## New rule"));
+        assert!(patch.contains("+Check output."));
+
+        let output = Command::new("git")
+            .arg("--git-dir")
+            .arg(prepared.artifact())
+            .args(["diff", "--no-ext-diff", "--no-textconv", "--text"])
+            .arg(prepared.revision())
+            .arg(prepared.reference())
+            .env("GIT_EXTERNAL_DIFF", "/usr/bin/true")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), patch);
+        assert_eq!(
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "# Rules\n"
+        );
+        assert!(git(&repo.0, &["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clean_filter_that_changes_proposal_is_rejected() {
+        let repo = Repo::new();
+        repo.git(&["config", "filter.sail-test.clean", "sed s/secret/public/g"]);
+        fs::write(
+            repo.0.join(".gitattributes"),
+            "AGENTS.md filter=sail-test\n",
+        )
+        .unwrap();
+        repo.git(&["add", ".gitattributes"]);
+        repo.git(&["commit", "-qm", "set filter"]);
+
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "secret",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("Git content conversion"), "{error}");
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn preview_rejects_filter_without_running_its_command() {
+        let repo = Repo::new();
+        fs::write(
+            repo.0.join(".gitattributes"),
+            "AGENTS.md filter=sail-test\n",
+        )
+        .unwrap();
+        repo.git(&["add", ".gitattributes"]);
+        repo.git(&["commit", "-qm", "set filter"]);
+        let marker = repo.0.join("filter-ran");
+        repo.git(&[
+            "config",
+            "filter.sail-test.clean",
+            &format!("touch {}; cat", marker.display()),
+        ]);
+
+        assert!(preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "change",
+            true,
+        )
+        .is_err());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn proposed_carriage_return_is_rejected() {
+        let repo = Repo::new();
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "## New rule\r\nbody",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("Git content conversion"), "{error}");
+    }
+
+    #[test]
+    fn hidden_or_custom_git_diff_is_rejected() {
+        for attribute in ["-diff", "diff=custom"] {
+            let repo = Repo::new();
+            fs::write(
+                repo.0.join(".gitattributes"),
+                format!("AGENTS.md {attribute}\n"),
+            )
+            .unwrap();
+            repo.git(&["add", ".gitattributes"]);
+            repo.git(&["commit", "-qm", "set diff override"]);
+
+            let error = preview(
+                &repo.0,
+                Repo::memory(),
+                Path::new("AGENTS.md"),
+                "## New rule",
+                true,
+            )
+            .unwrap_err();
+            assert!(error.contains("Git diff override"), "{attribute}: {error}");
+            assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn filter_enabled_after_preview_blocks_acceptance() {
+        let repo = Repo::new();
+        let proposal = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "secret",
+            true,
+        )
+        .unwrap();
+        repo.git(&["config", "filter.sail-test.clean", "sed s/secret/public/g"]);
+        fs::write(
+            repo.0.join(".gitattributes"),
+            "AGENTS.md filter=sail-test\n",
+        )
+        .unwrap();
+        let published = Cell::new(false);
+        let error = accept_with(
+            &repo.0,
+            &proposal,
+            true,
+            || published.set(true),
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("Git content conversion"), "{error}");
+        assert!(!published.get());
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn accept_prepares_only_the_reviewed_destination_in_a_git_tree() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let prepared = repo.accept(&proposal, true).unwrap();
+        let content = repo.prepared_text(&prepared, "AGENTS.md");
         assert!(content.ends_with("## New rule\n\nCheck output.\n"));
         assert!(!content.contains("private observation"));
         assert_eq!(
-            fs::read_to_string(repo.0.join("docs/project.md")).unwrap(),
+            repo.prepared_text(&prepared, "docs/project.md"),
             "# Project\n"
         );
         assert_eq!(
-            git(&repo.0, &["status", "--porcelain"]).unwrap(),
-            " M AGENTS.md"
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "# Rules\n"
         );
+        assert!(git(&repo.0, &["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(prepared.revision(), proposal.revision());
+        assert_eq!(
+            git(
+                prepared.artifact(),
+                &[
+                    "diff",
+                    "--name-only",
+                    prepared.revision(),
+                    prepared.reference()
+                ]
+            )
+            .unwrap(),
+            "AGENTS.md"
+        );
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn discarded_text_is_absent_from_source_objects() {
+        let repo = Repo::new();
+        let private_text = "private proposal 592-unique-sentence";
+        let proposal = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            private_text,
+            true,
+        )
+        .unwrap();
+        let prepared = repo.accept(&proposal, true).unwrap();
+        let artifact = prepared.artifact().to_owned();
+        let blob = git(
+            &artifact,
+            &["rev-parse", &format!("{}:AGENTS.md", prepared.reference())],
+        )
+        .unwrap();
+        assert!(!Command::new("git")
+            .arg("-C")
+            .arg(&repo.0)
+            .args(["cat-file", "-e", &blob])
+            .status()
+            .unwrap()
+            .success());
+        discard(&repo.0, &prepared).unwrap();
+        assert!(!artifact.exists());
+        assert!(!Command::new("git")
+            .arg("-C")
+            .arg(&repo.0)
+            .args(["cat-file", "-e", &blob])
+            .status()
+            .unwrap()
+            .success());
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -408,13 +1073,244 @@ mod tests {
         )
         .is_err());
         let proposal = repo.preview();
-        assert!(accept(&repo.0, &proposal, false).is_err());
+        assert!(repo.accept(&proposal, false).is_err());
         fs::write(repo.0.join("AGENTS.md"), "updated elsewhere\n").unwrap();
-        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert!(repo.accept(&proposal, true).is_err());
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
         assert_eq!(
             fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
             "updated elsewhere\n"
         );
+    }
+
+    #[test]
+    fn editor_save_after_review_does_not_change_the_prepared_diff() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let prepared = repo.accept(&proposal, true).unwrap();
+        fs::write(repo.0.join("AGENTS.md"), "editor's newer text\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "editor's newer text\n"
+        );
+        assert_eq!(
+            repo.prepared_text(&prepared, "AGENTS.md"),
+            "# Rules\n\n## New rule\n\nCheck output.\n"
+        );
+        assert_eq!(
+            git(
+                prepared.artifact(),
+                &[
+                    "diff",
+                    "--name-only",
+                    prepared.revision(),
+                    prepared.reference()
+                ]
+            )
+            .unwrap(),
+            "AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn editor_save_during_acceptance_leaves_no_proposal_ref() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let result = accept_with(
+            &repo.0,
+            &proposal,
+            true,
+            || {
+                fs::write(repo.0.join("AGENTS.md"), "editor's concurrent save\n").unwrap();
+            },
+            |_, _, _| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "editor's concurrent save\n"
+        );
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn inherited_git_environment_cannot_redirect_proposal_writes() {
+        if std::env::var_os("SAIL_KNOWLEDGE_ENV_TEST_CHILD").is_none() {
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::inherited_git_environment_cannot_redirect_proposal_writes",
+                ])
+                .env("SAIL_KNOWLEDGE_ENV_TEST_CHILD", "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+
+        let repo = Repo::new();
+        let source_index = repo.0.join(".git/index");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(repo.0.join("AGENTS.md"), "# Rules\n").unwrap();
+        let index_before = fs::read(&source_index).unwrap();
+        std::env::set_var("GIT_OBJECT_DIRECTORY", repo.0.join(".git/objects"));
+        std::env::set_var("GIT_INDEX_FILE", repo.0.join("nonexistent-index"));
+        std::env::set_var(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            repo.0.join("no-alternates"),
+        );
+        std::env::set_var("GIT_DIR", repo.0.join("no-git-dir"));
+        std::env::set_var("GIT_COMMON_DIR", repo.0.join("no-common-dir"));
+        std::env::set_var("GIT_WORK_TREE", repo.0.join("no-work-tree"));
+        std::env::set_var("GIT_NAMESPACE", "another-namespace");
+        let proposal = repo.preview();
+        let prepared = repo.accept(&proposal, true).unwrap();
+        let blob = git(
+            prepared.artifact(),
+            &["rev-parse", &format!("{}:AGENTS.md", prepared.reference())],
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source_index).unwrap(), index_before);
+        assert!(!git_command()
+            .arg("-C")
+            .arg(&repo.0)
+            .args(["cat-file", "-e", &blob])
+            .status()
+            .unwrap()
+            .success());
+        discard(&repo.0, &prepared).unwrap();
+    }
+
+    #[test]
+    fn changed_ref_survives_failed_acceptance_cleanup() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let other_tree = git(&repo.0, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        let retained = RefCell::new(None);
+        let result = accept_with(
+            &repo.0,
+            &proposal,
+            true,
+            || {},
+            |artifact, reference, tree| {
+                retained.replace(Some((artifact.to_owned(), reference.to_owned())));
+                assert!(git_command()
+                    .arg("--git-dir")
+                    .arg(artifact)
+                    .args(["update-ref", reference, &other_tree, tree])
+                    .status()
+                    .unwrap()
+                    .success());
+                fs::write(repo.0.join("AGENTS.md"), "changed concurrently\n").unwrap();
+            },
+        );
+        assert!(result.unwrap_err().contains("artifact retained"));
+        let (artifact, reference) = retained.into_inner().unwrap();
+        assert_eq!(
+            git(&artifact, &["rev-parse", &reference]).unwrap(),
+            other_tree
+        );
+        fs::remove_dir_all(artifact.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_docs_directory_cannot_redirect_proposal_write() {
+        let repo = Repo::new();
+        let proposal = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("docs/project.md"),
+            "## New rule",
+            true,
+        )
+        .unwrap();
+        let outside = repo.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("project.md"), "outside content\n").unwrap();
+        fs::rename(repo.0.join("docs"), repo.0.join("old-docs")).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.0.join("docs")).unwrap();
+        assert!(repo.accept(&proposal, true).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("project.md")).unwrap(),
+            "outside content\n"
+        );
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn occupied_reference_is_not_replaced() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let prepared = repo.accept(&proposal, true).unwrap();
+        let tree = git(&repo.0, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        let occupied = "refs/sail/knowledge/occupied";
+        let free = "refs/sail/knowledge/free";
+        assert!(Command::new("git")
+            .arg("--git-dir")
+            .arg(prepared.artifact())
+            .args(["update-ref", occupied, &tree])
+            .status()
+            .unwrap()
+            .success());
+        let mut candidates = [occupied, free].into_iter();
+        assert_eq!(
+            publish_tree_with(prepared.artifact(), &tree, || candidates
+                .next()
+                .unwrap()
+                .to_owned())
+            .unwrap(),
+            free
+        );
+        assert_eq!(
+            git(prepared.artifact(), &["rev-parse", occupied]).unwrap(),
+            tree
+        );
+        delete_tree_ref(prepared.artifact(), occupied, &tree).unwrap();
+        delete_tree_ref(prepared.artifact(), free, &tree).unwrap();
+    }
+
+    #[test]
+    fn discard_removes_only_the_exact_prepared_tree() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let prepared = repo.accept(&proposal, true).unwrap();
+        let other_tree = git(&repo.0, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        assert!(Command::new("git")
+            .arg("--git-dir")
+            .arg(prepared.artifact())
+            .args([
+                "update-ref",
+                prepared.reference(),
+                &other_tree,
+                &prepared.tree
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(discard(&repo.0, &prepared).is_err());
+        assert_eq!(
+            git(prepared.artifact(), &["rev-parse", prepared.reference()]).unwrap(),
+            other_tree
+        );
+        assert!(Command::new("git")
+            .arg("--git-dir")
+            .arg(prepared.artifact())
+            .args([
+                "update-ref",
+                prepared.reference(),
+                &prepared.tree,
+                &other_tree
+            ])
+            .status()
+            .unwrap()
+            .success());
     }
 
     #[test]
@@ -424,7 +1320,7 @@ mod tests {
         fs::write(repo.0.join("docs/project.md"), "new version\n").unwrap();
         repo.git(&["add", "docs/project.md"]);
         repo.git(&["commit", "-qm", "next"]);
-        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert!(repo.accept(&proposal, true).is_err());
         assert_eq!(
             fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
             "# Rules\n"
@@ -460,7 +1356,7 @@ mod tests {
         let repo = Repo::new();
         let proposal = repo.preview();
         repo.git(&["update-index", "--assume-unchanged", "AGENTS.md"]);
-        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert!(repo.accept(&proposal, true).is_err());
         assert!(preview(
             &repo.0,
             Repo::memory(),
@@ -471,7 +1367,7 @@ mod tests {
         .is_err());
         repo.git(&["update-index", "--no-assume-unchanged", "AGENTS.md"]);
         repo.git(&["update-index", "--skip-worktree", "AGENTS.md"]);
-        assert!(accept(&repo.0, &proposal, true).is_err());
+        assert!(repo.accept(&proposal, true).is_err());
         assert_eq!(
             fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
             "# Rules\n"
@@ -536,7 +1432,7 @@ mod tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("docs/project.md", repo.0.join("AGENTS.md")).unwrap();
-            assert!(accept(&repo.0, &proposal, true).is_err());
+            assert!(repo.accept(&proposal, true).is_err());
             assert_eq!(
                 fs::read_to_string(repo.0.join("docs/project.md")).unwrap(),
                 "# Project\n"
@@ -562,13 +1458,9 @@ mod tests {
         repo.git(&["add", name]);
         repo.git(&["commit", "-qm", "add unicode document"]);
         let proposal = preview(&repo.0, Repo::memory(), Path::new(name), "  code\n", true).unwrap();
-        accept(&repo.0, &proposal, true).unwrap();
-        assert_eq!(
-            fs::read_to_string(repo.0.join(name)).unwrap(),
-            "# Café\n\n  code\n"
-        );
-        repo.git(&["add", name]);
-        repo.git(&["commit", "-qm", "accept unicode document"]);
+        let prepared = repo.accept(&proposal, true).unwrap();
+        assert_eq!(repo.prepared_text(&prepared, name), "# Café\n\n  code\n");
+        assert_eq!(fs::read_to_string(repo.0.join(name)).unwrap(), "# Café\n");
 
         repo.git(&["update-index", "--assume-unchanged", name]);
         assert!(preview(&repo.0, Repo::memory(), Path::new(name), "add", true).is_err());
@@ -604,9 +1496,9 @@ mod tests {
             preview(&repo.0, Repo::memory(), Path::new("AGENTS.md"), text, true).unwrap();
         assert!(proposal.diff().contains("+    indented code  \n"));
         assert!(proposal.diff().contains("+  next line\t\n+\n"));
-        accept(&repo.0, &proposal, true).unwrap();
+        let prepared = repo.accept(&proposal, true).unwrap();
         assert_eq!(
-            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            repo.prepared_text(&prepared, "AGENTS.md"),
             format!("# Rules\n\n{text}")
         );
         assert!(preview(
