@@ -720,7 +720,7 @@ describe('native Ship run history', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer [data-pane-prompt]').setValue('Do a small thing');
-    await $('.agent-actions button').click();
+    await $('.agent-actions button:last-child').click();
     await $('.agent-permission button').waitForExist({ timeout: 20_000 });
     await $('.agent-permission button').click();
     await expect($('.agent-conversation')).toHaveText(

@@ -47,7 +47,7 @@ describe('keyboard scrolling of a long transcript', () => {
     await expect(conversation).not.toHaveAttribute('tabindex');
 
     await $('.agent-composer [data-pane-prompt]').setValue('Long answer');
-    await $('.agent-actions button').click();
+    await $('.agent-actions button:last-child').click();
     await $('.permission-card .permission-actions button').click();
     await expect(conversation).toHaveText(expect.stringContaining('Answer line 99'));
     await expect(conversation).toHaveAttribute('tabindex', '0');
