@@ -1061,7 +1061,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
-    if (text === 'Native child permission') {
+    if (text === 'Native child permission' || text === 'Native child permission and question') {
       const child = `${sessionId}:permission-child`;
       update(sessionId, {
         sessionUpdate: 'subagent_spawned',
@@ -1074,6 +1074,24 @@ for await (const line of createInterface({ input: process.stdin })) {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Child waits for approval.' },
       });
+      if (text === 'Native child permission and question') {
+        const id = ++nextPermission;
+        elicitations.set(id, { sessionId: child, promptId: message.id });
+        send({
+          id,
+          method: 'elicitation/create',
+          params: {
+            sessionId: child,
+            mode: 'form',
+            message: 'Choose the delivery approach',
+            requestedSchema: {
+              type: 'object',
+              properties: { approach: { type: 'string', enum: ['safe', 'fast'] } },
+              required: ['approach'],
+            },
+          },
+        });
+      }
       requestPermission(child, text, message.id, sessionId);
       continue;
     }

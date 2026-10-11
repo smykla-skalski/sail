@@ -77,7 +77,7 @@ describe('subagent navigation and control', () => {
     rmSync(other, { recursive: true, force: true });
   });
 
-  async function startChildPermission() {
+  async function startChildPermission(text = 'Native child permission') {
     await browser.execute((path) => {
       localStorage.setItem('sai-directory', path);
       localStorage.setItem(
@@ -90,7 +90,7 @@ describe('subagent navigation and control', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer [data-pane-prompt]').setValue('Native child permission');
+    await $('.agent-composer [data-pane-prompt]').setValue(text);
     await $('.agent-actions button').click();
     await expect($('.spawn-permission')).toBeDisplayed();
   }
@@ -240,5 +240,19 @@ describe('subagent navigation and control', () => {
     expect(await answerOutsideUi(request, 'reject')).toContain('no longer pending');
     await $('button[aria-label="Go to parent thread"]').click();
     await expect($('.spawn-permission-answered')).toHaveText(expect.stringContaining('Answered'));
+  });
+
+  it('keeps a child waiting while its form question remains pending', async () => {
+    await startChildPermission('Native child permission and question');
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (2)');
+    const request = await childRequest();
+    expect(await answerOutsideUi(request, 'allow')).toBe('ok');
+    await expect($('.spawn-permission-answered')).toHaveText(expect.stringContaining('Answered'));
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (1)');
+    await expect($('.project-agent-row[data-depth="1"] .activity-status')).toHaveAttribute(
+      'data-state',
+      'waiting',
+    );
+    await expect($('.agent-status-bar')).toHaveText(expect.stringContaining('1 need attention'));
   });
 });

@@ -11208,7 +11208,9 @@
     if (
       permissionStatusKey &&
       (event.message.method === 'session/request_permission' ||
-        event.message.method === 'sail/permission_resolved')
+        event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'elicitation/create' ||
+        event.message.method === '$/cancel_request')
     )
       permissionStatusRevisions.set(
         permissionStatusKey,
@@ -11264,9 +11266,17 @@
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
       const revision = permissionStatusRevisions.get(permissionStatusKey!);
       void acp
-        .pendingPermissions(event.agent, eventDirectory, eventSessionId)
+        .pendingInbox()
         .then((pending) => {
-          if (pending.length || permissionStatusRevisions.get(permissionStatusKey!) !== revision)
+          if (
+            pending.some(
+              (item) =>
+                item.agent === event.agent &&
+                item.directory === eventDirectory &&
+                item.message.params?.sessionId === eventSessionId,
+            ) ||
+            permissionStatusRevisions.get(permissionStatusKey!) !== revision
+          )
             return undefined;
           nativeSubagents = setNativeSubagentWaiting(
             nativeSubagents,
