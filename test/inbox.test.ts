@@ -23,6 +23,7 @@ const item = (key: string, receivedAt: number): InboxItem => ({
   agent: 'OpenCode',
   agentId: 'opencode',
   directory: '/projects/alpha',
+  repository: '/projects/alpha',
   project: 'alpha',
   worktree: null,
   sessionId: 'session',
@@ -38,10 +39,30 @@ void test('inbox covers repositories and worktrees with their parent project', (
       worktrees: { '/projects/alpha': [{ path: '/worktrees/feature', branch: 'feature' }] },
     }),
     [
-      { directory: '/projects/alpha', project: 'alpha', worktree: null },
-      { directory: '/worktrees/feature', project: 'alpha', worktree: 'feature' },
-      { directory: '/projects/beta', project: 'beta', worktree: null },
-      { directory: 'C:\\projects\\gamma', project: 'gamma', worktree: null },
+      {
+        directory: '/projects/alpha',
+        repository: '/projects/alpha',
+        project: 'alpha',
+        worktree: null,
+      },
+      {
+        directory: '/worktrees/feature',
+        repository: '/projects/alpha',
+        project: 'alpha',
+        worktree: 'feature',
+      },
+      {
+        directory: '/projects/beta',
+        repository: '/projects/beta',
+        project: 'beta',
+        worktree: null,
+      },
+      {
+        directory: 'C:\\projects\\gamma',
+        repository: 'C:\\projects\\gamma',
+        project: 'gamma',
+        worktree: null,
+      },
     ],
   );
 });

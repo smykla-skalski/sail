@@ -41,8 +41,10 @@ export type AttentionItem = {
   id: string;
   kind: AttentionKind;
   target: AttentionTarget;
-  /** Repository name the Inbox groups by. */
+  /** Repository name displayed in the Inbox. */
   repo: string;
+  /** Stable repository identity, including its parent path or owner. */
+  repository: string;
   /** When the state began. */
   since: number;
   severity: AttentionSeverity;
@@ -105,6 +107,7 @@ export function sessionRequestCandidates(items: InboxItem[]): AttentionCandidate
     return [
       candidate(item.kind === 'question' ? 'question' : 'permission', target, {
         repo: item.project,
+        repository: item.repository,
         since: item.receivedAt,
         severity: 'critical',
         dismissible: false,
@@ -190,7 +193,11 @@ export function shipAttentionCandidates(
         issueId: issue.id,
         repository: run.repository,
       };
-      const common = { repo: shipRepositoryName(run), dismissible: true };
+      const common = {
+        repo: shipRepositoryName(run),
+        repository: run.repository,
+        dismissible: true,
+      };
       if (shipClosedWithoutMerge(issue)) {
         const prTarget: AttentionTarget = issue.pullRequest
           ? {
@@ -290,6 +297,7 @@ export function subagentAttentionCandidates(
         },
         {
           repo: repositoryName(receipt.project),
+          repository: receipt.project,
           since: receipt.updated,
           severity: 'warning',
           dismissible: true,

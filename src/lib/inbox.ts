@@ -3,6 +3,7 @@ import { permissionDecisionTitle, type PermissionPolicyDecision } from './capabi
 
 export type InboxLocation = {
   directory: string;
+  repository: string;
   project: string;
   worktree: string | null;
 };
@@ -154,11 +155,13 @@ export function inboxLocations(catalog: ProjectCatalog): InboxLocation[] {
   return catalog.repositories.flatMap((repository) => [
     {
       directory: repository,
+      repository,
       project: repositoryName(repository),
       worktree: null,
     },
     ...(catalog.worktrees[repository] ?? []).map((worktree) => ({
       directory: worktree.path,
+      repository,
       project: repositoryName(repository),
       worktree: worktree.branch,
     })),

@@ -34,6 +34,7 @@ function permission(key: string, receivedAt = 100): InboxItem {
     agent: 'Claude',
     agentId: 'claude',
     directory: '/projects/alpha',
+    repository: '/projects/alpha',
     project: 'alpha',
     worktree: null,
     sessionId: key,

@@ -44,12 +44,22 @@
   let pending = $derived(items.filter((item) => !isInboxOutcome(item)));
   let groups = $derived(
     [
-      ...pending.map((item) => ({ repo: item.project, order: item.receivedAt })),
-      ...attention.map((item) => ({ repo: item.repo, order: item.since })),
+      ...pending.map((item) => ({
+        repository: item.repository,
+        repo: item.project,
+        order: item.receivedAt,
+      })),
+      ...attention.map((item) => ({
+        repository: item.repository,
+        repo: item.repo,
+        order: item.since,
+      })),
     ]
       .toSorted((left, right) => left.order - right.order)
-      .map((entry) => entry.repo)
-      .filter((repo, index, repos) => repos.indexOf(repo) === index),
+      .filter(
+        (entry, index, entries) =>
+          entries.findIndex((other) => other.repository === entry.repository) === index,
+      ),
   );
   let recent = $derived(items.filter(isInboxOutcome).toReversed());
   let recentGroups = $derived(
@@ -81,10 +91,14 @@
   {#if error}<p class="notice error" role="alert">{error}</p>{/if}
   {#if loading && !items.length}<p role="status">Checking all projects…</p>{/if}
   {#if !loading && !total && !loadError}<p class="inbox-empty">Nothing needs your input.</p>{/if}
-  {#each groups as repo (repo)}
-    <h3 class="inbox-group-heading">{repo}</h3>
+  {#each groups as group (group.repository)}
+    <h3 class="inbox-group-heading">
+      {groups.some((other) => other !== group && other.repo === group.repo)
+        ? group.repository
+        : group.repo}
+    </h3>
     <ol class="inbox-list">
-      {#each pending.filter((item) => item.project === repo) as item (item.key)}
+      {#each pending.filter((item) => item.repository === group.repository) as item (item.key)}
         <li class="inbox-item">
           <button class="inbox-open" onclick={() => onopen(item)}>
             <span class="inbox-location">
@@ -108,7 +122,7 @@
           {/if}
         </li>
       {/each}
-      {#each attention.filter((item) => item.repo === repo) as item (item.id)}
+      {#each attention.filter((item) => item.repository === group.repository) as item (item.id)}
         <li class="inbox-item inbox-attention" data-attention-kind={item.kind}>
           <button class="inbox-open" onclick={() => onopenattention(item)}>
             <span class="inbox-location">
@@ -135,7 +149,12 @@
       {@const first = groupItems?.[0]}
       {#if first}
         <h3 class="inbox-group-heading">
-          {first.project}{first.worktree ? ` · ${first.worktree}` : ' · main'}
+          {Object.values(recentGroups).some(
+            (items) =>
+              items?.[0]?.repository !== first.repository && items?.[0]?.project === first.project,
+          )
+            ? first.repository
+            : first.project}{first.worktree ? ` · ${first.worktree}` : ' · main'}
         </h3>
         <ol class="inbox-list">
           {#each groupItems ?? [] as item (item.key)}
