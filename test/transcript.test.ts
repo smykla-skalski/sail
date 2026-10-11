@@ -9,6 +9,7 @@ import {
   currentToolGroup,
   hookItems,
   nativeItems,
+  replayHistoryToolIds,
   pendingCoordinationItems,
   queuedItems,
   shellItems,
@@ -18,6 +19,7 @@ import {
   latestRevision,
   decisionItems,
 } from '../src/lib/transcript.ts';
+import { toolAlert } from '../src/lib/tool-alerts.ts';
 import {
   acpPermissionChoices,
   acpPermissionDetails,
@@ -97,9 +99,12 @@ const failed = (id: string): AgentDisplayEntry => ({
 });
 
 await test('historical and live failed tools keep separate announcement state', () => {
+  const replayed = [failed('older'), failed('current')].flatMap((entry) =>
+    entry.type === 'tool-group' ? entry.tools : [],
+  );
   const items = nativeItems([failed('older'), failed('current')], [], {
     ...host,
-    historicalToolIds: new Set(['older']),
+    historicalToolIds: new Set(replayHistoryToolIds(replayed, new Set(['current']))),
   });
   const tools = items.flatMap((item) => (item.kind === 'tools' ? item.tools : []));
   assert.deepEqual(
@@ -108,6 +113,31 @@ await test('historical and live failed tools keep separate announcement state', 
       ['older', false, 'Command failed'],
       ['current', true, 'Command failed'],
     ],
+  );
+  const seen = new Set<string>();
+  assert.equal(
+    toolAlert(
+      {
+        id: tools[0].id,
+        error: tools[0].error,
+        mountedError: tools[0].error,
+        mountedLive: tools[0].live ?? false,
+      },
+      seen,
+    ),
+    '',
+  );
+  assert.equal(
+    toolAlert(
+      {
+        id: tools[1].id,
+        error: tools[1].error,
+        mountedError: tools[1].error,
+        mountedLive: tools[1].live ?? false,
+      },
+      seen,
+    ),
+    'Command failed',
   );
 });
 

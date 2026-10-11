@@ -1,7 +1,7 @@
 <script lang="ts">
   import { keyboardScrollable } from './lib/scroll-focus';
   import { onMount, tick, untrack } from 'svelte';
-  import { SvelteMap } from 'svelte/reactivity';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { Button } from '@smykla-skalski/sui';
@@ -15,6 +15,7 @@
     checkItems,
     hookItems,
     nativeItems,
+    replayHistoryToolIds,
     pendingCoordinationItems,
     queuedItems,
     shellItems,
@@ -510,6 +511,7 @@
     onreplaychange?.(agent, directory, activeSessionId, value);
   }
   let replayEntries: AgentEntry[] = [];
+  let liveReplayToolIds = new SvelteSet<string>();
   let pendingUpdates: Record<string, unknown>[] = [];
   let updateTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
@@ -1001,6 +1003,12 @@
       acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
     onnativeplan?.(nativePlan);
     if (replaying) {
+      if (
+        (busy || running || liveTurn) &&
+        (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
+        typeof update.toolCallId === 'string'
+      )
+        liveReplayToolIds.add(update.toolCallId);
       updateEntriesInPlace(replayEntries, update);
       return;
     }
@@ -1052,12 +1060,16 @@
     historyLoading = true;
     setReplaying(true);
     replayEntries = [];
+    liveReplayToolIds = new SvelteSet();
     try {
       const session = await acp.load(agent, directory, id, activeCapabilityProfile);
       if (current !== generation) return;
       historicalToolIds = new Set([
         ...historicalToolIds,
-        ...replayEntries.filter((entry) => entry.type === 'tool').map((entry) => entry.id),
+        ...replayHistoryToolIds(
+          replayEntries.filter((entry) => entry.type === 'tool'),
+          liveReplayToolIds,
+        ),
       ]);
       if (!configOptions.length && Array.isArray(session.configOptions))
         configOptions = session.configOptions as AgentConfigOption[];
@@ -1240,6 +1252,7 @@
     pendingUpdates = [];
     setReplaying(false);
     replayEntries = [];
+    liveReplayToolIds = new SvelteSet();
     permissions = [];
     answeredNotes = [];
     settledElsewhere = [];
@@ -1365,6 +1378,7 @@
           if (restoresSubagents || !canResume) {
             setReplaying(true);
             replayEntries = [];
+            liveReplayToolIds = new SvelteSet();
           }
           const session =
             restoresSubagents || !canResume
@@ -1373,7 +1387,10 @@
           if (current === generation && (restoresSubagents || !canResume)) {
             historicalToolIds = new Set([
               ...historicalToolIds,
-              ...replayEntries.filter((entry) => entry.type === 'tool').map((entry) => entry.id),
+              ...replayHistoryToolIds(
+                replayEntries.filter((entry) => entry.type === 'tool'),
+                liveReplayToolIds,
+              ),
             ]);
             entries = restoreEntryTimes(replayEntries, entries);
             setReplaying(false);

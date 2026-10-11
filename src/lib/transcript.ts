@@ -201,6 +201,13 @@ export function nativeTool(tool: AgentTool, output: string, live = false): Trans
   };
 }
 
+export function replayHistoryToolIds(
+  entries: readonly AgentTool[],
+  liveToolIds: ReadonlySet<string>,
+): string[] {
+  return entries.filter((entry) => !liveToolIds.has(entry.id)).map((entry) => entry.id);
+}
+
 export function nativeItems(
   entries: AgentDisplayEntry[],
   spawn: SpawnReceipt[],
