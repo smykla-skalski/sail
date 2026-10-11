@@ -9,6 +9,7 @@ import {
   currentToolGroup,
   hookItems,
   nativeItems,
+  presentToolIds,
   replayHistoryToolIds,
   pendingCoordinationItems,
   queuedItems,
@@ -135,6 +136,39 @@ await test('historical and live failed tools keep separate announcement state', 
         mountedError: tools[1].error,
         mountedLive: tools[1].live ?? false,
       },
+      seen,
+    ),
+    'Command failed',
+  );
+});
+
+await test('opening a working child keeps earlier failures silent while new failures announce', () => {
+  const existing = failed('older');
+  assert.equal(existing.type, 'tool-group');
+  const historicalToolIds = presentToolIds(existing.type === 'tool-group' ? existing.tools : []);
+  const items = nativeItems([failed('older'), failed('new')], [], {
+    ...host,
+    historicalToolIds,
+  });
+  const tools = items.flatMap((item) => (item.kind === 'tools' ? item.tools : []));
+  const seen = new Set<string>();
+  assert.deepEqual(
+    tools.map((tool) => [tool.id, tool.live]),
+    [
+      ['older', false],
+      ['new', true],
+    ],
+  );
+  assert.equal(
+    toolAlert(
+      { id: tools[0].id, error: tools[0].error, mountedError: tools[0].error, mountedLive: false },
+      seen,
+    ),
+    '',
+  );
+  assert.equal(
+    toolAlert(
+      { id: tools[1].id, error: tools[1].error, mountedError: tools[1].error, mountedLive: true },
       seen,
     ),
     'Command failed',

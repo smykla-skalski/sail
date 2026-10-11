@@ -15,6 +15,7 @@
     checkItems,
     hookItems,
     nativeItems,
+    presentToolIds,
     replayHistoryToolIds,
     pendingCoordinationItems,
     queuedItems,
@@ -226,7 +227,6 @@
       requireClaim?: boolean,
     ) => Promise<DirectShipAuthorization | undefined>;
     nativeEntries?: AgentEntry[];
-    nativeLive?: boolean;
     /** The child's adapter advertised a prompt capability, so its composer is enabled. */
     childPrompts?: boolean;
     subagentControl?: SubagentControl;
@@ -271,7 +271,6 @@
     onworkspaceactivity,
     onshipit,
     nativeEntries,
-    nativeLive = false,
     childPrompts = false,
     subagentControl,
     capabilityProfile = 'build',
@@ -1269,11 +1268,9 @@
         ? liveSessionView(entries, kept, sessionState(agent, directory, id))
         : null;
     if (liveView) entries = liveView.entries;
-    historicalToolIds = new Set(
-      nativeEntries && nativeLive
-        ? []
-        : entries.filter((entry) => entry.type === 'tool').map((entry) => entry.id),
-    );
+    // Tools already present when this pane opens are history, even if the child is still working.
+    // A failed tool arriving afterward is absent from this set and announces on its first render.
+    historicalToolIds = presentToolIds(nativeEntries ?? entries);
     visibleCount = 50;
     historyLoaded = !id;
     historyLoading = false;

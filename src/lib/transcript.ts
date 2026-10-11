@@ -1,5 +1,5 @@
 import type { ActivityHistoryEvent } from './activity-history.ts';
-import type { AgentDisplayEntry, AgentTool } from './acp';
+import type { AgentDisplayEntry, AgentEntry, AgentTool } from './acp';
 import { acpToolFailure } from './acp-tool-failure.ts';
 import {
   receiptNeedsLiveActivity,
@@ -206,6 +206,10 @@ export function replayHistoryToolIds(
   liveToolIds: ReadonlySet<string>,
 ): string[] {
   return entries.filter((entry) => !liveToolIds.has(entry.id)).map((entry) => entry.id);
+}
+
+export function presentToolIds(entries: readonly AgentEntry[]): ReadonlySet<string> {
+  return new Set(entries.filter((entry) => entry.type === 'tool').map((entry) => entry.id));
 }
 
 export function nativeItems(
