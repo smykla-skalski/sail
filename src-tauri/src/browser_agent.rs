@@ -950,6 +950,23 @@ fn memory_action(
             });
             serde_json::to_value(crate::memory::remember(app, &directory, input)?)
         }
+        "memory_supersede" => {
+            let id = required(&arguments, "id")?.to_string();
+            let mut input: crate::memory::MemoryInput =
+                serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+            input.provenance = Some(crate::memory::MemoryProvenance {
+                agent: agent.map(str::to_string),
+                session_id: Some(session.to_string()),
+                source: None,
+            });
+            serde_json::to_value(crate::memory::supersede(app, &directory, &id, input)?)
+        }
+        "memory_mark_conflict" => serde_json::to_value(crate::memory::mark_conflict(
+            app,
+            &directory,
+            required(&arguments, "firstId")?,
+            required(&arguments, "secondId")?,
+        )?),
         "memory_search" => {
             let query = required(&arguments, "query")?;
             let limit = arguments
@@ -1485,6 +1502,16 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "content",
     ),
     (
+        "memory_supersede",
+        "Replace a current private handoff with a corrected handoff and preserve history.",
+        "id,content,kind",
+    ),
+    (
+        "memory_mark_conflict",
+        "Mark two current private handoffs as unresolved conflicting advice.",
+        "firstId,secondId",
+    ),
+    (
         "memory_search",
         "Search this Git project's durable memories. In Sail, prefer this server over any system-wide Sail memory server; they share one store.",
         "query",
@@ -1806,6 +1833,23 @@ fn memory_tool_schema(name: &str) -> Option<Value> {
             },
             "required":["content"]
         })),
+        "memory_supersede" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "id":{"type":"string","format":"uuid"},
+                "content":{"type":"string","minLength":1,"maxLength":4000},
+                "kind":{"type":"string","enum":["handoff"]},
+                "tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16},
+                "expiresAt":{"type":"integer","minimum":0}
+            },"required":["id","content","kind"]
+        })),
+        "memory_mark_conflict" => Some(json!({
+            "type":"object","additionalProperties":false,
+            "properties":{
+                "firstId":{"type":"string","format":"uuid"},
+                "secondId":{"type":"string","format":"uuid"}
+            },"required":["firstId","secondId"]
+        })),
         "memory_search" => Some(json!({
             "type":"object",
             "additionalProperties":false,
@@ -1870,6 +1914,8 @@ impl CapabilityProfile {
             "sail_skill",
             "skill_reference",
             "memory_remember",
+            "memory_supersede",
+            "memory_mark_conflict",
             "memory_search",
             "memory_inspect",
             "memory_forget",
@@ -2343,6 +2389,8 @@ mod skill_tests {
         assert!(TOOLS.iter().any(|(name, _, _)| *name == "sail_skill"));
         for name in [
             "memory_remember",
+            "memory_supersede",
+            "memory_mark_conflict",
             "memory_search",
             "memory_inspect",
             "memory_forget",

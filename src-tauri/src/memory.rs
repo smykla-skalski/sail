@@ -54,6 +54,10 @@ pub struct MemoryRecord {
     pub forgotten_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -349,10 +353,110 @@ pub(crate) fn remember_at(
         rating: None,
         forgotten_at: None,
         expires_at: input.expires_at,
+        superseded_by: None,
+        conflicts_with: Vec::new(),
     };
     store.memories.push(memory.clone());
     write_store(&paths, &store)?;
     Ok(memory)
+}
+
+pub(crate) fn supersede_at(
+    root: &Path,
+    key: &str,
+    id: &str,
+    input: MemoryInput,
+) -> Result<MemoryRecord, String> {
+    let input = validate(input)?;
+    if input.kind != Some(MemoryKind::Handoff) {
+        return Err("A handoff can only be replaced by another handoff.".into());
+    }
+    let paths = paths(root, key);
+    let _lock = lock_store(&paths)?;
+    let mut store = read_store(&paths)?;
+    let timestamp = now();
+    let previous = store
+        .memories
+        .iter_mut()
+        .find(|memory| memory.id == id && memory.forgotten_at.is_none())
+        .ok_or("Memory not found.")?;
+    if previous.kind != MemoryKind::Handoff || previous.superseded_by.is_some() {
+        return Err("Only a current handoff can be replaced.".into());
+    }
+    let conflicts_with = previous.conflicts_with.clone();
+    let memory = MemoryRecord {
+        id: Uuid::new_v4().to_string(),
+        content: input.content,
+        kind: MemoryKind::Handoff,
+        tags: input.tags.unwrap_or_default(),
+        created_at: timestamp,
+        updated_at: timestamp,
+        provenance: input.provenance.unwrap_or_default(),
+        rating: None,
+        forgotten_at: None,
+        expires_at: input.expires_at,
+        superseded_by: None,
+        conflicts_with: conflicts_with.clone(),
+    };
+    previous.superseded_by = Some(memory.id.clone());
+    previous.updated_at = timestamp;
+    for counterpart in store
+        .memories
+        .iter_mut()
+        .filter(|record| conflicts_with.contains(&record.id))
+    {
+        if !counterpart.conflicts_with.contains(&memory.id) {
+            counterpart.conflicts_with.push(memory.id.clone());
+            counterpart.updated_at = timestamp;
+        }
+    }
+    store.memories.push(memory.clone());
+    write_store(&paths, &store)?;
+    Ok(memory)
+}
+
+pub(crate) fn mark_conflict_at(
+    root: &Path,
+    key: &str,
+    first_id: &str,
+    second_id: &str,
+) -> Result<(), String> {
+    if first_id == second_id {
+        return Err("A handoff cannot conflict with itself.".into());
+    }
+    let paths = paths(root, key);
+    let _lock = lock_store(&paths)?;
+    let mut store = read_store(&paths)?;
+    let timestamp = now();
+    for id in [first_id, second_id] {
+        let memory = store
+            .memories
+            .iter()
+            .find(|memory| memory.id == id && memory.forgotten_at.is_none())
+            .ok_or("Memory not found.")?;
+        if memory.kind != MemoryKind::Handoff
+            || memory.superseded_by.is_some()
+            || is_expired(memory, timestamp)
+        {
+            return Err("Only current handoffs can be marked as conflicting.".into());
+        }
+    }
+    for (id, counterpart) in [(first_id, second_id), (second_id, first_id)] {
+        let memory = store
+            .memories
+            .iter_mut()
+            .find(|memory| memory.id == id)
+            .unwrap();
+        if !memory
+            .conflicts_with
+            .iter()
+            .any(|other| other == counterpart)
+        {
+            memory.conflicts_with.push(counterpart.to_string());
+            memory.updated_at = timestamp;
+        }
+    }
+    write_store(&paths, &store)
 }
 
 fn inspect_at(root: &Path, key: &str, id: &str) -> Result<MemoryRecord, String> {
@@ -437,6 +541,7 @@ pub(crate) fn search_at(
     let mut results: Vec<_> = list_at(root, key, false)?
         .into_iter()
         .filter(|memory| !is_expired(memory, timestamp))
+        .filter(|memory| memory.superseded_by.is_none())
         .filter_map(|memory| {
             let haystack = format!(
                 "{} {} {:?}",
@@ -492,6 +597,30 @@ pub fn remember(
     Ok(memory)
 }
 
+pub fn supersede(
+    app: &tauri::AppHandle,
+    directory: &str,
+    id: &str,
+    input: MemoryInput,
+) -> Result<MemoryRecord, String> {
+    let (root, key) = context(app, directory)?;
+    let memory = supersede_at(&root, &key, id, input)?;
+    crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    Ok(memory)
+}
+
+pub fn mark_conflict(
+    app: &tauri::AppHandle,
+    directory: &str,
+    first_id: &str,
+    second_id: &str,
+) -> Result<(), String> {
+    let (root, key) = context(app, directory)?;
+    mark_conflict_at(&root, &key, first_id, second_id)?;
+    crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    Ok(())
+}
+
 pub(crate) fn remember_unique_batch(
     app: &tauri::AppHandle,
     directory: &str,
@@ -529,6 +658,8 @@ pub(crate) fn remember_unique_batch(
             rating: None,
             forgotten_at: None,
             expires_at: input.expires_at,
+            superseded_by: None,
+            conflicts_with: Vec::new(),
         };
         store.memories.push(memory.clone());
         imported.push(memory);
@@ -652,6 +783,28 @@ pub fn memory_remember(
 }
 
 #[tauri::command]
+pub fn memory_supersede(
+    app: tauri::AppHandle,
+    directory: String,
+    id: String,
+    input: MemoryInput,
+) -> Result<MemoryRecord, String> {
+    ensure_enabled(&app, &directory)?;
+    supersede(&app, &directory, &id, input)
+}
+
+#[tauri::command]
+pub fn memory_mark_conflict(
+    app: tauri::AppHandle,
+    directory: String,
+    first_id: String,
+    second_id: String,
+) -> Result<(), String> {
+    ensure_enabled(&app, &directory)?;
+    mark_conflict(&app, &directory, &first_id, &second_id)
+}
+
+#[tauri::command]
 pub fn memory_inspect(
     app: tauri::AppHandle,
     directory: String,
@@ -763,6 +916,35 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
             );
             serde_json::to_value(memory).map_err(|error| error.to_string())
         }
+        "memory_supersede" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("id is required")?;
+            let mut input: MemoryInput =
+                serde_json::from_value(arguments.clone()).map_err(|error| error.to_string())?;
+            input.provenance = Some(MemoryProvenance {
+                agent: std::env::var("SAIL_MEMORY_AGENT").ok(),
+                session_id: session.map(str::to_string),
+                source: None,
+            });
+            let memory = supersede_at(&root, &key, id, input)?;
+            crate::memory_provider::sync_standalone_later(root, settings, key);
+            serde_json::to_value(memory).map_err(|error| error.to_string())
+        }
+        "memory_mark_conflict" => {
+            let first_id = arguments
+                .get("firstId")
+                .and_then(Value::as_str)
+                .ok_or("firstId is required")?;
+            let second_id = arguments
+                .get("secondId")
+                .and_then(Value::as_str)
+                .ok_or("secondId is required")?;
+            mark_conflict_at(&root, &key, first_id, second_id)?;
+            crate::memory_provider::sync_standalone_later(root, settings, key);
+            Ok(json!({"conflicted": true}))
+        }
         "memory_search" => {
             let query = arguments
                 .get("query")
@@ -840,6 +1022,8 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
 fn memory_tools() -> Value {
     json!({"tools":[
         {"name":"memory_remember","description":"Store one concise durable project fact. Set expiresAt in Unix milliseconds only for a handoff. Never store raw transcripts, complete tool output, secrets, or temporary progress.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"content":{"type":"string","minLength":1,"maxLength":4000},"kind":{"type":"string","enum":["decision","constraint","discovery","preference","handoff","other"]},"tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16},"expiresAt":{"type":"integer","minimum":0}},"required":["content"]}},
+        {"name":"memory_supersede","description":"Replace one current private handoff with a corrected handoff while preserving its history. The old text stays out of search even if the replacement expires or is forgotten.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"},"content":{"type":"string","minLength":1,"maxLength":4000},"kind":{"type":"string","enum":["handoff"]},"tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16},"expiresAt":{"type":"integer","minimum":0}},"required":["id","content","kind"]}},
+        {"name":"memory_mark_conflict","description":"Mark two current private handoffs as unresolved conflicting advice without declaring either one authoritative.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"firstId":{"type":"string","format":"uuid"},"secondId":{"type":"string","format":"uuid"}},"required":["firstId","secondId"]}},
         {"name":"memory_search","description":"Search this Git project's durable memories. External agents use this server; inside Sail, prefer sail-browser, which shares the same store.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","maxLength":1000},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["query"]}},
         {"name":"memory_inspect","description":"Inspect one project memory by ID.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"}},"required":["id"]}},
         {"name":"memory_forget","description":"Forget one project memory by ID and remove its stored content.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"}},"required":["id"]}},
@@ -848,7 +1032,7 @@ fn memory_tools() -> Value {
     ]})
 }
 
-const MCP_INSTRUCTIONS: &str = "Sail memory belongs to the current Git project and its worktrees. Outside Sail, use this server; inside Sail, prefer sail-browser, which shares the store. Search and inspect relevant memories before work that depends on past decisions; skip trivial tasks. Search before saving to avoid duplicates. Save only durable facts, never secrets, raw transcripts, or temporary progress. The current user instructions and repository rules take precedence. Forget only on user request.";
+const MCP_INSTRUCTIONS: &str = "Sail memory belongs to the current Git project and its worktrees. Outside Sail, use this server; inside Sail, prefer sail-browser. Search and inspect relevant memories before dependent work; skip trivial tasks. Search before saving to avoid duplicates. Correct handoffs with memory_supersede; flag disagreements with memory_mark_conflict. Save only durable facts, never secrets, transcripts, or temporary progress. The current user instructions and repository rules take precedence. Forget only on user request.";
 
 fn memory_initialize() -> Value {
     json!({
@@ -931,6 +1115,72 @@ mod tests {
             }),
             expires_at: None,
         }
+    }
+
+    fn handoff(content: &str) -> MemoryInput {
+        MemoryInput {
+            kind: Some(MemoryKind::Handoff),
+            ..input(content)
+        }
+    }
+
+    #[test]
+    fn corrected_handoff_does_not_reactivate_after_replacement_is_removed() {
+        let root = temporary("correction");
+        let old = remember_at(&root, "project", handoff("Use old endpoint")).unwrap();
+        let current = supersede_at(&root, "project", &old.id, handoff("Use new endpoint")).unwrap();
+        assert_eq!(
+            inspect_at(&root, "project", &old.id).unwrap().superseded_by,
+            Some(current.id.clone())
+        );
+        assert!(search_at(&root, "project", "endpoint", None)
+            .unwrap()
+            .iter()
+            .all(|result| result.memory.id != old.id));
+        assert_eq!(
+            search_at(&root, "project", "new endpoint", None)
+                .unwrap()
+                .len(),
+            1
+        );
+        set_expiry_at(&root, "project", &current.id, Some(0)).unwrap();
+        assert!(search_at(&root, "project", "endpoint", None)
+            .unwrap()
+            .is_empty());
+        forget_at(&root, "project", &current.id).unwrap();
+        assert!(search_at(&root, "project", "endpoint", None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(list_at(&root, "project", false).unwrap().len(), 1);
+        assert!(list_at(&root, "other-project", false).unwrap().is_empty());
+        assert!(supersede_at(&root, "other-project", &old.id, handoff("wrong")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conflicting_handoffs_remain_visible_as_unresolved() {
+        let root = temporary("conflict");
+        let first = remember_at(&root, "project", handoff("Deploy on Monday")).unwrap();
+        let second = remember_at(&root, "project", handoff("Deploy on Tuesday")).unwrap();
+        mark_conflict_at(&root, "project", &first.id, &second.id).unwrap();
+        let matches = search_at(&root, "project", "deploy", None).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert!(matches
+            .iter()
+            .all(|result| !result.memory.conflicts_with.is_empty()));
+        let correction =
+            supersede_at(&root, "project", &first.id, handoff("Deploy on Friday")).unwrap();
+        let matches = search_at(&root, "project", "deploy", None).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert!(matches
+            .iter()
+            .find(|result| result.memory.id == correction.id)
+            .unwrap()
+            .memory
+            .conflicts_with
+            .contains(&second.id));
+        assert!(mark_conflict_at(&root, "other-project", &first.id, &second.id).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

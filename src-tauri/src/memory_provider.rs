@@ -1529,6 +1529,7 @@ pub(crate) fn search_standalone(
             let canonical: HashMap<_, _> = crate::memory::list_at(root, key, false)?
                 .into_iter()
                 .filter(|memory| !crate::memory::is_expired(memory, timestamp))
+                .filter(|memory| memory.superseded_by.is_none())
                 .map(|memory| (memory.id.clone(), memory))
                 .collect();
             save_runtime_error(root, key, None);
@@ -1796,6 +1797,8 @@ mod tests {
             rating: None,
             forgotten_at: None,
             expires_at: None,
+            superseded_by: None,
+            conflicts_with: Vec::new(),
         }
     }
 

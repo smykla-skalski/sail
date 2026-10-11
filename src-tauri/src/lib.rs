@@ -2995,6 +2995,8 @@ pub fn run() {
             memory::memory_list,
             memory::memory_search,
             memory::memory_remember,
+            memory::memory_supersede,
+            memory::memory_mark_conflict,
             memory::memory_inspect,
             memory::memory_forget,
             memory::memory_set_expiry,

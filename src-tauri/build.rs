@@ -41,6 +41,8 @@ fn main() {
             "memory_list",
             "memory_search",
             "memory_remember",
+            "memory_supersede",
+            "memory_mark_conflict",
             "memory_inspect",
             "memory_forget",
             "memory_set_expiry",

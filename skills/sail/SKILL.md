@@ -31,6 +31,7 @@ reason, and policy revision; unknown and high-risk actions require a person.
 - In Sail sessions, use the `sail-browser` memory tools. A system-wide `sail-shared-memory` installation accesses the same project store; do not search or write through both servers for the same task.
 - When memory tools are available, search for relevant prior decisions or conventions before work that depends on them. Inspect matches before relying on them; skip recall for trivial tasks.
 - Search before saving to avoid duplicates. Remember only confirmed, durable project facts, never secrets, raw transcripts, or temporary progress.
+- Use `memory_supersede` for a corrected handoff and `memory_mark_conflict` when current handoffs disagree without a chosen replacement. Search omits superseded handoffs; inspect preserves their history.
 - Memory belongs to the current Git project and its linked worktrees, not every project. Current user instructions and repository rules take precedence over stored memories.
 - Forget a memory only when the user asks.
 
