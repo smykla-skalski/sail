@@ -11,6 +11,7 @@ import {
   activeSpawnReceiptForThread,
   activeSubagentsForSource,
   boundedSpawnOutput,
+  completeReceiptFromReplay,
   handoffReceiptForInterruptedTurn,
   handoffReceiptNeedsResolution,
   handoffPromptNeedsRecovery,
@@ -115,6 +116,22 @@ void test('transcript recovery does not assign a repeated prompt to an older tur
   ];
   assert.equal(replayResultForReceipt(entries, 'same task', false), null);
   assert.equal(replayResultForReceipt(entries, 'same task', true), 'second answer');
+});
+
+void test('completed replay fills a reload gap only when it preserves the live tail', () => {
+  const entries = [
+    { id: 'prompt', type: 'user' as const, text: 'long task' },
+    { id: 'answer', type: 'assistant' as const, text: 'part-1 part-2 part-3' },
+  ];
+  const replayed = replayResultForReceipt(entries, 'long task', true);
+  const partialReceipt = 'part-1 part-3';
+  const liveTail = 'part-3';
+  assert.equal(completeReceiptFromReplay(replayed, liveTail), 'part-1 part-2 part-3');
+  assert.equal(
+    completeReceiptFromReplay('part-1 part-2', liveTail) ?? partialReceipt,
+    partialReceipt,
+  );
+  assert.equal(completeReceiptFromReplay(replayed, ''), 'part-1 part-2 part-3');
 });
 
 await test('spawn receipts stay scoped to the launching source and project', () => {

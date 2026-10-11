@@ -245,6 +245,15 @@ export function replayResultForReceipt(
   );
 }
 
+/** A completed replay may repair a listener gap only when it retains the text seen live. */
+export function completeReceiptFromReplay(
+  replayed: string | null,
+  liveTail: string,
+): string | null {
+  if (!replayed || (liveTail && !replayed.endsWith(liveTail))) return null;
+  return replayed;
+}
+
 export function receiptIsSettled(state: SpawnState): boolean {
   return ['completed', 'failed', 'interrupted', 'unavailable'].includes(state);
 }

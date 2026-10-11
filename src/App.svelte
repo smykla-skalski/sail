@@ -471,6 +471,7 @@
     receiptForSource,
     receiptIsLatestFinishedTurn,
     replayResultForReceipt,
+    completeReceiptFromReplay,
     receiptMatchesTurn,
     receiptNeedsRefresh,
     receiptIsSettled,
@@ -860,9 +861,14 @@
   const initialSpawnReceipts = loadSpawnReceipts(getSetting('sai-agent-spawn-receipts'));
   let spawnReceipts = $state<SpawnReceipt[]>(initialSpawnReceipts);
   const spawnOutput = new SvelteMap<string, string>();
+  const receiptReplayNeeded = new SvelteSet<string>();
+  const postReloadReceiptTail = new SvelteMap<string, string>();
+  const recoveringSpawnResults = new SvelteMap<string, Promise<void>>();
   const activeSpawnTargets = new SvelteMap<string, string>();
   const spawnTargetKey = (path: string, targetId: string) => JSON.stringify([path, targetId]);
   for (const receipt of initialSpawnReceipts) {
+    if (receipt.targetId?.startsWith('acp:') && receipt.turnId && !receiptIsSettled(receipt.state))
+      receiptReplayNeeded.add(receipt.receiptId);
     if (
       receipt.targetId &&
       receipt.turnId &&
@@ -5490,6 +5496,8 @@
       if (pendingReceipt.dispatchPending) protectedIds.add(pendingReceipt.receiptId);
     spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+    if (receipt.state === 'completed' && receiptReplayNeeded.has(receipt.receiptId))
+      void recoverAcpSpawnResult(receipt).catch(() => undefined);
     for (const run of shipRuns) {
       const issue = run.issues.find((item) => item.receiptId === receipt.receiptId);
       if (issue) {
@@ -5732,7 +5740,7 @@
             ? (outcome.error ?? receipt.error)
             : receipt.error,
       });
-      if (state === 'completed' && !spawnOutput.has(receipt.receiptId))
+      if (state === 'completed' && !spawnOutput.has(receipt.receiptId) && !receipt.result)
         void recoverAcpSpawnResult(receipt).catch(() => undefined);
       if (
         receipt.targetId &&
@@ -5743,7 +5751,18 @@
     }
   }
 
-  async function recoverAcpSpawnResult(receipt: SpawnReceipt) {
+  function recoverAcpSpawnResult(receipt: SpawnReceipt): Promise<void> {
+    const existing = recoveringSpawnResults.get(receipt.receiptId);
+    if (existing) return existing;
+    const pending = recoverAcpSpawnResultInner(receipt);
+    recoveringSpawnResults.set(receipt.receiptId, pending);
+    void pending
+      .finally(() => recoveringSpawnResults.delete(receipt.receiptId))
+      .catch(() => undefined);
+    return pending;
+  }
+
+  async function recoverAcpSpawnResultInner(receipt: SpawnReceipt) {
     const targetDirectory = receipt.targetDirectory;
     if (
       !receipt.targetId ||
@@ -5794,8 +5813,16 @@
         reservation.restoreToken,
       );
       const latestFinished = await isLatestFinishedTurn();
-      const result = replayResultForReceipt(replay, receipt.prompt, latestFinished);
-      if (result) updateSpawnReceipt(receipt.receiptId, { result }, true);
+      const result = completeReceiptFromReplay(
+        replayResultForReceipt(replay, receipt.prompt, latestFinished),
+        postReloadReceiptTail.get(receipt.receiptId) ?? '',
+      );
+      if (result) {
+        receiptReplayNeeded.delete(receipt.receiptId);
+        postReloadReceiptTail.delete(receipt.receiptId);
+        spawnOutput.set(receipt.receiptId, result);
+        updateSpawnReceipt(receipt.receiptId, { result }, true);
+      }
     } catch {
       return;
     } finally {
@@ -6398,7 +6425,11 @@
         return awaitReceipt(await boundedReceipt(current));
       }
       let current = await awaitReceipt(await boundedReceipt(receipt));
-      if (request.name === 'agent_result' && current.state === 'completed' && !current.result) {
+      if (
+        request.name === 'agent_result' &&
+        current.state === 'completed' &&
+        (!current.result || receiptReplayNeeded.has(current.receiptId))
+      ) {
         await recoverAcpSpawnResult(current);
         current = spawnReceipts.find((item) => item.receiptId === current.receiptId) ?? current;
       }
@@ -11350,6 +11381,11 @@
             const result = `${receipt.result ?? ''}${text}`.slice(-16_000);
             updateSpawnReceipt(receipt.receiptId, { result, activity: 'Writing response…' });
             spawnOutput.set(receipt.receiptId, result);
+            if (receiptReplayNeeded.has(receipt.receiptId))
+              postReloadReceiptTail.set(
+                receipt.receiptId,
+                `${postReloadReceiptTail.get(receipt.receiptId) ?? ''}${text}`.slice(-16_000),
+              );
           }
         const toolTitle =
           update &&
