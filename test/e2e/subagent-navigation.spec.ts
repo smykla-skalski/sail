@@ -265,4 +265,17 @@ describe('subagent navigation and control', () => {
     await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
     await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
   });
+
+  it('clears child attention when the remaining form question is cancelled', async () => {
+    await startChildPermission('Native child permission and cancelled question');
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (2)');
+    const request = await childRequest();
+    expect(await answerOutsideUi(request, 'allow')).toBe('ok');
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
+    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
+      'data-state',
+      'waiting',
+    );
+    await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
+  });
 });

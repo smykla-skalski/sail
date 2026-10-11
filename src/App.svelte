@@ -11312,7 +11312,8 @@
       recordAnsweredPermission(event.agent, eventDirectory, eventSessionId, event.message.params);
     if (
       (event.message.method === 'sail/permission_resolved' ||
-        event.message.method === 'sail/elicitation_resolved') &&
+        event.message.method === 'sail/elicitation_resolved' ||
+        event.message.method === '$/cancel_request') &&
       typeof eventSessionId === 'string'
     )
       reconcilePendingSessionStatus(event.agent, eventDirectory, eventSessionId);
