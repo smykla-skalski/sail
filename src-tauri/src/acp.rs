@@ -400,6 +400,7 @@ struct Connection {
     agent: String,
     profile: CapabilityProfile,
     worktree: PathBuf,
+    _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(unix)]
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
@@ -943,7 +944,10 @@ impl Connection {
     fn stop_child(&self) -> Result<(), String> {
         if let Ok(mut child) = self.child.lock() {
             if self.stopped.swap(true, Ordering::AcqRel) {
-                return Ok(());
+                return self
+                    ._storage_lease
+                    .as_ref()
+                    .map_or(Ok(()), |lease| lease.release_clean());
             }
             if let Err(error) = stop_process(&mut child) {
                 self.stopped.store(false, Ordering::Release);
@@ -957,6 +961,9 @@ impl Connection {
             .lock()
             .map_err(|_| "Cannot lock agent process watchdog for shutdown.")?
             .stop();
+        if let Some(lease) = &self._storage_lease {
+            lease.release_clean()?;
+        }
         Ok(())
     }
 
@@ -1122,13 +1129,7 @@ impl Connection {
 fn stop_process(child: &mut Child) -> Result<(), String> {
     #[cfg(unix)]
     {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
-        if let Err(error) = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL) {
-            if error != nix::errno::Errno::ESRCH {
-                return Err(format!("Cannot stop agent process group: {error}"));
-            }
-        }
+        crate::terminal::kill_terminal_process_groups(child.id())?;
     }
     #[cfg(windows)]
     {
@@ -2894,20 +2895,30 @@ fn connect_blocking_inner(
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
-    let data_directory = crate::register_worktree_terminal_data(&cache_directory, worktree)?;
+    let (data_directory, storage_lease) =
+        crate::register_worktree_storage(&cache_directory, worktree)?;
     prepare_runtime_directories(&data_directory)?;
     for (name, value) in runtime_environment(&data_directory) {
         command.env(name, value);
     }
     command.current_dir(worktree);
     #[cfg(unix)]
-    command.process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Could not start {}: {error}", definition.name))?;
+    storage_lease.mark_started();
     if !is_test_agent {
         observe_agent_with_reef(&agent, child.id());
     }
@@ -2938,6 +2949,7 @@ fn connect_blocking_inner(
         agent: agent.clone(),
         profile,
         worktree: worktree.to_path_buf(),
+        _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
         #[cfg(unix)]
         watchdog: Mutex::new(watchdog),
@@ -4397,6 +4409,24 @@ pub async fn acp_authenticate(
     .map_err(|error| error.to_string())?
 }
 
+#[cfg(all(test, unix))]
+fn spawn_test_session_process() -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("sleep");
+    command.arg("30").stdin(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    command.spawn().expect("test ACP runtime should start")
+}
+
 #[cfg(test)]
 mod session_config_tests {
     use super::*;
@@ -4422,12 +4452,7 @@ mod session_config_tests {
         worktree: &Path,
         session_id: &str,
     ) -> Arc<Connection> {
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stdin(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .expect("test ACP runtime should start");
+        let mut child = super::spawn_test_session_process();
         let input = child.stdin.take().expect("test runtime stdin");
         let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
             .expect("test runtime watchdog should start");
@@ -4435,6 +4460,7 @@ mod session_config_tests {
             agent: agent.to_owned(),
             profile,
             worktree: worktree.to_path_buf(),
+            _storage_lease: None,
             child: Mutex::new(child),
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
@@ -4635,12 +4661,7 @@ mod session_config_tests {
         std::fs::create_dir_all(&sibling).unwrap();
         std::fs::create_dir_all(&nested).unwrap();
         let spawn = |worktree: &Path| {
-            let mut child = Command::new("sleep")
-                .arg("30")
-                .stdin(Stdio::piped())
-                .process_group(0)
-                .spawn()
-                .expect("test ACP runtime should start");
+            let mut child = super::spawn_test_session_process();
             let input = child.stdin.take().expect("test runtime stdin");
             let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
                 .expect("test runtime watchdog should start");
@@ -4648,6 +4669,7 @@ mod session_config_tests {
                 agent: "codex".into(),
                 profile: CapabilityProfile::Build,
                 worktree: worktree.to_path_buf(),
+                _storage_lease: None,
                 child: Mutex::new(child),
                 watchdog: Mutex::new(watchdog),
                 stopped: AtomicBool::new(false),
@@ -4996,12 +5018,7 @@ mod native_subagent_fence_tests {
     #[cfg(unix)]
     #[test]
     fn active_opencode_turn_blocks_worktree_cleanup() {
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .stdin(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .expect("placeholder agent should start");
+        let mut child = spawn_test_session_process();
         let input = child.stdin.take().expect("placeholder agent stdin");
         let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
             .expect("placeholder watchdog should start");
@@ -5009,6 +5026,7 @@ mod native_subagent_fence_tests {
             agent: "opencode".into(),
             profile: CapabilityProfile::Build,
             worktree: PathBuf::from("/worktree"),
+            _storage_lease: None,
             child: Mutex::new(child),
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),

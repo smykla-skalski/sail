@@ -31,6 +31,8 @@ fn main() {
             "machine_pressure",
             "migrate_settings",
             "save_setting",
+            "worktree_storage_cleanup_status",
+            "retry_worktree_storage_cleanup",
             "list_interrupted_agent_turns",
             "finish_interrupted_agent_turn",
             "get_acp_turn_evidence",

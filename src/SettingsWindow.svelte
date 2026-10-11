@@ -62,6 +62,10 @@
   } from './lib/shared-memory';
 
   let snapshot = $state<SettingsSnapshot | null>(null);
+  type WorktreeStoragePending = { cacheKey: string; reason: string };
+  let worktreeStoragePending = $state<WorktreeStoragePending[]>([]);
+  let worktreeStorageLoading = $state(false);
+  let worktreeStorageError = $state('');
   const openCodeAgent = $derived(snapshot?.agents.find((agent) => agent.id === 'opencode'));
   const notificationsOn = $derived(
     notificationTypes.some(
@@ -189,6 +193,20 @@
     }
   }
 
+  async function refreshWorktreeStorage(retry = false) {
+    worktreeStorageLoading = true;
+    worktreeStorageError = '';
+    try {
+      worktreeStoragePending = await invoke<WorktreeStoragePending[]>(
+        retry ? 'retry_worktree_storage_cleanup' : 'worktree_storage_cleanup_status',
+      );
+    } catch (cause) {
+      worktreeStorageError = `Private agent storage status: ${String(cause)}`;
+    } finally {
+      worktreeStorageLoading = false;
+    }
+  }
+
   async function chooseContextExecutable() {
     try {
       const path = await openDialog({
@@ -234,7 +252,8 @@
       await invoke('context_approve_provider', { directory, expectedFingerprint });
       if (snapshot?.directory === directory) {
         await refreshContext(directory);
-        contextMessage = 'Provider approved for this project. Connection is not available yet.';
+        contextMessage =
+          'Provider approved for this project. Approval does not show connection health.';
       }
     } catch (cause) {
       if (snapshot?.directory === directory) {
@@ -738,6 +757,7 @@
         const stop = await listen<SettingsSnapshot>(settingsState, (event) => {
           snapshot = event.payload;
           if (selectedSection === 'agents') {
+            void refreshWorktreeStorage();
             if (snapshot.directory !== hookDirectory) void inspectHooks(snapshot.directory);
             if (snapshot.directory !== integrationDirectory)
               void inspectIntegration(snapshot.directory);
@@ -790,6 +810,7 @@
         aria-current={selectedSection === 'agents' ? 'page' : undefined}
         onclick={() => {
           selectedSection = 'agents';
+          void refreshWorktreeStorage();
           if (snapshot?.directory) {
             if (snapshot.directory !== hookDirectory) void inspectHooks(snapshot.directory);
             if (snapshot.directory !== integrationDirectory)
@@ -887,6 +908,32 @@
             <strong>{agent.name}</strong>: {agent.binaryPath ?? agent.reason ?? 'Unavailable'}
           </p>{/each}
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
+      </section>
+      <section class="settings-card">
+        <h2>Private agent storage</h2>
+        {#if worktreeStorageError}<p class="runtime-diagnostic" role="alert">
+            {worktreeStorageError}
+          </p>
+        {:else if worktreeStoragePending.length > 0}
+          <p role="status">
+            {worktreeStoragePending.length} cleanup item(s) are pending. Their data was retained because
+            Sail could not verify that no process still owns it or that its Git worktree identity is unchanged.
+          </p>
+          <ul>
+            {#each worktreeStoragePending as item (item.cacheKey)}
+              <li>{item.reason} <code>{item.cacheKey}</code></li>
+            {/each}
+          </ul>
+        {:else}
+          <p role="status">No private agent storage cleanup is pending.</p>
+        {/if}
+        <Button
+          size="sm"
+          disabled={worktreeStorageLoading}
+          onclick={() => void refreshWorktreeStorage(true)}
+        >
+          {worktreeStorageLoading ? 'Checking…' : 'Retry cleanup'}
+        </Button>
       </section>
       <section class="settings-card">
         <h2>Concurrent jobs</h2>
@@ -1318,10 +1365,15 @@
           <p role="status">Checking committed context configuration…</p>
         {:else if contextStatus?.state === 'not-configured'}
           <p role="status">This project has no committed context provider selection.</p>
+          <p>
+            To set up a provider, add its selection to this project's Sail context configuration,
+            commit the configuration, then refresh this view. Sail uses the committed selection.
+          </p>
         {:else if contextStatus?.state === 'invalid'}
           <p class="runtime-diagnostic" role="alert">
             {contextStatus.reason || 'The committed context configuration is invalid.'}
           </p>
+          <p>Fix and commit the project context configuration, then refresh this view.</p>
         {:else if contextStatus}
           <dl class="integration-preview context-provider-details">
             <dt>Provider</dt>
@@ -1337,14 +1389,29 @@
             <dt>Committed revision</dt>
             <dd><code>{contextStatus.revision}</code></dd>
             <dt>Approval</dt>
-            <dd>{contextStatus.state === 'approved' ? 'Approved' : 'Approval required'}</dd>
+            <dd>
+              {contextStatus.state === 'approved'
+                ? 'Approved'
+                : contextStatus.state === 'unavailable'
+                  ? 'Unavailable'
+                  : 'Approval required'}
+            </dd>
           </dl>
           {#if contextStatus.reason}<p class="runtime-diagnostic" role="status">
               {contextStatus.reason}
             </p>{/if}
-          <p>
-            Approval records your choice. Sail does not start the provider or add it to agents yet.
-          </p>
+          {#if contextStatus.state === 'unavailable'}
+            <p>
+              Select an available executable for this registry command, then review its identity.
+            </p>
+          {:else if contextStatus.state === 'approval-required'}
+            <p>Review the executable and capabilities before approving this project.</p>
+          {:else}
+            <p>
+              Approval records your choice for this project. It does not show live connection
+              health.
+            </p>
+          {/if}
           <label for="context-executable">Provider executable</label>
           <input
             id="context-executable"
