@@ -83,6 +83,7 @@
     acpPromptInterrupted,
     groupAgentEntries,
     liveSessionView,
+    markLiveMessageBoundary,
     loadRecentTranscript,
     restoreEntryTimes,
     saveRecentTranscript,
@@ -508,7 +509,7 @@
     onreplaychange?.(agent, directory, activeSessionId, value);
   }
   let replayEntries: AgentEntry[] = [];
-  let splitNextLiveMessage = false;
+  let liveMessageBoundary = { pending: false };
   let pendingUpdates: Record<string, unknown>[] = [];
   let updateTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
@@ -1002,11 +1003,7 @@
       updateEntriesInPlace(replayEntries, update);
       return;
     }
-    if (splitNextLiveMessage && update.sessionUpdate === 'agent_message_chunk') {
-      update = { ...update, sailStartNewMessage: true };
-      splitNextLiveMessage = false;
-    }
-    pendingUpdates.push(update);
+    pendingUpdates.push(markLiveMessageBoundary(update, liveMessageBoundary));
     if (!updateTimer) updateTimer = setTimeout(flushUpdates, 50);
   }
 
@@ -1052,6 +1049,7 @@
     const current = generation;
     historyAttempted = true;
     historyLoading = true;
+    if (!historyLoaded) liveMessageBoundary.pending = true;
     let restoreToken: string | undefined;
     try {
       const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
@@ -1060,12 +1058,12 @@
       if (reservation.liveTurn) {
         liveTurn = true;
         activeTurnId = reservation.liveTurn;
-        splitNextLiveMessage = !historyLoaded;
         historyAttempted = false;
         return;
       }
       if (!restoreToken) throw new Error('Session restore reservation is missing.');
       setReplaying(true);
+      liveMessageBoundary.pending = false;
       replayEntries = [];
       const session = await acp.load(agent, directory, id, activeCapabilityProfile, restoreToken);
       if (current !== generation) return;
@@ -1251,7 +1249,7 @@
     pendingUpdates = [];
     setReplaying(false);
     replayEntries = [];
-    splitNextLiveMessage = false;
+    liveMessageBoundary = { pending: false };
     permissions = [];
     answeredNotes = [];
     settledElsewhere = [];
@@ -1267,7 +1265,11 @@
       id && !nativeEntries
         ? liveSessionView(entries, kept, sessionState(agent, directory, id))
         : null;
-    if (liveView) entries = liveView.entries;
+    if (liveView) {
+      entries = liveView.entries;
+      // Events can arrive while connect and restore reservation are still awaiting.
+      liveMessageBoundary = liveView.messageBoundary;
+    }
     visibleCount = 50;
     historyLoaded = !id;
     historyLoading = false;
@@ -1346,7 +1348,6 @@
           liveTurn = true;
           activeTurnId = turnId;
           historyLoaded = liveView.complete;
-          splitNextLiveMessage = !liveView.complete;
           configOptions = await restoreClaudeThreadConfig(
             cached.configOptions ?? liveView.configOptions,
           );
@@ -1385,6 +1386,7 @@
           if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
           if (needsReplay) {
             setReplaying(true);
+            liveMessageBoundary.pending = false;
             replayEntries = [];
           }
           let session: Record<string, unknown>;

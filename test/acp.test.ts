@@ -10,6 +10,7 @@ import {
   groupAgentEntries,
   invalidateLiveTranscript,
   liveSessionView,
+  markLiveMessageBoundary,
   liveTranscriptLimit,
   loadRecentTranscript,
   rememberSessionState,
@@ -128,6 +129,45 @@ void test('a resumed live chunk starts after an incomplete cached assistant mess
   assert.equal(resumed.length, 2);
   assert.equal(resumed[0]?.type === 'assistant' && resumed[0].text, 'Historical answer');
   assert.equal(resumed[1]?.type === 'assistant' && resumed[1].text, 'Live answer');
+});
+
+void test('a live chunk arriving before restore reservation keeps the cached message separate', async () => {
+  const cached = updateEntries([], {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Historical answer' },
+  });
+  const view = liveSessionView(cached, null, undefined);
+  const boundary = view.messageBoundary;
+  let finishConnect!: () => void;
+  const connecting = new Promise<void>((resolve) => {
+    finishConnect = resolve;
+  });
+  const activate = async () => {
+    await connecting;
+    return { liveTurn: 'turn-1' };
+  };
+  const reservation = activate();
+  const first = markLiveMessageBoundary(
+    {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'Live ' },
+    },
+    boundary,
+  );
+  let entries = updateEntries(view.entries, first);
+  finishConnect();
+  assert.deepEqual(await reservation, { liveTurn: 'turn-1' });
+  entries = updateEntries(
+    entries,
+    markLiveMessageBoundary(
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'answer' } },
+      boundary,
+    ),
+  );
+  assert.deepEqual(
+    entries.map((entry) => entry.type === 'assistant' && entry.text),
+    ['Historical answer', 'Live answer'],
+  );
 });
 
 void test('ACP tool calls keep terminal references across updates', () => {
@@ -496,7 +536,12 @@ void test('without a complete kept transcript the capped cache is shown as incom
   assert.equal(takeLiveTranscript('claude', '/repo', 'replayed'), null);
   trackLiveTranscript('claude', '/repo', 'unknown-state', [], true);
   const reloaded = liveSessionView(cached, null, sessionState('claude', '/repo', 'unknown-state'));
-  assert.deepEqual(reloaded, { complete: false, entries: cached, configOptions: [] });
+  assert.deepEqual(reloaded, {
+    complete: false,
+    messageBoundary: { pending: true },
+    entries: cached,
+    configOptions: [],
+  });
   takeLiveTranscript('claude', '/repo', 'unknown-state');
 });
 

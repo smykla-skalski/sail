@@ -738,15 +738,27 @@ export function liveSessionView(
 ): {
   entries: AgentEntry[];
   complete: boolean;
+  messageBoundary: { pending: boolean };
   configOptions: AgentConfigOption[];
   availableCommands?: AgentCommand[];
 } {
   return {
     complete: live?.complete ?? false,
+    messageBoundary: { pending: !live?.complete },
     entries: live ? live.entries.slice() : cached,
     configOptions: state?.configOptions ?? [],
     ...(state?.availableCommands ? { availableCommands: state.availableCommands } : {}),
   };
+}
+
+/** Marks the first assistant chunk received while an incomplete transcript is being activated. */
+export function markLiveMessageBoundary(
+  update: Record<string, unknown>,
+  boundary: { pending: boolean },
+): Record<string, unknown> {
+  if (!boundary.pending || update.sessionUpdate !== 'agent_message_chunk') return update;
+  boundary.pending = false;
+  return { ...update, sailStartNewMessage: true };
 }
 
 function isConfigOption(value: unknown): value is AgentConfigOption {
