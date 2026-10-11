@@ -1,6 +1,8 @@
 import { isInboxOutcome, repositoryName, type InboxItem } from './inbox.ts';
 import type { MergeOwner, ShipIssue, ShipRun } from './issue-shipping.ts';
 import type { SpawnReceipt } from './agent-results.ts';
+import type { ProjectCatalog } from './projects.ts';
+import { selectedRepository } from './saved-commands.ts';
 import {
   shipClosedBeforeLaunch,
   shipClosedWithoutMerge,
@@ -278,11 +280,13 @@ export function subagentAttentionCandidates(
   receipts: SpawnReceipt[],
   requestThreads: ReadonlySet<string> = new Set(),
   excludedReceipts: ReadonlySet<string> = new Set(),
+  catalog?: ProjectCatalog,
 ): AttentionCandidate[] {
   return receipts.flatMap((receipt) => {
     if (receipt.state !== 'waiting' || !receipt.targetId || receipt.validation) return [];
     if (excludedReceipts.has(receipt.receiptId)) return [];
     const directory = receipt.targetDirectory ?? receipt.sourceDirectory;
+    const repository = (catalog && selectedRepository(catalog, directory)) || receipt.project;
     const parts = shipThreadParts(receipt.targetId);
     if (parts && requestThreads.has(threadKeyOf(directory, parts.agentId, parts.sessionId)))
       return [];
@@ -296,8 +300,8 @@ export function subagentAttentionCandidates(
           targetId: receipt.targetId,
         },
         {
-          repo: repositoryName(receipt.project),
-          repository: receipt.project,
+          repo: repositoryName(repository),
+          repository,
           since: receipt.updated,
           severity: 'warning',
           dismissible: true,

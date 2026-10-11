@@ -201,6 +201,23 @@ void test('waiting subagents become items unless their thread shows a request', 
   assert.deepEqual(subagentAttentionCandidates([receipt()], requests), []);
 });
 
+void test('waiting subagents in worktrees group under their repository', () => {
+  const [item] = subagentAttentionCandidates(
+    [receipt({ project: '/worktrees/alpha-feature', targetDirectory: '/worktrees/alpha-feature' })],
+    new Set(),
+    new Set(),
+    {
+      repositories: ['/projects/alpha'],
+      groups: [],
+      worktrees: {
+        '/projects/alpha': [{ path: '/worktrees/alpha-feature', branch: 'feature' }],
+      },
+    },
+  );
+  assert.equal(item.repository, '/projects/alpha');
+  assert.equal(item.repo, 'alpha');
+});
+
 void test('Ship workers and validation gates are not counted as subagents', () => {
   const run = fixture();
   run.issues[0].receiptId = 'worker';

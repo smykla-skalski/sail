@@ -1226,6 +1226,7 @@
           visibleSpawnReceipts,
           threadRequestKeys(sessionAttention),
           shipReceiptIds(shipRuns),
+          projectCatalog,
         ),
       ],
       attentionClock,
