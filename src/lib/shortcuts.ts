@@ -171,15 +171,40 @@ export function detectShortcutPlatform(
   return /mac/i.test(agent?.platform || agent?.userAgent || '') ? 'mac' : 'other';
 }
 
+export function primaryModifierPressed(
+  event: Pick<KeyboardEvent, 'metaKey' | 'ctrlKey'>,
+  platform: ShortcutPlatform = detectShortcutPlatform(),
+): boolean {
+  return platform === 'mac' ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+}
+
+export function terminalDivertsKey(
+  event: KeyEventLike,
+  platform: ShortcutPlatform = detectShortcutPlatform(),
+): boolean {
+  const key = event.key.toLowerCase();
+  return (
+    event.key === 'F6' ||
+    (primaryModifierPressed(event, platform) &&
+      !event.altKey &&
+      ['w', 'd', 't', 'k', 'n'].includes(key)) ||
+    ((event.metaKey || event.ctrlKey) && event.altKey && key.startsWith('arrow'))
+  );
+}
+
 export function matchesShortcut(
   event: KeyEventLike,
   shortcut: Shortcut,
   platform: ShortcutPlatform = detectShortcutPlatform(),
 ): boolean {
   const modifier =
-    shortcut.modifier === 'primary' ? (platform === 'mac' ? 'meta' : 'ctrl') : shortcut.modifier;
+    shortcut.modifier === 'primary'
+      ? primaryModifierPressed(event, platform)
+      : shortcut.modifier === 'meta'
+        ? event.metaKey && !event.ctrlKey
+        : event.ctrlKey && !event.metaKey;
   return (
-    (modifier === 'meta' ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) &&
+    modifier &&
     event.altKey === (shortcut.alt ?? false) &&
     (shortcut.shift === undefined || event.shiftKey === shortcut.shift) &&
     shortcut.keys.includes(event.key.toLowerCase())

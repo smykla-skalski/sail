@@ -8,6 +8,7 @@ import {
   shortcutForEvent,
   shortcutLabel,
   shortcuts,
+  terminalDivertsKey,
   terminalOwnsKey,
   type ShortcutId,
   type ShortcutPlatform,
@@ -121,6 +122,17 @@ void test('shortcut sheet uses the platform primary modifier with any Shift stat
   assert.equal(shortcutForEvent(key('/'), 'mac'), undefined);
   assert.equal(shortcutLabel(shortcutFor('shortcuts.help'), 'mac'), '⌘/');
   assert.equal(shortcutLabel(shortcutFor('shortcuts.help'), 'other'), 'Ctrl+/');
+});
+
+void test('terminal keeps macOS Control input while diverting workspace shortcuts', () => {
+  for (const value of ['w', 'd', 't', 'k', 'n']) {
+    assert.equal(terminalDivertsKey(key(value, { ctrlKey: true }), 'mac'), false, value);
+    assert.equal(terminalDivertsKey(key(value, { metaKey: true }), 'mac'), true, value);
+    assert.equal(terminalDivertsKey(key(value, { ctrlKey: true }), 'other'), true, value);
+    assert.equal(terminalDivertsKey(key(value, { metaKey: true }), 'other'), false, value);
+  }
+  assert.equal(terminalDivertsKey(key('ArrowLeft', { ctrlKey: true, altKey: true }), 'mac'), true);
+  assert.equal(terminalDivertsKey(key('F6'), 'mac'), true);
 });
 
 void test('every registry entry has a label and a sheet label on each platform', () => {
