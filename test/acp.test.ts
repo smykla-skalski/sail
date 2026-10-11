@@ -115,6 +115,21 @@ void test('ACP chunks stream into one assistant message and tool updates keep th
   });
 });
 
+void test('a resumed live chunk starts after an incomplete cached assistant message', () => {
+  const cached = updateEntries([], {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Historical answer' },
+  });
+  const resumed = updateEntries(cached, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Live answer' },
+    sailStartNewMessage: true,
+  });
+  assert.equal(resumed.length, 2);
+  assert.equal(resumed[0]?.type === 'assistant' && resumed[0].text, 'Historical answer');
+  assert.equal(resumed[1]?.type === 'assistant' && resumed[1].text, 'Live answer');
+});
+
 void test('ACP tool calls keep terminal references across updates', () => {
   const created = updateEntries([], {
     sessionUpdate: 'tool_call',

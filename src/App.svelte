@@ -5758,6 +5758,21 @@
       const activity = await acp.activity(worktreeDirectory).catch(() => null);
       return receiptIsLatestFinishedTurn(receipt, activity?.[receipt.provider], sessionId);
     }
+    await acp.connect(receipt.provider, worktreeDirectory);
+    const profile = capabilityProfileForAcpSession(
+      receipt.provider,
+      worktreeDirectory,
+      sessionId,
+      receipt.validation ? 'review' : undefined,
+    );
+    const reservation = await acp.beginRestore(
+      receipt.provider,
+      worktreeDirectory,
+      sessionId,
+      profile,
+    );
+    if (reservation.liveTurn) return;
+    if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
     const replay: AgentEntry[] = [];
     const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
       if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId)) return;
@@ -5767,17 +5782,12 @@
     });
     setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
     try {
-      await acp.connect(receipt.provider, worktreeDirectory);
       await acp.load(
         receipt.provider,
         worktreeDirectory,
         sessionId,
-        capabilityProfileForAcpSession(
-          receipt.provider,
-          worktreeDirectory,
-          sessionId,
-          receipt.validation ? 'review' : undefined,
-        ),
+        profile,
+        reservation.restoreToken,
       );
       const latestFinished = await isLatestFinishedTurn();
       const result = replayResultForReceipt(replay, receipt.prompt, latestFinished);
@@ -5787,6 +5797,12 @@
     } finally {
       setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
       unlisten();
+      await acp.endRestore(
+        receipt.provider,
+        worktreeDirectory,
+        sessionId,
+        reservation.restoreToken,
+      );
     }
   }
 

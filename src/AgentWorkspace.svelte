@@ -507,6 +507,7 @@
     onreplaychange?.(agent, directory, activeSessionId, value);
   }
   let replayEntries: AgentEntry[] = [];
+  let splitNextLiveMessage = false;
   let pendingUpdates: Record<string, unknown>[] = [];
   let updateTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
@@ -1000,6 +1001,10 @@
       updateEntriesInPlace(replayEntries, update);
       return;
     }
+    if (splitNextLiveMessage && update.sessionUpdate === 'agent_message_chunk') {
+      update = { ...update, sailStartNewMessage: true };
+      splitNextLiveMessage = false;
+    }
     pendingUpdates.push(update);
     if (!updateTimer) updateTimer = setTimeout(flushUpdates, 50);
   }
@@ -1046,10 +1051,22 @@
     const current = generation;
     historyAttempted = true;
     historyLoading = true;
-    setReplaying(true);
-    replayEntries = [];
+    let restoreToken: string | undefined;
     try {
-      const session = await acp.load(agent, directory, id, activeCapabilityProfile);
+      const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
+      restoreToken = reservation.restoreToken;
+      if (current !== generation) return;
+      if (reservation.liveTurn) {
+        liveTurn = true;
+        activeTurnId = reservation.liveTurn;
+        splitNextLiveMessage = !historyLoaded;
+        historyAttempted = false;
+        return;
+      }
+      if (!restoreToken) throw new Error('Session restore reservation is missing.');
+      setReplaying(true);
+      replayEntries = [];
+      const session = await acp.load(agent, directory, id, activeCapabilityProfile, restoreToken);
       if (current !== generation) return;
       if (!configOptions.length && Array.isArray(session.configOptions))
         configOptions = session.configOptions as AgentConfigOption[];
@@ -1068,6 +1085,7 @@
     } catch (cause) {
       if (current === generation) error = describe(cause);
     } finally {
+      if (restoreToken) await acp.endRestore(agent, directory, id, restoreToken);
       if (current === generation) {
         setReplaying(false);
         replayEntries = [];
@@ -1232,6 +1250,7 @@
     pendingUpdates = [];
     setReplaying(false);
     replayEntries = [];
+    splitNextLiveMessage = false;
     permissions = [];
     answeredNotes = [];
     settledElsewhere = [];
@@ -1321,19 +1340,24 @@
         const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
         if (current !== generation) return;
         const runningTurn = runtime?.alive ? runtime.activeTurns[id] : undefined;
-        if (liveView && runningTurn !== undefined) {
+        const showLiveTurn = async (turnId: string) => {
+          if (!liveView) return;
           liveTurn = true;
-          activeTurnId = runningTurn;
+          activeTurnId = turnId;
           historyLoaded = liveView.complete;
+          splitNextLiveMessage = !liveView.complete;
           configOptions = await restoreClaudeThreadConfig(liveView.configOptions);
           rememberThreadConfig(configOptions);
           if (liveView.availableCommands) updateSkills(liveView.availableCommands);
           if (commandUpdates[id]) updateSkills(commandUpdates[id]);
           const latest = (await acp.activity(directory).catch(() => null))?.[agent];
-          if (current === generation && latest?.activeTurns[id] !== runningTurn) {
+          if (current === generation && latest?.activeTurns[id] !== turnId) {
             liveTurn = false;
             activeTurnId = null;
           }
+        };
+        if (liveView && runningTurn !== undefined) {
+          await showLiveTurn(runningTurn);
         } else {
           const sessionCapabilities =
             capabilities &&
@@ -1349,30 +1373,54 @@
             sessionCapabilities &&
             typeof sessionCapabilities === 'object' &&
             'subagents' in sessionCapabilities;
-          if (restoresSubagents || !canResume) {
-            setReplaying(true);
-            replayEntries = [];
+          const needsReplay = restoresSubagents || !canResume;
+          const reservation = needsReplay
+            ? await acp.beginRestore(agent, directory, id, activeCapabilityProfile)
+            : null;
+          if (current !== generation) {
+            if (reservation?.restoreToken)
+              await acp.endRestore(agent, directory, id, reservation.restoreToken);
+            return;
           }
-          const session =
-            restoresSubagents || !canResume
-              ? await acp.load(agent, directory, id, activeCapabilityProfile)
-              : await acp.resume(agent, directory, id, activeCapabilityProfile);
-          if (current === generation && (restoresSubagents || !canResume)) {
-            entries = restoreEntryTimes(replayEntries, entries);
-            setReplaying(false);
-            replayEntries = [];
-            historyLoaded = true;
-            rememberTranscript();
+          if (reservation?.liveTurn) {
+            await showLiveTurn(reservation.liveTurn);
+          } else {
+            if (needsReplay) {
+              setReplaying(true);
+              replayEntries = [];
+            }
+            let session: Record<string, unknown>;
+            try {
+              session = needsReplay
+                ? await acp.load(
+                    agent,
+                    directory,
+                    id,
+                    activeCapabilityProfile,
+                    reservation?.restoreToken,
+                  )
+                : await acp.resume(agent, directory, id, activeCapabilityProfile);
+            } finally {
+              if (reservation?.restoreToken)
+                await acp.endRestore(agent, directory, id, reservation.restoreToken);
+            }
+            if (current === generation && needsReplay) {
+              entries = restoreEntryTimes(replayEntries, entries);
+              setReplaying(false);
+              replayEntries = [];
+              historyLoaded = true;
+              rememberTranscript();
+            }
+            if (current === generation) {
+              configOptions = await restoreClaudeThreadConfig(
+                (session.configOptions as AgentConfigOption[] | undefined) ?? [],
+              );
+              rememberThreadConfig(configOptions);
+            }
+            if (current === generation && Array.isArray(session.availableCommands))
+              updateSkills(session.availableCommands);
+            if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
           }
-          if (current === generation) {
-            configOptions = await restoreClaudeThreadConfig(
-              (session.configOptions as AgentConfigOption[] | undefined) ?? [],
-            );
-            rememberThreadConfig(configOptions);
-          }
-          if (current === generation && Array.isArray(session.availableCommands))
-            updateSkills(session.availableCommands);
-          if (current === generation && commandUpdates[id]) updateSkills(commandUpdates[id]);
         }
         const waiting = await fencedAcpPermissionInventory(
           () => acp.pendingPermissions(agent, directory, id),

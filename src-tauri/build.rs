@@ -133,6 +133,8 @@ fn main() {
             "acp_forget_session",
             "acp_release_session_fence",
             "acp_load_session",
+            "acp_begin_session_restore",
+            "acp_end_session_restore",
             "acp_resume_session",
             "acp_list_sessions",
             "acp_prompt",

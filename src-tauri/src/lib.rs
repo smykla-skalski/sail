@@ -3088,6 +3088,8 @@ pub fn run() {
             acp::acp_forget_session,
             acp::acp_release_session_fence,
             acp::acp_load_session,
+            acp::acp_begin_session_restore,
+            acp::acp_end_session_restore,
             acp::acp_resume_session,
             acp::acp_list_sessions,
             acp::acp_prompt,

@@ -534,7 +534,7 @@ function applyEntryUpdate(
           ? 'thought'
           : 'assistant';
     const last = entries.at(-1);
-    if (last?.type === role) {
+    if (last?.type === role && update.sailStartNewMessage !== true) {
       entries[entries.length - 1] = { ...last, text: last.text + block.text };
       return true;
     }
@@ -792,34 +792,69 @@ function restoreSession(
   cwd: string,
   sessionId: string,
   profile: CapabilityProfile,
+  restoreToken?: string,
 ) {
   const key = JSON.stringify([agent, cwd, sessionId, profile]);
   const existing = restoringSessions.get(key);
-  if (existing) return existing;
-  // A restore replays history, so this session's kept transcript can no longer be trusted.
-  invalidateLiveTranscript(agent, cwd, sessionId);
+  if (existing) {
+    if (restoreToken)
+      void invoke('acp_end_session_restore', {
+        agent,
+        directory: cwd,
+        sessionId,
+        restoreToken,
+      });
+    return existing;
+  }
   const live = sessionKey(agent, cwd, sessionId);
-  restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
-  const request = invoke<Record<string, unknown>>(method, {
-    agent,
-    cwd,
-    sessionId,
-    profile,
-  }).then((session) => {
+  const request = async () => {
+    let token = restoreToken;
+    let ownsToken = false;
+    if (method === 'acp_load_session' && !token) {
+      const reservation = await invoke<{ liveTurn?: string; restoreToken?: string }>(
+        'acp_begin_session_restore',
+        { agent, cwd, sessionId, profile },
+      );
+      if (reservation.liveTurn) return { sailLiveTurn: reservation.liveTurn };
+      if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
+      token = reservation.restoreToken;
+      ownsToken = true;
+    }
+    // A replay invalidates the kept transcript only after a live turn has been ruled out.
     invalidateLiveTranscript(agent, cwd, sessionId);
-    rememberRestoredState(agent, cwd, sessionId, session);
-    return session;
-  });
-  restoringSessions.set(key, request);
-  void request
-    .finally(() => {
-      if (restoringSessions.get(key) === request) restoringSessions.delete(key);
+    restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
+    try {
+      const session = await invoke<Record<string, unknown>>(method, {
+        agent,
+        cwd,
+        sessionId,
+        profile,
+        restoreToken: token,
+      });
+      invalidateLiveTranscript(agent, cwd, sessionId);
+      rememberRestoredState(agent, cwd, sessionId, session);
+      return session;
+    } finally {
       const remaining = (restoringTranscripts.get(live) ?? 1) - 1;
       if (remaining > 0) restoringTranscripts.set(live, remaining);
       else restoringTranscripts.delete(live);
+      if (ownsToken && token)
+        await invoke('acp_end_session_restore', {
+          agent,
+          directory: cwd,
+          sessionId,
+          restoreToken: token,
+        });
+    }
+  };
+  const pending = request();
+  restoringSessions.set(key, pending);
+  void pending
+    .finally(() => {
+      if (restoringSessions.get(key) === pending) restoringSessions.delete(key);
     })
     .catch(() => undefined);
-  return request;
+  return pending;
 }
 
 const queuedPrompts = new Map<string, { agent: string; directory: string; sessionId: string }>();
@@ -926,8 +961,22 @@ export const acp = {
     invoke<AgentSessionListing>('acp_list_sessions', { agent, cwd, cursor, profile }),
   releaseSessionFence: (agent: AgentId, directory: string, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, directory, sessionId }),
-  load: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
-    restoreSession('acp_load_session', agent, cwd, sessionId, profile),
+  beginRestore: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
+    invoke<{ liveTurn?: string; restoreToken?: string }>('acp_begin_session_restore', {
+      agent,
+      cwd,
+      sessionId,
+      profile,
+    }),
+  endRestore: (agent: AgentId, directory: string, sessionId: string, restoreToken: string) =>
+    invoke<void>('acp_end_session_restore', { agent, directory, sessionId, restoreToken }),
+  load: (
+    agent: AgentId,
+    cwd: string,
+    sessionId: string,
+    profile: CapabilityProfile,
+    restoreToken?: string,
+  ) => restoreSession('acp_load_session', agent, cwd, sessionId, profile, restoreToken),
   resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
     restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
   forget: (agent: AgentId, directory: string, sessionId: string) => {
