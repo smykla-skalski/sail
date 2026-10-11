@@ -46,6 +46,21 @@ impl PreparedChange {
     pub fn reference(&self) -> &str {
         &self.reference
     }
+
+    pub fn review_diff(&self) -> Result<String, String> {
+        let output = git_command()
+            .arg("--git-dir")
+            .arg(&self.artifact)
+            .args(["diff", "--no-ext-diff", "--no-textconv", "--text"])
+            .arg(&self.revision)
+            .arg(&self.reference)
+            .output()
+            .map_err(|_| "Cannot inspect proposal diff.")?;
+        if !output.status.success() {
+            return Err("Cannot inspect proposal diff.".into());
+        }
+        String::from_utf8(output.stdout).map_err(|_| "Invalid proposal diff response.".into())
+    }
 }
 
 impl Proposal {
@@ -297,6 +312,7 @@ fn git_command() -> Command {
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_NAMESPACE",
+        "GIT_EXTERNAL_DIFF",
     ] {
         command.env_remove(variable);
     }
@@ -538,6 +554,9 @@ fn read_document(path: &Path) -> Result<String, String> {
         return Err("Destination is too large or is read-only.".into());
     }
     let bytes = fs::read(path).map_err(|_| "Cannot read destination.")?;
+    if bytes.contains(&0) {
+        return Err("Destination must be text Markdown without NUL bytes.".into());
+    }
     String::from_utf8(bytes).map_err(|_| "Destination must be UTF-8 Markdown.".into())
 }
 
@@ -782,6 +801,57 @@ mod tests {
         assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn nul_in_tracked_markdown_is_rejected_before_artifact_creation() {
+        let repo = Repo::new();
+        fs::write(repo.0.join("AGENTS.md"), b"# Rules\n\0hidden\n").unwrap();
+        repo.git(&["add", "AGENTS.md"]);
+        repo.git(&["commit", "-qm", "track binary markdown"]);
+
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "## New rule",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("NUL bytes"), "{error}");
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn artifact_diff_shows_text_with_external_diff_configured() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let prepared = repo.accept(&proposal, true).unwrap();
+        let patch = prepared.review_diff().unwrap();
+        assert!(patch.contains("+## New rule"));
+        assert!(patch.contains("+Check output."));
+
+        let output = Command::new("git")
+            .arg("--git-dir")
+            .arg(prepared.artifact())
+            .args(["diff", "--no-ext-diff", "--no-textconv", "--text"])
+            .arg(prepared.revision())
+            .arg(prepared.reference())
+            .env("GIT_EXTERNAL_DIFF", "/usr/bin/true")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), patch);
+        assert_eq!(
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "# Rules\n"
+        );
+        assert!(git(&repo.0, &["status", "--porcelain"]).unwrap().is_empty());
     }
 
     #[test]
