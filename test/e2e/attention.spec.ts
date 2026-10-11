@@ -1,6 +1,13 @@
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ShipIssue, ShipRun } from '../../src/lib/issue-shipping';
@@ -339,7 +346,8 @@ const blocked = (id: string, number: number): ShipIssue => ({
   url: `https://github.com/fixture/repo/issues/${number}`,
   title: `Blocked fixture ${number}`,
   dependsOn: [],
-  state: 'working',
+  // Keep the attention fixture outside active worker claim recovery.
+  state: 'awaiting_merge',
   branch: id,
   path: null,
   receiptId: null,
@@ -355,17 +363,32 @@ const focusedIssue = () =>
 
 describe('shared attention items', () => {
   const repository = mkdtempSync(join(tmpdir(), 'sail-shared-attention-'));
+  const fakeGhDirectory = process.env.SAIL_E2E_FAKE_GH_DIR;
+  const fakeGhState = fakeGhDirectory ? join(fakeGhDirectory, 'state.json') : null;
+  let previousFakeGhState: string | null = null;
   before(async () => {
     execFileSync('git', ['init', '-q', repository]);
+    if (fakeGhDirectory && fakeGhState) {
+      if (!existsSync(fakeGhDirectory)) throw new Error('Fake GitHub fixture directory is missing');
+      previousFakeGhState = existsSync(fakeGhState) ? readFileSync(fakeGhState, 'utf8') : null;
+      writeFileSync(fakeGhState, JSON.stringify({ repository: 'fixture/repo', pulls: {} }));
+    }
     await browser.setWindowSize(1280, 850);
   });
   after(async () => {
-    await browser.execute(() => {
-      localStorage.removeItem('sai-ship-runs');
-      localStorage.removeItem('sai-attention-ledger');
-      localStorage.removeItem('sai-notification-prefs');
-    });
-    rmSync(repository, { recursive: true, force: true });
+    try {
+      await browser.execute(() => {
+        localStorage.removeItem('sai-ship-runs');
+        localStorage.removeItem('sai-attention-ledger');
+        localStorage.removeItem('sai-notification-prefs');
+      });
+    } finally {
+      if (fakeGhState) {
+        if (previousFakeGhState === null) rmSync(fakeGhState, { force: true });
+        else writeFileSync(fakeGhState, previousFakeGhState);
+      }
+      rmSync(repository, { recursive: true, force: true });
+    }
   });
 
   it('counts one list everywhere, opens a clicked Ship notification, and moves with Cmd+J', async () => {

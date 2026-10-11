@@ -69,6 +69,14 @@ describe('close worktree shortcut', () => {
     await diagnose('Empty main pane', () =>
       expect($('[data-pane-id="main"] [data-pane-picker]')).toBeDisplayed(),
     );
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
+          return typeof ready === 'function' && ready();
+        }),
+      { timeout: 20000, timeoutMsg: 'Sidebar OpenCode inventory did not settle' },
+    );
   }
 
   const catalogPaths = async () => {

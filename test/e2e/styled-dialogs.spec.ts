@@ -102,9 +102,17 @@ describe('styled app dialogs', () => {
       }),
     );
     await browser.keys('ArrowRight');
-    const focusedAgent = $('.worktree-agent-option input:focus');
-    await expect(focusedAgent).toBeSelected();
-    expect(await focusedAgent.getValue()).not.toBe('');
+    const focusedAgent = await browser.execute(() => {
+      const input = document.activeElement;
+      return input instanceof HTMLInputElement &&
+        input.matches('.worktree-agent-option input') &&
+        input.checked &&
+        !input.disabled
+        ? input.value
+        : null;
+    });
+    expect(focusedAgent).not.toBeNull();
+    expect(focusedAgent).not.toBe('');
     await expect($('.worktree-dialog')).toBeDisplayed();
   });
 });
