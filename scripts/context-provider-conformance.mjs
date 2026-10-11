@@ -9,7 +9,7 @@ import process from 'node:process';
 const PROTOCOL_VERSION = '2025-06-18';
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const TIMEOUT_MS = 5000;
-const STDIO_FINAL_OUTPUT_MS = 100;
+const STDIO_FINAL_OUTPUT_MS = 500;
 
 class ConformanceError extends Error {}
 
@@ -315,6 +315,7 @@ function stdioTransport(command, args, environment) {
     async verify() {
       await new Promise((done) => setTimeout(done, STDIO_FINAL_OUTPUT_MS));
       if (failed) throw failed;
+      if (buffer.length > 0) throw new ConformanceError('Non-MCP output on provider stdout.');
     },
     async close() {
       if (child.exitCode !== null) return;
@@ -406,7 +407,10 @@ async function run(config) {
       await request('tools/call', { name: config.probe.tool, arguments: config.probe.arguments }),
       id,
     );
-    assert(!called.isError, 'Read-only probe returned an error.');
+    assert(
+      called.isError === undefined || called.isError === false,
+      'Read-only probe returned an error or invalid isError flag.',
+    );
     assert(
       Buffer.byteLength(JSON.stringify(called)) <= MAX_MESSAGE_BYTES,
       'Tool result exceeds 64 KiB.',
@@ -451,7 +455,18 @@ async function run(config) {
       },
     });
     assert(error?.jsonrpc === '2.0' && error.id === id, 'Invalid error probe JSON-RPC response.');
-    assert(error.error || error.result?.isError, 'Error probe did not fail.');
+    const rpcError = error.error;
+    const validRpcError =
+      rpcError !== null &&
+      typeof rpcError === 'object' &&
+      !Array.isArray(rpcError) &&
+      Number.isInteger(rpcError.code) &&
+      typeof rpcError.message === 'string';
+    assert(
+      (validRpcError && error.result === undefined) ||
+        (rpcError === undefined && error.result?.isError === true),
+      'Error probe did not return a valid JSON-RPC error or true isError flag.',
+    );
     const containsSecretText = (text) =>
       text.includes(secret) || text.includes(JSON.stringify(secret).slice(1, -1));
     const containsSecret = (value) => {

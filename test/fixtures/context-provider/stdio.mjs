@@ -43,8 +43,14 @@ for await (const line of createInterface({ input: process.stdin })) {
       ],
     };
   } else if (message.method === 'tools/call' && message.params.name === 'fixture_error') {
+    if (mode === 'string-rpc-error' || mode === 'valid-rpc-error') {
+      reply.error =
+        mode === 'string-rpc-error' ? 'false' : { code: -32000, message: 'Request denied.' };
+      output(reply);
+      continue;
+    }
     reply.result = {
-      isError: true,
+      isError: mode === 'string-false-error' ? 'false' : true,
       content: [
         {
           type: 'text',
@@ -80,5 +86,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   if (message.method === 'tools/call' && message.params.name === 'fixture_error') {
     if (mode === 'trailing-stdout') process.stdout.write('ready\n');
     if (mode === 'delayed-trailing-stdout') setTimeout(() => process.stdout.write('ready\n'), 10);
+    if (mode === 'late-trailing-stdout') setTimeout(() => process.stdout.write('ready\n'), 250);
+    if (mode === 'late-trailing-fragment') setTimeout(() => process.stdout.write('ready'), 250);
   }
 }
