@@ -396,6 +396,8 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
                             #[cfg(test)]
                             if let Err(error) = &acquisition {
                                 eprintln!("cleanup_status lease lock {}: {error}", path.display());
+                                #[cfg(unix)]
+                                log_lock_holder(&path);
                             }
                             acquisition.ok()
                         }
@@ -1132,6 +1134,29 @@ fn lexical_absolute(path: &Path) -> PathBuf {
     result
 }
 
+#[cfg(all(test, unix))]
+fn log_lock_holder(path: &Path) {
+    let program = if cfg!(target_os = "macos") {
+        "/usr/sbin/lsof"
+    } else {
+        "lsof"
+    };
+    match std::process::Command::new(program)
+        .arg("-nP")
+        .arg(path)
+        .output()
+    {
+        Ok(output) => eprintln!(
+            "lease lock holders for {}: status={} stdout={} stderr={}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => eprintln!("Cannot inspect lease lock holders: {error}"),
+    }
+}
+
 struct FileLock {
     file: File,
 }
@@ -1585,13 +1610,21 @@ mod tests {
 
         reconcile(&fixture.cache);
         assert!(directory.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "unclean-active-use"));
+        let pending = cleanup_status(&fixture.cache);
+        assert!(
+            pending
+                .iter()
+                .any(|item| item.reason == "unclean-active-use"),
+            "expected unclean-active-use, got {pending:?}"
+        );
 
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "unclean-active-use"));
+        let pending = cleanup_status(&fixture.cache);
+        assert!(
+            pending
+                .iter()
+                .any(|item| item.reason == "unclean-active-use"),
+            "expected unclean-active-use, got {pending:?}"
+        );
     }
 
     #[test]
@@ -1610,7 +1643,7 @@ mod tests {
             pending
                 .iter()
                 .any(|item| item.reason == "git-worktree-registration-still-present"),
-            "expected stale Git registration pending status, got {pending:?}"
+            "expected git-worktree-registration-still-present, got {pending:?}"
         );
     }
 
@@ -1710,7 +1743,7 @@ mod tests {
             pending
                 .iter()
                 .any(|item| item.reason == "git-common-dir-missing-or-unreadable"),
-            "unexpected cleanup status: {pending:?}"
+            "expected git-common-dir-missing-or-unreadable, got {pending:?}"
         );
     }
 

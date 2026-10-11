@@ -1184,12 +1184,14 @@
   let autoCopyEnabled = $state(getSetting('sai-auto-copy-enabled') !== 'false');
   let copiedStatus = $state('');
   let copiedStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  let copiedStatusGeneration = 0;
   let copyStatusRegion: HTMLDivElement;
   let copyStatusHome: { parent: Node; next: Node | null } | undefined;
   let shortcutsDialog: HTMLDialogElement;
   const shortcutPlatform = detectShortcutPlatform();
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
   let agentTerminalsEnabled = $state(getSetting('sai-agent-terminals-enabled') === 'true');
+  let backgroundPriorityEnabled = $state(getSetting('sai-background-priority-enabled') !== 'false');
   let agentStatusEnabled = $state(getSetting('sai-agent-status-enabled') !== 'false');
   let agentThreadListEnabled = $state(getSetting('sai-agent-thread-list-enabled') !== 'false');
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
@@ -1225,6 +1227,7 @@
           visibleSpawnReceipts,
           threadRequestKeys(sessionAttention),
           shipReceiptIds(shipRuns),
+          projectCatalog,
         ),
       ],
       attentionClock,
@@ -2069,6 +2072,7 @@
       personalPostTurnChecks,
       agentWorktreesEnabled,
       agentTerminalsEnabled,
+      backgroundPriorityEnabled,
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
@@ -2267,6 +2271,9 @@
         } else if (action.type === 'agent-terminals') {
           agentTerminalsEnabled = action.value;
           setSetting('sai-agent-terminals-enabled', String(action.value));
+        } else if (action.type === 'background-priority') {
+          backgroundPriorityEnabled = action.value;
+          setSetting('sai-background-priority-enabled', String(action.value));
         } else if (action.type === 'agent-status') {
           agentStatusEnabled = action.value;
           setSetting('sai-agent-status-enabled', String(action.value));
@@ -9324,10 +9331,19 @@
     shortcutsDialog.showModal();
   }
 
-  function placeCopyStatus() {
-    const node = window.getSelection()?.anchorNode;
-    const anchor = node instanceof Element ? node : (node?.parentElement ?? null);
-    const host = copyStatusHost(anchor, [...document.querySelectorAll('dialog:modal')]);
+  function currentCopyStatusHost(anchor: Element | null) {
+    const focused = document.activeElement;
+    const hit = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+    return copyStatusHost(
+      anchor?.closest<HTMLDialogElement>('dialog') ?? null,
+      [...document.querySelectorAll<HTMLDialogElement>('dialog:modal')],
+      focused instanceof Element ? focused.closest<HTMLDialogElement>('dialog') : null,
+      hit?.closest<HTMLDialogElement>('dialog') ?? null,
+    );
+  }
+
+  function placeCopyStatus(preferredHost: HTMLDialogElement | null) {
+    const host = currentCopyStatusHost(preferredHost);
     copyStatusHome ??= {
       parent: copyStatusRegion.parentNode as Node,
       next: copyStatusRegion.nextSibling,
@@ -9335,6 +9351,13 @@
     if (host) {
       if (copyStatusRegion.parentNode === host) return false;
       host.append(copyStatusRegion);
+      host.addEventListener(
+        'close',
+        () => {
+          if (copyStatusRegion.parentNode === host && copiedStatus) void announceCopied(null);
+        },
+        { once: true },
+      );
       return true;
     }
     const { parent, next } = copyStatusHome;
@@ -9343,20 +9366,39 @@
     return true;
   }
 
-  async function announceCopied() {
+  async function waitForCopyStatusPlacement(
+    preferredHost: HTMLDialogElement | null,
+    generation: number,
+  ): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (generation !== copiedStatusGeneration) return;
+    if (placeCopyStatus(preferredHost)) await waitForCopyStatusPlacement(preferredHost, generation);
+  }
+
+  async function announceCopied(preferredHost: HTMLDialogElement | null) {
+    const generation = ++copiedStatusGeneration;
     clearTimeout(copiedStatusTimer);
-    const moved = placeCopyStatus();
+    const moved = placeCopyStatus(preferredHost);
     copiedStatus = '';
     // A cleared region makes a repeated "Copied" a new live-region change.
     await tick();
     // Screen readers skip changes made as a live region is inserted.
-    if (moved) await new Promise((resolve) => setTimeout(resolve, 100));
+    if (moved) await waitForCopyStatusPlacement(preferredHost, generation);
+    if (generation !== copiedStatusGeneration) return;
     copiedStatus = 'Copied';
-    copiedStatusTimer = setTimeout(() => (copiedStatus = ''), 2000);
+    copiedStatusTimer = setTimeout(() => {
+      if (generation === copiedStatusGeneration) copiedStatus = '';
+    }, 2000);
   }
 
   function copySelection() {
-    copyCompletedSelection({ enabled: autoCopyEnabled, oncopied: () => void announceCopied() });
+    const node = window.getSelection()?.anchorNode;
+    const anchor = node instanceof Element ? node : (node?.parentElement ?? null);
+    const host = currentCopyStatusHost(anchor);
+    copyCompletedSelection({
+      enabled: autoCopyEnabled,
+      oncopied: () => void announceCopied(host),
+    });
   }
 
   async function choosePaletteEntry(entry: PaletteEntry | null) {
