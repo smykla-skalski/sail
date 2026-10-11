@@ -211,6 +211,7 @@ mod child_watchdog;
 pub mod context;
 pub mod context_broker;
 pub mod context_broker_mcp;
+mod context_output_controls;
 pub mod context_output_store;
 mod dev_servers;
 mod diagnostics;
@@ -2984,6 +2985,9 @@ pub fn run() {
             settings::load_settings,
             settings::migrate_settings,
             settings::save_setting,
+            context_output_controls::context_output_status,
+            context_output_controls::context_output_save_limits,
+            context_output_controls::context_output_purge,
             machine_pressure::machine_pressure,
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,

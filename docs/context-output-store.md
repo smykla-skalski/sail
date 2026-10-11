@@ -22,5 +22,10 @@ Files are written to private per-scope directories with a temporary file and ato
 ## Remaining #304 work
 
 - Wire terminal, test, browser, and MCP output through the #302 broker, with a threshold that replaces large responses with summaries and references.
-- Expose retention, size, usage, and purge controls in Sail's settings.
 - Verify the broker derives each scope from trusted state and that remote providers never receive unapproved local content.
+
+## Local controls
+
+The Context settings view reports aggregate item count and content bytes for Sail's local output store. It saves retention from 1 to 365 days and a total-content limit from 1 to 256 MiB. The 8 MiB per-item default is capped by the chosen total limit. New writes use the saved limits; existing item expiry timestamps do not change when retention changes. Lowering the total limit does not remove existing output, but new writes fail with a bounded quota warning until usage is below the limit. Clear stored output removes all local scopes and invalidates their references.
+
+The store root is `dirs::data_dir()/sail/context-output` in a normal build and `$SAIL_E2E_CONFIG_DIR/context-output` in an E2E build. Preferences live beside the store in `context-output-limits.json`. The broker and settings must use the same root helper and load preferences when opening the store.

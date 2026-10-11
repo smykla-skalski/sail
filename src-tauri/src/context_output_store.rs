@@ -13,6 +13,7 @@ const ABSOLUTE_ITEM_COUNT: usize = 1_024;
 const ABSOLUTE_STORE_LIMIT: u64 = 256 * 1024 * 1024;
 const ABSOLUTE_SCOPE_COUNT: usize = 1_024;
 const ABSOLUTE_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
+const PREFERENCES_FILE: &str = "context-output-limits.json";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OutputScope {
@@ -48,7 +49,7 @@ impl Default for OutputLimits {
 }
 
 impl OutputLimits {
-    fn validate(self) -> Result<Self, StoreWarning> {
+    pub fn validate(self) -> Result<Self, StoreWarning> {
         if self.max_item_bytes == 0
             || self.max_item_bytes > ABSOLUTE_ITEM_LIMIT
             || self.max_total_bytes == 0
@@ -65,6 +66,131 @@ impl OutputLimits {
         }
         Ok(self)
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutputPreferences {
+    pub retention_days: u64,
+    pub max_total_mib: u64,
+}
+
+impl Default for OutputPreferences {
+    fn default() -> Self {
+        Self {
+            retention_days: 7,
+            max_total_mib: 128,
+        }
+    }
+}
+
+impl OutputPreferences {
+    pub fn validate(self) -> Result<Self, StoreWarning> {
+        if self.retention_days == 0
+            || self.retention_days > 365
+            || self.max_total_mib == 0
+            || self.max_total_mib > 256
+        {
+            return Err(StoreWarning::InvalidLimits);
+        }
+        Ok(self)
+    }
+
+    pub fn limits(self) -> Result<OutputLimits, StoreWarning> {
+        self.validate()?;
+        let max_total_bytes = self.max_total_mib * 1024 * 1024;
+        OutputLimits {
+            max_item_bytes: usize::try_from(max_total_bytes)
+                .unwrap_or(usize::MAX)
+                .min(OutputLimits::default().max_item_bytes),
+            max_total_bytes,
+            retention_seconds: self.retention_days * 24 * 60 * 60,
+            ..OutputLimits::default()
+        }
+        .validate()
+    }
+}
+
+pub fn default_root() -> Result<PathBuf, StoreWarning> {
+    #[cfg(feature = "e2e")]
+    let parent = std::env::var_os("SAIL_E2E_CONFIG_DIR")
+        .map(PathBuf::from)
+        .ok_or(StoreWarning::StorageUnavailable)?;
+    #[cfg(not(feature = "e2e"))]
+    let parent = dirs::data_dir()
+        .ok_or(StoreWarning::StorageUnavailable)?
+        .join("sail");
+    Ok(parent.join("context-output"))
+}
+
+fn preferences_path(root: &Path) -> Result<PathBuf, StoreWarning> {
+    Ok(root
+        .parent()
+        .ok_or(StoreWarning::StorageUnavailable)?
+        .join(PREFERENCES_FILE))
+}
+
+pub fn load_preferences(root: &Path) -> Result<OutputPreferences, StoreWarning> {
+    let path = preferences_path(root)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OutputPreferences::default());
+        }
+        Err(_) => return Err(StoreWarning::StorageUnavailable),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 {
+        return Err(StoreWarning::StorageUnavailable);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| StoreWarning::StorageUnavailable)?;
+    let mut contents = Vec::new();
+    file.take(1025)
+        .read_to_end(&mut contents)
+        .map_err(|_| StoreWarning::StorageUnavailable)?;
+    if contents.len() > 1024 {
+        return Err(StoreWarning::StorageUnavailable);
+    }
+    serde_json::from_slice::<OutputPreferences>(&contents)
+        .map_err(|_| StoreWarning::InvalidLimits)?
+        .validate()
+}
+
+pub fn save_preferences(root: &Path, preferences: OutputPreferences) -> Result<(), StoreWarning> {
+    preferences.validate()?;
+    let path = preferences_path(root)?;
+    let parent = path.parent().ok_or(StoreWarning::StorageUnavailable)?;
+    fs::create_dir_all(parent).map_err(|_| StoreWarning::StorageUnavailable)?;
+    private_directory(parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(StoreWarning::StorageUnavailable);
+        }
+    }
+    let temporary = parent.join(format!(".{PREFERENCES_FILE}.{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = private_file(&temporary)?;
+        serde_json::to_writer(&mut file, &preferences)
+            .map_err(|_| StoreWarning::StorageUnavailable)?;
+        file.sync_all()
+            .map_err(|_| StoreWarning::StorageUnavailable)?;
+        fs::rename(&temporary, &path).map_err(|_| StoreWarning::StorageUnavailable)?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| StoreWarning::StorageUnavailable)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 /// A fixed, non-content-bearing warning safe to show when storage fails.
@@ -258,6 +384,11 @@ impl OutputScope {
 }
 
 impl OutputStore {
+    pub fn open_configured(root: PathBuf) -> Result<Self, StoreWarning> {
+        let limits = load_preferences(&root)?.limits()?;
+        Self::open(root, limits)
+    }
+
     pub fn open(root: PathBuf, limits: OutputLimits) -> Result<Self, StoreWarning> {
         let limits = limits.validate()?;
         private_directory(&root)?;
@@ -603,6 +734,20 @@ impl OutputStore {
         fs::remove_dir(directory).map_err(|_| StoreWarning::StorageUnavailable)?;
         Ok(removed)
     }
+
+    pub fn purge_all(&self) -> Result<usize, StoreWarning> {
+        let _lock = self.lock()?;
+        let entries = self.entries()?;
+        let mut directories = std::collections::HashSet::new();
+        for (path, key) in &entries {
+            fs::remove_file(path).map_err(|_| StoreWarning::StorageUnavailable)?;
+            directories.insert(self.scope_dir(key));
+        }
+        for directory in directories {
+            fs::remove_dir(directory).map_err(|_| StoreWarning::StorageUnavailable)?;
+        }
+        Ok(entries.len())
+    }
 }
 
 #[cfg(test)]
@@ -873,6 +1018,57 @@ mod tests {
         assert_eq!(
             store.purge_scope(&scope()),
             Err(StoreWarning::StorageUnavailable)
+        );
+    }
+
+    #[test]
+    fn saved_preferences_apply_limits_and_reject_invalid_updates() {
+        let root = TestRoot::new();
+        let store_root = root.0.join("context-output");
+        let saved = OutputPreferences {
+            retention_days: 30,
+            max_total_mib: 4,
+        };
+        save_preferences(&store_root, saved).unwrap();
+        assert_eq!(load_preferences(&store_root), Ok(saved));
+        assert_eq!(saved.limits().unwrap().max_total_bytes, 4 * 1024 * 1024);
+        assert_eq!(
+            save_preferences(
+                &store_root,
+                OutputPreferences {
+                    retention_days: 366,
+                    max_total_mib: 4,
+                },
+            ),
+            Err(StoreWarning::InvalidLimits)
+        );
+        assert_eq!(load_preferences(&store_root), Ok(saved));
+    }
+
+    #[test]
+    fn purge_all_removes_every_scope_and_updates_usage() {
+        let root = TestRoot::new();
+        let store = OutputStore::open(root.0.clone(), OutputLimits::default()).unwrap();
+        let first = store.put(&scope(), b"first").unwrap();
+        let mut second_scope = scope();
+        second_scope.session = "second".into();
+        let second = store.put(&second_scope, b"second").unwrap();
+        assert_eq!(
+            store.usage(None),
+            Ok(OutputUsage {
+                items: 2,
+                bytes: 11
+            })
+        );
+        assert_eq!(store.purge_all(), Ok(2));
+        assert_eq!(store.usage(None), Ok(OutputUsage { items: 0, bytes: 0 }));
+        assert_eq!(
+            store.read_range(&scope(), &first.reference, 0, 1),
+            Err(StoreWarning::NotFound)
+        );
+        assert_eq!(
+            store.read_range(&second_scope, &second.reference, 0, 1),
+            Err(StoreWarning::NotFound)
         );
     }
 }
