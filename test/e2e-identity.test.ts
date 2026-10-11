@@ -23,7 +23,7 @@ await test('private E2E app bundles a matching context service plist', () => {
     'src-tauri/macos/dev.smykla.sai-harness.context-supervisor.plist',
     'utf8',
   );
-  const service = e2eContextService(identity, template, '/tmp/sail-private-config');
+  const service = e2eContextService(identity, template, '/tmp/sail-private-config', '/tmp');
 
   assert.equal(service.label, `${identity.identifier}.context-supervisor`);
   assert.equal(service.destination, `Library/LaunchAgents/${service.label}.plist`);
@@ -34,7 +34,29 @@ await test('private E2E app bundles a matching context service plist', () => {
       '<key>SAIL_E2E_CONFIG_DIR</key><string>/tmp/sail-private-config</string>',
     ),
   );
+  assert.ok(service.plist.includes('<key>TMPDIR</key><string>/tmp</string>'));
   assert.doesNotMatch(service.plist, /dev\.smykla\.sai-harness\.context-supervisor/);
+});
+
+await test('private service carries and escapes a custom temporary directory', () => {
+  const identity = e2eIdentity();
+  const template = readFileSync(
+    'src-tauri/macos/dev.smykla.sai-harness.context-supervisor.plist',
+    'utf8',
+  );
+  const temporaryDir = '/tmp/sail-&<>"\'-custom';
+  const service = e2eContextService(identity, template, `${temporaryDir}/config`, temporaryDir);
+
+  assert.ok(
+    service.plist.includes(
+      '<key>TMPDIR</key><string>/tmp/sail-&amp;&lt;&gt;&quot;&apos;-custom</string>',
+    ),
+  );
+  assert.ok(
+    service.plist.includes(
+      '<key>SAIL_E2E_CONFIG_DIR</key><string>/tmp/sail-&amp;&lt;&gt;&quot;&apos;-custom/config</string>',
+    ),
+  );
 });
 
 await test('private service refuses a missing or relative approval store', () => {
@@ -45,11 +67,19 @@ await test('private service refuses a missing or relative approval store', () =>
   );
 
   assert.throws(
-    () => e2eContextService(identity, template, undefined),
+    () => e2eContextService(identity, template, undefined, '/tmp'),
     /absolute private SAIL_E2E_CONFIG_DIR/,
   );
   assert.throws(
-    () => e2eContextService(identity, template, 'relative/config'),
+    () => e2eContextService(identity, template, 'relative/config', '/tmp'),
     /absolute private SAIL_E2E_CONFIG_DIR/,
+  );
+  assert.throws(
+    () => e2eContextService(identity, template, '/tmp/config', undefined),
+    /absolute private TMPDIR/,
+  );
+  assert.throws(
+    () => e2eContextService(identity, template, '/tmp/config', 'relative/tmp'),
+    /absolute private TMPDIR/,
   );
 });
