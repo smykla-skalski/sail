@@ -159,6 +159,17 @@ void test('a worker thread opens with its pending request quoted for the reply',
   );
   touched(issue, { status: 'blocked', blocker: 'Need a decision', unresolvedQuestions: [] }, 6);
   assert.equal(shipWorkerRequest(issue), '> Need a decision\n\n');
+  issue.workerState = 'interrupted';
+  issue.blockedReason = 'Shipping claim recovery failed: GitHub is unavailable.';
+  assert.equal(shipWorkerRequest(issue), '> Need a decision\n\n');
+  touched(issue, { status: 'active', blocker: null, unresolvedQuestions: [] }, 7);
+  assert.equal(shipWorkerRequest(issue), null);
+  issue.workerState = 'working';
+  issue.claimFencePending = true;
+  issue.state = 'working';
+  assert.equal(shipWorkerRequest(issue), null);
+  touched(issue, { unresolvedQuestions: ['Which theme token?'] }, 8);
+  assert.equal(shipWorkerRequest(issue), '> Which theme token?\n\n');
   issue.threadId = null;
   assert.equal(shipWorkerRequest(issue), null);
   issue.threadId = 'acp:claude:s1';

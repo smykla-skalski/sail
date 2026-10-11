@@ -2,7 +2,6 @@ import type { ShipIssue, ShipRun } from './issue-shipping.ts';
 import {
   currentShipGates,
   shipActivity,
-  shipBlock,
   shipFixRounds,
   shipIssuePresentation,
   stages,
@@ -153,10 +152,21 @@ export function shipDetailFallback(
 /** What the worker waits on the user for, quoted for its composer, or null when nothing is pending. */
 export function shipWorkerRequest(issue: ShipIssue): string | null {
   if (issue.state === 'merged' || !issue.threadId) return null;
-  const waiting = issue.reportedStatus === 'blocked' || issue.checkpoint?.status === 'blocked';
+  const workerBlocked =
+    issue.reportedStatus === 'blocked' &&
+    issue.state === 'working' &&
+    issue.workerState !== 'interrupted' &&
+    !issue.claimFencePending &&
+    !issue.claimRevalidationPending &&
+    !issue.claimHandoffPending &&
+    issue.checkpoint?.status !== 'blocked';
   const lines = [
     ...new Set(
-      [waiting ? shipBlock(issue) : null, ...(issue.checkpoint?.unresolvedQuestions ?? [])]
+      [
+        issue.checkpoint?.status === 'blocked' ? issue.checkpoint.blocker : null,
+        workerBlocked ? issue.blockedReason : null,
+        ...(issue.checkpoint?.unresolvedQuestions ?? []),
+      ]
         .map((line) => line?.trim())
         .filter((line): line is string => !!line),
     ),
