@@ -105,6 +105,7 @@
   let showArchived = $state(false);
   let result = $state({ text: '', failed: false });
   let discardCandidate = $state<number | null>(null);
+  let discardBusy = $state(false);
   let focusedId = $state('');
   let frozen = $state<ShipOrderSnapshot | null>(null);
   const detailId = `ship-selected-issue-${crypto.randomUUID()}`;
@@ -292,12 +293,17 @@
   }
 
   async function discardUnparsed(index: number) {
-    if (!ondiscardunparsed) return;
-    await act(async () => {
-      await ondiscardunparsed(index);
-      discardCandidate = null;
-      showResult('Stored entry discarded.', false);
-    });
+    if (!ondiscardunparsed || discardBusy) return;
+    discardCandidate = null;
+    discardBusy = true;
+    try {
+      await act(async () => {
+        await ondiscardunparsed(index);
+        showResult('Stored entry discarded.', false);
+      });
+    } finally {
+      discardBusy = false;
+    }
   }
 
   function chooseArchived(archived: boolean) {
@@ -457,9 +463,13 @@
           <summary>Stored entry {index + 1}</summary>
           <pre>{typeof item === 'string' ? item : JSON.stringify(item, null, 2)}</pre>
           {#if discardCandidate === index}<p>Discard this stored entry permanently?</p>
-            <button onclick={() => discardUnparsed(index)}>Discard entry</button>
+            <button disabled={discardBusy} onclick={() => discardUnparsed(index)}
+              >Discard entry</button
+            >
             <button onclick={() => (discardCandidate = null)}>Cancel</button>
-          {:else}<button onclick={() => (discardCandidate = index)}>Discard…</button>{/if}
+          {:else}<button disabled={discardBusy} onclick={() => (discardCandidate = index)}
+              >Discard…</button
+            >{/if}
         </details>{/each}
     </section>{/if}
   {#if archivedCount || showArchived}<div class="ship-scope" role="group" aria-label="Run state">
