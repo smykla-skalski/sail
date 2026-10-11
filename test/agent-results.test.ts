@@ -134,6 +134,25 @@ void test('completed replay fills a reload gap only when it preserves the live t
   assert.equal(completeReceiptFromReplay(replayed, ''), 'part-1 part-2 part-3');
 });
 
+void test('tool-separated replay repairs a missed chunk across the observed live tail', () => {
+  const entries = [
+    { id: 'prompt', type: 'user' as const, text: 'long task' },
+    { id: 'before-tool', type: 'assistant' as const, text: 'PMA' },
+    {
+      id: 'tool',
+      type: 'tool' as const,
+      title: 'Search',
+      status: 'completed',
+      content: '',
+      terminalIds: [],
+    },
+    { id: 'after-tool', type: 'assistant' as const, text: 'B' },
+  ];
+  const replayed = replayResultForReceipt(entries, 'long task', true);
+  assert.equal(completeReceiptFromReplay(replayed, 'AB'), 'PMAB');
+  assert.equal(completeReceiptFromReplay(replayed, 'AX'), null);
+});
+
 await test('spawn receipts stay scoped to the launching source and project', () => {
   assert.deepEqual(
     receiptForSource(

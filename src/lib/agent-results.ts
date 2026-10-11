@@ -240,7 +240,8 @@ export function replayResultForReceipt(
   return (
     turn
       .flatMap((entry) => (entry.type === 'assistant' ? [entry.text] : []))
-      .join('\n')
+      // Live receipts concatenate ACP chunks without inserting tool or message separators.
+      .join('')
       .slice(-16_000) || null
   );
 }
