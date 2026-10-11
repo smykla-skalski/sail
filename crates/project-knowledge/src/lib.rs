@@ -29,12 +29,20 @@ pub struct Proposal {
 pub struct PreparedChange {
     repository: PathBuf,
     artifact: PathBuf,
+    worktree: PathBuf,
+    destination: PathBuf,
+    before: String,
+    after: String,
     revision: String,
     reference: String,
     tree: String,
 }
 
 impl PreparedChange {
+    pub fn worktree(&self) -> &Path {
+        &self.worktree
+    }
+
     pub fn artifact(&self) -> &Path {
         &self.artifact
     }
@@ -228,9 +236,31 @@ fn accept_with<F: FnOnce(), G: FnOnce(&Path, &str, &str)>(
             }
             return Err(error);
         }
+        let worktree = scratch.join("worktree");
+        if let Err(error) = materialize_worktree(&root, proposal, &worktree) {
+            if worktree.exists() {
+                retain_artifact = true;
+                return Err(format!(
+                    "{error} Proposal worktree retained at {}.",
+                    worktree.display()
+                ));
+            }
+            if delete_tree_ref(&artifact, &reference, &tree).is_err() {
+                retain_artifact = true;
+                return Err(format!(
+                    "{error} Proposal ref changed; artifact retained at {}.",
+                    artifact.display()
+                ));
+            }
+            return Err(error);
+        }
         Ok(PreparedChange {
             repository: root,
             artifact,
+            worktree,
+            destination: proposal.destination.clone(),
+            before: proposal.before.clone(),
+            after: proposal.after.clone(),
             revision: proposal.revision.clone(),
             reference,
             tree,
@@ -247,6 +277,14 @@ fn accept_with<F: FnOnce(), G: FnOnce(&Path, &str, &str)>(
         }
         Ok(prepared) => {
             if let Err(error) = fs::remove_file(scratch.join("index")) {
+                fs::write(prepared.worktree.join(&prepared.destination), &prepared.before)
+                    .map_err(|cleanup| {
+                        format!(
+                            "Cannot remove temporary index: {error}; worktree retained at {}: {cleanup}",
+                            prepared.worktree.display()
+                        )
+                    })?;
+                remove_worktree(&prepared.repository, &prepared.worktree)?;
                 delete_tree_ref(&prepared.artifact, &prepared.reference, &prepared.tree).map_err(
                     |_| {
                         format!(
@@ -271,6 +309,29 @@ pub fn discard(repository: &Path, prepared: &PreparedChange) -> Result<(), Strin
     if root != prepared.repository {
         return Err("Prepared change belongs to another repository.".into());
     }
+    if git(&prepared.artifact, &["rev-parse", &prepared.reference])? != prepared.tree {
+        return Err("Proposal ref changed; inspect it before discarding.".into());
+    }
+    let status = git_command()
+        .arg("-C")
+        .arg(&prepared.worktree)
+        .args(["status", "--porcelain", "-z"])
+        .output()
+        .map_err(|_| "Cannot inspect prepared worktree.")?;
+    let expected_status = format!(" M {}\0", prepared.destination.display());
+    if git(&prepared.worktree, &["rev-parse", "--verify", "HEAD"])? != prepared.revision
+        || read_document(&prepared.worktree.join(&prepared.destination))? != prepared.after
+        || !status.status.success()
+        || status.stdout != expected_status.as_bytes()
+    {
+        return Err("Prepared worktree changed; review it before discarding.".into());
+    }
+    fs::write(
+        prepared.worktree.join(&prepared.destination),
+        &prepared.before,
+    )
+    .map_err(|error| format!("Cannot reset proposal worktree: {error}"))?;
+    remove_worktree(&root, &prepared.worktree)?;
     delete_tree_ref(&prepared.artifact, &prepared.reference, &prepared.tree)?;
     fs::remove_dir_all(
         prepared
@@ -279,6 +340,52 @@ pub fn discard(repository: &Path, prepared: &PreparedChange) -> Result<(), Strin
             .ok_or("Invalid proposal artifact.")?,
     )
     .map_err(|error| format!("Cannot remove proposal artifact: {error}"))
+}
+
+fn materialize_worktree(root: &Path, proposal: &Proposal, worktree: &Path) -> Result<(), String> {
+    let output = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "add", "--detach", "--quiet"])
+        .arg(worktree)
+        .arg(&proposal.revision)
+        .output()
+        .map_err(|_| "Cannot create proposal worktree.")?;
+    if !output.status.success() {
+        return Err("Cannot create proposal worktree.".into());
+    }
+    let result = (|| {
+        if read_document(&worktree.join(&proposal.destination))? != proposal.before {
+            return Err("Proposal worktree content differs from the reviewed text.".into());
+        }
+        check_source(root, proposal)?;
+        fs::write(worktree.join(&proposal.destination), &proposal.after)
+            .map_err(|error| format!("Cannot prepare proposal worktree: {error}"))?;
+        check_source(root, proposal)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        if worktree.join(&proposal.destination).exists() {
+            fs::write(worktree.join(&proposal.destination), &proposal.before)
+                .map_err(|error| format!("Cannot reset rejected proposal worktree: {error}"))?;
+        }
+        remove_worktree(root, worktree)?;
+    }
+    result
+}
+
+fn remove_worktree(root: &Path, worktree: &Path) -> Result<(), String> {
+    let output = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "remove"])
+        .arg(worktree)
+        .output()
+        .map_err(|_| "Cannot remove proposal worktree.")?;
+    if !output.status.success() {
+        return Err("Cannot remove proposal worktree; inspect it before retrying.".into());
+    }
+    Ok(())
 }
 
 fn reserve_artifact_directory() -> Result<PathBuf, String> {
@@ -1002,6 +1109,18 @@ mod tests {
             "# Rules\n"
         );
         assert!(git(&repo.0, &["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(prepared.worktree().join("AGENTS.md")).unwrap(),
+            content
+        );
+        assert_eq!(
+            git(prepared.worktree(), &["status", "--porcelain"]).unwrap(),
+            " M AGENTS.md"
+        );
+        assert_eq!(
+            git(prepared.worktree(), &["diff", "--name-only"]).unwrap(),
+            "AGENTS.md"
+        );
         assert_eq!(prepared.revision(), proposal.revision());
         assert_eq!(
             git(
@@ -1096,6 +1215,10 @@ mod tests {
             "editor's newer text\n"
         );
         assert_eq!(
+            git(prepared.worktree(), &["status", "--porcelain"]).unwrap(),
+            " M AGENTS.md"
+        );
+        assert_eq!(
             repo.prepared_text(&prepared, "AGENTS.md"),
             "# Rules\n\n## New rule\n\nCheck output.\n"
         );
@@ -1135,6 +1258,23 @@ mod tests {
         assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
             .unwrap()
             .is_empty());
+        assert_eq!(
+            git(&repo.0, &["worktree", "list"]).unwrap().lines().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn discard_preserves_edits_to_the_proposal_worktree() {
+        let repo = Repo::new();
+        let prepared = repo.accept(&repo.preview(), true).unwrap();
+        fs::write(prepared.worktree().join("AGENTS.md"), "editor's revision\n").unwrap();
+        assert!(discard(&repo.0, &prepared).is_err());
+        assert_eq!(
+            fs::read_to_string(prepared.worktree().join("AGENTS.md")).unwrap(),
+            "editor's revision\n"
+        );
+        fs::write(prepared.worktree().join("AGENTS.md"), &prepared.after).unwrap();
     }
 
     #[test]
