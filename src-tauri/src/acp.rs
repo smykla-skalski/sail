@@ -420,6 +420,7 @@ struct Connection {
     session_configs: Mutex<HashMap<String, SessionConfig>>,
     native_subagents: Mutex<NativeSubagentRegistry>,
     session_profiles: Mutex<HashMap<String, CapabilityProfile>>,
+    session_ui: Mutex<HashMap<String, SessionUiState>>,
     pending_directory: Mutex<Option<PathBuf>>,
     session_creation: Mutex<()>,
     restores: Mutex<HashMap<String, RestoreClaim>>,
@@ -432,7 +433,32 @@ struct RestoreClaim {
     expires: Instant,
 }
 
+#[derive(Clone, Default)]
+struct SessionUiState {
+    config_options: Option<Value>,
+    available_commands: Option<Value>,
+}
+
 impl Connection {
+    fn remember_session_ui(&self, session_id: &str, source: &Value) -> Result<(), String> {
+        let config_options = source.get("configOptions").filter(|value| value.is_array());
+        let available_commands = source
+            .get("availableCommands")
+            .filter(|value| value.is_array());
+        if config_options.is_none() && available_commands.is_none() {
+            return Ok(());
+        }
+        let mut sessions = self.session_ui.lock().map_err(|error| error.to_string())?;
+        let state = sessions.entry(session_id.to_owned()).or_default();
+        if let Some(options) = config_options {
+            state.config_options = Some(options.clone());
+        }
+        if let Some(commands) = available_commands {
+            state.available_commands = Some(commands.clone());
+        }
+        Ok(())
+    }
+
     fn extend_restore(&self, session_id: &str, token: &str) -> Result<(), String> {
         let mut claims = self.restores.lock().map_err(|error| error.to_string())?;
         let claim = claims
@@ -453,7 +479,21 @@ impl Connection {
             .lock()
             .map_err(|error| error.to_string())?;
         if let Some(prompt) = prompts.active.get(session_id) {
-            return Ok(json!({"liveTurn":prompt.turn_id}));
+            let mut response = json!({"liveTurn":prompt.turn_id});
+            if let Some(state) = self
+                .session_ui
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(session_id)
+            {
+                if let Some(options) = &state.config_options {
+                    response["configOptions"] = options.clone();
+                }
+                if let Some(commands) = &state.available_commands {
+                    response["availableCommands"] = commands.clone();
+                }
+            }
+            return Ok(response);
         }
         let token = uuid::Uuid::new_v4().to_string();
         claims.insert(
@@ -3114,6 +3154,7 @@ fn connect_blocking_inner(
         session_configs: Mutex::new(HashMap::new()),
         native_subagents: Mutex::new(NativeSubagentRegistry::default()),
         session_profiles: Mutex::new(HashMap::new()),
+        session_ui: Mutex::new(HashMap::new()),
         pending_directory: Mutex::new(None),
         session_creation: Mutex::new(()),
         restores: Mutex::new(HashMap::new()),
@@ -3151,6 +3192,12 @@ fn connect_blocking_inner(
                 {
                     if let Ok(mut prompts) = reader.prompt_state.lock() {
                         prompts.observe_update(session_id, update);
+                    }
+                    if let Err(error) = reader.remember_session_ui(session_id, update) {
+                        crate::diagnostics::record(
+                            "acp_session_ui_cache_failed",
+                            json!({"agent":agent_id,"sessionId":session_id,"error":error}),
+                        );
                     }
                 }
                 if update.get("sessionUpdate").and_then(Value::as_str) == Some("subagent_spawned") {
@@ -3723,6 +3770,7 @@ pub async fn acp_new_session(
             let _ = fence.release_session(&agent, &directory, id);
             return Err(error);
         }
+        runtime.remember_session_ui(id, &result)?;
         browser.identify(&config.token, id);
         Ok(result)
     })
@@ -3761,6 +3809,11 @@ pub fn acp_forget_session(
         };
         let removed = runtime
             .session_configs
+            .lock()
+            .map_err(|error| error.to_string())?
+            .remove(&session_id);
+        runtime
+            .session_ui
             .lock()
             .map_err(|error| error.to_string())?
             .remove(&session_id);
@@ -3967,6 +4020,7 @@ async fn restore_session(
                     .remove(&session_id);
             }
             let result = result?;
+            runtime.remember_session_ui(&session_id, &result)?;
             Ok(result)
         })();
         if result.is_ok() {
@@ -4742,11 +4796,13 @@ pub async fn acp_set_config(
 ) -> Result<Value, String> {
     let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
     tauri::async_runtime::spawn_blocking(move || {
-        runtime.request(
+        let result = runtime.request(
             "session/set_config_option",
             json!({"sessionId":session_id,"configId":config_id,"value":value}),
             Duration::from_secs(30),
-        )
+        )?;
+        runtime.remember_session_ui(&session_id, &result)?;
+        Ok(result)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -4867,6 +4923,7 @@ mod session_config_tests {
             session_configs: Mutex::new(HashMap::new()),
             native_subagents: Mutex::new(NativeSubagentRegistry::default()),
             session_profiles: Mutex::new(HashMap::from([(session_id.to_owned(), profile)])),
+            session_ui: Mutex::new(HashMap::new()),
             pending_directory: Mutex::new(None),
             session_creation: Mutex::new(()),
             restores: Mutex::new(HashMap::new()),
@@ -4913,10 +4970,23 @@ mod session_config_tests {
         assert!(runtime.prompt_state.lock().unwrap().active.is_empty());
         runtime.release_restore("session", &token).unwrap();
         worker.join().unwrap();
-        assert_eq!(
-            runtime.begin_restore("session").unwrap()["liveTurn"],
-            "new-turn"
-        );
+        runtime
+            .remember_session_ui(
+                "session",
+                &json!({"configOptions":[{"id":"model","currentValue":"first"}],
+                    "availableCommands":[{"name":"inspect"}]}),
+            )
+            .unwrap();
+        runtime
+            .remember_session_ui(
+                "session",
+                &json!({"configOptions":[{"id":"model","currentValue":"second"}]}),
+            )
+            .unwrap();
+        let live = runtime.begin_restore("session").unwrap();
+        assert_eq!(live["configOptions"][0]["currentValue"], "second");
+        assert_eq!(live["availableCommands"][0]["name"], "inspect");
+        assert_eq!(live["liveTurn"], "new-turn");
         runtime.child.lock().unwrap().kill().unwrap();
         runtime.child.lock().unwrap().wait().unwrap();
     }
@@ -5141,6 +5211,7 @@ mod session_config_tests {
                 session_configs: Mutex::new(HashMap::new()),
                 native_subagents: Mutex::new(NativeSubagentRegistry::default()),
                 session_profiles: Mutex::new(HashMap::new()),
+                session_ui: Mutex::new(HashMap::new()),
                 pending_directory: Mutex::new(None),
                 session_creation: Mutex::new(()),
                 restores: Mutex::new(HashMap::new()),
@@ -5500,6 +5571,7 @@ mod native_subagent_fence_tests {
             session_configs: Mutex::new(HashMap::new()),
             native_subagents: Mutex::new(NativeSubagentRegistry::default()),
             session_profiles: Mutex::new(HashMap::new()),
+            session_ui: Mutex::new(HashMap::new()),
             pending_directory: Mutex::new(None),
             session_creation: Mutex::new(()),
             restores: Mutex::new(HashMap::new()),

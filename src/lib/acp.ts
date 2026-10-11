@@ -958,12 +958,12 @@ export const acp = {
   releaseSessionFence: (agent: AgentId, directory: string, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, directory, sessionId }),
   beginRestore: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
-    invoke<{ liveTurn?: string; restoreToken?: string }>('acp_begin_session_restore', {
-      agent,
-      cwd,
-      sessionId,
-      profile,
-    }),
+    invoke<{
+      liveTurn?: string;
+      restoreToken?: string;
+      configOptions?: AgentConfigOption[];
+      availableCommands?: AgentCommand[];
+    }>('acp_begin_session_restore', { agent, cwd, sessionId, profile }),
   endRestore: (agent: AgentId, directory: string, sessionId: string, restoreToken: string) =>
     invoke<void>('acp_end_session_restore', { agent, directory, sessionId, restoreToken }),
   load: (
@@ -973,8 +973,13 @@ export const acp = {
     profile: CapabilityProfile,
     restoreToken?: string,
   ) => restoreSession('acp_load_session', agent, cwd, sessionId, profile, restoreToken),
-  resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
-    restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
+  resume: (
+    agent: AgentId,
+    cwd: string,
+    sessionId: string,
+    profile: CapabilityProfile,
+    restoreToken?: string,
+  ) => restoreSession('acp_resume_session', agent, cwd, sessionId, profile, restoreToken),
   forget: (agent: AgentId, directory: string, sessionId: string) => {
     forgetSessionState(agent, directory, sessionId);
     forgetPlanningState({ agent, directory, sessionId });

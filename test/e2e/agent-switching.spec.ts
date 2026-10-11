@@ -449,6 +449,12 @@ describe('agent sessions survive thread switches', () => {
     await browser.refresh();
     await openThread('Continuity main');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await expect($('.agent-picker-controls .option-trigger[aria-label^="Model:"]')).toHaveText(
+      'Test model',
+    );
+    await expect($('.agent-picker-controls .option-trigger[aria-label^="Effort:"]')).toHaveText(
+      'Medium',
+    );
     await expect($('.agent-history-gap')).toBeDisplayed();
     await browser.waitUntil(
       async () =>
