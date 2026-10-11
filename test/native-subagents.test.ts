@@ -746,12 +746,12 @@ await test('structured tool input and output keep metadata while capping large s
   assert.equal(tool.input.command, 'write');
   const content = tool.input.content;
   assert.ok(typeof content === 'string');
-  assert.equal(content.length, nativeMessageLimit);
+  assert.ok(content.length < nativeMessageLimit);
   assert.ok(content.endsWith('…'));
   assert.ok(tool.output && typeof tool.output === 'object' && 'stdout' in tool.output);
   const stdout = tool.output.stdout;
   assert.ok(typeof stdout === 'string');
-  assert.equal(stdout.length, nativeMessageLimit);
+  assert.ok(stdout.length < nativeMessageLimit);
   assert.ok(stdout.startsWith('…'));
   assert.equal(tool.output.done, true);
 });
@@ -791,7 +791,35 @@ await test('a bounded failed tool still exposes its rule and command', () => {
   assert.ok(details && typeof details === 'object' && 'stderr' in details);
   const stderr = details.stderr;
   assert.ok(typeof stderr === 'string');
-  assert.equal(stderr.length, nativeMessageLimit);
+  assert.ok(stderr.length < nativeMessageLimit);
+});
+
+await test('many medium-sized fields stay within the structured output limit', () => {
+  const store = updateNativeSubagents(
+    spawnedChild(),
+    event('child', {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'large',
+      title: 'Run command',
+      status: 'failed',
+      rawInput: { command: 'git status' },
+      rawOutput: {
+        chunks: Array.from({ length: 100 }, () => 'x'.repeat(39_000)),
+        ruleName: 'GIT010',
+        hookPhase: 'PreToolUse',
+        reason: 'Rejected',
+      },
+    }),
+    '/repo',
+    2,
+  );
+  const tool = store[nativeSubagentId('codex', '/repo', 'child')].transcript.find(
+    (entry) => entry.id === 'large',
+  );
+  assert.ok(tool?.type === 'tool');
+  assert.ok(JSON.stringify(tool.output).length <= nativeMessageLimit);
+  assert.equal(acpToolFailure(tool)?.rule, 'GIT010');
+  assert.equal(acpToolFailure(tool)?.action, 'git status');
 });
 
 await test('small structured tool values stay structured', () => {
