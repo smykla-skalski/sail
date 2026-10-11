@@ -403,6 +403,8 @@ struct Connection {
     _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
     #[cfg(unix)]
+    scratch_owner: Option<String>,
+    #[cfg(unix)]
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
     stopped: AtomicBool,
     input: Mutex<ChildStdin>,
@@ -2903,6 +2905,9 @@ fn connect_blocking_inner(
     }
     command.current_dir(worktree);
     #[cfg(unix)]
+    let mut command = crate::scratch_cleanup::wrap_command(command)
+        .map_err(|error| format!("Could not prepare agent owner: {error}"))?;
+    #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
             if nix::libc::setsid() == -1 {
@@ -2919,6 +2924,8 @@ fn connect_blocking_inner(
         .spawn()
         .map_err(|error| format!("Could not start {}: {error}", definition.name))?;
     storage_lease.mark_started();
+    #[cfg(unix)]
+    let scratch_owner = crate::scratch_cleanup::owner_identity_for_pid(child.id());
     if !is_test_agent {
         observe_agent_with_reef(&agent, child.id());
     }
@@ -2951,6 +2958,8 @@ fn connect_blocking_inner(
         worktree: worktree.to_path_buf(),
         _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
+        #[cfg(unix)]
+        scratch_owner,
         #[cfg(unix)]
         watchdog: Mutex::new(watchdog),
         stopped: AtomicBool::new(false),
@@ -3119,6 +3128,10 @@ fn connect_blocking_inner(
                                     .or_else(|| runtime.pending_directory.lock().ok()?.clone());
                                 let manager =
                                     app.state::<crate::acp_terminal::AcpTerminalManager>();
+                                #[cfg(unix)]
+                                let scratch_owner = runtime.scratch_owner.as_deref();
+                                #[cfg(not(unix))]
+                                let scratch_owner = None;
                                 let response = match crate::acp_terminal::handle(
                                     &app,
                                     &manager,
@@ -3126,7 +3139,10 @@ fn connect_blocking_inner(
                                     runtime.profile,
                                     &method,
                                     params,
-                                    directory,
+                                    crate::acp_terminal::TerminalContext {
+                                        directory,
+                                        scratch_owner,
+                                    },
                                 ) {
                                     Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
                                     Err(error) => {
@@ -4468,6 +4484,7 @@ mod session_config_tests {
             worktree: worktree.to_path_buf(),
             _storage_lease: None,
             child: Mutex::new(child),
+            scratch_owner: None,
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
             input: Mutex::new(input),
@@ -4677,6 +4694,7 @@ mod session_config_tests {
                 worktree: worktree.to_path_buf(),
                 _storage_lease: None,
                 child: Mutex::new(child),
+                scratch_owner: None,
                 watchdog: Mutex::new(watchdog),
                 stopped: AtomicBool::new(false),
                 input: Mutex::new(input),
@@ -5034,6 +5052,7 @@ mod native_subagent_fence_tests {
             worktree: PathBuf::from("/worktree"),
             _storage_lease: None,
             child: Mutex::new(child),
+            scratch_owner: None,
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
             input: Mutex::new(input),

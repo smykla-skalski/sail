@@ -759,6 +759,11 @@ fn exited_without_reaping(child: &std::process::Child) -> Result<bool, String> {
     Ok(unsafe { status.si_pid() } == child.id() as i32)
 }
 
+pub struct TerminalContext<'a> {
+    pub directory: Option<PathBuf>,
+    pub scratch_owner: Option<&'a str>,
+}
+
 pub fn handle(
     app: &AppHandle,
     manager: &AcpTerminalManager,
@@ -766,7 +771,7 @@ pub fn handle(
     profile: CapabilityProfile,
     method: &str,
     params: Value,
-    session_directory: Option<PathBuf>,
+    context: TerminalContext<'_>,
 ) -> Result<Value, String> {
     if method == "terminal/create" {
         let params: CreateParams =
@@ -786,7 +791,8 @@ pub fn handle(
         {
             return Err("Command arguments or environment are invalid.".to_string());
         }
-        let fallback = session_directory
+        let fallback = context
+            .directory
             .ok_or("Unknown agent session.")?
             .canonicalize()
             .map_err(|error| error.to_string())?;
@@ -833,6 +839,14 @@ pub fn handle(
             for variable in params.env {
                 command.env(variable.name, variable.value);
             }
+            #[cfg(unix)]
+            if let Some(owner) = context.scratch_owner {
+                command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
+            } else {
+                command.env_remove("SAIL_SCRATCH_OWNER_IDENTITY");
+            }
+            #[cfg(not(unix))]
+            let _ = context.scratch_owner;
             for (name, value) in terminal_environment(&data_directory) {
                 command.env(name, value);
             }

@@ -224,6 +224,13 @@ mod memory_install;
 mod memory_provider;
 mod opencode_config;
 mod post_turn_checks;
+#[cfg(unix)]
+mod scratch_cleanup;
+
+#[cfg(unix)]
+pub fn exec_with_scratch_owner() -> ! {
+    scratch_cleanup::exec_with_scratch_owner()
+}
 mod settings;
 mod shell_command;
 mod ship_actions;
@@ -2955,6 +2962,8 @@ pub fn run() {
             if let Err(error) = diagnostics::init(_app.handle()) {
                 eprintln!("Sail diagnostics unavailable: {error}");
             }
+            #[cfg(unix)]
+            std::thread::spawn(scratch_cleanup::sweep_on_startup);
             if let Ok(cache_directory) = _app.path().app_cache_dir() {
                 worktree_storage::reconcile(&cache_directory);
             }

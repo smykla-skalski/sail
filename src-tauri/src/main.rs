@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    #[cfg(unix)]
+    if std::env::args().nth(1).as_deref() == Some("--exec-with-scratch-owner") {
+        sail_lib::exec_with_scratch_owner();
+    }
     #[cfg(all(target_os = "macos", feature = "e2e"))]
     if std::env::args().nth(1).as_deref() == Some("--context-auth-replay-probe") {
         let Some(directory) = std::env::args().nth(2) else {
