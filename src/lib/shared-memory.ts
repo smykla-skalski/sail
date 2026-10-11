@@ -21,6 +21,7 @@ export type MemoryRecord = {
   provenance: { agent?: string; sessionId?: string; source?: string };
   rating?: { value: -1 | 0 | 1; updatedAt: number };
   forgottenAt?: number;
+  expiresAt?: number;
 };
 
 export type MemorySearchResult = { memory: MemoryRecord; score: number };
@@ -81,6 +82,16 @@ export function parseMemoryTags(value: string): string[] {
         .filter(Boolean),
     ),
   ];
+}
+
+export function resolveHandoffExpiry(
+  value: string,
+  originalValue: string,
+  originalTimestamp: number | null,
+): number | null {
+  if (!value) return null;
+  if (value === originalValue && originalTimestamp !== null) return originalTimestamp;
+  return new Date(value).getTime();
 }
 
 export function createSerialExecutor(): <T>(work: () => Promise<T>) => Promise<T> {

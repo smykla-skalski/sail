@@ -2834,6 +2834,19 @@ fn connect_blocking(
     }
 }
 
+#[cfg(unix)]
+fn isolate_agent_process(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
 fn connect_blocking_inner(
     app: AppHandle,
     manager: &AgentManager,
@@ -2894,10 +2907,11 @@ fn connect_blocking_inner(
     let test_agent: Option<std::ffi::OsString> = None;
     let mut paths = Vec::new();
     let is_test_agent = test_agent.is_some();
+    let background = crate::background_priority::enabled(&app);
     let mut command = if let Some(path) = test_agent {
         let node = find_executable("node").ok_or("Node.js not found.")?;
         paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
-        let mut command = Command::new(&node);
+        let mut command = crate::background_priority::worker_command(node.as_os_str(), background);
         command.arg(path).arg(&agent);
         command
     } else {
@@ -2906,7 +2920,8 @@ fn connect_blocking_inner(
                 let node = find_executable("node").ok_or("Node.js not found.")?;
                 paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
                 let npx = find_executable("npx").ok_or("npx not found.")?;
-                let mut command = Command::new(npx);
+                let mut command =
+                    crate::background_priority::worker_command(npx.as_os_str(), background);
                 command.args(["--yes", package]);
                 command
             }
@@ -2915,7 +2930,10 @@ fn connect_blocking_inner(
                     .binary_path
                     .clone()
                     .ok_or("OpenCode binary not found.")?;
-                let mut command = Command::new(binary);
+                let mut command = crate::background_priority::worker_command(
+                    std::ffi::OsStr::new(&binary),
+                    background,
+                );
                 command.arg("acp");
                 command.env_remove("OPENCODE_CONFIG_DIR");
                 command
@@ -2948,21 +2966,31 @@ fn connect_blocking_inner(
     }
     command.current_dir(worktree);
     #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if nix::libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    let mut child = command
+    isolate_agent_process(&mut command);
+    let spawn = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Could not start {}: {error}", definition.name))?;
+        .spawn();
+    let spawn = spawn.or_else(|error| {
+        if !background {
+            return Err(error);
+        }
+        eprintln!(
+            "Background priority launch failed for {}: {error}; retrying at normal priority",
+            definition.name
+        );
+        let mut retry = crate::background_priority::normal_priority_copy(&command);
+        #[cfg(unix)]
+        isolate_agent_process(&mut retry);
+        retry
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    });
+    let mut child =
+        spawn.map_err(|error| format!("Could not start {}: {error}", definition.name))?;
     storage_lease.mark_started();
     if !is_test_agent {
         observe_agent_with_reef(&agent, child.id());
@@ -4649,6 +4677,21 @@ mod session_config_tests {
     use super::*;
     use crate::browser_agent::McpConfig;
     use std::collections::BTreeMap;
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_priority_retry_keeps_its_own_session() {
+        let mut command =
+            crate::background_priority::worker_command(std::ffi::OsStr::new("/bin/sh"), true);
+        command.args(["-c", "sleep 2"]);
+        let mut retry = crate::background_priority::normal_priority_copy(&command);
+        isolate_agent_process(&mut retry);
+        let mut child = retry.spawn().unwrap();
+        let session = unsafe { nix::libc::getsid(child.id() as i32) };
+        assert_eq!(session, child.id() as i32);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 
     fn config(token: &str, env: &[(&str, &str)]) -> McpConfig {
         McpConfig {

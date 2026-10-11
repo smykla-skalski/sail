@@ -49,6 +49,7 @@
     exportMemories,
     memoryKinds,
     parseMemoryTags,
+    resolveHandoffExpiry,
     type MemoryAgentInstallPreview,
     type MemoryAgentStatus,
     type MemoryImportCandidate,
@@ -125,6 +126,7 @@
   let memoryContent = $state('');
   let memoryKind = $state<MemoryKind>('other');
   let memoryTags = $state('');
+  let memoryExpiry = $state('');
   let memoryLoading = $state(false);
   let memoryStorageError = $state('');
   let memoryAgentError = $state('');
@@ -132,6 +134,10 @@
   let memoryRequest = 0;
   let memoryDirectory = '';
   let pendingForget = $state('');
+  let pendingExpiry = $state('');
+  let expiryEditValue = $state('');
+  let expiryEditOriginalValue = '';
+  let expiryEditOriginalTimestamp: number | null = null;
   let agentPreview = $state<{
     action: 'install' | 'uninstall';
     result: MemoryAgentInstallPreview;
@@ -294,6 +300,11 @@
       memoryImportMessage = '';
       memoryQuery = '';
       pendingForget = '';
+      pendingExpiry = '';
+      expiryEditValue = '';
+      expiryEditOriginalValue = '';
+      expiryEditOriginalTimestamp = null;
+      memoryExpiry = '';
       agentPreview = null;
       previewRequest += 1;
       memoryProviderStatus = null;
@@ -455,13 +466,20 @@
     const content = memoryContent.trim();
     if (!directory || !content) return;
     memoryStorageError = '';
+    const expiresAt =
+      memoryKind === 'handoff' && memoryExpiry ? new Date(memoryExpiry).getTime() : undefined;
+    if (expiresAt !== undefined && !Number.isFinite(expiresAt)) {
+      memoryStorageError = 'Storage: Enter a valid handoff expiry.';
+      return;
+    }
     try {
       await invoke<MemoryRecord>('memory_remember', {
         directory,
-        input: { content, kind: memoryKind, tags: parseMemoryTags(memoryTags) },
+        input: { content, kind: memoryKind, tags: parseMemoryTags(memoryTags), expiresAt },
       });
       memoryContent = '';
       memoryTags = '';
+      memoryExpiry = '';
       await refreshMemory(directory);
     } catch (cause) {
       memoryStorageError = `Storage: ${String(cause)}`;
@@ -498,6 +516,29 @@
     try {
       await invoke('memory_forget', { directory, id });
       pendingForget = '';
+      await refreshMemory(directory);
+    } catch (cause) {
+      memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function saveMemoryExpiry(id: string) {
+    const directory = snapshot?.directory;
+    if (!directory) return;
+    const expiresAt = resolveHandoffExpiry(
+      expiryEditValue,
+      expiryEditOriginalValue,
+      expiryEditOriginalTimestamp,
+    );
+    if (expiresAt !== null && !Number.isFinite(expiresAt)) {
+      memoryStorageError = 'Storage: Enter a valid handoff expiry.';
+      return;
+    }
+    memoryStorageError = '';
+    try {
+      await invoke<MemoryRecord>('memory_set_expiry', { directory, id, expiresAt });
+      pendingExpiry = '';
+      expiryEditValue = '';
       await refreshMemory(directory);
     } catch (cause) {
       memoryStorageError = `Storage: ${String(cause)}`;
@@ -1820,6 +1861,53 @@
                 </div>
                 <p>{record.content}</p>
                 {#if record.tags.length}<p class="memory-tags">{record.tags.join(' · ')}</p>{/if}
+                {#if record.kind === 'handoff' && record.expiresAt != null}
+                  <p class="memory-tags">
+                    {record.expiresAt <= Date.now() ? 'Expired' : 'Expires'}
+                    <span aria-hidden="true"> · </span>
+                    <time datetime={new Date(record.expiresAt).toISOString()}>
+                      {new Date(record.expiresAt).toLocaleString()}
+                    </time>
+                  </p>
+                {/if}
+                {#if record.kind === 'handoff'}
+                  {#if pendingExpiry === record.id}
+                    <div
+                      class="memory-forget-confirm"
+                      role="group"
+                      aria-label="Edit handoff expiry"
+                    >
+                      <label for="expiry-{record.id}">Expires (leave empty to remove)</label>
+                      <input
+                        id="expiry-{record.id}"
+                        type="datetime-local"
+                        bind:value={expiryEditValue}
+                      />
+                      <Button size="sm" onclick={() => void saveMemoryExpiry(record.id)}
+                        >Save expiry</Button
+                      >
+                      <Button size="sm" variant="secondary" onclick={() => (pendingExpiry = '')}
+                        >Cancel</Button
+                      >
+                    </div>
+                  {:else}
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={() => {
+                        pendingExpiry = record.id;
+                        const expiry = record.expiresAt;
+                        expiryEditValue = expiry
+                          ? new Date(expiry - new Date(expiry).getTimezoneOffset() * 60_000)
+                              .toISOString()
+                              .slice(0, 16)
+                          : '';
+                        expiryEditOriginalValue = expiryEditValue;
+                        expiryEditOriginalTimestamp = expiry ?? null;
+                      }}>Edit expiry</Button
+                    >
+                  {/if}
+                {/if}
                 {#if pendingForget === record.id}
                   <div class="memory-forget-confirm" role="group" aria-label="Confirm forget">
                     <span>Forget this memory?</span>
@@ -1853,6 +1941,10 @@
         <select id="memory-kind" bind:value={memoryKind}>
           {#each memoryKinds as kind (kind)}<option value={kind}>{kind}</option>{/each}
         </select>
+        {#if memoryKind === 'handoff'}
+          <label for="memory-expiry">Expires (optional)</label>
+          <input id="memory-expiry" type="datetime-local" bind:value={memoryExpiry} />
+        {/if}
         <label for="memory-tags">Tags, separated by commas</label>
         <input id="memory-tags" bind:value={memoryTags} />
         <Button

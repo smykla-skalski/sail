@@ -25,6 +25,7 @@
     "allow-memory-remember",
     "allow-memory-inspect",
     "allow-memory-forget",
+    "allow-memory-set-expiry",
     "allow-memory-rate",
     "allow-preview-memory-import",
     "allow-import-agent-memories",

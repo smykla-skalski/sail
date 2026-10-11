@@ -1339,6 +1339,7 @@ fn metadata(memory: &MemoryRecord) -> Value {
         "sail_tags": memory.tags,
         "sail_provenance": memory.provenance,
         "sail_rating": memory.rating,
+        "sail_expires_at": memory.expires_at,
     })
 }
 
@@ -1521,8 +1522,13 @@ pub(crate) fn search_standalone(
         Ok(remote) => {
             let local_results = local()?;
             // Linearize returned records after all remote I/O so completed forgets win.
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
             let canonical: HashMap<_, _> = crate::memory::list_at(root, key, false)?
                 .into_iter()
+                .filter(|memory| !crate::memory::is_expired(memory, timestamp))
                 .map(|memory| (memory.id.clone(), memory))
                 .collect();
             save_runtime_error(root, key, None);
@@ -1789,6 +1795,7 @@ mod tests {
             provenance: MemoryProvenance::default(),
             rating: None,
             forgotten_at: None,
+            expires_at: None,
         }
     }
 
@@ -1819,6 +1826,7 @@ mod tests {
                 kind: Some(MemoryKind::Preference),
                 tags: Some(vec!["communication".into()]),
                 provenance: None,
+                expires_at: None,
             },
         )
         .unwrap()
@@ -2311,6 +2319,78 @@ mod tests {
         });
         search_started_rx.recv().unwrap();
         forget_at(&root, &key, &local.id).unwrap();
+        continue_tx.send(()).unwrap();
+        assert!(search.join().unwrap().unwrap().is_empty());
+        server.join().unwrap();
+        session_credentials().lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn standalone_search_filters_handoff_expired_during_remote_request() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        let key = Uuid::new_v4().to_string();
+        let local = remember_at(
+            &root,
+            &key,
+            MemoryInput {
+                content: "Continue release".into(),
+                kind: Some(MemoryKind::Handoff),
+                tags: None,
+                provenance: None,
+                expires_at: None,
+            },
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        write_provider_settings(&settings, &key, &endpoint);
+        session_credentials()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), "secret".into());
+        let (search_started_tx, search_started_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let remote_id = local.id.clone();
+        let remote_updated_at = local.updated_at;
+        let server = std::thread::spawn(move || {
+            for request_number in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let body = json!({ "results": [{
+                    "id": "remote-id",
+                    "score": 0.9,
+                    "metadata": {
+                        "sail_memory_id": remote_id,
+                        "sail_updated_at": remote_updated_at
+                    }
+                }] })
+                .to_string();
+                if request_number == 0 {
+                    assert!(request.starts_with("GET /memories?"));
+                    respond(&mut stream, &body);
+                } else {
+                    assert!(request.starts_with("POST /search HTTP/1.1"));
+                    search_started_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                    respond(&mut stream, &body);
+                }
+            }
+        });
+        let search_root = root.clone();
+        let search_settings = settings.clone();
+        let search_key = key.clone();
+        let search = std::thread::spawn(move || {
+            search_standalone(
+                &search_root,
+                &search_settings,
+                &search_key,
+                "release",
+                Some(10),
+            )
+        });
+        search_started_rx.recv().unwrap();
+        crate::memory::set_expiry_at(&root, &key, &local.id, Some(0)).unwrap();
         continue_tx.send(()).unwrap();
         assert!(search.join().unwrap().unwrap().is_empty());
         server.join().unwrap();
