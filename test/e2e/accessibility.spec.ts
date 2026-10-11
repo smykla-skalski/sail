@@ -335,7 +335,7 @@ describe('palette actions and accessibility', () => {
       lower.showModal();
       top.showModal();
       const range = document.createRange();
-      range.selectNodeContents(document.querySelector('.agent-header')!);
+      range.selectNodeContents(top);
       const selection = window.getSelection();
       selection?.removeAllRanges();
       selection?.addRange(range);
