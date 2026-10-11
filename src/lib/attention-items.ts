@@ -298,7 +298,8 @@ export function subagentAttentionCandidates(
 }
 
 export type AttentionHidden =
-  { mode: 'dismissed'; since: number } | { mode: 'snoozed'; since: number; until: number };
+  | { mode: 'dismissed'; since: number; state?: string }
+  | { mode: 'snoozed'; since: number; until: number };
 
 export type AttentionLedger = {
   /** First time each current item was seen, for items without their own timestamp. */
@@ -323,7 +324,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function parseHidden(entry: unknown): AttentionHidden | null {
   if (!isRecord(entry) || typeof entry.since !== 'number' || !Number.isFinite(entry.since))
     return null;
-  if (entry.mode === 'dismissed') return { mode: 'dismissed', since: entry.since };
+  const state = typeof entry.state === 'string' ? { state: entry.state } : {};
+  if (entry.mode === 'dismissed') return { mode: 'dismissed', since: entry.since, ...state };
   if (entry.mode === 'snoozed' && typeof entry.until === 'number' && Number.isFinite(entry.until))
     return { mode: 'snoozed', since: entry.since, until: entry.until };
   return null;
@@ -368,12 +370,15 @@ export function snoozeUntil(choice: AttentionSnooze, now: number): number {
 
 export function dismissAttention(
   ledger: AttentionLedger,
-  item: Pick<AttentionItem, 'id' | 'since' | 'dismissible'>,
+  item: Pick<AttentionItem, 'id' | 'since' | 'dismissible' | 'title' | 'detail' | 'severity'>,
 ): AttentionLedger {
   if (!item.dismissible) return ledger;
   return {
     ...ledger,
-    hidden: { ...ledger.hidden, [item.id]: { mode: 'dismissed', since: item.since } },
+    hidden: {
+      ...ledger.hidden,
+      [item.id]: { mode: 'dismissed', since: item.since, state: attentionState(item) },
+    },
   };
 }
 
@@ -385,7 +390,10 @@ export function snoozeAttention(
   if (!item.dismissible) return ledger;
   return {
     ...ledger,
-    hidden: { ...ledger.hidden, [item.id]: { mode: 'snoozed', since: item.since, until } },
+    hidden: {
+      ...ledger.hidden,
+      [item.id]: { mode: 'snoozed', since: item.since, until },
+    },
   };
 }
 
@@ -405,13 +413,16 @@ export type AttentionView = {
   changed: boolean;
 };
 
+function attentionState(item: Pick<AttentionItem, 'title' | 'detail' | 'severity'>): string {
+  return JSON.stringify([item.title, item.detail ?? null, item.severity]);
+}
+
 /**
  * Dedupes candidates by target plus kind, stamps when each state began, hides
  * dismissed and snoozed items, and forgets items whose state stayed resolved
  * for longer than the grace period.
  *
- * - A dismissed item returns when its state changes: its kind changes, or it
- *   resolves and comes back with a new start time.
+ * - A dismissed item returns when its state changes or it resolves and returns.
  * - A snoozed item returns when the snooze ends.
  */
 export function applyAttentionLifecycle(
@@ -433,7 +444,11 @@ export function applyAttentionLifecycle(
     if (entry.since === undefined) seen[entry.id] = since;
     const item: AttentionItem = { ...entry, since };
     const hide = item.dismissible ? ledger.hidden[item.id] : undefined;
-    if (hide && hide.since === since && (hide.mode === 'dismissed' || now < hide.until)) {
+    if (
+      hide &&
+      hide.since === since &&
+      (hide.mode === 'dismissed' ? hide.state === attentionState(item) : now < hide.until)
+    ) {
       hidden[item.id] = hide;
       continue;
     }
@@ -449,7 +464,7 @@ export function applyAttentionLifecycle(
     if (hide?.mode === 'snoozed' && now >= hide.until) continue;
     gone[id] = missingSince;
     if (id in ledger.seen) seen[id] = ledger.seen[id];
-    if (hide) hidden[id] = hide;
+    if (hide?.mode === 'snoozed') hidden[id] = hide;
   }
   const next: AttentionLedger = Object.keys(gone).length
     ? { seen, hidden, gone }

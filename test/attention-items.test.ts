@@ -236,6 +236,16 @@ void test('a dismissed item returns on its next state change', () => {
   view = applyAttentionLifecycle(view.ledger, [ready], now + 99_999_999);
   assert.deepEqual(view.items, [], 'a dismissal does not expire with time');
 
+  const changedReason = { ...ready, detail: 'A different blocker reason' };
+  view = applyAttentionLifecycle(view.ledger, [changedReason], now + 99_999_999);
+  assert.equal(view.items[0].detail, 'A different blocker reason');
+  view = applyAttentionLifecycle(
+    dismissAttention(view.ledger, view.items[0]),
+    [changedReason],
+    now,
+  );
+  assert.deepEqual(view.items, []);
+
   const other: AttentionCandidate = {
     ...ready,
     id: 'ship-needs-input:x',
@@ -254,7 +264,23 @@ void test('a dismissed item returns on its next state change', () => {
   assert.equal(view.items[0].since, back);
 });
 
-void test('an item that is missing for a moment keeps its dismissal and start time', () => {
+void test('a changed Ship blocker reason restores a dismissed item', () => {
+  const run = fixture();
+  const issue = run.issues[0];
+  Object.assign(issue, { state: 'working', workerState: 'working', reportedStatus: 'blocked' });
+  issue.blockedReason = 'First reason';
+  const [first] = shipAttentionCandidates([run], { mergeOwner: 'you', now });
+  let view = applyAttentionLifecycle(emptyAttentionLedger, [first], now);
+  const stored = loadAttentionLedger(JSON.stringify(dismissAttention(view.ledger, view.items[0])));
+
+  issue.blockedReason = 'Second reason';
+  const [second] = shipAttentionCandidates([run], { mergeOwner: 'you', now: now + 1 });
+  assert.equal(second.id, first.id);
+  view = applyAttentionLifecycle(stored, [second], now + 1);
+  assert.equal(view.items[0].detail, 'Second reason');
+});
+
+void test('a dismissed item returns after resolving within the grace period', () => {
   const [ready] = shipAttentionCandidates([readyRun()], { mergeOwner: 'you', now });
   let view = applyAttentionLifecycle(emptyAttentionLedger, [ready], now);
   const since = view.items[0].since;
@@ -262,7 +288,7 @@ void test('an item that is missing for a moment keeps its dismissal and start ti
   view = applyAttentionLifecycle(view.ledger, [], now + 1_000);
   assert.deepEqual(view.items, []);
   view = applyAttentionLifecycle(view.ledger, [ready], now + 30_000);
-  assert.deepEqual(view.items, [], 'a source that loads late does not undo a dismissal');
+  assert.equal(view.items.length, 1, 'resolving and re-blocking is a state change');
   assert.deepEqual(view.ledger.gone ?? {}, {});
   assert.equal(view.ledger.seen[ready.id], since);
 });
