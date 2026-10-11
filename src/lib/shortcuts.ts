@@ -4,7 +4,7 @@
  * shortcut sheet and command palette read their labels from it.
  */
 export type ShortcutModifier =
-  /** Command on macOS, Control elsewhere. Either key is accepted. */
+  /** Command on macOS, Control elsewhere. */
   | 'primary'
   /** Command only. */
   | 'meta'
@@ -163,15 +163,23 @@ export function shortcutFor(id: ShortcutId): Shortcut {
 
 type KeyEventLike = Pick<KeyboardEvent, 'key' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'>;
 
-export function matchesShortcut(event: KeyEventLike, shortcut: Shortcut): boolean {
+export type ShortcutPlatform = 'mac' | 'other';
+
+export function detectShortcutPlatform(
+  agent: Pick<Navigator, 'platform' | 'userAgent'> | undefined = globalThis.navigator,
+): ShortcutPlatform {
+  return /mac/i.test(agent?.platform || agent?.userAgent || '') ? 'mac' : 'other';
+}
+
+export function matchesShortcut(
+  event: KeyEventLike,
+  shortcut: Shortcut,
+  platform: ShortcutPlatform = detectShortcutPlatform(),
+): boolean {
   const modifier =
-    shortcut.modifier === 'primary'
-      ? event.metaKey || event.ctrlKey
-      : shortcut.modifier === 'meta'
-        ? event.metaKey && !event.ctrlKey
-        : event.ctrlKey && !event.metaKey;
+    shortcut.modifier === 'primary' ? (platform === 'mac' ? 'meta' : 'ctrl') : shortcut.modifier;
   return (
-    modifier &&
+    (modifier === 'meta' ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) &&
     event.altKey === (shortcut.alt ?? false) &&
     (shortcut.shift === undefined || event.shiftKey === shortcut.shift) &&
     shortcut.keys.includes(event.key.toLowerCase())
@@ -188,24 +196,23 @@ export function terminalOwnsKey(
 }
 
 /** The registered shortcut that matches the event, if any. */
-export function shortcutForEvent(event: KeyEventLike): Shortcut | undefined {
-  return shortcuts.find((shortcut) => matchesShortcut(event, shortcut));
+export function shortcutForEvent(
+  event: KeyEventLike,
+  platform: ShortcutPlatform = detectShortcutPlatform(),
+): Shortcut | undefined {
+  return shortcuts.find((shortcut) => matchesShortcut(event, shortcut, platform));
 }
 
-export function matches(event: KeyEventLike, id: ShortcutId): boolean {
-  return matchesShortcut(event, shortcutFor(id));
+export function matches(
+  event: KeyEventLike,
+  id: ShortcutId,
+  platform: ShortcutPlatform = detectShortcutPlatform(),
+): boolean {
+  return matchesShortcut(event, shortcutFor(id), platform);
 }
 
 function keyName(key: string): string {
   return key.length === 1 ? key.toUpperCase() : key.charAt(0).toUpperCase() + key.slice(1);
-}
-
-export type ShortcutPlatform = 'mac' | 'other';
-
-export function detectShortcutPlatform(
-  agent: Pick<Navigator, 'platform' | 'userAgent'> | undefined = globalThis.navigator,
-): ShortcutPlatform {
-  return /mac/i.test(agent?.platform || agent?.userAgent || '') ? 'mac' : 'other';
 }
 
 /** Human label such as `⌘J`, `⌘⇧J` or `Ctrl+J`. */
@@ -220,19 +227,21 @@ export function shortcutLabel(shortcut: Shortcut, platform: ShortcutPlatform = '
   return `${modifier}+${shift ? 'Shift+' : ''}${key}`;
 }
 
-/** Value for `aria-keyshortcuts`. Primary shortcuts list both modifier keys. */
-export function ariaKeyShortcuts(shortcut: Shortcut): string {
+/** Value for `aria-keyshortcuts`. */
+export function ariaKeyShortcuts(
+  shortcut: Shortcut,
+  platform: ShortcutPlatform = detectShortcutPlatform(),
+): string {
   const key = shortcut.display ?? keyName(shortcut.keys[0]);
   const shift = shortcut.shift === true ? 'Shift+' : '';
-  const modifiers =
-    shortcut.modifier === 'primary'
-      ? ['Meta', 'Control']
-      : shortcut.modifier === 'meta'
-        ? ['Meta']
-        : ['Control'];
-  return modifiers.map((modifier) => `${modifier}+${shift}${key}`).join(' ');
+  const modifier =
+    shortcut.modifier === 'primary' ? (platform === 'mac' ? 'meta' : 'ctrl') : shortcut.modifier;
+  return `${modifier === 'meta' ? 'Meta' : 'Control'}+${shift}${key}`;
 }
 
-export function ariaKeyShortcutsFor(id: ShortcutId): string {
-  return ariaKeyShortcuts(shortcutFor(id));
+export function ariaKeyShortcutsFor(
+  id: ShortcutId,
+  platform: ShortcutPlatform = detectShortcutPlatform(),
+): string {
+  return ariaKeyShortcuts(shortcutFor(id), platform);
 }
