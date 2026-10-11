@@ -60,6 +60,8 @@
     type MemoryRecord,
     type MemorySearchResult,
     type MemoryStatus,
+    type KnowledgePreview,
+    type KnowledgeChange,
   } from './lib/shared-memory';
 
   let snapshot = $state<SettingsSnapshot | null>(null);
@@ -134,6 +136,29 @@
   let conflictOtherId = $state('');
   let memoryLoading = $state(false);
   let memoryStorageError = $state('');
+  let knowledgeMemoryId = $state('');
+  let knowledgeDestination = $state('');
+  let knowledgeText = $state('');
+  let knowledgePreview = $state<{
+    result: KnowledgePreview;
+    memoryId: string;
+    destination: string;
+    text: string;
+    directory: string;
+  } | null>(null);
+  let knowledgeChange = $state<KnowledgeChange | null>(null);
+  let knowledgeError = $state('');
+  let knowledgeLoading = $state(false);
+  const knowledgeReviewCurrent = $derived(
+    knowledgePreview !== null &&
+      knowledgePreview.memoryId === knowledgeMemoryId &&
+      knowledgePreview.destination === knowledgeDestination &&
+      knowledgePreview.text === knowledgeText &&
+      knowledgePreview.directory === snapshot?.directory,
+  );
+  const selectedKnowledgeMemory = $derived(
+    memoryRecords.find((record) => record.id === knowledgeMemoryId),
+  );
   let memoryAgentError = $state('');
   let memoryConfigError = $state('');
   let memoryRequest = 0;
@@ -298,6 +323,12 @@
   async function refreshMemory(directory: string, query = memoryQuery.trim()) {
     const request = ++memoryRequest;
     if (memoryDirectory !== directory) {
+      knowledgeMemoryId = '';
+      knowledgeDestination = '';
+      knowledgeText = '';
+      knowledgePreview = null;
+      knowledgeChange = null;
+      knowledgeError = '';
       memoryStatus = null;
       memoryRecords = [];
       memoryImportCandidates = [];
@@ -468,6 +499,63 @@
       memoryProviderError = `Provider: ${String(cause)}`;
     } finally {
       memoryProviderLoading = false;
+    }
+  }
+
+  async function previewKnowledge() {
+    const directory = snapshot?.directory;
+    if (!directory || !knowledgeMemoryId || !knowledgeDestination.trim() || !knowledgeText.trim())
+      return;
+    knowledgeLoading = true;
+    knowledgeError = '';
+    knowledgeChange = null;
+    knowledgePreview = null;
+    const memoryId = knowledgeMemoryId;
+    const destination = knowledgeDestination;
+    const text = knowledgeText;
+    try {
+      const result = await invoke<KnowledgePreview>('preview_project_knowledge', {
+        directory,
+        memoryId,
+        destination,
+        proposedText: text,
+      });
+      if (snapshot?.directory === directory) {
+        knowledgePreview = { result, memoryId, destination, text, directory };
+      }
+    } catch (cause) {
+      knowledgeError = String(cause);
+    } finally {
+      knowledgeLoading = false;
+    }
+  }
+
+  async function rejectKnowledge() {
+    const preview = knowledgePreview;
+    knowledgePreview = null;
+    if (!preview) return;
+    try {
+      await invoke('reject_project_knowledge', { token: preview.result.token });
+    } catch (cause) {
+      knowledgeError = String(cause);
+    }
+  }
+
+  async function acceptKnowledge() {
+    const preview = knowledgePreview;
+    if (!preview || !knowledgeReviewCurrent) return;
+    knowledgeLoading = true;
+    knowledgeError = '';
+    try {
+      knowledgeChange = await invoke<KnowledgeChange>('accept_project_knowledge', {
+        token: preview.result.token,
+      });
+      knowledgePreview = null;
+    } catch (cause) {
+      knowledgePreview = null;
+      knowledgeError = String(cause);
+    } finally {
+      knowledgeLoading = false;
     }
   }
 
@@ -1909,6 +1997,18 @@
                   </p>
                 {/if}
                 {#if record.tags.length}<p class="memory-tags">{record.tags.join(' · ')}</p>{/if}
+                {#if record.provenance.sessionId}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onclick={() => {
+                      knowledgeMemoryId = record.id;
+                      knowledgePreview = null;
+                      knowledgeChange = null;
+                      knowledgeError = '';
+                    }}>Propose for project docs</Button
+                  >
+                {/if}
                 {#if record.kind === 'handoff' && record.expiresAt != null}
                   <p class="memory-tags">
                     {record.expiresAt <= Date.now() ? 'Expired' : 'Expires'}
@@ -2038,6 +2138,72 @@
           disabled={!memoryStatus?.enabled || !memoryStatus.count}
           onclick={() => void downloadMemoryExport()}>Export all memories</Button
         >
+      </section>
+
+      <section class="settings-card">
+        <h2>Propose project knowledge</h2>
+        <p>
+          Select a memory with a source session above, then choose a tracked Markdown file in this
+          repository. Sail prepares an uncommitted change in a separate worktree for your review.
+        </p>
+        {#if selectedKnowledgeMemory}
+          <p><strong>Private memory</strong></p>
+          <p>{selectedKnowledgeMemory.content}</p>
+          <p class="runtime-binary">
+            Source session: {selectedKnowledgeMemory.provenance.sessionId}
+          </p>
+        {:else}
+          <p class="memory-empty">Select a memory with a source session to start.</p>
+        {/if}
+        <label for="knowledge-destination">Tracked Markdown destination</label>
+        <input
+          id="knowledge-destination"
+          bind:value={knowledgeDestination}
+          placeholder="docs/project-context.md"
+          autocomplete="off"
+        />
+        <label for="knowledge-text">Text to add to the document</label>
+        <textarea
+          id="knowledge-text"
+          rows="5"
+          bind:value={knowledgeText}
+          placeholder="Write only the knowledge you want to share."></textarea>
+        <Button
+          size="sm"
+          disabled={!selectedKnowledgeMemory ||
+            !knowledgeDestination.trim() ||
+            !knowledgeText.trim() ||
+            knowledgeLoading}
+          onclick={() => void previewKnowledge()}>Preview exact diff</Button
+        >
+        {#if knowledgeError}<p role="alert" class="runtime-diagnostic">{knowledgeError}</p>{/if}
+        {#if knowledgePreview && knowledgeReviewCurrent}
+          <div class="memory-install-preview">
+            <h3>Review proposed document change</h3>
+            <p><strong>Original memory:</strong> {knowledgePreview.result.memory}</p>
+            <p><strong>Source session:</strong> {knowledgePreview.result.sourceSession}</p>
+            <p><strong>Destination:</strong> <code>{knowledgePreview.result.destination}</code></p>
+            <p><strong>Base revision:</strong> <code>{knowledgePreview.result.revision}</code></p>
+            <pre class="knowledge-diff">{knowledgePreview.result.diff}</pre>
+            <Button size="sm" disabled={knowledgeLoading} onclick={() => void acceptKnowledge()}
+              >Accept and prepare worktree</Button
+            >
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={knowledgeLoading}
+              onclick={() => void rejectKnowledge()}>Reject</Button
+            >
+          </div>
+        {:else if knowledgePreview}
+          <p role="status">The proposal inputs changed. Preview the diff again before accepting.</p>
+        {/if}
+        {#if knowledgeChange}
+          <p role="status">
+            Review the uncommitted change in <code>{knowledgeChange.worktree}</code>, then commit
+            and share it through your normal repository review process.
+          </p>
+        {/if}
       </section>
 
       <section class="settings-card">

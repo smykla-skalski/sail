@@ -28,6 +28,21 @@ export type MemoryRecord = {
 
 export type MemorySearchResult = { memory: MemoryRecord; score: number };
 
+export type KnowledgePreview = {
+  token: string;
+  memory: string;
+  sourceSession: string;
+  destination: string;
+  revision: string;
+  diff: string;
+};
+
+export type KnowledgeChange = {
+  worktree: string;
+  destination: string;
+  revision: string;
+};
+
 export type MemoryImportCandidate = {
   id: string;
   agent: 'claude';
