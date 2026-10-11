@@ -1,4 +1,20 @@
 import type { BrowserAttachment } from './browser-pick';
+import type { AcpTurnEvidence } from './acp';
+
+export function queuedTurnDisposition(
+  backendStatus: 'done' | 'failed' | 'interrupted' | null,
+  evidenceStatus: AcpTurnEvidence['status'] | null,
+): 'completed' | 'sent' | 'uncertain' | 'unsent' {
+  if (backendStatus === 'done' || evidenceStatus === 'done') return 'completed';
+  if (
+    backendStatus !== null ||
+    evidenceStatus === 'dispatched' ||
+    evidenceStatus === 'failed' ||
+    evidenceStatus === 'interrupted'
+  )
+    return 'sent';
+  return evidenceStatus === 'dispatch_uncertain' ? 'uncertain' : 'unsent';
+}
 
 export interface QueuedAgentMessage {
   text: string;

@@ -71,6 +71,7 @@
   import {
     agentQueuePaused,
     queuedAgentMessages,
+    queuedTurnDisposition,
     saveQueuedAgentMessages,
     setAgentQueuePaused,
     type QueuedAgentMessage,
@@ -327,6 +328,7 @@
   });
   let queued = $state<QueuedAgentMessage[]>([]);
   let queuePaused = $state(false);
+  let queueDispatching = $state(false);
   let steering = $state(false);
   function diagnostic(event: DiagnosticEvent, sessionId = activeSessionId, turnId = activeTurnId) {
     recordDiagnostic(event, {
@@ -337,12 +339,33 @@
     });
   }
   $effect(() => {
-    if (isBusy || !ready || queuePaused || steering || !queued.length) return;
+    if (isBusy || !ready || queuePaused || queueDispatching || steering || !queued.length) return;
     const [next, ...remaining] = queued;
+    const dispatchAgent = agent;
+    const dispatchDirectory = directory;
+    const dispatchSessionId = activeSessionId;
+    queueDispatching = true;
     queued = remaining;
     diagnostic('queue_dispatch_started');
     if (activeSessionId) saveQueuedAgentMessages(agent, directory, activeSessionId, queued);
-    void send(next.text, next);
+    void send(next.text, next)
+      .catch((cause) => {
+        if (!dispatchSessionId) return;
+        const restored = [
+          next,
+          ...queuedAgentMessages(dispatchAgent, dispatchDirectory, dispatchSessionId),
+        ];
+        saveQueuedAgentMessages(dispatchAgent, dispatchDirectory, dispatchSessionId, restored);
+        setAgentQueuePaused(dispatchAgent, dispatchDirectory, dispatchSessionId, true);
+        if (activeSessionId === dispatchSessionId) {
+          queued = restored;
+          queuePaused = true;
+          error = describe(cause);
+        }
+      })
+      .finally(() => {
+        queueDispatching = false;
+      });
   });
   $effect(() => {
     if (ephemeral || !activeSessionId || !onshipit || (!busy && !running)) return;
@@ -1754,6 +1777,7 @@
       shipIssue = await beginShipItRun(directory, text, promptSkill(skills, text)?.name ?? null);
     } catch (cause) {
       error = describe(cause);
+      if (queuedMessage) throw cause;
       return;
     }
     const command = text.toLowerCase();
@@ -1779,7 +1803,7 @@
       return;
     }
     if ((!text && (external || !clipboardAttachments.length)) || !ready || isBusy || !directory) {
-      if (external) throw new Error('Wait for the current agent turn.');
+      if (external || queuedMessage) throw new Error('Wait for the current agent turn.');
       return;
     }
     const sentImages = queuedMessage?.images ?? (external ? [] : [...images]);
@@ -1963,15 +1987,25 @@
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
-      restoreShell();
       const backendStatus =
         phase === 'prompt' && deliverySessionId
           ? await acpFinishedPromptStatus(turnAgent, turnDirectory, deliverySessionId, turnId)
           : null;
+      const evidence =
+        phase === 'prompt' && deliverySessionId
+          ? await acp
+              .turnEvidence(turnAgent, turnDirectory, deliverySessionId, turnId)
+              .catch(() => null)
+          : null;
+      const disposition = queuedTurnDisposition(backendStatus, evidence?.status ?? null);
+      const delivered = disposition === 'completed';
+      const mayRetry = disposition === 'unsent';
+      if (mayRetry) restoreShell();
       const interrupted =
         backendStatus === 'interrupted' ||
+        evidence?.status === 'interrupted' ||
         (backendStatus !== 'failed' && (finalStatus === 'interrupted' || stopRequested));
-      finalStatus = interrupted ? 'interrupted' : 'failed';
+      finalStatus = delivered ? 'done' : interrupted ? 'interrupted' : 'failed';
       if (interrupted) notifyOnDone = false;
       if (!deliverySessionId && current !== generation && disposed && !ephemeral && !external) {
         const recovered =
@@ -1991,18 +2025,18 @@
       const steer =
         deliverySessionId && inFlightSteer?.sessionId === deliverySessionId ? inFlightSteer : null;
       const retryQueued =
+        !delivered &&
         !!deliverySessionId &&
-        (queuedMessage !== undefined ||
+        ((mayRetry && (queuedMessage !== undefined || (current !== generation && disposed))) ||
           following.length > 0 ||
-          steer !== null ||
-          (current !== generation && disposed));
+          steer !== null);
       if (retryQueued && deliverySessionId) {
         if (recoveredDraft) {
           recoveredDraft = false;
         }
-        const retry = { text, images: sentImages, attachments: sentClipboard };
+        const retry = !mayRetry ? [] : [{ text, images: sentImages, attachments: sentClipboard }];
         if (steer) steer.requeued = true;
-        const messages = [retry, ...(steer ? [steer.message] : []), ...following];
+        const messages = [...retry, ...(steer ? [steer.message] : []), ...following];
         saveQueuedAgentMessages(turnAgent, turnDirectory, deliverySessionId, messages);
         setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, true);
         recordDiagnostic('queue_paused', {
@@ -2011,7 +2045,7 @@
           turnId,
           queueLength: messages.length,
         });
-        keepImages = true;
+        keepImages = mayRetry;
         if (current === generation && activeSessionId === deliverySessionId) {
           queued = messages;
           queuePaused = true;
@@ -2028,11 +2062,15 @@
           errorName: cause instanceof Error ? cause.name : typeof cause,
           phase,
         });
-        error = describe(cause);
+        error = delivered
+          ? `Message delivered, but Sail could not finish local bookkeeping: ${describe(cause)}`
+          : disposition === 'uncertain'
+            ? `Message delivery is uncertain. Check the agent thread before retrying: ${describe(cause)}`
+            : describe(cause);
         authNeeded = /auth|login|sign.?in/i.test(error);
-        if (retryQueued) {
+        if (retryQueued && mayRetry) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
-        } else if (!external || queuedMessage) {
+        } else if (mayRetry && (!external || queuedMessage)) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [composerDraft, draft.trim()].filter(Boolean).join('\n\n');
           images = [...sentImages, ...images];
@@ -2041,7 +2079,7 @@
         }
         if (stopRequested) markTools('status unconfirmed', ['stopping']);
       }
-      if (external && !queuedMessage) throw cause;
+      if (external && !queuedMessage && !delivered) throw cause;
     } finally {
       releaseSlot?.();
       if (inFlightSteer?.sessionId === deliverySessionId && inFlightSteer.turnId === turnId)
