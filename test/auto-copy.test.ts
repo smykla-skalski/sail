@@ -119,4 +119,6 @@ void test('the Copied region moves into the open modal that holds the selection'
   assert.equal(copyStatusHost(inbox, [sheet, inbox], sheet), sheet);
   assert.equal(copyStatusHost(null, [sheet, inbox], sheet), sheet);
   assert.equal(copyStatusHost(inbox, [inbox], sheet), inbox);
+  assert.equal(copyStatusHost(null, [sheet, inbox], null, sheet), sheet);
+  assert.equal(copyStatusHost(inbox, [sheet, inbox], inbox, sheet), sheet);
 });

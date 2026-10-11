@@ -9304,10 +9304,12 @@
 
   function currentCopyStatusHost(anchor: Element | null) {
     const focused = document.activeElement;
+    const hit = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
     return copyStatusHost(
       anchor?.closest<HTMLDialogElement>('dialog') ?? null,
       [...document.querySelectorAll<HTMLDialogElement>('dialog:modal')],
       focused instanceof Element ? focused.closest<HTMLDialogElement>('dialog') : null,
+      hit?.closest<HTMLDialogElement>('dialog') ?? null,
     );
   }
 
@@ -9320,6 +9322,13 @@
     if (host) {
       if (copyStatusRegion.parentNode === host) return false;
       host.append(copyStatusRegion);
+      host.addEventListener(
+        'close',
+        () => {
+          if (copyStatusRegion.parentNode === host && copiedStatus) void announceCopied(null);
+        },
+        { once: true },
+      );
       return true;
     }
     const { parent, next } = copyStatusHome;

@@ -65,8 +65,10 @@ export function copyStatusHost<T>(
   owner: T | null,
   openModals: readonly T[],
   focused: T | null = null,
+  topmost: T | null = null,
 ): T | null {
   if (!openModals.length) return null;
+  if (topmost && openModals.includes(topmost)) return topmost;
   if (focused && openModals.includes(focused)) return focused;
   if (owner && openModals.includes(owner)) return owner;
   return openModals[openModals.length - 1];

@@ -400,6 +400,21 @@ describe('palette actions and accessibility', () => {
     await browser.execute(() => window.getSelection()?.removeAllRanges());
   });
 
+  it('keeps Copied visible when its host closes after placement', async () => {
+    await browser.waitUntil(async () => (await $('.copy-status').getText()) === '');
+    await pressShortcut('/');
+    await expect($('.shortcuts-dialog[open]')).toBeDisplayed();
+    expect((await selectText('.shortcuts-list')).join(' ')).toContain('Toggle sidebar');
+    await expect($('.shortcuts-dialog .copy-status')).toHaveText('Copied');
+    await browser.keys('Escape');
+    await browser.waitUntil(() =>
+      browser.execute(() => {
+        const region = document.querySelector('.copy-status');
+        return !region?.closest('dialog') && region?.textContent?.trim() === 'Copied';
+      }),
+    );
+  });
+
   it('copies selections only when select-to-copy is on and announces "Copied"', async () => {
     expect((await selectText()).join(' ')).toContain('Accessibility thread');
     await expect($('.copy-status[role="status"]')).toHaveText('Copied');
