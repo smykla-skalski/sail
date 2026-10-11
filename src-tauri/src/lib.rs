@@ -225,6 +225,7 @@ mod memory_provider;
 mod opencode_config;
 mod owned_processes;
 mod post_turn_checks;
+mod project_knowledge;
 mod settings;
 mod shell_command;
 mod ship_actions;
@@ -2978,6 +2979,7 @@ pub fn run() {
         .manage(shell_command::ShellRuns::default())
         .manage(browser_agent::BrowserManager::default())
         .manage(browser::CaptureStore::default())
+        .manage(project_knowledge::PendingProposal::default())
         .manage(hook_activity::HookActivityManager::default())
         .invoke_handler(tauri::generate_handler![
             diagnostics::diagnostic_event,
@@ -2999,6 +3001,9 @@ pub fn run() {
             memory::memory_forget,
             memory::memory_set_expiry,
             memory::memory_rate,
+            project_knowledge::preview_project_knowledge,
+            project_knowledge::accept_project_knowledge,
+            project_knowledge::reject_project_knowledge,
             memory_import::preview_memory_import,
             memory_import::import_agent_memories,
             memory_provider::memory_provider_status,
