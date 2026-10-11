@@ -276,6 +276,14 @@ export function parseShipReport(value: unknown) {
   return report;
 }
 
+export function shipWorkerProgressChanges(
+  status: 'running' | 'blocked',
+  reason?: string,
+): Pick<ShipIssue, 'reportedStatus' | 'blockedReason' | 'workerRequest'> {
+  const request = status === 'blocked' ? (reason ?? null) : null;
+  return { reportedStatus: status, blockedReason: request, workerRequest: request };
+}
+
 export function requireValidatorEconomics(
   report: ReturnType<typeof parseShipReport>,
   allowLegacyMissing: boolean,
@@ -1459,6 +1467,7 @@ const shipIssueSchema = z.object({
     .object({ at: z.number().int().nonnegative(), head: nullableString, comment: z.string() })
     .optional(),
   blockedReason: nullableString.optional(),
+  workerRequest: nullableString.optional(),
   models: z.array(z.string()).optional(),
   workerModel: z.string().optional(),
   workerState: z

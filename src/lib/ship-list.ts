@@ -152,19 +152,13 @@ export function shipDetailFallback(
 /** What the worker waits on the user for, quoted for its composer, or null when nothing is pending. */
 export function shipWorkerRequest(issue: ShipIssue): string | null {
   if (issue.state === 'merged' || !issue.threadId) return null;
-  const workerBlocked =
-    issue.reportedStatus === 'blocked' &&
-    issue.state === 'working' &&
-    issue.workerState !== 'interrupted' &&
-    !issue.claimFencePending &&
-    !issue.claimRevalidationPending &&
-    !issue.claimHandoffPending &&
-    issue.checkpoint?.status !== 'blocked';
   const lines = [
     ...new Set(
       [
         issue.checkpoint?.status === 'blocked' ? issue.checkpoint.blocker : null,
-        workerBlocked ? issue.blockedReason : null,
+        issue.reportedStatus === 'blocked' && issue.checkpoint?.status !== 'blocked'
+          ? issue.workerRequest
+          : null,
         ...(issue.checkpoint?.unresolvedQuestions ?? []),
       ]
         .map((line) => line?.trim())

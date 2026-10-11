@@ -19,6 +19,10 @@ import {
   shipWorkerRequest,
 } from '../src/lib/ship-list.ts';
 import { initialTaskCheckpoint, updateTaskCheckpoint } from '../src/lib/task-checkpoint.ts';
+import {
+  loadShipRuns as parseShipRuns,
+  shipWorkerProgressChanges,
+} from '../src/lib/ship-progress.ts';
 
 function fixture(count = 4): ShipRun {
   return createShipRun(
@@ -150,6 +154,7 @@ void test('a worker thread opens with its pending request quoted for the reply',
   working(issue, 'implementing', {
     reportedStatus: 'blocked',
     blockedReason: 'Which theme token?\nPick one.',
+    workerRequest: 'Which theme token?\nPick one.',
   });
   assert.equal(shipWorkerRequest(issue), '> Which theme token?\n> Pick one.\n\n');
   touched(issue, { unresolvedQuestions: ['Keep the old label?', 'Which theme token?'] }, 5);
@@ -163,6 +168,7 @@ void test('a worker thread opens with its pending request quoted for the reply',
   issue.blockedReason = 'Shipping claim recovery failed: GitHub is unavailable.';
   assert.equal(shipWorkerRequest(issue), '> Need a decision\n\n');
   touched(issue, { status: 'active', blocker: null, unresolvedQuestions: [] }, 7);
+  issue.workerRequest = null;
   assert.equal(shipWorkerRequest(issue), null);
   issue.workerState = 'working';
   issue.claimFencePending = true;
@@ -175,6 +181,19 @@ void test('a worker thread opens with its pending request quoted for the reply',
   issue.threadId = 'acp:claude:s1';
   issue.state = 'merged';
   assert.equal(shipWorkerRequest(issue), null);
+});
+
+void test('a Sail gate error cannot replace the worker request in a reply', () => {
+  const run = fixture(1);
+  const [issue] = run.issues;
+  issue.threadId = 'acp:opencode:s1';
+  working(issue, 'reviewing');
+  Object.assign(issue, shipWorkerProgressChanges('blocked', 'Which theme token?'));
+  const restored = parseShipRuns(JSON.stringify([run]))[0].issues[0];
+  restored.blockedReason = 'Select validation risk before starting a gate.';
+  assert.equal(shipWorkerRequest(restored), '> Which theme token?\n\n');
+  Object.assign(restored, shipWorkerProgressChanges('running'));
+  assert.equal(shipWorkerRequest(restored), null);
 });
 
 void test('group mapping covers every presentation status', () => {

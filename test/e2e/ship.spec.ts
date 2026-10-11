@@ -644,6 +644,7 @@ describe('native Ship run history', () => {
       threadId: 'acp:claude:request-fixture',
       reportedStatus: 'blocked',
       blockedReason: 'Which theme token should the badge use?',
+      workerRequest: 'Which theme token should the badge use?',
     });
     waitingWorker.checkpoint = updateTaskCheckpoint(
       initialTaskCheckpoint(

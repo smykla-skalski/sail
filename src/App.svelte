@@ -79,6 +79,7 @@
     shipOwner,
     shipCheckpointOwner,
     shipTaskReceiptIdsToProtect,
+    shipWorkerProgressChanges,
     authorizeShipCheckpointThread,
     commitRevisionBoundValidation,
     rollbackValidationIssue,
@@ -2645,6 +2646,7 @@
       cancelledAt: undefined,
       stage: undefined,
       reportedStatus: undefined,
+      workerRequest: null,
       claimFencePending: false,
       claimRevalidationPending: false,
       claimHandoffPending: false,
@@ -7050,8 +7052,7 @@
       if (!owner) throw new Error('Only the assigned Ship worker can report issue progress.');
       await updateShipIssue(owner.run, owner.issue, {
         stage: report.stage,
-        reportedStatus: report.status,
-        blockedReason: report.status === 'blocked' ? report.reason : null,
+        ...shipWorkerProgressChanges(report.status, report.reason),
         events: appendShipEvent(owner.issue.events, report.stage, report.reason),
       });
     }
