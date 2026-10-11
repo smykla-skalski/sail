@@ -264,7 +264,9 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         };
         let repo_lock = match FileLock::try_acquire(&repo_lock_path, true) {
             Ok(lock) => lock,
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                eprintln!("reconcile repository lock: {_error}");
                 report_pending(&data_directory, "active-use");
                 continue;
             }
@@ -278,7 +280,9 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         };
         let mutation = match FileLock::try_acquire(&mutation_path, true) {
             Ok(lock) => lock,
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                eprintln!("reconcile mutation lock: {_error}");
                 report_pending(&data_directory, "active-use");
                 continue;
             }
@@ -292,7 +296,9 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         };
         let lease = match FileLock::try_acquire(&lease_path, true) {
             Ok(lock) => lock,
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                eprintln!("reconcile lease lock: {_error}");
                 report_pending(&data_directory, "active-use");
                 continue;
             }
@@ -384,10 +390,24 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
             match read_owner(&directory) {
                 Err(reason) => Some(reason),
                 Ok(identity) => {
-                    let lease_path = lock_path(cache_directory, "lease", &directory);
-                    let lease = lease_path
-                        .ok()
-                        .and_then(|path| FileLock::try_acquire(&path, true).ok());
+                    let lease = match lock_path(cache_directory, "lease", &directory) {
+                        Ok(path) => {
+                            let acquisition = FileLock::try_acquire(&path, true);
+                            #[cfg(test)]
+                            if let Err(error) = &acquisition {
+                                eprintln!("cleanup_status lease lock {}: {error}", path.display());
+                            }
+                            acquisition.ok()
+                        }
+                        Err(_error) => {
+                            #[cfg(test)]
+                            eprintln!(
+                                "cleanup_status lease lock path for {}: {_error}",
+                                directory.display()
+                            );
+                            None
+                        }
+                    };
                     if lease.is_none() {
                         Some("active-use")
                     } else if has_active_markers(&directory) {
@@ -1123,7 +1143,9 @@ impl FileLock {
 
     fn acquire_mode(path: &Path, exclusive: bool, nonblocking: bool) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("Cannot create lock directory {}: {error}", parent.display())
+            })?;
         }
         let file = OpenOptions::new()
             .read(true)
@@ -1131,8 +1153,9 @@ impl FileLock {
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|error| error.to_string())?;
-        lock_file(&file, exclusive, nonblocking).map_err(|error| error.to_string())?;
+            .map_err(|error| format!("Cannot open lock file {}: {error}", path.display()))?;
+        lock_file(&file, exclusive, nonblocking)
+            .map_err(|error| format!("Cannot lock file {}: {error}", path.display()))?;
         Ok(Self { file })
     }
 
