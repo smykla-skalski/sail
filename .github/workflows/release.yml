@@ -113,7 +113,7 @@ jobs:
 
       - name: Build development installer
         if: runner.os != 'macOS' || env.SAIL_SIGNING_MODE == 'ad-hoc'
-        run: npm run tauri build -- --bundles ${{ matrix.bundles }} --ci
+        run: npm run tauri build -- --bundles ${{ matrix.bundles }} --ci ${{ matrix.target == 'macos-x64' && '-v' || '' }}
 
       - name: Build and notarize Developer ID installer
         if: runner.os == 'macOS' && env.SAIL_SIGNING_MODE == 'developer-id'
