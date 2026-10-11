@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import type { ShipIssue, ShipRun } from './lib/issue-shipping';
   import {
     shipArchiveAction,
@@ -26,6 +27,12 @@
     onresult: (message: string, failed: boolean) => void;
   } = $props();
   let pending = $state<ShipActionId | null>(null);
+  let actionClock = $state(Date.now());
+
+  onMount(() => {
+    const timer = setInterval(() => (actionClock = Date.now()), 15_000);
+    return () => clearInterval(timer);
+  });
 
   async function perform(id: ShipActionId) {
     pending = id;
@@ -39,7 +46,7 @@
     }
   }
 
-  const merge = $derived(issue ? shipMergeAction(issue) : null);
+  const merge = $derived(issue ? shipMergeAction(issue, actionClock) : null);
   const retry = $derived(issue ? shipRetryAction(issue) : null);
   const reopen = $derived(issue && shipClosedWithoutMerge(issue) ? shipReopenAction(issue) : null);
   const stop = $derived(shipStopAction(run));
@@ -67,7 +74,7 @@
   {#if !shipRunArchived(run)}
     {#if issue.state === 'awaiting_merge' && merge}{@render action(
         'merge',
-        shipMergeRetryReason(issue) ? 'Request again' : 'Merge',
+        shipMergeRetryReason(issue, actionClock) ? 'Request again' : 'Merge',
         shipIssueTarget(issue),
         merge,
       )}{/if}

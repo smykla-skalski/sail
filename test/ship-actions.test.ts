@@ -81,7 +81,7 @@ void test('a stale merge request can be confirmed again at the threshold', () =>
   assert.deepEqual(shipMergeAction(requested, now), { enabled: true, reason: null });
   const confirmation = shipMergeConfirmation(requested, 'a/b');
   assert.match(confirmation.title, /Request merge again/);
-  assert.match(confirmation.message, /post “squash”/);
+  assert.match(confirmation.message, /post a bot comment or merge the pull request directly/);
   assert.equal(confirmation.confirmLabel, 'Request again');
   requested.checks = [{ name: 'test', state: 'FAILURE', url: 'https://example.test' }];
   assert.equal(shipMergeAction(requested, now).enabled, false);

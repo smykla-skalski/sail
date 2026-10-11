@@ -111,7 +111,7 @@ export function shipMergeConfirmation(issue: ShipIssue, remote: string): ShipCon
   if (issue.mergeRequested && retryReason)
     return {
       title: `Request merge again for ${shipIssueTarget(issue)}?`,
-      message: `${retryReason} Sail will post “${issue.mergeRequested.comment}” on the pull request for ${shipIssueTarget(issue)} in ${remote} again. Confirm only if the previous request did not merge it.`,
+      message: `${retryReason} Sail will request the merge again for ${shipIssueTarget(issue)} in ${remote} using the repository's current release policy. This can post a bot comment or merge the pull request directly. Confirm only if the previous request did not merge it.`,
       confirmLabel: 'Request again',
       destructive: false,
     };
