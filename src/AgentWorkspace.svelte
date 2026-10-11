@@ -1,7 +1,7 @@
 <script lang="ts">
   import { keyboardScrollable } from './lib/scroll-focus';
   import { onMount, tick, untrack } from 'svelte';
-  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+  import { SvelteMap } from 'svelte/reactivity';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { Button } from '@smykla-skalski/sui';
@@ -16,7 +16,6 @@
     hookItems,
     nativeItems,
     presentToolIds,
-    replayHistoryToolIds,
     pendingCoordinationItems,
     queuedItems,
     shellItems,
@@ -510,7 +509,6 @@
     onreplaychange?.(agent, directory, activeSessionId, value);
   }
   let replayEntries: AgentEntry[] = [];
-  let liveReplayToolIds = new SvelteSet<string>();
   let pendingUpdates: Record<string, unknown>[] = [];
   let updateTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
@@ -1002,12 +1000,8 @@
       acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
     onnativeplan?.(nativePlan);
     if (replaying) {
-      if (
-        (busy || running || liveTurn) &&
-        (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
-        typeof update.toolCallId === 'string'
-      )
-        liveReplayToolIds.add(update.toolCallId);
+      // ACP does not identify live updates interleaved with session/load replay (#342).
+      // A mutable running flag cannot establish provenance for old failed tools.
       updateEntriesInPlace(replayEntries, update);
       return;
     }
@@ -1059,20 +1053,17 @@
     historyLoading = true;
     setReplaying(true);
     replayEntries = [];
-    liveReplayToolIds = new SvelteSet();
     try {
       const session = await acp.load(agent, directory, id, activeCapabilityProfile);
       if (current !== generation) return;
-      historicalToolIds = new Set([
-        ...historicalToolIds,
-        ...replayHistoryToolIds(
-          replayEntries.filter((entry) => entry.type === 'tool'),
-          liveReplayToolIds,
-        ),
-      ]);
+      historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
       if (!configOptions.length && Array.isArray(session.configOptions))
         configOptions = session.configOptions as AgentConfigOption[];
       entries = restoreEntryTimes(replayEntries, entries);
+      // Switch the event sink before yielding to Svelte. An update delivered during tick()
+      // must reach entries rather than a replay buffer that finally discards.
+      setReplaying(false);
+      replayEntries = [];
       visibleCount = 50;
       historyLoaded = true;
       rememberTranscript();
@@ -1251,7 +1242,6 @@
     pendingUpdates = [];
     setReplaying(false);
     replayEntries = [];
-    liveReplayToolIds = new SvelteSet();
     permissions = [];
     answeredNotes = [];
     settledElsewhere = [];
@@ -1375,20 +1365,13 @@
           if (restoresSubagents || !canResume) {
             setReplaying(true);
             replayEntries = [];
-            liveReplayToolIds = new SvelteSet();
           }
           const session =
             restoresSubagents || !canResume
               ? await acp.load(agent, directory, id, activeCapabilityProfile)
               : await acp.resume(agent, directory, id, activeCapabilityProfile);
           if (current === generation && (restoresSubagents || !canResume)) {
-            historicalToolIds = new Set([
-              ...historicalToolIds,
-              ...replayHistoryToolIds(
-                replayEntries.filter((entry) => entry.type === 'tool'),
-                liveReplayToolIds,
-              ),
-            ]);
+            historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
             entries = restoreEntryTimes(replayEntries, entries);
             setReplaying(false);
             replayEntries = [];

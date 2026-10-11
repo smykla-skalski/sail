@@ -201,13 +201,6 @@ export function nativeTool(tool: AgentTool, output: string, live = false): Trans
   };
 }
 
-export function replayHistoryToolIds(
-  entries: readonly AgentTool[],
-  liveToolIds: ReadonlySet<string>,
-): string[] {
-  return entries.filter((entry) => !liveToolIds.has(entry.id)).map((entry) => entry.id);
-}
-
 export function presentToolIds(entries: readonly AgentEntry[]): ReadonlySet<string> {
   return new Set(entries.filter((entry) => entry.type === 'tool').map((entry) => entry.id));
 }

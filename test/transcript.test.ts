@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { AgentDisplayEntry } from '../src/lib/acp.ts';
+import { groupAgentEntries, updateEntriesBatch, type AgentDisplayEntry } from '../src/lib/acp.ts';
 import type { ActivityHistoryEvent } from '../src/lib/activity-history.ts';
 import type { SpawnReceipt } from '../src/lib/agent-results.ts';
 import {
@@ -10,7 +10,6 @@ import {
   hookItems,
   nativeItems,
   presentToolIds,
-  replayHistoryToolIds,
   pendingCoordinationItems,
   queuedItems,
   shellItems,
@@ -100,12 +99,10 @@ const failed = (id: string): AgentDisplayEntry => ({
 });
 
 await test('historical and live failed tools keep separate announcement state', () => {
-  const replayed = [failed('older'), failed('current')].flatMap((entry) =>
-    entry.type === 'tool-group' ? entry.tools : [],
-  );
+  const replayed = failed('older');
   const items = nativeItems([failed('older'), failed('current')], [], {
     ...host,
-    historicalToolIds: new Set(replayHistoryToolIds(replayed, new Set(['current']))),
+    historicalToolIds: presentToolIds(replayed.type === 'tool-group' ? replayed.tools : []),
   });
   const tools = items.flatMap((item) => (item.kind === 'tools' ? item.tools : []));
   assert.deepEqual(
@@ -140,13 +137,35 @@ await test('historical and live failed tools keep separate announcement state', 
     ),
     'Command failed',
   );
+  assert.equal(
+    toolAlert(
+      {
+        id: tools[1].id,
+        error: tools[1].error,
+        mountedError: tools[1].error,
+        mountedLive: tools[1].live ?? false,
+      },
+      seen,
+    ),
+    '',
+  );
 });
 
 await test('opening a working child keeps earlier failures silent while new failures announce', () => {
   const existing = failed('older');
   assert.equal(existing.type, 'tool-group');
-  const historicalToolIds = presentToolIds(existing.type === 'tool-group' ? existing.tools : []);
-  const items = nativeItems([failed('older'), failed('new')], [], {
+  const initial = existing.type === 'tool-group' ? existing.tools : [];
+  const historicalToolIds = presentToolIds(initial);
+  const updated = updateEntriesBatch(initial, [
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'new',
+      title: 'Run',
+      status: 'failed',
+      content: [{ content: { type: 'text', text: 'New failure' } }],
+    },
+  ]);
+  const items = nativeItems(groupAgentEntries(updated), [], {
     ...host,
     historicalToolIds,
   });
@@ -171,7 +190,7 @@ await test('opening a working child keeps earlier failures silent while new fail
       { id: tools[1].id, error: tools[1].error, mountedError: tools[1].error, mountedLive: true },
       seen,
     ),
-    'Command failed',
+    'New failure',
   );
 });
 
