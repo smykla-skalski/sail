@@ -57,8 +57,10 @@ pub fn preview(
     {
         return Err("Select a private memory with a source session.".into());
     }
-    let text = proposed_text.trim();
-    if text.is_empty() || text.len() > MAX_PROPOSAL_BYTES || text.contains('\0') {
+    if proposed_text.trim().is_empty()
+        || proposed_text.len() > MAX_PROPOSAL_BYTES
+        || proposed_text.contains('\0')
+    {
         return Err("Proposed text must contain 1 to 4096 bytes.".into());
     }
     let root = repository
@@ -97,8 +99,10 @@ pub fn preview(
     if !after.ends_with("\n\n") {
         after.push('\n');
     }
-    after.push_str(text);
-    after.push('\n');
+    after.push_str(proposed_text);
+    if !after.ends_with('\n') {
+        after.push('\n');
+    }
     let diff = unified_diff(destination, &before, &after);
     Ok(Proposal {
         repository: root,
@@ -227,11 +231,21 @@ fn checked_target(root: &Path, destination: &Path) -> Result<PathBuf, String> {
 
 fn check_index_state(root: &Path, destination: &Path) -> Result<(), String> {
     let relative = destination.to_str().ok_or("Invalid destination.")?;
-    let flags = git(root, &["ls-files", "-v", "--", relative])?;
-    if flags != format!("H {relative}") {
+    let output = Command::new("git")
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "-v", "--", relative])
+        .output()
+        .map_err(|_| "Cannot inspect repository.")?;
+    if !output.status.success() || !plain_index_entry(&output.stdout, relative) {
         return Err("Destination has hidden or changed Git index state.".into());
     }
     Ok(())
+}
+
+fn plain_index_entry(output: &[u8], relative: &str) -> bool {
+    output == format!("H {relative}\0").as_bytes()
 }
 
 fn read_document(path: &Path) -> Result<String, String> {
@@ -537,5 +551,71 @@ mod tests {
         memory.source_session.clear();
         assert!(preview(&repo.0, memory, Path::new("AGENTS.md"), "change", true).is_err());
         assert!(preview(&repo.0, Repo::memory(), Path::new("AGENTS.md"), "  ", true).is_err());
+    }
+
+    #[test]
+    fn unicode_document_requires_one_visible_tracked_index_entry() {
+        let repo = Repo::new();
+        let name = "docs/café.md";
+        fs::write(repo.0.join(name), "# Café\n").unwrap();
+        assert!(preview(&repo.0, Repo::memory(), Path::new(name), "add", true).is_err());
+        repo.git(&["add", name]);
+        repo.git(&["commit", "-qm", "add unicode document"]);
+        let proposal = preview(&repo.0, Repo::memory(), Path::new(name), "  code\n", true).unwrap();
+        accept(&repo.0, &proposal, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.0.join(name)).unwrap(),
+            "# Café\n\n  code\n"
+        );
+        repo.git(&["add", name]);
+        repo.git(&["commit", "-qm", "accept unicode document"]);
+
+        repo.git(&["update-index", "--assume-unchanged", name]);
+        assert!(preview(&repo.0, Repo::memory(), Path::new(name), "add", true).is_err());
+        repo.git(&["update-index", "--no-assume-unchanged", name]);
+        repo.git(&["update-index", "--skip-worktree", name]);
+        assert!(preview(&repo.0, Repo::memory(), Path::new(name), "add", true).is_err());
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_index_response_is_rejected() {
+        let name = "docs/café.md";
+        assert!(plain_index_entry(format!("H {name}\0").as_bytes(), name));
+        for response in [
+            format!("H {name}"),
+            format!("h {name}\0"),
+            format!("S {name}\0"),
+            "H docs/other.md\0".to_string(),
+            format!("H {name}\0H {name}\0"),
+            format!("H {name}\0garbage"),
+        ] {
+            assert!(
+                !plain_index_entry(response.as_bytes(), name),
+                "{response:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proposed_markdown_spacing_survives_preview_and_acceptance() {
+        let repo = Repo::new();
+        let text = "    indented code  \n\n  next line\t\n\n";
+        let proposal =
+            preview(&repo.0, Repo::memory(), Path::new("AGENTS.md"), text, true).unwrap();
+        assert!(proposal.diff().contains("+    indented code  \n"));
+        assert!(proposal.diff().contains("+  next line\t\n+\n"));
+        accept(&repo.0, &proposal, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            format!("# Rules\n\n{text}")
+        );
+        assert!(preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("docs/project.md"),
+            " \n\t ",
+            true
+        )
+        .is_err());
     }
 }
