@@ -2993,6 +2993,7 @@ pub fn run() {
             memory::memory_remember,
             memory::memory_inspect,
             memory::memory_forget,
+            memory::memory_set_expiry,
             memory::memory_rate,
             memory_import::preview_memory_import,
             memory_import::import_agent_memories,

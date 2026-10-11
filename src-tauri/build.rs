@@ -43,6 +43,7 @@ fn main() {
             "memory_remember",
             "memory_inspect",
             "memory_forget",
+            "memory_set_expiry",
             "memory_rate",
             "preview_memory_import",
             "import_agent_memories",
