@@ -433,6 +433,18 @@ struct RestoreClaim {
 }
 
 impl Connection {
+    fn extend_restore(&self, session_id: &str, token: &str) -> Result<(), String> {
+        let mut claims = self.restores.lock().map_err(|error| error.to_string())?;
+        let claim = claims
+            .get_mut(session_id)
+            .filter(|claim| claim.token == token && claim.expires > Instant::now())
+            .ok_or("Session restore reservation expired.")?;
+        // The frontend releases this claim after it has applied replayed updates.
+        // Expiry also releases it if the webview disappears before that finalizer runs.
+        claim.expires = Instant::now() + Duration::from_secs(65);
+        Ok(())
+    }
+
     fn begin_restore(&self, session_id: &str) -> Result<Value, String> {
         let claims = self.restores.lock().map_err(|error| error.to_string())?;
         let mut claims = self.wait_for_restore(claims, session_id)?;
@@ -3788,8 +3800,35 @@ pub fn acp_end_session_restore(
     session_id: String,
     restore_token: String,
 ) -> Result<(), String> {
-    let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
-    runtime.release_restore(&session_id, &restore_token)
+    release_session_restore(
+        &manager,
+        &agent,
+        Path::new(&directory),
+        &session_id,
+        &restore_token,
+    )
+}
+
+fn release_session_restore(
+    manager: &AgentManager,
+    agent: &str,
+    directory: &Path,
+    session_id: &str,
+    token: &str,
+) -> Result<(), String> {
+    let worktree = worktree_identity(directory);
+    let runtimes = manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .values()
+        .filter(|runtime| runtime.agent == agent && runtime.worktree == worktree)
+        .cloned()
+        .collect::<Vec<_>>();
+    for runtime in runtimes {
+        runtime.release_restore(session_id, token)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3882,12 +3921,7 @@ async fn restore_session(
         let runtime =
             register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
         if let Some(token) = &restore_token {
-            let mut claims = runtime.restores.lock().map_err(|error| error.to_string())?;
-            let claim = claims
-                .get_mut(&session_id)
-                .filter(|claim| claim.token == *token && claim.expires > Instant::now())
-                .ok_or("Session restore reservation expired.")?;
-            claim.expires = Instant::now() + Duration::from_secs(65);
+            runtime.extend_restore(&session_id, token)?;
         }
         let result = (|| {
             let params = {
@@ -3935,8 +3969,11 @@ async fn restore_session(
             let result = result?;
             Ok(result)
         })();
-        if let Some(token) = restore_token {
-            runtime.release_restore(&session_id, &token)?;
+        if result.is_ok() {
+            if let Some(token) = &restore_token {
+                // Give the webview its own bounded window to apply the replay.
+                runtime.extend_restore(&session_id, token)?;
+            }
         }
         result
     })
@@ -4840,7 +4877,7 @@ mod session_config_tests {
 
     #[cfg(unix)]
     #[test]
-    fn restore_claim_serializes_prompt_start_and_detects_live_turn() {
+    fn restore_claim_survives_backend_result_until_frontend_finalizes() {
         let runtime = test_runtime(
             "claude",
             CapabilityProfile::Build,
@@ -4851,6 +4888,7 @@ mod session_config_tests {
             .as_str()
             .unwrap()
             .to_owned();
+        runtime.extend_restore("session", &token).unwrap();
         let waiting = Arc::clone(&runtime);
         let (started, receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -4871,6 +4909,7 @@ mod session_config_tests {
             );
         });
         receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        // The backend load has returned, but the frontend has not applied replay yet.
         assert!(runtime.prompt_state.lock().unwrap().active.is_empty());
         runtime.release_restore("session", &token).unwrap();
         worker.join().unwrap();
@@ -4878,6 +4917,32 @@ mod session_config_tests {
             runtime.begin_restore("session").unwrap()["liveTurn"],
             "new-turn"
         );
+        runtime.child.lock().unwrap().kill().unwrap();
+        runtime.child.lock().unwrap().wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_finalizer_releases_claim_after_failed_load_forgets_session() {
+        let directory = Path::new("/worktree");
+        let runtime = test_runtime("claude", CapabilityProfile::Build, directory, "session");
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key("claude", CapabilityProfile::Build, directory),
+            Arc::clone(&runtime),
+        );
+        let token = runtime.begin_restore("session").unwrap()["restoreToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        runtime.session_profiles.lock().unwrap().remove("session");
+        runtime
+            .session_directories
+            .lock()
+            .unwrap()
+            .remove("session");
+        release_session_restore(&manager, "claude", directory, "session", &token).unwrap();
+        assert!(runtime.restores.lock().unwrap().is_empty());
         runtime.child.lock().unwrap().kill().unwrap();
         runtime.child.lock().unwrap().wait().unwrap();
     }

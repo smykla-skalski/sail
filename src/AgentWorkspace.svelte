@@ -1085,12 +1085,12 @@
     } catch (cause) {
       if (current === generation) error = describe(cause);
     } finally {
-      if (restoreToken) await acp.endRestore(agent, directory, id, restoreToken);
       if (current === generation) {
         setReplaying(false);
         replayEntries = [];
         historyLoading = false;
       }
+      if (restoreToken) await acp.endRestore(agent, directory, id, restoreToken);
     }
   }
 
@@ -1400,16 +1400,18 @@
                     reservation?.restoreToken,
                   )
                 : await acp.resume(agent, directory, id, activeCapabilityProfile);
+              if (current === generation && needsReplay) {
+                entries = restoreEntryTimes(replayEntries, entries);
+                historyLoaded = true;
+                rememberTranscript();
+              }
             } finally {
+              if (current === generation && needsReplay) {
+                setReplaying(false);
+                replayEntries = [];
+              }
               if (reservation?.restoreToken)
                 await acp.endRestore(agent, directory, id, reservation.restoreToken);
-            }
-            if (current === generation && needsReplay) {
-              entries = restoreEntryTimes(replayEntries, entries);
-              setReplaying(false);
-              replayEntries = [];
-              historyLoaded = true;
-              rememberTranscript();
             }
             if (current === generation) {
               configOptions = await restoreClaudeThreadConfig(
