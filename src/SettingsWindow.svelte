@@ -1849,6 +1849,7 @@
                 {#if record.kind === 'handoff' && record.expiresAt != null}
                   <p class="memory-tags">
                     {record.expiresAt <= Date.now() ? 'Expired' : 'Expires'}
+                    <span aria-hidden="true"> · </span>
                     <time datetime={new Date(record.expiresAt).toISOString()}>
                       {new Date(record.expiresAt).toLocaleString()}
                     </time>
