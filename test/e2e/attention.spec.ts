@@ -338,7 +338,7 @@ const blocked = (id: string, number: number): ShipIssue => ({
   url: `https://github.com/fixture/repo/issues/${number}`,
   title: `Blocked fixture ${number}`,
   dependsOn: [],
-  state: 'working',
+  state: 'awaiting_merge',
   branch: id,
   path: null,
   receiptId: null,
