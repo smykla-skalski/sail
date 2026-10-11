@@ -46,6 +46,21 @@ impl PreparedChange {
     pub fn reference(&self) -> &str {
         &self.reference
     }
+
+    pub fn review_diff(&self) -> Result<String, String> {
+        let output = git_command()
+            .arg("--git-dir")
+            .arg(&self.artifact)
+            .args(["diff", "--no-ext-diff", "--no-textconv", "--text"])
+            .arg(&self.revision)
+            .arg(&self.reference)
+            .output()
+            .map_err(|_| "Cannot inspect proposal diff.")?;
+        if !output.status.success() {
+            return Err("Cannot inspect proposal diff.".into());
+        }
+        String::from_utf8(output.stdout).map_err(|_| "Invalid proposal diff response.".into())
+    }
 }
 
 impl Proposal {
@@ -101,6 +116,7 @@ pub fn preview(
     check_index_state(&root, destination)?;
     let revision = git(&root, &["rev-parse", "--verify", "HEAD"])?;
     let before = read_document(&target)?;
+    reject_content_attributes(&root, destination)?;
     if !git(
         &root,
         &[
@@ -125,6 +141,7 @@ pub fn preview(
     if !after.ends_with('\n') {
         after.push('\n');
     }
+    check_git_content(&root, &revision, destination, &before, &after)?;
     let diff = unified_diff(destination, &before, &after);
     Ok(Proposal {
         repository: root,
@@ -167,6 +184,13 @@ fn accept_with<F: FnOnce(), G: FnOnce(&Path, &str, &str)>(
     {
         return Err("Proposal changed after preview.".into());
     }
+    check_git_content(
+        &root,
+        &proposal.revision,
+        &proposal.destination,
+        &proposal.before,
+        &proposal.after,
+    )?;
     let scratch = reserve_artifact_directory()?;
     let mut retain_artifact = false;
     let result = (|| {
@@ -288,6 +312,7 @@ fn git_command() -> Command {
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_NAMESPACE",
+        "GIT_EXTERNAL_DIFF",
     ] {
         command.env_remove(variable);
     }
@@ -443,6 +468,7 @@ fn delete_tree_ref(root: &Path, reference: &str, tree: &str) -> Result<(), Strin
 fn check_source(root: &Path, proposal: &Proposal) -> Result<(), String> {
     let target = checked_target(root, &proposal.destination)?;
     check_index_state(root, &proposal.destination)?;
+    reject_content_attributes(root, &proposal.destination)?;
     if git(root, &["rev-parse", "--verify", "HEAD"])? != proposal.revision
         || read_document(&target)? != proposal.before
         || !git(
@@ -528,7 +554,75 @@ fn read_document(path: &Path) -> Result<String, String> {
         return Err("Destination is too large or is read-only.".into());
     }
     let bytes = fs::read(path).map_err(|_| "Cannot read destination.")?;
+    if bytes.contains(&0) {
+        return Err("Destination must be text Markdown without NUL bytes.".into());
+    }
     String::from_utf8(bytes).map_err(|_| "Destination must be UTF-8 Markdown.".into())
+}
+
+fn check_git_content(
+    root: &Path,
+    revision: &str,
+    destination: &Path,
+    before: &str,
+    after: &str,
+) -> Result<(), String> {
+    reject_content_attributes(root, destination)?;
+    let relative = destination.to_str().ok_or("Invalid destination.")?;
+    let blob = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "blob", &format!("{revision}:{relative}")])
+        .output()
+        .map_err(|_| "Cannot inspect tracked destination content.")?;
+    if !blob.status.success() {
+        return Err("Cannot inspect tracked destination content.".into());
+    }
+    if blob.stdout != before.as_bytes() || after.contains('\r') {
+        return Err(
+            "Destination uses Git content conversion; choose a file without filters.".into(),
+        );
+    }
+    Ok(())
+}
+
+fn reject_content_attributes(root: &Path, destination: &Path) -> Result<(), String> {
+    let relative = destination.to_str().ok_or("Invalid destination.")?;
+    let attributes = ["filter", "ident", "working-tree-encoding", "diff"];
+    let output = git_command()
+        .arg("-C")
+        .arg(root)
+        .args(["check-attr", "-z"])
+        .args(attributes)
+        .args(["--", relative])
+        .output()
+        .map_err(|_| "Cannot inspect Git content conversion.")?;
+    if !output.status.success() {
+        return Err("Cannot inspect Git content conversion.".into());
+    }
+    let fields: Vec<_> = output.stdout.split(|byte| *byte == 0).collect();
+    if fields.len() != attributes.len() * 3 + 1
+        || !fields.last().is_some_and(|value| value.is_empty())
+    {
+        return Err("Invalid Git content conversion response.".into());
+    }
+    for (index, attribute) in attributes.iter().enumerate() {
+        let field = index * 3;
+        if fields[field] != relative.as_bytes() || fields[field + 1] != attribute.as_bytes() {
+            return Err("Invalid Git content conversion response.".into());
+        }
+        if *attribute == "diff" && fields[field + 2] != b"unspecified" {
+            return Err(
+                "Destination has a Git diff override; choose a file with a text diff.".into(),
+            );
+        }
+        if fields[field + 2] != b"unspecified" && fields[field + 2] != b"unset" {
+            return Err(
+                "Destination uses Git content conversion; choose a file without filters.".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -579,7 +673,7 @@ fn unified_diff(path: &Path, before: &str, after: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     struct Repo(PathBuf, RefCell<Vec<PreparedChange>>);
 
@@ -678,6 +772,217 @@ mod tests {
             "# Rules\n"
         );
         assert!(git(&repo.0, &["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn crlf_working_copy_is_rejected_before_preview() {
+        let repo = Repo::new();
+        fs::write(repo.0.join(".gitattributes"), "AGENTS.md text eol=crlf\n").unwrap();
+        repo.git(&["add", ".gitattributes"]);
+        repo.git(&["commit", "-qm", "set line endings"]);
+        fs::write(repo.0.join("AGENTS.md"), "# Rules\r\n").unwrap();
+        repo.git(&["add", "AGENTS.md"]);
+        assert!(git(&repo.0, &["status", "--porcelain", "--", "AGENTS.md"])
+            .unwrap()
+            .is_empty());
+
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "## New rule",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("Git content conversion"), "{error}");
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn nul_in_tracked_markdown_is_rejected_before_artifact_creation() {
+        let repo = Repo::new();
+        fs::write(repo.0.join("AGENTS.md"), b"# Rules\n\0hidden\n").unwrap();
+        repo.git(&["add", "AGENTS.md"]);
+        repo.git(&["commit", "-qm", "track binary markdown"]);
+
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "## New rule",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("NUL bytes"), "{error}");
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn artifact_diff_shows_text_with_external_diff_configured() {
+        let repo = Repo::new();
+        let proposal = repo.preview();
+        let prepared = repo.accept(&proposal, true).unwrap();
+        let patch = prepared.review_diff().unwrap();
+        assert!(patch.contains("+## New rule"));
+        assert!(patch.contains("+Check output."));
+
+        let output = Command::new("git")
+            .arg("--git-dir")
+            .arg(prepared.artifact())
+            .args(["diff", "--no-ext-diff", "--no-textconv", "--text"])
+            .arg(prepared.revision())
+            .arg(prepared.reference())
+            .env("GIT_EXTERNAL_DIFF", "/usr/bin/true")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), patch);
+        assert_eq!(
+            fs::read_to_string(repo.0.join("AGENTS.md")).unwrap(),
+            "# Rules\n"
+        );
+        assert!(git(&repo.0, &["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clean_filter_that_changes_proposal_is_rejected() {
+        let repo = Repo::new();
+        repo.git(&["config", "filter.sail-test.clean", "sed s/secret/public/g"]);
+        fs::write(
+            repo.0.join(".gitattributes"),
+            "AGENTS.md filter=sail-test\n",
+        )
+        .unwrap();
+        repo.git(&["add", ".gitattributes"]);
+        repo.git(&["commit", "-qm", "set filter"]);
+
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "secret",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("Git content conversion"), "{error}");
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn preview_rejects_filter_without_running_its_command() {
+        let repo = Repo::new();
+        fs::write(
+            repo.0.join(".gitattributes"),
+            "AGENTS.md filter=sail-test\n",
+        )
+        .unwrap();
+        repo.git(&["add", ".gitattributes"]);
+        repo.git(&["commit", "-qm", "set filter"]);
+        let marker = repo.0.join("filter-ran");
+        repo.git(&[
+            "config",
+            "filter.sail-test.clean",
+            &format!("touch {}; cat", marker.display()),
+        ]);
+
+        assert!(preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "change",
+            true,
+        )
+        .is_err());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn proposed_carriage_return_is_rejected() {
+        let repo = Repo::new();
+        let error = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "## New rule\r\nbody",
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("Git content conversion"), "{error}");
+    }
+
+    #[test]
+    fn hidden_or_custom_git_diff_is_rejected() {
+        for attribute in ["-diff", "diff=custom"] {
+            let repo = Repo::new();
+            fs::write(
+                repo.0.join(".gitattributes"),
+                format!("AGENTS.md {attribute}\n"),
+            )
+            .unwrap();
+            repo.git(&["add", ".gitattributes"]);
+            repo.git(&["commit", "-qm", "set diff override"]);
+
+            let error = preview(
+                &repo.0,
+                Repo::memory(),
+                Path::new("AGENTS.md"),
+                "## New rule",
+                true,
+            )
+            .unwrap_err();
+            assert!(error.contains("Git diff override"), "{attribute}: {error}");
+            assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn filter_enabled_after_preview_blocks_acceptance() {
+        let repo = Repo::new();
+        let proposal = preview(
+            &repo.0,
+            Repo::memory(),
+            Path::new("AGENTS.md"),
+            "secret",
+            true,
+        )
+        .unwrap();
+        repo.git(&["config", "filter.sail-test.clean", "sed s/secret/public/g"]);
+        fs::write(
+            repo.0.join(".gitattributes"),
+            "AGENTS.md filter=sail-test\n",
+        )
+        .unwrap();
+        let published = Cell::new(false);
+        let error = accept_with(
+            &repo.0,
+            &proposal,
+            true,
+            || published.set(true),
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("Git content conversion"), "{error}");
+        assert!(!published.get());
+        assert!(git(&repo.0, &["for-each-ref", "refs/sail/knowledge"])
+            .unwrap()
+            .is_empty());
+        assert!(git(&repo.0, &["fsck", "--unreachable", "--no-reflogs"])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
