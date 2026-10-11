@@ -503,6 +503,7 @@
     setSetting,
     setSettingDurable,
     settingsError,
+    trackSettingsMutation,
   } from './lib/settings';
   import {
     defaultResourceLimits,
@@ -11144,14 +11145,18 @@
             'Approve command',
           );
           if (!allow) {
-            const canceled = await invoke<PostTurnCheck>('cancel_post_turn_check', check);
+            const canceled = await trackSettingsMutation(() =>
+              invoke<PostTurnCheck>('cancel_post_turn_check', check),
+            );
             postTurnResults = upsertCheck(postTurnResults, canceled);
             return;
           }
-          await invoke('approve_post_turn_check', {
-            directory: check.directory,
-            command: check.command,
-          });
+          await trackSettingsMutation(() =>
+            invoke('approve_post_turn_check', {
+              directory: check.directory,
+              command: check.command,
+            }),
+          );
         }
       }
       postTurnResults = upsertCheck(postTurnResults, { ...check, status: 'running' });

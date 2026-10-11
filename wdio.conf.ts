@@ -186,6 +186,10 @@ export const config = {
       const core: unknown = tauri && typeof tauri === 'object' ? Reflect.get(tauri, 'core') : null;
       const invoke: unknown = core && typeof core === 'object' ? Reflect.get(core, 'invoke') : null;
       if (typeof invoke !== 'function') throw new Error('Tauri API missing; cannot reset settings');
+      const quiesce: unknown = Reflect.get(window, '__SAIL_E2E_QUIESCE_SETTINGS__');
+      if (typeof quiesce === 'function') await quiesce();
+      else if (document.querySelector('.app-shell'))
+        throw new Error('E2E app has no settings write barrier');
       localStorage.clear();
       sessionStorage.clear();
       await invoke('reset_test_settings');

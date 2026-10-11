@@ -154,6 +154,8 @@ pub fn approve_post_turn_check(
     directory: String,
     command: String,
 ) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = crate::settings::begin_e2e_settings_write()?;
     let directory = canonical_directory(&directory)?;
     if !configured(&app, &directory, "repository", &command)? {
         return Err("Repository check changed. Review its new command.".into());
@@ -369,7 +371,7 @@ pub async fn run_post_turn_check(
     .map_err(|error| error.to_string())?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn execute(directory: &str, command: &str) -> Result<(String, Option<i32>, String), String> {
     execute_with_timeout(directory, command, TIMEOUT, None)
 }

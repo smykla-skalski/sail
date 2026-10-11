@@ -24,13 +24,25 @@ let ready = false;
 let e2eSettingsDisabled = false;
 let values: Record<string, string> = {};
 let writes = Promise.resolve();
+const pendingLoads = new Set<Promise<unknown>>();
+const pendingMutations = new Set<Promise<unknown>>();
 let e2eQuiesced = false;
 
 export async function quiesceSettingsWrites(): Promise<void> {
   e2eQuiesced = true;
   ready = false;
   e2eSettingsDisabled = true;
-  await writes;
+  const settled = await Promise.allSettled([...pendingLoads, ...pendingMutations, writes]);
+  const persisted = settled.at(-1);
+  if (persisted?.status === 'rejected') throw persisted.reason;
+}
+
+export function trackSettingsMutation<T>(operation: () => Promise<T>): Promise<T> {
+  if (e2eQuiesced) return Promise.reject(new Error('E2E settings writes are quiesced'));
+  const pending = operation();
+  pendingMutations.add(pending);
+  void pending.finally(() => pendingMutations.delete(pending)).catch(() => undefined);
+  return pending;
 }
 
 if (typeof window !== 'undefined' && import.meta.env?.MODE === 'e2e')
@@ -43,13 +55,15 @@ export async function initializeSettings(): Promise<void> {
     import.meta.env?.MODE === 'e2e' && sessionStorage.getItem('sail-e2e-settings') !== 'enabled';
   if (e2eSettingsDisabled) return;
   try {
-    const saved =
+    const loading =
       localStorage.getItem(migrationKey) === '1'
-        ? await invoke<Record<string, string>>('load_settings')
-        : await invoke<Record<string, string>>('migrate_settings', {
+        ? invoke<Record<string, string>>('load_settings')
+        : invoke<Record<string, string>>('migrate_settings', {
             legacy: snapshot(),
             preferLegacy: location.protocol === 'tauri:' || location.hostname === 'tauri.localhost',
           });
+    pendingLoads.add(loading);
+    const saved = await loading.finally(() => pendingLoads.delete(loading));
     if (e2eQuiesced) return;
     values = Object.fromEntries(
       Object.entries(saved).filter(

@@ -5,6 +5,7 @@ import {
   initializeSettings,
   quiesceSettingsWrites,
   setSetting,
+  trackSettingsMutation,
 } from '../src/lib/settings.ts';
 
 class MemoryStorage implements Storage {
@@ -64,14 +65,39 @@ void test('quiescence rejects a settings load that finishes after its write barr
   try {
     const initializing = initializeSettings();
     assert.deepEqual(commands, ['load_settings']);
-    await quiesceSettingsWrites();
+    let releaseMutation!: () => void;
+    const mutation = new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    });
+    void trackSettingsMutation(() => mutation);
+    let quiesced = false;
+    const quiescing = (async () => {
+      await quiesceSettingsWrites();
+      quiesced = true;
+    })();
+    await Promise.resolve();
+    assert.equal(quiesced, false);
+    releaseMutation();
+    await mutation;
+    await Promise.resolve();
+    assert.equal(quiesced, false);
     resolveLoad({ 'sai-quiescence-probe': 'stale' });
+    await quiescing;
     await initializing;
 
     assert.equal(getSetting('sai-quiescence-probe'), null);
     setSetting('sai-quiescence-probe', 'new');
     await Promise.resolve();
     assert.deepEqual(commands, ['load_settings']);
+    let invoked = false;
+    await assert.rejects(
+      trackSettingsMutation(() => {
+        invoked = true;
+        return Promise.resolve();
+      }),
+      /quiesced/,
+    );
+    assert.equal(invoked, false);
   } finally {
     globals.forEach((key, index) => {
       const descriptor = original[index];
