@@ -1,5 +1,5 @@
 import { browser } from '@wdio/globals';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import {
@@ -56,6 +56,19 @@ if (!attach && process.platform !== 'win32' && !process.env.SAIL_E2E_FAKE_GH_DIR
 
 const e2eAppearance = process.env.SAIL_E2E_APPEARANCE === 'dark' ? 'dark' : 'light';
 
+/** WDIO logs ordinary config-hook errors and continues, so fixture failures must stop the worker. */
+function failClosedSetup(setup: () => Promise<void>): () => Promise<void> {
+  return async () => {
+    try {
+      await setup();
+    } catch (error) {
+      const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+      writeSync(2, `Fatal E2E fixture reset: ${detail}\n`);
+      process.exit(1);
+    }
+  };
+}
+
 const binary = resolve(
   process.env.SAIL_E2E_BINARY ??
     `src-tauri/target/debug/sail${process.platform === 'win32' ? '.exe' : ''}`,
@@ -97,7 +110,7 @@ export const config = {
     }
   },
   /** Specs share one app process. Clear state left by earlier specs before pinning appearance. */
-  async before() {
+  before: failClosedSetup(async () => {
     await browser.switchToWindow('main');
     await browser.setWindowSize(1280, 850);
     await browser.execute(async () => {
@@ -189,7 +202,7 @@ export const config = {
       if (typeof invoke !== 'function') throw new Error('Tauri API missing; cannot pin appearance');
       await invoke('plugin:window|set_theme', { label: 'main', value });
     }, e2eAppearance);
-  },
+  }),
   onComplete() {
     jobs.release();
     rmSync(state, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
