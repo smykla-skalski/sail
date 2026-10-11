@@ -324,6 +324,28 @@ void test('saving keeps stored runs that cannot be parsed', () => {
   assert.deepEqual(loadShipRunStore(null), { runs: [], unparsed: [] });
 });
 
+void test('saving a valid run keeps fields from a newer Sail build', () => {
+  const stored = {
+    ...fixture(),
+    futureRun: { enabled: true },
+    issues: [
+      {
+        ...fixture().issues[0],
+        futureIssue: 'kept',
+        events: [{ at: 42, stage: 'working', futureEvent: ['later'] }],
+      },
+    ],
+  };
+
+  const loaded = loadShipRunStore(JSON.stringify([stored]));
+  const saved = serializeShipRuns(loaded.runs, loaded.unparsed);
+
+  assert.deepEqual(JSON.parse(saved)[0].futureRun, { enabled: true });
+  assert.equal(JSON.parse(saved)[0].issues[0].futureIssue, 'kept');
+  assert.deepEqual(JSON.parse(saved)[0].issues[0].events[0].futureEvent, ['later']);
+  assert.deepEqual(loadShipRunStore(saved).unparsed, []);
+});
+
 void test('legacy persisted work cannot opt out of validation by omitting the policy flag', () => {
   const run = fixture();
   delete run.issues[0].validationPolicyRequired;

@@ -53,6 +53,8 @@
     repository,
     active = true,
     runs,
+    unparsedRuns = [],
+    ondiscardunparsed,
     busy,
     mergeOwner = 'you',
     onclose,
@@ -69,6 +71,8 @@
     repository: string;
     active?: boolean;
     runs: ShipRun[];
+    unparsedRuns?: unknown[];
+    ondiscardunparsed?: (index: number) => Promise<void>;
     busy: boolean;
     mergeOwner?: MergeOwner;
     onclose: () => void;
@@ -100,6 +104,7 @@
   let showDone = $state(false);
   let showArchived = $state(false);
   let result = $state({ text: '', failed: false });
+  let discardCandidate = $state<number | null>(null);
   let focusedId = $state('');
   let frozen = $state<ShipOrderSnapshot | null>(null);
   const detailId = `ship-selected-issue-${crypto.randomUUID()}`;
@@ -286,6 +291,15 @@
     result = { text, failed };
   }
 
+  async function discardUnparsed(index: number) {
+    if (!ondiscardunparsed) return;
+    await act(async () => {
+      await ondiscardunparsed(index);
+      discardCandidate = null;
+      showResult('Stored entry discarded.', false);
+    });
+  }
+
   function chooseArchived(archived: boolean) {
     showArchived = archived;
     selectedRun = '';
@@ -436,6 +450,18 @@
     >
       {result.text}
     </p>{/if}
+  {#if unparsedRuns.length}<section class="ship-unparsed" aria-label="Unreadable Ship runs">
+      <h3>Unreadable stored runs ({unparsedRuns.length})</h3>
+      <p>Sail cannot use these entries. Inspect their stored data before discarding them.</p>
+      {#each unparsedRuns as item, index (index)}<details>
+          <summary>Stored entry {index + 1}</summary>
+          <pre>{typeof item === 'string' ? item : JSON.stringify(item, null, 2)}</pre>
+          {#if discardCandidate === index}<p>Discard this stored entry permanently?</p>
+            <button onclick={() => discardUnparsed(index)}>Discard entry</button>
+            <button onclick={() => (discardCandidate = null)}>Cancel</button>
+          {:else}<button onclick={() => (discardCandidate = index)}>Discard…</button>{/if}
+        </details>{/each}
+    </section>{/if}
   {#if archivedCount || showArchived}<div class="ship-scope" role="group" aria-label="Run state">
       <button aria-pressed={!showArchived} onclick={() => chooseArchived(false)}>Active</button
       ><button aria-pressed={showArchived} onclick={() => chooseArchived(true)}
@@ -1271,6 +1297,16 @@
   }
   .ship-empty {
     padding: 24px 0;
+  }
+  .ship-unparsed {
+    padding: 12px;
+    border: 1px solid var(--shell-divider);
+  }
+  .ship-unparsed pre {
+    overflow: auto;
+    max-height: 320px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   @media (max-width: 520px) {
     .ship-panel {

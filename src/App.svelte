@@ -628,7 +628,7 @@
   const initialShipArchiveDelay = parseShipArchiveDelay(getSetting('sai-ship-archive-delay'));
   const storedShipRuns = loadShipRunStore(getSetting('sai-ship-runs'));
   // Entries this build cannot parse are written back with every save instead of being lost.
-  const unparsedShipRuns = storedShipRuns.unparsed;
+  let unparsedShipRuns = $state<unknown[]>(storedShipRuns.unparsed);
   const shipArchiveMigration =
     getSetting(shipArchiveMigrationKey) === 'done'
       ? null
@@ -639,7 +639,7 @@
     : Number(getSetting('sai-ship-archive-notice')) || 0;
   if (shipArchiveMigration) {
     if (shipArchiveMigration.archived > 0) {
-      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, unparsedShipRuns));
+      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, storedShipRuns.unparsed));
       setSetting('sai-ship-archive-notice', String(initialShipArchiveNotice));
     }
     setSetting(shipArchiveMigrationKey, 'done');
@@ -2521,6 +2521,17 @@
   async function saveShipRuns(): Promise<void> {
     const value = serializeShipRuns(shipRuns, unparsedShipRuns);
     await setSettingDurable('sai-ship-runs', value);
+  }
+
+  async function discardUnparsedShipRun(index: number): Promise<void> {
+    const previous = unparsedShipRuns;
+    unparsedShipRuns = unparsedShipRuns.filter((_, itemIndex) => itemIndex !== index);
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      unparsedShipRuns = previous;
+      throw cause;
+    }
   }
 
   async function archiveDueShipRuns(): Promise<void> {
@@ -12342,6 +12353,8 @@
       <ShipPanel
         repository={coordinationProject(directory) ?? directory}
         runs={shipRuns}
+        unparsedRuns={unparsedShipRuns}
+        ondiscardunparsed={discardUnparsedShipRun}
         busy={shippingBusy}
         {mergeOwner}
         nativeSubagents={Object.values(nativeSubagents)}
@@ -12520,6 +12533,8 @@
             repository={coordinationProject(directory) ?? directory}
             active={activeSideTab === 'ship' && detailsOpen && (acpAgent ? agentChangesOpen : true)}
             runs={shipRuns}
+            unparsedRuns={unparsedShipRuns}
+            ondiscardunparsed={discardUnparsedShipRun}
             busy={shippingBusy}
             {mergeOwner}
             nativeSubagents={Object.values(nativeSubagents)}
