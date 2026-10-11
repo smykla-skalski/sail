@@ -49,6 +49,7 @@
     exportMemories,
     memoryKinds,
     parseMemoryTags,
+    resolveHandoffExpiry,
     type MemoryAgentInstallPreview,
     type MemoryAgentStatus,
     type MemoryImportCandidate,
@@ -135,6 +136,8 @@
   let pendingForget = $state('');
   let pendingExpiry = $state('');
   let expiryEditValue = $state('');
+  let expiryEditOriginalValue = '';
+  let expiryEditOriginalTimestamp: number | null = null;
   let agentPreview = $state<{
     action: 'install' | 'uninstall';
     result: MemoryAgentInstallPreview;
@@ -299,6 +302,8 @@
       pendingForget = '';
       pendingExpiry = '';
       expiryEditValue = '';
+      expiryEditOriginalValue = '';
+      expiryEditOriginalTimestamp = null;
       memoryExpiry = '';
       agentPreview = null;
       previewRequest += 1;
@@ -520,7 +525,11 @@
   async function saveMemoryExpiry(id: string) {
     const directory = snapshot?.directory;
     if (!directory) return;
-    const expiresAt = expiryEditValue ? new Date(expiryEditValue).getTime() : null;
+    const expiresAt = resolveHandoffExpiry(
+      expiryEditValue,
+      expiryEditOriginalValue,
+      expiryEditOriginalTimestamp,
+    );
     if (expiresAt !== null && !Number.isFinite(expiresAt)) {
       memoryStorageError = 'Storage: Enter a valid handoff expiry.';
       return;
@@ -1877,6 +1886,8 @@
                               .toISOString()
                               .slice(0, 16)
                           : '';
+                        expiryEditOriginalValue = expiryEditValue;
+                        expiryEditOriginalTimestamp = expiry ?? null;
                       }}>Edit expiry</Button
                     >
                   {/if}

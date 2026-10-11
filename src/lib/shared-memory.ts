@@ -84,6 +84,16 @@ export function parseMemoryTags(value: string): string[] {
   ];
 }
 
+export function resolveHandoffExpiry(
+  value: string,
+  originalValue: string,
+  originalTimestamp: number | null,
+): number | null {
+  if (!value) return null;
+  if (value === originalValue && originalTimestamp !== null) return originalTimestamp;
+  return new Date(value).getTime();
+}
+
 export function createSerialExecutor(): <T>(work: () => Promise<T>) => Promise<T> {
   let tail = Promise.resolve();
   return <T>(work: () => Promise<T>) => {
