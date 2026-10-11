@@ -1327,6 +1327,18 @@ mod tests {
         }
     }
 
+    fn assert_cleanup_reason(cache: &Path, expected: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            let status = cleanup_status(cache);
+            if status.iter().any(|item| item.reason == expected) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn lexical_identity_does_not_follow_a_reused_path() {
         let root = Path::new("/tmp/worktree/../worktree");
@@ -1562,13 +1574,9 @@ mod tests {
 
         reconcile(&fixture.cache);
         assert!(directory.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "unclean-active-use"));
+        assert_cleanup_reason(&fixture.cache, "unclean-active-use");
 
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "unclean-active-use"));
+        assert_cleanup_reason(&fixture.cache, "unclean-active-use");
     }
 
     #[test]
@@ -1582,9 +1590,7 @@ mod tests {
         reconcile(&fixture.cache);
 
         assert!(directory.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "git-worktree-registration-still-present"));
+        assert_cleanup_reason(&fixture.cache, "git-worktree-registration-still-present");
     }
 
     #[test]
@@ -1678,9 +1684,7 @@ mod tests {
         reconcile(&fixture.cache);
 
         assert!(directory.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "git-common-dir-missing-or-unreadable"));
+        assert_cleanup_reason(&fixture.cache, "git-common-dir-missing-or-unreadable");
     }
 
     #[test]
