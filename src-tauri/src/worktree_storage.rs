@@ -1678,9 +1678,13 @@ mod tests {
         reconcile(&fixture.cache);
 
         assert!(directory.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "git-common-dir-missing-or-unreadable"));
+        let pending = cleanup_status(&fixture.cache);
+        assert!(
+            pending
+                .iter()
+                .any(|item| item.reason == "git-common-dir-missing-or-unreadable"),
+            "unexpected cleanup status: {pending:?}"
+        );
     }
 
     #[test]
