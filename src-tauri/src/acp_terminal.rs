@@ -499,6 +499,7 @@ struct AcpTerminal {
     agent: String,
     profile: CapabilityProfile,
     session_id: String,
+    owner: Option<String>,
     directory: PathBuf,
     _storage_lease: Option<std::sync::Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
@@ -717,10 +718,16 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     }
     #[cfg(unix)]
     {
+        let ownership_stop = terminal
+            .owner
+            .as_deref()
+            .map(|owner| crate::owned_processes::stop_pid(owner, child.id()))
+            .unwrap_or(Ok(()));
         crate::terminal::kill_terminal_process_groups(child.id())?;
         child
             .wait()
             .map_err(|error| format!("Cannot wait for terminal process to stop: {error}"))?;
+        ownership_stop?;
     }
     #[cfg(windows)]
     terminal.job.stop()?;
@@ -728,6 +735,10 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     child
         .wait()
         .map_err(|error| format!("Cannot wait for terminal process to stop: {error}"))?;
+    #[cfg(windows)]
+    if let Some(owner) = terminal.owner.as_deref() {
+        crate::owned_processes::stop_pid(owner, child.id())?;
+    }
     #[cfg(unix)]
     if let Ok(mut watchdog) = terminal.watchdog.lock() {
         watchdog.stop();
@@ -832,13 +843,34 @@ pub fn handle(
             let mut child = command
                 .spawn()
                 .map_err(|error| format!("Cannot start command: {error}"))?;
+            let owner = format!(
+                "{}\0acp:{}:{}",
+                fallback.display(),
+                agent,
+                params.session_id
+            );
+            if let Err(error) =
+                crate::owned_processes::register_session(&owner, child.id(), child.id())
+            {
+                #[cfg(unix)]
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(child.id() as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Cannot track command ownership: {error}"));
+            }
             storage_lease.mark_started();
             #[cfg(unix)]
             let watchdog = start_watchdog_or_cleanup(
                 &mut child,
                 &storage_lease,
                 crate::child_watchdog::ChildWatchdog::start,
-            )?;
+            )
+            .inspect_err(|_| {
+                let _ = crate::owned_processes::stop_pid(&owner, child.id());
+            })?;
             let stdout = child
                 .stdout
                 .take()
@@ -856,6 +888,7 @@ pub fn handle(
                 agent: agent.to_string(),
                 profile,
                 session_id: params.session_id.clone(),
+                owner: Some(owner),
                 directory: worktree.to_path_buf(),
                 _storage_lease: Some(storage_lease),
                 child: Mutex::new(child),
@@ -1596,6 +1629,7 @@ mod tests {
             agent: "codex".to_string(),
             profile: CapabilityProfile::Review,
             session_id: "nested-session".to_string(),
+            owner: None,
             directory: nested.clone(),
             _storage_lease: None,
             child: Mutex::new(child),
