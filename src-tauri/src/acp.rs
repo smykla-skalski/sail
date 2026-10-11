@@ -1224,10 +1224,29 @@ fn prepare_runtime_directories(data_directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct ForgetGenerationKey {
+    agent: String,
+    directory: PathBuf,
+    session_id: String,
+}
+
+impl ForgetGenerationKey {
+    fn new(agent: &str, directory: &str, session_id: &str) -> Self {
+        Self {
+            agent: agent.to_string(),
+            directory: canonical_directory(directory),
+            session_id: session_id.to_string(),
+        }
+    }
+}
+
+type ForgetGenerations = HashMap<ForgetGenerationKey, u64>;
+
 #[derive(Clone, Default)]
 pub struct AgentManager(
     Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>,
-    Arc<Mutex<HashMap<(String, PathBuf, String), u64>>>,
+    Arc<Mutex<ForgetGenerations>>,
 );
 
 impl AgentManager {
@@ -1241,11 +1260,7 @@ impl AgentManager {
             .1
             .lock()
             .map_err(|error| error.to_string())?
-            .get(&(
-                agent.to_string(),
-                canonical_directory(directory),
-                session_id.to_string(),
-            ))
+            .get(&ForgetGenerationKey::new(agent, directory, session_id))
             .unwrap_or(&0))
     }
 
@@ -1254,13 +1269,31 @@ impl AgentManager {
             .1
             .lock()
             .map_err(|error| error.to_string())?
-            .entry((
-                agent.to_string(),
-                canonical_directory(directory),
-                session_id.to_string(),
-            ))
+            .entry(ForgetGenerationKey::new(agent, directory, session_id))
             .or_default() += 1;
         Ok(())
+    }
+
+    fn with_current_forget_generation<T>(
+        &self,
+        agent: &str,
+        directory: &str,
+        session_id: &str,
+        expected: u64,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let generations = self.1.lock().map_err(|error| error.to_string())?;
+        if generations
+            .get(&ForgetGenerationKey::new(agent, directory, session_id))
+            .copied()
+            .unwrap_or(0)
+            != expected
+        {
+            return Err("This agent thread was deleted while reconnecting.".into());
+        }
+        let result = operation();
+        drop(generations);
+        result
     }
 
     fn active_sessions_in(
@@ -1840,6 +1873,48 @@ mod interruption_report_tests {
         )
         .is_ok());
         assert!(!prompts.lock().unwrap().forgotten.contains("target"));
+    }
+
+    #[test]
+    fn deletion_during_connect_prevents_late_registration_and_token_creation() {
+        let manager = AgentManager::default();
+        let directory = "/example/worktree";
+        let started_generation = manager
+            .forget_generation("claude", directory, "target")
+            .unwrap();
+        // Forget sees no connection while connect_blocking is still in progress.
+        manager.mark_forget("claude", directory, "target").unwrap();
+        let mut registered_or_minted = false;
+
+        let stale = manager.with_current_forget_generation(
+            "claude",
+            directory,
+            "target",
+            started_generation,
+            || {
+                registered_or_minted = true;
+                Ok(())
+            },
+        );
+
+        assert!(stale.is_err());
+        assert!(!registered_or_minted);
+        let explicit_generation = manager
+            .forget_generation("claude", directory, "target")
+            .unwrap();
+        manager
+            .with_current_forget_generation(
+                "claude",
+                directory,
+                "target",
+                explicit_generation,
+                || {
+                    registered_or_minted = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(registered_or_minted);
     }
 
     #[test]
@@ -4070,43 +4145,57 @@ async fn restore_session(
             profile,
             Path::new(&cwd),
         )?;
-        let runtime =
-            register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
-        let forget_generation = runtime
-            .prompt_state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .forget_generation
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        let params = {
-            let mut configs = runtime
-                .session_configs
-                .lock()
-                .map_err(|error| error.to_string())?;
-            // The reader drains this map when it exits, so minting for a stopped agent would
-            // leak the token.
-            if !runtime.alive.load(Ordering::Acquire) {
-                return Err("Agent process stopped. Reopen the thread to reconnect.".to_string());
-            }
-            restore_params(
-                per_load_mcp(),
-                &mut configs,
-                &session_id,
-                &cwd,
-                || {
-                    browser.config_for_profile(
+        // Deletion must not finish while this restore is registering a session or minting
+        // its browser token. Once the token is stored, forget can find and release it.
+        // Forget releases the generation lock before touching runtime or config locks.
+        let (runtime, forget_generation, params) = manager.with_current_forget_generation(
+            &agent,
+            &cwd,
+            &session_id,
+            manager_generation,
+            || {
+                let runtime =
+                    register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
+                let forget_generation = runtime
+                    .prompt_state
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .forget_generation
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or(0);
+                let params = {
+                    let mut configs = runtime
+                        .session_configs
+                        .lock()
+                        .map_err(|error| error.to_string())?;
+                    // The reader drains this map when it exits, so minting for a stopped agent
+                    // would leak the token.
+                    if !runtime.alive.load(Ordering::Acquire) {
+                        return Err(
+                            "Agent process stopped. Reopen the thread to reconnect.".to_string()
+                        );
+                    }
+                    restore_params(
+                        per_load_mcp(),
+                        &mut configs,
+                        &session_id,
                         &cwd,
-                        Some(&session_id),
-                        Some(&agent),
-                        Some(profile.as_str()),
-                        crate::background_priority::enabled(&app),
-                    )
-                },
-                |token| browser.release(token),
-            )?
-        };
+                        || {
+                            browser.config_for_profile(
+                                &cwd,
+                                Some(&session_id),
+                                Some(&agent),
+                                Some(profile.as_str()),
+                                crate::background_priority::enabled(&app),
+                            )
+                        },
+                        |token| browser.release(token),
+                    )?
+                };
+                Ok((runtime, forget_generation, params))
+            },
+        )?;
         let result = runtime.request(method, params, Duration::from_secs(60));
         if result.is_err() {
             runtime
