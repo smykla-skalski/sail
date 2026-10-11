@@ -573,6 +573,7 @@ describe('agent sessions survive thread switches', () => {
     await openThread('Continuity codex');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     const before = restarts(codex);
+    rmSync(join(codex, 'codex-background-release.txt'), { force: true });
     await sendPrompt('Background task');
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Background task started.'),
@@ -586,6 +587,42 @@ describe('agent sessions survive thread switches', () => {
       { wait: 15_000 },
     );
     expect(restarts(codex)).toBe(before);
+  });
+
+  it('keeps idle Codex background work alive across a webview refresh', async () => {
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const before = restarts(codex);
+    rmSync(join(codex, 'codex-background-release.txt'), { force: true });
+    await sendPrompt('Background task');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Background task started.'),
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.refresh();
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.pause(500);
+    expect(restarts(codex)).toBe(before);
+    writeFileSync(join(codex, 'codex-background-release.txt'), 'release\n');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Background task finished.'),
+      { wait: 15_000 },
+    );
+    expect(restarts(codex)).toBe(before);
+  });
+
+  it('recovers an evicted idle Codex session before its next prompt', async () => {
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await sendPrompt('Evict session');
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Session evicted.'));
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await switchAwayAndBack('Continuity codex', 'Codex sibling', 1);
+    await sendPrompt('Discuss interruption');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('The previous step was interrupted, then recovered.'),
+    );
   });
 
   it('keeps the parent transcript after visiting its native child', async () => {

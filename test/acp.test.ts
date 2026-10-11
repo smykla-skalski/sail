@@ -16,6 +16,7 @@ import {
   liveTranscriptLimit,
   loadRecentTranscript,
   rememberSessionState,
+  recoverMissingCodexSession,
   restoreEntryTimes,
   saveRecentTranscript,
   sessionState,
@@ -33,6 +34,67 @@ import { toolCommand } from '../src/lib/tool-display.ts';
 
 const normalizeEntries = (entries: AgentEntry[]) =>
   entries.map((entry) => (entry.type === 'tool' ? entry : { ...entry, id: entry.type }));
+
+void test('a stale Codex session resumes before retrying its prompt', async () => {
+  const calls: string[] = [];
+  const response = await recoverMissingCodexSession(
+    'codex',
+    async () => {
+      calls.push('prompt');
+      if (calls.length === 1) throw new Error('Session not found: codex-test');
+      return 'recovered';
+    },
+    async () => {
+      calls.push('resume');
+    },
+  );
+  assert.equal(response, 'recovered');
+  assert.deepEqual(calls, ['prompt', 'resume', 'prompt']);
+});
+
+void test('prompt recovery leaves other errors and agents untouched', async () => {
+  await Promise.all(
+    [
+      ['codex', 'Permission denied'],
+      ['claude', 'Session not found: claude-test'],
+    ].map(async ([agent, message]) => {
+      let resumes = 0;
+      await assert.rejects(
+        recoverMissingCodexSession(
+          agent,
+          async () => {
+            throw new Error(message);
+          },
+          async () => {
+            resumes += 1;
+          },
+        ),
+        { message },
+      );
+      assert.equal(resumes, 0);
+    }),
+  );
+});
+
+void test('a missing Codex session is retried only once', async () => {
+  let prompts = 0;
+  let resumes = 0;
+  await assert.rejects(
+    recoverMissingCodexSession(
+      'codex',
+      async () => {
+        prompts += 1;
+        throw new Error('Session not found: codex-test');
+      },
+      async () => {
+        resumes += 1;
+      },
+    ),
+    { message: 'Session not found: codex-test' },
+  );
+  assert.equal(prompts, 2);
+  assert.equal(resumes, 1);
+});
 
 void test('scoped ACP disconnect only affects sessions from the exited connection', () => {
   const message: AgentEvent['message'] = {

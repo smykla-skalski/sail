@@ -87,6 +87,7 @@
     liveSessionView,
     markLiveMessageBoundary,
     restoredLiveTurnIsCurrent,
+    recoverMissingCodexSession,
     loadRecentTranscript,
     restoreEntryTimes,
     saveRecentTranscript,
@@ -515,6 +516,7 @@
   });
   let visibleCount = $state(50);
   let historyLoaded = $state(true);
+  let attachedCodexSession = $state(false);
   let historyLoading = $state(false);
   let historyAttempted = $state(false);
   let historicalToolIds = $state.raw<ReadonlySet<string>>(new Set());
@@ -722,6 +724,7 @@
   // The app marks a thread done from the turn-finished event, before this pane's prompt call
   // returns; the header follows that event so both settle in the same frame.
   let turnEnded = $state(false);
+  let recoveringPromptTurnId: string | null = null;
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
   // What the user sees: a turn the app already marked finished no longer reads busy, so the
   // header, the working row and the pickers settle together.
@@ -800,7 +803,15 @@
   });
 
   $effect(() => {
-    if (ready && !busy && !running && !liveTurn && !historyLoaded && !historyAttempted)
+    if (
+      ready &&
+      !busy &&
+      !running &&
+      !liveTurn &&
+      !attachedCodexSession &&
+      !historyLoaded &&
+      !historyAttempted
+    )
       void loadHistory();
   });
 
@@ -1075,7 +1086,17 @@
 
   async function loadHistory() {
     const id = activeSessionId;
-    if (!id || historyLoading || !ready || busy || running || liveTurn || historyAttempted) return;
+    if (
+      !id ||
+      historyLoading ||
+      !ready ||
+      busy ||
+      running ||
+      liveTurn ||
+      attachedCodexSession ||
+      historyAttempted
+    )
+      return;
     const current = generation;
     historyAttempted = true;
     historyLoading = true;
@@ -1318,6 +1339,7 @@
     historicalToolIds = presentToolIds(nativeEntries ?? entries);
     visibleCount = 50;
     historyLoaded = !id;
+    attachedCodexSession = false;
     historyLoading = false;
     historyAttempted = false;
     configOptions = [];
@@ -1427,8 +1449,8 @@
         const needsReplay = restoresSubagents || !canResume;
         const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
         if (current !== generation) return;
-        const attachedCodexSession =
-          agent === 'codex' && runtime?.alive && runtime.sessions.includes(id);
+        attachedCodexSession =
+          agent === 'codex' && runtime?.alive === true && runtime.sessions.includes(id);
         const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
         if (current !== generation) {
           if (reservation.restoreToken)
@@ -1689,7 +1711,8 @@
           busy &&
           params.sessionId === activeSessionId &&
           typeof params.turnId === 'string' &&
-          params.turnId === activeTurnId
+          params.turnId === activeTurnId &&
+          params.turnId !== recoveringPromptTurnId
         )
           turnEnded = true;
         if (
@@ -2062,15 +2085,24 @@
       let result;
       try {
         result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
-          acp.prompt(
+          recoverMissingCodexSession(
             turnAgent,
-            directory,
-            id!,
-            recalledPrompt,
-            turnId,
-            promptImagePaths(sentImages, sentClipboard),
-            undefined,
-            true,
+            () =>
+              acp.prompt(
+                turnAgent,
+                directory,
+                id!,
+                recalledPrompt,
+                turnId,
+                promptImagePaths(sentImages, sentClipboard),
+                undefined,
+                true,
+              ),
+            async () => {
+              recoveringPromptTurnId = turnId;
+              if (current === generation) turnEnded = false;
+              await acp.resume(turnAgent, directory, id!, activeCapabilityProfile);
+            },
           ),
         );
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
@@ -2185,6 +2217,7 @@
       }
       if (external && !queuedMessage && !delivered) throw cause;
     } finally {
+      if (recoveringPromptTurnId === turnId) recoveringPromptTurnId = null;
       releaseSlot?.();
       if (inFlightSteer?.sessionId === deliverySessionId && inFlightSteer.turnId === turnId)
         inFlightSteer.finish();
