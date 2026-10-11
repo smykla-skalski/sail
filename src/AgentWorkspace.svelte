@@ -1388,11 +1388,11 @@
             : false;
         if (!canLoad) throw new Error(`${name} does not support restoring threads.`);
         const showLiveTurn = async (
-          turnId: string,
+          turnId: string | null,
           cached: { configOptions?: AgentConfigOption[]; availableCommands?: AgentCommand[] },
         ) => {
           if (!liveView) return;
-          liveTurn = true;
+          liveTurn = turnId !== null;
           activeTurnId = turnId;
           historyLoaded = liveView.complete;
           configOptions = await restoreClaudeThreadConfig(
@@ -1405,6 +1405,7 @@
           const latest = (await acp.activity(directory).catch(() => null))?.[agent];
           if (
             current === generation &&
+            turnId !== null &&
             !restoredLiveTurnIsCurrent(turnId, latest?.activeTurns[id], finishedTurnIds)
           ) {
             liveTurn = false;
@@ -1424,6 +1425,10 @@
           typeof sessionCapabilities === 'object' &&
           'subagents' in sessionCapabilities;
         const needsReplay = restoresSubagents || !canResume;
+        const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
+        if (current !== generation) return;
+        const attachedCodexSession =
+          agent === 'codex' && runtime?.alive && runtime.sessions.includes(id);
         const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
         if (current !== generation) {
           if (reservation.restoreToken)
@@ -1432,6 +1437,10 @@
         }
         if (reservation.liveTurn) {
           await showLiveTurn(reservation.liveTurn, reservation);
+        } else if (liveView && attachedCodexSession) {
+          if (reservation.restoreToken)
+            await acp.endRestore(agent, directory, id, reservation.restoreToken);
+          await showLiveTurn(null, reservation);
         } else {
           if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
           if (needsReplay) {

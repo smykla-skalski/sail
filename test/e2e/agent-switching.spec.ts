@@ -569,6 +569,25 @@ describe('agent sessions survive thread switches', () => {
     expect(restarts(codex)).toBe(before);
   });
 
+  it('does not restore an idle Codex session with live background work', async () => {
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const before = restarts(codex);
+    await sendPrompt('Background task');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Background task started.'),
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await switchAwayAndBack('Continuity codex', 'Codex sibling', 2);
+    expect(restarts(codex)).toBe(before);
+    writeFileSync(join(codex, 'codex-background-release.txt'), 'release\n');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Background task started. Background task finished.'),
+      { wait: 15_000 },
+    );
+    expect(restarts(codex)).toBe(before);
+  });
+
   it('keeps the parent transcript after visiting its native child', async () => {
     await openThread('Continuity main');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));

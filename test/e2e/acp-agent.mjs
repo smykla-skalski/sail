@@ -888,14 +888,22 @@ for await (const line of createInterface({ input: process.stdin })) {
         content: { type: 'text', text: 'Background task started.' },
       });
       send({ id: message.id, result: { stopReason: 'end_turn' } });
-      const timer = setTimeout(() => {
+      const started = Date.now();
+      const finish = () => {
         stop();
+        clearInterval(timer);
         recordUpdate(sessionId, sessionId, {
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: ' Background task finished.' },
         });
-      }, 6000);
-      const stop = trackWork(sessionId, () => clearTimeout(timer));
+      };
+      const timer = setInterval(() => {
+        if (agent === 'codex') {
+          if (existsSync(join(sessions.get(sessionId).cwd, 'codex-background-release.txt')))
+            finish();
+        } else if (Date.now() - started >= 6000) finish();
+      }, 100);
+      const stop = trackWork(sessionId, () => clearInterval(timer));
       continue;
     }
     if (text === 'Second live subagent') {
