@@ -1650,7 +1650,7 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
   } catch {
     return { runs: [], unparsed: raw?.trim() ? [raw] : [] };
   }
-  if (!Array.isArray(value)) return { runs: [], unparsed: value == null ? [] : [value] };
+  if (!Array.isArray(value)) return { runs: [], unparsed: [value] };
   const runs: ShipRun[] = [];
   const unparsed: unknown[] = [];
   for (const item of value) {

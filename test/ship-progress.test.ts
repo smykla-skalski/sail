@@ -315,7 +315,7 @@ void test('saving keeps stored runs that cannot be parsed', () => {
   assert.deepEqual(reloaded.unparsed, [broken]);
   assert.equal(reloaded.runs.length, 1);
 
-  for (const raw of ['{', '{"not":"a list"}']) {
+  for (const raw of ['{', '{"not":"a list"}', 'null']) {
     const corrupt = loadShipRunStore(raw);
     assert.deepEqual(corrupt.runs, []);
     assert.equal(corrupt.unparsed.length, 1, raw);
