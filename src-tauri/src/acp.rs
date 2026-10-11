@@ -418,6 +418,7 @@ struct Connection {
     capabilities: Mutex<Value>,
     session_directories: Mutex<HashMap<String, PathBuf>>,
     session_configs: Mutex<HashMap<String, SessionConfig>>,
+    per_load_tokens: Mutex<HashMap<String, Vec<String>>>,
     native_subagents: Mutex<NativeSubagentRegistry>,
     session_profiles: Mutex<HashMap<String, CapabilityProfile>>,
     pending_directory: Mutex<Option<PathBuf>>,
@@ -495,11 +496,75 @@ fn reuse_session_config(
     Ok(next)
 }
 
+fn store_session_config(
+    alive: &AtomicBool,
+    configs: &mut HashMap<String, SessionConfig>,
+    session_id: &str,
+    config: SessionConfig,
+    mut release: impl FnMut(&str),
+) -> bool {
+    if !alive.load(Ordering::Acquire) {
+        release(&config.token);
+        return false;
+    }
+    if let Some(previous) = configs.insert(session_id.to_string(), config) {
+        release(&previous.token);
+    }
+    true
+}
+
+fn store_per_load_token(
+    alive: &AtomicBool,
+    tokens: &mut HashMap<String, Vec<String>>,
+    session_id: &str,
+    token: String,
+    mut release: impl FnMut(&str),
+) -> bool {
+    if !alive.load(Ordering::Acquire) {
+        release(&token);
+        return false;
+    }
+    tokens
+        .entry(session_id.to_string())
+        .or_default()
+        .push(token);
+    true
+}
+
+fn release_session_tokens(
+    tokens: &mut HashMap<String, Vec<String>>,
+    session_id: &str,
+    mut release: impl FnMut(&str),
+) {
+    if let Some(session_tokens) = tokens.remove(session_id) {
+        for token in session_tokens {
+            release(&token);
+        }
+    }
+}
+
+fn release_all_per_load_tokens(
+    tokens: &mut HashMap<String, Vec<String>>,
+    mut release: impl FnMut(&str),
+) {
+    for (_, session_tokens) in tokens.drain() {
+        for token in session_tokens {
+            release(&token);
+        }
+    }
+}
+
 /// Returns the parameters to send for a restored session. Reuse keeps the adapter's live session;
 /// `per_load` is the documented rollback switch and mints a fresh config for every load.
+struct RestoreConfigState<'a> {
+    alive: &'a AtomicBool,
+    configs: &'a mut HashMap<String, SessionConfig>,
+    per_load_tokens: &'a mut HashMap<String, Vec<String>>,
+}
+
 fn restore_params(
     per_load: bool,
-    configs: &mut HashMap<String, SessionConfig>,
+    state: RestoreConfigState<'_>,
     session_id: &str,
     cwd: &str,
     mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
@@ -508,9 +573,18 @@ fn restore_params(
     if per_load {
         let config = mint()?;
         let servers = session_servers(mcp_server(&config));
+        if !store_per_load_token(
+            state.alive,
+            state.per_load_tokens,
+            session_id,
+            config.token,
+            release,
+        ) {
+            return Err("Agent process stopped. Reopen the thread to reconnect.".into());
+        }
         return Ok(session_request_params(cwd, Some(session_id), &servers));
     }
-    let config = reuse_session_config(configs, session_id, cwd, mint, release)?;
+    let config = reuse_session_config(state.configs, session_id, cwd, mint, release)?;
     Ok(session_request_params(
         &config.cwd,
         Some(session_id),
@@ -2967,6 +3041,7 @@ fn connect_blocking_inner(
         capabilities: Mutex::new(Value::Null),
         session_directories: Mutex::new(HashMap::new()),
         session_configs: Mutex::new(HashMap::new()),
+        per_load_tokens: Mutex::new(HashMap::new()),
         native_subagents: Mutex::new(NativeSubagentRegistry::default()),
         session_profiles: Mutex::new(HashMap::new()),
         pending_directory: Mutex::new(None),
@@ -3251,6 +3326,10 @@ fn connect_blocking_inner(
                 browser.release(&config.token);
             }
         }
+        if let Ok(mut tokens) = reader.per_load_tokens.lock() {
+            let browser = app.state::<crate::browser_agent::BrowserManager>();
+            release_all_per_load_tokens(&mut tokens, |token| browser.release(token));
+        }
         let mut session_ids = reader
             .session_profiles
             .lock()
@@ -3507,28 +3586,40 @@ pub async fn acp_new_session(
             let _ = fence.finish_session(&directory, native_generation);
             return Err("Agent did not return a session ID.".into());
         };
-        if !per_load_mcp() {
+        if per_load_mcp() {
+            let mut tokens = runtime
+                .per_load_tokens
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if !store_per_load_token(
+                &runtime.alive,
+                &mut tokens,
+                id,
+                config.token.clone(),
+                |token| browser.release(token),
+            ) {
+                let _ = fence.finish_session(&directory, native_generation);
+                return Err("Agent process stopped. Reopen the thread to reconnect.".into());
+            }
+        } else {
             let mut configs = runtime
                 .session_configs
                 .lock()
                 .map_err(|error| error.to_string())?;
-            // The reader drains this map when it exits, so a config stored for a stopped agent
-            // would keep its token for the life of the process.
-            if runtime.alive.load(Ordering::Acquire) {
-                let previous = configs.insert(
-                    id.to_string(),
-                    SessionConfig {
-                        cwd: cwd.clone(),
-                        directory: canonical_directory(&cwd),
-                        servers,
-                        token: config.token.clone(),
-                    },
-                );
-                if let Some(previous) = previous {
-                    browser.release(&previous.token);
-                }
-            } else {
-                browser.release(&config.token);
+            if !store_session_config(
+                &runtime.alive,
+                &mut configs,
+                id,
+                SessionConfig {
+                    cwd: cwd.clone(),
+                    directory: canonical_directory(&cwd),
+                    servers,
+                    token: config.token.clone(),
+                },
+                |token| browser.release(token),
+            ) {
+                let _ = fence.finish_session(&directory, native_generation);
+                return Err("Agent process stopped. Reopen the thread to reconnect.".into());
             }
         }
         if let Err(error) = register_session(&manager, &agent, profile, id, directory.clone()) {
@@ -3594,6 +3685,11 @@ pub fn acp_forget_session(
         if let Some(config) = removed {
             browser.release(&config.token);
         }
+        let mut tokens = runtime
+            .per_load_tokens
+            .lock()
+            .map_err(|error| error.to_string())?;
+        release_session_tokens(&mut tokens, &session_id, |token| browser.release(token));
     }
     Ok(())
 }
@@ -3724,9 +3820,17 @@ async fn restore_session(
             if !runtime.alive.load(Ordering::Acquire) {
                 return Err("Agent process stopped. Reopen the thread to reconnect.".to_string());
             }
+            let mut tokens = runtime
+                .per_load_tokens
+                .lock()
+                .map_err(|error| error.to_string())?;
             restore_params(
                 per_load_mcp(),
-                &mut configs,
+                RestoreConfigState {
+                    alive: &runtime.alive,
+                    configs: &mut configs,
+                    per_load_tokens: &mut tokens,
+                },
                 &session_id,
                 &cwd,
                 || {
@@ -4486,6 +4590,7 @@ mod session_config_tests {
                 worktree.to_path_buf(),
             )])),
             session_configs: Mutex::new(HashMap::new()),
+            per_load_tokens: Mutex::new(HashMap::new()),
             native_subagents: Mutex::new(NativeSubagentRegistry::default()),
             session_profiles: Mutex::new(HashMap::from([(session_id.to_owned(), profile)])),
             pending_directory: Mutex::new(None),
@@ -4686,6 +4791,7 @@ mod session_config_tests {
                 capabilities: Mutex::new(Value::Null),
                 session_directories: Mutex::new(HashMap::new()),
                 session_configs: Mutex::new(HashMap::new()),
+                per_load_tokens: Mutex::new(HashMap::new()),
                 native_subagents: Mutex::new(NativeSubagentRegistry::default()),
                 session_profiles: Mutex::new(HashMap::new()),
                 pending_directory: Mutex::new(None),
@@ -4820,11 +4926,17 @@ mod session_config_tests {
     #[test]
     fn the_per_load_switch_mints_parameters_for_every_load() {
         let mut configs = HashMap::new();
+        let mut tokens = HashMap::new();
+        let alive = AtomicBool::new(true);
         let mut minted = 0;
         let mut released = 0;
         let first = restore_params(
             true,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             "/work/repo",
             || {
@@ -4836,7 +4948,11 @@ mod session_config_tests {
         .unwrap();
         let second = restore_params(
             true,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             "/work/repo",
             || {
@@ -4849,7 +4965,74 @@ mod session_config_tests {
         assert_eq!(minted, 2);
         assert_eq!(released, 0);
         assert!(configs.is_empty());
+        assert_eq!(tokens["session"], ["first", "second"]);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_stopped_agent_releases_the_config_instead_of_storing_it() {
+        let alive = AtomicBool::new(false);
+        let mut configs = HashMap::new();
+        let mut released = Vec::new();
+        let stored = store_session_config(
+            &alive,
+            &mut configs,
+            "session",
+            SessionConfig {
+                cwd: "/work/repo".into(),
+                directory: PathBuf::from("/work/repo"),
+                servers: vec![],
+                token: "stopped".into(),
+            },
+            |token| released.push(token.to_string()),
+        );
+        assert!(!stored);
+        assert!(configs.is_empty());
+        assert_eq!(released, ["stopped"]);
+    }
+
+    #[test]
+    fn a_stopped_agent_releases_a_new_per_load_token() {
+        let alive = AtomicBool::new(false);
+        let mut configs = HashMap::new();
+        let mut tokens = HashMap::new();
+        let mut released = Vec::new();
+        let result = restore_params(
+            true,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
+            "session",
+            "/work/repo",
+            || Ok(config("stopped", &[])),
+            |token| released.push(token.to_string()),
+        );
+        assert!(result.is_err());
+        assert!(tokens.is_empty());
+        assert_eq!(released, ["stopped"]);
+    }
+
+    #[test]
+    fn per_load_tokens_are_released_on_forget_and_reader_exit() {
+        let mut tokens = HashMap::from([
+            (
+                "first".to_string(),
+                vec!["new".to_string(), "load".to_string()],
+            ),
+            ("second".to_string(), vec!["other".to_string()]),
+        ]);
+        let mut released = Vec::new();
+        release_session_tokens(&mut tokens, "first", |token| {
+            released.push(token.to_string())
+        });
+        assert_eq!(released, ["new", "load"]);
+        assert_eq!(tokens["second"], ["other"]);
+
+        release_all_per_load_tokens(&mut tokens, |token| released.push(token.to_string()));
+        assert_eq!(released, ["new", "load", "other"]);
+        assert!(tokens.is_empty());
     }
 
     #[test]
@@ -4857,10 +5040,16 @@ mod session_config_tests {
         let directory = scratch("restore");
         let cwd = directory.to_string_lossy().into_owned();
         let mut configs = HashMap::new();
+        let mut tokens = HashMap::new();
+        let alive = AtomicBool::new(true);
         let mut minted = 0;
         let first = restore_params(
             false,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             &cwd,
             || {
@@ -4872,7 +5061,11 @@ mod session_config_tests {
         .unwrap();
         let second = restore_params(
             false,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             &cwd,
             || {
@@ -5043,6 +5236,7 @@ mod native_subagent_fence_tests {
             capabilities: Mutex::new(Value::Null),
             session_directories: Mutex::new(HashMap::new()),
             session_configs: Mutex::new(HashMap::new()),
+            per_load_tokens: Mutex::new(HashMap::new()),
             native_subagents: Mutex::new(NativeSubagentRegistry::default()),
             session_profiles: Mutex::new(HashMap::new()),
             pending_directory: Mutex::new(None),
