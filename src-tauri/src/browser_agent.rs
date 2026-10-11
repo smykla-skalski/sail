@@ -121,6 +121,7 @@ impl BrowserManager {
         session: Option<&str>,
         agent: Option<&str>,
         profile: Option<&str>,
+        background_priority: bool,
     ) -> Result<McpConfig, String> {
         let profile = profile
             .map(|value| {
@@ -130,6 +131,10 @@ impl BrowserManager {
             })
             .transpose()?;
         let mut config = self.config(directory, session, agent)?;
+        config.env.insert(
+            "SAIL_BACKGROUND_PRIORITY".into(),
+            background_priority.to_string(),
+        );
         if let Some(profile) = profile {
             config
                 .env
@@ -1247,6 +1252,7 @@ pub fn browser_project_access(
 
 #[tauri::command]
 pub fn browser_mcp_config(
+    app: AppHandle,
     manager: State<'_, BrowserManager>,
     directory: String,
     session: Option<String>,
@@ -1258,6 +1264,7 @@ pub fn browser_mcp_config(
         session.as_deref(),
         agent.as_deref(),
         profile.as_deref(),
+        crate::background_priority::enabled(&app),
     )
 }
 
@@ -2294,7 +2301,7 @@ mod skill_tests {
     #[test]
     fn invalid_profile_is_rejected_before_registering_a_client() {
         let manager = BrowserManager::default();
-        let error = match manager.config_for_profile("/not-used", None, None, Some("admin")) {
+        let error = match manager.config_for_profile("/not-used", None, None, Some("admin"), true) {
             Ok(_) => panic!("invalid profile was accepted"),
             Err(error) => error,
         };
@@ -2303,6 +2310,26 @@ mod skill_tests {
             "Unknown capability profile. Expected explore, review, build, or release."
         );
         assert!(manager.0.clients.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn native_browser_configs_honor_background_priority_setting() {
+        let manager = BrowserManager::default();
+        *manager.0.port.lock().unwrap() = 1;
+        let directory = std::env::temp_dir().canonicalize().unwrap();
+        let directory = directory.to_str().unwrap();
+        for enabled in [true, false] {
+            let config = manager
+                .config_for_profile(directory, None, Some("codex"), Some("build"), enabled)
+                .unwrap();
+            assert_eq!(
+                config
+                    .env
+                    .get("SAIL_BACKGROUND_PRIORITY")
+                    .map(String::as_str),
+                Some(if enabled { "true" } else { "false" })
+            );
+        }
     }
     use serde_json::json;
     use std::collections::BTreeSet;

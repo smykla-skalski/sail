@@ -818,6 +818,17 @@ pub fn handle(
             let cache_directory = data_directory.join("cache");
             std::fs::create_dir_all(&temp_directory).map_err(|error| error.to_string())?;
             std::fs::create_dir_all(&cache_directory).map_err(|error| error.to_string())?;
+            let background = crate::background_priority::enabled(app);
+            #[cfg(unix)]
+            let mut command =
+                if let Some(nice) = crate::background_priority::nice_program(background) {
+                    let mut command = Command::new(nice);
+                    command.args(["-n", "10"]).arg(&params.command);
+                    command
+                } else {
+                    Command::new(&params.command)
+                };
+            #[cfg(windows)]
             let mut command = Command::new(&params.command);
             command.args(&params.args).current_dir(directory);
             #[cfg(unix)]
@@ -860,6 +871,10 @@ pub fn handle(
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!("Cannot track command ownership: {error}"));
+            }
+            #[cfg(windows)]
+            if background {
+                crate::background_priority::lower_process(child.id());
             }
             storage_lease.mark_started();
             #[cfg(unix)]
