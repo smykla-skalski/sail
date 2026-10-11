@@ -1582,9 +1582,13 @@ mod tests {
         reconcile(&fixture.cache);
 
         assert!(directory.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "git-worktree-registration-still-present"));
+        let pending = cleanup_status(&fixture.cache);
+        assert!(
+            pending
+                .iter()
+                .any(|item| item.reason == "git-worktree-registration-still-present"),
+            "expected stale Git registration pending status, got {pending:?}"
+        );
     }
 
     #[test]
