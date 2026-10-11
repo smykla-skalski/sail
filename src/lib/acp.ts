@@ -137,8 +137,10 @@ export async function recoverMissingCodexSession<T>(
     return await prompt();
   } catch (cause) {
     const message = typeof cause === 'string' ? cause : cause instanceof Error ? cause.message : '';
-    if (agent !== 'codex' || !/(?:session|thread) (?:not found|missing)/i.test(message))
-      throw cause;
+    const missing =
+      /(?:session|thread) (?:not found|missing)/i.test(message) ||
+      message === 'Agent session is not connected in this worktree.';
+    if (agent !== 'codex' || !missing) throw cause;
     await resume();
     return prompt();
   }

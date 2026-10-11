@@ -634,6 +634,31 @@ describe('agent sessions survive thread switches', () => {
     );
   });
 
+  it('recovers Codex after a manual history load fails', async () => {
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await sendPrompt('Discuss interruption');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('The previous step was interrupted, then recovered.'),
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.refresh();
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const before = occurrences(await conversationText(), 'then recovered.');
+    const failLoad = join(codex, 'codex-fail-next-load.txt');
+    writeFileSync(failLoad, 'fail\n');
+    await $('.agent-history-gap button').click();
+    await browser.waitUntil(() => !existsSync(failLoad));
+    await expect($('.agent-history-gap button')).toBeDisplayed();
+    await sendPrompt('Discuss interruption');
+    await browser.waitUntil(async () => {
+      const text = await conversationText();
+      return occurrences(text, 'then recovered.') === before + 1;
+    });
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+  });
+
   it('keeps the parent transcript after visiting its native child', async () => {
     await openThread('Continuity main');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));

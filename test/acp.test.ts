@@ -52,11 +52,32 @@ void test('a stale Codex session resumes before retrying its prompt', async () =
   assert.deepEqual(calls, ['prompt', 'resume', 'prompt']);
 });
 
+void test('a failed history load can restore Codex backend registration on send', async () => {
+  const calls: string[] = [];
+  let registered = false;
+  const response = await recoverMissingCodexSession(
+    'codex',
+    async () => {
+      calls.push('prompt');
+      if (!registered) throw new Error('Agent session is not connected in this worktree.');
+      return 'sent';
+    },
+    async () => {
+      calls.push('resume');
+      registered = true;
+    },
+  );
+  assert.equal(response, 'sent');
+  assert.deepEqual(calls, ['prompt', 'resume', 'prompt']);
+});
+
 void test('prompt recovery leaves other errors and agents untouched', async () => {
   await Promise.all(
     [
       ['codex', 'Permission denied'],
+      ['codex', 'Agent session is not connected in another worktree.'],
       ['claude', 'Session not found: claude-test'],
+      ['claude', 'Agent session is not connected in this worktree.'],
     ].map(async ([agent, message]) => {
       let resumes = 0;
       await assert.rejects(
@@ -77,23 +98,29 @@ void test('prompt recovery leaves other errors and agents untouched', async () =
 });
 
 void test('a missing Codex session is retried only once', async () => {
-  let prompts = 0;
-  let resumes = 0;
-  await assert.rejects(
-    recoverMissingCodexSession(
-      'codex',
-      async () => {
-        prompts += 1;
-        throw new Error('Session not found: codex-test');
-      },
-      async () => {
-        resumes += 1;
+  await Promise.all(
+    ['Session not found: codex-test', 'Agent session is not connected in this worktree.'].map(
+      async (message) => {
+        let prompts = 0;
+        let resumes = 0;
+        await assert.rejects(
+          recoverMissingCodexSession(
+            'codex',
+            async () => {
+              prompts += 1;
+              throw new Error(message);
+            },
+            async () => {
+              resumes += 1;
+            },
+          ),
+          { message },
+        );
+        assert.equal(prompts, 2);
+        assert.equal(resumes, 1);
       },
     ),
-    { message: 'Session not found: codex-test' },
   );
-  assert.equal(prompts, 2);
-  assert.equal(resumes, 1);
 });
 
 void test('scoped ACP disconnect only affects sessions from the exited connection', () => {

@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
@@ -373,6 +373,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         },
       });
   } else if (message.method === 'session/load') {
+    const failLoad = join(message.params.cwd, 'codex-fail-next-load.txt');
+    if (agent === 'codex' && existsSync(failLoad)) {
+      unlinkSync(failLoad);
+      send({ id: message.id, error: { code: -32002, message: 'Injected history load failure' } });
+      continue;
+    }
     adoptExternalSession(message.params.sessionId, message.params.cwd);
     applyClaudeDefaults(message.params.sessionId);
     const session = sessions.get(message.params.sessionId);
