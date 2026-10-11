@@ -31,8 +31,6 @@ pub struct PreparedChange {
     artifact: PathBuf,
     worktree: PathBuf,
     destination: PathBuf,
-    before: String,
-    after: String,
     revision: String,
     reference: String,
     tree: String,
@@ -41,6 +39,10 @@ pub struct PreparedChange {
 impl PreparedChange {
     pub fn worktree(&self) -> &Path {
         &self.worktree
+    }
+
+    pub fn destination(&self) -> &Path {
+        &self.destination
     }
 
     pub fn artifact(&self) -> &Path {
@@ -259,8 +261,6 @@ fn accept_with<F: FnOnce(), G: FnOnce(&Path, &str, &str)>(
             artifact,
             worktree,
             destination: proposal.destination.clone(),
-            before: proposal.before.clone(),
-            after: proposal.after.clone(),
             revision: proposal.revision.clone(),
             reference,
             tree,
@@ -277,25 +277,10 @@ fn accept_with<F: FnOnce(), G: FnOnce(&Path, &str, &str)>(
         }
         Ok(prepared) => {
             if let Err(error) = fs::remove_file(scratch.join("index")) {
-                fs::write(prepared.worktree.join(&prepared.destination), &prepared.before)
-                    .map_err(|cleanup| {
-                        format!(
-                            "Cannot remove temporary index: {error}; worktree retained at {}: {cleanup}",
-                            prepared.worktree.display()
-                        )
-                    })?;
-                remove_worktree(&prepared.repository, &prepared.worktree)?;
-                delete_tree_ref(&prepared.artifact, &prepared.reference, &prepared.tree).map_err(
-                    |_| {
-                        format!(
-                            "Cannot remove temporary index; artifact retained at {}.",
-                            prepared.artifact.display()
-                        )
-                    },
-                )?;
-                fs::remove_dir_all(&scratch)
-                    .map_err(|cleanup| format!("Cannot remove proposal artifact: {cleanup}"))?;
-                return Err(format!("Cannot remove temporary proposal index: {error}"));
+                return Err(format!(
+                    "Cannot remove temporary proposal index: {error}; worktree retained at {}",
+                    prepared.worktree.display()
+                ));
             }
             Ok(prepared)
         }
@@ -309,37 +294,9 @@ pub fn discard(repository: &Path, prepared: &PreparedChange) -> Result<(), Strin
     if root != prepared.repository {
         return Err("Prepared change belongs to another repository.".into());
     }
-    if git(&prepared.artifact, &["rev-parse", &prepared.reference])? != prepared.tree {
-        return Err("Proposal ref changed; inspect it before discarding.".into());
-    }
-    let status = git_command()
-        .arg("-C")
-        .arg(&prepared.worktree)
-        .args(["status", "--porcelain", "-z"])
-        .output()
-        .map_err(|_| "Cannot inspect prepared worktree.")?;
-    let expected_status = format!(" M {}\0", prepared.destination.display());
-    if git(&prepared.worktree, &["rev-parse", "--verify", "HEAD"])? != prepared.revision
-        || read_document(&prepared.worktree.join(&prepared.destination))? != prepared.after
-        || !status.status.success()
-        || status.stdout != expected_status.as_bytes()
-    {
-        return Err("Prepared worktree changed; review it before discarding.".into());
-    }
-    fs::write(
-        prepared.worktree.join(&prepared.destination),
-        &prepared.before,
-    )
-    .map_err(|error| format!("Cannot reset proposal worktree: {error}"))?;
-    remove_worktree(&root, &prepared.worktree)?;
     delete_tree_ref(&prepared.artifact, &prepared.reference, &prepared.tree)?;
-    fs::remove_dir_all(
-        prepared
-            .artifact
-            .parent()
-            .ok_or("Invalid proposal artifact.")?,
-    )
-    .map_err(|error| format!("Cannot remove proposal artifact: {error}"))
+    fs::remove_dir_all(&prepared.artifact)
+        .map_err(|error| format!("Cannot remove proposal artifact: {error}"))
 }
 
 fn materialize_worktree(root: &Path, proposal: &Proposal, worktree: &Path) -> Result<(), String> {
@@ -358,10 +315,28 @@ fn materialize_worktree(root: &Path, proposal: &Proposal, worktree: &Path) -> Re
         if read_document(&worktree.join(&proposal.destination))? != proposal.before {
             return Err("Proposal worktree content differs from the reviewed text.".into());
         }
+        if !git(
+            worktree,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )?
+        .is_empty()
+        {
+            return Err("Proposal worktree contains changes from checkout.".into());
+        }
         check_source(root, proposal)?;
         fs::write(worktree.join(&proposal.destination), &proposal.after)
             .map_err(|error| format!("Cannot prepare proposal worktree: {error}"))?;
         check_source(root, proposal)?;
+        let expected_status = format!(" M {}\0", proposal.destination.display());
+        let status = git_command()
+            .arg("-C")
+            .arg(worktree)
+            .args(["status", "--porcelain", "-z", "--untracked-files=all"])
+            .output()
+            .map_err(|_| "Cannot inspect proposal worktree.")?;
+        if !status.status.success() || status.stdout != expected_status.as_bytes() {
+            return Err("Proposal worktree contains unexpected changes.".into());
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -859,6 +834,23 @@ mod tests {
                 if prepared.artifact().exists() {
                     discard(&self.0, prepared).unwrap();
                 }
+                if prepared.worktree().exists() {
+                    let base = git_command()
+                        .arg("-C")
+                        .arg(prepared.worktree())
+                        .arg("show")
+                        .arg(format!("HEAD:{}", prepared.destination().display()))
+                        .output()
+                        .unwrap();
+                    assert!(base.status.success());
+                    fs::write(
+                        prepared.worktree().join(prepared.destination()),
+                        base.stdout,
+                    )
+                    .unwrap();
+                    remove_worktree(&self.0, prepared.worktree()).unwrap();
+                    fs::remove_dir_all(prepared.worktree().parent().unwrap()).unwrap();
+                }
             }
             fs::remove_dir_all(&self.0).unwrap();
         }
@@ -1269,12 +1261,40 @@ mod tests {
         let repo = Repo::new();
         let prepared = repo.accept(&repo.preview(), true).unwrap();
         fs::write(prepared.worktree().join("AGENTS.md"), "editor's revision\n").unwrap();
-        assert!(discard(&repo.0, &prepared).is_err());
+        discard(&repo.0, &prepared).unwrap();
         assert_eq!(
             fs::read_to_string(prepared.worktree().join("AGENTS.md")).unwrap(),
             "editor's revision\n"
         );
-        fs::write(prepared.worktree().join("AGENTS.md"), &prepared.after).unwrap();
+        assert!(!prepared.artifact().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_hook_change_rejects_acceptance() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = Repo::new();
+        let hook = repo.0.join(".git/hooks/post-checkout");
+        fs::write(&hook, "#!/bin/sh\nprintf 'hook output\\n' > extra.txt\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = repo.accept(&repo.preview(), true).unwrap_err();
+        assert!(error.contains("retained"), "{error}");
+        assert!(git(&repo.0, &["status", "--porcelain"]).unwrap().is_empty());
+
+        let list = git(&repo.0, &["worktree", "list", "--porcelain"]).unwrap();
+        let worktree = PathBuf::from(
+            list.lines()
+                .filter_map(|line| line.strip_prefix("worktree "))
+                .nth(1)
+                .unwrap(),
+        );
+        assert_eq!(
+            git(&worktree, &["status", "--porcelain"]).unwrap(),
+            "?? extra.txt"
+        );
+        fs::remove_file(worktree.join("extra.txt")).unwrap();
+        remove_worktree(&repo.0, &worktree).unwrap();
+        fs::remove_dir_all(worktree.parent().unwrap()).unwrap();
     }
 
     #[test]
