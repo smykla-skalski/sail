@@ -1495,6 +1495,8 @@ struct PromptState {
     finished: HashMap<String, PromptOutcome>,
     forgotten: HashSet<String>,
     forget_generation: HashMap<String, u64>,
+    pending_forgets: HashMap<String, usize>,
+    committed_forgets: HashSet<String>,
     tool_turns: HashMap<String, HashMap<String, String>>,
     retired_tool_turns: HashMap<String, VecDeque<(String, String)>>,
 }
@@ -1506,16 +1508,48 @@ impl PromptState {
     fn mark_forgotten(&mut self, session_id: &str) {
         self.forgotten.insert(session_id.to_string());
         *self
+            .pending_forgets
+            .entry(session_id.to_string())
+            .or_default() += 1;
+        *self
             .forget_generation
             .entry(session_id.to_string())
             .or_default() += 1;
+    }
+
+    fn finish_forget(&mut self, session_id: &str, committed: bool) {
+        let Some(pending) = self.pending_forgets.get_mut(session_id) else {
+            return;
+        };
+        *pending -= 1;
+        if *pending == 0 {
+            self.pending_forgets.remove(session_id);
+        }
+        if committed {
+            self.committed_forgets.insert(session_id.to_string());
+        } else if !self.pending_forgets.contains_key(session_id)
+            && !self.committed_forgets.contains(session_id)
+        {
+            self.forgotten.remove(session_id);
+        }
+    }
+
+    fn ensure_prompt_available(&self, session_id: &str) -> Result<(), String> {
+        if self.forgotten.contains(session_id) {
+            return Err("This agent thread was deleted.".into());
+        }
+        Ok(())
     }
 
     fn complete_restore(&mut self, session_id: &str, generation: u64) -> Result<(), String> {
         if self.forget_generation.get(session_id).copied().unwrap_or(0) != generation {
             return Err("This agent thread was deleted while reconnecting.".into());
         }
+        if self.pending_forgets.contains_key(session_id) {
+            return Err("This agent thread is being deleted.".into());
+        }
         self.forgotten.remove(session_id);
+        self.committed_forgets.remove(session_id);
         Ok(())
     }
 
@@ -1792,6 +1826,12 @@ mod interruption_report_tests {
         assert!(started.elapsed() >= Duration::from_millis(150));
         assert!(!state.lock().unwrap().active.contains_key("target"));
         assert!(state.lock().unwrap().forgotten.contains("target"));
+        state.lock().unwrap().finish_forget("target", true);
+        assert!(state
+            .lock()
+            .unwrap()
+            .ensure_prompt_available("target")
+            .is_err());
     }
 
     #[test]
@@ -1809,7 +1849,59 @@ mod interruption_report_tests {
 
         assert_eq!(result.unwrap_err(), "cancel failed");
         assert!(state.lock().unwrap().active.contains_key("target"));
-        assert!(state.lock().unwrap().forgotten.contains("target"));
+        assert!(!state.lock().unwrap().forgotten.contains("target"));
+        state.lock().unwrap().active.remove("target");
+        assert!(state
+            .lock()
+            .unwrap()
+            .ensure_prompt_available("target")
+            .is_ok());
+    }
+
+    #[test]
+    fn timeout_keeps_token_and_allows_prompt_after_turn_settles() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Mutex::new(prompts);
+
+        let result = cancel_before_forget(&state, "target", || Ok(()), Duration::ZERO);
+
+        assert_eq!(
+            result.unwrap_err(),
+            "Agent turn did not stop; browser token remains active."
+        );
+        assert!(!state.lock().unwrap().forgotten.contains("target"));
+        state.lock().unwrap().active.remove("target");
+        assert!(state
+            .lock()
+            .unwrap()
+            .ensure_prompt_available("target")
+            .is_ok());
+    }
+
+    #[test]
+    fn failed_forget_cannot_clear_another_pending_or_committed_deletion() {
+        let mut prompts = PromptState::default();
+        prompts.mark_forgotten("target");
+        prompts.mark_forgotten("target");
+
+        prompts.finish_forget("target", false);
+        assert!(prompts.ensure_prompt_available("target").is_err());
+        assert!(prompts.complete_restore("target", 2).is_err());
+        prompts.finish_forget("target", true);
+        assert!(prompts.ensure_prompt_available("target").is_err());
+
+        prompts.mark_forgotten("target");
+        prompts.finish_forget("target", false);
+        assert!(prompts.ensure_prompt_available("target").is_err());
+
+        let mut retryable = PromptState::default();
+        retryable.mark_forgotten("target");
+        retryable.mark_forgotten("target");
+        retryable.finish_forget("target", false);
+        assert!(retryable.ensure_prompt_available("target").is_err());
+        retryable.finish_forget("target", false);
+        assert!(retryable.ensure_prompt_available("target").is_ok());
     }
 
     #[test]
@@ -1837,6 +1929,7 @@ mod interruption_report_tests {
         let prompts = Mutex::new(PromptState::default());
         manager.mark_forget("claude", directory, "target").unwrap();
         prompts.lock().unwrap().mark_forgotten("target");
+        prompts.lock().unwrap().finish_forget("target", true);
         // The restore reaches the runtime after deletion, so its local snapshot is current.
         let restore_generation = prompts.lock().unwrap().forget_generation["target"];
 
@@ -3936,25 +4029,34 @@ fn cancel_before_forget(
         prompts.mark_forgotten(session_id);
         prompts.active.contains_key(session_id)
     };
-    if !active {
-        return Ok(());
-    }
-    cancel()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if !prompts
-            .lock()
-            .map_err(|error| error.to_string())?
-            .active
-            .contains_key(session_id)
-        {
+    let result = (|| {
+        if !active {
             return Ok(());
         }
-        if Instant::now() >= deadline {
-            return Err("Agent turn did not stop; browser token remains active.".into());
+        cancel()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !prompts
+                .lock()
+                .map_err(|error| error.to_string())?
+                .active
+                .contains_key(session_id)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("Agent turn did not stop; browser token remains active.".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
+    })();
+    if result.is_err() {
+        prompts
+            .lock()
+            .map_err(|error| error.to_string())?
+            .finish_forget(session_id, false);
     }
+    result
 }
 
 fn complete_restore_if_current(
@@ -4000,7 +4102,7 @@ pub async fn acp_forget_session(
         let waiting_session = session_id.clone();
         let waiting_agent = agent.clone();
         let waiting_app = app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        let stopped = tauri::async_runtime::spawn_blocking(move || {
             cancel_before_forget(
                 &waiting.prompt_state,
                 &waiting_session,
@@ -4016,16 +4118,38 @@ pub async fn acp_forget_session(
                 Duration::from_secs(30),
             )
         })
-        .await
-        .map_err(|error| error.to_string())??;
-        let removed = runtime
-            .session_configs
-            .lock()
-            .map_err(|error| error.to_string())?
-            .remove(&session_id);
+        .await;
+        match stopped {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                runtime
+                    .prompt_state
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(&session_id, false);
+                return Err(error.to_string());
+            }
+        }
+        let removed = match runtime.session_configs.lock() {
+            Ok(mut configs) => configs.remove(&session_id),
+            Err(error) => {
+                runtime
+                    .prompt_state
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(&session_id, false);
+                return Err(error.to_string());
+            }
+        };
         if let Some(config) = removed {
             browser.release(&config.token);
         }
+        runtime
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .finish_forget(&session_id, true);
     }
     Ok(())
 }
@@ -4303,9 +4427,7 @@ pub async fn acp_prompt(
             .prompt_state
             .lock()
             .map_err(|error| error.to_string())?;
-        if prompts.forgotten.contains(&session_id) {
-            return Err("This agent thread was deleted.".into());
-        }
+        prompts.ensure_prompt_available(&session_id)?;
         if prompts.active.contains_key(&session_id) || prompts.finishing.contains(&session_id) {
             return Err("This agent thread already has an active turn.".to_string());
         }
