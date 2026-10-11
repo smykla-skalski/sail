@@ -533,7 +533,34 @@ describe('Ship queue, archive and actions', () => {
       return fits;
     });
     expect(zoomFits).toBe(true);
+    state.pulls['fixture/repo#9'].state = 'open';
+    writeFileSync(join(fakeGh, 'state.json'), JSON.stringify(state));
     await replacement.$('.confirmation-primary').click();
+    await expect($('[data-ship-result]')).toHaveText(
+      expect.stringContaining('The original pull request reopened before replacement'),
+    );
+    const retained = (await storedRuns())
+      .find((run) => run.id === 'active-run')!
+      .issues.find((item) => item.id === 'closed')!;
+    expect(retained.branch).toBe('closed');
+    expect(retained.pullRequest).toBe('https://github.com/fixture/repo/pull/9');
+    expect(retained.path).toBeNull();
+    expect(
+      execFileSync('git', ['-C', repository, 'branch', '--list', 'ship-issue-15-replacement-9'], {
+        encoding: 'utf8',
+      }).trim(),
+    ).toBe('');
+    state.pulls['fixture/repo#9'].state = 'closed';
+    writeFileSync(join(fakeGh, 'state.json'), JSON.stringify(state));
+    await row('closed').$('[data-ship-action="reopen"]').click();
+    await expect($('.confirmation-dialog h2')).toHaveText(
+      expect.stringMatching(/Reopen pull request #9 for #15 Closed fixture\?/),
+    );
+    await $('.confirmation-dialog .confirmation-primary').click();
+    await expect($('.confirmation-dialog h2')).toHaveText(
+      expect.stringContaining('Start a replacement'),
+    );
+    await $('.confirmation-dialog .confirmation-primary').click();
     await expect($('[data-ship-result]')).toHaveText(
       expect.stringContaining('Replacement pull request queued'),
     );

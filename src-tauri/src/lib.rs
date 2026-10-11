@@ -1646,6 +1646,26 @@ fn replacement_shipping_worktree(
     if !target.eq_ignore_ascii_case(expected_repository) {
         return Err("The closed pull request belongs to another repository.".to_string());
     }
+    let endpoint = format!("repos/{target}/pulls/{pull_number}");
+    let details = github::gh_output(repository, &["api", &endpoint]).map_err(|error| {
+        format!("Cannot verify the original pull request before replacement. Refresh Ship and retry. {error}")
+    })?;
+    let details: serde_json::Value = serde_json::from_str(&details).map_err(|_| {
+        "Cannot verify the original pull request before replacement. GitHub returned invalid details."
+            .to_string()
+    })?;
+    if details["state"] == "open" {
+        return Err(
+            "The original pull request reopened before replacement. Refresh Ship and continue it."
+                .to_string(),
+        );
+    }
+    if details["state"] != "closed" || details["merged"] != false {
+        return Err(
+            "The original pull request is not confirmed closed without merging. Refresh Ship before replacement."
+                .to_string(),
+        );
+    }
     replacement_worktree_at_checkpoint(
         repository,
         issue_number,
