@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import { SvelteMap } from 'svelte/reactivity';
   import ActivityStatus from './ActivityStatus.svelte';
   import ShipActions from './ShipActions.svelte';
   import WorkerDependencyMap from './WorkerDependencyMap.svelte';
@@ -38,7 +39,6 @@
     shipTaskCriteria,
     shipTaskObjective,
     shipWorkerRequest,
-    type ShipDetailFallback,
     type ShipOrderSnapshot,
     type ShipRow,
   } from './lib/ship-list';
@@ -119,11 +119,11 @@
   const pinned = $derived(new Set([selectedIssue, focusedId].filter(Boolean)));
   const groups = $derived(shipGroups(rows, { showDone, pinned }));
   const visibleIds = $derived(groups.flatMap((group) => group.rows.map((row) => row.issue.id)));
-  // Kept once shown so a re-sort does not switch the detail to another issue.
-  const shown: { fallback: ShipDetailFallback | null } = { fallback: null };
-  const fallback = $derived(wide ? shipDetailFallback(run, rows, shown.fallback) : null);
+  // Keep each run's detail stable when its rows re-sort.
+  const shown = new SvelteMap<string, string>();
+  const fallback = $derived(wide ? shipDetailFallback(run, rows, shown) : null);
   $effect(() => {
-    if (fallback && !selectedIssue) shown.fallback = fallback;
+    if (fallback && !selectedIssue) shown.set(fallback.runId, fallback.issueId);
   });
   const issue = $derived(
     run?.issues.find((item) => item.id === selectedIssue) ??
