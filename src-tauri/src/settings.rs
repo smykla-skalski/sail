@@ -692,8 +692,10 @@ pub fn reset_test_settings(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(feature = "e2e")]
     {
         let path = settings_path(&app)?;
+        crate::post_turn_checks::quiesce_test_checks(&app)?;
         let _lock = lock_settings(&path)?;
-        write_settings(&path, &Settings::new())
+        write_settings(&path, &Settings::new())?;
+        crate::post_turn_checks::resume_test_checks(&app)
     }
     #[cfg(not(feature = "e2e"))]
     {
