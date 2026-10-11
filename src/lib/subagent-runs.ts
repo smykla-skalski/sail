@@ -180,7 +180,7 @@ function usage({ tokens, toolUses, durationMs }: TaskNotification): SubagentUsag
 function notificationRuns(transcripts: readonly ParentTranscript[]): SubagentRun[] {
   return transcripts.flatMap(({ agent, sessionId, directory, entries }) => {
     // Restored entries can lack a time; the parent's latest known one keeps them in order.
-    const latest = Math.max(0, ...entries.map((entry) => entry.created ?? 0));
+    const latest = entries.reduce((time, entry) => Math.max(time, entry.created ?? 0), 0);
     const notes = entries.flatMap((entry) =>
       entry.type === 'user'
         ? splitTaskNotifications(entry.text).flatMap((segment) =>

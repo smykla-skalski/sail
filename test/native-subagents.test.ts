@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { AgentEvent } from '../src/lib/acp.ts';
+import { acpToolFailure } from '../src/lib/acp-tool-failure.ts';
 import { automaticPermissionPolicy } from '../src/lib/capability-profiles.ts';
 import {
   disconnectNativeSubagents,
@@ -722,7 +723,7 @@ await test('a chunk appended to a long spawn prompt keeps the prompt start', () 
   assert.ok(first.text.endsWith('more'));
 });
 
-await test('structured tool input and output are capped as text', () => {
+await test('structured tool input and output keep metadata while capping large strings', () => {
   const big = 'Y'.repeat(100_000);
   const store = updateNativeSubagents(
     spawnedChild(),
@@ -741,10 +742,56 @@ await test('structured tool input and output are capped as text', () => {
     (entry) => entry.id === 'write',
   );
   assert.ok(tool?.type === 'tool');
-  assert.ok(typeof tool.input === 'string' && tool.input.length === nativeMessageLimit);
-  assert.ok(tool.input.startsWith('{"command":"write"'));
-  assert.ok(typeof tool.output === 'string' && tool.output.length === nativeMessageLimit);
-  assert.ok(tool.output.endsWith('"done":true}'));
+  assert.ok(tool.input && typeof tool.input === 'object' && 'content' in tool.input);
+  assert.equal(tool.input.command, 'write');
+  const content = tool.input.content;
+  assert.ok(typeof content === 'string');
+  assert.equal(content.length, nativeMessageLimit);
+  assert.ok(content.endsWith('…'));
+  assert.ok(tool.output && typeof tool.output === 'object' && 'stdout' in tool.output);
+  const stdout = tool.output.stdout;
+  assert.ok(typeof stdout === 'string');
+  assert.equal(stdout.length, nativeMessageLimit);
+  assert.ok(stdout.startsWith('…'));
+  assert.equal(tool.output.done, true);
+});
+
+await test('a bounded failed tool still exposes its rule and command', () => {
+  const store = updateNativeSubagents(
+    spawnedChild(),
+    event('child', {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'commit',
+      title: 'Run command',
+      status: 'failed',
+      rawInput: { command: 'git commit -s -S -m test', content: 'x'.repeat(100_000) },
+      rawOutput: {
+        hookName: 'klaudiush',
+        ruleName: 'GIT010',
+        hookPhase: 'PreToolUse',
+        reason: 'Commit rejected',
+        details: { stderr: 'y'.repeat(100_000) },
+      },
+    }),
+    '/repo',
+    2,
+  );
+  const tool = store[nativeSubagentId('codex', '/repo', 'child')].transcript.find(
+    (entry) => entry.id === 'commit',
+  );
+  assert.ok(tool?.type === 'tool');
+  const failure = acpToolFailure(tool);
+  assert.equal(failure?.kind, 'hook');
+  assert.equal(failure.event, 'PreToolUse');
+  assert.equal(failure.action, 'git commit -s -S -m test');
+  assert.equal(failure.rule, 'GIT010');
+  assert.equal(failure.reason, 'Commit rejected');
+  assert.ok(tool.output && typeof tool.output === 'object' && 'details' in tool.output);
+  const details = tool.output.details;
+  assert.ok(details && typeof details === 'object' && 'stderr' in details);
+  const stderr = details.stderr;
+  assert.ok(typeof stderr === 'string');
+  assert.equal(stderr.length, nativeMessageLimit);
 });
 
 await test('small structured tool values stay structured', () => {

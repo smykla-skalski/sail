@@ -117,11 +117,20 @@ function messageHead(text: string): string {
   return `${text.slice(0, code >= 0xd800 && code <= 0xdbff ? end - 1 : end)}…`;
 }
 
-/** Caps a raw tool value. Structured values over the limit become their capped JSON text, so a
- * tool's input keeps its leading fields and its output keeps the newest text. */
 function boundValue(value: unknown, cut: (text: string) => string): unknown {
-  const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return typeof text === 'string' && text.length > nativeMessageLimit ? cut(text) : value;
+  if (typeof value === 'string') return value.length > nativeMessageLimit ? cut(value) : value;
+  if (Array.isArray(value)) {
+    const bounded = value.map((item) => boundValue(item, cut));
+    return bounded.some((item, index) => item !== value[index]) ? bounded : value;
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value);
+    const bounded = entries.map(([key, item]) => [key, boundValue(item, cut)] as const);
+    return bounded.some(([, item], index) => item !== entries[index][1])
+      ? Object.fromEntries(bounded)
+      : value;
+  }
+  return value;
 }
 
 function boundEntry(entry: AgentEntry): AgentEntry {
