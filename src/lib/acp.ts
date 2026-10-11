@@ -822,7 +822,24 @@ function restoreSession(
   return request;
 }
 
-const queuedPrompts = new Map<string, { agent: string; directory: string; sessionId: string }>();
+type PendingTurn = {
+  agent: AgentId;
+  directory: string;
+  sessionId: string;
+  cancelled: boolean;
+};
+
+const queuedPrompts = new Map<string, PendingTurn>();
+const workspaceTurns = new Map<string, PendingTurn>();
+
+function cancelSessionQueues(agent: AgentId, directory: string, sessionId: string): void {
+  for (const [id, target] of [...workspaceTurns, ...queuedPrompts]) {
+    if (target.agent !== agent || target.directory !== directory || target.sessionId !== sessionId)
+      continue;
+    target.cancelled = true;
+    resourceQueues.agent.cancel(id);
+  }
+}
 
 function queuedPromptKey(
   agent: AgentId,
@@ -837,15 +854,31 @@ async function acquireTurnSlot(
   turnId: string,
   onQueue?: (limit: number | null, reason: string | null) => void,
   directory = '',
+  target?: { agent: AgentId; sessionId: string | null },
 ): Promise<() => void> {
   const queue = resourceQueues.agent;
+  const pending = target?.sessionId
+    ? { agent: target.agent, directory, sessionId: target.sessionId, cancelled: false }
+    : null;
+  if (pending) workspaceTurns.set(turnId, pending);
   if (queue.reason || queue.status.active >= queue.status.limit || queue.status.waiting)
     onQueue?.(queue.status.limit, queue.reason);
   const unsubscribe = queue.subscribe(() => {
     if (queue.isQueued(turnId)) onQueue?.(queue.status.limit, queue.reasonFor(turnId));
   });
   try {
-    return await queue.acquire(turnId, directory);
+    const release = await queue.acquire(turnId, directory);
+    if (pending?.cancelled) {
+      release();
+      throw new Error('Agent turn was cancelled.');
+    }
+    return () => {
+      if (workspaceTurns.get(turnId) === pending) workspaceTurns.delete(turnId);
+      release();
+    };
+  } catch (cause) {
+    if (workspaceTurns.get(turnId) === pending) workspaceTurns.delete(turnId);
+    throw cause;
   } finally {
     unsubscribe();
     onQueue?.(null, null);
@@ -887,24 +920,25 @@ async function limitedPrompt(
   onQueue?: (limit: number | null, reason: string | null) => void,
   slotHeld = false,
 ): Promise<AcpPromptOutcome> {
-  if (slotHeld)
+  if (slotHeld) {
+    if (workspaceTurns.get(turnId)?.cancelled) throw new Error('Agent turn was cancelled.');
     return invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
+  }
   const queueId = queuedPromptKey(agent, directory, sessionId, turnId);
-  queuedPrompts.set(queueId, { agent, directory, sessionId });
-  let release: () => void;
+  const pending = { agent, directory, sessionId, cancelled: false };
+  queuedPrompts.set(queueId, pending);
+  let release: (() => void) | null = null;
   try {
     release = await acquireTurnSlot(queueId, onQueue, directory);
-  } finally {
-    queuedPrompts.delete(queueId);
-  }
-  try {
+    if (pending.cancelled) throw new Error('Agent turn was cancelled.');
     return await invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
   } finally {
-    release();
+    queuedPrompts.delete(queueId);
+    release?.();
   }
 }
 
@@ -931,6 +965,7 @@ export const acp = {
   resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
     restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
   forget: (agent: AgentId, directory: string, sessionId: string) => {
+    cancelSessionQueues(agent, directory, sessionId);
     forgetSessionState(agent, directory, sessionId);
     forgetPlanningState({ agent, directory, sessionId });
     acpPlans().forget({ agent, directory, sessionId });

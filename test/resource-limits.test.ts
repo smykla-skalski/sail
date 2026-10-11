@@ -232,6 +232,87 @@ void test('Stop cancels queued workspace turns with or without a session', async
   }
 });
 
+void test('closed pane turns run when retained and cancel before deletion', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const settings = new Map<string, string>();
+  const invokes: { command: string; waiting: number }[] = [];
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string) => {
+          if (command === 'machine_pressure') return healthy;
+          invokes.push({ command, waiting: resourceQueues.agent.status.waiting });
+          return undefined;
+        },
+      },
+    },
+  });
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => settings.get(key) ?? null,
+      setItem: (key: string, value: string) => settings.set(key, value),
+    },
+  });
+  resourceQueues.agent.setLimit(0);
+  try {
+    const retained = acp.acquireTurnSlot('retained-turn', undefined, '/repo', {
+      agent: 'codex',
+      sessionId: 'retained-thread',
+    });
+    assert.equal(await settled(retained), false);
+    resourceQueues.agent.setLimit(1);
+    const releaseRetained = await retained;
+    assert.equal(resourceQueues.agent.status.active, 1);
+    releaseRetained();
+    resourceQueues.agent.setLimit(0);
+
+    const queued = acp.acquireTurnSlot('closed-pane-turn', undefined, '/repo', {
+      agent: 'codex',
+      sessionId: 'saved-thread',
+    });
+    assert.equal(await settled(queued), false);
+    assert.equal(resourceQueues.agent.status.waiting, 1);
+
+    // Closing the pane leaves the turn queued; deletion happens after reopening the thread.
+    await acp.forget('codex', '/repo', 'saved-thread');
+    await assert.rejects(queued, /cancelled/);
+    assert.deepEqual(invokes, [{ command: 'acp_forget_session', waiting: 0 }]);
+    resourceQueues.agent.setLimit(1);
+    assert.equal(resourceQueues.agent.status.active, 0);
+    const release = await acp.acquireTurnSlot('granted-turn', undefined, '/repo', {
+      agent: 'codex',
+      sessionId: 'granted-thread',
+    });
+    try {
+      await acp.forget('codex', '/repo', 'granted-thread');
+      await assert.rejects(
+        acp.prompt(
+          'codex',
+          '/repo',
+          'granted-thread',
+          'late prompt',
+          'granted-turn',
+          [],
+          undefined,
+          true,
+        ),
+        /cancelled/,
+      );
+    } finally {
+      release();
+    }
+  } finally {
+    resourceQueues.agent.setLimit(4);
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+    if (previousStorage) Object.defineProperty(globalThis, 'localStorage', previousStorage);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
+
 async function settled(promise: Promise<unknown>): Promise<boolean> {
   return Promise.race([
     promise.then(() => true),

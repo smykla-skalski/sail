@@ -1425,6 +1425,7 @@ struct PromptState {
     active: HashMap<String, ActivePrompt>,
     finishing: HashSet<String>,
     finished: HashMap<String, PromptOutcome>,
+    forgotten: HashSet<String>,
     tool_turns: HashMap<String, HashMap<String, String>>,
     retired_tool_turns: HashMap<String, VecDeque<(String, String)>>,
 }
@@ -1705,6 +1706,7 @@ mod interruption_report_tests {
         assert!(cancelled);
         assert!(started.elapsed() >= Duration::from_millis(150));
         assert!(!state.lock().unwrap().active.contains_key("target"));
+        assert!(state.lock().unwrap().forgotten.contains("target"));
     }
 
     #[test]
@@ -1722,6 +1724,22 @@ mod interruption_report_tests {
 
         assert_eq!(result.unwrap_err(), "cancel failed");
         assert!(state.lock().unwrap().active.contains_key("target"));
+        assert!(state.lock().unwrap().forgotten.contains("target"));
+    }
+
+    #[test]
+    fn forgetting_idle_session_fences_late_turns() {
+        let state = Mutex::new(PromptState::default());
+
+        cancel_before_forget(
+            &state,
+            "target",
+            || panic!("idle session must not be cancelled"),
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        assert!(state.lock().unwrap().forgotten.contains("target"));
     }
 
     #[test]
@@ -3693,6 +3711,12 @@ pub async fn acp_new_session(
             let _ = fence.release_session(&agent, &directory, id);
             return Err(error);
         }
+        runtime
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .forgotten
+            .remove(id);
         browser.identify(&config.token, id);
         Ok(result)
     })
@@ -3716,11 +3740,11 @@ fn cancel_before_forget(
     cancel: impl FnOnce() -> Result<(), String>,
     timeout: Duration,
 ) -> Result<(), String> {
-    let active = prompts
-        .lock()
-        .map_err(|error| error.to_string())?
-        .active
-        .contains_key(session_id);
+    let active = {
+        let mut prompts = prompts.lock().map_err(|error| error.to_string())?;
+        prompts.forgotten.insert(session_id.to_string());
+        prompts.active.contains_key(session_id)
+    };
     if !active {
         return Ok(());
     }
@@ -3953,6 +3977,12 @@ async fn restore_session(
                 .remove(&session_id);
         }
         let result = result?;
+        runtime
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .forgotten
+            .remove(&session_id);
         Ok(result)
     })
     .await
@@ -4037,6 +4067,9 @@ pub async fn acp_prompt(
             .prompt_state
             .lock()
             .map_err(|error| error.to_string())?;
+        if prompts.forgotten.contains(&session_id) {
+            return Err("This agent thread was deleted.".into());
+        }
         if prompts.active.contains_key(&session_id) || prompts.finishing.contains(&session_id) {
             return Err("This agent thread already has an active turn.".to_string());
         }

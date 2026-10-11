@@ -1842,6 +1842,7 @@
           queuedReason = reason;
         },
         turnDirectory,
+        { agent: turnAgent, sessionId: activeSessionId },
       );
       if (stopRequested) throw new Error('Agent turn was cancelled.');
       if (!activeSessionId || !activityThread)
