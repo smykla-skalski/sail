@@ -1691,11 +1691,20 @@ fn replacement_worktree_at_checkpoint(
         }
         return Err("The replacement worktree already exists at another revision. Inspect it before retrying.".to_string());
     }
-    add_worktree(
+    let branch = format!("refs/heads/{name}");
+    let existing_branch = git_reference(repository, &["rev-parse", "--verify", &branch]);
+    if existing_branch
+        .as_ref()
+        .is_some_and(|revision| !revision.eq_ignore_ascii_case(checkpoint_revision))
+    {
+        return Err("The replacement branch already exists at another revision. Inspect it before retrying.".to_string());
+    }
+    add_worktree_with_branch_creation(
         repository.to_string_lossy().into_owned(),
         name,
         destination_parent,
         Some(checkpoint_revision.to_string()),
+        existing_branch.is_none(),
     )
 }
 
@@ -1806,6 +1815,16 @@ fn add_worktree(
     destination_parent: Option<String>,
     base_ref: Option<String>,
 ) -> Result<CreatedWorktree, String> {
+    add_worktree_with_branch_creation(repository, name, destination_parent, base_ref, true)
+}
+
+fn add_worktree_with_branch_creation(
+    repository: String,
+    name: String,
+    destination_parent: Option<String>,
+    base_ref: Option<String>,
+    create_branch: bool,
+) -> Result<CreatedWorktree, String> {
     let repository = validate_repository(repository)?;
     let repository = Path::new(&repository);
     let name = name.trim();
@@ -1855,13 +1874,18 @@ fn add_worktree(
     } else {
         worktree_base(repository)
     };
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["-c", "checkout.workers=8"])
         .arg("-C")
         .arg(repository)
-        .args(["worktree", "add", "-b", name])
+        .args(["worktree", "add"]);
+    if create_branch {
+        command.args(["-b", name]);
+    }
+    let output = command
         .arg(&path)
-        .arg(&base)
+        .arg(if create_branch { &base } else { name })
         .output()
         .map_err(|error| format!("Cannot start Git: {error}"))?;
     if !output.status.success() {
@@ -1889,7 +1913,7 @@ fn add_worktree(
                 .args(["worktree", "remove", "--force"])
                 .arg(&path)
                 .output();
-            if removed.is_ok_and(|output| output.status.success()) {
+            if create_branch && removed.is_ok_and(|output| output.status.success()) {
                 let _ = Command::new("git")
                     .arg("-C")
                     .arg(repository)
@@ -4221,6 +4245,32 @@ mod tests {
         )
         .is_err());
         git(&repo, &["worktree", "remove", &created.path]);
+        let restored = replacement_worktree_at_checkpoint(
+            &repository,
+            15,
+            9,
+            &checkpoint,
+            Some(parent.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        assert_eq!(restored.branch, created.branch);
+        assert_eq!(
+            git_reference(Path::new(&restored.path), &["rev-parse", "HEAD"]),
+            Some(checkpoint.clone())
+        );
+        git(&repo, &["worktree", "remove", &restored.path]);
+        git(&repo, &["branch", "-f", &created.branch, "HEAD"]);
+        let error = replacement_worktree_at_checkpoint(
+            &repository,
+            15,
+            9,
+            &checkpoint,
+            Some(parent.to_string_lossy().into_owned()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("already exists at another revision"));
+        assert!(!Path::new(&created.path).exists());
         fs::remove_dir_all(root).unwrap();
     }
 
