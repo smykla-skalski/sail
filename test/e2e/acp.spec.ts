@@ -1,6 +1,13 @@
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chooseTopbarAction } from './topbar';
@@ -950,5 +957,39 @@ describe('ACP agent threads', () => {
     const titles = await savedTitles();
     expect(titles).toContain('Main action');
     expect(titles).not.toContain('Split action');
+  });
+
+  it('stops a deleted thread before releasing its browser connection', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Delete with browser call');
+    await $(sendButton).click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    const [sessionId] = await activeClaudeSessions();
+    expect(typeof sessionId).toBe('string');
+
+    await chooseTopbarAction('More actions', 'Delete thread');
+    const dialog = $('.confirmation-dialog');
+    await expect(dialog).toHaveText(expect.stringContaining('The active turn will be stopped.'));
+    await dialog.$('.confirmation-primary').click();
+    await expect(dialog).not.toBeDisplayed();
+    expect(await savedTitles()).not.toContain('Delete with browser call');
+
+    const resultFile = join(repository, 'acp-delete-browser-result.txt');
+    await browser.waitUntil(() => existsSync(resultFile), { timeout: 15_000 });
+    expect(readFileSync(resultFile, 'utf8')).toBe('Worktree tool works');
+    await browser.waitUntil(async () => !(await activeClaudeSessions()).includes(sessionId), {
+      timeout: 15_000,
+    });
   });
 });

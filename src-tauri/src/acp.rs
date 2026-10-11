@@ -1678,6 +1678,53 @@ mod interruption_report_tests {
     }
 
     #[test]
+    fn forgetting_waits_for_the_cancelled_turn_to_settle() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Arc::new(Mutex::new(prompts));
+        let settling = Arc::clone(&state);
+        let settled = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            settling.lock().unwrap().active.remove("target");
+        });
+        let started = Instant::now();
+        let mut cancelled = false;
+
+        cancel_before_forget(
+            &state,
+            "target",
+            || {
+                cancelled = true;
+                Ok(())
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        settled.join().unwrap();
+        assert!(cancelled);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(!state.lock().unwrap().active.contains_key("target"));
+    }
+
+    #[test]
+    fn forgetting_keeps_the_turn_active_when_cancel_fails() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Mutex::new(prompts);
+
+        let result = cancel_before_forget(
+            &state,
+            "target",
+            || Err("cancel failed".into()),
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(result.unwrap_err(), "cancel failed");
+        assert!(state.lock().unwrap().active.contains_key("target"));
+    }
+
+    #[test]
     fn prompt_cleanup_finishes_before_next_turn_can_start() {
         let mut prompts = PromptState::default();
         prompts.active.insert("target".into(), prompt());
@@ -3663,9 +3710,42 @@ pub fn acp_release_session_fence(
     fence.release_session(&agent, Path::new(&directory), &session_id)
 }
 
-/// Releases the browser token a deleted thread's session still holds.
+fn cancel_before_forget(
+    prompts: &Mutex<PromptState>,
+    session_id: &str,
+    cancel: impl FnOnce() -> Result<(), String>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let active = prompts
+        .lock()
+        .map_err(|error| error.to_string())?
+        .active
+        .contains_key(session_id);
+    if !active {
+        return Ok(());
+    }
+    cancel()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !prompts
+            .lock()
+            .map_err(|error| error.to_string())?
+            .active
+            .contains_key(session_id)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("Agent turn did not stop; browser token remains active.".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Cancels a deleted thread's active turn before releasing its browser token.
 #[tauri::command]
-pub fn acp_forget_session(
+pub async fn acp_forget_session(
+    app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
     agent: String,
@@ -3682,6 +3762,28 @@ pub fn acp_forget_session(
         else {
             continue;
         };
+        let waiting = Arc::clone(&runtime);
+        let waiting_session = session_id.clone();
+        let waiting_agent = agent.clone();
+        let waiting_app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            cancel_before_forget(
+                &waiting.prompt_state,
+                &waiting_session,
+                || {
+                    cancel_session(
+                        &waiting_app,
+                        &waiting,
+                        &waiting_agent,
+                        &waiting_session,
+                        None,
+                    )
+                },
+                Duration::from_secs(30),
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())??;
         let removed = runtime
             .session_configs
             .lock()

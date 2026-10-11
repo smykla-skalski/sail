@@ -10634,7 +10634,7 @@
     const confirmed = await confirmInApp(
       'Delete thread',
       `Delete “${thread.title}” from Sail? Its transcript and status are removed from Sail.${
-        stillRunning ? ' The agent is still working, and deleting the thread does not stop it.' : ''
+        stillRunning ? ' The active turn will be stopped.' : ''
       }`,
       'Delete thread',
       { destructive: true },
@@ -10686,7 +10686,9 @@
       // session/list keeps returning a deleted OpenCode session.
       removeSidebarThread(thread);
     }
-    void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
+    void acp.forget(thread.agent, thread.directory, thread.sessionId).catch((cause) => {
+      error = `Could not stop deleted thread: ${describe(cause)}`;
+    });
   }
 
   function agentThreadKey(thread: AgentThread): string {

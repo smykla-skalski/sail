@@ -1271,7 +1271,16 @@ for await (const line of createInterface({ input: process.stdin })) {
               result: { stopReason: pending.text === 'Cancel ignored' ? 'end_turn' : 'cancelled' },
             });
         };
-        if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
+        if (pending.text === 'Delete with browser call') {
+          setTimeout(() => {
+            const session = sessions.get(pending.sessionId);
+            const server = session.mcpServers.find((item) => item.name === 'sail-browser');
+            callWorktreeList(server, (result) => {
+              writeFileSync(join(session.cwd, 'acp-delete-browser-result.txt'), result);
+              finish();
+            });
+          }, 250);
+        } else if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
         else finish();
       }
     }
