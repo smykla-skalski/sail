@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 use sysinfo::{Pid, System};
 
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
@@ -61,7 +61,48 @@ fn process_started(pid: u32) -> Option<u64> {
         .checked_add(info.pbi_start_tvusec)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn process_started(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is parenthesized and may contain spaces or closing
+    // parentheses. Count fields only after its final delimiter.
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let start_ticks = fields.split_whitespace().nth(19)?.parse::<u64>().ok()?;
+    let boot_seconds = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .parse::<u64>()
+        .ok()?;
+    let ticks_per_second = unsafe { nix::libc::sysconf(nix::libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    let started = u128::from(boot_seconds) * 1_000_000
+        + u128::from(start_ticks) * 1_000_000 / ticks_per_second as u128;
+    u64::try_from(started).ok()
+}
+
+#[cfg(windows)]
+fn process_started(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let result =
+        unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
+    let _ = unsafe { CloseHandle(handle) };
+    result.ok()?;
+    Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn process_started(pid: u32) -> Option<u64> {
     let mut system = System::new();
     system.refresh_processes(
@@ -105,17 +146,25 @@ fn write_file(path: &Path, state: &ProcessFile) -> Result<(), String> {
 
 #[cfg(unix)]
 fn stop_process(record: &ProcessRecord) -> Result<bool, String> {
-    match process_started(record.pid) {
-        Some(started) if started != record.started => return Ok(false),
-        // A group can outlive its leader. Its ID remains reserved while any
-        // member survives, so an absent leader does not make that group stale.
-        Some(_) | None => {}
+    // An orphaned group cannot be distinguished from an unrelated group
+    // that reused its numeric ID after the leader disappeared.
+    if process_started(record.pid) != Some(record.started) {
+        return Ok(false);
+    }
+    if record.session && unsafe { nix::libc::getsid(record.pid as i32) } != record.pid as i32 {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    if nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(record.pid as i32)))
+        .ok()
+        .map(|group| group.as_raw())
+        != Some(record.group as i32)
+    {
+        return Ok(false);
     }
     #[cfg(target_os = "macos")]
-    if let Some(info) = process_info(record.pid) {
-        if info.pbi_pgid != record.group {
-            return Ok(false);
-        }
+    if process_info(record.pid).map(|info| info.pbi_pgid) != Some(record.group) {
+        return Ok(false);
     }
     if record.session {
         crate::terminal::kill_terminal_process_groups(record.pid)?;
@@ -630,5 +679,35 @@ mod tests {
             assert!(process_started(child.id()).is_some());
             let _ = child.wait();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_identity_retains_subsecond_precision() {
+        let started = process_started(std::process::id()).unwrap();
+        assert!(started > now() * 1_000);
+        assert!(started <= now() * 1_000_000);
+    }
+
+    #[test]
+    fn absent_group_leader_is_not_signaled() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = process_started(pid).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let record = ProcessRecord {
+            run: "finished".into(),
+            pid,
+            group: pid,
+            session: false,
+            started,
+            recorded: now(),
+        };
+        assert!(!stop_process(&record).unwrap());
     }
 }

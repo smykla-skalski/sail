@@ -396,6 +396,8 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
                             #[cfg(test)]
                             if let Err(error) = &acquisition {
                                 eprintln!("cleanup_status lease lock {}: {error}", path.display());
+                                #[cfg(unix)]
+                                log_lock_holder(&path);
                             }
                             acquisition.ok()
                         }
@@ -1130,6 +1132,29 @@ fn lexical_absolute(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+#[cfg(all(test, unix))]
+fn log_lock_holder(path: &Path) {
+    let program = if cfg!(target_os = "macos") {
+        "/usr/sbin/lsof"
+    } else {
+        "lsof"
+    };
+    match std::process::Command::new(program)
+        .arg("-nP")
+        .arg(path)
+        .output()
+    {
+        Ok(output) => eprintln!(
+            "lease lock holders for {}: status={} stdout={} stderr={}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => eprintln!("Cannot inspect lease lock holders: {error}"),
+    }
 }
 
 struct FileLock {
