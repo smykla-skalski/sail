@@ -992,4 +992,54 @@ describe('ACP agent threads', () => {
       timeout: 15_000,
     });
   });
+
+  it('keeps a thread visible when stopping it fails, then allows deletion to retry', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Retain on forget error');
+    await $(sendButton).click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: Retain on forget error'),
+    );
+    const titles = await savedTitles();
+    await browser.execute(() => {
+      const internals = Reflect.get(window, '__TAURI_INTERNALS__');
+      const original: unknown = Reflect.get(internals, 'invoke');
+      if (typeof original !== 'function') throw new Error('Missing Tauri invoke');
+      Reflect.set(window, '__sailOriginalInvoke', original);
+      Reflect.set(internals, 'invoke', (command: string, ...args: unknown[]) =>
+        command === 'acp_forget_session'
+          ? Promise.reject(new Error('Test cancellation failure'))
+          : Reflect.apply(original, internals, [command, ...args]),
+      );
+    });
+    try {
+      await chooseTopbarAction('More actions', 'Delete thread');
+      await $('.confirmation-dialog .confirmation-primary').click();
+      await expect($('.notice.error[role="alert"]')).toHaveText(
+        expect.stringContaining('Could not stop thread: Test cancellation failure'),
+      );
+      expect(await savedTitles()).toEqual(titles);
+      await expect($('.agent-workspace')).toBeDisplayed();
+    } finally {
+      await browser.execute(() => {
+        const internals = Reflect.get(window, '__TAURI_INTERNALS__');
+        Reflect.set(internals, 'invoke', Reflect.get(window, '__sailOriginalInvoke'));
+        Reflect.deleteProperty(window, '__sailOriginalInvoke');
+      });
+    }
+    await chooseTopbarAction('More actions', 'Delete thread');
+    await $('.confirmation-dialog .confirmation-primary').click();
+    await browser.waitUntil(async () => (await savedTitles()).length < titles.length);
+  });
 });

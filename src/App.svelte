@@ -10639,7 +10639,13 @@
       'Delete thread',
       { destructive: true },
     );
-    if (confirmed) removeAgentThread(thread);
+    if (!confirmed) return;
+    try {
+      await acp.forget(thread.agent, thread.directory, thread.sessionId);
+      removeAgentThread(thread);
+    } catch (cause) {
+      error = `Could not stop thread: ${describe(cause)}`;
+    }
   }
 
   function removeAgentThread(thread: AgentThread) {
@@ -10686,9 +10692,6 @@
       // session/list keeps returning a deleted OpenCode session.
       removeSidebarThread(thread);
     }
-    void acp.forget(thread.agent, thread.directory, thread.sessionId).catch((cause) => {
-      error = `Could not stop deleted thread: ${describe(cause)}`;
-    });
   }
 
   function agentThreadKey(thread: AgentThread): string {

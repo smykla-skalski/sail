@@ -1225,9 +1225,44 @@ fn prepare_runtime_directories(data_directory: &Path) -> Result<(), String> {
 }
 
 #[derive(Clone, Default)]
-pub struct AgentManager(Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>);
+pub struct AgentManager(
+    Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>,
+    Arc<Mutex<HashMap<(String, PathBuf, String), u64>>>,
+);
 
 impl AgentManager {
+    fn forget_generation(
+        &self,
+        agent: &str,
+        directory: &str,
+        session_id: &str,
+    ) -> Result<u64, String> {
+        Ok(*self
+            .1
+            .lock()
+            .map_err(|error| error.to_string())?
+            .get(&(
+                agent.to_string(),
+                canonical_directory(directory),
+                session_id.to_string(),
+            ))
+            .unwrap_or(&0))
+    }
+
+    fn mark_forget(&self, agent: &str, directory: &str, session_id: &str) -> Result<(), String> {
+        *self
+            .1
+            .lock()
+            .map_err(|error| error.to_string())?
+            .entry((
+                agent.to_string(),
+                canonical_directory(directory),
+                session_id.to_string(),
+            ))
+            .or_default() += 1;
+        Ok(())
+    }
+
     fn active_sessions_in(
         &self,
         directory: &Path,
@@ -1426,6 +1461,7 @@ struct PromptState {
     finishing: HashSet<String>,
     finished: HashMap<String, PromptOutcome>,
     forgotten: HashSet<String>,
+    forget_generation: HashMap<String, u64>,
     tool_turns: HashMap<String, HashMap<String, String>>,
     retired_tool_turns: HashMap<String, VecDeque<(String, String)>>,
 }
@@ -1433,6 +1469,22 @@ struct PromptState {
 impl PromptState {
     const ACTIVE_TOOL_TURN_LIMIT: usize = 512;
     const RETIRED_TOOL_TURN_LIMIT: usize = 4096;
+
+    fn mark_forgotten(&mut self, session_id: &str) {
+        self.forgotten.insert(session_id.to_string());
+        *self
+            .forget_generation
+            .entry(session_id.to_string())
+            .or_default() += 1;
+    }
+
+    fn complete_restore(&mut self, session_id: &str, generation: u64) -> Result<(), String> {
+        if self.forget_generation.get(session_id).copied().unwrap_or(0) != generation {
+            return Err("This agent thread was deleted while reconnecting.".into());
+        }
+        self.forgotten.remove(session_id);
+        Ok(())
+    }
 
     fn remember_retired_tool_turns(
         &mut self,
@@ -1740,6 +1792,70 @@ mod interruption_report_tests {
         .unwrap();
 
         assert!(state.lock().unwrap().forgotten.contains("target"));
+    }
+
+    #[test]
+    fn restore_started_before_forget_cannot_revive_deleted_session() {
+        let manager = AgentManager::default();
+        let directory = "/example/worktree";
+        let manager_generation = manager
+            .forget_generation("claude", directory, "target")
+            .unwrap();
+        let prompts = Mutex::new(PromptState::default());
+        manager.mark_forget("claude", directory, "target").unwrap();
+        prompts.lock().unwrap().mark_forgotten("target");
+        // The restore reaches the runtime after deletion, so its local snapshot is current.
+        let restore_generation = prompts.lock().unwrap().forget_generation["target"];
+
+        assert_ne!(
+            manager
+                .forget_generation("claude", directory, "target")
+                .unwrap(),
+            manager_generation
+        );
+        assert_eq!(restore_generation, 1);
+        assert!(complete_restore_if_current(
+            &manager,
+            &prompts,
+            "claude",
+            directory,
+            "target",
+            manager_generation,
+            restore_generation,
+        )
+        .is_err());
+        assert!(prompts.lock().unwrap().forgotten.contains("target"));
+        let explicit_restore_generation = manager
+            .forget_generation("claude", directory, "target")
+            .unwrap();
+        assert_eq!(explicit_restore_generation, 1);
+        assert!(complete_restore_if_current(
+            &manager,
+            &prompts,
+            "claude",
+            directory,
+            "target",
+            explicit_restore_generation,
+            restore_generation,
+        )
+        .is_ok());
+        assert!(!prompts.lock().unwrap().forgotten.contains("target"));
+    }
+
+    #[test]
+    fn restore_already_using_runtime_cannot_clear_later_forget() {
+        let mut prompts = PromptState::default();
+        let restore_generation = prompts
+            .forget_generation
+            .get("target")
+            .copied()
+            .unwrap_or(0);
+        prompts.mark_forgotten("target");
+
+        assert!(prompts
+            .complete_restore("target", restore_generation)
+            .is_err());
+        assert!(prompts.forgotten.contains("target"));
     }
 
     #[test]
@@ -3742,7 +3858,7 @@ fn cancel_before_forget(
 ) -> Result<(), String> {
     let active = {
         let mut prompts = prompts.lock().map_err(|error| error.to_string())?;
-        prompts.forgotten.insert(session_id.to_string());
+        prompts.mark_forgotten(session_id);
         prompts.active.contains_key(session_id)
     };
     if !active {
@@ -3766,6 +3882,24 @@ fn cancel_before_forget(
     }
 }
 
+fn complete_restore_if_current(
+    manager: &AgentManager,
+    prompts: &Mutex<PromptState>,
+    agent: &str,
+    directory: &str,
+    session_id: &str,
+    manager_generation: u64,
+    runtime_generation: u64,
+) -> Result<(), String> {
+    if manager.forget_generation(agent, directory, session_id)? != manager_generation {
+        return Err("This agent thread was deleted while reconnecting.".into());
+    }
+    prompts
+        .lock()
+        .map_err(|error| error.to_string())?
+        .complete_restore(session_id, runtime_generation)
+}
+
 /// Cancels a deleted thread's active turn before releasing its browser token.
 #[tauri::command]
 pub async fn acp_forget_session(
@@ -3776,6 +3910,7 @@ pub async fn acp_forget_session(
     directory: String,
     session_id: String,
 ) -> Result<(), String> {
+    manager.mark_forget(&agent, &directory, &session_id)?;
     for profile in [
         CapabilityProfile::Explore,
         CapabilityProfile::Review,
@@ -3923,6 +4058,7 @@ async fn restore_session(
         profile,
         method,
     } = params;
+    let manager_generation = manager.forget_generation(&agent, &cwd, &session_id)?;
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     let browser = browser.inner().clone();
@@ -3936,6 +4072,14 @@ async fn restore_session(
         )?;
         let runtime =
             register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
+        let forget_generation = runtime
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .forget_generation
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
         let params = {
             let mut configs = runtime
                 .session_configs
@@ -3977,12 +4121,15 @@ async fn restore_session(
                 .remove(&session_id);
         }
         let result = result?;
-        runtime
-            .prompt_state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .forgotten
-            .remove(&session_id);
+        complete_restore_if_current(
+            &manager,
+            &runtime.prompt_state,
+            &agent,
+            &cwd,
+            &session_id,
+            manager_generation,
+            forget_generation,
+        )?;
         Ok(result)
     })
     .await
