@@ -172,6 +172,8 @@ pub fn save_preferences(root: &Path, preferences: OutputPreferences) -> Result<(
     let parent = path.parent().ok_or(StoreWarning::StorageUnavailable)?;
     fs::create_dir_all(parent).map_err(|_| StoreWarning::StorageUnavailable)?;
     private_directory(parent)?;
+    let store = OutputStore::open(root.to_path_buf(), OutputLimits::default())?;
+    let _lock = store.lock()?;
     if let Ok(metadata) = fs::symlink_metadata(&path) {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(StoreWarning::StorageUnavailable);
@@ -185,9 +187,11 @@ pub fn save_preferences(root: &Path, preferences: OutputPreferences) -> Result<(
         file.sync_all()
             .map_err(|_| StoreWarning::StorageUnavailable)?;
         fs::rename(&temporary, &path).map_err(|_| StoreWarning::StorageUnavailable)?;
+        #[cfg(unix)]
         File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|_| StoreWarning::StorageUnavailable)
+            .map_err(|_| StoreWarning::StorageUnavailable)?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);
@@ -249,6 +253,7 @@ pub struct OutputUsage {
 pub struct OutputStore {
     root: PathBuf,
     limits: OutputLimits,
+    configured: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -388,13 +393,19 @@ impl OutputScope {
 impl OutputStore {
     pub fn open_configured(root: PathBuf) -> Result<Self, StoreWarning> {
         let limits = load_preferences(&root)?.limits()?;
-        Self::open(root, limits)
+        let mut store = Self::open(root, limits)?;
+        store.configured = true;
+        Ok(store)
     }
 
     pub fn open(root: PathBuf, limits: OutputLimits) -> Result<Self, StoreWarning> {
         let limits = limits.validate()?;
         private_directory(&root)?;
-        Ok(Self { root, limits })
+        Ok(Self {
+            root,
+            limits,
+            configured: false,
+        })
     }
 
     fn lock(&self) -> Result<File, StoreWarning> {
@@ -528,17 +539,22 @@ impl OutputStore {
         now: u64,
     ) -> Result<StoredOutput, StoreWarning> {
         let key = scope.key()?;
-        if output.len() > self.limits.max_item_bytes {
+        let _lock = self.lock()?;
+        let limits = if self.configured {
+            load_preferences(&self.root)?.limits()?
+        } else {
+            self.limits
+        };
+        if output.len() > limits.max_item_bytes {
             return Err(StoreWarning::TooLarge);
         }
-        let _lock = self.lock()?;
         self.purge_expired_locked(now)?;
         let usage = self.usage_locked(None)?;
-        if usage.items >= self.limits.max_items
+        if usage.items >= limits.max_items
             || usage
                 .bytes
                 .checked_add(output.len() as u64)
-                .is_none_or(|bytes| bytes > self.limits.max_total_bytes)
+                .is_none_or(|bytes| bytes > limits.max_total_bytes)
         {
             return Err(StoreWarning::QuotaExceeded);
         }
@@ -548,7 +564,7 @@ impl OutputStore {
         let reference = format!("out:v1:{id}");
         let summary = self.summary(output);
         let expires_at_ms = now
-            .checked_add(self.limits.retention_seconds.saturating_mul(1_000))
+            .checked_add(limits.retention_seconds.saturating_mul(1_000))
             .ok_or(StoreWarning::InvalidLimits)?;
         let header = RecordHeader {
             version: 1,
@@ -1045,6 +1061,40 @@ mod tests {
             Err(StoreWarning::InvalidLimits)
         );
         assert_eq!(load_preferences(&store_root), Ok(saved));
+    }
+
+    #[test]
+    fn live_configured_store_uses_new_limits_after_save() {
+        let root = TestRoot::new();
+        let store_root = root.0.join("context-output");
+        let initial = OutputPreferences {
+            retention_days: 30,
+            max_total_mib: 4,
+        };
+        save_preferences(&store_root, initial).unwrap();
+        let store = OutputStore::open_configured(store_root.clone()).unwrap();
+        store
+            .put_at(&scope(), &vec![b'a'; 2 * 1024 * 1024], 1_000)
+            .unwrap();
+        save_preferences(
+            &store_root,
+            OutputPreferences {
+                retention_days: 1,
+                max_total_mib: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store.put_at(&scope(), b"x", 2_000),
+            Err(StoreWarning::QuotaExceeded)
+        );
+        assert_eq!(
+            store.put_at(&scope(), &vec![b'b'; 2 * 1024 * 1024], 2_000),
+            Err(StoreWarning::TooLarge)
+        );
+        store.purge_all().unwrap();
+        let next = store.put_at(&scope(), b"x", 3_000).unwrap();
+        assert_eq!(next.expires_at_ms, 3_000 + 24 * 60 * 60 * 1_000);
     }
 
     #[test]

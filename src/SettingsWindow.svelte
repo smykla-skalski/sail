@@ -1526,7 +1526,7 @@
         {#if outputStatus}
           <p role="status">
             {outputStatus.items === 0
-              ? 'No stored output.'
+              ? 'No stored output: 0 items, 0 content bytes.'
               : `${outputStatus.items} stored item(s), ${outputStatus.bytes.toLocaleString()} content bytes.`}
           </p>
           <label for="output-retention-days">Retention (days)</label>
