@@ -127,6 +127,8 @@
   let memoryKind = $state<MemoryKind>('other');
   let memoryTags = $state('');
   let memoryExpiry = $state('');
+  let memoryCorrectionOriginalValue = '';
+  let memoryCorrectionOriginalTimestamp: number | null = null;
   let memorySupersedesId = $state('');
   let pendingConflict = $state('');
   let conflictOtherId = $state('');
@@ -308,6 +310,8 @@
       expiryEditOriginalValue = '';
       expiryEditOriginalTimestamp = null;
       memoryExpiry = '';
+      memoryCorrectionOriginalValue = '';
+      memoryCorrectionOriginalTimestamp = null;
       memorySupersedesId = '';
       pendingConflict = '';
       conflictOtherId = '';
@@ -472,8 +476,12 @@
     const content = memoryContent.trim();
     if (!directory || !content) return;
     memoryStorageError = '';
-    const expiresAt =
-      memoryKind === 'handoff' && memoryExpiry ? new Date(memoryExpiry).getTime() : undefined;
+    const resolvedExpiry = resolveHandoffExpiry(
+      memoryExpiry,
+      memoryCorrectionOriginalValue,
+      memoryCorrectionOriginalTimestamp,
+    );
+    const expiresAt = memoryKind === 'handoff' ? (resolvedExpiry ?? undefined) : undefined;
     if (expiresAt !== undefined && !Number.isFinite(expiresAt)) {
       memoryStorageError = 'Storage: Enter a valid handoff expiry.';
       return;
@@ -492,6 +500,8 @@
       memoryContent = '';
       memoryTags = '';
       memoryExpiry = '';
+      memoryCorrectionOriginalValue = '';
+      memoryCorrectionOriginalTimestamp = null;
       memorySupersedesId = '';
       await refreshMemory(directory);
     } catch (cause) {
@@ -1917,6 +1927,16 @@
                         memoryKind = 'handoff';
                         memorySupersedesId = record.id;
                         memoryTags = record.tags.join(', ');
+                        memoryExpiry = record.expiresAt
+                          ? new Date(
+                              record.expiresAt -
+                                new Date(record.expiresAt).getTimezoneOffset() * 60_000,
+                            )
+                              .toISOString()
+                              .slice(0, 16)
+                          : '';
+                        memoryCorrectionOriginalValue = memoryExpiry;
+                        memoryCorrectionOriginalTimestamp = record.expiresAt ?? null;
                         document.getElementById('memory-content')?.focus();
                       }}>Correct</Button
                     >
@@ -2030,8 +2050,15 @@
         {#if memoryKind === 'handoff'}
           {#if memorySupersedesId}
             <p>Correction for handoff {memorySupersedesId}</p>
-            <Button size="sm" variant="secondary" onclick={() => (memorySupersedesId = '')}
-              >Cancel correction</Button
+            <Button
+              size="sm"
+              variant="secondary"
+              onclick={() => {
+                memorySupersedesId = '';
+                memoryExpiry = '';
+                memoryCorrectionOriginalValue = '';
+                memoryCorrectionOriginalTimestamp = null;
+              }}>Cancel correction</Button
             >
           {/if}
           <label for="memory-expiry">Expires (optional)</label>

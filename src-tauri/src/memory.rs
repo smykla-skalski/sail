@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -315,6 +316,19 @@ pub(crate) fn list_at(
     }
     let _lock = lock_store(&paths)?;
     let mut memories = read_store(&paths)?.memories;
+    let timestamp = now();
+    let current_ids: HashSet<_> = memories
+        .iter()
+        .filter(|memory| {
+            memory.forgotten_at.is_none()
+                && memory.superseded_by.is_none()
+                && !is_expired(memory, timestamp)
+        })
+        .map(|memory| memory.id.clone())
+        .collect();
+    for memory in &mut memories {
+        memory.conflicts_with.retain(|id| current_ids.contains(id));
+    }
     if !forgotten {
         memories.retain(|memory| memory.forgotten_at.is_none());
     }
@@ -1179,6 +1193,19 @@ mod tests {
             .memory
             .conflicts_with
             .contains(&second.id));
+        set_expiry_at(&root, "project", &second.id, Some(0)).unwrap();
+        assert!(search_at(&root, "project", "Friday", None).unwrap()[0]
+            .memory
+            .conflicts_with
+            .is_empty());
+        forget_at(&root, "project", &second.id).unwrap();
+        assert!(list_at(&root, "project", false)
+            .unwrap()
+            .iter()
+            .find(|record| record.id == correction.id)
+            .unwrap()
+            .conflicts_with
+            .is_empty());
         assert!(mark_conflict_at(&root, "other-project", &first.id, &second.id).is_err());
         fs::remove_dir_all(root).unwrap();
     }
