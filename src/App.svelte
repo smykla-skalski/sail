@@ -1668,6 +1668,10 @@
   }
   let answeredPermissions = $state<AnsweredPermission[]>([]);
   const permissionStatusRevisions = new SvelteMap<string, number>();
+  const pendingStatusRetries = new SvelteMap<
+    string,
+    { agent: AgentId; directory: string; sessionId: string }
+  >();
   // Inbox items can go before their resolution event arrives, so their titles are kept here.
   const permissionTitles = new SvelteMap<string, string>();
   $effect(() => {
@@ -1713,12 +1717,13 @@
     agent: AgentId,
     worktreeDirectory: string,
     sessionId: string,
+    pendingSnapshot?: Awaited<ReturnType<typeof acp.pendingInbox>>,
   ) {
     const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
     const revision = permissionStatusRevisions.get(key);
-    void acp
-      .pendingInbox()
+    void (pendingSnapshot ? Promise.resolve(pendingSnapshot) : acp.pendingInbox())
       .then((pending) => {
+        if (permissionStatusRevisions.get(key) === revision) pendingStatusRetries.delete(key);
         if (
           pending.some(
             (item) =>
@@ -1753,7 +1758,11 @@
           updateSpawnReceipt(receipt.receiptId, { state: 'working' });
         return undefined;
       })
-      .catch(() => scheduleInboxRefresh());
+      .catch(() => {
+        if (permissionStatusRevisions.get(key) !== revision) return;
+        pendingStatusRetries.set(key, { agent, directory: worktreeDirectory, sessionId });
+        scheduleInboxRefresh();
+      });
   }
   const shipOwnedThreads = $derived.by(() => {
     const owned = new SvelteSet<string>();
@@ -8096,6 +8105,13 @@
         : new Map();
     if (generation !== inboxGeneration || disposed) return;
     if (acpResult.status === 'fulfilled') {
+      for (const retry of pendingStatusRetries.values())
+        reconcilePendingSessionStatus(
+          retry.agent,
+          retry.directory,
+          retry.sessionId,
+          acpResult.value,
+        );
       for (const pending of acpResult.value) {
         const sessionId = pending.message.params?.sessionId;
         const requestId = pending.message.id;
