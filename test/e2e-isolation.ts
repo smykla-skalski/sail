@@ -8,7 +8,12 @@ function isNotFound(error: unknown): boolean {
 
 /** Reject an unsafe attach configuration before WDIO starts its services or specs. */
 export function assertPrivateE2eConfigRoot(config: string | undefined, temporary: string): void {
-  if (!config || !isAbsolute(config) || /(^|[\\/])\.{1,2}([\\/]|$)/.test(config))
+  const components = process.platform === 'win32' ? config?.split(/[\\/]/) : config?.split('/');
+  if (
+    !config ||
+    !isAbsolute(config) ||
+    components?.some((component) => component === '.' || component === '..')
+  )
     throw new Error('SAIL_E2E_CONFIG_DIR must be an absolute private path');
 
   const tempRoot = realpathSync(temporary);

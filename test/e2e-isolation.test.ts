@@ -26,6 +26,9 @@ await test('attached runner rejects config roots outside its private temporary d
     assert.throws(() => assertPrivateE2eConfigRoot(join(temporary, '..', 'outside'), temporary));
     assert.throws(() => assertPrivateE2eConfigRoot('relative', temporary));
     if (process.platform !== 'win32') {
+      assert.doesNotThrow(() =>
+        assertPrivateE2eConfigRoot(join(temporary, 'valid\\..', 'config'), temporary),
+      );
       symlinkSync(outside, join(temporary, 'outside-link'));
       symlinkSync(join(fixture, 'missing'), join(temporary, 'dangling-link'));
       assert.throws(
