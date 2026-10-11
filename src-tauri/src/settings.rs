@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(not(feature = "e2e"))]
 use tauri::Manager;
 
 type Settings = BTreeMap<String, String>;
@@ -315,13 +316,7 @@ pub(crate) fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(feature = "e2e")]
     {
         let _ = app;
-        let root = std::env::var_os("SAIL_E2E_CONFIG_DIR")
-            .ok_or("E2E settings require SAIL_E2E_CONFIG_DIR")?;
-        let root = PathBuf::from(root);
-        if !root.is_absolute() {
-            return Err("SAIL_E2E_CONFIG_DIR must be an absolute path".into());
-        }
-        Ok(root.join("settings.json"))
+        Ok(crate::e2e_config::root()?.join("settings.json"))
     }
     #[cfg(not(feature = "e2e"))]
     {

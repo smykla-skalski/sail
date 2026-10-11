@@ -212,6 +212,8 @@ pub mod context;
 pub mod context_output_store;
 mod dev_servers;
 mod diagnostics;
+#[cfg(feature = "e2e")]
+mod e2e_config;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;

@@ -90,10 +90,16 @@ describe('styled app dialogs', () => {
     );
     await $('.path-picker-dialog[open] .path-picker-actions .confirmation-primary').click();
     await expect($('.worktree-destination span')).toHaveText(realpathSync(fixture));
-    await browser.execute(() =>
-      document
-        .querySelector<HTMLInputElement>('.worktree-agent-option input:not(:disabled)')
-        ?.focus(),
+    await expect($('.worktree-agent-option input:not(:disabled)')).toExist();
+    await browser.waitUntil(async () =>
+      browser.execute(() => {
+        const option = document.querySelector<HTMLInputElement>(
+          '.worktree-agent-option input:not(:disabled)',
+        );
+        if (!option) return false;
+        option.focus();
+        return document.activeElement === option;
+      }),
     );
     await browser.keys('ArrowRight');
     const focusedAgent = $('.worktree-agent-option input:focus');

@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(not(feature = "e2e"))]
 use tauri::Manager;
 use uuid::Uuid;
 
@@ -111,13 +112,17 @@ pub fn project_key_for(directory: &Path) -> Result<String, String> {
 
 fn memory_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(feature = "e2e")]
-    if let Some(root) = std::env::var_os("SAIL_E2E_CONFIG_DIR") {
-        return Ok(PathBuf::from(root).join("memory"));
+    {
+        let _ = app;
+        Ok(crate::e2e_config::root()?.join("memory"))
     }
-    app.path()
-        .app_local_data_dir()
-        .map(|path| path.join("memory"))
-        .map_err(|error| format!("Cannot locate shared memory storage: {error}"))
+    #[cfg(not(feature = "e2e"))]
+    {
+        app.path()
+            .app_local_data_dir()
+            .map(|path| path.join("memory"))
+            .map_err(|error| format!("Cannot locate shared memory storage: {error}"))
+    }
 }
 
 pub fn standalone_paths(app: &tauri::AppHandle) -> Result<(PathBuf, PathBuf), String> {
