@@ -412,6 +412,7 @@ struct Connection {
     elicitation_state: Mutex<HashMap<String, PendingElicitation>>,
     next_permission_generation: AtomicU64,
     prompt_state: Mutex<PromptState>,
+    prompt_dispatch: Mutex<()>,
     cancelled_prompts: Mutex<HashSet<String>>,
     next_id: AtomicU64,
     alive: AtomicBool,
@@ -1812,6 +1813,7 @@ mod interruption_report_tests {
 
         cancel_before_forget(
             &state,
+            &Mutex::new(()),
             "target",
             || {
                 cancelled = true;
@@ -1842,6 +1844,7 @@ mod interruption_report_tests {
 
         let result = cancel_before_forget(
             &state,
+            &Mutex::new(()),
             "target",
             || Err("cancel failed".into()),
             Duration::from_secs(1),
@@ -1864,7 +1867,8 @@ mod interruption_report_tests {
         prompts.active.insert("target".into(), prompt());
         let state = Mutex::new(prompts);
 
-        let result = cancel_before_forget(&state, "target", || Ok(()), Duration::ZERO);
+        let result =
+            cancel_before_forget(&state, &Mutex::new(()), "target", || Ok(()), Duration::ZERO);
 
         assert_eq!(
             result.unwrap_err(),
@@ -1877,6 +1881,46 @@ mod interruption_report_tests {
             .unwrap()
             .ensure_prompt_available("target")
             .is_ok());
+    }
+
+    #[test]
+    fn cancel_before_prompt_write_fences_late_dispatch() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Arc::new(Mutex::new(prompts));
+        let dispatch = Arc::new(Mutex::new(()));
+        let waiting = Arc::clone(&state);
+        let waiting_dispatch = Arc::clone(&dispatch);
+        let (cancelled, observed) = mpsc::channel();
+        let forget = std::thread::spawn(move || {
+            cancel_before_forget(
+                &waiting,
+                &waiting_dispatch,
+                "target",
+                || {
+                    cancelled.send(()).unwrap();
+                    Ok(())
+                },
+                Duration::from_secs(1),
+            )
+        });
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let mut wrote_prompt = false;
+        let result = dispatch_prompt_if_current(&dispatch, &state, "target", "turn", || {
+            wrote_prompt = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!wrote_prompt);
+        state.lock().unwrap().active.remove("target");
+        forget.join().unwrap().unwrap();
+        state.lock().unwrap().finish_forget("target", true);
+        assert!(state
+            .lock()
+            .unwrap()
+            .ensure_prompt_available("target")
+            .is_err());
     }
 
     #[test]
@@ -1910,6 +1954,7 @@ mod interruption_report_tests {
 
         cancel_before_forget(
             &state,
+            &Mutex::new(()),
             "target",
             || panic!("idle session must not be cancelled"),
             Duration::ZERO,
@@ -3380,6 +3425,7 @@ fn connect_blocking_inner(
         elicitation_state: Mutex::new(HashMap::new()),
         next_permission_generation: AtomicU64::new(1),
         prompt_state: Mutex::new(PromptState::default()),
+        prompt_dispatch: Mutex::new(()),
         cancelled_prompts: Mutex::new(HashSet::new()),
         next_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
@@ -4020,20 +4066,35 @@ pub fn acp_release_session_fence(
 
 fn cancel_before_forget(
     prompts: &Mutex<PromptState>,
+    dispatch: &Mutex<()>,
     session_id: &str,
     cancel: impl FnOnce() -> Result<(), String>,
     timeout: Duration,
 ) -> Result<(), String> {
+    // Serialize deletion's fence and cancel with the prompt write. An adapter can ignore
+    // cancellation sent before it receives the prompt.
     let active = {
-        let mut prompts = prompts.lock().map_err(|error| error.to_string())?;
-        prompts.mark_forgotten(session_id);
-        prompts.active.contains_key(session_id)
+        let _dispatch = dispatch.lock().map_err(|error| error.to_string())?;
+        let active = {
+            let mut prompts = prompts.lock().map_err(|error| error.to_string())?;
+            prompts.mark_forgotten(session_id);
+            prompts.active.contains_key(session_id)
+        };
+        if active {
+            if let Err(error) = cancel() {
+                prompts
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(session_id, false);
+                return Err(error);
+            }
+        }
+        active
     };
     let result = (|| {
         if !active {
             return Ok(());
         }
-        cancel()?;
         let deadline = Instant::now() + timeout;
         loop {
             if !prompts
@@ -4057,6 +4118,28 @@ fn cancel_before_forget(
             .finish_forget(session_id, false);
     }
     result
+}
+
+fn dispatch_prompt_if_current<T>(
+    dispatch: &Mutex<()>,
+    prompts: &Mutex<PromptState>,
+    session_id: &str,
+    turn_id: &str,
+    write: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _dispatch = dispatch.lock().map_err(|error| error.to_string())?;
+    let prompts = prompts.lock().map_err(|error| error.to_string())?;
+    prompts.ensure_prompt_available(session_id)?;
+    if !prompts
+        .active
+        .get(session_id)
+        .is_some_and(|prompt| prompt.turn_id == turn_id)
+        || prompts.finishing.contains(session_id)
+    {
+        return Err("This agent turn is no longer active.".into());
+    }
+    drop(prompts);
+    write()
 }
 
 fn complete_restore_if_current(
@@ -4105,6 +4188,7 @@ pub async fn acp_forget_session(
         let stopped = tauri::async_runtime::spawn_blocking(move || {
             cancel_before_forget(
                 &waiting.prompt_state,
+                &waiting.prompt_dispatch,
                 &waiting_session,
                 || {
                     cancel_session(
@@ -4502,6 +4586,7 @@ pub async fn acp_prompt(
         let uncertain_directory = directory.clone();
         let dispatch_agent = agent.clone();
         let dispatch_session = session_id.clone();
+        let dispatch_turn = turn_id.clone();
         let dispatch_directory = PathBuf::from(directory.clone());
         let writer = Arc::clone(&runtime);
         let response = runtime.request_response_around_write(
@@ -4511,27 +4596,40 @@ pub async fn acp_prompt(
             }),
             Duration::from_secs(60 * 60 * 3),
             move |message| {
-                dispatch_fence.dispatch_session(&dispatch_agent, &dispatch_directory, &dispatch_session, || {
-                    crate::settings::record_acp_turn_evidence(
-                        &uncertain_app,
-                        crate::settings::AcpTurnEvidence {
-                            agent: uncertain_agent,
-                            directory: uncertain_directory,
-                            session_id: uncertain_session,
-                            turn_id: uncertain_turn,
-                            status: "dispatch_uncertain".into(),
-                            error: None,
-                            updated_at: 0,
-                        },
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "Cannot persist uncertain prompt dispatch before sending: {error}"
+                dispatch_prompt_if_current(
+                    &writer.prompt_dispatch,
+                    &writer.prompt_state,
+                    &dispatch_session,
+                    &dispatch_turn,
+                    || {
+                        dispatch_fence.dispatch_session(
+                            &dispatch_agent,
+                            &dispatch_directory,
+                            &dispatch_session,
+                            || {
+                                crate::settings::record_acp_turn_evidence(
+                                    &uncertain_app,
+                                    crate::settings::AcpTurnEvidence {
+                                        agent: uncertain_agent,
+                                        directory: uncertain_directory,
+                                        session_id: uncertain_session,
+                                        turn_id: uncertain_turn,
+                                        status: "dispatch_uncertain".into(),
+                                        error: None,
+                                        updated_at: 0,
+                                    },
+                                )
+                                .map_err(|error| {
+                                    format!(
+                                        "Cannot persist uncertain prompt dispatch before sending: {error}"
+                                    )
+                                })?;
+                                uncertain_phase.store(1, Ordering::Release);
+                                writer.write(message)
+                            },
                         )
-                    })?;
-                    uncertain_phase.store(1, Ordering::Release);
-                    writer.write(message)
-                })
+                    },
+                )
             },
             move || {
                 match crate::settings::record_acp_turn_evidence(
@@ -5211,6 +5309,7 @@ mod session_config_tests {
             )])),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
+            prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
@@ -5414,6 +5513,7 @@ mod session_config_tests {
                 elicitation_state: Mutex::new(HashMap::new()),
                 next_permission_generation: AtomicU64::new(1),
                 prompt_state: Mutex::new(PromptState::default()),
+                prompt_dispatch: Mutex::new(()),
                 cancelled_prompts: Mutex::new(HashSet::new()),
                 next_id: AtomicU64::new(1),
                 alive: AtomicBool::new(true),
@@ -5771,6 +5871,7 @@ mod native_subagent_fence_tests {
             elicitation_state: Mutex::new(HashMap::new()),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
+            prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
