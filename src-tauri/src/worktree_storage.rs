@@ -23,7 +23,8 @@ const TEMP_OWNER_HEADER: &str = "sail-temp-owner-v3";
 const PREVIOUS_TEMP_OWNER_HEADER: &str = "sail-temp-owner-v2";
 const LEGACY_TEMP_OWNER_FILE: &str = "sail-temp-owner-v1";
 const LEGACY_TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
-const TEMP_PROCESS_START_FILE: &str = "sail-temp-process-starting-v1";
+const TEMP_PROCESS_UNSTARTED: &str = "sail-temp-process-state-v1\nunstarted\n";
+const TEMP_PROCESS_EXPOSED: &str = "sail-temp-process-state-v1\nexposed\n";
 const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
 const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
 const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
@@ -86,6 +87,7 @@ pub(crate) struct WorktreeDataLease {
 
 struct TempLease {
     directory: PathBuf,
+    process_state_file: PathBuf,
     released: AtomicBool,
     started: AtomicBool,
     _lock: FileLock,
@@ -97,38 +99,73 @@ struct TempOwner {
     protocol_v3: bool,
 }
 
+fn process_state_path(cache_directory: &Path, temp_directory: &Path) -> Result<PathBuf, String> {
+    let root = cache_directory.join("terminal-worktree-locks");
+    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    Ok(root.join(format!("temp-state-{}.state", cache_key(temp_directory)?)))
+}
+
+fn unstarted_process_state(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && fs::read_to_string(path).is_ok_and(|state| state == TEMP_PROCESS_UNSTARTED)
+}
+
+fn create_process_state(path: &Path) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let result = file
+        .write_all(TEMP_PROCESS_UNSTARTED.as_bytes())
+        .and_then(|_| file.sync_all());
+    if let Err(error) = result {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+fn write_process_state(path: &Path, state: &str) -> Result<(), String> {
+    if !fs::symlink_metadata(path)
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("Private temporary process state is not a regular file.".into());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(state.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| error.to_string())
+}
+
 impl TempLease {
     fn exposed_to_process(&self) -> bool {
-        !matches!(
-            fs::symlink_metadata(self.directory.join(TEMP_PROCESS_START_FILE)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        )
+        !unstarted_process_state(&self.process_state_file)
     }
 
     fn prepare_process_start(&self) -> Result<(), String> {
         self.verify_root()?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(self.directory.join(TEMP_PROCESS_START_FILE))
-            .map_err(|error| error.to_string())?;
-        file.write_all(b"sail-temp-process-starting-v1\n")
-            .and_then(|_| file.sync_all())
-            .map_err(|error| error.to_string())
+        if self.exposed_to_process() {
+            return Err("Private temporary process state is not unstarted.".into());
+        }
+        write_process_state(&self.process_state_file, TEMP_PROCESS_EXPOSED)
     }
 
     fn cancel_process_start(&self) -> Result<(), String> {
         self.verify_root()?;
-        match fs::remove_file(self.directory.join(TEMP_PROCESS_START_FILE)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => {
-                self.mark_pending("turn-temp-process-start-reset-failed");
-                Err(format!(
-                    "Cannot reset private temporary process start: {error}"
-                ))
-            }
+        if self.started.load(Ordering::Acquire) {
+            return Err("Cannot reset temporary state after a process started.".into());
         }
+        write_process_state(&self.process_state_file, TEMP_PROCESS_UNSTARTED).map_err(|error| {
+            self.mark_pending("turn-temp-process-start-reset-failed");
+            format!("Cannot reset private temporary process start: {error}")
+        })
     }
 
     fn verify_root(&self) -> Result<(), String> {
@@ -172,6 +209,7 @@ impl TempLease {
                 if temp_directory_in_use(&self.directory) {
                     return Err("Private temporary data is still used by a process.".into());
                 }
+                fs::remove_file(&self.process_state_file).map_err(|error| error.to_string())?;
                 fs::remove_dir_all(&self.directory).map_err(|error| error.to_string())
             })
         };
@@ -207,7 +245,6 @@ impl TempLease {
             if entry.file_name() == TEMP_OWNER_FILE
                 || entry.file_name() == LEGACY_TEMP_OWNER_FILE
                 || entry.file_name() == TEMP_PENDING_FILE
-                || entry.file_name() == TEMP_PROCESS_START_FILE
             {
                 continue;
             }
@@ -420,8 +457,10 @@ fn create_temp_lease(cache_directory: &Path, data_directory: &Path) -> Result<Te
     let name = format!("run-{}", uuid::Uuid::new_v4());
     let directory = root.join(&name);
     let staging = root.join(format!(".{name}.tmp"));
+    let process_state_file = process_state_path(cache_directory, &directory)?;
     let lock = FileLock::acquire(&lock_path(cache_directory, "temp", &directory)?, true)?;
     fs::create_dir(&staging).map_err(|error| error.to_string())?;
+    let mut state_created = false;
     let result = (|| {
         let pid = std::process::id();
         let started_at = sysinfo::System::new_all()
@@ -444,14 +483,20 @@ fn create_temp_lease(cache_directory: &Path, data_directory: &Path) -> Result<Te
             .and_then(|_| owner.sync_all())
             .map_err(|error| error.to_string())?;
         drop(owner);
+        create_process_state(&process_state_file)?;
+        state_created = true;
         fs::rename(&staging, &directory).map_err(|error| error.to_string())
     })();
     if let Err(error) = result {
         let _ = fs::remove_dir_all(&staging);
+        if state_created {
+            let _ = fs::remove_file(&process_state_file);
+        }
         return Err(error);
     }
     Ok(TempLease {
         directory,
+        process_state_file,
         released: AtomicBool::new(false),
         started: AtomicBool::new(false),
         _lock: lock,
@@ -885,10 +930,10 @@ fn reclaim_verified_unstarted_temp(cache_directory: &Path, data_directory: &Path
         if !owner.protocol_v3 || process_owner_alive(&owner) {
             continue;
         }
-        if !matches!(
-            fs::symlink_metadata(directory.join(TEMP_PROCESS_START_FILE)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        ) {
+        let Ok(process_state_file) = process_state_path(cache_directory, &lock_directory) else {
+            continue;
+        };
+        if !unstarted_process_state(&process_state_file) {
             continue;
         }
         let Ok(lock_path) = lock_path(cache_directory, "temp", &lock_directory) else {
@@ -898,6 +943,17 @@ fn reclaim_verified_unstarted_temp(cache_directory: &Path, data_directory: &Path
             continue;
         };
         if temp_directory_in_use(&directory) {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(&process_state_file) {
+            let _ = fs::write(
+                directory.join(TEMP_PENDING_FILE),
+                b"verified-temp-removal-failed",
+            );
+            report_pending(
+                &directory,
+                &format!("verified-temp-removal-failed: {error}"),
+            );
             continue;
         }
         if let Err(error) = fs::remove_dir_all(&directory) {
@@ -938,9 +994,9 @@ pub(crate) fn clean_pending_temp(
     {
         return Err("Temporary data is no longer pending; refresh cleanup status.".into());
     }
-    let _temp_lock = if let Some(lock_directory) = lock_directory {
+    let _temp_lock = if let Some(lock_directory) = &lock_directory {
         Some(
-            FileLock::try_acquire(&lock_path(cache_directory, "temp", &lock_directory)?, true)
+            FileLock::try_acquire(&lock_path(cache_directory, "temp", lock_directory)?, true)
                 .map_err(|_| "Temporary data still has an active owner.".to_string())?,
         )
     } else {
@@ -956,6 +1012,17 @@ pub(crate) fn clean_pending_temp(
     if let Ok(owner) = read_temp_owner(&target, &data_directory) {
         if owner.pid != std::process::id() && process_owner_alive(&owner) {
             return Err("Temporary data still has a verified active owner.".into());
+        }
+    }
+    if let Some(lock_directory) = &lock_directory {
+        let process_state_file = process_state_path(cache_directory, lock_directory)?;
+        if let Err(error) = fs::remove_file(process_state_file) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                report_pending(&target, "manual-temp-removal-failed");
+                return Err(format!(
+                    "Cannot remove pending temporary process state: {error}"
+                ));
+            }
         }
     }
     fs::remove_dir_all(&target).map_err(|error| {
@@ -2509,6 +2576,10 @@ mod tests {
             .spawn()
             .unwrap();
         runtime.mark_started();
+        let child_visible_marker = temp.join("sail-temp-process-starting-v1");
+        if child_visible_marker.exists() {
+            fs::remove_file(child_visible_marker).unwrap();
+        }
         assert!(child.wait().unwrap().success());
         runtime.release_clean().unwrap();
 
@@ -2544,9 +2615,10 @@ mod tests {
         let fixture = GitFixture::new();
         let (_, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
+        let state = lease.temp.process_state_file.clone();
         lease.prepare_process_start().unwrap();
-        fs::remove_file(temp.join(TEMP_PROCESS_START_FILE)).unwrap();
-        fs::create_dir(temp.join(TEMP_PROCESS_START_FILE)).unwrap();
+        fs::remove_file(&state).unwrap();
+        fs::create_dir(&state).unwrap();
         assert!(lease.cancel_process_start().is_err());
         drop(lease);
 
@@ -2554,6 +2626,29 @@ mod tests {
         let item = pending
             .iter()
             .find(|item| item.reason == "turn-temp-cleanup-failed")
+            .unwrap();
+        fs::remove_dir(&state).unwrap();
+        fs::write(&state, "invalid").unwrap();
+        clean_pending_temp(&fixture.cache, item.cleanup_token.as_deref().unwrap()).unwrap();
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn missing_process_state_cannot_prove_temp_was_unexposed() {
+        let fixture = GitFixture::new();
+        let (_, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        fs::write(temp.join("artifact"), "retain").unwrap();
+        fs::remove_file(&lease.temp.process_state_file).unwrap();
+        lease.mark_started();
+        drop(lease);
+
+        retry_cleanup(&fixture.cache);
+        assert_eq!(fs::read_to_string(temp.join("artifact")).unwrap(), "retain");
+        let pending = cleanup_status(&fixture.cache);
+        let item = pending
+            .iter()
+            .find(|item| item.reason == "turn-temp-owner-unverified")
             .unwrap();
         clean_pending_temp(&fixture.cache, item.cleanup_token.as_deref().unwrap()).unwrap();
         assert!(!temp.exists());
@@ -2628,7 +2723,7 @@ mod tests {
     }
 
     #[test]
-    fn process_start_marker_retains_crashed_owner_temp() {
+    fn process_exposure_state_retains_crashed_owner_temp() {
         let fixture = GitFixture::new();
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
