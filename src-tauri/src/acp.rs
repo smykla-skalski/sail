@@ -1594,6 +1594,26 @@ impl ForgetGenerationKey {
 
 type ForgetGenerations = HashMap<ForgetGenerationKey, u64>;
 
+fn retryable_process_cleanup_sessions(
+    failed: &HashSet<String>,
+    prompts: &PromptState,
+    cancelled_turns: &HashSet<String>,
+) -> Vec<(String, bool)> {
+    let busy = !prompts.active.is_empty() || !prompts.finishing.is_empty();
+    failed
+        .iter()
+        .filter_map(|session_id| {
+            let cancelled_and_finishing = prompts.finishing.contains(session_id)
+                && prompts
+                    .active
+                    .get(session_id)
+                    .is_some_and(|prompt| cancelled_turns.contains(&prompt.turn_id));
+            (!busy || cancelled_and_finishing)
+                .then(|| (session_id.clone(), cancelled_and_finishing))
+        })
+        .collect()
+}
+
 #[derive(Clone, Default)]
 pub struct AgentManager(
     Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>,
@@ -1621,14 +1641,27 @@ impl AgentManager {
                     .prompt_state
                     .lock()
                     .map_err(|error| error.to_string())?;
-                if !prompts.active.is_empty() || !prompts.finishing.is_empty() {
-                    return Ok(());
-                }
+                let cancelled_turns = connection
+                    .cancelled_prompts
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                let sessions = retryable_process_cleanup_sessions(
+                    &temp_gate.failed_process_sessions,
+                    &prompts,
+                    &cancelled_turns,
+                );
+                drop(cancelled_turns);
                 drop(prompts);
-                let sessions = temp_gate.failed_process_sessions.clone();
-                for session_id in sessions {
+                let mut cancelled_retry_succeeded = false;
+                for (session_id, cancelled_and_finishing) in sessions {
                     if cleanup_session_processes(app, &connection, &connection.agent, &session_id) {
                         temp_gate.failed_process_sessions.remove(&session_id);
+                        cancelled_retry_succeeded |= cancelled_and_finishing;
+                    }
+                }
+                if cancelled_retry_succeeded && temp_gate.failed_process_sessions.is_empty() {
+                    if let Some(lease) = &connection._storage_lease {
+                        lease.mark_temp_pending("turn-temp-owner-unverified");
                     }
                 }
                 Ok(())
@@ -6187,7 +6220,16 @@ fn cancel_session(
         return result;
     }
     if cleanup_current {
-        let _ = cleanup_session_processes(app, runtime, &agent, &session_id);
+        let clean = cleanup_session_processes(app, runtime, &agent, &session_id);
+        if let Err(error) = runtime.record_process_cleanup(&session_id, clean) {
+            if let Some(lease) = &runtime._storage_lease {
+                lease.mark_temp_pending("turn-temp-process-cleanup-failed");
+            }
+            crate::diagnostics::record(
+                "turn_temp_cleanup_failed",
+                json!({"agent":agent,"sessionId":session_id,"error":error}),
+            );
+        }
     }
     resolve_session_permissions(
         &mut permission_state.pending,
@@ -6348,6 +6390,43 @@ mod session_config_tests {
     use super::*;
     use crate::browser_agent::McpConfig;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn retry_can_clean_cancelled_session_while_its_prompt_is_unanswered() {
+        let mut prompts = PromptState::default();
+        let prompt = |turn_id: &str| ActivePrompt {
+            turn_id: turn_id.into(),
+            text: String::new(),
+            memory_capture: crate::memory_capture::TurnCapture::default(),
+            last_agent_message: String::new(),
+            agent_message_open: false,
+            agent_message_overflow: false,
+            known_tool_calls: HashSet::new(),
+        };
+        prompts
+            .active
+            .insert("cancelled".into(), prompt("turn-cancelled"));
+        prompts
+            .active
+            .insert("running".into(), prompt("turn-running"));
+        prompts.finishing.insert("cancelled".into());
+        let failed = HashSet::from([
+            "cancelled".to_string(),
+            "running".to_string(),
+            "old".to_string(),
+        ]);
+        let cancelled_turns = HashSet::from(["turn-cancelled".to_string()]);
+
+        let sessions = retryable_process_cleanup_sessions(&failed, &prompts, &cancelled_turns);
+        assert_eq!(sessions, vec![("cancelled".to_string(), true)]);
+
+        prompts.active.clear();
+        prompts.finishing.clear();
+        assert_eq!(
+            retryable_process_cleanup_sessions(&failed, &prompts, &cancelled_turns).len(),
+            3
+        );
+    }
 
     #[cfg(unix)]
     #[test]
