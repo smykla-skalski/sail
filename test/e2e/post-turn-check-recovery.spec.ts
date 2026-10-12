@@ -24,6 +24,9 @@ describe('post-turn check recovery', () => {
       const tauri = Reflect.get(window, '__TAURI__');
       await tauri.core.invoke('save_setting', { key: 'sai-acp-turn-evidence', value: null });
       await tauri.core.invoke('save_setting', { key: 'sai-post-turn-personal', value: null });
+      await tauri.core.invoke('save_setting', { key: 'sai-post-turn-history', value: null });
+      await tauri.core.invoke('save_setting', { key: 'sail-agent-threads', value: null });
+      await tauri.core.invoke('save_setting', { key: 'sai-pane-layouts', value: null });
       localStorage.clear();
       sessionStorage.removeItem('sail-e2e-settings');
     });
@@ -618,5 +621,100 @@ describe('post-turn check recovery', () => {
     );
     await emitReady();
     expect(readFileSync(join(repository, 'evidence-retry-runs.txt'), 'utf8')).toBe('saved\n');
+  });
+
+  it('acknowledges a pending turn after a failed automatic check is manually retried', async () => {
+    const checkCommand = "printf 'manual\\n' >> manual-retry-runs.txt";
+    const thread = {
+      agent: 'claude',
+      sessionId: 'manual-retry-session',
+      directory: repository,
+      title: 'Manual retry session',
+      updated: Date.now(),
+    };
+    mkdirSync(join(repository, '.sail'), { recursive: true });
+    writeFileSync(
+      join(repository, '.sail', 'worktree.json'),
+      JSON.stringify({ postTurnChecks: [] }),
+    );
+    await browser.execute(
+      async (path, value, savedThread) => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-post-turn-personal',
+          value: JSON.stringify([value]),
+        });
+        await tauri.core.invoke('save_setting', { key: 'sai-post-turn-history', value: '{' });
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-acp-turn-evidence',
+          value: JSON.stringify([
+            {
+              agent: 'claude',
+              directory: path,
+              sessionId: savedThread.sessionId,
+              turnId: 'manual-retry-turn',
+              status: 'done',
+              error: null,
+              updatedAt: Date.now(),
+              postTurnPending: true,
+            },
+          ]),
+        });
+        await tauri.core.invoke('save_setting', {
+          key: 'sail-agent-threads',
+          value: JSON.stringify([savedThread]),
+        });
+        const paneLayouts = JSON.stringify({
+          [path]: { id: 'main', agent: 'claude', thread: savedThread },
+        });
+        await tauri.core.invoke('save_setting', { key: 'sai-pane-layouts', value: paneLayouts });
+        localStorage.setItem('sai-post-turn-personal', JSON.stringify([value]));
+        localStorage.setItem('sail-agent-threads', JSON.stringify([savedThread]));
+        localStorage.setItem('sai-pane-layouts', paneLayouts);
+        localStorage.setItem('sai-directory', path);
+        sessionStorage.setItem('sail-e2e-settings', 'enabled');
+      },
+      repository,
+      checkCommand,
+      thread,
+    );
+    await browser.refresh();
+
+    const failedCheck = $(
+      '//article[contains(@class, "post-turn-check")][contains(., "manual-retry-runs.txt")]',
+    );
+    await browser.waitUntil(
+      async () => {
+        if (!(await failedCheck.isExisting())) return false;
+        return (await failedCheck.getText()).includes('failed');
+      },
+      {
+        timeoutMsg: 'The automatic check did not show its history error in the transcript',
+      },
+    );
+    const evidence = async () =>
+      browser.execute(async (path) => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        return tauri.core.invoke('get_acp_turn_evidence', {
+          agent: 'claude',
+          directory: path,
+          sessionId: 'manual-retry-session',
+          turnId: 'manual-retry-turn',
+        });
+      }, repository);
+    expect((await evidence())?.postTurnPending).toBe(true);
+    expect(existsSync(join(repository, 'manual-retry-runs.txt'))).toBe(false);
+
+    await browser.execute(async () => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('save_setting', { key: 'sai-post-turn-history', value: null });
+    });
+    await failedCheck.$('button').click();
+    await browser.waitUntil(async () => (await evidence())?.postTurnPending === false, {
+      timeoutMsg: 'Manual Retry did not acknowledge the verified completed turn',
+    });
+    expect(readFileSync(join(repository, 'manual-retry-runs.txt'), 'utf8')).toBe('manual\n');
+    await browser.refresh();
+    expect(readFileSync(join(repository, 'manual-retry-runs.txt'), 'utf8')).toBe('manual\n');
   });
 });

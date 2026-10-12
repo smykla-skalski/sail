@@ -11265,6 +11265,13 @@
     }
   }
 
+  async function retryPostTurnCheck(check: PostTurnCheck) {
+    if (!(await runOnePostTurnCheck(check, true))) return;
+    const match = /^acp:([^:]+):(.+)$/.exec(check.thread);
+    if (!match) return;
+    await runVerifiedCompletedChecks(match[1], check.directory, match[2], check.turn);
+  }
+
   async function reconcilePendingPostTurnChecks() {
     try {
       const pending = await acp.pendingPostTurnChecks();
@@ -12276,7 +12283,7 @@
                     check.directory === directory &&
                     check.thread === `acp:${acpAgent}:${acpThread.sessionId}`,
                 )}
-                onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+                onretrycheck={(check) => void retryPostTurnCheck(check)}
               />
             {/key}
           {:else}
@@ -12369,7 +12376,7 @@
           startShippingRun(graph, provider, limit, source)}
         onshipit={adoptDirectShipRunWithAuthorization}
         postTurnChecks={postTurnResults}
-        onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+        onretrycheck={(check) => void retryPostTurnCheck(check)}
         {agentUsage}
         {agentRates}
         onentries={(id, entries, sessionId, ready) =>
