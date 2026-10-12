@@ -85,6 +85,8 @@
     acpPromptInterrupted,
     groupAgentEntries,
     liveSessionView,
+    markLiveMessageBoundary,
+    restoredLiveTurnIsCurrent,
     loadRecentTranscript,
     restoreEntryTimes,
     saveRecentTranscript,
@@ -97,6 +99,7 @@
     type AgentTool,
     type AgentEvent,
     type AgentConfigOption,
+    type AgentCommand,
     type AgentAuthMethod,
     type AgentId,
     type AgentPermission,
@@ -532,6 +535,7 @@
     onreplaychange?.(agent, directory, activeSessionId, value);
   }
   let replayEntries: AgentEntry[] = [];
+  let liveMessageBoundary = { pending: false };
   let pendingUpdates: Record<string, unknown>[] = [];
   let updateTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
@@ -714,6 +718,7 @@
     }),
   );
   let liveTurn = $state(false);
+  let finishedTurnIds: string[] = [];
   // The app marks a thread done from the turn-finished event, before this pane's prompt call
   // returns; the header follows that event so both settle in the same frame.
   let turnEnded = $state(false);
@@ -1028,7 +1033,7 @@
       updateEntriesInPlace(replayEntries, update);
       return;
     }
-    pendingUpdates.push(update);
+    pendingUpdates.push(markLiveMessageBoundary(update, liveMessageBoundary));
     if (!updateTimer) updateTimer = setTimeout(flushUpdates, 50);
   }
 
@@ -1074,10 +1079,30 @@
     const current = generation;
     historyAttempted = true;
     historyLoading = true;
-    setReplaying(true);
-    replayEntries = [];
+    if (!historyLoaded) liveMessageBoundary.pending = true;
+    let restoreToken: string | undefined;
     try {
-      const session = await acp.load(agent, directory, id, activeCapabilityProfile);
+      const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
+      restoreToken = reservation.restoreToken;
+      if (current !== generation) return;
+      if (reservation.liveTurn) {
+        const turnId = reservation.liveTurn;
+        const latest = (await acp.activity(directory))[agent];
+        if (current !== generation) return;
+        if (!restoredLiveTurnIsCurrent(turnId, latest?.activeTurns[id], finishedTurnIds)) {
+          historyAttempted = false;
+          return;
+        }
+        liveTurn = true;
+        activeTurnId = turnId;
+        historyAttempted = false;
+        return;
+      }
+      if (!restoreToken) throw new Error('Session restore reservation is missing.');
+      setReplaying(true);
+      liveMessageBoundary.pending = false;
+      replayEntries = [];
+      const session = await acp.load(agent, directory, id, activeCapabilityProfile, restoreToken);
       if (current !== generation) return;
       historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
       if (!configOptions.length && Array.isArray(session.configOptions))
@@ -1106,6 +1131,7 @@
         replayEntries = [];
         historyLoading = false;
       }
+      if (restoreToken) await acp.endRestore(agent, directory, id, restoreToken);
     }
   }
 
@@ -1266,6 +1292,7 @@
     pendingUpdates = [];
     setReplaying(false);
     replayEntries = [];
+    liveMessageBoundary = { pending: false };
     permissions = [];
     answeredNotes = [];
     settledElsewhere = [];
@@ -1281,7 +1308,11 @@
       id && !nativeEntries
         ? liveSessionView(entries, kept, sessionState(agent, directory, id))
         : null;
-    if (liveView) entries = liveView.entries;
+    if (liveView) {
+      entries = liveView.entries;
+      // Events can arrive while connect and restore reservation are still awaiting.
+      liveMessageBoundary = liveView.messageBoundary;
+    }
     // Tools already present when this pane opens are history, even if the child is still working.
     // A failed tool arriving afterward is absent from this set and announces on its first render.
     historicalToolIds = presentToolIds(nativeEntries ?? entries);
@@ -1313,6 +1344,7 @@
     liveTurn = false;
     stopRequested = false;
     activeTurnId = null;
+    finishedTurnIds = [];
     turnEnded = false;
     error = '';
     ready = false;
@@ -1355,52 +1387,87 @@
             ? capabilities.loadSession
             : false;
         if (!canLoad) throw new Error(`${name} does not support restoring threads.`);
-        const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
-        if (current !== generation) return;
-        const runningTurn = runtime?.alive ? runtime.activeTurns[id] : undefined;
-        if (liveView && runningTurn !== undefined) {
+        const showLiveTurn = async (
+          turnId: string,
+          cached: { configOptions?: AgentConfigOption[]; availableCommands?: AgentCommand[] },
+        ) => {
+          if (!liveView) return;
           liveTurn = true;
-          activeTurnId = runningTurn;
+          activeTurnId = turnId;
           historyLoaded = liveView.complete;
-          configOptions = await restoreClaudeThreadConfig(liveView.configOptions);
+          configOptions = await restoreClaudeThreadConfig(
+            cached.configOptions ?? liveView.configOptions,
+          );
           rememberThreadConfig(configOptions);
-          if (liveView.availableCommands) updateSkills(liveView.availableCommands);
+          const availableCommands = cached.availableCommands ?? liveView.availableCommands;
+          if (availableCommands) updateSkills(availableCommands);
           if (commandUpdates[id]) updateSkills(commandUpdates[id]);
           const latest = (await acp.activity(directory).catch(() => null))?.[agent];
-          if (current === generation && latest?.activeTurns[id] !== runningTurn) {
+          if (
+            current === generation &&
+            !restoredLiveTurnIsCurrent(turnId, latest?.activeTurns[id], finishedTurnIds)
+          ) {
             liveTurn = false;
             activeTurnId = null;
           }
+        };
+        const sessionCapabilities =
+          capabilities && typeof capabilities === 'object' && 'sessionCapabilities' in capabilities
+            ? capabilities.sessionCapabilities
+            : null;
+        const canResume =
+          sessionCapabilities &&
+          typeof sessionCapabilities === 'object' &&
+          'resume' in sessionCapabilities;
+        const restoresSubagents =
+          sessionCapabilities &&
+          typeof sessionCapabilities === 'object' &&
+          'subagents' in sessionCapabilities;
+        const needsReplay = restoresSubagents || !canResume;
+        const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
+        if (current !== generation) {
+          if (reservation.restoreToken)
+            await acp.endRestore(agent, directory, id, reservation.restoreToken);
+          return;
+        }
+        if (reservation.liveTurn) {
+          await showLiveTurn(reservation.liveTurn, reservation);
         } else {
-          const sessionCapabilities =
-            capabilities &&
-            typeof capabilities === 'object' &&
-            'sessionCapabilities' in capabilities
-              ? capabilities.sessionCapabilities
-              : null;
-          const canResume =
-            sessionCapabilities &&
-            typeof sessionCapabilities === 'object' &&
-            'resume' in sessionCapabilities;
-          const restoresSubagents =
-            sessionCapabilities &&
-            typeof sessionCapabilities === 'object' &&
-            'subagents' in sessionCapabilities;
-          if (restoresSubagents || !canResume) {
+          if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
+          if (needsReplay) {
             setReplaying(true);
+            liveMessageBoundary.pending = false;
             replayEntries = [];
           }
-          const session =
-            restoresSubagents || !canResume
-              ? await acp.load(agent, directory, id, activeCapabilityProfile)
-              : await acp.resume(agent, directory, id, activeCapabilityProfile);
-          if (current === generation && (restoresSubagents || !canResume)) {
-            historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
-            entries = restoreEntryTimes(replayEntries, entries);
-            setReplaying(false);
-            replayEntries = [];
-            historyLoaded = true;
-            rememberTranscript();
+          let session: Record<string, unknown>;
+          try {
+            session = needsReplay
+              ? await acp.load(
+                  agent,
+                  directory,
+                  id,
+                  activeCapabilityProfile,
+                  reservation.restoreToken,
+                )
+              : await acp.resume(
+                  agent,
+                  directory,
+                  id,
+                  activeCapabilityProfile,
+                  reservation.restoreToken,
+                );
+            if (current === generation && needsReplay) {
+              historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
+              entries = restoreEntryTimes(replayEntries, entries);
+              historyLoaded = true;
+              rememberTranscript();
+            }
+          } finally {
+            if (current === generation && needsReplay) {
+              setReplaying(false);
+              replayEntries = [];
+            }
+            await acp.endRestore(agent, directory, id, reservation.restoreToken);
           }
           if (current === generation) {
             configOptions = await restoreClaudeThreadConfig(
@@ -1605,6 +1672,10 @@
           commandUpdates[params.sessionId] = update.availableCommands;
       }
       if (message.method === 'sail/prompt_finished' && typeof params?.sessionId === 'string') {
+        if (params.sessionId === activeSessionId && typeof params.turnId === 'string') {
+          if (!finishedTurnIds.includes(params.turnId)) finishedTurnIds.push(params.turnId);
+          if (finishedTurnIds.length > 32) finishedTurnIds.shift();
+        }
         if (
           busy &&
           params.sessionId === activeSessionId &&

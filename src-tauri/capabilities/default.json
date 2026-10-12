@@ -104,6 +104,8 @@
     "allow-acp-forget-session",
     "allow-acp-release-session-fence",
     "allow-acp-load-session",
+    "allow-acp-begin-session-restore",
+    "allow-acp-end-session-restore",
     "allow-acp-resume-session",
     "allow-acp-list-sessions",
     "allow-acp-prompt",
