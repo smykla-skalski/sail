@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import type { AttentionItem, AttentionKind, AttentionSnooze } from './lib/attention-items';
   import { inboxRepositoryLabel, isInboxOutcome, type InboxItem } from './lib/inbox';
 
@@ -40,6 +41,7 @@
     ondecide,
   }: Props = $props();
   let busyKey = $state<string | null>(null);
+  let panel: HTMLElement;
   let error = $state('');
   let pending = $derived(items.filter((item) => !isInboxOutcome(item)));
   let groups = $derived(
@@ -81,9 +83,19 @@
       busyKey = null;
     }
   }
+
+  async function actOnAttention(event: MouseEvent, action: () => void) {
+    const entry = (event.currentTarget as HTMLElement).closest('.inbox-item');
+    const index = entry ? [...panel.querySelectorAll('.inbox-item')].indexOf(entry) : -1;
+    action();
+    await tick();
+    const remaining = panel.querySelectorAll('.inbox-item');
+    const next = remaining[Math.min(index, remaining.length - 1)]?.querySelector('button');
+    (next ?? panel.closest('dialog')?.querySelector('.inbox-dialog-top button'))?.focus();
+  }
 </script>
 
-<section class="inbox-panel" aria-label="Inbox across projects">
+<section class="inbox-panel" aria-label="Inbox across projects" bind:this={panel}>
   <header class="inbox-header">
     <h2>Waiting for you</h2>
     <span aria-label={`${total} need attention`}>{total}</span>
@@ -133,9 +145,15 @@
             {#if item.detail}<span class="inbox-text">{item.detail}</span>{/if}
           </button>
           <div class="inbox-actions">
-            <button onclick={() => ondismiss(item)}>Dismiss</button>
-            <button onclick={() => onsnooze(item, 'hour')}>Snooze 1 hour</button>
-            <button onclick={() => onsnooze(item, 'tomorrow')}>Until tomorrow</button>
+            <button onclick={(event) => actOnAttention(event, () => ondismiss(item))}
+              >Dismiss</button
+            >
+            <button onclick={(event) => actOnAttention(event, () => onsnooze(item, 'hour'))}
+              >Snooze 1 hour</button
+            >
+            <button onclick={(event) => actOnAttention(event, () => onsnooze(item, 'tomorrow'))}
+              >Until tomorrow</button
+            >
           </div>
         </li>
       {/each}

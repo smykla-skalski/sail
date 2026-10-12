@@ -90,15 +90,29 @@ describe('styled app dialogs', () => {
     );
     await $('.path-picker-dialog[open] .path-picker-actions .confirmation-primary').click();
     await expect($('.worktree-destination span')).toHaveText(realpathSync(fixture));
-    await browser.execute(() =>
-      document
-        .querySelector<HTMLInputElement>('.worktree-agent-option input:not(:disabled)')
-        ?.focus(),
+    await expect($('.worktree-agent-option input:not(:disabled)')).toExist();
+    await browser.waitUntil(async () =>
+      browser.execute(() => {
+        const option = document.querySelector<HTMLInputElement>(
+          '.worktree-agent-option input:not(:disabled)',
+        );
+        if (!option) return false;
+        option.focus();
+        return document.activeElement === option;
+      }),
     );
     await browser.keys('ArrowRight');
-    const focusedAgent = $('.worktree-agent-option input:focus');
-    await expect(focusedAgent).toBeSelected();
-    expect(await focusedAgent.getValue()).not.toBe('');
+    const focusedAgent = await browser.execute(() => {
+      const input = document.activeElement;
+      return input instanceof HTMLInputElement &&
+        input.matches('.worktree-agent-option input') &&
+        input.checked &&
+        !input.disabled
+        ? input.value
+        : null;
+    });
+    expect(focusedAgent).not.toBeNull();
+    expect(focusedAgent).not.toBe('');
     await expect($('.worktree-dialog')).toBeDisplayed();
   });
 });

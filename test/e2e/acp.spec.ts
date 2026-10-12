@@ -611,6 +611,38 @@ describe('ACP agent threads', () => {
     await expect($('.queued-messages')).not.toExist();
   });
 
+  it('does not queue a dispatched prompt again after the agent reports failure', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Ship gate fixture queue ordering');
+    await $(sendButton).click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Prompt failure');
+    await $(sendButton).click();
+    await $('.agent-composer [data-pane-prompt]').setValue('After failed prompt');
+    await $(sendButton).click();
+    await expect($('.agent-error')).toHaveText(expect.stringContaining('Fixture prompt failed'));
+    await expect($('.queued-messages')).toHaveText(expect.stringContaining('After failed prompt'));
+    await expect($('.queued-messages')).not.toHaveText(expect.stringContaining('Prompt failure'));
+    await $('button=Retry queue').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    await $('.agent-permission button').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Done: After failed prompt'),
+    );
+    await expect($('.queued-messages')).not.toExist();
+  });
+
   it('keeps an active ACP turn running when closing Sail is cancelled', async () => {
     await browser.execute((path) => {
       localStorage.setItem('sai-directory', path);

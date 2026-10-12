@@ -19,6 +19,7 @@ cc = "1.6"
 
 [dependencies]
 tauri = { version = "2", features = ["unstable", "devtools"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1.6"
@@ -41,6 +42,7 @@ netstat2 = "0.11.2"
 sysinfo = { version = "0.39.0", default-features = false, features = ["disk", "system"] }
 wait-timeout = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+sail-project-knowledge = { path = "../crates/project-knowledge" }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 keyring = { version = "4.0.0", default-features = false, features = [
