@@ -98,6 +98,13 @@ struct TempOwner {
 }
 
 impl TempLease {
+    fn exposed_to_process(&self) -> bool {
+        !matches!(
+            fs::symlink_metadata(self.directory.join(TEMP_PROCESS_START_FILE)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
     fn prepare_process_start(&self) -> Result<(), String> {
         self.verify_root()?;
         let mut file = OpenOptions::new()
@@ -130,13 +137,7 @@ impl TempLease {
 
     fn mark_pending(&self, reason: &str) {
         if self.verify_root().is_ok() {
-            if let Ok(mut file) = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(self.directory.join(TEMP_PENDING_FILE))
-            {
-                let _ = file.write_all(reason.as_bytes());
-            }
+            let _ = fs::write(self.directory.join(TEMP_PENDING_FILE), reason);
         }
         report_pending(&self.directory, reason);
     }
@@ -145,12 +146,17 @@ impl TempLease {
         if self.released.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let removal = self.verify_root().and_then(|_| {
-            if temp_directory_in_use(&self.directory) {
-                return Err("Private temporary data is still used by a process.".into());
-            }
-            fs::remove_dir_all(&self.directory).map_err(|error| error.to_string())
-        });
+        let removal = if self.exposed_to_process() {
+            self.mark_pending("turn-temp-owner-unverified");
+            Ok(())
+        } else {
+            self.verify_root().and_then(|_| {
+                if temp_directory_in_use(&self.directory) {
+                    return Err("Private temporary data is still used by a process.".into());
+                }
+                fs::remove_dir_all(&self.directory).map_err(|error| error.to_string())
+            })
+        };
         let removal = removal.map_err(|error| {
             self.mark_pending("turn-temp-removal-failed");
             format!("Cannot remove private temporary data: {error}")
@@ -227,7 +233,15 @@ impl WorktreeDataLease {
         &self.temp.directory
     }
 
+    pub(crate) fn mark_temp_pending(&self, reason: &str) {
+        self.temp.mark_pending(reason);
+    }
+
     pub(crate) fn clear_turn_temp(&self) -> Result<(), String> {
+        if self.temp.exposed_to_process() {
+            self.temp.mark_pending("turn-temp-owner-unverified");
+            return Ok(());
+        }
         self.temp.clear_contents()?;
         fs::create_dir_all(self.temp.directory.join("go-tmp")).map_err(|error| {
             self.temp.mark_pending("turn-temp-prepare-failed");
@@ -1074,6 +1088,9 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
         let key = cache_key(&directory).unwrap_or_else(|_| "unknown".into());
         let reason = match read_temp_owner(&directory, data_directory) {
             Ok(owner) => {
+                let pending_reason = fs::read_to_string(directory.join(TEMP_PENDING_FILE)).ok();
+                let owner_unverified =
+                    pending_reason.as_deref() == Some("turn-temp-owner-unverified");
                 let cleanup_failed = fs::symlink_metadata(directory.join(TEMP_PENDING_FILE))
                     .is_ok_and(|metadata| metadata.is_file());
                 let lock_path = lock_path(cache_directory, "temp", &lock_directory);
@@ -1084,8 +1101,10 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
                     Ok(_lock) if owner.pid != std::process::id() && process_owner_alive(&owner) => {
                         Some("turn-temp-process-active")
                     }
+                    Ok(_lock) if owner_unverified => Some("turn-temp-owner-unverified"),
                     Ok(_lock) if cleanup_failed => Some("turn-temp-cleanup-failed"),
                     Ok(_lock) => Some("turn-temp-owner-unverified"),
+                    Err(_) if owner_unverified => Some("turn-temp-owner-unverified-active"),
                     Err(_) if cleanup_failed => Some("turn-temp-cleanup-failed"),
                     Err(_) => None,
                 }
@@ -2392,7 +2411,7 @@ mod tests {
     }
 
     #[test]
-    fn ten_exited_turns_do_not_accumulate_temp_while_terminal_runs() {
+    fn ten_verified_unexposed_turns_do_not_accumulate_temp_while_terminal_runs() {
         let fixture = GitFixture::new();
         let (_, terminal) = register(&fixture.cache, &fixture.first).unwrap();
         terminal.mark_started();
@@ -2403,18 +2422,83 @@ mod tests {
             let (_, runtime) = register(&fixture.cache, &fixture.first).unwrap();
             let temp = runtime.temp_directory().to_path_buf();
             fs::write(temp.join(format!("turn-{turn}")), "finished").unwrap();
-            let mut child = std::process::Command::new("git")
-                .arg("--version")
-                .env("TMPDIR", &temp)
-                .spawn()
-                .unwrap();
             runtime.mark_started();
-            assert!(child.wait().unwrap().success());
             runtime.release_clean().unwrap();
             assert!(!temp.exists());
             assert_eq!(fs::read_to_string(&active).unwrap(), "running");
         }
         terminal.release_clean().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ten_crashed_owners_with_verified_exits_leave_no_earlier_temp() {
+        let fixture = GitFixture::new();
+        let (_, terminal) = register(&fixture.cache, &fixture.first).unwrap();
+        terminal.mark_started();
+        let active = terminal.temp_directory().join("terminal-artifact");
+        fs::write(&active, "running").unwrap();
+
+        for turn in 0..10 {
+            let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+            let temp = lease.temp_directory().to_path_buf();
+            fs::write(temp.join(format!("turn-{turn}")), "unused").unwrap();
+            let mut owner = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let started_at = sysinfo::System::new_all()
+                .process(sysinfo::Pid::from_u32(owner.id()))
+                .unwrap()
+                .start_time();
+            fs::write(
+                temp.join(TEMP_OWNER_FILE),
+                format!(
+                    "{TEMP_OWNER_HEADER}\n{}\n{}\n{started_at}\n",
+                    cache_key(&directory).unwrap(),
+                    owner.id(),
+                ),
+            )
+            .unwrap();
+            lease.mark_started();
+            drop(lease);
+            owner.kill().unwrap();
+            owner.wait().unwrap();
+
+            retry_cleanup(&fixture.cache);
+            assert!(!temp.exists());
+            assert_eq!(fs::read_to_string(&active).unwrap(), "running");
+        }
+        terminal.release_clean().unwrap();
+    }
+
+    #[test]
+    fn process_exposed_temp_remains_pending_after_its_parent_exits() {
+        let fixture = GitFixture::new();
+        let (_, runtime) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = runtime.temp_directory().to_path_buf();
+        let artifact = temp.join("artifact");
+        fs::write(&artifact, "retain").unwrap();
+        runtime.prepare_process_start().unwrap();
+        let mut child = std::process::Command::new("git")
+            .arg("--version")
+            .env("TMPDIR", &temp)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        runtime.mark_started();
+        assert!(child.wait().unwrap().success());
+        runtime.release_clean().unwrap();
+
+        let pending = cleanup_status(&fixture.cache);
+        let item = pending
+            .iter()
+            .find(|item| item.reason == "turn-temp-owner-unverified")
+            .unwrap();
+        assert!(item.size_bytes.unwrap() >= 6);
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "retain");
+        clean_pending_temp(&fixture.cache, item.cleanup_token.as_deref().unwrap()).unwrap();
+        assert!(!artifact.exists());
     }
 
     #[test]
