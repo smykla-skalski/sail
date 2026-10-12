@@ -110,7 +110,11 @@ impl TempLease {
             format!("Cannot remove private temporary data: {error}")
         });
         let unlock = self._lock.unlock();
-        removal.and(unlock)
+        let result = removal.and(unlock);
+        if result.is_err() {
+            self.released.store(false, Ordering::Release);
+        }
+        result
     }
 
     fn clear_contents(&self) -> Result<(), String> {
@@ -198,6 +202,9 @@ impl WorktreeDataLease {
             self.released.store(false, Ordering::Release);
             report_pending(&self.directory, "active-lease-release-failed");
             return Err(error);
+        }
+        if temp_result.is_err() {
+            self.released.store(false, Ordering::Release);
         }
         temp_result
     }
@@ -627,6 +634,13 @@ pub(crate) fn reconcile(cache_directory: &Path) {
                 continue;
             }
         }
+        let pending_temp = temp_directory_status(cache_directory, &data_directory, true);
+        if !pending_temp.is_empty() {
+            for item in pending_temp {
+                report_pending(&data_directory, &item.reason);
+            }
+            continue;
+        }
         let quarantine_key = match cache_key(&data_directory) {
             Ok(key) => key,
             Err(_) => {
@@ -890,6 +904,20 @@ fn read_temp_owner(directory: &Path, data_directory: &Path) -> Result<TempOwner,
 }
 
 fn temp_directory_in_use(directory: &Path) -> bool {
+    let system = sysinfo::System::new_all();
+    system
+        .processes()
+        .values()
+        .any(|process| process_uses_temp(process, directory))
+}
+
+pub(crate) fn process_uses_temp(process: &sysinfo::Process, directory: &Path) -> bool {
+    if matches!(
+        process.status(),
+        sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+    ) {
+        return false;
+    }
     let environment = ["TMPDIR", "TEMP", "TMP"].map(|name| {
         let mut value = OsString::from(name);
         value.push("=");
@@ -898,15 +926,31 @@ fn temp_directory_in_use(directory: &Path) -> bool {
     });
     let mut go_temporary = OsString::from("GOTMPDIR=");
     go_temporary.push(directory.join("go-tmp").as_os_str());
-    let system = sysinfo::System::new_all();
-    system.processes().values().any(|process| {
-        !matches!(
-            process.status(),
-            sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
-        ) && process
-            .environ()
-            .iter()
-            .any(|value| environment.contains(value) || value == &go_temporary)
+    if process
+        .environ()
+        .iter()
+        .any(|value| environment.contains(value) || value == &go_temporary)
+    {
+        return true;
+    }
+    if process
+        .cwd()
+        .is_some_and(|path| path.starts_with(directory))
+        || process
+            .exe()
+            .is_some_and(|path| path.starts_with(directory))
+    {
+        return true;
+    }
+    let path = directory.as_os_str().as_encoded_bytes();
+    if path.is_empty() {
+        return false;
+    }
+    process.cmd().iter().any(|argument| {
+        argument
+            .as_encoded_bytes()
+            .windows(path.len())
+            .any(|part| part == path)
     })
 }
 
@@ -1122,6 +1166,13 @@ pub(crate) fn remove_after_worktree_removal(
             return Err(
                 "Private agent data is retained because Git still identifies this worktree.".into(),
             );
+        }
+        let pending_temp = temp_directory_status(cache_directory, data_directory, true);
+        if !pending_temp.is_empty() {
+            for item in pending_temp {
+                report_pending(data_directory, &item.reason);
+            }
+            return Err("Private agent data is retained while temporary data is still in use or cannot be verified.".into());
         }
         let name = cache_key(data_directory)?;
         let quarantine = quarantine_path(
@@ -2212,6 +2263,48 @@ mod tests {
         assert!(unrelated.try_wait().unwrap().is_none());
         unrelated.kill().unwrap();
         unrelated.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removed_worktree_retains_temp_used_by_detached_worker() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        let artifact = temp.join("artifact");
+        fs::write(&artifact, "live").unwrap();
+        let mut worker = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import sys,time; time.sleep(30); open(sys.argv[1]).read()")
+            .arg(&artifact)
+            .env("TMPDIR", &temp)
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if temp_directory_in_use(&temp) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(temp_directory_in_use(&temp));
+
+        lease.mark_started();
+        assert!(lease.release_clean().is_err());
+        fixture.remove(&fixture.first);
+
+        assert!(
+            remove_after_worktree_removal(&fixture.cache, std::slice::from_ref(&directory))
+                .is_err()
+        );
+        reconcile(&fixture.cache);
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "live");
+
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        lease.release_clean().unwrap();
+        drop(lease);
+        retry_cleanup(&fixture.cache);
+        assert!(!directory.exists());
     }
 
     #[cfg(unix)]

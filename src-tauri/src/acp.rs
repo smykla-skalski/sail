@@ -5686,14 +5686,6 @@ pub async fn acp_steer(
 fn runtime_has_live_children(root: u32, temp_directory: Option<&Path>) -> bool {
     let system = sysinfo::System::new_all();
     let root = sysinfo::Pid::from_u32(root);
-    let temp_environment = temp_directory.map(|directory| {
-        ["TMPDIR", "TEMP", "TMP"].map(|name| {
-            let mut value = std::ffi::OsString::from(name);
-            value.push("=");
-            value.push(directory.as_os_str());
-            value
-        })
-    });
     system.processes().values().any(|process| {
         if process.pid() == root
             || matches!(
@@ -5707,12 +5699,9 @@ fn runtime_has_live_children(root: u32, temp_directory: Option<&Path>) -> bool {
         if process.session_id() == Some(root) {
             return true;
         }
-        if temp_environment.as_ref().is_some_and(|environment| {
-            process
-                .environ()
-                .iter()
-                .any(|value| environment.contains(value))
-        }) {
+        if temp_directory
+            .is_some_and(|directory| crate::worktree_storage::process_uses_temp(process, directory))
+        {
             return true;
         }
         let mut parent = process.parent();
@@ -6440,6 +6429,79 @@ time.sleep(10)
         assert!(runtime_has_live_children(root, Some(&temp)));
         runtime.clear_idle_temp(true).unwrap();
         assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_detects_detached_worker_with_temp_argument() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-detached-temp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let (_, lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        lease.mark_started();
+        let temp = lease.temp_directory().to_path_buf();
+        let artifact = temp.join("artifact");
+        let ready = scratch.join("ready");
+        let code = r#"import os,sys,time
+p=os.fork()
+if p==0:
+    p2=os.fork()
+    if p2>0: os._exit(0)
+    os.setsid()
+    worker="import os,sys,time; open(sys.argv[1], 'w').write('live'); open(sys.argv[2], 'w').write(str(os.getpid())); time.sleep(10)"
+    os.execve(sys.executable, [sys.executable, '-c', worker, sys.argv[1], sys.argv[2]], {})
+os.waitpid(p, 0)
+time.sleep(10)
+"#;
+        let mut command = Command::new("python3");
+        command
+            .arg("-c")
+            .arg(code)
+            .arg(&artifact)
+            .arg(&ready)
+            .stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let mut runtime = test_runtime_with_child(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            child,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        for _ in 0..100 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists());
+        let root = runtime.child.lock().unwrap().id();
+        assert!(!runtime_has_live_children(root, None));
+        assert!(runtime_has_live_children(root, Some(&temp)));
+        runtime.clear_idle_temp(true).unwrap();
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
+        let worker: i32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(worker),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
         runtime.stop_child().unwrap();
         drop(runtime);
         std::fs::remove_dir_all(scratch).unwrap();
