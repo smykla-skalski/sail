@@ -1291,13 +1291,7 @@ fn temp_directory_in_use(directory: &Path) -> bool {
         .any(|process| process_uses_temp(process, directory))
 }
 
-pub(crate) fn process_uses_temp(process: &sysinfo::Process, directory: &Path) -> bool {
-    if matches!(
-        process.status(),
-        sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
-    ) {
-        return false;
-    }
+fn environment_uses_temp(values: &[OsString], directory: &Path) -> bool {
     let environment = ["TMPDIR", "TEMP", "TMP"].map(|name| {
         let mut value = OsString::from(name);
         value.push("=");
@@ -1306,11 +1300,21 @@ pub(crate) fn process_uses_temp(process: &sysinfo::Process, directory: &Path) ->
     });
     let mut go_temporary = OsString::from("GOTMPDIR=");
     go_temporary.push(directory.join("go-tmp").as_os_str());
-    if process
-        .environ()
-        .iter()
-        .any(|value| environment.contains(value) || value == &go_temporary)
-    {
+    let mut legacy_go_temporary = OsString::from("GOTMPDIR=");
+    legacy_go_temporary.push(directory.as_os_str());
+    values.iter().any(|value| {
+        environment.contains(value) || value == &go_temporary || value == &legacy_go_temporary
+    })
+}
+
+pub(crate) fn process_uses_temp(process: &sysinfo::Process, directory: &Path) -> bool {
+    if matches!(
+        process.status(),
+        sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+    ) {
+        return false;
+    }
+    if environment_uses_temp(process.environ(), directory) {
         return true;
     }
     if process
@@ -2854,6 +2858,62 @@ mod tests {
             .unwrap();
         assert_pending_temp_cleaned(&fixture.cache, &token);
         assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn legacy_go_temp_environment_is_recognized() {
+        let temp = Path::new("cache/build/go-tmp");
+        let mut legacy = OsString::from("GOTMPDIR=");
+        legacy.push(temp.as_os_str());
+        let mut current = OsString::from("GOTMPDIR=");
+        current.push(temp.join("go-tmp").as_os_str());
+
+        assert!(environment_uses_temp(&[legacy], temp));
+        assert!(environment_uses_temp(&[current], temp));
+        assert!(!environment_uses_temp(
+            &[OsString::from("GOTMPDIR=other")],
+            temp
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manual_cleanup_keeps_legacy_go_temp_while_its_process_is_running() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = directory.join("build/go-tmp");
+        fs::create_dir_all(&temp).unwrap();
+        let artifact = temp.join("artifact");
+        fs::write(&artifact, "active-go-build").unwrap();
+        lease.release_clean().unwrap();
+
+        let mut process = std::process::Command::new("sleep")
+            .arg("30")
+            .env("GOTMPDIR", &temp)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let observed = loop {
+            if temp_directory_in_use(&temp) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let result = clean_pending_temp(&fixture.cache, &cache_key(&temp).unwrap());
+        process.kill().unwrap();
+        process.wait().unwrap();
+
+        assert!(observed, "legacy Go temporary process was not visible");
+        assert_eq!(
+            result.unwrap_err(),
+            "Temporary data is not an unused directory."
+        );
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "active-go-build");
+        assert_pending_temp_cleaned(&fixture.cache, &cache_key(&temp).unwrap());
+        assert!(!temp.exists());
     }
 
     #[cfg(unix)]
