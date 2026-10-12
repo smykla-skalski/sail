@@ -1784,14 +1784,25 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_terminal_job_stops_descendant_after_direct_child_exits() {
-        let mut command = Command::new("cmd.exe");
+        const HELPER: &str = "SAIL_WINDOWS_TERMINAL_JOB_DESCENDANT_HELPER";
+        if std::env::var_os(HELPER).is_some() {
+            Command::new("ping.exe")
+                .args(["-n", "60", "127.0.0.1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start descendant inside terminal job");
+            return;
+        }
+
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
             .args([
-                "/D",
-                "/Q",
-                "/C",
-                "start \"\" /B ping.exe -n 60 127.0.0.1 >NUL",
+                "--exact",
+                "acp_terminal::tests::windows_terminal_job_stops_descendant_after_direct_child_exits",
             ])
+            .env(HELPER, "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let (mut child, job) = WindowsTerminalJob::spawn(&mut command).unwrap();
@@ -1800,7 +1811,7 @@ mod tests {
         while child.try_wait().unwrap().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "cmd.exe parent did not exit: pid={}, elapsed={:?}, job active processes={:?}",
+                "test helper did not exit: pid={}, elapsed={:?}, job active processes={:?}",
                 child.id(),
                 started.elapsed(),
                 job.active_processes(),
