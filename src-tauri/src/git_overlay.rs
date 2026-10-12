@@ -14,8 +14,17 @@ static CACHE: OnceLock<PathBuf> = OnceLock::new();
 fn git_config_path(path: &Path) -> OsString {
     #[cfg(windows)]
     {
-        // Git config treats backslashes as escapes, including in include.path values.
-        OsString::from(path.to_string_lossy().replace('\\', "/"))
+        // canonicalize() adds the verbatim prefix, which Git for Windows rejects
+        // in include.path and the objects/info/alternates text file.
+        let path = path.to_string_lossy();
+        let path = if let Some(unc) = path.strip_prefix("\\\\?\\UNC\\") {
+            format!("\\\\{unc}")
+        } else if let Some(local) = path.strip_prefix("\\\\?\\") {
+            local.to_string()
+        } else {
+            path.into_owned()
+        };
+        OsString::from(path.replace('\\', "/"))
     }
     #[cfg(not(windows))]
     {
@@ -449,7 +458,7 @@ fn validate_overlay(git_dir: &Path, common_dir: &Path) -> Result<(), String> {
     let alternates = fs::read_to_string(git_dir.join("objects/info/alternates"))
         .map_err(|error| format!("Cannot read private Git object alternates: {error}"))?;
     let expected = common_dir.join("objects");
-    if alternates.trim_end() != expected.to_string_lossy() {
+    if alternates.trim_end() != git_config_path(&expected).to_string_lossy() {
         return Err("Private Git object alternates changed; overlay requires recovery.".into());
     }
     Ok(())
@@ -776,7 +785,10 @@ impl GitOverlay {
         let alternate = git_dir.join("objects/info/alternates");
         fs::write(
             &alternate,
-            format!("{}\n", current.common_dir.join("objects").display()),
+            format!(
+                "{}\n",
+                git_config_path(&current.common_dir.join("objects")).to_string_lossy()
+            ),
         )
         .map_err(|error| error.to_string())?;
         let config = git_dir.join("config");
@@ -1277,6 +1289,14 @@ mod tests {
         assert_eq!(
             git_config_quoted_path(Path::new(r"C:\task\repo\.git\config")).unwrap(),
             "\"C:/task/repo/.git/config\""
+        );
+        assert_eq!(
+            git_config_path(Path::new(r"\\?\C:\task\repo\.git\config")),
+            OsString::from("C:/task/repo/.git/config")
+        );
+        assert_eq!(
+            git_config_path(Path::new(r"\\?\UNC\server\share\repo\.git\config")),
+            OsString::from("//server/share/repo/.git/config")
         );
     }
 
