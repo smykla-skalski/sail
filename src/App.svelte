@@ -2652,6 +2652,12 @@
     scheduleInboxRefresh();
   }
 
+  async function saveProjectCatalogDurably(next: ProjectCatalog): Promise<void> {
+    projectCatalog = next;
+    scheduleInboxRefresh();
+    await setSettingDurable('sai-project-catalog', JSON.stringify(next));
+  }
+
   async function agentWorktreeOrigin(
     project: string,
     sourcePath: string,
@@ -5323,16 +5329,109 @@
             confirmedOwnership.ownershipGeneration !== ownership.ownershipGeneration
           )
             return;
+          const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', {
+            repository: run.repository,
+          });
+          const source = registered.find((worktree) => worktree.path === issue.path);
+          if (!source?.generation)
+            throw new Error('Ship worktree identity changed before descendant cleanup.');
+          const catalogued = projectCatalog.worktrees[run.repository] ?? [];
+          const savedSource = catalogued.find((worktree) => worktree.path === issue.path);
+          if (savedSource?.generation !== source.generation)
+            throw new Error('Ship worktree catalog identity changed before descendant cleanup.');
+          const knownPaths = new Set(catalogued.map((worktree) => worktree.path));
+          const unknown = registered.find(
+            (worktree) =>
+              worktree.path !== run.repository &&
+              worktree.path !== issue.path &&
+              !knownPaths.has(worktree.path),
+          );
+          if (unknown)
+            throw new Error(
+              `Cannot verify whether registered worktree ${unknown.path} belongs to the ship worktree. Its cleanup remains pending.`,
+            );
+          const descendants = worktreeDescendants(
+            projectCatalog,
+            run.repository,
+            registered,
+            issue.path,
+          );
+          if (descendants.length) {
+            const preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+              repository: run.repository,
+              paths: descendants.map((worktree) => worktree.path),
+            });
+            if (
+              preview.length !== descendants.length ||
+              preview.some(
+                (entry, index) =>
+                  entry.path !== descendants[index].path ||
+                  entry.generation !== descendants[index].generation,
+              )
+            )
+              throw new Error('Ship descendant identities changed before cleanup.');
+            let pendingCatalog = projectCatalog;
+            for (const [index, worktree] of descendants.entries()) {
+              const state = preview[index];
+              pendingCatalog = markWorktreeCleanupPending(
+                pendingCatalog,
+                run.repository,
+                worktree.path,
+                {
+                  originalPath: worktree.path,
+                  recoveryPath: worktree.path,
+                  sizeBytes: state.sizeBytes,
+                  reason: state.inspectionError
+                    ? `Cannot verify checkout contents: ${state.inspectionError}`
+                    : state.dirty
+                      ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+                      : state.activeSessions.length
+                        ? 'Agent sessions are connected. Finish them before retrying cleanup.'
+                        : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.',
+                },
+                state.generation,
+              );
+            }
+            await saveProjectCatalogDurably(pendingCatalog);
+          } else await saveProjectCatalogDurably(projectCatalog);
           const archivePath = await invoke<string | null>('delete_worktree', {
             request: {
               ...shipCleanupRequest(run.repository, issue, currentRevision),
               nativeGeneration: confirmedOwnership.nativeGeneration,
+              expectedRegisteredWorktrees: registered.map(
+                ({ path: registeredPath, generation }) => ({
+                  path: registeredPath,
+                  generation,
+                }),
+              ),
             },
           });
-          saveProjectCatalog(removeWorktree(projectCatalog, run.repository, issue.path));
+          await saveProjectCatalogDurably(
+            removeWorktree(projectCatalog, run.repository, issue.path),
+          );
           await updateShipIssue(run, issue, { path: null, archivePath, error: null });
         } catch (cause) {
-          await update({ error: `Cleanup: ${describe(cause)}` });
+          const retained = pendingStorageFromError(cause) ?? pendingRecoveryFromError(cause);
+          let catalogError = '';
+          if (retained && issue.path) {
+            const saved = projectCatalog.worktrees[run.repository]?.find(
+              (worktree) => worktree.path === issue.path,
+            );
+            try {
+              await saveProjectCatalogDurably(
+                markWorktreeCleanupPending(
+                  projectCatalog,
+                  run.repository,
+                  issue.path,
+                  retained,
+                  saved?.generation ?? undefined,
+                ),
+              );
+            } catch (failure) {
+              catalogError = ` Recovery details could not be saved: ${describe(failure)}`;
+            }
+          }
+          await update({ error: `Cleanup: ${describe(cause)}${catalogError}` });
         }
       }
       return;
@@ -9074,7 +9173,7 @@
       const warnings = [
         state.inspectionError ? 'files cannot be fully inspected' : null,
         state.dirty ? 'uncommitted changes' : null,
-        state.activeSessions.length ? `active: ${state.activeSessions.join(', ')}` : null,
+        state.activeSessions.length ? `connected: ${state.activeSessions.join(', ')}` : null,
       ].filter(Boolean);
       return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}`;
     });
@@ -9105,7 +9204,7 @@
         : state.dirty
           ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
           : state.activeSessions.length
-            ? 'Agent sessions are active. Finish them before retrying cleanup.'
+            ? 'Agent sessions are connected. Finish them before retrying cleanup.'
             : 'Awaiting explicit confirmation that this worktree is unused.';
       pendingCatalog = markWorktreeCleanupPending(
         pendingCatalog,
@@ -9120,7 +9219,15 @@
         state.generation,
       );
     }
-    saveProjectCatalog(pendingCatalog);
+    const previousCatalog = projectCatalog;
+    try {
+      await saveProjectCatalogDurably(pendingCatalog);
+    } catch (cause) {
+      saveProjectCatalog(previousCatalog);
+      throw new Error(`Could not persist pending worktrees before cleanup: ${describe(cause)}`, {
+        cause,
+      });
+    }
     error = '';
   }
 
@@ -9222,7 +9329,9 @@
                 ? await invoke<boolean>('pending_cleanup_paths_absent', { paths })
                 : true;
               if (absent) {
-                return { entry, pending, sizeBytes: null, reason: '', completed: true };
+                reason =
+                  'The Git checkout was removed outside Sail. Private storage without a durable cleanup marker cannot be ruled out; inspect its cache before clearing this pending entry.';
+                return { entry, pending, sizeBytes: null, reason, completed: false };
               }
               reason = `The Git generation is unregistered, but a saved checkout or storage path still exists. Inspect ${paths.join(', ')} before clearing this pending entry.`;
               return { entry, pending, sizeBytes: null, reason, completed: false };
@@ -9249,7 +9358,7 @@
                   : state.dirty
                     ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
                     : state.activeSessions.length
-                      ? 'Agent sessions are active. Finish them before retrying cleanup.'
+                      ? 'Agent sessions are connected. Finish them before retrying cleanup.'
                       : 'Checkout verified clean and registered. Awaiting explicit unused confirmation.';
               }
             } catch (cause) {
@@ -9596,6 +9705,7 @@
   function hasActiveAgentSessions(message: string) {
     return (
       message.startsWith('Worktree has active agent sessions') ||
+      message.startsWith('Worktree has connected agent sessions') ||
       message === 'An agent session is starting in this worktree.'
     );
   }
@@ -9736,7 +9846,7 @@
       const storage = pendingStorageFromError(cause);
       if (storage) {
         const prior = projectCatalog.worktrees[repository]?.find((item) => item.path === path);
-        saveProjectCatalog(
+        await saveProjectCatalogDurably(
           markWorktreeCleanupPending(
             projectCatalog,
             repository,
@@ -9755,7 +9865,7 @@
       const recovery = pendingRecoveryFromError(cause);
       if (recovery) {
         const prior = projectCatalog.worktrees[repository]?.find((item) => item.path === path);
-        saveProjectCatalog(
+        await saveProjectCatalogDurably(
           markWorktreeCleanupPending(
             projectCatalog,
             repository,

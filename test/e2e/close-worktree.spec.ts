@@ -285,7 +285,7 @@ describe('close worktree shortcut', () => {
     await expect($('dialog[open]')).not.toExist();
   });
 
-  it('reconciles a completed cleanup after restart but keeps a leftover path pending', async () => {
+  it('keeps an externally removed checkout pending across restart and path replacement', async () => {
     const completed = join(worktrees, 'completed-after-crash');
     const leftover = join(completed, 'leftover.txt');
     git('worktree', 'add', '-q', '-b', 'completed-after-crash', completed);
@@ -348,8 +348,10 @@ describe('close worktree shortcut', () => {
     rmSync(completed, { recursive: true });
     git('worktree', 'add', '-q', '-b', 'completed-replacement', completed);
     await $(`[data-pending-worktree="${completed}"]`).$('button=Recheck worktree').click();
-    await browser.waitUntil(async () => !(await catalogPaths()).includes(completed));
-    expect(await catalogPaths()).toEqual([first]);
+    await browser.waitUntil(async () =>
+      (await pendingCleanup(completed))?.reason.includes('removed outside Sail'),
+    );
+    expect(await catalogPaths()).toContain(completed);
     expect(existsSync(completed)).toBe(true);
     expect(git('worktree', 'list')).toContain(completed);
     git('worktree', 'remove', completed);
@@ -555,6 +557,16 @@ describe('close worktree shortcut', () => {
     await browser.refresh();
     await diagnose('Clean detached catalog', () =>
       expect($(`.project-worktree-select[title="${detached}"]`)).toBeDisplayed(),
+    );
+    await diagnose('Clean detached sidebar inventory', () =>
+      browser.waitUntil(
+        () =>
+          browser.execute(() => {
+            const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
+            return typeof ready === 'function' && ready();
+          }),
+        { timeout: 60000, timeoutMsg: 'Sidebar inventory did not settle before cleanup' },
+      ),
     );
     await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
     await $('[aria-label="Delete worktree first"]').click();

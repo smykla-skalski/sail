@@ -2291,7 +2291,7 @@ fn worktree_removal_preview(
         })?;
         let (revision, dirty) = worktree_preview_state_with_hook(&canonical, || {})?;
         let active_sessions = agents
-            .active_sessions_in(&canonical)?
+            .sessions_blocking_cleanup_in(&canonical)?
             .into_iter()
             .map(|(agent, _, session)| format!("{agent}:{session}"))
             .collect();
