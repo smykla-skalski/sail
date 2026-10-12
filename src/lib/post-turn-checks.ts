@@ -26,6 +26,18 @@ export function hasDurableCheckOutcome(check: PostTurnCheck): boolean {
   );
 }
 
+export function uniquePostTurnCheckCommands(
+  checks: Pick<PostTurnCheck, 'source' | 'command'>[],
+): Pick<PostTurnCheck, 'source' | 'command'>[] {
+  const seen = new Set<string>();
+  return checks.filter((check) => {
+    const key = JSON.stringify([check.source, check.command]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 export function personalChecks(raw: string | null): string[] {
   try {
     const value: unknown = JSON.parse(raw ?? '[]');

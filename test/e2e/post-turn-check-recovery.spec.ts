@@ -410,6 +410,64 @@ describe('post-turn check recovery', () => {
     expect(readFileSync(join(repository, 'restart-runs.txt'), 'utf8')).toBe('recovered\n');
   });
 
+  it('runs a duplicated repository check once and acknowledges the recovered turn', async () => {
+    const check = "printf 'once\\n' >> duplicate-runs.txt";
+    writeFileSync(
+      join(repository, '.sail', 'worktree.json'),
+      JSON.stringify({ postTurnChecks: [check, check] }),
+    );
+    await browser.execute(
+      async (path, checkCommand) => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        await tauri.core.invoke('approve_post_turn_check', {
+          directory: path,
+          command: checkCommand,
+        });
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-post-turn-personal',
+          value: '[]',
+        });
+        localStorage.setItem('sai-post-turn-personal', '[]');
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-acp-turn-evidence',
+          value: JSON.stringify([
+            {
+              agent: 'claude',
+              directory: path,
+              sessionId: 'duplicate-session',
+              turnId: 'duplicate-turn',
+              status: 'done',
+              error: null,
+              updatedAt: Date.now(),
+              postTurnPending: true,
+            },
+          ]),
+        });
+      },
+      repository,
+      check,
+    );
+    await browser.refresh();
+    await browser.waitUntil(() => existsSync(join(repository, 'duplicate-runs.txt')), {
+      timeoutMsg: 'Duplicated repository check did not run',
+    });
+    await browser.waitUntil(() =>
+      browser.execute(async (path) => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        const evidence = await tauri.core.invoke('get_acp_turn_evidence', {
+          agent: 'claude',
+          directory: path,
+          sessionId: 'duplicate-session',
+          turnId: 'duplicate-turn',
+        });
+        return evidence?.postTurnPending === false;
+      }, repository),
+    );
+    expect(readFileSync(join(repository, 'duplicate-runs.txt'), 'utf8')).toBe('once\n');
+    await browser.refresh();
+    expect(readFileSync(join(repository, 'duplicate-runs.txt'), 'utf8')).toBe('once\n');
+  });
+
   it('shows a persistent write failure and waits for verified recovery before running', async () => {
     const check = "printf 'saved\\n' >> evidence-retry-runs.txt";
     writeFileSync(

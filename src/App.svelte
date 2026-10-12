@@ -262,6 +262,7 @@
     hasDurableCheckOutcome,
     personalChecks,
     retryInterruptedCheck,
+    uniquePostTurnCheckCommands,
     upsertCheck,
     type PostTurnCheck,
   } from './lib/post-turn-checks';
@@ -11215,7 +11216,7 @@
       error = `Could not load repository post-turn checks: ${describe(cause)}`;
     }
     const durable = await Promise.all(
-      entries.map((entry) =>
+      uniquePostTurnCheckCommands(entries).map((entry) =>
         runOnePostTurnCheck({
           id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
           updated: Date.now(),

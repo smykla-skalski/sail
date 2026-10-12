@@ -249,6 +249,11 @@ fn merge_acp_turn_evidence_at(
     } else if matches!(item.status.as_str(), "done" | "failed" | "interrupted") {
         item.post_turn_pending = false;
     }
+    // A failed request that never reached the dispatch fence is still labeled "prepared",
+    // but it cannot produce a completed turn or post-turn checks.
+    if item.status == "prepared" && item.error.is_some() {
+        item.post_turn_pending = false;
+    }
     evidence.retain(|saved| {
         saved.agent != item.agent
             || saved.directory != item.directory
@@ -1108,6 +1113,85 @@ mod tests {
             500
         );
         assert!(saved.iter().all(|item| item.turn_id != "turn-0"));
+    }
+
+    #[test]
+    fn failed_pre_dispatch_prompt_releases_its_pending_check_slot() {
+        let evidence = |turn: &str, error: Option<&str>| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "session".into(),
+            turn_id: turn.into(),
+            status: "prepared".into(),
+            error: error.map(str::to_string),
+            updated_at: 0,
+            post_turn_pending: error.is_none(),
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence_at(&mut settings, evidence("failed", None), 1).unwrap();
+        assert!(acp_turn_evidence(&settings)[0].post_turn_pending);
+
+        merge_acp_turn_evidence_at(
+            &mut settings,
+            evidence("failed", Some("dispatch fence rejected request")),
+            2,
+        )
+        .unwrap();
+        let failed = &acp_turn_evidence(&settings)[0];
+        assert_eq!(failed.status, "prepared");
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("dispatch fence rejected request")
+        );
+        assert!(!failed.post_turn_pending);
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("next", None), 3).unwrap();
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].turn_id, "next");
+        assert!(saved[0].post_turn_pending);
+    }
+
+    #[test]
+    fn failed_pre_dispatch_prompt_does_not_exhaust_the_500_turn_backlog() {
+        let mut settings = Settings::new();
+        let pending = (0..ACP_TURN_EVIDENCE_LIMIT - 1)
+            .map(|index| AcpTurnEvidence {
+                agent: "claude".into(),
+                directory: "/repo".into(),
+                session_id: format!("older-{index}"),
+                turn_id: format!("older-{index}"),
+                status: "done".into(),
+                error: None,
+                updated_at: 1,
+                post_turn_pending: true,
+            })
+            .collect::<Vec<_>>();
+        write_acp_turn_evidence(&mut settings, &pending).unwrap();
+        let prepared = |turn: &str, error: Option<&str>| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "current".into(),
+            turn_id: turn.into(),
+            status: "prepared".into(),
+            error: error.map(str::to_string),
+            updated_at: 0,
+            post_turn_pending: error.is_none(),
+        };
+        merge_acp_turn_evidence_at(&mut settings, prepared("failed", None), 2).unwrap();
+        assert_eq!(
+            acp_turn_evidence(&settings)
+                .iter()
+                .filter(|item| item.post_turn_pending)
+                .count(),
+            ACP_TURN_EVIDENCE_LIMIT
+        );
+        merge_acp_turn_evidence_at(&mut settings, prepared("failed", Some("not sent")), 3).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, prepared("next", None), 4).unwrap();
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), ACP_TURN_EVIDENCE_LIMIT);
+        assert!(saved.iter().any(|item| item.turn_id == "next"));
+        assert!(!saved.iter().any(|item| item.turn_id == "failed"));
     }
 
     #[test]

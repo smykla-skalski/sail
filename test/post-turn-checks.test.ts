@@ -4,6 +4,7 @@ import {
   hasDurableCheckOutcome,
   personalChecks,
   retryInterruptedCheck,
+  uniquePostTurnCheckCommands,
   upsertCheck,
   type PostTurnCheck,
 } from '../src/lib/post-turn-checks.ts';
@@ -14,6 +15,17 @@ await test('personal checks reject malformed settings while keeping configured c
     'mise run lint',
   ]);
   assert.deepEqual(personalChecks('{'), []);
+});
+
+await test('duplicate commands schedule once per source in first-seen order', () => {
+  const entries = [
+    { source: 'personal' as const, command: 'mise run test' },
+    { source: 'personal' as const, command: 'mise run test' },
+    { source: 'repository' as const, command: 'mise run test' },
+    { source: 'repository' as const, command: 'mise run test' },
+    { source: 'repository' as const, command: 'mise run lint' },
+  ];
+  assert.deepEqual(uniquePostTurnCheckCommands(entries), [entries[0], entries[2], entries[4]]);
 });
 
 await test('restart-interrupted checks require one automatic retry; declined checks remain settled', () => {
