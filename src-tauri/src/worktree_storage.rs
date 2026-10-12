@@ -29,6 +29,23 @@ const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
 const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
 const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
 
+fn write_temp_pending(directory: &Path, reason: &str) -> std::io::Result<()> {
+    let staging = directory.join(format!(".{TEMP_PENDING_FILE}-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(reason.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&staging, directory.join(TEMP_PENDING_FILE))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    result
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorktreeIdentity {
     root: PathBuf,
@@ -188,7 +205,7 @@ impl TempLease {
 
     fn mark_pending(&self, reason: &str) {
         if self.verify_root().is_ok() {
-            let _ = fs::write(self.directory.join(TEMP_PENDING_FILE), reason);
+            let _ = write_temp_pending(&self.directory, reason);
         }
         report_pending(&self.directory, reason);
     }
@@ -946,10 +963,7 @@ fn reclaim_verified_unstarted_temp(cache_directory: &Path, data_directory: &Path
             continue;
         }
         if let Err(error) = fs::remove_file(&process_state_file) {
-            let _ = fs::write(
-                directory.join(TEMP_PENDING_FILE),
-                b"verified-temp-removal-failed",
-            );
+            let _ = write_temp_pending(&directory, "verified-temp-removal-failed");
             report_pending(
                 &directory,
                 &format!("verified-temp-removal-failed: {error}"),
@@ -957,10 +971,7 @@ fn reclaim_verified_unstarted_temp(cache_directory: &Path, data_directory: &Path
             continue;
         }
         if let Err(error) = fs::remove_dir_all(&directory) {
-            let _ = fs::write(
-                directory.join(TEMP_PENDING_FILE),
-                b"verified-temp-removal-failed",
-            );
+            let _ = write_temp_pending(&directory, "verified-temp-removal-failed");
             report_pending(
                 &directory,
                 &format!("verified-temp-removal-failed: {error}"),
@@ -1106,26 +1117,22 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
         data_directory.join("tmp"),
         data_directory.join("build/go-tmp"),
     ] {
+        let key = cache_key(&legacy).unwrap_or_else(|_| "unknown".into());
         match fs::symlink_metadata(&legacy) {
             Ok(metadata) if metadata.is_dir() => pending.push(pending_item(
-                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                key,
                 "legacy-temp-owner-unverified",
                 Some(&legacy),
                 true,
             )),
             Ok(_) => pending.push(pending_item(
-                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                key,
                 "legacy-temp-root-unverifiable",
                 Some(&legacy),
                 false,
             )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => pending.push(pending_item(
-                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
-                "legacy-temp-scan-failed",
-                None,
-                false,
-            )),
+            Err(_) => pending.push(pending_item(key, "legacy-temp-scan-failed", None, false)),
         }
     }
     let root = data_directory.join(TEMP_ROOT);
@@ -2264,6 +2271,7 @@ mod tests {
                     "add",
                     "--quiet",
                     "--detach",
+                    "--lock",
                     first.to_str().unwrap(),
                     "HEAD",
                 ],
@@ -2275,6 +2283,7 @@ mod tests {
                     "add",
                     "--quiet",
                     "--detach",
+                    "--lock",
                     second.to_str().unwrap(),
                     "HEAD",
                 ],
@@ -2307,7 +2316,13 @@ mod tests {
         fn remove(&self, worktree: &Path) {
             Self::git(
                 &self.repository,
-                &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    "--force",
+                    worktree.to_str().unwrap(),
+                ],
             );
         }
     }
@@ -2477,6 +2492,7 @@ mod tests {
                 "add",
                 "--quiet",
                 "--detach",
+                "--lock",
                 worktree.to_str().unwrap(),
                 "HEAD",
             ],
@@ -2858,6 +2874,48 @@ mod tests {
             .unwrap();
         assert_pending_temp_cleaned(&fixture.cache, &token);
         assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn malformed_legacy_temp_paths_have_distinct_pending_keys() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        fs::write(directory.join("tmp"), "not a directory").unwrap();
+        fs::create_dir_all(directory.join("build")).unwrap();
+        fs::write(directory.join("build/go-tmp"), "not a directory").unwrap();
+        lease.release_clean().unwrap();
+
+        let malformed: Vec<_> = cleanup_status(&fixture.cache)
+            .into_iter()
+            .filter(|item| item.reason == "legacy-temp-root-unverifiable")
+            .collect();
+        assert_eq!(malformed.len(), 2);
+        assert_ne!(malformed[0].cache_key, malformed[1].cache_key);
+        assert!(malformed.iter().all(|item| item.cleanup_token.is_none()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_marker_symlink_cannot_overwrite_a_user_file() {
+        let fixture = GitFixture::new();
+        let (_, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let user_file = fixture.root.join("user-file");
+        fs::write(&user_file, "keep this user data").unwrap();
+        let marker = lease.temp_directory().join(TEMP_PENDING_FILE);
+        std::os::unix::fs::symlink(&user_file, &marker).unwrap();
+
+        lease.mark_temp_pending("turn-temp-owner-unverified");
+
+        assert_eq!(
+            fs::read_to_string(&user_file).unwrap(),
+            "keep this user data"
+        );
+        assert!(fs::symlink_metadata(&marker).unwrap().is_file());
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "turn-temp-owner-unverified"
+        );
+        lease.release_clean().unwrap();
     }
 
     #[test]
