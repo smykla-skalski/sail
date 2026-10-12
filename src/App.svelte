@@ -12298,6 +12298,7 @@
         onselectdefault={(path) => void selectDefaultWorktree(path)}
         onselectthread={(key) => void selectSidebarThread(key)}
         onremovethread={removeSidebarThread}
+        oncopied={() => void announceCopied(null)}
         onaddrepository={(groupID) => void chooseProject(groupID)}
         onaddgroup={addProjectGroup}
         onrenamegroup={renameProjectGroup}
