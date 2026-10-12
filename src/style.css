@@ -506,7 +506,7 @@ button:disabled {
   margin: 0 8px 4px 45px;
   overflow: hidden;
   color: var(--sui-muted);
-  font-size: var(--type-11);
+  font-size: var(--type-12);
   text-overflow: ellipsis;
   white-space: nowrap;
 }

@@ -3838,7 +3838,8 @@ mod tests {
         let canonical_child = child.git_canonical().unwrap();
         assert!(discovered
             .iter()
-            .any(|entry| entry.path == canonical_child.to_string_lossy() && entry.generation.is_some()));
+            .any(|entry| entry.path == canonical_child.to_string_lossy()
+                && entry.generation.is_some()));
 
         fs::remove_dir_all(root).unwrap();
     }
