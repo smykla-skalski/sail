@@ -2494,6 +2494,7 @@ mod tests {
                         && matches!(
                             error.as_str(),
                             "Temporary data still has an active owner."
+                                | "Private storage still has an active owner."
                                 | "Temporary data is no longer pending; refresh cleanup status."
                                 | "Private storage is changing; retry after it becomes idle."
                                 | "Temporary data is not an unused directory."
@@ -2504,6 +2505,15 @@ mod tests {
                 Err(error) => panic!("pending temporary cleanup failed: {error}"),
             }
         }
+    }
+
+    fn assert_storage_reclaimed_after_retry(cache: &Path, directory: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while directory.exists() && std::time::Instant::now() < deadline {
+            retry_cleanup(cache);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!directory.exists(), "private storage was not reclaimed");
     }
 
     #[cfg(unix)]
@@ -3173,9 +3183,7 @@ mod tests {
         owner.wait().unwrap();
         retry_cleanup(&fixture.cache);
         assert!(temp.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "turn-temp-owner-unverified"));
+        pending_with_reason(&fixture.cache, "turn-temp-owner-unverified");
         assert_pending_temp_cleaned(&fixture.cache, &cache_key(&temp).unwrap());
         assert!(!temp.exists());
     }
@@ -3405,7 +3413,7 @@ mod tests {
         assert_eq!(pending.reason, "turn-temp-owner-unverifiable");
         assert!(pending.size_bytes.is_some_and(|size| size > 0));
         assert_pending_temp_cleaned(&fixture.cache, pending.cleanup_token.as_deref().unwrap());
-        assert!(!directory.exists());
+        assert_storage_reclaimed_after_retry(&fixture.cache, &directory);
     }
 
     #[test]
@@ -3438,7 +3446,7 @@ mod tests {
         assert_eq!(pending.cache_key, cache_key(root).unwrap());
         assert_pending_temp_cleaned(&fixture.cache, pending.cleanup_token.as_deref().unwrap());
         assert!(!process_state.exists());
-        assert!(!directory.exists());
+        assert_storage_reclaimed_after_retry(&fixture.cache, &directory);
     }
 
     #[cfg(unix)]
