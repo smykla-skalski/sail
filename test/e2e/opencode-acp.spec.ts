@@ -1,6 +1,6 @@
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chooseTopbarAction, topbarMenuTrigger } from './topbar';
@@ -172,6 +172,104 @@ describe('OpenCode in the ACP pane', () => {
     expect((await $$('.pane-leaf .agent-composer [data-pane-prompt]')).length).toBe(2);
     await expect($('.pane-leaf[data-pane-id="right"] .agent-header')).toHaveText(
       expect.stringContaining('Second outside'),
+    );
+  });
+
+  it('shows OpenCode thinking and a policy decision with its reason in the shared transcript', async () => {
+    await browser.execute((directory) => {
+      localStorage.setItem('sai-directory', directory);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, path);
+    await browser.refresh();
+    await chooseTopbarAction('New agent', 'OpenCode');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Thinking demo');
+    await $('.agent-actions button:last-child').click();
+    await expect($('.assistant-message.thought')).toHaveText(
+      expect.stringContaining('I should inspect the result.'),
+    );
+    await expect($('.assistant-message:not(.thought)')).toHaveText(
+      expect.stringContaining('The result is ready.'),
+    );
+
+    await $('.agent-composer [data-pane-prompt]').setValue('Automatic policy');
+    await $('.agent-actions button:last-child').click();
+    const decision = $('.transcript-decision');
+    await expect(decision).toHaveText(expect.stringMatching(/(Allowed|Rejected) automatically/));
+    await expect(decision).toHaveText(expect.stringContaining('Format notes'));
+    await expect(decision).toHaveText(expect.stringContaining('profile'));
+    await expect($('.agent-permission')).not.toExist();
+
+    const evidence = process.env.SAIL_VISUAL_AUDIT_DIR;
+    if (evidence) {
+      mkdirSync(evidence, { recursive: true });
+      await [
+        [2560, 1440],
+        [1920, 1200],
+        [390, 800],
+      ].reduce(async (previous, [requestedWidth, height]) => {
+        await previous;
+        await browser.setWindowSize(requestedWidth, height);
+        const width = await browser.execute(() => innerWidth);
+        console.log('OpenCode transcript viewport', { requestedWidth, width });
+        if (requestedWidth === 390)
+          expect(
+            await browser.execute(() => document.documentElement.scrollWidth),
+          ).toBeLessThanOrEqual(width);
+        await ['light', 'dark'].reduce(async (previousTheme, theme) => {
+          await previousTheme;
+          await browser.execute((value) => {
+            document.documentElement.dataset.suiTheme = value;
+          }, theme);
+          await browser.saveScreenshot(join(evidence, `opencode-transcript-${width}-${theme}.png`));
+        }, Promise.resolve());
+      }, Promise.resolve());
+      await browser.setWindowSize(1920, 1200);
+      const beforeZoom = await browser.execute(() => innerWidth);
+      await Array.from({ length: 5 }).reduce(async (previous) => {
+        await previous;
+        await browser.keys(['Meta', '=']);
+      }, Promise.resolve());
+      const zoomed = await browser.execute(() => ({
+        width: innerWidth,
+        documentWidth: document.documentElement.scrollWidth,
+      }));
+      expect(zoomed.width).toBeLessThanOrEqual(beforeZoom / 2);
+      expect(zoomed.documentWidth).toBeLessThanOrEqual(zoomed.width);
+      await $('.agent-composer [data-pane-prompt]').click();
+      await expect($('.agent-composer [data-pane-prompt]')).toBeFocused();
+      await browser.keys(['Meta', '0']);
+    }
+
+    await browser.execute(() => {
+      const key = 'sai-activity-history';
+      const events = JSON.parse(localStorage.getItem(key) ?? '[]');
+      const now = Date.now();
+      localStorage.setItem(
+        key,
+        JSON.stringify([
+          ...events,
+          ...Array.from({ length: 150 }, (_, index) => ({
+            workspace: '/other-workspace',
+            kind: 'tool',
+            source: 'Claude',
+            sourceId: `other-tool-${index}`,
+            title: 'Background work',
+            outcome: 'completed',
+            at: now + index + 1,
+          })),
+        ]),
+      );
+    });
+    await browser.refresh();
+    await expect($('.transcript-decision')).toHaveText(expect.stringContaining('profile'));
+    await expect($('.assistant-message.thought')).toHaveText(
+      expect.stringContaining('I should inspect the result.'),
     );
   });
 });
