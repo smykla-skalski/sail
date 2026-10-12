@@ -60,6 +60,7 @@
     "allow-registered-worktrees",
     "allow-repository-worktrees",
     "allow-worktree-removal-preview",
+    "allow-restore-pending-worktree",
     "allow-delete-worktree",
     "allow-worktree-config",
     "allow-context-provider-status",

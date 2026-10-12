@@ -88,6 +88,7 @@ fn main() {
             "registered_worktrees",
             "repository_worktrees",
             "worktree_removal_preview",
+            "restore_pending_worktree",
             "delete_worktree",
             "worktree_config",
             "context_provider_status",

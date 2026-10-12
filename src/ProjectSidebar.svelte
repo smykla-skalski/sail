@@ -96,6 +96,8 @@
       issue: GitHubIssue | null,
     ) => Promise<string>;
     ondeleteworktree: (repository: string, path: string, branch: string) => Promise<void>;
+    oncheckpendingcleanup: (repository: string, path?: string) => Promise<void>;
+    onremovependingcleanup: (repository: string, path: string) => Promise<void>;
     oncreatepullrequest: (
       repository: string,
       worktree: ProjectWorktree,
@@ -151,6 +153,8 @@
     onremoverepository,
     oncreateworktree,
     ondeleteworktree,
+    oncheckpendingcleanup,
+    onremovependingcleanup,
     oncreatepullrequest,
     onsendchecklog,
   }: Props = $props();
@@ -463,6 +467,14 @@
 
   function externalWorktrees(repository: string): ProjectWorktree[] {
     return externalGitWorktrees(catalog, repository, registeredWorktrees[repository] ?? []);
+  }
+
+  function pendingCleanupSize(bytes: number | null): string {
+    if (bytes === null) return 'Unknown';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+    const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)) - 1, units.length - 1);
+    return `${(bytes / 1024 ** (unit + 1)).toFixed(1)} ${units[unit]}`;
   }
 
   function isExternalWorktree(repository: string, path: string): boolean {
@@ -1162,6 +1174,13 @@
                 id={repositoryWorktreesID(path)}
                 hidden={repositoryCollapsed(path)}
               >
+                {#if catalog.worktrees[path]?.some((worktree) => worktree.pendingCleanup)}
+                  <button
+                    class="project-worktree-retry"
+                    onclick={() => void oncheckpendingcleanup(path)}
+                    >Recheck all pending worktrees</button
+                  >
+                {/if}
                 <div class:active={path === directory} class="project-worktree-row" role="group">
                   <button
                     class="project-worktree-select project-default-worktree-select"
@@ -1256,6 +1275,33 @@
                     </p>{:else if worktree.statusComment}<p class="project-worktree-status">
                       {worktree.statusComment}
                     </p>{/if}
+                  {#if worktree.pendingCleanup}
+                    <div
+                      class="project-worktree-cleanup-pending"
+                      data-pending-worktree={worktree.path}
+                      role="status"
+                    >
+                      <strong>Pending cleanup</strong>
+                      <span>Original: {worktree.pendingCleanup.originalPath}</span>
+                      <span>Recovery: {worktree.pendingCleanup.recoveryPath}</span>
+                      <span
+                        >Retained size: {pendingCleanupSize(
+                          worktree.pendingCleanup.sizeBytes,
+                        )}</span
+                      >
+                      <span>{worktree.pendingCleanup.reason}</span>
+                      <button
+                        class="project-worktree-retry"
+                        onclick={() => void oncheckpendingcleanup(path, worktree.path)}
+                        >Recheck worktree</button
+                      >
+                      <button
+                        class="project-worktree-retry"
+                        onclick={() => void onremovependingcleanup(path, worktree.path)}
+                        >Clean up this worktree…</button
+                      >
+                    </div>
+                  {/if}
                   {@render checkFailures(path, worktree)}
                 {/each}
                 {@render externalRows(path)}
@@ -1313,6 +1359,13 @@
               id={repositoryWorktreesID(path)}
               hidden={repositoryCollapsed(path)}
             >
+              {#if catalog.worktrees[path]?.some((worktree) => worktree.pendingCleanup)}
+                <button
+                  class="project-worktree-retry"
+                  onclick={() => void oncheckpendingcleanup(path)}
+                  >Recheck all pending worktrees</button
+                >
+              {/if}
               <div class:active={path === directory} class="project-worktree-row" role="group">
                 <button
                   class="project-worktree-select project-default-worktree-select"
@@ -1407,6 +1460,31 @@
                   </p>{:else if worktree.statusComment}<p class="project-worktree-status">
                     {worktree.statusComment}
                   </p>{/if}
+                {#if worktree.pendingCleanup}
+                  <div
+                    class="project-worktree-cleanup-pending"
+                    data-pending-worktree={worktree.path}
+                    role="status"
+                  >
+                    <strong>Pending cleanup</strong>
+                    <span>Original: {worktree.pendingCleanup.originalPath}</span>
+                    <span>Recovery: {worktree.pendingCleanup.recoveryPath}</span>
+                    <span
+                      >Retained size: {pendingCleanupSize(worktree.pendingCleanup.sizeBytes)}</span
+                    >
+                    <span>{worktree.pendingCleanup.reason}</span>
+                    <button
+                      class="project-worktree-retry"
+                      onclick={() => void oncheckpendingcleanup(path, worktree.path)}
+                      >Recheck worktree</button
+                    >
+                    <button
+                      class="project-worktree-retry"
+                      onclick={() => void onremovependingcleanup(path, worktree.path)}
+                      >Clean up this worktree…</button
+                    >
+                  </div>
+                {/if}
                 {@render checkFailures(path, worktree)}
               {/each}
               {@render externalRows(path)}

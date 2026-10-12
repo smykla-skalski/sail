@@ -6,6 +6,7 @@ import {
   currentCatalogWorktrees,
   externalGitWorktrees,
   loadProjectCatalog,
+  markWorktreeCleanupPending,
   owningRepository,
   removeRepository,
   removeWorktree,
@@ -139,6 +140,39 @@ await test('keeps a created worktree beneath its repository after restart', () =
   assert.deepEqual(restored.worktrees['/repo'], [
     { path: '/sail/worktrees/repo/task', branch: 'task', setupStatus: 'ready' },
   ]);
+});
+
+await test('keeps a recovery worktree visible and distinct from a replacement at its original path', () => {
+  const originalGeneration = testGeneration(41);
+  const replacementGeneration = testGeneration(42);
+  const catalog = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
+    path: '/worktrees/child',
+    branch: 'child',
+    generation: originalGeneration,
+  });
+  const pending = markWorktreeCleanupPending(catalog, '/repo', '/worktrees/child', {
+    originalPath: '/worktrees/child',
+    recoveryPath: '/worktrees/.sail-removing-recovery',
+    sizeBytes: 2048,
+    reason: 'Original path was replaced during cleanup.',
+  });
+  const restored = loadProjectCatalog(JSON.stringify(pending), '/repo');
+  assert.equal(restored.worktrees['/repo'][0].path, '/worktrees/.sail-removing-recovery');
+  assert.equal(restored.worktrees['/repo'][0].pendingCleanup?.originalPath, '/worktrees/child');
+  assert.equal(restored.worktrees['/repo'][0].pendingCleanup?.sizeBytes, 2048);
+  assert.deepEqual(
+    externalGitWorktrees(restored, '/repo', [
+      {
+        path: '/worktrees/.sail-removing-recovery',
+        branch: 'child',
+        generation: originalGeneration,
+      },
+      { path: '/worktrees/child', branch: 'replacement', generation: replacementGeneration },
+    ]).map((worktree) => worktree.path),
+    ['/worktrees/child'],
+  );
+  assert.equal(worktreeAt(restored, '/worktrees/.sail-removing-recovery')?.repository, '/repo');
+  assert.equal(worktreeAt(restored, '/worktrees/child'), null);
 });
 
 await test('restores sibling worktrees in their Sail creation ancestry', () => {

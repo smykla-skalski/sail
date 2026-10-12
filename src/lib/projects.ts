@@ -20,6 +20,12 @@ export type WorktreeOrigin = {
   sessionId: string;
   sessionTitle: string;
 };
+export type PendingWorktreeCleanup = {
+  originalPath: string;
+  recoveryPath: string;
+  sizeBytes: number | null;
+  reason: string;
+};
 export type ProjectWorktree = {
   path: string;
   branch: string;
@@ -29,6 +35,7 @@ export type ProjectWorktree = {
   pullRequest?: PullRequestLink;
   statusComment?: string;
   setupStatus?: 'pending' | 'ready' | 'failed';
+  pendingCleanup?: PendingWorktreeCleanup;
 };
 
 export type WorktreeCreation = {
@@ -95,6 +102,21 @@ export function loadProjectCatalog(raw: string | null, current: string): Project
           worktree.setupStatus = entry.setupStatus;
         if (typeof entry.statusComment === 'string')
           worktree.statusComment = entry.statusComment.slice(0, 140);
+        if (isRecord(entry.pendingCleanup)) {
+          const { originalPath, recoveryPath, sizeBytes, reason } = entry.pendingCleanup;
+          if (
+            typeof originalPath === 'string' &&
+            !!originalPath &&
+            recoveryPath === worktree.path &&
+            (sizeBytes === null ||
+              (typeof sizeBytes === 'number' &&
+                Number.isSafeInteger(sizeBytes) &&
+                sizeBytes >= 0)) &&
+            typeof reason === 'string' &&
+            !!reason
+          )
+            worktree.pendingCleanup = { originalPath, recoveryPath, sizeBytes, reason };
+        }
         if (isRecord(entry.pullRequest)) {
           const { number, url } = entry.pullRequest;
           if (typeof number === 'number' && validPullRequestLink(number, url))
@@ -398,6 +420,46 @@ export function removeWorktree(
     worktrees: {
       ...catalog.worktrees,
       [repository]: (catalog.worktrees[repository] ?? []).filter((item) => item.path !== path),
+    },
+  };
+}
+
+export function markWorktreeCleanupPending(
+  catalog: ProjectCatalog,
+  repository: string,
+  path: string,
+  pendingCleanup: PendingWorktreeCleanup,
+  generation?: string,
+): ProjectCatalog {
+  const entries = catalog.worktrees[repository] ?? [];
+  const owner = entries.find((item) => item.path === path);
+  if (!owner || entries.some((item) => item.path === pendingCleanup.recoveryPath && item !== owner))
+    return catalog;
+  const updated = entries.slice();
+  for (const [index, item] of entries.entries()) {
+    if (item === owner) {
+      updated[index] = {
+        ...item,
+        path: pendingCleanup.recoveryPath,
+        generation: generation ?? item.generation,
+        pendingCleanup,
+      };
+    } else if (
+      owner.generation &&
+      item.origin?.sourcePath === path &&
+      item.origin.sourceGeneration === owner.generation
+    ) {
+      updated[index] = {
+        ...item,
+        origin: { ...item.origin, sourcePath: pendingCleanup.recoveryPath },
+      };
+    }
+  }
+  return {
+    ...catalog,
+    worktrees: {
+      ...catalog.worktrees,
+      [repository]: updated,
     },
   };
 }

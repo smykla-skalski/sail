@@ -115,6 +115,25 @@ describe('close worktree shortcut', () => {
     return (catalog.worktrees[repository] ?? []).map((worktree) => worktree.path);
   };
 
+  const pendingCleanup = async (path: string) => {
+    const saved = await browser.execute(() => localStorage.getItem('sai-project-catalog'));
+    return loadProjectCatalog(saved, repository).worktrees[repository]?.find(
+      (worktree) => worktree.path === path,
+    )?.pendingCleanup;
+  };
+
+  async function cleanPending(path: string) {
+    await $(`[data-pending-worktree="${path}"]`).$('button=Clean up this worktree…').click();
+    await diagnose(`Pending cleanup dialog ${path}`, async () => {
+      const dialog = $('dialog.confirmation-dialog[open]');
+      await expect(dialog).toExist();
+      await dialog.$('button=Remove this worktree').click();
+    });
+    await diagnose(`Pending cleanup result ${path}`, () =>
+      browser.waitUntil(async () => !(await catalogPaths()).includes(path)),
+    );
+  }
+
   async function diagnose<T>(label: string, step: () => Promise<T>): Promise<T> {
     try {
       return await step();
@@ -166,7 +185,7 @@ describe('close worktree shortcut', () => {
     expect(await catalogPaths()).toEqual([first, second]);
   });
 
-  it('deletes only the selected worktree once when pressed repeatedly', async () => {
+  it('marks only the selected worktree pending when pressed repeatedly, then cleans it explicitly', async () => {
     await select(second);
     await browser.execute(() => {
       sessionStorage.setItem('sai-e2e-delete-worktree', 'Yes');
@@ -175,7 +194,18 @@ describe('close worktree shortcut', () => {
           new KeyboardEvent('keydown', { key: 'w', metaKey: true, shiftKey: true }),
         );
     });
-    await diagnose('Repeated delete', async () => {
+    await diagnose('Repeated delete', () =>
+      browser.waitUntil(async () => !!(await pendingCleanup(second))),
+    );
+    expect(existsSync(second)).toBe(true);
+    expect(await catalogPaths()).toEqual([first, second]);
+    expect((await pendingCleanup(second))?.originalPath).toBe(second);
+    expect((await pendingCleanup(second))?.recoveryPath).toBe(second);
+    await expect($(`[data-pending-worktree="${second}"]`)).toHaveText(
+      expect.stringContaining('Retained size:'),
+    );
+    await cleanPending(second);
+    await diagnose('Explicit cleanup', async () => {
       await browser.waitUntil(async () => !existsSync(second));
       await browser.waitUntil(async () => (await catalogPaths()).length === 1);
     });
@@ -257,9 +287,15 @@ describe('close worktree shortcut', () => {
     const dialog = $('dialog.confirmation-dialog[open]');
     await expect(dialog).toHaveText(expect.stringContaining('detached'));
     writeFileSync(newFile, 'keep this file');
-    await dialog.$('button=Delete 2 worktrees').click();
+    await dialog.$('button=Mark 2 pending').click();
+    await browser.waitUntil(async () => !!(await pendingCleanup(detached)));
+    await $(`[data-pending-worktree="${detached}"]`).$('button=Recheck worktree').click();
+    await browser.waitUntil(async () =>
+      (await pendingCleanup(detached))?.reason.includes('Files changed'),
+    );
+    await $(`[data-pending-worktree="${detached}"]`).$('button=Clean up this worktree…').click();
     await expect($('.app-shell [role="alert"]')).toHaveText(
-      expect.stringContaining('Worktree changed after validation'),
+      expect.stringContaining('Pending worktrees with files'),
     );
     expect(existsSync(newFile)).toBe(true);
     expect(existsSync(first)).toBe(true);
@@ -350,7 +386,13 @@ describe('close worktree shortcut', () => {
     await $('[aria-label="Delete worktree first"]').click();
     const dialog = $('dialog.confirmation-dialog[open]');
     await expect(dialog).toHaveText(expect.stringContaining('detached'));
-    await dialog.$('button=Delete 2 worktrees').click();
+    await dialog.$('button=Mark 2 pending').click();
+    await browser.waitUntil(async () => !!(await pendingCleanup(detached)));
+    expect(existsSync(first)).toBe(true);
+    expect(existsSync(detached)).toBe(true);
+    await cleanPending(detached);
+    await browser.waitUntil(() => !existsSync(detached));
+    await cleanPending(first);
     await browser.waitUntil(() => !existsSync(first) && !existsSync(detached));
     await browser.waitUntil(async () => (await catalogPaths()).length === 0);
     expect(
@@ -359,7 +401,7 @@ describe('close worktree shortcut', () => {
     git('worktree', 'add', '-q', first, 'first');
   });
 
-  it('previews and removes only Sail descendants from the leaves inward', async () => {
+  it('previews Sail descendants, preserves them pending, and cleans selected checkouts leaves first', async () => {
     const child = join(worktrees, 'child');
     const grandchild = join(worktrees, 'grandchild');
     const external = join(worktrees, 'external');
@@ -483,9 +525,11 @@ describe('close worktree shortcut', () => {
     expect(existsSync(grandchild)).toBe(true);
 
     await openRemoval();
-    await $('dialog.confirmation-dialog[open]').$('button=Delete 3 worktrees').click();
+    await $('dialog.confirmation-dialog[open]').$('button=Mark 3 pending').click();
+    await browser.waitUntil(async () => !!(await pendingCleanup(grandchild)));
+    await $(`[data-pending-worktree="${grandchild}"]`).$('button=Clean up this worktree…').click();
     await expect($('.app-shell [role="alert"]')).toHaveText(
-      expect.stringContaining('Clean it and retry deletion'),
+      expect.stringContaining('Pending worktrees with files'),
     );
     expect(existsSync(uncommitted)).toBe(true);
     expect(existsSync(first)).toBe(true);
@@ -494,13 +538,133 @@ describe('close worktree shortcut', () => {
     expect(await catalogPaths()).toEqual([first, child, grandchild, external]);
 
     rmSync(uncommitted);
-    await openRemoval();
-    await $('dialog.confirmation-dialog[open]').$('button=Delete 3 worktrees').click();
+    await cleanPending(grandchild);
+    await browser.waitUntil(() => !existsSync(grandchild));
+    await cleanPending(child);
+    await browser.waitUntil(() => !existsSync(child));
+    await cleanPending(first);
     await browser.waitUntil(
       () => !existsSync(first) && !existsSync(child) && !existsSync(grandchild),
     );
     await browser.waitUntil(async () => (await catalogPaths()).length === 1);
     expect(existsSync(external)).toBe(true);
     expect(await catalogPaths()).toEqual([external]);
+  });
+
+  it('keeps an occupied original path and restores its registered recovery before cleanup', async () => {
+    const original = join(worktrees, 'recovery-original');
+    const recovery = join(worktrees, '.sail-pending-recovery');
+    git('worktree', 'add', '-q', '-b', 'recovery-original', original);
+    git('worktree', 'move', original, recovery);
+    git('worktree', 'add', '-q', '-b', 'recovery-replacement', original);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = registered.find((worktree) => worktree.path === recovery)?.generation;
+    if (!generation) throw new Error('Missing registered recovery generation');
+    await browser.execute(
+      (repo, originalPath, recoveryPath, identity) => {
+        localStorage.setItem('sai-directory', repo);
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({
+            repositories: [repo],
+            groups: [],
+            worktrees: {
+              [repo]: [
+                {
+                  path: recoveryPath,
+                  branch: 'recovery-original',
+                  generation: identity,
+                  pendingCleanup: {
+                    originalPath,
+                    recoveryPath,
+                    sizeBytes: 4096,
+                    reason: 'Original path was occupied after cleanup stopped.',
+                  },
+                },
+              ],
+            },
+          }),
+        );
+      },
+      repository,
+      original,
+      recovery,
+      generation,
+    );
+    await browser.refresh();
+    await browser.waitUntil(async () => $(`[data-pending-worktree="${recovery}"]`).isDisplayed());
+    await expect($(`[data-pending-worktree="${recovery}"]`)).toHaveText(
+      expect.stringContaining('Original path was occupied'),
+    );
+    await $(`[data-pending-worktree="${recovery}"]`).$('button=Clean up this worktree…').click();
+    await expect($('.app-shell [role="alert"]')).toHaveText(expect.stringContaining('is occupied'));
+    expect(existsSync(original)).toBe(true);
+    expect(existsSync(recovery)).toBe(true);
+    expect(git('worktree', 'list')).toContain(recovery);
+
+    git('worktree', 'remove', original);
+    await $(`[data-pending-worktree="${recovery}"]`).$('button=Clean up this worktree…').click();
+    await browser.waitUntil(
+      async () =>
+        !!(await pendingCleanup(original)) ||
+        /private Git state/i.test((await pendingCleanup(recovery))?.reason ?? ''),
+    );
+    if (!(await pendingCleanup(original))) {
+      await expect($(`[data-pending-worktree="${recovery}"]`)).toHaveText(
+        expect.stringMatching(/private Git state/i),
+      );
+      expect(existsSync(original)).toBe(false);
+      expect(existsSync(recovery)).toBe(true);
+      expect(git('worktree', 'list')).toContain(recovery);
+      return;
+    }
+    expect(existsSync(recovery)).toBe(false);
+    expect(existsSync(original)).toBe(true);
+    expect((await pendingCleanup(original))?.recoveryPath).toBe(original);
+    await browser.refresh();
+    await browser.waitUntil(async () => $(`[data-pending-worktree="${original}"]`).isDisplayed());
+    await $(`[data-pending-worktree="${original}"]`).$('button=Clean up this worktree…').click();
+    const dialog = $('dialog.confirmation-dialog[open]');
+    const alert = $('.app-shell [role="alert"]');
+    await browser.waitUntil(
+      async () =>
+        (await dialog.isExisting()) ||
+        ((await alert.isExisting()) && (await alert.getText()).includes('Private Git state')),
+    );
+    if (await dialog.isExisting()) {
+      await dialog.$('button=Remove this worktree').click();
+      await diagnose('Recovery cleanup result', () =>
+        browser.waitUntil(
+          async () => {
+            const pending = await pendingCleanup(original);
+            return (
+              (!existsSync(original) && !pending) ||
+              /(An agent session is starting|Private Git state)/i.test(pending?.reason ?? '')
+            );
+          },
+          { timeout: 30000 },
+        ),
+      );
+      if (await pendingCleanup(original)) {
+        await expect($(`[data-pending-worktree="${original}"]`)).toHaveText(
+          expect.stringMatching(/An agent session is starting|Private Git state/i),
+        );
+        expect(existsSync(original)).toBe(true);
+        expect(git('worktree', 'list')).toContain(original);
+      }
+    } else {
+      await expect($(`[data-pending-worktree="${original}"]`)).toHaveText(
+        expect.stringContaining('Private Git state'),
+      );
+      expect(existsSync(original)).toBe(true);
+      expect(git('worktree', 'list')).toContain(original);
+      expect((await pendingCleanup(original))?.recoveryPath).toBe(original);
+    }
   });
 });

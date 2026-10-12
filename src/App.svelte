@@ -580,6 +580,7 @@
     addWorktree,
     assignRepository,
     loadProjectCatalog,
+    markWorktreeCleanupPending,
     owningRepository,
     removeRepository,
     removeWorktree,
@@ -591,6 +592,7 @@
     setWorktreeStatus,
     type ProjectCatalog,
     type ProjectWorktree,
+    type PendingWorktreeCleanup,
     type WorktreeCreation,
     type WorktreeOrigin,
   } from './lib/projects';
@@ -8827,14 +8829,47 @@
     revision: string;
     dirty: boolean;
     activeSessions: string[];
+    sizeBytes: number;
   };
 
-  async function deleteProjectWorktree(
-    repository: string,
-    path: string,
-    branch: string,
-    force = false,
-  ) {
+  function pendingRecoveryFromError(cause: unknown): PendingWorktreeCleanup | null {
+    const message = describe(cause);
+    const prefix = 'SAIL_PENDING_RECOVERY:';
+    if (!message.startsWith(prefix)) return null;
+    try {
+      const value: unknown = JSON.parse(message.slice(prefix.length));
+      if (!value || typeof value !== 'object') return null;
+      const recovery = value as Record<string, unknown>;
+      if (
+        typeof recovery.originalPath !== 'string' ||
+        typeof recovery.recoveryPath !== 'string' ||
+        typeof recovery.reason !== 'string' ||
+        !recovery.originalPath ||
+        !recovery.recoveryPath ||
+        !recovery.reason ||
+        !(
+          recovery.sizeBytes === null ||
+          (typeof recovery.sizeBytes === 'number' &&
+            Number.isSafeInteger(recovery.sizeBytes) &&
+            recovery.sizeBytes >= 0)
+        )
+      )
+        return null;
+      return recovery as PendingWorktreeCleanup;
+    } catch {
+      return null;
+    }
+  }
+
+  async function deleteProjectWorktree(repository: string, path: string, branch: string) {
+    if (
+      projectCatalog.worktrees[repository]?.some(
+        (item) => item.path === path && item.pendingCleanup,
+      )
+    ) {
+      error = 'This worktree is pending cleanup. Review its retained files before continuing.';
+      return;
+    }
     if (deletingWorktreeRequests.has(path)) return;
     if (deletingWorktreeRepositories.has(repository)) {
       error = 'Another worktree deletion is in progress. Retry when it finishes.';
@@ -8860,16 +8895,7 @@
           registered,
         );
       } else {
-        await deleteProjectWorktreeOnce(
-          repository,
-          path,
-          branch,
-          force,
-          false,
-          undefined,
-          false,
-          registered,
-        );
+        await deleteProjectWorktreeWithDescendants(repository, path, branch, [], registered);
       }
     } catch (cause) {
       error = describe(cause);
@@ -8927,8 +8953,8 @@
           ? false
           : await confirmInApp(
               'Delete worktree and descendants',
-              `Delete these ${targets.length} worktrees from the leaves inward? Active agent sessions will stop. A worktree with uncommitted or ignored files will remain, and cleanup will stop there so you can resolve it and retry. Their branches will remain.\n\n${lines.join('\n')}`,
-              `Delete ${targets.length} worktrees`,
+              `Mark these ${targets.length} worktrees for cleanup? They will remain registered with their files intact. You can review them and explicitly confirm they are unused before physical deletion. Their branches will remain.\n\n${lines.join('\n')}`,
+              `Mark ${targets.length} pending`,
               { destructive: true },
             );
     if (!confirmed) return;
@@ -8936,45 +8962,216 @@
       error = 'Another descendant deletion started during the preview. Retry after it finishes.';
       return;
     }
-    for (const worktree of descendants) deletingWorktreeRequests.add(worktree.path);
-    worktreeDeletions = {
-      ...worktreeDeletions,
-      ...Object.fromEntries(targets.map((worktree) => [worktree.path, 'Queued for deletion'])),
-    };
+    let pendingCatalog = projectCatalog;
+    for (const [index, worktree] of targets.entries()) {
+      const state = preview[index];
+      const reason = state.dirty
+        ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+        : state.activeSessions.length
+          ? 'Agent sessions are active. Finish them before retrying cleanup.'
+          : 'Awaiting explicit confirmation that this worktree is unused.';
+      pendingCatalog = markWorktreeCleanupPending(
+        pendingCatalog,
+        repository,
+        worktree.path,
+        {
+          originalPath: worktree.path,
+          recoveryPath: worktree.path,
+          sizeBytes: state.sizeBytes,
+          reason,
+        },
+        state.generation,
+      );
+    }
+    saveProjectCatalog(pendingCatalog);
+    error = '';
+  }
+
+  async function checkPendingWorktreeCleanup(repository: string, selectedPath?: string) {
+    const entries = (projectCatalog.worktrees[repository] ?? []).filter(
+      (item) => item.pendingCleanup && (!selectedPath || item.path === selectedPath),
+    );
+    if (!entries.length) return;
     try {
-      const removedPaths = new SvelteSet<string>();
-      async function removeNext(index: number): Promise<void> {
-        const worktree = targets[index];
-        if (!worktree) return;
-        const current = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
-        if (worktreeDescendants(projectCatalog, repository, current, worktree.path).length) {
-          error = `New descendants appeared under “${worktree.branch}”. Remaining worktrees were kept; refresh and retry.`;
-          return;
-        }
-        const removed = await deleteProjectWorktreeOnce(
-          repository,
-          worktree.path,
-          preview[index].branch ?? 'detached',
-          true,
-          true,
-          preview[index],
-          true,
-          registered.filter((entry) => !removedPaths.has(entry.path)),
-        );
-        if (!removed) {
-          if (!error)
-            error = `Deletion stopped at “${worktree.branch}”. That worktree and the remaining worktrees were kept; retry when ready.`;
-          return;
-        }
-        removedPaths.add(worktree.path);
-        return removeNext(index + 1);
+      const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+      const current = new Map(registered.map((item) => [item.path, item]));
+      const updates = await Promise.all(
+        entries.map(async (entry) => {
+          const pending = entry.pendingCleanup!;
+          let reason: string;
+          let sizeBytes = pending.sizeBytes;
+          const live = current.get(entry.path);
+          if (!live || !entry.generation || live.generation !== entry.generation) {
+            reason =
+              'The registered worktree identity changed. Its files were kept; inspect the recovery path.';
+          } else {
+            try {
+              const [state] = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+                repository,
+                paths: [entry.path],
+              });
+              if (!state || state.generation !== entry.generation || state.branch !== live.branch) {
+                reason = 'The worktree identity changed during recheck. Its files were kept.';
+              } else {
+                sizeBytes = state.sizeBytes;
+                reason = state.dirty
+                  ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+                  : state.activeSessions.length
+                    ? 'Agent sessions are active. Finish them before retrying cleanup.'
+                    : 'Checkout verified clean and registered. Awaiting explicit unused confirmation.';
+              }
+            } catch (cause) {
+              reason = `Could not verify checkout: ${describe(cause)}`;
+            }
+          }
+          return { entry, pending, sizeBytes, reason };
+        }),
+      );
+      let catalog = projectCatalog;
+      for (const { entry, pending, sizeBytes, reason } of updates) {
+        catalog = markWorktreeCleanupPending(catalog, repository, entry.path, {
+          ...pending,
+          sizeBytes,
+          reason,
+        });
       }
-      await removeNext(0);
+      saveProjectCatalog(catalog);
+      error = '';
+    } catch (cause) {
+      error = `Could not recheck pending worktrees: ${describe(cause)}`;
+    }
+  }
+
+  async function removePendingWorktreeCleanup(repository: string, selectedPath: string) {
+    try {
+      await removeSelectedPendingWorktreeCleanup(repository, selectedPath);
+    } catch (cause) {
+      const reason = `Pending worktree cleanup stopped: ${describe(cause)}`;
+      const pending = projectCatalog.worktrees[repository]?.find(
+        (item) => item.path === selectedPath && item.pendingCleanup,
+      );
+      if (pending?.pendingCleanup) {
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+            ...pending.pendingCleanup,
+            reason,
+          }),
+        );
+      }
+      error = reason;
+    }
+  }
+
+  async function removeSelectedPendingWorktreeCleanup(repository: string, selectedPath: string) {
+    if (deletingWorktreeRepositories.has(repository) || worktreeRegistrationPending(repository)) {
+      error = 'A worktree operation is in progress. Retry cleanup when it finishes.';
+      return;
+    }
+    const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+    const pending = (projectCatalog.worktrees[repository] ?? []).filter(
+      (worktree) => worktree.pendingCleanup && worktree.path === selectedPath,
+    );
+    if (!pending.length) return;
+    const recovery = pending[0].pendingCleanup!;
+    if (recovery.recoveryPath !== recovery.originalPath) {
+      if (
+        projectCatalog.worktrees[repository]?.some(
+          (item) => item.path === recovery.originalPath && item.path !== selectedPath,
+        )
+      ) {
+        error =
+          'The original path belongs to another catalogued worktree. The recovery worktree remains intact.';
+        return;
+      }
+      try {
+        await invoke('restore_pending_worktree', {
+          repository,
+          recoveryPath: recovery.recoveryPath,
+          originalPath: recovery.originalPath,
+          expectedGeneration: pending[0].generation,
+        });
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, recovery.recoveryPath, {
+            ...recovery,
+            recoveryPath: recovery.originalPath,
+            reason:
+              'Restored to its original path. Recheck and confirm it is unused before cleanup.',
+          }),
+        );
+        error = '';
+      } catch (cause) {
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, recovery.recoveryPath, {
+            ...recovery,
+            reason: `Recovery remains registered: ${describe(cause)}`,
+          }),
+        );
+        error = `Recovery worktree kept at ${recovery.recoveryPath}. ${describe(cause)}`;
+      }
+      return;
+    }
+    const target = pending[0];
+    const preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+      repository,
+      paths: [target.path],
+    });
+    const live = new Map(registered.map((worktree) => [worktree.path, worktree]));
+    if (
+      preview.length !== 1 ||
+      preview[0].path !== target.path ||
+      preview[0].generation !== target.generation ||
+      preview[0].generation !== live.get(target.path)?.generation ||
+      preview[0].branch !== live.get(target.path)?.branch
+    ) {
+      error =
+        'A pending worktree changed identity. It remains registered; refresh before retrying.';
+      return;
+    }
+    if (preview[0].dirty || preview[0].activeSessions.length) {
+      await checkPendingWorktreeCleanup(repository, selectedPath);
+      error = 'Pending worktrees with files or active sessions were kept. Inspect them and retry.';
+      return;
+    }
+    const confirmed = await confirmInApp(
+      'Confirm unused worktrees',
+      `Confirm this pending worktree is unused, with no process writing to it during cleanup? Sail rechecks its identity and files immediately before removal. Detected changes stop cleanup, and its branch remains.\n\n• ${target.branch}: ${target.path} (original: ${target.pendingCleanup!.originalPath})`,
+      'Remove this worktree',
+      { destructive: true },
+    );
+    if (!confirmed) return;
+    deletingWorktreeRepositories.add(repository);
+    try {
+      const current = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+      if (worktreeDescendants(projectCatalog, repository, current, target.path).length) {
+        error = `A new descendant appeared under “${target.branch}”. Remaining worktrees were kept.`;
+        return;
+      }
+      const removed = await deleteProjectWorktreeOnce(
+        repository,
+        target.path,
+        target.branch,
+        false,
+        false,
+        preview[0],
+        true,
+        registered,
+        true,
+      );
+      if (!removed && error) {
+        const retained = projectCatalog.worktrees[repository]?.find(
+          (item) => item.path === target.path && item.pendingCleanup,
+        );
+        if (retained?.pendingCleanup) {
+          saveProjectCatalog(
+            markWorktreeCleanupPending(projectCatalog, repository, target.path, {
+              ...retained.pendingCleanup,
+              reason: error,
+            }),
+          );
+        }
+      }
     } finally {
-      for (const worktree of descendants) deletingWorktreeRequests.delete(worktree.path);
-      const remaining = { ...worktreeDeletions };
-      for (const worktree of targets) delete remaining[worktree.path];
-      worktreeDeletions = remaining;
+      deletingWorktreeRepositories.delete(repository);
     }
   }
 
@@ -9029,6 +9226,7 @@
     expected?: WorktreeRemovalPreview,
     preconfirmed = false,
     expectedRegisteredWorktrees?: RegisteredWorktree[],
+    confirmedUnused = false,
   ): Promise<boolean> {
     let retryForce = false;
     let retryStop = false;
@@ -9121,6 +9319,7 @@
           expectedRegisteredWorktrees: expectedRegisteredWorktrees?.map(
             ({ path: registeredPath, generation }) => ({ path: registeredPath, generation }),
           ),
+          ...(confirmedUnused ? { confirmedUnused: true } : {}),
           ...(stopAgents ? { stopAgents: true } : {}),
         },
       });
@@ -9150,9 +9349,36 @@
       error = '';
       return true;
     } catch (cause) {
+      const recovery = pendingRecoveryFromError(cause);
+      if (recovery) {
+        const prior = projectCatalog.worktrees[repository]?.find((item) => item.path === path);
+        saveProjectCatalog(
+          markWorktreeCleanupPending(
+            projectCatalog,
+            repository,
+            path,
+            {
+              ...recovery,
+              originalPath: prior?.pendingCleanup?.originalPath ?? recovery.originalPath,
+            },
+            expected?.generation ?? prior?.generation ?? undefined,
+          ),
+        );
+        error = `Cleanup stopped. The worktree and its files remain at ${recovery.recoveryPath}. ${recovery.reason}`;
+        if (wasSelected && directory === repository) {
+          try {
+            await loadProject(recovery.recoveryPath);
+          } catch {
+            // The registered recovery path remains visible in the catalog.
+          }
+        }
+        return false;
+      }
       if (wasSelected && directory === repository) await loadProject(path);
       const deletionError = describe(cause);
-      if (preconfirmed) {
+      if (confirmedUnused) {
+        error = `Cleanup stopped at “${branch}”. The checkout and its files remain intact; inspect them before retrying. ${deletionError}`;
+      } else if (preconfirmed) {
         error = `Could not delete “${branch}” at ${path}: ${deletionError}. Remaining worktrees were kept; fix the cause and retry.`;
       } else if (!stopAgents && hasActiveAgentSessions(deletionError)) {
         error = '';
@@ -12636,6 +12862,8 @@
         onremoverepository={removeProjectRepository}
         oncreateworktree={createProjectWorktree}
         ondeleteworktree={deleteProjectWorktree}
+        oncheckpendingcleanup={checkPendingWorktreeCleanup}
+        onremovependingcleanup={removePendingWorktreeCleanup}
         oncreatepullrequest={createProjectPullRequest}
         onsendchecklog={sendFailedCheckLog}
       />
