@@ -8903,7 +8903,7 @@
           ? false
           : await confirmInApp(
               'Delete worktree and descendants',
-              `Delete these ${targets.length} worktrees from the leaves inward? Active agent sessions will stop. Uncommitted and ignored files will be permanently removed. Their branches will remain.\n\n${lines.join('\n')}`,
+              `Delete these ${targets.length} worktrees from the leaves inward? Active agent sessions will stop. A worktree with uncommitted or ignored files will remain, and cleanup will stop there so you can resolve it and retry. Their branches will remain.\n\n${lines.join('\n')}`,
               `Delete ${targets.length} worktrees`,
               { destructive: true },
             );

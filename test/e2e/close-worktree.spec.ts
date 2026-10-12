@@ -242,6 +242,14 @@ describe('close worktree shortcut', () => {
       generation(detached),
     );
     await browser.refresh();
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
+          return typeof ready === 'function' && ready();
+        }),
+      { timeout: 20000, timeoutMsg: 'Detached catalog did not settle after reload' },
+    );
     await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
     await $('[aria-label="Delete worktree first"]').click();
     const dialog = $('dialog.confirmation-dialog[open]');
@@ -351,10 +359,11 @@ describe('close worktree shortcut', () => {
     const child = join(worktrees, 'child');
     const grandchild = join(worktrees, 'grandchild');
     const external = join(worktrees, 'external');
+    const uncommitted = join(grandchild, 'uncommitted.txt');
     git('worktree', 'add', '-q', '-b', 'child', child);
     git('worktree', 'add', '-q', '-b', 'grandchild', grandchild);
     git('worktree', 'add', '-q', '-b', 'external', external);
-    writeFileSync(join(grandchild, 'uncommitted.txt'), 'keep until confirmed');
+    writeFileSync(uncommitted, 'keep until cleaned');
     await select(first, false);
     const registered = await browser.execute(async (repo) => {
       const internals: unknown = Reflect.get(window, '__TAURI_INTERNALS__');
@@ -469,6 +478,18 @@ describe('close worktree shortcut', () => {
     expect(existsSync(child)).toBe(true);
     expect(existsSync(grandchild)).toBe(true);
 
+    await openRemoval();
+    await $('dialog.confirmation-dialog[open]').$('button=Delete 3 worktrees').click();
+    await expect($('.app-shell [role="alert"]')).toHaveText(
+      expect.stringContaining('Clean it and retry deletion'),
+    );
+    expect(existsSync(uncommitted)).toBe(true);
+    expect(existsSync(first)).toBe(true);
+    expect(existsSync(child)).toBe(true);
+    expect(existsSync(grandchild)).toBe(true);
+    expect(await catalogPaths()).toEqual([first, child, grandchild, external]);
+
+    rmSync(uncommitted);
     await openRemoval();
     await $('dialog.confirmation-dialog[open]').$('button=Delete 3 worktrees').click();
     await browser.waitUntil(
