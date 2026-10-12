@@ -4738,6 +4738,15 @@ fn connect_blocking_inner(
                                 let scratch_owner = runtime.scratch_owner.as_deref();
                                 #[cfg(not(unix))]
                                 let scratch_owner = None;
+                                let build_directory =
+                                    runtime.shared_build_directory.clone().or_else(|| {
+                                        runtime
+                                            .runtime_scratch
+                                            .lock()
+                                            .ok()?
+                                            .as_ref()
+                                            .map(|scratch| scratch.path().join("build"))
+                                    });
                                 let session_id = params
                                     .get("sessionId")
                                     .and_then(Value::as_str)
@@ -4753,6 +4762,7 @@ fn connect_blocking_inner(
                                         crate::acp_terminal::TerminalContext {
                                             directory,
                                             scratch_owner,
+                                            build_directory: build_directory.as_deref(),
                                         },
                                     )
                                 };

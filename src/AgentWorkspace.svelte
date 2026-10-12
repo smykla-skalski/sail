@@ -85,6 +85,7 @@
     acpFinishedPromptStatus,
     acpPromptInterrupted,
     acpSessionOwner,
+    acpRestoreMode,
     groupAgentEntries,
     liveSessionView,
     markLiveMessageBoundary,
@@ -1338,10 +1339,15 @@
     elicitationDrafts = {};
     onnativeplan?.(nativePlan);
     entries = id && thread ? loadRecentTranscript(thread) : [];
+    let transcriptStorageError = '';
     if (id && thread && acpSessionOwner(id)) {
-      const durable = await loadOwnedTranscript(ownedTranscriptKey(agent, directory, id));
-      if (current !== generation) return;
-      if (durable.length > entries.length) entries = durable;
+      try {
+        const durable = await loadOwnedTranscript(ownedTranscriptKey(agent, directory, id));
+        if (current !== generation) return;
+        if (durable.length > entries.length) entries = durable;
+      } catch (cause) {
+        transcriptStorageError = `Could not load saved conversation: ${describe(cause)}`;
+      }
     }
     const kept = id && !nativeEntries ? takeLiveTranscript(agent, directory, id) : null;
     const liveView =
@@ -1387,7 +1393,7 @@
     activeTurnId = null;
     finishedTurnIds = [];
     turnEnded = false;
-    error = '';
+    error = transcriptStorageError;
     ready = false;
     connecting = true;
     if (nativeEntries) {
@@ -1424,11 +1430,8 @@
       authMethods = (info.authMethods as AgentAuthMethod[] | undefined) ?? [];
       if (id) {
         const capabilities = info.agentCapabilities;
-        const canLoad =
-          capabilities && typeof capabilities === 'object' && 'loadSession' in capabilities
-            ? capabilities.loadSession
-            : false;
-        if (!canLoad) throw new Error(`${name} does not support restoring threads.`);
+        const restoreMode = acpRestoreMode(capabilities);
+        if (!restoreMode) throw new Error(`${name} does not support restoring threads.`);
         const showLiveTurn = async (
           turnId: string | null,
           cached: { configOptions?: AgentConfigOption[]; availableCommands?: AgentCommand[] },
@@ -1454,19 +1457,7 @@
             activeTurnId = null;
           }
         };
-        const sessionCapabilities =
-          capabilities && typeof capabilities === 'object' && 'sessionCapabilities' in capabilities
-            ? capabilities.sessionCapabilities
-            : null;
-        const canResume =
-          sessionCapabilities &&
-          typeof sessionCapabilities === 'object' &&
-          'resume' in sessionCapabilities;
-        const restoresSubagents =
-          sessionCapabilities &&
-          typeof sessionCapabilities === 'object' &&
-          'subagents' in sessionCapabilities;
-        const needsReplay = restoresSubagents || !canResume;
+        const needsReplay = restoreMode === 'load';
         const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
         if (current !== generation) return;
         attachedCodexSession =
@@ -1987,7 +1978,7 @@
       images = [];
       clipboardAttachments = [];
     }
-    const userEntryId = crypto.randomUUID();
+    const userEntryId = `owned-prompt:${turnId}`;
     const shellSession = activeSessionId;
     const sentShell =
       external && !queuedMessage

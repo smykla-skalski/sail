@@ -8,6 +8,7 @@ import {
   flushOwnedTranscriptWrites,
   forgetOwnedTranscript,
   saveOwnedTranscript,
+  updateOwnedTranscript,
 } from './owned-transcripts.ts';
 import type { CapabilityProfile, PermissionPolicyDecision } from './capability-profiles.ts';
 
@@ -245,6 +246,24 @@ export function restoreEntryTimes(history: AgentEntry[], recent: AgentEntry[]): 
 /** A provider may accept session/load while replaying no history. Keep Sail's complete owned copy. */
 export function restoreOwnedEntries(history: AgentEntry[], saved: AgentEntry[]): AgentEntry[] {
   return history.length >= saved.length ? restoreEntryTimes(history, saved) : saved;
+}
+
+export function acpRestoreMode(capabilities: unknown): 'load' | 'resume' | null {
+  if (!capabilities || typeof capabilities !== 'object') return null;
+  const canLoad = 'loadSession' in capabilities && capabilities.loadSession === true;
+  const sessionCapabilities =
+    'sessionCapabilities' in capabilities ? capabilities.sessionCapabilities : null;
+  const session =
+    sessionCapabilities && typeof sessionCapabilities === 'object' ? sessionCapabilities : null;
+  const canResume =
+    !!session && 'resume' in session && !!session.resume && typeof session.resume === 'object';
+  const restoresSubagents =
+    !!session &&
+    'subagents' in session &&
+    !!session.subagents &&
+    typeof session.subagents === 'object';
+  if (canLoad && (restoresSubagents || !canResume)) return 'load';
+  return canResume ? 'resume' : null;
 }
 
 export interface AgentPermission {
@@ -543,6 +562,44 @@ export function updateEntriesInPlace(
     replayToolIndexes.set(entries, toolIndexes);
   }
   applyEntryUpdate(entries, update, toolIndexes, created);
+}
+
+/** Record owned turns even when no AgentWorkspace pane is mounted. */
+export function archiveOwnedPrompt(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+  turnId: string,
+  text: string,
+): Promise<void> {
+  if (!acpSessionOwner(sessionId)) return Promise.resolve();
+  const id = `owned-prompt:${turnId}`;
+  return updateOwnedTranscript(sessionKey(agent, directory, sessionId), (entries) => {
+    if (!entries.some((entry) => entry.id === id))
+      entries.push({ id, type: 'user', text, created: Date.now() });
+    return entries;
+  });
+}
+
+export function archiveOwnedTranscriptUpdate(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+  update: Record<string, unknown>,
+): Promise<void> {
+  if (!acpSessionOwner(sessionId) || update.sessionUpdate === 'user_message_chunk')
+    return Promise.resolve();
+  if (
+    update.sessionUpdate !== 'agent_message_chunk' &&
+    update.sessionUpdate !== 'agent_thought_chunk' &&
+    update.sessionUpdate !== 'tool_call' &&
+    update.sessionUpdate !== 'tool_call_update'
+  )
+    return Promise.resolve();
+  return updateOwnedTranscript(sessionKey(agent, directory, sessionId), (entries) => {
+    updateEntriesInPlace(entries, update, Date.now());
+    return entries;
+  });
 }
 
 function indexTools(entries: AgentEntry[]): Map<string, number> {
@@ -1021,6 +1078,7 @@ async function limitedPrompt(
 ): Promise<AcpPromptOutcome> {
   if (slotHeld) {
     if (workspaceTurns.get(turnId)?.cancelled) throw new Error('Agent turn was cancelled.');
+    await archiveOwnedPrompt(agent, directory, sessionId, turnId, text);
     return invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
@@ -1032,6 +1090,7 @@ async function limitedPrompt(
   try {
     release = await acquireTurnSlot(queueId, onQueue, directory);
     if (pending.cancelled) throw new Error('Agent turn was cancelled.');
+    await archiveOwnedPrompt(agent, directory, sessionId, turnId, text);
     return await invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
@@ -1066,8 +1125,18 @@ export const acp = {
   releaseSessionFence: (agent: AgentId, directory: string, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, directory, sessionId }),
   releaseOwner: async (directory: string, owner: string) => {
-    await flushOwnedTranscriptWrites(owner);
+    let archiveError: unknown;
+    try {
+      await flushOwnedTranscriptWrites(owner);
+    } catch (cause) {
+      archiveError = cause;
+    }
     await invoke<void>('acp_release_owner', { directory, owner });
+    if (archiveError) {
+      const detail =
+        archiveError instanceof Error ? archiveError.message : 'Transcript storage failed.';
+      throw new Error(`Run ended, but its local transcript could not be saved: ${detail}`);
+    }
   },
   beginRestore: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
     invoke<{

@@ -157,9 +157,12 @@ function runTerminal(sessionId, text, promptId) {
     return;
   }
   const stop = text.includes('stop');
-  const script = stop
-    ? 'echo started; sleep 30; echo done'
-    : 'echo started; sleep 1; echo finished; exit 7';
+  const script =
+    text === 'Terminal: Native build'
+      ? 'mkdir -p "$CARGO_TARGET_DIR"; printf marker > "$CARGO_TARGET_DIR/terminal-marker"; printf "CARGO_TARGET_DIR=%s\\n" "$CARGO_TARGET_DIR"'
+      : stop
+        ? 'echo started; sleep 30; echo done'
+        : 'echo started; sleep 1; echo finished; exit 7';
   terminalRequest(
     'terminal/create',
     { sessionId, command: '/bin/sh', args: ['-c', script], outputByteLimit: 1024 },

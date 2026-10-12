@@ -430,6 +430,7 @@
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
     acpSessionOwner,
+    archiveOwnedTranscriptUpdate,
     applyLiveTranscriptUpdate,
     forgetRecentTranscript,
     invalidateLiveTranscript,
@@ -11793,6 +11794,10 @@
         const update = params?.update;
         if (update && typeof update === 'object') {
           const data = update as Record<string, unknown>;
+          if (!replayingAgentSessions[JSON.stringify([event.agent, eventDirectory, sessionId])])
+            void archiveOwnedTranscriptUpdate(event.agent, eventDirectory, sessionId, data).catch(
+              (cause) => (error = `Could not save owned conversation: ${describe(cause)}`),
+            );
           const thread = [...agentThreads, ...nativeChildThreads].find(
             (item) =>
               item.agent === event.agent &&

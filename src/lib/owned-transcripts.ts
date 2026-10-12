@@ -3,6 +3,7 @@ import type { AgentEntry } from './acp.ts';
 const databaseName = 'sail-owned-transcripts';
 const storeName = 'threads';
 const pending = new Map<string, Promise<void>>();
+const snapshots = new Map<string, AgentEntry[]>();
 let database: Promise<IDBDatabase> | null = null;
 
 function openDatabase(): Promise<IDBDatabase> {
@@ -54,19 +55,37 @@ export function ownedTranscriptKey(agent: string, directory: string, sessionId: 
 }
 
 export function saveOwnedTranscript(key: string, entries: AgentEntry[]): void {
-  if (typeof indexedDB === 'undefined') return;
+  const snapshot = entries.slice();
+  void updateOwnedTranscript(key, (saved) =>
+    snapshot.length >= saved.length ? snapshot : saved,
+  ).catch(() => undefined);
+}
+
+/** Serialize changes per thread and keep failed writes in memory for the next attempt. */
+export function updateOwnedTranscript(
+  key: string,
+  update: (entries: AgentEntry[]) => AgentEntry[],
+): Promise<void> {
+  if (typeof indexedDB === 'undefined') return Promise.resolve();
   const previous = pending.get(key) ?? Promise.resolve();
   const write = previous
     .catch(() => undefined)
-    .then(() => transaction(key, 'readwrite', entries).then(() => undefined));
+    .then(async () => {
+      const saved = snapshots.get(key) ?? (await transaction(key, 'readonly'));
+      const entries = update(saved.slice());
+      snapshots.set(key, entries);
+      await transaction(key, 'readwrite', entries);
+      snapshots.delete(key);
+      return undefined;
+    });
   pending.set(key, write);
-  void write.catch(() => undefined);
+  return write;
 }
 
 export async function loadOwnedTranscript(key: string): Promise<AgentEntry[]> {
   if (typeof indexedDB === 'undefined') return [];
   await pending.get(key);
-  return transaction(key, 'readonly');
+  return snapshots.get(key)?.slice() ?? transaction(key, 'readonly');
 }
 
 export async function flushOwnedTranscriptWrites(owner: string): Promise<void> {
@@ -93,7 +112,11 @@ export function forgetOwnedTranscript(key: string): void {
   const previous = pending.get(key) ?? Promise.resolve();
   const removal = previous
     .catch(() => undefined)
-    .then(() => transaction(key, 'readwrite').then(() => undefined));
+    .then(async () => {
+      await transaction(key, 'readwrite');
+      snapshots.delete(key);
+      return undefined;
+    });
   pending.set(key, removal);
   void removal.catch(() => undefined);
 }

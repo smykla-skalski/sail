@@ -4,6 +4,7 @@ import {
   acp,
   acpDisconnectAffectsSession,
   acpSessionOwner,
+  acpRestoreMode,
   acpCancelMatchesSession,
   acpEventMatchesSession,
   applyLiveTranscriptUpdate,
@@ -36,6 +37,16 @@ import { toolCommand } from '../src/lib/tool-display.ts';
 
 const normalizeEntries = (entries: AgentEntry[]) =>
   entries.map((entry) => (entry.type === 'tool' ? entry : { ...entry, id: entry.type }));
+
+void test('owned thread restore chooses the advertised provider mode', () => {
+  assert.equal(acpRestoreMode({ sessionCapabilities: { resume: {} } }), 'resume');
+  assert.equal(acpRestoreMode({ loadSession: true }), 'load');
+  assert.equal(
+    acpRestoreMode({ loadSession: true, sessionCapabilities: { resume: {}, subagents: {} } }),
+    'load',
+  );
+  assert.equal(acpRestoreMode({ loadSession: false, sessionCapabilities: {} }), null);
+});
 
 void test('a stale Codex session resumes before retrying its prompt', async () => {
   const calls: string[] = [];
