@@ -65,7 +65,6 @@
     refreshedPullRequest,
     closedWithoutMerge,
     shipGatesSettled,
-    shipCleanupRequest,
     shipEvidenceReadiness,
     shipOwnedThreadIds,
     shipOwnershipQuietGeneration,
@@ -5339,77 +5338,76 @@
           const savedSource = catalogued.find((worktree) => worktree.path === issue.path);
           if (savedSource?.generation !== source.generation)
             throw new Error('Ship worktree catalog identity changed before descendant cleanup.');
-          const knownPaths = new Set(catalogued.map((worktree) => worktree.path));
-          const unknown = registered.find(
-            (worktree) =>
-              worktree.path !== run.repository &&
-              worktree.path !== issue.path &&
-              !knownPaths.has(worktree.path),
-          );
-          if (unknown)
-            throw new Error(
-              `Cannot verify whether registered worktree ${unknown.path} belongs to the ship worktree. Its cleanup remains pending.`,
-            );
           const descendants = worktreeDescendants(
             projectCatalog,
             run.repository,
             registered,
             issue.path,
           );
-          if (descendants.length) {
-            const preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+          const targets = [source, ...descendants];
+          const pendingNotice =
+            'Cleanup pending: confirm the merged worktree is unused before removing it.';
+          if (
+            targets.every((worktree) =>
+              catalogued.some(
+                (item) =>
+                  item.path === worktree.path &&
+                  item.generation === worktree.generation &&
+                  item.pendingCleanup,
+              ),
+            )
+          ) {
+            if (issue.error !== pendingNotice) await update({ error: pendingNotice });
+            return;
+          }
+          let preview: WorktreeRemovalPreview[] = [];
+          let previewFailure: string | null = null;
+          try {
+            preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
               repository: run.repository,
-              paths: descendants.map((worktree) => worktree.path),
+              paths: targets.map((worktree) => worktree.path),
             });
             if (
-              preview.length !== descendants.length ||
+              preview.length !== targets.length ||
               preview.some(
                 (entry, index) =>
-                  entry.path !== descendants[index].path ||
-                  entry.generation !== descendants[index].generation,
+                  entry.path !== targets[index].path ||
+                  entry.generation !== targets[index].generation,
               )
             )
-              throw new Error('Ship descendant identities changed before cleanup.');
-            let pendingCatalog = projectCatalog;
-            for (const [index, worktree] of descendants.entries()) {
-              const state = preview[index];
-              pendingCatalog = markWorktreeCleanupPending(
-                pendingCatalog,
-                run.repository,
-                worktree.path,
-                {
-                  originalPath: worktree.path,
-                  recoveryPath: worktree.path,
-                  sizeBytes: state.sizeBytes,
-                  reason: state.inspectionError
+              throw new Error('Ship worktree identities changed before pending cleanup.');
+          } catch (cause) {
+            preview = [];
+            previewFailure = `Cannot verify checkout state: ${describe(cause)}`;
+          }
+          let pendingCatalog = projectCatalog;
+          for (const [index, worktree] of targets.entries()) {
+            const state = preview[index];
+            pendingCatalog = markWorktreeCleanupPending(
+              pendingCatalog,
+              run.repository,
+              worktree.path,
+              {
+                originalPath: worktree.path,
+                recoveryPath: worktree.path,
+                sizeBytes: state?.sizeBytes ?? null,
+                reason:
+                  previewFailure ??
+                  (state.inspectionError
                     ? `Cannot verify checkout contents: ${state.inspectionError}`
                     : state.dirty
                       ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
                       : state.activeSessions.length
                         ? 'Agent sessions are connected. Finish them before retrying cleanup.'
-                        : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.',
-                },
-                state.generation,
-              );
-            }
-            await saveProjectCatalogDurably(pendingCatalog);
-          } else await saveProjectCatalogDurably(projectCatalog);
-          const archivePath = await invoke<string | null>('delete_worktree', {
-            request: {
-              ...shipCleanupRequest(run.repository, issue, currentRevision),
-              nativeGeneration: confirmedOwnership.nativeGeneration,
-              expectedRegisteredWorktrees: registered.map(
-                ({ path: registeredPath, generation }) => ({
-                  path: registeredPath,
-                  generation,
-                }),
-              ),
-            },
-          });
-          await saveProjectCatalogDurably(
-            removeWorktree(projectCatalog, run.repository, issue.path),
-          );
-          await updateShipIssue(run, issue, { path: null, archivePath, error: null });
+                        : index === 0
+                          ? 'The merged ship worktree remains registered. Confirm it is unused before cleanup.'
+                          : 'The parent ship worktree completed. Confirm this descendant is unused before cleanup.'),
+              },
+              state.generation,
+            );
+          }
+          await saveProjectCatalogDurably(pendingCatalog);
+          await update({ error: pendingNotice });
         } catch (cause) {
           const retained = pendingStorageFromError(cause) ?? pendingRecoveryFromError(cause);
           let catalogError = '';
@@ -9414,6 +9412,23 @@
     }
   }
 
+  async function settleMergedShipCleanup(repository: string, path: string) {
+    const matches = shipRuns
+      .filter((run) => run.repository === repository)
+      .flatMap((run) =>
+        run.issues
+          .filter((issue) => issue.state === 'merged' && issue.path === path)
+          .map((issue) => ({ run, issue })),
+      );
+    await matches.reduce(
+      (previous, { run, issue }) =>
+        previous.then(() =>
+          updateShipIssue(run, issue, { path: null, archivePath: null, error: null }),
+        ),
+      Promise.resolve(),
+    );
+  }
+
   async function removeSelectedPendingWorktreeCleanup(repository: string, selectedPath: string) {
     if (deletingWorktreeRepositories.has(repository) || worktreeRegistrationPending(repository)) {
       error = 'A worktree operation is in progress. Retry cleanup when it finishes.';
@@ -9549,6 +9564,13 @@
             ? ''
             : 'Private storage was removed, but worktree registration could not be rechecked. Refresh before clearing saved workspace state.';
         }
+        if (remaining) {
+          try {
+            await settleMergedShipCleanup(repository, selectedPath);
+          } catch (cause) {
+            error = `Private storage was removed, but the Ship cleanup record could not be saved: ${describe(cause)}`;
+          }
+        }
       } catch (cause) {
         const reason = `Private storage remains pending: ${describe(cause)}`;
         saveProjectCatalog(
@@ -9648,6 +9670,13 @@
         registered,
         true,
       );
+      if (removed) {
+        try {
+          await settleMergedShipCleanup(repository, target.path);
+        } catch (cause) {
+          error = `The worktree was removed, but the Ship cleanup record could not be saved: ${describe(cause)}`;
+        }
+      }
       if (!removed && error) {
         const retained = projectCatalog.worktrees[repository]?.find(
           (item) => item.path === target.path && item.pendingCleanup,

@@ -2339,6 +2339,12 @@ async fn delete_worktree(
         let _lock = operation_locks.lock(Path::new(&checked))?;
         // Sail worktree creation takes this same Git-directory lock.
         ensure_expected_worktree_inventory(&checked, expected_registered_worktrees.as_deref())?;
+        if archive_ignored == Some(true) {
+            return Err(
+                "Automatic ignored-file archival is unavailable. The worktree remains registered for pending cleanup."
+                    .into(),
+            );
+        }
         if expected_revision.is_some()
             && expected_generation.is_some()
             && confirmed_unused != Some(true)
@@ -2416,32 +2422,19 @@ async fn delete_worktree(
                             &directory,
                             expected_generation.as_deref(),
                         )?;
-                        if archive_ignored == Some(true) {
-                            let result = archive_ignored_and_remove(
-                                checked,
-                                worktree,
-                                expected_revision,
-                                expected_branch,
-                            );
-                            if result.is_ok() {
+                        remove_worktree_guarded_with_hook(
+                            checked,
+                            worktree,
+                            force,
+                            expected_revision.as_deref(),
+                            expected_branch.as_deref(),
+                            expected_generation.as_deref(),
+                            || {
                                 removed_from_git = true;
-                            }
-                            result
-                        } else {
-                            remove_worktree_guarded_with_hook(
-                                checked,
-                                worktree,
-                                force,
-                                expected_revision.as_deref(),
-                                expected_branch.as_deref(),
-                                expected_generation.as_deref(),
-                                || {
-                                    removed_from_git = true;
-                                    Ok(())
-                                },
-                            )?;
-                            Ok(None)
-                        }
+                                Ok(())
+                            },
+                        )?;
+                        Ok(None)
                     })
                 },
             )
@@ -2981,6 +2974,7 @@ fn decode_manifest_path(encoded: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+#[cfg(test)]
 fn archive_ignored_and_remove(
     repository: String,
     worktree: String,
@@ -3081,6 +3075,7 @@ fn extended_windows_path(path: &Path) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_wide(&extended))
 }
 
+#[cfg(test)]
 fn rollback_staged_archive(
     staging: &Path,
     worktree: &Path,
@@ -3116,6 +3111,7 @@ fn rollback_staged_archive(
     }
 }
 
+#[cfg(test)]
 fn archive_ignored_and_remove_with_hook<F>(
     repository: String,
     worktree: String,
@@ -3498,6 +3494,7 @@ fn pending_recovery_error(
     )
 }
 
+#[cfg(test)]
 fn remove_worktree(
     repository: String,
     worktree: String,
@@ -3558,6 +3555,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn remove_worktree_with_hook<F>(
     repository: String,
     worktree: String,
