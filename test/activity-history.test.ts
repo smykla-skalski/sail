@@ -8,6 +8,7 @@ import {
 } from '../src/lib/activity-history.ts';
 import { permissionDecisionTitle } from '../src/lib/capability-profiles.ts';
 import { acpPermissionActivitySourceId } from '../src/lib/acp-permissions.ts';
+import { decisionItems } from '../src/lib/transcript.ts';
 
 await test('activity history deduplicates provider updates with latest scoped outcome', () => {
   const events = recentActivityEvents([
@@ -85,6 +86,68 @@ await test('activity history stays bounded in reverse chronological order', () =
   assert.equal(events.length, 100);
   assert.equal(events[0].sourceId, 'session-149');
   assert.equal(events.at(-1)?.sourceId, 'session-50');
+});
+
+await test('an older session keeps policy decisions after activity in other workspaces', () => {
+  const scope = { agent: 'opencode', directory: '/repo/older', sessionId: 'session-older' };
+  const stored = saveActivityHistory(
+    recentActivityEvents([
+      {
+        workspace: scope.directory,
+        kind: 'decision',
+        source: 'OpenCode',
+        sourceId: 'permission-1',
+        title: 'Format notes',
+        outcome: 'allowed',
+        at: 1,
+        agent: scope.agent,
+        sessionId: scope.sessionId,
+        automatic: true,
+        reason: 'Policy allows formatting notes.',
+      },
+      ...Array.from({ length: 150 }, (_, index) => ({
+        workspace: '/repo/busy',
+        kind: 'tool' as const,
+        source: 'Claude',
+        sourceId: `tool-${index}`,
+        title: 'Run tool',
+        outcome: 'completed',
+        at: index + 2,
+      })),
+    ]),
+  );
+
+  assert.deepEqual(
+    decisionItems(loadActivityHistory(stored), scope).map(({ title, outcome, reason }) => ({
+      title,
+      outcome,
+      reason,
+    })),
+    [{ title: 'Format notes', outcome: 'allowed', reason: 'Policy allows formatting notes.' }],
+  );
+  assert.equal(loadActivityHistory(stored).length, 101);
+});
+
+await test('policy decision history keeps the latest twenty rows per session', () => {
+  const events = recentActivityEvents(
+    Array.from({ length: 25 }, (_, index) => ({
+      workspace: '/repo',
+      kind: 'decision' as const,
+      source: 'OpenCode',
+      sourceId: `permission-${index}`,
+      title: `Decision ${index}`,
+      outcome: 'allowed',
+      at: index + 1,
+      agent: 'opencode',
+      sessionId: 'session',
+      automatic: true,
+      reason: 'Allowed by policy.',
+    })),
+  );
+
+  assert.equal(events.length, 20);
+  assert.equal(events[0]?.sourceId, 'permission-24');
+  assert.equal(events.at(-1)?.sourceId, 'permission-5');
 });
 
 await test('activity history bounds display text without storing output', () => {

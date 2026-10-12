@@ -20,6 +20,8 @@ export type ActivityHistoryEvent = {
 
 export type ActivityHistoryInput = Omit<ActivityHistoryEvent, 'id'> & { id?: string };
 
+const automaticDecisionsPerSession = 20;
+
 function isActivityKind(value: unknown): value is ActivityHistoryKind {
   return (
     value === 'parent' ||
@@ -72,9 +74,23 @@ export function recentActivityEvents(
     const previous = events.get(id);
     if (!previous || previous.at <= event.at) events.set(id, event);
   }
+  // The global activity cap must not erase a thread's policy decisions as other workspaces run.
+  const sessions = new Map<string, number>();
+  let ordinary = 0;
   return [...events.values()]
     .toSorted((left, right) => right.at - left.at || left.id.localeCompare(right.id))
-    .slice(0, Math.max(0, limit));
+    .filter((event) => {
+      if (event.kind === 'decision' && event.automatic && event.agent && event.sessionId) {
+        const session = JSON.stringify([event.workspace, event.agent, event.sessionId]);
+        const count = sessions.get(session) ?? 0;
+        if (count >= automaticDecisionsPerSession) return false;
+        sessions.set(session, count + 1);
+        return true;
+      }
+      if (ordinary >= Math.max(0, limit)) return false;
+      ordinary += 1;
+      return true;
+    });
 }
 
 export function activityWorkspaces(events: ActivityHistoryEvent[]): string[] {

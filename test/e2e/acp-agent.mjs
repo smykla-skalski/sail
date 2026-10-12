@@ -882,6 +882,21 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
       continue;
     }
+    if (text === 'Thinking demo') {
+      const thought = {
+        sessionUpdate: 'agent_thought_chunk',
+        content: { type: 'text', text: 'I should inspect the result.' },
+      };
+      const answer = {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'The result is ready.' },
+      };
+      sessions.get(sessionId).history.push(thought, answer);
+      update(sessionId, thought);
+      update(sessionId, answer);
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Background task') {
       recordUpdate(sessionId, sessionId, {
         sessionUpdate: 'agent_message_chunk',
