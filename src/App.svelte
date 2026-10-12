@@ -11108,15 +11108,26 @@
       }).catch(() => undefined),
   });
 
-  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false) {
+  function hasDurableCheckOutcome(status: PostTurnCheck['status']): boolean {
+    return (
+      status === 'passed' || status === 'failed' || status === 'timed_out' || status === 'canceled'
+    );
+  }
+
+  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false): Promise<boolean> {
     const key = checkKey(check);
-    if (
-      pendingPostTurnChecks.has(key) ||
-      (!retry && postTurnResults.some((item) => checkKey(item) === key))
-    )
-      return;
+    if (pendingPostTurnChecks.has(key)) return false;
     pendingPostTurnChecks.add(key);
     try {
+      if (!retry) {
+        const stored = (await invoke<PostTurnCheck[]>('list_post_turn_checks')).find(
+          (item) => checkKey(item) === key,
+        );
+        if (stored) {
+          postTurnResults = upsertCheck(postTurnResults, stored);
+          return hasDurableCheckOutcome(stored.status);
+        }
+      }
       if (check.source === 'repository') {
         const approved = await invoke<boolean>('is_post_turn_check_approved', {
           directory: check.directory,
@@ -11131,7 +11142,7 @@
           if (!allow) {
             const canceled = await invoke<PostTurnCheck>('cancel_post_turn_check', check);
             postTurnResults = upsertCheck(postTurnResults, canceled);
-            return;
+            return hasDurableCheckOutcome(canceled.status);
           }
           await invoke('approve_post_turn_check', {
             directory: check.directory,
@@ -11144,6 +11155,7 @@
         request: { ...check, retry },
       });
       postTurnResults = upsertCheck(postTurnResults, result);
+      return hasDurableCheckOutcome(result.status);
     } catch (cause) {
       postTurnResults = upsertCheck(postTurnResults, {
         ...check,
@@ -11151,18 +11163,21 @@
         output: describe(cause),
         code: null,
       });
+      return false;
     } finally {
       pendingPostTurnChecks.delete(key);
       scheduleInboxRefresh();
     }
   }
 
-  async function runCompletedChecks(path: string, thread: string, turn: string) {
-    if (!path || !thread || !turn) return;
+  async function runCompletedChecks(path: string, thread: string, turn: string): Promise<boolean> {
+    if (!path || !thread || !turn) return false;
     const entries: { source: 'repository' | 'personal'; command: string }[] =
       personalPostTurnChecks.map((command) => ({ source: 'personal', command }));
+    let configLoaded = false;
     try {
       const config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
+      configLoaded = true;
       entries.push(
         ...(config?.postTurnChecks ?? []).map((command) => ({
           source: 'repository' as const,
@@ -11172,7 +11187,7 @@
     } catch (cause) {
       error = `Could not load repository post-turn checks: ${describe(cause)}`;
     }
-    await Promise.all(
+    const durable = await Promise.all(
       entries.map((entry) =>
         runOnePostTurnCheck({
           id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
@@ -11187,6 +11202,7 @@
         }),
       ),
     );
+    return configLoaded && durable.every(Boolean);
   }
 
   async function runVerifiedCompletedChecks(
@@ -11209,7 +11225,7 @@
         evidence.turnId !== turnId
       )
         return;
-      await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId);
+      if (!(await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId))) return;
       await acp.finishPostTurnChecks(agent, path, sessionId, turnId);
     } catch (cause) {
       error = `Could not verify completed agent turn: ${describe(cause)}`;
