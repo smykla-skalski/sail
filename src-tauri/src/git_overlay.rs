@@ -218,6 +218,62 @@ pub(crate) fn require_no_private_state_at_missing(worktree: &Path) -> Result<(),
     Ok(())
 }
 
+/// A staged checkout can still own a synchronized overlay keyed to its old path.
+/// Keep that overlay in place so it becomes usable again after the Git move.
+pub(crate) fn require_recoverable_private_state_at_missing(
+    original: &Path,
+    recovery: &Path,
+) -> Result<(), String> {
+    let root = crate::acp_terminal::stable_worktree_identity(original);
+    let Some(cache) = CACHE.get() else {
+        return require_no_private_state_at_missing(&root);
+    };
+    require_recoverable_private_state_at_missing_in_cache(cache, &root, recovery)
+}
+
+fn require_recoverable_private_state_at_missing_in_cache(
+    cache: &Path,
+    original: &Path,
+    recovery: &Path,
+) -> Result<(), String> {
+    let root = crate::acp_terminal::stable_worktree_identity(original);
+    let (private, manifest_path, _) = paths(cache, &root);
+    let present = |path: &Path| fs::symlink_metadata(path).is_ok();
+    if !present(&private)
+        && !present(&manifest_path)
+        && !present(&manifest_path.with_extension("bak"))
+    {
+        return require_no_private_state_at_missing(&root);
+    }
+    let manifest = read_manifest(&manifest_path)?
+        .ok_or("Missing worktree has incomplete private Git state; recovery refused.")?;
+    if manifest.version != VERSION || manifest.worktree != root || manifest.promotion.is_some() {
+        return Err("Missing worktree has private Git state that requires recovery.".into());
+    }
+    let current = source(recovery)?.ok_or("Recovery checkout is not a linked Git worktree.")?;
+    if manifest.source_git_dir != current.git_dir
+        || manifest.common_dir != current.common_dir
+        || manifest.branch != current.branch
+        || manifest.promoted_oid != current.head
+        || index_hash(&current.git_dir.join("index"))? != manifest.source_index_hash
+    {
+        return Err("Recovery checkout does not match the original private Git state.".into());
+    }
+    validate_overlay(&private, &current.common_dir)?;
+    let head = output(
+        git_command()
+            .arg("--git-dir")
+            .arg(git_config_path(&private))
+            .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+    )?;
+    if String::from_utf8_lossy(&head.stdout).trim() != manifest.promoted_oid
+        || index_hash(&private.join("index"))? != manifest.source_index_hash
+    {
+        return Err("Recovery checkout has unpromoted private Git changes.".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn forget_removed_worktree(worktree: &Path) -> Result<(), String> {
     let root = crate::acp_terminal::stable_worktree_identity(worktree);
     let Some(cache) = CACHE.get() else {
@@ -1485,6 +1541,94 @@ mod tests {
         assert!(GitOverlay::ensure(&cache, &task).unwrap().is_some());
         git(&task, &["checkout", "--detach", "-q"]);
         assert!(GitOverlay::existing(&cache, &task).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_recovery_accepts_only_the_original_synchronized_overlay() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-overlay-staged-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let main = root.join("main");
+        let task = root.join("task");
+        let recovery = root.join("recovery");
+        let cache = root.join("cache");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main", main.to_str().unwrap()]);
+        git(&main, &["config", "user.name", "Sail Test"]);
+        git(&main, &["config", "user.email", "sail@example.test"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "base",
+            ],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task",
+                task.to_str().unwrap(),
+            ],
+        );
+        let overlay = GitOverlay::ensure(&cache, &task).unwrap().unwrap();
+        require_shared_current_in_cache(&cache, &task).unwrap();
+
+        git(
+            &main,
+            &[
+                "worktree",
+                "move",
+                task.to_str().unwrap(),
+                recovery.to_str().unwrap(),
+            ],
+        );
+        require_recoverable_private_state_at_missing_in_cache(&cache, &task, &recovery).unwrap();
+        assert!(overlay.manifest_path.exists());
+        git(
+            &main,
+            &[
+                "worktree",
+                "move",
+                recovery.to_str().unwrap(),
+                task.to_str().unwrap(),
+            ],
+        );
+        require_shared_current_in_cache(&cache, &task).unwrap();
+        git(
+            &main,
+            &[
+                "worktree",
+                "move",
+                task.to_str().unwrap(),
+                recovery.to_str().unwrap(),
+            ],
+        );
+        git(
+            &recovery,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "changed",
+            ],
+        );
+        assert!(
+            require_recoverable_private_state_at_missing_in_cache(&cache, &task, &recovery)
+                .is_err()
+        );
+        assert!(overlay.manifest_path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

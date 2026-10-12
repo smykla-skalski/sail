@@ -2023,6 +2023,31 @@ pub(crate) struct SelectedStorageLocation {
     pub(crate) size_bytes: Option<u64>,
 }
 
+fn malformed_marker_proven_unrelated(
+    cache_directory: &Path,
+    marker_key: &str,
+    selected_root: &Path,
+    common_dir: &Path,
+    repository_generation: &str,
+) -> bool {
+    let original = cache_directory.join("terminal-worktrees").join(marker_key);
+    let Ok(locations) =
+        retained_selected_storage_locations(cache_directory, std::slice::from_ref(&original))
+    else {
+        return false;
+    };
+    !locations.is_empty()
+        && locations.iter().all(|(_, path)| {
+            read_owner(path).is_ok_and(|owner| {
+                identity_data_directory(cache_directory, &owner)
+                    .is_ok_and(|owner_path| owner_path == original)
+                    && (!owner.root.starts_with(selected_root)
+                        || owner.common_dir != common_dir
+                        || owner.repository_generation != repository_generation)
+            })
+        })
+}
+
 pub(crate) fn selected_removed_storage_locations(
     cache_directory: &Path,
     repository: &Path,
@@ -2068,8 +2093,21 @@ pub(crate) fn selected_removed_storage_locations(
         else {
             continue;
         };
-        let Some(durable) = durable_cleanup_identity_by_key(cache_directory, marker_key)? else {
-            continue;
+        let durable = match durable_cleanup_identity_by_key(cache_directory, marker_key) {
+            Ok(Some(durable)) => durable,
+            Ok(None) => continue,
+            Err(_error)
+                if malformed_marker_proven_unrelated(
+                    cache_directory,
+                    marker_key,
+                    &selected_root,
+                    &common_dir,
+                    repository_generation,
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         let identity = &durable.owner;
         if !identity.root.starts_with(&selected_root)
@@ -4314,6 +4352,52 @@ mod tests {
         )
         .is_err());
         assert!(retained.join("user-data").exists());
+    }
+
+    #[test]
+    fn selected_storage_scan_ignores_only_proven_unrelated_malformed_markers() {
+        let fixture = GitFixture::new();
+        let generation = generation(&fixture.first).unwrap();
+        let (selected, selected_lease) = register(&fixture.cache, &fixture.first).unwrap();
+        selected_lease.release_clean().unwrap();
+        let (sibling, sibling_lease) = register(&fixture.cache, &fixture.second).unwrap();
+        sibling_lease.release_clean().unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&selected))
+            .unwrap();
+        ensure_ready_before_worktree_removal(&fixture.cache, std::slice::from_ref(&sibling))
+            .unwrap();
+        fixture.remove(&fixture.first);
+
+        let sibling_key = sibling.file_name().unwrap().to_str().unwrap();
+        fs::write(
+            durable_cleanup_marker_path(&fixture.cache, sibling_key),
+            "malformed marker",
+        )
+        .unwrap();
+        let found = selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &generation,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, selected);
+        let selected_key = selected.file_name().unwrap().to_str().unwrap();
+        fs::write(
+            durable_cleanup_marker_path(&fixture.cache, selected_key),
+            "malformed marker",
+        )
+        .unwrap();
+        assert!(selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &generation,
+        )
+        .is_err());
+        assert!(selected.exists());
+        assert!(sibling.exists());
     }
 
     #[test]

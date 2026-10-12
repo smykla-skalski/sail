@@ -2510,8 +2510,11 @@ async fn restore_pending_worktree(
             .git_canonical()
             .map_err(|_| "Repository folder no longer exists.".to_string())?;
         let _lock = operation_locks.lock(&repository)?;
-        if !agents.active_sessions_in(Path::new(&recovery_path))?.is_empty() {
-            return Err("The recovery worktree has active agent sessions. Finish them before restoring its path.".into());
+        if !agents
+            .sessions_blocking_cleanup_in(Path::new(&recovery_path))?
+            .is_empty()
+        {
+            return Err("The recovery worktree has connected agent sessions. Finish them before restoring its path.".into());
         }
         restore_pending_worktree_inner(
             &repository,
@@ -2540,12 +2543,12 @@ fn restore_pending_worktree_inner(
             original.display()
         ));
     }
-    git_overlay::require_no_private_state_at_missing(&original)?;
     if recovery == repository || original == repository {
         return Err("Cannot restore over the main repository.".into());
     }
     ensure_expected_worktree_generation(&recovery, Some(expected_generation))?;
     git_overlay::require_shared_current(&recovery)?;
+    git_overlay::require_recoverable_private_state_at_missing(&original, &recovery)?;
     move_worktree_for_removal(repository, &recovery, &original)?;
     ensure_expected_worktree_generation(&original, Some(expected_generation))?;
     Ok(())
