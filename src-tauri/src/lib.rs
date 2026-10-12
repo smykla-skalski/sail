@@ -1447,23 +1447,27 @@ fn registered_worktrees(
 }
 
 #[tauri::command]
-fn repository_worktrees(repository: String) -> Result<Vec<RegisteredWorktree>, String> {
-    let repository = validate_repository(repository)?;
-    let listed = git_reference(
-        Path::new(&repository),
-        &["worktree", "list", "--porcelain", "-z"],
-    )
-    .ok_or("Cannot inspect repository worktrees.")?;
-    Ok(parse_registered_worktrees(&listed)
-        .into_iter()
-        .filter(|entry| entry.present)
-        .filter_map(|mut entry| {
-            let path = Path::new(&entry.path).git_canonical().ok()?;
-            entry.path = path.to_string_lossy().into_owned();
-            entry.generation = worktree_storage::generation(&path).ok();
-            Some(entry)
-        })
-        .collect())
+async fn repository_worktrees(repository: String) -> Result<Vec<RegisteredWorktree>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = validate_repository(repository)?;
+        let listed = git_reference(
+            Path::new(&repository),
+            &["worktree", "list", "--porcelain", "-z"],
+        )
+        .ok_or("Cannot inspect repository worktrees.")?;
+        Ok(parse_registered_worktrees(&listed)
+            .into_iter()
+            .filter(|entry| entry.present)
+            .filter_map(|mut entry| {
+                let path = Path::new(&entry.path).git_canonical().ok()?;
+                entry.path = path.to_string_lossy().into_owned();
+                entry.generation = worktree_storage::generation(&path).ok();
+                Some(entry)
+            })
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn parse_registered_worktrees(listed: &str) -> Vec<RegisteredWorktree> {
@@ -3886,7 +3890,8 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].path, alias);
         assert_eq!(matched[0].branch.as_deref(), Some("child"));
-        let discovered = repository_worktrees(repository_path.into()).unwrap();
+        let discovered =
+            tauri::async_runtime::block_on(repository_worktrees(repository_path.into())).unwrap();
         let canonical_child = child.git_canonical().unwrap();
         assert!(discovered
             .iter()

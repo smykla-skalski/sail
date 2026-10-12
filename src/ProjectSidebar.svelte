@@ -168,6 +168,8 @@
   let creatingWorktreeFor = $state<string | null>(null);
   let registeredWorktrees = $state<Record<string, RegisteredWorktree[]>>({});
   let registrationSequence = 0;
+  let registrationRefreshRunning = false;
+  let registrationRefreshPending = false;
   let worktreeFromPalette = $state(false);
   let worktreeCreated = false;
   let lastWorktreeRequest = '';
@@ -397,17 +399,31 @@
   });
 
   async function refreshWorktreeRegistrations() {
-    const sequence = ++registrationSequence;
-    const repositories = catalog.repositories;
-    const results = await Promise.all(
-      repositories.map(async (repository) => {
-        const worktrees = await invoke<RegisteredWorktree[]>('repository_worktrees', {
-          repository,
-        }).catch(() => []);
-        return [repository, worktrees] as const;
-      }),
-    );
-    if (sequence === registrationSequence) registeredWorktrees = Object.fromEntries(results);
+    ++registrationSequence;
+    if (registrationRefreshRunning) {
+      registrationRefreshPending = true;
+      return;
+    }
+    registrationRefreshRunning = true;
+    try {
+      const sequence = registrationSequence;
+      const repositories = catalog.repositories;
+      const results = await Promise.all(
+        repositories.map(async (repository) => {
+          const worktrees = await invoke<RegisteredWorktree[]>('repository_worktrees', {
+            repository,
+          }).catch(() => []);
+          return [repository, worktrees] as const;
+        }),
+      );
+      if (sequence === registrationSequence) registeredWorktrees = Object.fromEntries(results);
+    } finally {
+      registrationRefreshRunning = false;
+      if (registrationRefreshPending) {
+        registrationRefreshPending = false;
+        void refreshWorktreeRegistrations();
+      }
+    }
   }
 
   $effect(() => {
