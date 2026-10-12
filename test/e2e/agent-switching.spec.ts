@@ -67,6 +67,7 @@ describe('agent switching', () => {
     const sessions = await browser.tauri.execute(async ({ core }, titles) => {
       const path = sessionStorage.getItem('sai-e2e-switch-target');
       if (!path) throw new Error('Missing target repository');
+      await core.invoke('acp_connect', { agent: 'opencode', directory: path });
       return Promise.all(
         titles.map((title) =>
           core.invoke<{ sessionId: string }>('acp_new_session', {
@@ -230,27 +231,30 @@ describe('agent sessions survive thread switches', () => {
     await browser.execute((value) => {
       sessionStorage.setItem('sai-e2e-continuity-threads', value);
     }, JSON.stringify(threads));
-    const sessions = await browser.tauri.execute(async ({ core }) => {
-      const pending: { agent: string; directory: string }[] = JSON.parse(
-        sessionStorage.getItem('sai-e2e-continuity-threads') ?? '[]',
-      );
-      const codexDirectory = pending.find((thread) => thread.agent === 'codex')?.directory;
-      if (!codexDirectory) throw new Error('Codex fixture directory is missing');
-      await core.invoke('acp_connect', { agent: 'codex', directory: codexDirectory });
-      await core.invoke('acp_authenticate', {
-        agent: 'codex',
-        directory: codexDirectory,
-        methodId: 'chat-gpt',
-      });
-      const created = await Promise.all(
-        pending.map((thread) =>
-          core.invoke<{ sessionId: string }>('acp_new_session', {
-            params: { agent: thread.agent, cwd: thread.directory },
-          }),
-        ),
-      );
-      return created.map((session) => session.sessionId);
-    });
+    const sessions = await browser.tauri.execute(
+      async ({ core }, directories) => {
+        const pending: { agent: string; directory: string }[] = JSON.parse(
+          sessionStorage.getItem('sai-e2e-continuity-threads') ?? '[]',
+        );
+        await core.invoke('acp_connect', { agent: 'claude', directory: directories[0] });
+        await core.invoke('acp_connect', { agent: 'claude', directory: directories[1] });
+        await core.invoke('acp_connect', { agent: 'codex', directory: directories[2] });
+        await core.invoke('acp_authenticate', {
+          agent: 'codex',
+          directory: directories[2],
+          methodId: 'chat-gpt',
+        });
+        const created = await Promise.all(
+          pending.map((thread) =>
+            core.invoke<{ sessionId: string }>('acp_new_session', {
+              params: { agent: thread.agent, cwd: thread.directory },
+            }),
+          ),
+        );
+        return created.map((session) => session.sessionId);
+      },
+      [first, second, codex],
+    );
     await browser.execute(
       (saved, personalCheck, directories) => {
         sessionStorage.removeItem('sai-e2e-continuity-threads');
@@ -567,6 +571,96 @@ describe('agent sessions survive thread switches', () => {
       wait: 30_000,
     });
     expect(restarts(codex)).toBe(before);
+  });
+
+  it('does not restore an idle Codex session with live background work', async () => {
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const before = restarts(codex);
+    rmSync(join(codex, 'codex-background-release.txt'), { force: true });
+    await sendPrompt('Background task');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Background task started.'),
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await switchAwayAndBack('Continuity codex', 'Codex sibling', 2);
+    expect(restarts(codex)).toBe(before);
+    writeFileSync(join(codex, 'codex-background-release.txt'), 'release\n');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Background task started. Background task finished.'),
+      { wait: 15_000 },
+    );
+    expect(restarts(codex)).toBe(before);
+  });
+
+  it('keeps idle Codex background work alive across a webview refresh', async () => {
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const before = restarts(codex);
+    rmSync(join(codex, 'codex-background-release.txt'), { force: true });
+    await sendPrompt('Background task with history');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Background task started.'),
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.refresh();
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.pause(500);
+    expect(restarts(codex)).toBe(before);
+    await expect($('.agent-history-gap')).toHaveText(
+      expect.stringContaining('Loading history can restart work still running.'),
+    );
+    expect(await conversationText()).not.toContain('History marker 1.');
+    writeFileSync(join(codex, 'codex-background-release.txt'), 'release\n');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Background task finished.'),
+      { wait: 15_000 },
+    );
+    expect(restarts(codex)).toBe(before);
+    const loadEarlier = $('.agent-history-gap button');
+    await loadEarlier.click();
+    await expect($('.agent-history-gap')).not.toBeExisting();
+    expect(await conversationText()).toContain('History marker 1.');
+    expect(restarts(codex)).toBe(before);
+  });
+
+  it('recovers an evicted idle Codex session before its next prompt', async () => {
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await sendPrompt('Evict session');
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('Session evicted.'));
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await switchAwayAndBack('Continuity codex', 'Codex sibling', 1);
+    await sendPrompt('Discuss interruption');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('The previous step was interrupted, then recovered.'),
+    );
+  });
+
+  it('recovers Codex after a manual history load fails', async () => {
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await sendPrompt('Discuss interruption');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('The previous step was interrupted, then recovered.'),
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.refresh();
+    await openThread('Continuity codex');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    const before = occurrences(await conversationText(), 'then recovered.');
+    const failLoad = join(codex, 'codex-fail-next-load.txt');
+    writeFileSync(failLoad, 'fail\n');
+    await $('.agent-history-gap button').click();
+    await browser.waitUntil(() => !existsSync(failLoad));
+    await expect($('.agent-history-gap button')).toBeDisplayed();
+    await sendPrompt('Discuss interruption');
+    await browser.waitUntil(async () => {
+      const text = await conversationText();
+      return occurrences(text, 'then recovered.') === before + 1;
+    });
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
   });
 
   it('keeps the parent transcript after visiting its native child', async () => {

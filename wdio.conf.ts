@@ -29,6 +29,7 @@ process.once('exit', () => {
   rmSync(state, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 const attach = process.env.SAIL_E2E_ATTACH === '1';
+if (!attach) process.env.SAIL_HOOK_CONNECTION_FILE = join(state, 'hook-connection.json');
 Object.assign(process.env, isolatedPaths(state, attach, process.env));
 if (attach) assertPrivateE2eConfigRoot(process.env.SAIL_E2E_CONFIG_DIR, tmpdir());
 if (attach && process.env.SAIL_E2E_MACHINE_READING !== 'healthy')

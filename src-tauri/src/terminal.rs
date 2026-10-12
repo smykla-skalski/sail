@@ -1194,6 +1194,13 @@ fn spawn(
             std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
             command.env(key, value);
         }
+        if let Some(overlay) = crate::git_overlay::GitOverlay::ensure(&cache_directory, &worktree)?
+        {
+            command.env("GIT_DIR", &overlay.git_dir);
+            command.env("GIT_WORK_TREE", &overlay.worktree);
+            command.env_remove("GIT_COMMON_DIR");
+            command.env_remove("GIT_INDEX_FILE");
+        }
         storage_lease = Some(lease);
     }
     command.env("TERM", "xterm-256color");
@@ -1673,9 +1680,21 @@ pub fn terminal_resize(
 }
 
 #[tauri::command]
-pub fn terminal_close(manager: State<'_, TerminalManager>, id: String) -> Result<(), String> {
+pub fn terminal_close(
+    app: AppHandle,
+    manager: State<'_, TerminalManager>,
+    id: String,
+) -> Result<(), String> {
     let mut sessions = manager.0.lock().map_err(|error| error.to_string())?;
-    stop_then_remove(&mut sessions, &id, TerminalSession::stop)
+    let worktree = sessions.get(&id).map(|session| session.worktree.clone());
+    stop_then_remove(&mut sessions, &id, TerminalSession::stop)?;
+    drop(sessions);
+    if let Some(worktree) =
+        worktree.filter(|root| crate::git_overlay::known_worktree(root).is_some())
+    {
+        let _ = crate::acp::promote_idle_worktree(&app, &worktree);
+    }
+    Ok(())
 }
 
 fn stop_then_remove<T>(

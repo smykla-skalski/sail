@@ -29,6 +29,7 @@
   import PlanPanel from './PlanPanel.svelte';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
+  import { updateReplayingAgentSessions } from './lib/agent-replay';
   import { isPlanTool } from './lib/plan-engine';
   import { openCodeSessionId, sameThreadId } from './lib/thread-id';
   import {
@@ -589,6 +590,7 @@
     type ProjectCatalog,
     type ProjectWorktree,
     type WorktreeCreation,
+    type WorktreeOrigin,
   } from './lib/projects';
 
   let themePreference = $state<ThemePreference>(parseThemePreference(getSetting(themeSettingKey)));
@@ -772,6 +774,7 @@
   type CreatedWorktree = {
     path: string;
     branch: string;
+    generation: string | null;
     base: string;
     setup: string;
     shippingTarget?: ShippingTarget;
@@ -2617,6 +2620,28 @@
     projectCatalog = next;
     setSetting('sai-project-catalog', JSON.stringify(next));
     scheduleInboxRefresh();
+  }
+
+  async function agentWorktreeOrigin(
+    project: string,
+    sourcePath: string,
+    agent: string,
+    sessionId: string,
+    sessionTitle: string,
+  ): Promise<WorktreeOrigin> {
+    const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+      repository: project,
+      paths: [sourcePath],
+    });
+    const source = registered.find((item) => item.path === sourcePath);
+    if (!source?.generation) throw new Error('Source Git worktree identity is unavailable.');
+    return {
+      sourcePath,
+      sourceGeneration: source.generation,
+      agent,
+      sessionId,
+      sessionTitle,
+    };
   }
 
   async function saveShipRuns(): Promise<void> {
@@ -6058,7 +6083,9 @@
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available))
       return threads;
     const known = new Set(threads.map((thread) => thread.id));
-    const listed = await Promise.all(directories.map((path) => listOpenCodeRootThreads(path)));
+    const listed = await Promise.all(
+      directories.map((path) => listOpenCodeRootThreads(path).catch(() => [])),
+    );
     return [
       ...threads,
       ...listed
@@ -6096,6 +6123,47 @@
     setSetting('sai-coordination-messages', JSON.stringify(coordinationMessages));
   }
 
+  async function resolveCoordinationThread(
+    target: CoordinationThread,
+  ): Promise<AgentThread | null> {
+    const existing = [
+      ...agentThreads,
+      ...nativeChildThreads,
+      ...nativeThreads,
+      ...sidebarOpenCodeThreads,
+    ].find(
+      (item) =>
+        item.directory === target.directory && target.id === `acp:${item.agent}:${item.sessionId}`,
+    );
+    if (existing) return existing;
+
+    const match = /^acp:([^:]+):(.+)$/.exec(target.id);
+    if (!match) return null;
+    const [, agent, sessionId] = match;
+    const receipt = spawnReceipts.find(
+      (item) => item.targetId === target.id && item.targetDirectory === target.directory,
+    );
+    const listed =
+      agent === 'opencode'
+        ? await listSidebarAcpThreads(
+            agent,
+            (cursor) => acp.listSessions(agent, target.directory, cursor, 'explore'),
+            target.directory,
+          ).catch(() => [])
+        : [];
+    return (
+      listed.find((item) => item.sessionId === sessionId) ?? {
+        agent,
+        directory: target.directory,
+        sessionId,
+        title: target.title || receipt?.name || 'Recovered session',
+        updated: receipt?.updated ?? Date.now(),
+        model: receipt?.model,
+        capabilityProfile: capabilityProfileForAcpSession(agent, target.directory, sessionId),
+      }
+    );
+  }
+
   function queueCoordinationDelivery(target: CoordinationThread, message: CoordinationMessage) {
     const previous = coordinationDeliveries.get(message.target) ?? Promise.resolve();
     const delivery = previous
@@ -6104,11 +6172,7 @@
         if (disposed || coordinationMessages.find((item) => item.id === message.id)?.delivered)
           return;
         const text = coordinationPrompt(message);
-        const thread = [...agentThreads, ...sidebarOpenCodeThreads].find(
-          (item) =>
-            item.directory === target.directory &&
-            target.id === `acp:${item.agent}:${item.sessionId}`,
-        );
+        const thread = await resolveCoordinationThread(target);
         if (!thread) throw new Error('The receiving thread is unavailable.');
         const info = await acp.connect(thread.agent, thread.directory);
         const agentActivity = (await acp.activity(thread.directory))[thread.agent];
@@ -6129,6 +6193,15 @@
             await acp.resume(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
           else await acp.load(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
         }
+        if (
+          !agentThreads.some(
+            (item) =>
+              item.agent === thread.agent &&
+              item.directory === thread.directory &&
+              item.sessionId === thread.sessionId,
+          )
+        )
+          saveAgentThread(thread);
         await waitForCoordinationThread(thread);
         if (disposed) return;
         await invoke('record_turn_snapshot', {
@@ -6990,11 +7063,20 @@
     if (!(await approval)) throw new Error('User declined the worktree request.');
     if (Date.now() >= request.expiresAt)
       throw new Error('The worktree request expired before approval.');
-    const created = await invoke<{ path: string; branch: string; base: string; setup: string }>(
-      'create_worktree',
-      { repository: request.directory, name, destinationParent: null, baseRef: null },
+    const origin = await agentWorktreeOrigin(
+      project,
+      request.directory,
+      source.agent,
+      request.sessionId,
+      source.title,
     );
-    saveProjectCatalog(addWorktree(projectCatalog, project, created));
+    const created = await invoke<CreatedWorktree>('create_worktree', {
+      repository: request.directory,
+      name,
+      destinationParent: null,
+      baseRef: null,
+    });
+    saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
     if (created.setup) {
       await loadProject(created.path);
       if (directory !== created.path) throw new Error('Worktree changed before setup started.');
@@ -7756,11 +7838,20 @@
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out while waiting to launch.');
       if (!destination) {
-        const created = await invoke<{ path: string; branch: string; setup: string }>(
-          'create_worktree',
-          { repository: project, name, destinationParent: null, baseRef: null },
+        const origin = await agentWorktreeOrigin(
+          project,
+          request.directory,
+          source.agent,
+          request.sessionId,
+          source.title,
         );
-        saveProjectCatalog(addWorktree(projectCatalog, project, created));
+        const created = await invoke<CreatedWorktree>('create_worktree', {
+          repository: project,
+          name,
+          destinationParent: null,
+          baseRef: null,
+        });
+        saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
         destination = created;
         updateSpawnReceipt(receiptId, {
           worktreeId: created.path,
@@ -8574,6 +8665,29 @@
     return runWorktreeCreation(id, request);
   }
 
+  async function adoptExternalWorktree(repository: string, worktree: ProjectWorktree) {
+    try {
+      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+        repository,
+        paths: [worktree.path],
+      });
+      const current = registered.find((entry) => entry.path === worktree.path);
+      if (!current || current.generation !== worktree.generation)
+        throw new Error('The external Git worktree changed. Refresh the list and try again.');
+      saveProjectCatalog(
+        addWorktree(projectCatalog, repository, {
+          path: worktree.path,
+          branch: current.branch ?? 'detached',
+          generation: current.generation,
+        }),
+      );
+      showWorkspace();
+      await loadProject(worktree.path);
+    } catch (cause) {
+      error = describe(cause);
+    }
+  }
+
   function retryWorktreeCreation(id: string) {
     const request = worktreeCreationRequests.get(id);
     if (!request || !worktreeCreations.some((creation) => creation.id === id && creation.error))
@@ -8743,7 +8857,10 @@
   }
 
   function hasActiveAgentSessions(message: string) {
-    return message.startsWith('Worktree has active agent sessions');
+    return (
+      message.startsWith('Worktree has active agent sessions') ||
+      message === 'An agent session is starting in this worktree.'
+    );
   }
 
   async function deleteProjectWorktreeOnce(
@@ -8866,8 +8983,8 @@
     }
     if (retryStop) {
       const stopConfirmed = await confirmInApp(
-        'Agent is running',
-        `An agent is still running in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
+        'Agent is running or starting',
+        `An agent is running or starting in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
         'Stop agent and delete',
         { destructive: true },
       );
@@ -11792,6 +11909,10 @@
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
+      const promotionError = event.message.params?.gitPromotionError;
+      if (typeof promotionError === 'string')
+        error = `Private Git changes remain pending: ${promotionError}`;
+      else if (error.startsWith('Private Git changes remain pending: ')) error = '';
       if (
         typeof sessionId !== 'string' ||
         (status !== 'done' && status !== 'failed' && status !== 'interrupted')
@@ -11913,12 +12034,13 @@
     replaying: boolean,
   ) {
     if (!sessionId) return;
-    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
-    const next = { ...replayingAgentSessions };
-    const count = (next[key] ?? 0) + (replaying ? 1 : -1);
-    if (count > 0) next[key] = count;
-    else delete next[key];
-    replayingAgentSessions = next;
+    replayingAgentSessions = updateReplayingAgentSessions(
+      replayingAgentSessions,
+      agent,
+      worktreeDirectory,
+      sessionId,
+      replaying,
+    );
     if (!replaying && sessionId)
       nativeSubagents = finalizeNativeSubagentRestore(
         nativeSubagents,
@@ -12293,9 +12415,11 @@
           showWorkspace();
           if (path !== directory) void loadProject(path);
         }}
+        onadoptworktree={(repository, worktree) => void adoptExternalWorktree(repository, worktree)}
         onselectdefault={(path) => void selectDefaultWorktree(path)}
         onselectthread={(key) => void selectSidebarThread(key)}
         onremovethread={removeSidebarThread}
+        oncopied={() => void announceCopied(null)}
         onaddrepository={(groupID) => void chooseProject(groupID)}
         onaddgroup={addProjectGroup}
         onrenamegroup={renameProjectGroup}

@@ -33,6 +33,7 @@
   import { activityForSession, parseHookActivity, type HookActivity } from './lib/hook-activity';
   import { toolInput } from './lib/tool-display';
   import { agentHeaderStatus } from './lib/agent-status';
+  import { AgentReplay } from './lib/agent-replay';
   import {
     acpToolFailure,
     prepareAcpFailureDraft,
@@ -87,6 +88,7 @@
     liveSessionView,
     markLiveMessageBoundary,
     restoredLiveTurnIsCurrent,
+    recoverMissingCodexSession,
     loadRecentTranscript,
     restoreEntryTimes,
     saveRecentTranscript,
@@ -515,6 +517,7 @@
   });
   let visibleCount = $state(50);
   let historyLoaded = $state(true);
+  let attachedCodexSession = $state(false);
   let historyLoading = $state(false);
   let historyAttempted = $state(false);
   let historicalToolIds = $state.raw<ReadonlySet<string>>(new Set());
@@ -528,11 +531,10 @@
       visibleCount += total - seenEntryCount;
     seenEntryCount = total;
   });
-  let replaying = false;
+  const replay = new AgentReplay();
   function setReplaying(value: boolean) {
-    if (replaying === value) return;
-    replaying = value;
-    onreplaychange?.(agent, directory, activeSessionId, value);
+    const sessionId = replay.set(value, activeSessionId);
+    if (sessionId) onreplaychange?.(agent, directory, sessionId, value);
   }
   let replayEntries: AgentEntry[] = [];
   let liveMessageBoundary = { pending: false };
@@ -722,6 +724,7 @@
   // The app marks a thread done from the turn-finished event, before this pane's prompt call
   // returns; the header follows that event so both settle in the same frame.
   let turnEnded = $state(false);
+  let recoveringPromptTurnId: string | null = null;
   const isBusy = $derived(busy || running || historyLoading || liveTurn);
   // What the user sees: a turn the app already marked finished no longer reads busy, so the
   // header, the working row and the pickers settle together.
@@ -800,7 +803,15 @@
   });
 
   $effect(() => {
-    if (ready && !busy && !running && !liveTurn && !historyLoaded && !historyAttempted)
+    if (
+      ready &&
+      !busy &&
+      !running &&
+      !liveTurn &&
+      !attachedCodexSession &&
+      !historyLoaded &&
+      !historyAttempted
+    )
       void loadHistory();
   });
 
@@ -1016,7 +1027,7 @@
     const previousPlan = nativePlan;
     nativePlan = nativePlanUpdate(agent, update, nativePlan);
     if (
-      !replaying &&
+      !replay.active &&
       nativePlan !== previousPlan &&
       activePlanRevision?.acceptingUpdates &&
       activePlanRevision.sessionId === activeSessionId
@@ -1024,10 +1035,10 @@
       activePlanRevision.revisedPlanSeen = true;
     if (activeSessionId && nativePlan)
       saveNativePlan({ agent, directory, sessionId: activeSessionId }, nativePlan);
-    if (activeSessionId && !replaying)
+    if (activeSessionId && !replay.active)
       acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
     onnativeplan?.(nativePlan);
-    if (replaying) {
+    if (replay.active) {
       // ACP does not identify live updates interleaved with session/load replay (#342).
       // A mutable running flag cannot establish provenance for old failed tools.
       updateEntriesInPlace(replayEntries, update);
@@ -1073,10 +1084,21 @@
       void showEarlier();
   }
 
-  async function loadHistory() {
+  async function loadHistory(requested = false) {
     const id = activeSessionId;
-    if (!id || historyLoading || !ready || busy || running || liveTurn || historyAttempted) return;
+    if (
+      !id ||
+      historyLoading ||
+      !ready ||
+      busy ||
+      running ||
+      liveTurn ||
+      (attachedCodexSession && !requested) ||
+      historyAttempted
+    )
+      return;
     const current = generation;
+    attachedCodexSession = false;
     historyAttempted = true;
     historyLoading = true;
     if (!historyLoaded) liveMessageBoundary.pending = true;
@@ -1124,7 +1146,13 @@
       )
         void showEarlier();
     } catch (cause) {
-      if (current === generation) error = describe(cause);
+      if (current === generation) {
+        error = describe(cause);
+        if (requested) {
+          attachedCodexSession = true;
+          historyAttempted = false;
+        }
+      }
     } finally {
       if (current === generation) {
         setReplaying(false);
@@ -1318,6 +1346,7 @@
     historicalToolIds = presentToolIds(nativeEntries ?? entries);
     visibleCount = 50;
     historyLoaded = !id;
+    attachedCodexSession = false;
     historyLoading = false;
     historyAttempted = false;
     configOptions = [];
@@ -1388,11 +1417,11 @@
             : false;
         if (!canLoad) throw new Error(`${name} does not support restoring threads.`);
         const showLiveTurn = async (
-          turnId: string,
+          turnId: string | null,
           cached: { configOptions?: AgentConfigOption[]; availableCommands?: AgentCommand[] },
         ) => {
           if (!liveView) return;
-          liveTurn = true;
+          liveTurn = turnId !== null;
           activeTurnId = turnId;
           historyLoaded = liveView.complete;
           configOptions = await restoreClaudeThreadConfig(
@@ -1405,6 +1434,7 @@
           const latest = (await acp.activity(directory).catch(() => null))?.[agent];
           if (
             current === generation &&
+            turnId !== null &&
             !restoredLiveTurnIsCurrent(turnId, latest?.activeTurns[id], finishedTurnIds)
           ) {
             liveTurn = false;
@@ -1424,6 +1454,10 @@
           typeof sessionCapabilities === 'object' &&
           'subagents' in sessionCapabilities;
         const needsReplay = restoresSubagents || !canResume;
+        const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
+        if (current !== generation) return;
+        attachedCodexSession =
+          agent === 'codex' && runtime?.alive === true && runtime.sessions.includes(id);
         const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
         if (current !== generation) {
           if (reservation.restoreToken)
@@ -1432,6 +1466,10 @@
         }
         if (reservation.liveTurn) {
           await showLiveTurn(reservation.liveTurn, reservation);
+        } else if (liveView && attachedCodexSession) {
+          if (reservation.restoreToken)
+            await acp.endRestore(agent, directory, id, reservation.restoreToken);
+          await showLiveTurn(null, reservation);
         } else {
           if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
           if (needsReplay) {
@@ -1680,7 +1718,8 @@
           busy &&
           params.sessionId === activeSessionId &&
           typeof params.turnId === 'string' &&
-          params.turnId === activeTurnId
+          params.turnId === activeTurnId &&
+          params.turnId !== recoveringPromptTurnId
         )
           turnEnded = true;
         if (
@@ -1781,7 +1820,7 @@
           Array.isArray(data.availableCommands)
         )
           updateSkills(data.availableCommands);
-        if (data.sessionUpdate !== 'user_message_chunk' || replaying) applyUpdate(data);
+        if (data.sessionUpdate !== 'user_message_chunk' || replay.active) applyUpdate(data);
         if (
           data.sessionUpdate === 'tool_call_update' &&
           (data.status === 'completed' || data.status === 'failed')
@@ -2053,15 +2092,24 @@
       let result;
       try {
         result = await dispatchAuthorizedDirectShipPrompt(directAuthorization, () =>
-          acp.prompt(
+          recoverMissingCodexSession(
             turnAgent,
-            directory,
-            id!,
-            recalledPrompt,
-            turnId,
-            promptImagePaths(sentImages, sentClipboard),
-            undefined,
-            true,
+            () =>
+              acp.prompt(
+                turnAgent,
+                directory,
+                id!,
+                recalledPrompt,
+                turnId,
+                promptImagePaths(sentImages, sentClipboard),
+                undefined,
+                true,
+              ),
+            async () => {
+              recoveringPromptTurnId = turnId;
+              if (current === generation) turnEnded = false;
+              await acp.resume(turnAgent, directory, id!, activeCapabilityProfile);
+            },
           ),
         );
         await recordImplementationModel(turnDirectory, implementationModel, tracking);
@@ -2176,6 +2224,7 @@
       }
       if (external && !queuedMessage && !delivered) throw cause;
     } finally {
+      if (recoveringPromptTurnId === turnId) recoveringPromptTurnId = null;
       releaseSlot?.();
       if (inFlightSteer?.sessionId === deliverySessionId && inFlightSteer.turnId === turnId)
         inFlightSteer.finish();
@@ -2749,6 +2798,13 @@
           role="note"
         >
           Earlier messages load when this turn ends.
+        </div>{:else if attachedCodexSession && !historyLoaded && !nativeEntries}<div
+          class="agent-history-status agent-history-gap"
+          role="note"
+        >
+          <p>Earlier messages are hidden while this Codex thread stays connected.</p>
+          <p>Wait for background work to finish. Loading history can restart work still running.</p>
+          <Button size="sm" onclick={() => void loadHistory(true)}>Load earlier messages</Button>
         </div>{/if}
       {#snippet failureTool(item: TranscriptTool)}
         {@const tool = item.raw as AgentTool}
@@ -3083,6 +3139,12 @@
   .agent-history-status {
     display: block;
     margin: 12px auto 20px;
+  }
+  .agent-history-gap {
+    max-width: 650px;
+  }
+  .agent-history-gap p {
+    margin: 0 0 8px;
   }
   .agent-welcome {
     max-width: 650px;

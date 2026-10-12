@@ -502,6 +502,14 @@ button:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.project-worktree-origin {
+  margin: 0 8px 4px 45px;
+  overflow: hidden;
+  color: var(--sui-muted);
+  font-size: var(--type-12);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .project-worktree-status.failed {
   color: var(--sui-danger);
   white-space: normal;
@@ -2910,6 +2918,7 @@ time {
 .confirmation-dialog p {
   line-height: 1.5;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .confirmation-actions,
 .path-picker-actions,

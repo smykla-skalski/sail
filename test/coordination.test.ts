@@ -49,6 +49,36 @@ await test('worktree discovery stays in the source project and marks stale entri
   assert.deepEqual(projectWorktreeInfo(catalog, '/missing', registered, threads, attention), []);
 });
 
+await test('worktree discovery exposes a verified creating session', () => {
+  const repositoryGeneration =
+    '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002';
+  const childGeneration =
+    '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000003';
+  const origin = {
+    sourcePath: '/repo',
+    sourceGeneration: repositoryGeneration,
+    agent: 'codex',
+    sessionId: 'session-123',
+    sessionTitle: 'Build task',
+  };
+  const catalog = {
+    repositories: ['/repo'],
+    groups: [],
+    worktrees: {
+      '/repo': [{ path: '/sibling', branch: 'task', generation: childGeneration, origin }],
+    },
+  };
+  const registered = [
+    { path: '/repo', branch: 'main', present: true, generation: repositoryGeneration },
+    { path: '/sibling', branch: 'task', present: true, generation: childGeneration },
+  ];
+  const current = projectWorktreeInfo(catalog, '/repo', registered, [], {})[1];
+  assert.deepEqual(current.origin, origin);
+  assert.equal(current.sourceMissing, false);
+  const missing = projectWorktreeInfo(catalog, '/repo', registered.slice(1), [], {})[1];
+  assert.equal(missing.sourceMissing, true);
+});
+
 await test('messages keep sender and target across reload', () => {
   const target = coordinationKey('/repo/worktree', 'acp:claude:session-1');
   const message = {

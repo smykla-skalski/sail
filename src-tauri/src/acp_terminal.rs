@@ -870,6 +870,14 @@ pub fn handle(
             for (name, value) in terminal_environment(&data_directory, temp_directory) {
                 command.env(name, value);
             }
+            if let Some(overlay) = crate::git_overlay::GitOverlay::ensure(
+                &app.path()
+                    .app_cache_dir()
+                    .map_err(|error| error.to_string())?,
+                worktree,
+            )? {
+                overlay.apply(&mut command);
+            }
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
             storage_lease.prepare_process_start()?;
             #[cfg(windows)]
@@ -1087,6 +1095,10 @@ pub fn handle(
         }
         "terminal/release" => {
             manager.archive(terminal_id, &terminal)?;
+            let worktree = terminal_worktree_root(&terminal.directory);
+            if crate::git_overlay::known_worktree(&worktree).is_some() {
+                let _ = crate::acp::promote_idle_worktree(app, &worktree);
+            }
             Ok(json!({}))
         }
         _ => Err("Unknown terminal method.".to_string()),

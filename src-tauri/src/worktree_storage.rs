@@ -1668,6 +1668,14 @@ fn resolve_identity(worktree: &Path) -> Result<WorktreeIdentity, String> {
     })
 }
 
+pub(crate) fn generation(worktree: &Path) -> Result<String, String> {
+    let identity = resolve_identity(worktree)?;
+    Ok(format!(
+        "{}:{}",
+        identity.repository_generation, identity.generation
+    ))
+}
+
 fn git_path(directory: &Path, arguments: &[&str]) -> Result<PathBuf, String> {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -3411,6 +3419,7 @@ mod tests {
     fn reused_worktree_path_gets_a_separate_generation_and_keeps_old_data() {
         let fixture = GitFixture::new();
         let (old_directory, old_lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let old_generation = generation(&fixture.first).unwrap();
         old_lease.release_clean().unwrap();
         fixture.remove(&fixture.first);
         GitFixture::git(
@@ -3425,8 +3434,10 @@ mod tests {
             ],
         );
         let (new_directory, new_lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let new_generation = generation(&fixture.first).unwrap();
 
         assert_ne!(old_directory, new_directory);
+        assert_ne!(old_generation, new_generation);
         reconcile(&fixture.cache);
         assert!(old_directory.exists());
         assert!(new_directory.exists());
