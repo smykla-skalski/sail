@@ -9040,7 +9040,12 @@
     descendants: ProjectWorktree[],
     registered: RegisteredWorktree[],
   ) {
-    const targets = [...descendants, { path, branch }];
+    const owner = projectCatalog.worktrees[repository]?.find((worktree) => worktree.path === path);
+    if (!owner?.generation || owner.branch !== branch) {
+      error = 'The selected worktree changed identity. Refresh before marking cleanup pending.';
+      return;
+    }
+    const targets = [...descendants, owner];
     const live = new Map(registered.map((worktree) => [worktree.path, worktree]));
     if (descendants.some((worktree) => deletingWorktreeRequests.has(worktree.path))) {
       error = 'Another descendant deletion is in progress. Retry after it finishes.';
@@ -9057,7 +9062,8 @@
           entry.path !== targets[index].path ||
           !live.get(entry.path)?.generation ||
           entry.generation !== live.get(entry.path)?.generation ||
-          entry.branch !== live.get(entry.path)?.branch,
+          entry.branch !== live.get(entry.path)?.branch ||
+          entry.generation !== targets[index].generation,
       )
     ) {
       error = 'Worktree identities changed during the preview. Refresh and retry.';
@@ -9195,12 +9201,26 @@
                   completed: false,
                 };
               }
-              const paths = [
+              const savedPaths = [
                 pending.originalPath,
                 pending.recoveryPath,
                 ...(pending.storagePaths ?? []),
               ];
-              const absent = await invoke<boolean>('pending_cleanup_paths_absent', { paths });
+              // A different registered generation may occupy an old checkout
+              // path. Its bytes belong to that replacement, not this pending row.
+              const paths = savedPaths.filter(
+                (path) =>
+                  !(path === pending.originalPath || path === pending.recoveryPath) ||
+                  !registered.some(
+                    (item) =>
+                      item.path === path &&
+                      !!item.generation &&
+                      item.generation !== entry.generation,
+                  ),
+              );
+              const absent = paths.length
+                ? await invoke<boolean>('pending_cleanup_paths_absent', { paths })
+                : true;
               if (absent) {
                 return { entry, pending, sizeBytes: null, reason: '', completed: true };
               }

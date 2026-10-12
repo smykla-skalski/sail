@@ -386,6 +386,32 @@ await test('keeps a pending original visible beside a replacement generation', (
   assert.deepEqual(externalGitWorktrees(catalog, '/repo', registered), [registered[0]]);
 });
 
+await test('does not transfer a Sail entry to a replacement generation during cleanup marking', () => {
+  const originalGeneration = testGeneration(33);
+  const replacementGeneration = testGeneration(34);
+  const catalog = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
+    path: '/worktrees/child',
+    branch: 'old',
+    generation: originalGeneration,
+  });
+  const changed = markWorktreeCleanupPending(
+    catalog,
+    '/repo',
+    '/worktrees/child',
+    {
+      originalPath: '/worktrees/child',
+      recoveryPath: '/worktrees/child',
+      sizeBytes: 0,
+      reason: 'Awaiting explicit cleanup.',
+    },
+    replacementGeneration,
+  );
+
+  assert.equal(changed, catalog);
+  assert.equal(changed.worktrees['/repo'][0].generation, originalGeneration);
+  assert.equal(changed.worktrees['/repo'][0].pendingCleanup, undefined);
+});
+
 await test('does not infer ancestry for an external worktree or a reused catalog path', () => {
   const oldGeneration = '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002';
   const newGeneration = '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000003';

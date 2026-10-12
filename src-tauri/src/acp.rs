@@ -8804,6 +8804,13 @@ mod native_subagent_fence_tests {
     #[cfg(unix)]
     #[test]
     fn active_opencode_turn_blocks_worktree_cleanup() {
+        use std::fs;
+
+        let directory =
+            std::env::temp_dir().join(format!("sail-active-turn-cleanup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).expect("create worktree fixture");
+        let marker = directory.join("keep.txt");
+        fs::write(&marker, b"active session data").expect("write worktree marker");
         let mut child = spawn_test_session_process();
         let input = child.stdin.take().expect("placeholder agent stdin");
         let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
@@ -8811,7 +8818,7 @@ mod native_subagent_fence_tests {
         let runtime = Arc::new(Connection {
             agent: "opencode".into(),
             profile: CapabilityProfile::Build,
-            worktree: PathBuf::from("/worktree"),
+            worktree: directory.clone(),
             owner: None,
             #[cfg(unix)]
             shared_build_directory: None,
@@ -8848,7 +8855,6 @@ mod native_subagent_fence_tests {
             ready: Condvar::new(),
             _owned_temp: None,
         });
-        let directory = PathBuf::from("/worktree");
         runtime
             .session_directories
             .lock()
@@ -8868,7 +8874,7 @@ mod native_subagent_fence_tests {
         );
         let agents = AgentManager::default();
         agents.0.lock().unwrap().insert(
-            connection_key("opencode", CapabilityProfile::Build, Path::new("/worktree")),
+            connection_key("opencode", CapabilityProfile::Build, &directory),
             runtime,
         );
         let mut cleaned = false;
@@ -8876,6 +8882,7 @@ mod native_subagent_fence_tests {
         let error = AgentWorktreeFence::default()
             .cleanup(&agents, &directory, None, false, || {
                 cleaned = true;
+                fs::remove_dir_all(&directory).expect("remove selected worktree");
                 Ok(())
             })
             .expect_err("an active OpenCode turn must block worktree removal");
@@ -8885,6 +8892,11 @@ mod native_subagent_fence_tests {
             "Worktree has active agent sessions: opencode:ses_open."
         );
         assert!(!cleaned);
+        assert_eq!(
+            fs::read(&marker).expect("active worktree must remain"),
+            b"active session data"
+        );
+        fs::remove_dir_all(directory).expect("remove worktree fixture");
     }
 
     #[test]

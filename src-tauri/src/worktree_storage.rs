@@ -2015,8 +2015,21 @@ pub(crate) fn selected_removed_storage_locations(
         .split_once(':')
         .ok_or("The selected worktree generation is malformed.")?;
     let locks = cache_directory.join("terminal-worktree-locks");
-    let entries = fs::read_dir(locks)
-        .map_err(|error| format!("Cannot inspect selected storage markers: {error}"))?;
+    let entries = match fs::read_dir(locks) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A new app cache has neither markers nor private storage. An
+            // existing storage root without markers remains ambiguous.
+            match fs::symlink_metadata(cache_directory.join("terminal-worktrees")) {
+                Err(storage_error) if storage_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                _ => {}
+            }
+            return Err(format!("Cannot inspect selected storage markers: {error}"));
+        }
+        Err(error) => return Err(format!("Cannot inspect selected storage markers: {error}")),
+    };
     let mut locations = Vec::new();
     for entry in entries {
         let entry =
@@ -4248,6 +4261,34 @@ mod tests {
         retry(&fixture.first, &generation, &selected_key).unwrap();
         assert!(!selected.exists());
         assert!(sibling.exists());
+    }
+
+    #[test]
+    fn selected_storage_scan_distinguishes_an_empty_cache_from_unmarked_storage() {
+        let fixture = GitFixture::new();
+        let generation = generation(&fixture.first).unwrap();
+        fixture.remove(&fixture.first);
+
+        assert!(selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &generation,
+        )
+        .unwrap()
+        .is_empty());
+
+        let retained = fixture.cache.join("terminal-worktrees").join("unmarked");
+        fs::create_dir_all(&retained).unwrap();
+        fs::write(retained.join("user-data"), "keep").unwrap();
+        assert!(selected_removed_storage_locations(
+            &fixture.cache,
+            &fixture.repository,
+            &fixture.first,
+            &generation,
+        )
+        .is_err());
+        assert!(retained.join("user-data").exists());
     }
 
     #[test]

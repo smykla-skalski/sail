@@ -68,8 +68,16 @@ describe('close worktree shortcut', () => {
   });
 
   async function select(directory: string, waitForInventory = true) {
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = (path: string) => registered.find((item) => item.path === path)?.generation;
     await browser.execute(
-      (repo, selected, firstPath, secondPath, firstPresent, secondPresent) => {
+      (repo, selected, firstPath, secondPath, firstGeneration, secondGeneration) => {
         sessionStorage.removeItem('sai-e2e-delete-worktree');
         localStorage.setItem('sai-directory', selected);
         localStorage.setItem(`sai-main-pane-empty:${selected}`, 'true');
@@ -80,8 +88,12 @@ describe('close worktree shortcut', () => {
             groups: [],
             worktrees: {
               [repo]: [
-                ...(firstPresent ? [{ path: firstPath, branch: 'first' }] : []),
-                ...(secondPresent ? [{ path: secondPath, branch: 'second' }] : []),
+                ...(firstGeneration
+                  ? [{ path: firstPath, branch: 'first', generation: firstGeneration }]
+                  : []),
+                ...(secondGeneration
+                  ? [{ path: secondPath, branch: 'second', generation: secondGeneration }]
+                  : []),
               ],
             },
           }),
@@ -91,8 +103,8 @@ describe('close worktree shortcut', () => {
       directory,
       first,
       second,
-      existsSync(first),
-      existsSync(second),
+      generation(first),
+      generation(second),
     );
     await browser.refresh();
     await diagnose('Workspace load', () => expect(topbarMenuTrigger('New agent')).toBeDisplayed());
@@ -295,17 +307,69 @@ describe('close worktree shortcut', () => {
     await browser.refresh();
     await expect($(`[data-pending-worktree="${completed}"]`)).toBeDisplayed();
     await $(`[data-pending-worktree="${completed}"]`).$('button=Recheck worktree').click();
-    await browser.waitUntil(async () =>
-      (await pendingCleanup(completed))?.reason.includes(
-        'a saved checkout or storage path still exists',
+    await diagnose('Completed cleanup retained path', () =>
+      browser.waitUntil(async () =>
+        (await pendingCleanup(completed))?.reason.includes(
+          'a saved checkout or storage path still exists',
+        ),
       ),
     );
     expect(existsSync(leftover)).toBe(true);
 
     rmSync(completed, { recursive: true });
+    git('worktree', 'add', '-q', '-b', 'completed-replacement', completed);
     await $(`[data-pending-worktree="${completed}"]`).$('button=Recheck worktree').click();
     await browser.waitUntil(async () => !(await catalogPaths()).includes(completed));
     expect(await catalogPaths()).toEqual([first]);
+    expect(existsSync(completed)).toBe(true);
+    expect(git('worktree', 'list')).toContain(completed);
+    git('worktree', 'remove', completed);
+  });
+
+  it('does not claim an external worktree that replaced a saved Sail generation', async () => {
+    const reused = join(worktrees, 'reused-catalog-path');
+    git('worktree', 'add', '-q', '-b', 'saved-generation', reused);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const oldGeneration = registered.find((item) => item.path === reused)?.generation;
+    if (!oldGeneration) throw new Error('Missing saved generation for replacement fixture');
+    git('worktree', 'remove', reused);
+    git('worktree', 'add', '-q', '-b', 'catalog-external-replacement', reused);
+    await select(reused, false);
+    await browser.execute(
+      (repo, path, generation) => {
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({
+            repositories: [repo],
+            groups: [],
+            worktrees: {
+              [repo]: [{ path, branch: 'saved-generation', generation }],
+            },
+          }),
+        );
+      },
+      repository,
+      reused,
+      oldGeneration,
+    );
+    await browser.refresh();
+    await expect(topbarMenuTrigger('New agent')).toBeDisplayed();
+    await browser.keys(['Meta', 'Shift', 'w']);
+    await expect($('.app-shell [role="alert"]')).toHaveText(
+      expect.stringMatching(
+        /Worktree identities changed during the preview|Private Git state .* requires recovery; task Git command refused/,
+      ),
+    );
+    expect(await pendingCleanup(reused)).toBeUndefined();
+    expect(existsSync(reused)).toBe(true);
+    expect(git('worktree', 'list')).toContain(reused);
+    git('worktree', 'remove', reused);
   });
 
   it('preserves a detached descendant changed after preview', async () => {

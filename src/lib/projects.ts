@@ -466,13 +466,16 @@ export function markWorktreeCleanupPending(
   const owner = entries.find((item) => item.path === path);
   if (!owner || entries.some((item) => item.path === pendingCleanup.recoveryPath && item !== owner))
     return catalog;
+  // A path reused by an external worktree does not transfer ownership of the
+  // saved Sail entry. A legacy entry without a generation remains unverified.
+  if (generation && owner.generation && generation !== owner.generation) return catalog;
   const updated = entries.slice();
   for (const [index, item] of entries.entries()) {
     if (item === owner) {
       updated[index] = {
         ...item,
         path: pendingCleanup.recoveryPath,
-        generation: generation ?? item.generation,
+        generation: item.generation,
         pendingCleanup,
       };
     } else if (
