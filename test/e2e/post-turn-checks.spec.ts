@@ -220,6 +220,25 @@ describe('post-turn checks', () => {
     }, command);
     await browser.refresh();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.execute(async (path) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.event.emitTo('main', 'acp-event', {
+        agent: 'claude',
+        directory: path,
+        worktree: path,
+        message: {
+          method: 'sail/prompt_finished',
+          params: {
+            sessionId: 'unknown-session',
+            turnId: 'unknown-turn',
+            status: 'done',
+            notify: true,
+          },
+        },
+      });
+    }, repository);
+    await browser.pause(1_000);
+    expect(existsSync(join(repository, 'reload-runs.txt'))).toBe(false);
     await $('.agent-composer [data-pane-prompt]').setValue('Long turn');
     await $('.agent-actions button').click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-3 '));

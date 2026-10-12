@@ -3063,6 +3063,17 @@ fn connect_blocking_inner(
                 };
                 message = translated;
             }
+            if message
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| method.starts_with("sail/"))
+            {
+                crate::diagnostics::record(
+                    "acp_reserved_method",
+                    json!({"agent":agent_id,"method":message.get("method")}),
+                );
+                continue;
+            }
             if message.get("method").is_some() {
                 if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
                     params.insert("sailCapabilityProfile".into(), profile.as_str().into());

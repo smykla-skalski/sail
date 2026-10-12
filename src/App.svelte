@@ -11179,6 +11179,27 @@
     }
   }
 
+  async function runVerifiedCompletedChecks(
+    agent: AgentId,
+    path: string,
+    sessionId: string,
+    turnId: string,
+  ) {
+    try {
+      const evidence = await acp.turnEvidence(agent, path, sessionId, turnId);
+      if (
+        evidence?.status !== 'done' ||
+        evidence.agent !== agent ||
+        evidence.sessionId !== sessionId ||
+        evidence.turnId !== turnId
+      )
+        return;
+      await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId);
+    } catch (cause) {
+      error = `Could not verify completed agent turn: ${describe(cause)}`;
+    }
+  }
+
   function handleAgentEvent(event: AgentEvent) {
     if (event.message.method === 'sail/disconnected' && !event.directory) {
       const sessionDirectories = event.message.params?.sessionDirectories;
@@ -11427,7 +11448,7 @@
       )
         return;
       if (status === 'done' && typeof turnId === 'string' && event.message.params?.notify !== false)
-        void runCompletedChecks(eventDirectory, `acp:${event.agent}:${sessionId}`, turnId);
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
