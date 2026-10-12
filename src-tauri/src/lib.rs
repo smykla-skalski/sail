@@ -112,6 +112,7 @@ fn existing_shipping_worktree(
     Ok(Some(CreatedWorktree {
         path: path.to_string_lossy().into_owned(),
         branch: name.to_string(),
+        generation: worktree_storage::generation(&path).ok(),
         base: shipping_target
             .as_ref()
             .map(|target| target.base_ref.clone())
@@ -1319,6 +1320,7 @@ fn diff_file_contents(path: String, file: String, side: String) -> Result<Option
 struct CreatedWorktree {
     path: String,
     branch: String,
+    generation: Option<String>,
     base: String,
     setup: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1405,6 +1407,7 @@ struct RegisteredWorktree {
     path: String,
     branch: Option<String>,
     present: bool,
+    generation: Option<String>,
 }
 
 #[tauri::command]
@@ -1432,11 +1435,33 @@ fn registered_worktrees(
         .into_iter()
         .filter_map(|path| {
             let branch = registered.get(&Path::new(&path).git_canonical().ok()?)?;
+            let generation = worktree_storage::generation(Path::new(&path)).ok();
             Some(RegisteredWorktree {
                 path,
                 branch: branch.clone(),
                 present: true,
+                generation,
             })
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn repository_worktrees(repository: String) -> Result<Vec<RegisteredWorktree>, String> {
+    let repository = validate_repository(repository)?;
+    let listed = git_reference(
+        Path::new(&repository),
+        &["worktree", "list", "--porcelain", "-z"],
+    )
+    .ok_or("Cannot inspect repository worktrees.")?;
+    Ok(parse_registered_worktrees(&listed)
+        .into_iter()
+        .filter(|entry| entry.present)
+        .filter_map(|mut entry| {
+            let path = Path::new(&entry.path).git_canonical().ok()?;
+            entry.path = path.to_string_lossy().into_owned();
+            entry.generation = worktree_storage::generation(&path).ok();
+            Some(entry)
         })
         .collect())
 }
@@ -1459,6 +1484,7 @@ fn parse_registered_worktrees(listed: &str) -> Vec<RegisteredWorktree> {
                 path: path.to_string(),
                 branch,
                 present: !prunable && Path::new(path).is_dir(),
+                generation: None,
             })
         })
         .collect()
@@ -1920,14 +1946,15 @@ fn add_worktree_with_branch_creation(
     let path = path
         .git_canonical()
         .map_err(|error| format!("Cannot resolve new worktree: {error}"))?;
-    let config = (|| -> Result<Option<worktree_config::WorktreeConfig>, String> {
-        let config = worktree_config::read(&path)?;
-        if let Some(config) = &config {
-            worktree_config::copy_ignored(repository, &path, config)?;
-        }
-        Ok(config)
-    })();
-    let config = match config {
+    let config =
+        (|| -> Result<(Option<worktree_config::WorktreeConfig>, Option<String>), String> {
+            let config = worktree_config::read(&path)?;
+            if let Some(config) = &config {
+                worktree_config::copy_ignored(repository, &path, config)?;
+            }
+            Ok((config, worktree_storage::generation(&path).ok()))
+        })();
+    let (config, generation) = match config {
         Ok(config) => config,
         Err(error) => {
             let removed = Command::new("git")
@@ -1949,6 +1976,7 @@ fn add_worktree_with_branch_creation(
     Ok(CreatedWorktree {
         path: path.to_string_lossy().into_owned(),
         branch: name.to_string(),
+        generation,
         base,
         setup: config.map(|config| config.setup).unwrap_or_default(),
         shipping_target: None,
@@ -3181,6 +3209,7 @@ pub fn run() {
             find_shipping_worktree,
             run_shipping_setup,
             registered_worktrees,
+            repository_worktrees,
             delete_worktree,
             worktree_config,
             context::context_provider_status,
@@ -3366,7 +3395,7 @@ mod tests {
         register_worktree_terminal_data, registered_worktrees, remove_worktree,
         remove_worktree_then_terminal_data, remove_worktree_then_terminal_data_many,
         remove_worktree_with_hook, remove_worktree_with_hooks, replacement_worktree_at_checkpoint,
-        repository_namespace, shipping_base_revision, shipping_changed_paths,
+        repository_namespace, repository_worktrees, shipping_base_revision, shipping_changed_paths,
         shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
         working_tree_diff, worktree_overviews, WorktreeOperationLocks,
         NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
@@ -3407,6 +3436,56 @@ mod tests {
             .expect("managed data should be deleted after successful removal");
         assert!(!managed.exists());
         assert!(sibling.join("cache").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_creation_survives_generation_marker_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sail-worktree-marker-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = root.join("repository");
+        let worktrees = root.join("worktrees");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&worktrees).unwrap();
+        let repository_arg = repository.to_str().unwrap();
+        git(repository_arg, &["init", "-q"]);
+        git(repository_arg, &["config", "user.name", "Sail Test"]);
+        git(
+            repository_arg,
+            &["config", "user.email", "sail@example.test"],
+        );
+        fs::write(repository.join("tracked"), "fixture").unwrap();
+        git(repository_arg, &["add", "tracked"]);
+        git(repository_arg, &["commit", "--quiet", "-m", "fixture"]);
+
+        let hooks = root.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\ngit_dir=$(git rev-parse --absolute-git-dir) || exit 1\nprintf 'invalid\n' > \"$git_dir/sail-worktree-generation-v1\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            repository_arg,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+
+        let created = add_worktree(
+            repository_arg.to_string(),
+            "created".to_string(),
+            Some(worktrees.to_string_lossy().into_owned()),
+            None,
+        )
+        .expect("Git worktree creation must survive an unavailable generation marker");
+        assert!(Path::new(&created.path).join("tracked").exists());
+        assert_eq!(created.generation, None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3807,6 +3886,12 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].path, alias);
         assert_eq!(matched[0].branch.as_deref(), Some("child"));
+        let discovered = repository_worktrees(repository_path.into()).unwrap();
+        let canonical_child = child.git_canonical().unwrap();
+        assert!(discovered
+            .iter()
+            .any(|entry| entry.path == canonical_child.to_string_lossy()
+                && entry.generation.is_some()));
 
         fs::remove_dir_all(root).unwrap();
     }

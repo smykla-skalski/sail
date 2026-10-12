@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
@@ -373,6 +373,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         },
       });
   } else if (message.method === 'session/load') {
+    const failLoad = join(message.params.cwd, 'codex-fail-next-load.txt');
+    if (agent === 'codex' && existsSync(failLoad)) {
+      unlinkSync(failLoad);
+      send({ id: message.id, error: { code: -32002, message: 'Injected history load failure' } });
+      continue;
+    }
     adoptExternalSession(message.params.sessionId, message.params.cwd);
     applyClaudeDefaults(message.params.sessionId);
     const session = sessions.get(message.params.sessionId);
@@ -897,20 +903,41 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
-    if (text === 'Background task') {
+    if (text === 'Background task' || text === 'Background task with history') {
+      if (text === 'Background task with history')
+        for (let index = 1; index <= 60; index += 1) {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'tool_call',
+            toolCallId: `background-history-${message.id}-${index}`,
+            title: `History step ${index}`,
+            status: 'completed',
+          });
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `History marker ${index}. ` },
+          });
+        }
       recordUpdate(sessionId, sessionId, {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Background task started.' },
       });
       send({ id: message.id, result: { stopReason: 'end_turn' } });
-      const timer = setTimeout(() => {
+      const started = Date.now();
+      const finish = () => {
         stop();
+        clearInterval(timer);
         recordUpdate(sessionId, sessionId, {
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: ' Background task finished.' },
         });
-      }, 6000);
-      const stop = trackWork(sessionId, () => clearTimeout(timer));
+      };
+      const timer = setInterval(() => {
+        if (agent === 'codex') {
+          if (existsSync(join(sessions.get(sessionId).cwd, 'codex-background-release.txt')))
+            finish();
+        } else if (Date.now() - started >= 6000) finish();
+      }, 100);
+      const stop = trackWork(sessionId, () => clearInterval(timer));
       continue;
     }
     if (text === 'Second live subagent') {

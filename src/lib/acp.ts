@@ -128,6 +128,24 @@ export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
   return outcome.stopReason === 'cancelled' || outcome.sailInterrupted === true;
 }
 
+export async function recoverMissingCodexSession<T>(
+  agent: AgentId,
+  prompt: () => Promise<T>,
+  resume: () => Promise<unknown>,
+): Promise<T> {
+  try {
+    return await prompt();
+  } catch (cause) {
+    const message = typeof cause === 'string' ? cause : cause instanceof Error ? cause.message : '';
+    const missing =
+      /(?:session|thread) (?:not found|missing)/i.test(message) ||
+      message === 'Agent session is not connected in this worktree.';
+    if (agent !== 'codex' || !missing) throw cause;
+    await resume();
+    return prompt();
+  }
+}
+
 export function loadInterruptedAgentTurns(raw: string | null): InterruptedAgentTurn[] {
   try {
     const value: unknown = JSON.parse(raw ?? '[]');
