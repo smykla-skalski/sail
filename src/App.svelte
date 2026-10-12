@@ -11449,6 +11449,10 @@
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
+      const promotionError = event.message.params?.gitPromotionError;
+      if (typeof promotionError === 'string')
+        error = `Private Git changes remain pending: ${promotionError}`;
+      else if (error.startsWith('Private Git changes remain pending: ')) error = '';
       if (
         typeof sessionId !== 'string' ||
         (status !== 'done' && status !== 'failed' && status !== 'interrupted')
