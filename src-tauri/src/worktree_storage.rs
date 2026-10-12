@@ -26,7 +26,6 @@ const LEGACY_TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
 const TEMP_PROCESS_UNSTARTED: &str = "sail-temp-process-state-v1\nunstarted\n";
 const TEMP_PROCESS_EXPOSED: &str = "sail-temp-process-state-v1\nexposed\n";
 const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
-const TEMP_ORIGINAL_RUN_FILE: &str = "sail-temp-original-run-v1";
 const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
 const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
 
@@ -120,7 +119,44 @@ struct TempOwner {
 fn process_state_path(cache_directory: &Path, temp_directory: &Path) -> Result<PathBuf, String> {
     let root = cache_directory.join("terminal-worktree-locks");
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-    Ok(root.join(format!("temp-state-{}.state", cache_key(temp_directory)?)))
+    let data_directory = temp_directory
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("Private temporary path has no storage owner.")?;
+    Ok(root.join(format!(
+        "temp-state-{}-{}.state",
+        cache_key(data_directory)?,
+        cache_key(temp_directory)?
+    )))
+}
+
+fn process_state_paths(cache_directory: &Path, data_key: &str) -> Result<Vec<PathBuf>, String> {
+    let root = cache_directory.join("terminal-worktree-locks");
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let prefix = format!("temp-state-{data_key}-");
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".state"))
+        {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+
+fn exposed_process_states(cache_directory: &Path, data_key: &str) -> Result<Vec<PathBuf>, String> {
+    Ok(process_state_paths(cache_directory, data_key)?
+        .into_iter()
+        .filter(|path| !unstarted_process_state(path))
+        .collect())
 }
 
 fn unstarted_process_state(path: &Path) -> bool {
@@ -263,7 +299,6 @@ impl TempLease {
             if entry.file_name() == TEMP_OWNER_FILE
                 || entry.file_name() == LEGACY_TEMP_OWNER_FILE
                 || entry.file_name() == TEMP_PENDING_FILE
-                || entry.file_name() == TEMP_ORIGINAL_RUN_FILE
             {
                 continue;
             }
@@ -502,16 +537,6 @@ fn create_temp_lease(cache_directory: &Path, data_directory: &Path) -> Result<Te
             .and_then(|_| owner.sync_all())
             .map_err(|error| error.to_string())?;
         drop(owner);
-        let mut original_run = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(staging.join(TEMP_ORIGINAL_RUN_FILE))
-            .map_err(|error| error.to_string())?;
-        original_run
-            .write_all(format!("{TEMP_ORIGINAL_RUN_FILE}\n{name}\n").as_bytes())
-            .and_then(|_| original_run.sync_all())
-            .map_err(|error| error.to_string())?;
-        drop(original_run);
         create_process_state(&process_state_file)?;
         state_created = true;
         fs::rename(&staging, &directory).map_err(|error| error.to_string())
@@ -954,13 +979,10 @@ fn reclaim_verified_unstarted_temp(cache_directory: &Path, data_directory: &Path
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let lock_directory = if name.starts_with("run-") {
-            directory.clone()
-        } else if name.starts_with(".run-") && name.ends_with(".tmp") {
-            root.join(&name[1..name.len() - 4])
-        } else {
+        let Some(original_name) = original_run_name(&name) else {
             continue;
         };
+        let lock_directory = root.join(original_name);
         let Ok(owner) = read_temp_owner(&directory, data_directory) else {
             continue;
         };
@@ -1028,6 +1050,42 @@ pub(crate) fn clean_pending_temp(
     {
         return Err("Temporary data is no longer pending; refresh cleanup status.".into());
     }
+    if target == data_directory.join(TEMP_ROOT) {
+        let states = process_state_paths(cache_directory, &cache_key(&data_directory)?)?;
+        if !states.iter().any(|path| !unstarted_process_state(path)) {
+            return Err("Temporary exposure is no longer pending; refresh cleanup status.".into());
+        }
+        if temp_directory_status(cache_directory, &data_directory)
+            .iter()
+            .any(|item| {
+                matches!(
+                    item.reason.as_str(),
+                    "turn-temp-process-active" | "turn-temp-owner-unverified-active"
+                )
+            })
+            || temp_directory_in_use(&target)
+        {
+            return Err("Temporary data still has an active owner.".into());
+        }
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&target).map_err(|error| {
+                report_pending(&target, "manual-temp-removal-failed");
+                format!("Cannot remove pending temporary data: {error}")
+            })?,
+            Ok(_) => return Err("Temporary root is not an unused directory.".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        for state in states {
+            fs::remove_file(&state).map_err(|error| {
+                report_pending(&target, "manual-temp-removal-failed");
+                format!("Cannot remove pending temporary process state: {error}")
+            })?;
+        }
+        drop(_lease);
+        drop(_mutation);
+        return Ok(retry_cleanup(cache_directory));
+    }
     let _temp_lock = if let Some(lock_directory) = &lock_directory {
         Some(
             FileLock::try_acquire(&lock_path(cache_directory, "temp", lock_directory)?, true)
@@ -1049,16 +1107,15 @@ pub(crate) fn clean_pending_temp(
         }
     }
     if let Some(lock_directory) = &lock_directory {
-        if lock_directory != &target && fs::symlink_metadata(lock_directory).is_ok() {
-            return Err("Original temporary path changed; refresh cleanup status.".into());
-        }
         let process_state_file = process_state_path(cache_directory, lock_directory)?;
-        if let Err(error) = fs::remove_file(process_state_file) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                report_pending(&target, "manual-temp-removal-failed");
-                return Err(format!(
-                    "Cannot remove pending temporary process state: {error}"
-                ));
+        if unstarted_process_state(&process_state_file) {
+            if let Err(error) = fs::remove_file(process_state_file) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    report_pending(&target, "manual-temp-removal-failed");
+                    return Err(format!(
+                        "Cannot remove pending temporary process state: {error}"
+                    ));
+                }
             }
         }
     }
@@ -1100,6 +1157,11 @@ fn find_pending_temp(
             }
         }
         let temp_root = data_directory.join(TEMP_ROOT);
+        if cache_key(&temp_root)? == token
+            && !exposed_process_states(cache_directory, &cache_key(&data_directory)?)?.is_empty()
+        {
+            return Ok((data_directory, temp_root, None));
+        }
         if !fs::symlink_metadata(&temp_root).is_ok_and(|metadata| metadata.is_dir()) {
             continue;
         }
@@ -1107,13 +1169,10 @@ fn find_pending_temp(
             let entry = entry.map_err(|error| error.to_string())?;
             let target = entry.path();
             let name = entry.file_name();
-            let lock_directory = match name.to_str() {
-                Some(name) if name.starts_with("run-") => Some(target.clone()),
-                Some(name) if name.starts_with(".run-") && name.ends_with(".tmp") => {
-                    Some(temp_root.join(&name[1..name.len() - 4]))
-                }
-                _ => original_run_directory(&target, &temp_root, &data_directory),
-            };
+            let lock_directory = name
+                .to_str()
+                .and_then(original_run_name)
+                .map(|name| temp_root.join(name));
             if cache_key(&target)? == token {
                 return Ok((data_directory, target, lock_directory));
             }
@@ -1122,25 +1181,13 @@ fn find_pending_temp(
     Err("Pending temporary data was not found; refresh cleanup status.".into())
 }
 
-fn original_run_directory(target: &Path, root: &Path, data_directory: &Path) -> Option<PathBuf> {
-    read_temp_owner(target, data_directory).ok()?;
-    let marker = target.join(TEMP_ORIGINAL_RUN_FILE);
-    if !fs::symlink_metadata(&marker).ok()?.is_file() {
-        return None;
-    }
-    let contents = fs::read_to_string(marker).ok()?;
-    let name = contents
-        .strip_prefix(&format!("{TEMP_ORIGINAL_RUN_FILE}\n"))?
-        .strip_suffix('\n')?;
-    let uuid = name.strip_prefix("run-")?;
-    if uuid::Uuid::parse_str(uuid).ok()?.to_string() != uuid {
-        return None;
-    }
-    let original = root.join(name);
-    if fs::symlink_metadata(&original).is_ok() {
-        return None;
-    }
-    Some(original)
+fn original_run_name(name: &str) -> Option<&str> {
+    let original = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .unwrap_or(name);
+    let uuid = uuid::Uuid::parse_str(original.strip_prefix("run-")?).ok()?;
+    (format!("run-{uuid}") == original).then_some(original)
 }
 
 fn verified_data_owner(cache_directory: &Path, data_directory: &Path) -> bool {
@@ -1156,6 +1203,30 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
     let mut pending = Vec::new();
     if !verified_data_owner(cache_directory, data_directory) {
         return pending;
+    }
+    let root = data_directory.join(TEMP_ROOT);
+    match cache_key(data_directory).and_then(|key| exposed_process_states(cache_directory, &key)) {
+        Ok(states) if !states.is_empty() => {
+            let can_clean = match fs::symlink_metadata(&root) {
+                Ok(metadata) => metadata.is_dir(),
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            };
+            let mut item = pending_item(
+                cache_key(&root).unwrap_or_else(|_| "unknown".into()),
+                "turn-temp-owner-unverifiable",
+                Some(&root),
+                can_clean,
+            );
+            item.size_bytes = Some(item.size_bytes.unwrap_or(0));
+            pending.push(item);
+        }
+        Err(_) => pending.push(pending_item(
+            cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+            "turn-temp-state-scan-failed",
+            Some(data_directory),
+            false,
+        )),
+        Ok(_) => {}
     }
     for legacy in [
         data_directory.join("tmp"),
@@ -1179,7 +1250,6 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
             Err(_) => pending.push(pending_item(key, "legacy-temp-scan-failed", None, false)),
         }
     }
-    let root = data_directory.join(TEMP_ROOT);
     if let Ok(metadata) = fs::symlink_metadata(&root) {
         if !metadata.is_dir() {
             pending.push(pending_item(
@@ -1217,12 +1287,9 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
         let directory = entry.path();
         let key = cache_key(&directory).unwrap_or_else(|_| "unknown".into());
         let name = entry.file_name();
-        let lock_directory = match name.to_str() {
-            Some(name) if name.starts_with("run-") => directory.clone(),
-            Some(name) if name.starts_with(".run-") && name.ends_with(".tmp") => {
-                root.join(&name[1..name.len() - 4])
-            }
-            _ => {
+        let lock_directory = match name.to_str().and_then(original_run_name) {
+            Some(name) => root.join(name),
+            None => {
                 let can_clean =
                     fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir());
                 pending.push(pending_item(
@@ -2029,6 +2096,18 @@ fn remove_quarantine(path: &Path, key: &str) {
     {
         report_pending(path, "quarantine-owner-key-mismatch");
         return;
+    }
+    let cache_directory = path.parent().and_then(Path::parent).unwrap_or(path);
+    match exposed_process_states(cache_directory, key) {
+        Ok(states) if !states.is_empty() => {
+            report_pending(path, "turn-temp-owner-unverifiable");
+            return;
+        }
+        Err(_) => {
+            report_pending(path, "turn-temp-state-scan-failed");
+            return;
+        }
+        Ok(_) => {}
     }
     match fs::remove_dir_all(path) {
         Ok(()) => {}
@@ -3188,7 +3267,7 @@ mod tests {
         let fixture = GitFixture::new();
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
-        let orphan = temp.parent().unwrap().join("orphan");
+        let orphan = temp.parent().unwrap().join("run-orphan");
         let process_state = process_state_path(&fixture.cache, &temp).unwrap();
         let artifact = temp.join("artifact");
         let ready = fixture.root.join("worker-ready");
@@ -3249,7 +3328,117 @@ mod tests {
         assert!(item.size_bytes.is_some_and(|size| size > 0));
         assert_pending_temp_cleaned(&fixture.cache, item.cleanup_token.as_deref().unwrap());
         assert!(!orphan.exists());
+        assert_eq!(
+            fs::read_to_string(&process_state).unwrap(),
+            TEMP_PROCESS_EXPOSED
+        );
+        let root = pending_with_reason(&fixture.cache, "turn-temp-owner-unverifiable");
+        assert_eq!(root.cache_key, cache_key(temp.parent().unwrap()).unwrap());
+        assert_pending_temp_cleaned(&fixture.cache, root.cleanup_token.as_deref().unwrap());
         assert!(!process_state.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_temp_root_fd_preserves_late_child_after_quarantine() {
+        use std::os::unix::process::CommandExt;
+
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        let root = temp.parent().unwrap().to_path_buf();
+        let ready = fixture.root.join("fd-ready");
+        let trigger = fixture.root.join("create-late-child");
+        let key = cache_key(&directory).unwrap();
+        let quarantine = quarantine_path(&fixture.cache.join("terminal-worktrees"), &key).unwrap();
+        lease.prepare_process_start().unwrap();
+        let mut command = std::process::Command::new("python3");
+        command
+            .arg("-c")
+            .arg("import os,sys,time\nfd=os.open(sys.argv[1], os.O_RDONLY|os.O_DIRECTORY)\nopen(sys.argv[2], 'w').write('ready')\nwhile not os.path.exists(sys.argv[3]): time.sleep(.01)\nos.mkdir('late', dir_fd=fd)\nchild=os.open('late', os.O_RDONLY|os.O_DIRECTORY, dir_fd=fd)\nartifact=os.open('artifact', os.O_WRONLY|os.O_CREAT, 0o600, dir_fd=child)\nos.write(artifact, b'late-write')\nos.close(artifact)\ntime.sleep(30)")
+            .arg(&root)
+            .arg(&ready)
+            .arg(&trigger)
+            .env_remove("TMPDIR");
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut worker = command.spawn().unwrap();
+        lease.mark_started();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let worker_ready = ready.exists();
+        if worker_ready {
+            lease.release_clean().unwrap();
+            fs::remove_dir_all(&temp).unwrap();
+            fixture.remove(&fixture.first);
+            fs::rename(&directory, &quarantine).unwrap();
+            remove_quarantine(&quarantine, &key);
+            fs::write(&trigger, "go").unwrap();
+        }
+        let artifact = quarantine.join(TEMP_ROOT).join("late/artifact");
+        let artifact_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while worker_ready && !artifact.exists() && std::time::Instant::now() < artifact_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let retained = fs::read_to_string(&artifact);
+        retry_cleanup(&fixture.cache);
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+
+        assert!(worker_ready, "detached worker did not open temporary root");
+        assert_eq!(retained.unwrap(), "late-write");
+        assert!(quarantine.exists());
+        fs::rename(&quarantine, &directory).unwrap();
+        let pending = cleanup_status(&fixture.cache)
+            .into_iter()
+            .find(|item| item.cache_key == cache_key(&root).unwrap())
+            .expect("exposed temporary root must remain pending");
+        assert_eq!(pending.reason, "turn-temp-owner-unverifiable");
+        assert!(pending.size_bytes.is_some_and(|size| size > 0));
+        assert_pending_temp_cleaned(&fixture.cache, pending.cleanup_token.as_deref().unwrap());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn copied_temp_owner_marker_cannot_clear_external_exposure() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        let root = temp.parent().unwrap();
+        let copied = root.join("copied");
+        let process_state = process_state_path(&fixture.cache, &temp).unwrap();
+        lease.prepare_process_start().unwrap();
+        lease.mark_started();
+        lease.release_clean().unwrap();
+        fs::create_dir(&copied).unwrap();
+        fs::copy(temp.join(TEMP_OWNER_FILE), copied.join(TEMP_OWNER_FILE)).unwrap();
+        fs::write(copied.join("artifact"), "retain").unwrap();
+        fs::remove_dir_all(&temp).unwrap();
+        fixture.remove(&fixture.first);
+
+        assert!(
+            remove_after_worktree_removal(&fixture.cache, std::slice::from_ref(&directory))
+                .is_err()
+        );
+        assert_pending_temp_cleaned(&fixture.cache, &cache_key(&copied).unwrap());
+        assert_eq!(
+            fs::read_to_string(&process_state).unwrap(),
+            TEMP_PROCESS_EXPOSED
+        );
+        let pending = pending_with_reason(&fixture.cache, "turn-temp-owner-unverifiable");
+        assert_eq!(pending.cache_key, cache_key(root).unwrap());
+        assert_pending_temp_cleaned(&fixture.cache, pending.cleanup_token.as_deref().unwrap());
+        assert!(!process_state.exists());
+        assert!(!directory.exists());
     }
 
     #[cfg(unix)]
