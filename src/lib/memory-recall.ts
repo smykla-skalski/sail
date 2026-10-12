@@ -21,6 +21,8 @@ interface MemoryRecord {
   createdAt: number;
   provenance?: MemoryProvenance | null;
   forgottenAt?: number | null;
+  supersededBy?: string | null;
+  conflictsWith?: string[];
 }
 
 type MemorySearchResult =
@@ -96,7 +98,8 @@ function recordFromResult(result: MemorySearchResult): MemoryRecord | null {
     typeof candidate.id === 'string' &&
     typeof candidate.content === 'string' &&
     typeof candidate.createdAt === 'number' &&
-    candidate.forgottenAt == null
+    candidate.forgottenAt == null &&
+    candidate.supersededBy == null
     ? candidate
     : null;
 }
@@ -114,6 +117,7 @@ function reference(record: MemoryRecord): string {
       session: record.provenance?.sessionId ?? 'unknown',
     },
     content: record.content,
+    status: record.conflictsWith?.length ? 'unresolved conflict' : 'current',
   });
 }
 
