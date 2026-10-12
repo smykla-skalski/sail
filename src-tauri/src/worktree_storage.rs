@@ -18,8 +18,10 @@ const REPOSITORY_HEADER: &str = "sail-repository-generation-v1";
 const ACTIVE_PREFIX: &str = ".active-";
 const QUARANTINE_PREFIX: &str = ".reclaim-";
 const TEMP_ROOT: &str = "turn-temp";
-const TEMP_OWNER_FILE: &str = "sail-temp-owner-v1";
-const TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
+const TEMP_OWNER_FILE: &str = "sail-temp-owner-v2";
+const TEMP_OWNER_HEADER: &str = "sail-temp-owner-v2";
+const LEGACY_TEMP_OWNER_FILE: &str = "sail-temp-owner-v1";
+const LEGACY_TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
 const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
 const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
 const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
@@ -54,6 +56,11 @@ struct TempLease {
     released: AtomicBool,
     started: AtomicBool,
     _lock: FileLock,
+}
+
+struct TempOwner {
+    pid: u32,
+    started_at: Option<u64>,
 }
 
 impl TempLease {
@@ -92,9 +99,12 @@ impl TempLease {
         if self.released.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let removal = self
-            .verify_root()
-            .and_then(|_| fs::remove_dir_all(&self.directory).map_err(|error| error.to_string()));
+        let removal = self.verify_root().and_then(|_| {
+            if temp_directory_in_use(&self.directory) {
+                return Err("Private temporary data is still used by a process.".into());
+            }
+            fs::remove_dir_all(&self.directory).map_err(|error| error.to_string())
+        });
         let removal = removal.map_err(|error| {
             self.mark_pending("turn-temp-removal-failed");
             format!("Cannot remove private temporary data: {error}")
@@ -120,7 +130,10 @@ impl TempLease {
         self.verify_root()?;
         for entry in fs::read_dir(&self.directory).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?;
-            if entry.file_name() == TEMP_OWNER_FILE || entry.file_name() == TEMP_PENDING_FILE {
+            if entry.file_name() == TEMP_OWNER_FILE
+                || entry.file_name() == LEGACY_TEMP_OWNER_FILE
+                || entry.file_name() == TEMP_PENDING_FILE
+            {
                 continue;
             }
             let path = entry.path();
@@ -316,10 +329,16 @@ fn create_temp_lease(cache_directory: &Path, data_directory: &Path) -> Result<Te
     let lock = FileLock::acquire(&lock_path(cache_directory, "temp", &directory)?, true)?;
     fs::create_dir(&staging).map_err(|error| error.to_string())?;
     let result = (|| {
+        let pid = std::process::id();
+        let started_at = sysinfo::System::new_all()
+            .process(sysinfo::Pid::from_u32(pid))
+            .ok_or("Cannot verify the private temporary owner process.")?
+            .start_time();
         let contents = format!(
-            "{TEMP_OWNER_HEADER}\n{}\n{}\n",
+            "{TEMP_OWNER_HEADER}\n{}\n{}\n{}\n",
             cache_key(data_directory)?,
-            std::process::id()
+            pid,
+            started_at
         );
         let mut owner = OpenOptions::new()
             .write(true)
@@ -421,24 +440,42 @@ fn verify_or_publish_plain_owner(
     match read_plain_owner(cache_directory, data_directory) {
         Ok(registered) if registered == root => return Ok(()),
         Ok(_) => return Err("Plain-folder storage owner does not match.".into()),
-        Err("plain-folder-owner-missing") => {}
-        Err(reason) => {
-            return Err(format!(
-                "Plain-folder storage owner is unverifiable: {reason}"
-            ))
+        Err(_) => {}
+    }
+    match fs::symlink_metadata(data_directory.join(TEMP_ROOT)) {
+        Ok(_) => {
+            return Err("Existing plain-folder temporary data has no verifiable owner.".into());
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
     }
-    if data_directory.join(TEMP_ROOT).exists() {
-        return Err("Existing plain-folder temporary data has no verifiable owner.".into());
+    let owner = data_directory.join(PLAIN_OWNER_FILE);
+    match fs::symlink_metadata(&owner) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err("Plain-folder storage owner is not a regular file.".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(data_directory.join(PLAIN_OWNER_FILE))
-        .map_err(|error| error.to_string())?;
-    file.write_all(format!("{PLAIN_OWNER_HEADER}\n{}\n", encode_path(root)).as_bytes())
-        .and_then(|_| file.sync_all())
-        .map_err(|error| error.to_string())
+    let staging = data_directory.join(format!(".{PLAIN_OWNER_FILE}-{}.tmp", uuid::Uuid::new_v4()));
+    let publication = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(format!("{PLAIN_OWNER_HEADER}\n{}\n", encode_path(root)).as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        if owner.exists() {
+            fs::remove_file(&owner)?;
+        }
+        fs::rename(&staging, &owner)
+    })();
+    if publication.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    publication.map_err(|error| error.to_string())
 }
 
 fn has_git_metadata(path: &Path) -> bool {
@@ -769,12 +806,15 @@ fn temp_directory_status(
         };
         let key = cache_key(&directory).unwrap_or_else(|_| "unknown".into());
         let reason = match read_temp_owner(&directory, data_directory) {
-            Ok(pid) => {
+            Ok(owner) => {
                 let cleanup_failed = fs::symlink_metadata(directory.join(TEMP_PENDING_FILE))
                     .is_ok_and(|metadata| metadata.is_file());
                 let lock_path = lock_path(cache_directory, "temp", &lock_directory);
                 match lock_path.and_then(|path| FileLock::try_acquire(&path, true)) {
-                    Ok(_lock) if pid != std::process::id() && process_alive(pid) => {
+                    Ok(_lock) if temp_directory_in_use(&directory) => {
+                        Some("turn-temp-process-active")
+                    }
+                    Ok(_lock) if owner.pid != std::process::id() && process_owner_alive(&owner) => {
                         Some("turn-temp-process-active")
                     }
                     Ok(_lock) if remove => match fs::remove_dir_all(&directory) {
@@ -798,14 +838,21 @@ fn temp_directory_status(
     pending
 }
 
-fn read_temp_owner(directory: &Path, data_directory: &Path) -> Result<u32, String> {
+fn read_temp_owner(directory: &Path, data_directory: &Path) -> Result<TempOwner, String> {
     if !fs::symlink_metadata(directory)
         .map_err(|error| error.to_string())?
         .is_dir()
     {
         return Err("Temporary owner is not a directory.".into());
     }
-    let path = directory.join(TEMP_OWNER_FILE);
+    let current = directory.join(TEMP_OWNER_FILE);
+    let path = match fs::symlink_metadata(&current) {
+        Ok(_) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            directory.join(LEGACY_TEMP_OWNER_FILE)
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     if !fs::symlink_metadata(&path)
         .map_err(|error| error.to_string())?
         .is_file()
@@ -814,7 +861,8 @@ fn read_temp_owner(directory: &Path, data_directory: &Path) -> Result<u32, Strin
     }
     let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let mut lines = contents.lines();
-    if lines.next() != Some(TEMP_OWNER_HEADER)
+    let header = lines.next();
+    if !matches!(header, Some(TEMP_OWNER_HEADER | LEGACY_TEMP_OWNER_HEADER))
         || lines.next() != Some(cache_key(data_directory)?.as_str())
     {
         return Err("Temporary owner marker does not match its worktree.".into());
@@ -824,31 +872,85 @@ fn read_temp_owner(directory: &Path, data_directory: &Path) -> Result<u32, Strin
         .ok_or("Temporary owner marker lacks a process ID.")?
         .parse::<u32>()
         .map_err(|error| error.to_string())?;
-    if pid == 0 || lines.next().is_some() {
+    let started_at = if header == Some(TEMP_OWNER_HEADER) {
+        Some(
+            lines
+                .next()
+                .ok_or("Temporary owner marker lacks a process start time.")?
+                .parse::<u64>()
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    if pid == 0 || started_at == Some(0) || lines.next().is_some() {
         return Err("Temporary owner marker is malformed.".into());
     }
-    Ok(pid)
+    Ok(TempOwner { pid, started_at })
+}
+
+fn temp_directory_in_use(directory: &Path) -> bool {
+    let environment = ["TMPDIR", "TEMP", "TMP"].map(|name| {
+        let mut value = OsString::from(name);
+        value.push("=");
+        value.push(directory.as_os_str());
+        value
+    });
+    let mut go_temporary = OsString::from("GOTMPDIR=");
+    go_temporary.push(directory.join("go-tmp").as_os_str());
+    let system = sysinfo::System::new_all();
+    system.processes().values().any(|process| {
+        !matches!(
+            process.status(),
+            sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+        ) && process
+            .environ()
+            .iter()
+            .any(|value| environment.contains(value) || value == &go_temporary)
+    })
 }
 
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+fn process_owner_alive(owner: &TempOwner) -> bool {
     use nix::errno::Errno;
     use nix::unistd::Pid;
 
-    matches!(
-        nix::sys::signal::kill(Pid::from_raw(pid as i32), None),
-        Ok(()) | Err(Errno::EPERM)
-    )
+    match nix::sys::signal::kill(Pid::from_raw(owner.pid as i32), None) {
+        Err(Errno::ESRCH) => false,
+        Ok(()) | Err(Errno::EPERM) => {
+            let system = sysinfo::System::new_all();
+            system
+                .process(sysinfo::Pid::from_u32(owner.pid))
+                .is_none_or(|process| {
+                    !matches!(
+                        process.status(),
+                        sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+                    ) && owner
+                        .started_at
+                        .is_none_or(|started_at| process.start_time() == started_at)
+                })
+        }
+        Err(_) => true,
+    }
 }
 
 #[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
+fn process_owner_alive(owner: &TempOwner) -> bool {
     let system = sysinfo::System::new_all();
-    system.process(sysinfo::Pid::from_u32(pid)).is_some()
+    system
+        .process(sysinfo::Pid::from_u32(owner.pid))
+        .is_some_and(|process| {
+            !matches!(
+                process.status(),
+                sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+            ) && owner
+                .started_at
+                .is_none_or(|started_at| process.start_time() == started_at)
+        })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_alive(_pid: u32) -> bool {
+fn process_owner_alive(_owner: &TempOwner) -> bool {
     true
 }
 
@@ -1782,7 +1884,7 @@ mod tests {
     }
 
     fn assert_cleanup_reason(cache: &Path, expected: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let status = cleanup_status(cache);
             if status.iter().any(|item| item.reason == expected) {
@@ -1791,6 +1893,23 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "{status:?}");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    fn write_expired_temp_owner(temp: &Path, data_directory: &Path) {
+        let pid = std::process::id();
+        let started_at = sysinfo::System::new_all()
+            .process(sysinfo::Pid::from_u32(pid))
+            .unwrap()
+            .start_time();
+        fs::write(
+            temp.join(TEMP_OWNER_FILE),
+            format!(
+                "{TEMP_OWNER_HEADER}\n{}\n{pid}\n{}\n",
+                cache_key(data_directory).unwrap(),
+                started_at + 1
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1947,12 +2066,11 @@ mod tests {
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let abandoned = lease.temp_directory().to_path_buf();
         fs::write(abandoned.join("artifact"), "old").unwrap();
+        write_expired_temp_owner(&abandoned, &directory);
         lease.mark_started();
         drop(lease);
 
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "abandoned-turn-temp"));
+        assert_cleanup_reason(&fixture.cache, "abandoned-turn-temp");
         retry_cleanup(&fixture.cache);
         assert!(!abandoned.exists());
         assert!(directory.exists());
@@ -1982,6 +2100,7 @@ mod tests {
         let (directory, lease) = register(&fixture.cache, &plain).unwrap();
         let temp = lease.temp_directory().to_path_buf();
         fs::write(temp.join("artifact"), "old").unwrap();
+        write_expired_temp_owner(&temp, &directory);
         lease.mark_started();
         drop(lease);
 
@@ -2006,6 +2125,21 @@ mod tests {
         assert!(!cleanup_status(&fixture.cache).is_empty());
     }
 
+    #[test]
+    fn incomplete_plain_folder_owner_is_republished_before_creating_temp() {
+        let fixture = GitFixture::new();
+        let plain = fixture.root.join("plain-folder");
+        fs::create_dir(&plain).unwrap();
+        let directory = legacy_data_directory(&fixture.cache, &plain).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(PLAIN_OWNER_FILE), "").unwrap();
+
+        let (_, lease) = register(&fixture.cache, &plain).unwrap();
+
+        assert_eq!(read_plain_owner(&fixture.cache, &directory).unwrap(), plain);
+        lease.release_clean().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn abandoned_temp_waits_for_its_owner_process_to_exit() {
@@ -2019,9 +2153,13 @@ mod tests {
         fs::write(
             temp.join(TEMP_OWNER_FILE),
             format!(
-                "{TEMP_OWNER_HEADER}\n{}\n{}\n",
+                "{TEMP_OWNER_HEADER}\n{}\n{}\n{}\n",
                 cache_key(&directory).unwrap(),
-                owner.id()
+                owner.id(),
+                sysinfo::System::new_all()
+                    .process(sysinfo::Pid::from_u32(owner.id()))
+                    .unwrap()
+                    .start_time()
             ),
         )
         .unwrap();
@@ -2038,6 +2176,42 @@ mod tests {
         owner.wait().unwrap();
         retry_cleanup(&fixture.cache);
         assert!(!temp.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_process_id_does_not_retain_abandoned_temp() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        fs::write(temp.join("artifact"), "old").unwrap();
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let started_at = sysinfo::System::new_all()
+            .process(sysinfo::Pid::from_u32(unrelated.id()))
+            .unwrap()
+            .start_time();
+        fs::write(
+            temp.join(TEMP_OWNER_FILE),
+            format!(
+                "{TEMP_OWNER_HEADER}\n{}\n{}\n{}\n",
+                cache_key(&directory).unwrap(),
+                unrelated.id(),
+                started_at + 1
+            ),
+        )
+        .unwrap();
+        lease.mark_started();
+        drop(lease);
+
+        retry_cleanup(&fixture.cache);
+
+        assert!(!temp.exists());
+        assert!(unrelated.try_wait().unwrap().is_none());
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
     }
 
     #[cfg(unix)]

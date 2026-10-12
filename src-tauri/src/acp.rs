@@ -1239,7 +1239,12 @@ impl Connection {
         if idle && subagents.active_in(&self.worktree).is_empty() {
             let child_id = self.child.lock().map_err(|error| error.to_string())?.id();
             let _pause = PausedAgent::new(child_id)?;
-            if runtime_has_live_children(child_id) {
+            if runtime_has_live_children(
+                child_id,
+                self._storage_lease
+                    .as_ref()
+                    .map(|lease| lease.temp_directory()),
+            ) {
                 return Ok(());
             }
             if let Some(lease) = &self._storage_lease {
@@ -5678,10 +5683,38 @@ pub async fn acp_steer(
     .map_err(|error| error.to_string())?
 }
 
-fn runtime_has_live_children(root: u32) -> bool {
+fn runtime_has_live_children(root: u32, temp_directory: Option<&Path>) -> bool {
     let system = sysinfo::System::new_all();
     let root = sysinfo::Pid::from_u32(root);
+    let temp_environment = temp_directory.map(|directory| {
+        ["TMPDIR", "TEMP", "TMP"].map(|name| {
+            let mut value = std::ffi::OsString::from(name);
+            value.push("=");
+            value.push(directory.as_os_str());
+            value
+        })
+    });
     system.processes().values().any(|process| {
+        if process.pid() == root
+            || matches!(
+                process.status(),
+                sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+            )
+        {
+            return false;
+        }
+        #[cfg(unix)]
+        if process.session_id() == Some(root) {
+            return true;
+        }
+        if temp_environment.as_ref().is_some_and(|environment| {
+            process
+                .environ()
+                .iter()
+                .any(|value| environment.contains(value))
+        }) {
+            return true;
+        }
         let mut parent = process.parent();
         while let Some(pid) = parent {
             if pid == root {
@@ -5825,14 +5858,12 @@ impl PausedAgent {
                 if result.is_err() {
                     break;
                 }
-                if entry.th32OwnerProcessID != pid || !suspended.insert(entry.th32ThreadID) {
+                if entry.th32OwnerProcessID != pid || suspended.contains(&entry.th32ThreadID) {
                     continue;
                 }
-                let Ok(thread) =
-                    (unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) })
-                else {
-                    continue;
-                };
+                let thread =
+                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
+                        .map_err(|error| format!("Cannot open agent thread for pause: {error}"))?;
                 let thread = unsafe { OwnedHandle::from_raw_handle(thread.0) };
                 if unsafe { SuspendThread(HANDLE(thread.as_raw_handle() as _)) } == u32::MAX {
                     return Err(format!(
@@ -5841,6 +5872,7 @@ impl PausedAgent {
                     ));
                 }
                 pause.0.push(thread);
+                suspended.insert(entry.th32ThreadID);
                 newly_suspended += 1;
             }
             if newly_suspended == 0 {
@@ -6321,12 +6353,12 @@ mod session_config_tests {
         Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
         let root = runtime.child.lock().unwrap().id();
         for _ in 0..100 {
-            if runtime_has_live_children(root) {
+            if runtime_has_live_children(root, None) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(runtime_has_live_children(root));
+        assert!(runtime_has_live_children(root, None));
         start_temp_cleanup_watcher(&runtime).unwrap();
         runtime.clear_idle_temp(true).unwrap();
         assert!(artifact.exists());
@@ -6341,6 +6373,73 @@ mod session_config_tests {
             !artifact.exists(),
             "watcher did not reclaim completed-turn data"
         );
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_preserves_orphaned_worker() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-orphan-temp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let (_, lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        lease.mark_started();
+        let temp = lease.temp_directory().to_path_buf();
+        let artifact = temp.join("artifact");
+        let ready = scratch.join("ready");
+        let code = r#"import os,sys,time
+p=os.fork()
+if p==0:
+    p2=os.fork()
+    if p2>0: os._exit(0)
+    open(sys.argv[1], 'w').write('live')
+    open(sys.argv[2], 'w').write(str(os.getpid()))
+    time.sleep(10)
+    os._exit(0)
+os.waitpid(p, 0)
+time.sleep(10)
+"#;
+        let mut command = Command::new("python3");
+        command
+            .arg("-c")
+            .arg(code)
+            .arg(&artifact)
+            .arg(&ready)
+            .stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let mut runtime = test_runtime_with_child(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            child,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        for _ in 0..100 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists());
+        let root = runtime.child.lock().unwrap().id();
+        assert!(runtime_has_live_children(root, Some(&temp)));
+        runtime.clear_idle_temp(true).unwrap();
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
         runtime.stop_child().unwrap();
         drop(runtime);
         std::fs::remove_dir_all(scratch).unwrap();
