@@ -588,6 +588,7 @@
     type ProjectCatalog,
     type ProjectWorktree,
     type WorktreeCreation,
+    type WorktreeOrigin,
   } from './lib/projects';
 
   let themePreference = $state<ThemePreference>(parseThemePreference(getSetting(themeSettingKey)));
@@ -771,6 +772,7 @@
   type CreatedWorktree = {
     path: string;
     branch: string;
+    generation: string | null;
     base: string;
     setup: string;
     shippingTarget?: ShippingTarget;
@@ -2611,6 +2613,28 @@
     projectCatalog = next;
     setSetting('sai-project-catalog', JSON.stringify(next));
     scheduleInboxRefresh();
+  }
+
+  async function agentWorktreeOrigin(
+    project: string,
+    sourcePath: string,
+    agent: string,
+    sessionId: string,
+    sessionTitle: string,
+  ): Promise<WorktreeOrigin> {
+    const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+      repository: project,
+      paths: [sourcePath],
+    });
+    const source = registered.find((item) => item.path === sourcePath);
+    if (!source?.generation) throw new Error('Source Git worktree identity is unavailable.');
+    return {
+      sourcePath,
+      sourceGeneration: source.generation,
+      agent,
+      sessionId,
+      sessionTitle,
+    };
   }
 
   async function saveShipRuns(): Promise<void> {
@@ -6933,11 +6957,20 @@
     if (!(await approval)) throw new Error('User declined the worktree request.');
     if (Date.now() >= request.expiresAt)
       throw new Error('The worktree request expired before approval.');
-    const created = await invoke<{ path: string; branch: string; base: string; setup: string }>(
-      'create_worktree',
-      { repository: request.directory, name, destinationParent: null, baseRef: null },
+    const origin = await agentWorktreeOrigin(
+      project,
+      request.directory,
+      source.agent,
+      request.sessionId,
+      source.title,
     );
-    saveProjectCatalog(addWorktree(projectCatalog, project, created));
+    const created = await invoke<CreatedWorktree>('create_worktree', {
+      repository: request.directory,
+      name,
+      destinationParent: null,
+      baseRef: null,
+    });
+    saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
     if (created.setup) {
       await loadProject(created.path);
       if (directory !== created.path) throw new Error('Worktree changed before setup started.');
@@ -7699,11 +7732,20 @@
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out while waiting to launch.');
       if (!destination) {
-        const created = await invoke<{ path: string; branch: string; setup: string }>(
-          'create_worktree',
-          { repository: project, name, destinationParent: null, baseRef: null },
+        const origin = await agentWorktreeOrigin(
+          project,
+          request.directory,
+          source.agent,
+          request.sessionId,
+          source.title,
         );
-        saveProjectCatalog(addWorktree(projectCatalog, project, created));
+        const created = await invoke<CreatedWorktree>('create_worktree', {
+          repository: project,
+          name,
+          destinationParent: null,
+          baseRef: null,
+        });
+        saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
         destination = created;
         updateSpawnReceipt(receiptId, {
           worktreeId: created.path,
@@ -8515,6 +8557,29 @@
       ),
     });
     return runWorktreeCreation(id, request);
+  }
+
+  async function adoptExternalWorktree(repository: string, worktree: ProjectWorktree) {
+    try {
+      const registered = await invoke<RegisteredWorktree[]>('registered_worktrees', {
+        repository,
+        paths: [worktree.path],
+      });
+      const current = registered.find((entry) => entry.path === worktree.path);
+      if (!current || current.generation !== worktree.generation)
+        throw new Error('The external Git worktree changed. Refresh the list and try again.');
+      saveProjectCatalog(
+        addWorktree(projectCatalog, repository, {
+          path: worktree.path,
+          branch: current.branch ?? 'detached',
+          generation: current.generation,
+        }),
+      );
+      showWorkspace();
+      await loadProject(worktree.path);
+    } catch (cause) {
+      error = describe(cause);
+    }
   }
 
   function retryWorktreeCreation(id: string) {
@@ -12226,6 +12291,7 @@
           showWorkspace();
           if (path !== directory) void loadProject(path);
         }}
+        onadoptworktree={(repository, worktree) => void adoptExternalWorktree(repository, worktree)}
         onselectdefault={(path) => void selectDefaultWorktree(path)}
         onselectthread={(key) => void selectSidebarThread(key)}
         onremovethread={removeSidebarThread}

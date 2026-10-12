@@ -6,11 +6,13 @@ import {
   loadProjectCatalog,
   owningRepository,
   removeRepository,
+  removeWorktree,
   replaceRepositoryPath,
   setWorktreePullRequest,
   setWorktreeSetupStatus,
   setWorktreeStatus,
   ungroupedRepositories,
+  worktreeAncestry,
   worktreeAt,
 } from '../src/lib/projects.ts';
 
@@ -131,6 +133,120 @@ await test('keeps a created worktree beneath its repository after restart', () =
   assert.deepEqual(restored.worktrees['/repo'], [
     { path: '/sail/worktrees/repo/task', branch: 'task', setupStatus: 'ready' },
   ]);
+});
+
+await test('restores sibling worktrees in their Sail creation ancestry', () => {
+  const rootGeneration =
+    '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002';
+  const firstGeneration =
+    '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000003';
+  const secondGeneration =
+    '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000004';
+  const first = {
+    path: '/siblings/first',
+    branch: 'first',
+    generation: firstGeneration,
+    origin: {
+      sourcePath: '/repo',
+      sourceGeneration: rootGeneration,
+      agent: 'codex',
+      sessionId: 'session-first',
+      sessionTitle: 'First task',
+    },
+  };
+  const second = {
+    path: '/siblings/second',
+    branch: 'second',
+    generation: secondGeneration,
+    origin: {
+      sourcePath: '/siblings/first',
+      sourceGeneration: firstGeneration,
+      agent: 'claude',
+      sessionId: 'session-second',
+      sessionTitle: 'Second task',
+    },
+  };
+  const registered = [
+    { path: '/repo', generation: rootGeneration },
+    { path: first.path, generation: firstGeneration },
+    { path: second.path, generation: secondGeneration },
+  ];
+  const catalog = loadProjectCatalog(
+    JSON.stringify(
+      addWorktree(addWorktree(loadProjectCatalog(null, '/repo'), '/repo', second), '/repo', first),
+    ),
+    '/repo',
+  );
+  const rows = worktreeAncestry(catalog, '/repo', registered);
+  assert.deepEqual(
+    rows.map(({ worktree, depth, sourceMissing }) => [worktree.path, depth, sourceMissing]),
+    [
+      [first.path, 0, false],
+      [second.path, 1, false],
+    ],
+  );
+  assert.equal(rows[1].origin?.sessionId, 'session-second');
+  assert.equal(rows[1].sourceLabel, 'first');
+
+  const missingSource = worktreeAncestry(
+    removeWorktree(catalog, '/repo', first.path),
+    '/repo',
+    registered,
+  );
+  assert.deepEqual(
+    missingSource.map(({ depth, sourceMissing }) => [depth, sourceMissing]),
+    [[0, true]],
+  );
+  const reusedSource = worktreeAncestry(catalog, '/repo', [
+    registered[0],
+    { path: first.path, generation: secondGeneration },
+    registered[2],
+  ]);
+  assert.equal(
+    reusedSource.find(({ worktree }) => worktree.path === second.path)?.sourceMissing,
+    true,
+  );
+  const reusedChild = worktreeAncestry(catalog, '/repo', [
+    registered[0],
+    registered[1],
+    { path: second.path, generation: firstGeneration },
+  ]);
+  assert.equal(reusedChild.find(({ worktree }) => worktree.path === second.path)?.origin, null);
+});
+
+await test('does not infer ancestry for an external worktree or a reused catalog path', () => {
+  const oldGeneration = '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002';
+  const newGeneration = '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000003';
+  const old = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
+    path: '/sibling',
+    branch: 'old',
+    generation: oldGeneration,
+    origin: {
+      sourcePath: '/repo',
+      sourceGeneration: oldGeneration,
+      agent: 'codex',
+      sessionId: 'old-session',
+      sessionTitle: 'Old task',
+    },
+  });
+  const replaced = addWorktree(old, '/repo', {
+    path: '/sibling',
+    branch: 'new',
+    generation: newGeneration,
+  });
+  const external = addWorktree(replaced, '/repo', { path: '/external', branch: 'external' });
+  const rows = worktreeAncestry(loadProjectCatalog(JSON.stringify(external), '/repo'), '/repo', [
+    { path: '/repo', generation: oldGeneration },
+    { path: '/sibling', generation: newGeneration },
+    { path: '/external', generation: null },
+  ]);
+  assert.deepEqual(
+    rows.map(({ origin, depth }) => [origin, depth]),
+    [
+      [null, 0],
+      [null, 0],
+    ],
+  );
 });
 
 await test('tracks worktree setup across failure and restart', () => {

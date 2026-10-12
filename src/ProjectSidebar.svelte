@@ -26,7 +26,8 @@
     type SpawnReceipt,
   } from './lib/agent-results';
   import type { ProjectCatalog, ProjectWorktree, WorktreeCreation } from './lib/projects';
-  import { ungroupedRepositories } from './lib/projects';
+  import { ungroupedRepositories, worktreeAncestry } from './lib/projects';
+  import type { RegisteredWorktree } from './lib/coordination';
   import { getSetting, setSetting } from './lib/settings';
   import { issueBranch, parseGitHubIssueLink, worktreeBranchName } from './lib/github-issues';
 
@@ -68,6 +69,7 @@
     ondismissworktree: (id: string) => void;
     onworktreecancelled: (repository: string) => void;
     onselect: (path: string) => void;
+    onadoptworktree: (repository: string, worktree: ProjectWorktree) => void;
     onselectdefault: (path: string) => void;
     onselectthread: (key: string) => void;
     onremovethread: (thread: AgentThread) => void;
@@ -128,6 +130,7 @@
     ondismissworktree,
     onworktreecancelled,
     onselect,
+    onadoptworktree,
     onselectdefault,
     onselectthread,
     onremovethread,
@@ -155,6 +158,8 @@
   let menuY = $state(0);
   let menuTrigger: HTMLElement | null = null;
   let creatingWorktreeFor = $state<string | null>(null);
+  let registeredWorktrees = $state<Record<string, RegisteredWorktree[]>>({});
+  let registrationSequence = 0;
   let worktreeFromPalette = $state(false);
   let worktreeCreated = false;
   let lastWorktreeRequest = '';
@@ -376,7 +381,29 @@
   onMount(() => {
     void refreshChecks();
     const timer = setInterval(() => void refreshChecks(), 30_000);
-    return () => clearInterval(timer);
+    const registrationTimer = setInterval(() => void refreshWorktreeRegistrations(), 30_000);
+    return () => {
+      clearInterval(timer);
+      clearInterval(registrationTimer);
+    };
+  });
+
+  async function refreshWorktreeRegistrations() {
+    const sequence = ++registrationSequence;
+    const repositories = catalog.repositories;
+    const results = await Promise.all(
+      repositories.map(async (repository) => {
+        const worktrees = await invoke<RegisteredWorktree[]>('repository_worktrees', {
+          repository,
+        }).catch(() => []);
+        return [repository, worktrees] as const;
+      }),
+    );
+    if (sequence === registrationSequence) registeredWorktrees = Object.fromEntries(results);
+  }
+
+  $effect(() => {
+    void refreshWorktreeRegistrations();
   });
 
   async function sendCheckLog(
@@ -402,7 +429,24 @@
   });
 
   function railWorktrees(path: string): ProjectWorktree[] {
-    return repositoryCollapsed(path) ? [] : (catalog.worktrees[path] ?? []);
+    return repositoryCollapsed(path)
+      ? []
+      : [...(catalog.worktrees[path] ?? []), ...externalWorktrees(path)];
+  }
+
+  function externalWorktrees(repository: string): ProjectWorktree[] {
+    const known = new Set((catalog.worktrees[repository] ?? []).map((worktree) => worktree.path));
+    return (registeredWorktrees[repository] ?? [])
+      .filter((worktree) => worktree.path !== repository && !known.has(worktree.path))
+      .map((worktree) => ({
+        path: worktree.path,
+        branch: worktree.branch ?? 'detached',
+        generation: worktree.generation,
+      }));
+  }
+
+  function isExternalWorktree(repository: string, path: string): boolean {
+    return externalWorktrees(repository).some((worktree) => worktree.path === path);
   }
 
   function railLocations(path: string): string[] {
@@ -875,7 +919,10 @@
       aria-current={worktree.path === directory ? 'page' : undefined}
       title={worktree.branch}
       disabled={disabled || !!worktreeDeletions[worktree.path]}
-      onclick={() => onselect(worktree.path)}
+      onclick={() =>
+        isExternalWorktree(path, worktree.path)
+          ? onadoptworktree(path, worktree)
+          : onselect(worktree.path)}
       ><span aria-hidden="true">⑂{worktree.branch.charAt(0)}</span></button
     >
   {/each}
@@ -897,6 +944,22 @@
         <span class="rail-thread-state" aria-hidden="true">{state.icon}</span>
       </button>
     {/each}
+  {/each}
+{/snippet}
+
+{#snippet externalRows(repository: string)}
+  {#each externalWorktrees(repository) as worktree (worktree.path)}
+    <div class="project-worktree-row" role="group">
+      <button
+        class="project-worktree-select"
+        aria-label={`Open external worktree ${worktree.branch}`}
+        title={worktree.path}
+        {disabled}
+        onclick={() => onadoptworktree(repository, worktree)}
+        ><span aria-hidden="true">⑂</span><span>{worktree.branch}</span></button
+      >
+    </div>
+    <p class="project-worktree-origin">External worktree · Open to add to Sail</p>
   {/each}
 {/snippet}
 
@@ -1083,7 +1146,9 @@
                   >
                 </div>
                 {@render agentRows(path)}
-                {#each catalog.worktrees[path] ?? [] as worktree (worktree.path)}<div
+                {#each worktreeAncestry(catalog, path, registeredWorktrees[path] ?? []) as row (row.worktree.path)}
+                  {@const worktree = row.worktree}
+                  <div
                     class:active={worktree.path === directory}
                     class="project-worktree-row"
                     role="group"
@@ -1094,6 +1159,7 @@
                   >
                     <button
                       class="project-worktree-select"
+                      style:padding-left={`${32 + row.depth * 16}px`}
                       aria-current={worktree.path === directory ? 'page' : undefined}
                       aria-expanded={threads[worktree.path]?.length
                         ? !agentListCollapsed(worktree.path)
@@ -1137,6 +1203,19 @@
                     >
                   </div>
                   {@render agentRows(worktree.path)}
+                  {#if row.origin}<p
+                      class="project-worktree-origin"
+                      style:margin-left={`${45 + row.depth * 16}px`}
+                      title={`${row.origin.sourcePath} · ${row.origin.agent} session ${row.origin.sessionId}`}
+                    >
+                      {row.sourceMissing
+                        ? `Source missing: ${row.sourceLabel}`
+                        : `From ${row.sourceLabel}`} · {row.origin.agent}
+                      session {row.origin.sessionTitle || row.origin.sessionId} ({row.origin.sessionId.slice(
+                        0,
+                        8,
+                      )})
+                    </p>{/if}
                   {#if worktreeDeletions[worktree.path]}<p
                       class="project-worktree-status"
                       role="status"
@@ -1147,6 +1226,7 @@
                     </p>{/if}
                   {@render checkFailures(path, worktree)}
                 {/each}
+                {@render externalRows(path)}
                 {@render creationRows(path)}
               </div>
             </div>
@@ -1217,7 +1297,9 @@
                 >
               </div>
               {@render agentRows(path)}
-              {#each catalog.worktrees[path] ?? [] as worktree (worktree.path)}<div
+              {#each worktreeAncestry(catalog, path, registeredWorktrees[path] ?? []) as row (row.worktree.path)}
+                {@const worktree = row.worktree}
+                <div
                   class:active={worktree.path === directory}
                   class="project-worktree-row"
                   role="group"
@@ -1228,6 +1310,7 @@
                 >
                   <button
                     class="project-worktree-select"
+                    style:padding-left={`${32 + row.depth * 16}px`}
                     aria-current={worktree.path === directory ? 'page' : undefined}
                     aria-expanded={threads[worktree.path]?.length
                       ? !agentListCollapsed(worktree.path)
@@ -1271,6 +1354,19 @@
                   >
                 </div>
                 {@render agentRows(worktree.path)}
+                {#if row.origin}<p
+                    class="project-worktree-origin"
+                    style:margin-left={`${45 + row.depth * 16}px`}
+                    title={`${row.origin.sourcePath} · ${row.origin.agent} session ${row.origin.sessionId}`}
+                  >
+                    {row.sourceMissing
+                      ? `Source missing: ${row.sourceLabel}`
+                      : `From ${row.sourceLabel}`} · {row.origin.agent}
+                    session {row.origin.sessionTitle || row.origin.sessionId} ({row.origin.sessionId.slice(
+                      0,
+                      8,
+                    )})
+                  </p>{/if}
                 {#if worktreeDeletions[worktree.path]}<p
                     class="project-worktree-status"
                     role="status"
@@ -1281,6 +1377,7 @@
                   </p>{/if}
                 {@render checkFailures(path, worktree)}
               {/each}
+              {@render externalRows(path)}
               {@render creationRows(path)}
             </div>
           </div>

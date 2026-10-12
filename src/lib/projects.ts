@@ -13,9 +13,18 @@ export type ProjectCatalog = {
 };
 
 export type PullRequestLink = { number: number; url: string };
+export type WorktreeOrigin = {
+  sourcePath: string;
+  sourceGeneration: string;
+  agent: string;
+  sessionId: string;
+  sessionTitle: string;
+};
 export type ProjectWorktree = {
   path: string;
   branch: string;
+  generation?: string | null;
+  origin?: WorktreeOrigin;
   base?: string;
   pullRequest?: PullRequestLink;
   statusComment?: string;
@@ -62,6 +71,21 @@ export function loadProjectCatalog(raw: string | null, current: string): Project
         if (!isRecord(entry) || typeof entry.path !== 'string' || typeof entry.branch !== 'string')
           return [];
         const worktree: ProjectWorktree = { path: entry.path, branch: entry.branch };
+        if (validGeneration(entry.generation)) worktree.generation = entry.generation;
+        if (isRecord(entry.origin)) {
+          const { sourcePath, sourceGeneration, agent, sessionId, sessionTitle } = entry.origin;
+          if (
+            typeof sourcePath === 'string' &&
+            sourcePath &&
+            validGeneration(sourceGeneration) &&
+            typeof agent === 'string' &&
+            agent &&
+            typeof sessionId === 'string' &&
+            sessionId &&
+            typeof sessionTitle === 'string'
+          )
+            worktree.origin = { sourcePath, sourceGeneration, agent, sessionId, sessionTitle };
+        }
         if (typeof entry.base === 'string') worktree.base = entry.base;
         if (
           entry.setupStatus === 'pending' ||
@@ -133,6 +157,10 @@ function validPullRequestLink(number: unknown, value: unknown): value is string 
   }
 }
 
+function validGeneration(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f-]{36}:[0-9a-f-]{36}$/i.test(value);
+}
+
 export function ungroupedRepositories(catalog: ProjectCatalog): string[] {
   const assigned = new Set(catalog.groups.flatMap((group) => group.repositories));
   return catalog.repositories.filter((path) => !assigned.has(path));
@@ -184,17 +212,79 @@ export function addWorktree(
   worktree: ProjectWorktree & { setup?: string },
 ): ProjectCatalog {
   const entries = catalog.worktrees[repository] ?? [];
-  if (entries.some((entry) => entry.path === worktree.path)) return catalog;
+  const existing = entries.find((entry) => entry.path === worktree.path);
+  if (existing && (!worktree.generation || existing.generation === worktree.generation))
+    return catalog;
   return {
     ...catalog,
     worktrees: {
       ...catalog.worktrees,
       [repository]: [
-        ...entries,
+        ...entries.filter((entry) => entry.path !== worktree.path),
         { ...worktree, setupStatus: worktree.setup ? 'pending' : 'ready' },
       ],
     },
   };
+}
+
+export type WorktreeAncestryRow = {
+  worktree: ProjectWorktree;
+  depth: number;
+  origin: WorktreeOrigin | null;
+  sourceMissing: boolean;
+  sourceLabel: string;
+};
+
+export function worktreeAncestry(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; generation: string | null }[],
+): WorktreeAncestryRow[] {
+  const entries = catalog.worktrees[repository] ?? [];
+  const live = new Map(registered.map((item) => [item.path, item.generation]));
+  const known = new Map(entries.map((item) => [item.path, item]));
+  const parent = new Map<string, string>();
+  const origins = new Map<string, WorktreeOrigin>();
+  for (const worktree of entries) {
+    if (!worktree.generation || live.get(worktree.path) !== worktree.generation) continue;
+    const origin = worktree.origin;
+    if (!origin) continue;
+    origins.set(worktree.path, origin);
+    const source = known.get(origin.sourcePath);
+    if (
+      origin.sourcePath !== worktree.path &&
+      live.get(origin.sourcePath) === origin.sourceGeneration &&
+      (origin.sourcePath === repository || source?.generation === origin.sourceGeneration)
+    )
+      parent.set(worktree.path, origin.sourcePath);
+  }
+  const rows: WorktreeAncestryRow[] = [];
+  const visited = new Set<string>();
+  function append(worktree: ProjectWorktree, depth: number) {
+    if (visited.has(worktree.path)) return;
+    visited.add(worktree.path);
+    const origin = origins.get(worktree.path) ?? null;
+    const source = origin ? known.get(origin.sourcePath) : undefined;
+    rows.push({
+      worktree,
+      depth,
+      origin,
+      sourceMissing: !!origin && !parent.has(worktree.path),
+      sourceLabel:
+        source?.branch ??
+        (origin?.sourcePath === repository
+          ? 'Default'
+          : (origin?.sourcePath.split('/').at(-1) ?? '')),
+    });
+    for (const child of entries) {
+      if (parent.get(child.path) === worktree.path) append(child, depth + 1);
+    }
+  }
+  for (const worktree of entries) {
+    if (parent.get(worktree.path) === repository || !parent.has(worktree.path)) append(worktree, 0);
+  }
+  for (const worktree of entries) append(worktree, 0);
+  return rows;
 }
 
 export function setWorktreeSetupStatus(
@@ -311,6 +401,9 @@ export function replaceRepositoryPath(
       entries.map((entry) => ({
         ...entry,
         path: entry.path === oldPath ? canonicalPath : entry.path,
+        ...(entry.origin?.sourcePath === oldPath
+          ? { origin: { ...entry.origin, sourcePath: canonicalPath } }
+          : {}),
       })),
     ]),
   );
