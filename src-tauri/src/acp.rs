@@ -418,6 +418,7 @@ struct Connection {
     capabilities: Mutex<Value>,
     session_directories: Mutex<HashMap<String, PathBuf>>,
     session_configs: Mutex<HashMap<String, SessionConfig>>,
+    per_load_tokens: Mutex<HashMap<String, Vec<String>>>,
     native_subagents: Mutex<NativeSubagentRegistry>,
     session_profiles: Mutex<HashMap<String, CapabilityProfile>>,
     pending_directory: Mutex<Option<PathBuf>>,
@@ -495,26 +496,121 @@ fn reuse_session_config(
     Ok(next)
 }
 
+fn store_session_config(
+    alive: &AtomicBool,
+    configs: &mut HashMap<String, SessionConfig>,
+    session_id: &str,
+    config: SessionConfig,
+    mut release: impl FnMut(&str),
+) -> bool {
+    if !alive.load(Ordering::Acquire) {
+        release(&config.token);
+        return false;
+    }
+    if let Some(previous) = configs.insert(session_id.to_string(), config) {
+        release(&previous.token);
+    }
+    true
+}
+
+fn store_per_load_token(
+    alive: &AtomicBool,
+    tokens: &mut HashMap<String, Vec<String>>,
+    session_id: &str,
+    token: String,
+    mut release: impl FnMut(&str),
+) -> bool {
+    if !alive.load(Ordering::Acquire) {
+        release(&token);
+        return false;
+    }
+    tokens
+        .entry(session_id.to_string())
+        .or_default()
+        .push(token);
+    true
+}
+
+fn release_session_tokens(
+    tokens: &mut HashMap<String, Vec<String>>,
+    session_id: &str,
+    mut release: impl FnMut(&str),
+) {
+    if let Some(session_tokens) = tokens.remove(session_id) {
+        for token in session_tokens {
+            release(&token);
+        }
+    }
+}
+
+fn release_per_load_token(
+    tokens: &mut HashMap<String, Vec<String>>,
+    session_id: &str,
+    token: &str,
+    mut release: impl FnMut(&str),
+) {
+    let Some(session_tokens) = tokens.get_mut(session_id) else {
+        return;
+    };
+    let Some(index) = session_tokens.iter().position(|stored| stored == token) else {
+        return;
+    };
+    session_tokens.swap_remove(index);
+    if session_tokens.is_empty() {
+        tokens.remove(session_id);
+    }
+    release(token);
+}
+
+fn release_all_per_load_tokens(
+    tokens: &mut HashMap<String, Vec<String>>,
+    mut release: impl FnMut(&str),
+) {
+    for (_, session_tokens) in tokens.drain() {
+        for token in session_tokens {
+            release(&token);
+        }
+    }
+}
+
+struct RestoreConfigState<'a> {
+    alive: &'a AtomicBool,
+    configs: &'a mut HashMap<String, SessionConfig>,
+    per_load_tokens: &'a mut HashMap<String, Vec<String>>,
+}
+
 /// Returns the parameters to send for a restored session. Reuse keeps the adapter's live session;
 /// `per_load` is the documented rollback switch and mints a fresh config for every load.
 fn restore_params(
     per_load: bool,
-    configs: &mut HashMap<String, SessionConfig>,
+    state: RestoreConfigState<'_>,
     session_id: &str,
     cwd: &str,
     mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
     release: impl FnMut(&str),
-) -> Result<Value, String> {
+) -> Result<(Value, Option<String>), String> {
     if per_load {
         let config = mint()?;
         let servers = session_servers(mcp_server(&config));
-        return Ok(session_request_params(cwd, Some(session_id), &servers));
+        let token = config.token.clone();
+        if !store_per_load_token(
+            state.alive,
+            state.per_load_tokens,
+            session_id,
+            config.token,
+            release,
+        ) {
+            return Err("Agent process stopped. Reopen the thread to reconnect.".into());
+        }
+        return Ok((
+            session_request_params(cwd, Some(session_id), &servers),
+            Some(token),
+        ));
     }
-    let config = reuse_session_config(configs, session_id, cwd, mint, release)?;
-    Ok(session_request_params(
-        &config.cwd,
-        Some(session_id),
-        &config.servers,
+    let config = reuse_session_config(state.configs, session_id, cwd, mint, release)?;
+    Ok((
+        session_request_params(&config.cwd, Some(session_id), &config.servers),
+        None,
     ))
 }
 
@@ -834,6 +930,7 @@ fn resolve_session_permissions(
 pub struct PendingPermissionInfo {
     agent: String,
     directory: String,
+    profile: String,
     message: Value,
     received_at: u64,
 }
@@ -1610,6 +1707,55 @@ fn durable_prompt_status(status: &'static str, failed: bool, dispatch_phase: u8)
     }
 }
 
+fn retry_completed_turn_evidence(
+    mut write: impl FnMut() -> Result<(), String>,
+    mut report: impl FnMut(&str),
+    mut pause: impl FnMut(Duration),
+    attempts: usize,
+) -> Result<(), String> {
+    let mut delay = Duration::from_millis(50);
+    for attempt in 0..attempts {
+        match write() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                report(&error);
+                if attempt + 1 == attempts {
+                    return Err(error);
+                }
+            }
+        }
+        pause(delay);
+        delay = delay.saturating_mul(2).min(Duration::from_secs(2));
+    }
+    Err("No completion evidence write was attempted.".into())
+}
+
+async fn retry_completion_evidence_after_cleanup<F, R, P, Fut, S>(
+    mut write: F,
+    mut report: R,
+    mut pause: P,
+    on_saved: S,
+) where
+    F: FnMut() -> Result<(), String>,
+    R: FnMut(&str),
+    P: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+    S: FnOnce(),
+{
+    let mut delay = Duration::from_millis(50);
+    loop {
+        match write() {
+            Ok(()) => {
+                on_saved();
+                return;
+            }
+            Err(error) => report(&error),
+        }
+        pause(delay).await;
+        delay = delay.saturating_mul(2).min(Duration::from_secs(2));
+    }
+}
+
 impl ActivePrompt {
     fn observe_update(&mut self, update: &Value) {
         match update.get("sessionUpdate").and_then(Value::as_str) {
@@ -1664,6 +1810,7 @@ impl ActivePrompt {
 #[cfg(test)]
 mod interruption_report_tests {
     use super::*;
+    use std::cell::Cell;
 
     fn prompt() -> ActivePrompt {
         ActivePrompt {
@@ -2129,6 +2276,117 @@ mod interruption_report_tests {
     }
 
     #[test]
+    fn transient_completion_write_failure_delays_finished_event_until_evidence_is_durable() {
+        let attempts = Cell::new(0);
+        let reports = Cell::new(0);
+        let pauses = Cell::new(0);
+        let finished = Cell::new(false);
+        retry_completed_turn_evidence(
+            || {
+                assert!(!finished.get());
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err("injected settings write failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |error| {
+                assert_eq!(error, "injected settings write failure");
+                assert!(!finished.get());
+                reports.set(reports.get() + 1);
+            },
+            |delay| {
+                assert_eq!(delay, Duration::from_millis(50));
+                assert!(!finished.get());
+                pauses.set(pauses.get() + 1);
+            },
+            3,
+        )
+        .unwrap();
+        finished.set(true);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(reports.get(), 1);
+        assert_eq!(pauses.get(), 1);
+    }
+
+    #[test]
+    fn persistent_completion_write_failure_returns_without_signaling_a_finish() {
+        let attempts = Cell::new(0);
+        let pauses = Cell::new(0);
+        let result = retry_completed_turn_evidence(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err("injected persistent settings failure".into())
+            },
+            |_| {},
+            |_| pauses.set(pauses.get() + 1),
+            3,
+        );
+        assert_eq!(result.unwrap_err(), "injected persistent settings failure");
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(pauses.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_completion_write_retries_after_cleanup_and_signals_once_after_recovery() {
+        let attempts = Cell::new(0);
+        let ready_events = Cell::new(0);
+        let pauses = Cell::new(0);
+        retry_completion_evidence_after_cleanup(
+            || {
+                assert_eq!(ready_events.get(), 0);
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= 4 {
+                    Err("injected persistent settings failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| assert_eq!(ready_events.get(), 0),
+            |delay| {
+                pauses.set(pauses.get() + 1);
+                assert!(delay <= Duration::from_secs(2));
+                async {}
+            },
+            || ready_events.set(ready_events.get() + 1),
+        )
+        .await;
+        assert_eq!(attempts.get(), 5);
+        assert_eq!(pauses.get(), 4);
+        assert_eq!(ready_events.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn background_completion_retry_can_be_cancelled_when_the_app_stops() {
+        use std::sync::atomic::AtomicUsize;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let ready_events = Arc::new(AtomicUsize::new(0));
+        let retry_attempts = attempts.clone();
+        let retry_events = ready_events.clone();
+        let retry = tokio::spawn(async move {
+            retry_completion_evidence_after_cleanup(
+                || {
+                    retry_attempts.fetch_add(1, Ordering::SeqCst);
+                    Err("settings remain unwritable".into())
+                },
+                |_| {},
+                |_| std::future::pending::<()>(),
+                || {
+                    retry_events.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        retry.abort();
+        assert!(retry.await.unwrap_err().is_cancelled());
+        assert_eq!(ready_events.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn prompt_response_waits_for_reader_acknowledgement() {
         let progress = Arc::new(ReaderProgress::default());
         let generation = progress.next_generation();
@@ -2237,6 +2495,7 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                profile: runtime.profile.as_str().to_string(),
                 directory: runtime
                     .session_directories
                     .lock()
@@ -2263,6 +2522,7 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                profile: runtime.profile.as_str().to_string(),
                 directory: runtime
                     .session_directories
                     .lock()
@@ -3037,6 +3297,7 @@ fn connect_blocking_inner(
         capabilities: Mutex::new(Value::Null),
         session_directories: Mutex::new(HashMap::new()),
         session_configs: Mutex::new(HashMap::new()),
+        per_load_tokens: Mutex::new(HashMap::new()),
         native_subagents: Mutex::new(NativeSubagentRegistry::default()),
         session_profiles: Mutex::new(HashMap::new()),
         pending_directory: Mutex::new(None),
@@ -3062,6 +3323,17 @@ fn connect_blocking_inner(
                     continue;
                 };
                 message = translated;
+            }
+            if message
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| method.starts_with("sail/"))
+            {
+                crate::diagnostics::record(
+                    "acp_reserved_method",
+                    json!({"agent":agent_id,"method":message.get("method")}),
+                );
+                continue;
             }
             if message.get("method").is_some() {
                 if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
@@ -3342,6 +3614,10 @@ fn connect_blocking_inner(
                 browser.release(&config.token);
             }
         }
+        if let Ok(mut tokens) = reader.per_load_tokens.lock() {
+            let browser = app.state::<crate::browser_agent::BrowserManager>();
+            release_all_per_load_tokens(&mut tokens, |token| browser.release(token));
+        }
         let mut session_ids = reader
             .session_profiles
             .lock()
@@ -3494,6 +3770,7 @@ pub struct AcpElicitationParams {
 
 #[tauri::command]
 pub fn acp_elicitation(
+    app: AppHandle,
     manager: State<'_, AgentManager>,
     params: AcpElicitationParams,
 ) -> Result<(), String> {
@@ -3521,6 +3798,17 @@ pub fn acp_elicitation(
             .insert(key, pending);
         return Err(error);
     }
+    let _ = app.emit(
+        "acp-event",
+        AgentEvent {
+            agent: params.agent,
+            directory: Some(params.directory),
+            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+            message: json!({"method":"sail/elicitation_resolved","params":{
+                "sessionId":params.session_id,"requestId":params.request_id
+            }}),
+        },
+    );
     Ok(())
 }
 
@@ -3603,28 +3891,40 @@ pub async fn acp_new_session(
             let _ = fence.finish_session(&directory, native_generation);
             return Err("Agent did not return a session ID.".into());
         };
-        if !per_load_mcp() {
+        if per_load_mcp() {
+            let mut tokens = runtime
+                .per_load_tokens
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if !store_per_load_token(
+                &runtime.alive,
+                &mut tokens,
+                id,
+                config.token.clone(),
+                |token| browser.release(token),
+            ) {
+                let _ = fence.finish_session(&directory, native_generation);
+                return Err("Agent process stopped. Reopen the thread to reconnect.".into());
+            }
+        } else {
             let mut configs = runtime
                 .session_configs
                 .lock()
                 .map_err(|error| error.to_string())?;
-            // The reader drains this map when it exits, so a config stored for a stopped agent
-            // would keep its token for the life of the process.
-            if runtime.alive.load(Ordering::Acquire) {
-                let previous = configs.insert(
-                    id.to_string(),
-                    SessionConfig {
-                        cwd: cwd.clone(),
-                        directory: canonical_directory(&cwd),
-                        servers,
-                        token: config.token.clone(),
-                    },
-                );
-                if let Some(previous) = previous {
-                    browser.release(&previous.token);
-                }
-            } else {
-                browser.release(&config.token);
+            if !store_session_config(
+                &runtime.alive,
+                &mut configs,
+                id,
+                SessionConfig {
+                    cwd: cwd.clone(),
+                    directory: canonical_directory(&cwd),
+                    servers,
+                    token: config.token.clone(),
+                },
+                |token| browser.release(token),
+            ) {
+                let _ = fence.finish_session(&directory, native_generation);
+                return Err("Agent process stopped. Reopen the thread to reconnect.".into());
             }
         }
         if let Err(error) = register_session(&manager, &agent, profile, id, directory.clone()) {
@@ -3663,6 +3963,22 @@ pub fn acp_release_session_fence(
     fence.release_session(&agent, Path::new(&directory), &session_id)
 }
 
+/// E2E specs share one app process; release their fixture runtimes between specs.
+/// The command is only permitted by the E2E capability and has no production effect.
+#[tauri::command]
+pub fn acp_reset_test_runtimes(manager: State<'_, AgentManager>) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        manager.shutdown();
+        Ok(())
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let _ = manager;
+        Err("ACP test runtime reset requires the E2E build".into())
+    }
+}
+
 /// Releases the browser token a deleted thread's session still holds.
 #[tauri::command]
 pub fn acp_forget_session(
@@ -3690,6 +4006,11 @@ pub fn acp_forget_session(
         if let Some(config) = removed {
             browser.release(&config.token);
         }
+        let mut tokens = runtime
+            .per_load_tokens
+            .lock()
+            .map_err(|error| error.to_string())?;
+        release_session_tokens(&mut tokens, &session_id, |token| browser.release(token));
     }
     Ok(())
 }
@@ -3810,7 +4131,7 @@ async fn restore_session(
         )?;
         let runtime =
             register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
-        let params = {
+        let (params, minted_token) = {
             let mut configs = runtime
                 .session_configs
                 .lock()
@@ -3820,9 +4141,17 @@ async fn restore_session(
             if !runtime.alive.load(Ordering::Acquire) {
                 return Err("Agent process stopped. Reopen the thread to reconnect.".to_string());
             }
+            let mut tokens = runtime
+                .per_load_tokens
+                .lock()
+                .map_err(|error| error.to_string())?;
             restore_params(
                 per_load_mcp(),
-                &mut configs,
+                RestoreConfigState {
+                    alive: &runtime.alive,
+                    configs: &mut configs,
+                    per_load_tokens: &mut tokens,
+                },
                 &session_id,
                 &cwd,
                 || {
@@ -3839,6 +4168,15 @@ async fn restore_session(
         };
         let result = runtime.request(method, params, Duration::from_secs(60));
         if result.is_err() {
+            if let Some(token) = minted_token {
+                let mut tokens = runtime
+                    .per_load_tokens
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                release_per_load_token(&mut tokens, &session_id, &token, |token| {
+                    browser.release(token)
+                });
+            }
             runtime
                 .session_directories
                 .lock()
@@ -3971,6 +4309,7 @@ pub async fn acp_prompt(
             status: "prepared".into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: true,
         },
     ) {
         if let Ok(mut prompts) = runtime.prompt_state.lock() {
@@ -4029,6 +4368,7 @@ pub async fn acp_prompt(
                             status: "dispatch_uncertain".into(),
                             error: None,
                             updated_at: 0,
+                            post_turn_pending: false,
                         },
                     )
                     .map_err(|error| {
@@ -4051,6 +4391,7 @@ pub async fn acp_prompt(
                         status: "dispatched".into(),
                         error: None,
                         updated_at: 0,
+                        post_turn_pending: false,
                     },
                 ) {
                     Ok(()) => dispatched_phase.store(2, Ordering::Release),
@@ -4139,23 +4480,39 @@ pub async fn acp_prompt(
             result.is_err() && settlement_generation.is_none(),
             dispatch_phase.load(Ordering::Acquire),
         );
-        if let Err(error) = crate::settings::record_acp_turn_evidence(
-            &app,
-            crate::settings::AcpTurnEvidence {
-                agent: agent.clone(),
-                directory: directory.clone(),
-                session_id: session_id.clone(),
-                turn_id: turn_id.clone(),
-                status: evidence_status.into(),
-                error: result.as_ref().err().cloned(),
-                updated_at: 0,
-            },
-        ) {
+        let notify = !explicitly_cancelled && !interrupted;
+        let completion_evidence = crate::settings::AcpTurnEvidence {
+            agent: agent.clone(),
+            directory: directory.clone(),
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            status: evidence_status.into(),
+            error: result.as_ref().err().cloned(),
+            updated_at: 0,
+            post_turn_pending: evidence_status == "done" && notify,
+        };
+        let report_evidence_error = |error: &str| {
             crate::diagnostics::record(
                 "acp_turn_evidence_failed",
                 json!({"agent":agent,"sessionId":session_id,"turnId":turn_id,"error":error}),
             );
-        }
+        };
+        let completion_write_error = if completion_evidence.post_turn_pending {
+            retry_completed_turn_evidence(
+                || crate::settings::record_acp_turn_evidence(&app, completion_evidence.clone()),
+                |error| report_evidence_error(error),
+                std::thread::sleep,
+                4,
+            )
+            .err()
+        } else if let Err(error) =
+            crate::settings::record_acp_turn_evidence(&app, completion_evidence.clone())
+        {
+            report_evidence_error(&error);
+            None
+        } else {
+            None
+        };
         crate::diagnostics::record("prompt_finished", json!({
             "agent":agent,"sessionId":session_id,"turnId":turn_id,
             "status":status,"explicitlyCancelled":explicitly_cancelled,
@@ -4163,7 +4520,6 @@ pub async fn acp_prompt(
             "reportedErrorInterruption":reported_error_interruption,
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
-        let notify = !explicitly_cancelled && !interrupted;
         let stop_reason = result
             .as_ref()
             .ok()
@@ -4221,20 +4577,63 @@ pub async fn acp_prompt(
                 cleanup_session_processes(&app, &runtime, &agent, &session_id);
             },
         );
-        if latest {
-            let _ = app.emit(
-                "acp-event",
-                AgentEvent {
-                    agent,
-                    directory: directory.map(|path| path.to_string_lossy().into_owned()),
-                    worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
-                    message: json!({"method":"sail/prompt_finished","params":{
-                        "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
-                        "error":result.as_ref().err(),
-                        "sailCapabilityProfile":runtime.profile.as_str()
-                    }}),
-                },
-            );
+        let finished_event = AgentEvent {
+            agent: agent.clone(),
+            directory: directory.map(|path| path.to_string_lossy().into_owned()),
+            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+            message: json!({"method":"sail/prompt_finished","params":{
+                "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
+                "error":result.as_ref().err(),
+                "sailCapabilityProfile":runtime.profile.as_str()
+            }}),
+        };
+        if let Some(write_error) = completion_write_error {
+            if latest {
+                let mut pending_event = finished_event.clone();
+                pending_event.message["params"]["notify"] = Value::Bool(false);
+                pending_event.message["params"]["evidenceError"] = Value::String(write_error);
+                let _ = app.emit("acp-event", pending_event);
+            }
+            let retry_app = app.clone();
+            let evidence_directory = completion_evidence.directory.clone();
+            // The retry belongs to the app, not the ACP connection: disconnecting the agent
+            // must not discard a completion whose check is still pending.
+            drop(tauri::async_runtime::spawn(async move {
+                retry_completion_evidence_after_cleanup(
+                    || {
+                        crate::settings::record_acp_turn_evidence(
+                            &retry_app,
+                            completion_evidence.clone(),
+                        )
+                    },
+                    |error| {
+                        crate::diagnostics::record(
+                            "acp_turn_evidence_failed",
+                            json!({"agent":agent,"sessionId":session_id,"turnId":turn_id,
+                                "error":error}),
+                        );
+                    },
+                    tokio::time::sleep,
+                    || {
+                        if latest {
+                            let _ = retry_app.emit(
+                                "acp-event",
+                                AgentEvent {
+                                    agent: finished_event.agent,
+                                    directory: Some(evidence_directory),
+                                    worktree: finished_event.worktree,
+                                    message: json!({"method":"sail/post_turn_evidence_ready","params":{
+                                        "sessionId":session_id,"turnId":turn_id
+                                    }}),
+                                },
+                            );
+                        }
+                    },
+                )
+                .await;
+            }));
+        } else if latest {
+            let _ = app.emit("acp-event", finished_event);
         }
         result
     })
@@ -4727,6 +5126,7 @@ mod session_config_tests {
                 worktree.to_path_buf(),
             )])),
             session_configs: Mutex::new(HashMap::new()),
+            per_load_tokens: Mutex::new(HashMap::new()),
             native_subagents: Mutex::new(NativeSubagentRegistry::default()),
             session_profiles: Mutex::new(HashMap::from([(session_id.to_owned(), profile)])),
             pending_directory: Mutex::new(None),
@@ -4927,6 +5327,7 @@ mod session_config_tests {
                 capabilities: Mutex::new(Value::Null),
                 session_directories: Mutex::new(HashMap::new()),
                 session_configs: Mutex::new(HashMap::new()),
+                per_load_tokens: Mutex::new(HashMap::new()),
                 native_subagents: Mutex::new(NativeSubagentRegistry::default()),
                 session_profiles: Mutex::new(HashMap::new()),
                 pending_directory: Mutex::new(None),
@@ -5061,11 +5462,17 @@ mod session_config_tests {
     #[test]
     fn the_per_load_switch_mints_parameters_for_every_load() {
         let mut configs = HashMap::new();
+        let mut tokens = HashMap::new();
+        let alive = AtomicBool::new(true);
         let mut minted = 0;
         let mut released = 0;
         let first = restore_params(
             true,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             "/work/repo",
             || {
@@ -5077,7 +5484,11 @@ mod session_config_tests {
         .unwrap();
         let second = restore_params(
             true,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             "/work/repo",
             || {
@@ -5090,7 +5501,108 @@ mod session_config_tests {
         assert_eq!(minted, 2);
         assert_eq!(released, 0);
         assert!(configs.is_empty());
+        assert_eq!(tokens["session"], ["first", "second"]);
+        assert_eq!(first.1.as_deref(), Some("first"));
+        assert_eq!(second.1.as_deref(), Some("second"));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn failed_restore_releases_only_its_new_token() {
+        let mut configs = HashMap::new();
+        let mut tokens = HashMap::from([("session".to_string(), vec!["older".to_string()])]);
+        let alive = AtomicBool::new(true);
+        let (_, minted_token) = restore_params(
+            true,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
+            "session",
+            "/work/repo",
+            || Ok(config("failed", &[])),
+            |_| unreachable!(),
+        )
+        .unwrap();
+
+        let mut released = Vec::new();
+        release_per_load_token(
+            &mut tokens,
+            "session",
+            minted_token.as_deref().unwrap(),
+            |token| released.push(token.to_string()),
+        );
+        assert_eq!(released, ["failed"]);
+        assert_eq!(tokens["session"], ["older"]);
+
+        release_per_load_token(&mut tokens, "session", "failed", |_| unreachable!());
+    }
+
+    #[test]
+    fn a_stopped_agent_releases_the_config_instead_of_storing_it() {
+        let alive = AtomicBool::new(false);
+        let mut configs = HashMap::new();
+        let mut released = Vec::new();
+        let stored = store_session_config(
+            &alive,
+            &mut configs,
+            "session",
+            SessionConfig {
+                cwd: "/work/repo".into(),
+                directory: PathBuf::from("/work/repo"),
+                servers: vec![],
+                token: "stopped".into(),
+            },
+            |token| released.push(token.to_string()),
+        );
+        assert!(!stored);
+        assert!(configs.is_empty());
+        assert_eq!(released, ["stopped"]);
+    }
+
+    #[test]
+    fn a_stopped_agent_releases_a_new_per_load_token() {
+        let alive = AtomicBool::new(false);
+        let mut configs = HashMap::new();
+        let mut tokens = HashMap::new();
+        let mut released = Vec::new();
+        let result = restore_params(
+            true,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
+            "session",
+            "/work/repo",
+            || Ok(config("stopped", &[])),
+            |token| released.push(token.to_string()),
+        );
+        assert!(result.is_err());
+        assert!(tokens.is_empty());
+        assert_eq!(released, ["stopped"]);
+    }
+
+    #[test]
+    fn per_load_tokens_are_released_on_forget_and_reader_exit() {
+        let mut tokens = HashMap::from([
+            (
+                "first".to_string(),
+                vec!["new".to_string(), "load".to_string()],
+            ),
+            ("second".to_string(), vec!["other".to_string()]),
+        ]);
+        let mut released = Vec::new();
+        release_session_tokens(&mut tokens, "first", |token| {
+            released.push(token.to_string())
+        });
+        assert_eq!(released, ["new", "load"]);
+        assert_eq!(tokens["second"], ["other"]);
+
+        release_all_per_load_tokens(&mut tokens, |token| released.push(token.to_string()));
+        assert_eq!(released, ["new", "load", "other"]);
+        assert!(tokens.is_empty());
     }
 
     #[test]
@@ -5098,10 +5610,16 @@ mod session_config_tests {
         let directory = scratch("restore");
         let cwd = directory.to_string_lossy().into_owned();
         let mut configs = HashMap::new();
+        let mut tokens = HashMap::new();
+        let alive = AtomicBool::new(true);
         let mut minted = 0;
         let first = restore_params(
             false,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             &cwd,
             || {
@@ -5113,7 +5631,11 @@ mod session_config_tests {
         .unwrap();
         let second = restore_params(
             false,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             &cwd,
             || {
@@ -5284,6 +5806,7 @@ mod native_subagent_fence_tests {
             capabilities: Mutex::new(Value::Null),
             session_directories: Mutex::new(HashMap::new()),
             session_configs: Mutex::new(HashMap::new()),
+            per_load_tokens: Mutex::new(HashMap::new()),
             native_subagents: Mutex::new(NativeSubagentRegistry::default()),
             session_profiles: Mutex::new(HashMap::new()),
             pending_directory: Mutex::new(None),

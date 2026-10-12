@@ -100,10 +100,13 @@
   import {
     shipArchiveAction,
     shipArchiveConfirmation,
+    shipCheckpointCommit,
     shipMergeAction,
     shipMergeConfirmation,
     shipReopenAction,
     shipReopenConfirmation,
+    shipReplacementConfirmation,
+    shipReopenHeadWarning,
     shipRetryAction,
     shipRetryConfirmation,
     shipStopAction,
@@ -260,10 +263,14 @@
   import { resolveTaskLocation, type TaskLocation as TaskLocationValue } from './lib/task-location';
   import {
     checkKey,
+    hasDurableCheckOutcome,
     personalChecks,
+    retryInterruptedCheck,
+    uniquePostTurnCheckCommands,
     upsertCheck,
     type PostTurnCheck,
   } from './lib/post-turn-checks';
+  import { createTurnVerificationQueue } from './lib/turn-verification-queue';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import { promptSkill, type SkillChoice } from './lib/skills';
@@ -504,6 +511,7 @@
     setSetting,
     setSettingDurable,
     settingsError,
+    trackSettingsMutation,
   } from './lib/settings';
   import {
     defaultResourceLimits,
@@ -629,7 +637,7 @@
   const initialShipArchiveDelay = parseShipArchiveDelay(getSetting('sai-ship-archive-delay'));
   const storedShipRuns = loadShipRunStore(getSetting('sai-ship-runs'));
   // Entries this build cannot parse are written back with every save instead of being lost.
-  const unparsedShipRuns = storedShipRuns.unparsed;
+  let unparsedShipRuns = $state<unknown[]>(storedShipRuns.unparsed);
   const shipArchiveMigration =
     getSetting(shipArchiveMigrationKey) === 'done'
       ? null
@@ -640,7 +648,7 @@
     : Number(getSetting('sai-ship-archive-notice')) || 0;
   if (shipArchiveMigration) {
     if (shipArchiveMigration.archived > 0) {
-      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, unparsedShipRuns));
+      setSetting('sai-ship-runs', serializeShipRuns(initialShipRuns, storedShipRuns.unparsed));
       setSetting('sai-ship-archive-notice', String(initialShipArchiveNotice));
     }
     setSetting(shipArchiveMigrationKey, 'done');
@@ -887,6 +895,8 @@
   };
   let postTurnResults = $state<PostTurnCheck[]>([]);
   const pendingPostTurnChecks = new SvelteSet<string>();
+  const queueTurnVerification = createTurnVerificationQueue();
+  const pendingCompletionErrors = new SvelteMap<string, string>();
   let personalPostTurnChecks = $state(personalChecks(getSetting('sai-post-turn-personal')));
   type TurnSnapshot = { id: string; kind: 'turn' | 'undo'; created: number };
   let selectedWorktreeConfig = $state<WorktreeConfig | null>(null);
@@ -1277,6 +1287,7 @@
   let inboxError = $state('');
   let inboxDialog: HTMLDialogElement;
   let inboxRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingStatusRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let inboxGeneration = 0;
   // Requests resolved since a refresh started; that refresh's stale list must not bring them back.
   const resolvedDuringRefresh = new SvelteMap<string, number>();
@@ -1623,7 +1634,10 @@
   let selection = 0;
   const paneSelections = new SvelteMap<string, number>();
   let sidebarInventoryGeneration = 0;
+  let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
+  let sidebarInventoryReadyKey = '';
+  let agentDetectionSettled = false;
   let projectLoadGeneration = 0;
 
   let actionAgentThread = $derived(
@@ -1668,6 +1682,11 @@
     goToSubagentTarget(direction < 0 ? subagentNav?.previous : subagentNav?.next);
   }
   let answeredPermissions = $state<AnsweredPermission[]>([]);
+  const permissionStatusRevisions = new SvelteMap<string, number>();
+  const pendingStatusRetries = new SvelteMap<
+    string,
+    { agent: AgentId; directory: string; sessionId: string }
+  >();
   // Inbox items can go before their resolution event arrives, so their titles are kept here.
   const permissionTitles = new SvelteMap<string, string>();
   $effect(() => {
@@ -1708,6 +1727,57 @@
         outcome: permissionResolution(params),
       },
     ].slice(-50);
+  }
+  function reconcilePendingSessionStatus(
+    agent: AgentId,
+    worktreeDirectory: string,
+    sessionId: string,
+    pendingSnapshot?: Awaited<ReturnType<typeof acp.pendingInbox>>,
+  ) {
+    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
+    const revision = permissionStatusRevisions.get(key);
+    void (pendingSnapshot ? Promise.resolve(pendingSnapshot) : acp.pendingInbox())
+      .then((pending) => {
+        if (permissionStatusRevisions.get(key) === revision) pendingStatusRetries.delete(key);
+        if (
+          pending.some(
+            (item) =>
+              item.agent === agent &&
+              item.directory === worktreeDirectory &&
+              item.message.params?.sessionId === sessionId,
+          ) ||
+          permissionStatusRevisions.get(key) !== revision
+        )
+          return undefined;
+        nativeSubagents = setNativeSubagentWaiting(
+          nativeSubagents,
+          agent,
+          worktreeDirectory,
+          sessionId,
+          false,
+        );
+        for (const thread of agentThreads.filter(
+          (item) =>
+            item.agent === agent &&
+            item.sessionId === sessionId &&
+            item.directory === worktreeDirectory &&
+            threadAttention[threadKey(item)]?.status === 'waiting',
+        ))
+          updateAgentThreadStatus(thread, 'working');
+        for (const receipt of spawnReceipts.filter(
+          (item) =>
+            item.targetId === `acp:${agent}:${sessionId}` &&
+            item.targetDirectory === worktreeDirectory &&
+            item.state === 'waiting',
+        ))
+          updateSpawnReceipt(receipt.receiptId, { state: 'working' });
+        return undefined;
+      })
+      .catch(() => {
+        if (permissionStatusRevisions.get(key) !== revision) return;
+        pendingStatusRetries.set(key, { agent, directory: worktreeDirectory, sessionId });
+        scheduleInboxRefresh();
+      });
   }
   const shipOwnedThreads = $derived.by(() => {
     const owned = new SvelteSet<string>();
@@ -2097,6 +2167,7 @@
     } catch (cause) {
       agentDetectionError = `Could not detect agents: ${describe(cause)}`;
     }
+    agentDetectionSettled = true;
     await sendSettingsState();
   }
 
@@ -2144,6 +2215,7 @@
   onMount(() => {
     window.addEventListener(OPEN_IN_SPLIT_EVENT, openLinkInSplit);
     let unlistenAgentEvents: (() => void) | undefined;
+    let unlistenPostTurnCheckEvents: (() => void) | undefined;
     let unlistenBrowserAccess: (() => void) | undefined;
     let unlistenCoordination: (() => void) | undefined;
     const unsubscribePlans = acpPlans().subscribe((change) => {
@@ -2348,22 +2420,40 @@
       void listen<(typeof agentTerminals)[number]>('acp-terminal-created', ({ payload }) => {
         agentTerminals = [...agentTerminals, payload];
       }).then((unlisten) => (unlistenAgentTerminals = unlisten));
-      void listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)).then(
-        (unlisten) => {
-          if (disposed) unlisten();
-          else {
-            unlistenAgentEvents = unlisten;
-            void recoverInterruptedAgentTurns()
-              .then(() => restoreAgentActivity())
-              .finally(() => {
-                acpRecoveryReady = true;
-                void tickShippingRuns();
-              });
-            scheduleInboxRefresh();
-          }
-          return undefined;
-        },
-      );
+      void Promise.all([
+        listen<PostTurnCheck>('post-turn-check-completed', ({ payload }) => {
+          postTurnResults = upsertCheck(postTurnResults, payload);
+          if (!hasDurableCheckOutcome(payload)) return;
+          const match = /^acp:([^:]+):(.+)$/.exec(payload.thread);
+          if (match)
+            void runVerifiedCompletedChecks(match[1], payload.directory, match[2], payload.turn);
+        }),
+        listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)),
+      ]).then(([unlistenChecks, unlistenAgent]) => {
+        if (disposed) {
+          unlistenChecks();
+          unlistenAgent();
+        } else {
+          unlistenPostTurnCheckEvents = unlistenChecks;
+          unlistenAgentEvents = unlistenAgent;
+          if (import.meta.env.MODE === 'e2e')
+            Reflect.set(window, 'sailE2eStopAgentEvents', () => {
+              unlistenAgentEvents?.();
+              unlistenAgentEvents = undefined;
+            });
+          void recoverInterruptedAgentTurns()
+            .then(() => restoreAgentActivity())
+            .then(() => reconcilePendingPostTurnChecks())
+            .finally(() => {
+              acpRecoveryReady = true;
+              if (import.meta.env.MODE === 'e2e')
+                Reflect.set(window, 'sailE2eAcpRecoveryReady', true);
+              void tickShippingRuns();
+            });
+          scheduleInboxRefresh();
+        }
+        return undefined;
+      });
       if (import.meta.env.MODE === 'e2e') {
         const emulateClick = (event: Event) =>
           void openNotificationTarget((event as CustomEvent<unknown>).detail);
@@ -2411,12 +2501,16 @@
       for (const timer of shipClaimLeaseFenceTimers.values()) clearTimeout(timer);
       shipClaimLeaseFenceTimers.clear();
       clearTimeout(inboxRefreshTimer);
+      clearTimeout(pendingStatusRetryTimer);
       clearInterval(attentionTimer);
       notifications.dispose();
       clearInterval(sidebarRefreshTimer);
       clearTimeout(sidebarInventoryTimer);
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eStopAgentEvents');
+      unlistenPostTurnCheckEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eAcpRecoveryReady');
       unlistenBrowserAccess?.();
       unlistenCoordination?.();
       unsubscribePlans();
@@ -2524,6 +2618,17 @@
     await setSettingDurable('sai-ship-runs', value);
   }
 
+  async function discardUnparsedShipRun(index: number): Promise<void> {
+    const previous = unparsedShipRuns;
+    unparsedShipRuns = unparsedShipRuns.filter((_, itemIndex) => itemIndex !== index);
+    try {
+      await saveShipRuns();
+    } catch (cause) {
+      unparsedShipRuns = previous;
+      throw cause;
+    }
+  }
+
   async function archiveDueShipRuns(): Promise<void> {
     const now = Date.now();
     const due = shipRuns.filter((run) => shipRunDueForArchive(run, shipArchiveDelay, now));
@@ -2615,6 +2720,14 @@
       );
   }
 
+  async function cleanCheckpointCommit(path: string, revision: string): Promise<string | null> {
+    const commit = await invoke<string | null>('working_tree_commit', { path });
+    const after = await invoke<string>('working_tree_revision', { path });
+    if (after !== revision)
+      throw new Error('The worktree changed while recording the checkpoint commit. Retry.');
+    return commit;
+  }
+
   /** Stops leftovers and queues a fresh worker that resumes from the saved checkpoint. */
   async function restartShipIssue(
     run: ShipRun,
@@ -2681,16 +2794,76 @@
     const ready = shipReopenAction(issue);
     if (!ready.enabled)
       throw new Error(ready.reason ?? 'This issue changed and cannot be reopened.');
-    const outcome = await invoke<{ head: string; pullRequest: string; alreadyOpen: boolean }>(
-      'ship_reopen_pull_request',
-      {
+    let outcome: { head: string; pullRequest: string; alreadyOpen: boolean };
+    try {
+      outcome = await invoke('ship_reopen_pull_request', {
         request: {
           repository: run.repository,
           expectedRepository: run.remote,
           pullRequest: issue.pullRequest,
         },
-      },
-    );
+      });
+    } catch (cause) {
+      if (!describe(cause).startsWith('GitHub could not reopen the pull request.')) throw cause;
+      const revision = issue.checkpoint?.revision;
+      if (!revision)
+        throw new Error('The saved checkpoint has no revision for a replacement.', { cause });
+      let commit = shipCheckpointCommit(issue);
+      if (!commit && issue.path) {
+        const current = await invoke<string>('working_tree_revision', { path: issue.path });
+        if (current !== revision)
+          throw new Error(
+            'The source worktree differs from the saved checkpoint. Reconcile it before replacement.',
+            { cause },
+          );
+        commit = await cleanCheckpointCommit(issue.path, revision);
+      }
+      if (!commit)
+        throw new Error(
+          'The saved checkpoint has no clean Git commit for a replacement. Restore and bind a clean source worktree first.',
+          { cause },
+        );
+      if (!(await confirmShipAction(shipReplacementConfirmation(issue, run.remote)))) return '';
+      const stillReady = shipReopenAction(issue);
+      if (!stillReady.enabled)
+        throw new Error(stillReady.reason ?? 'This issue changed and cannot start a replacement.', {
+          cause,
+        });
+      if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
+        await stopShippingWorker(issue);
+      const created = await invoke<CreatedWorktree>('create_shipping_replacement_worktree', {
+        repository: run.repository,
+        expectedRepository: run.remote,
+        issueNumber: issue.number,
+        pullRequest: issue.pullRequest,
+        checkpointRevision: commit,
+      });
+      saveProjectCatalog(addWorktree(projectCatalog, run.repository, created));
+      const key = `${run.id}:${issue.id}`;
+      beginLatestRefresh(shippingPullRequestGenerations, key);
+      shippingPullRequests.delete(key);
+      await restartShipIssue(
+        run,
+        issue,
+        `The closed pull request ${issue.pullRequest} could not reopen. Continue from checkpoint commit ${commit.slice(0, 8)} on replacement branch ${created.branch} and publish a new pull request.`,
+        {
+          branch: created.branch,
+          path: created.path,
+          worktreeUnavailable: false,
+          setupStarted: false,
+          setupCompleted: false,
+          shippingTarget: created.shippingTarget ?? issue.shippingTarget,
+          pullRequest: null,
+          pullRequestState: undefined,
+          pullRequestHead: undefined,
+          pullRequestMergeable: undefined,
+          mergeRequested: undefined,
+          checks: undefined,
+          ciTriages: undefined,
+        },
+      );
+      return `Replacement pull request queued on ${created.branch} from checkpoint commit ${commit.slice(0, 8)}. The original pull request stays closed.`;
+    }
     if (!(issue.workerSettled === true && (await shippingTaskWorkersSettled(issue))))
       await stopShippingWorker(issue);
     const key = `${run.id}:${issue.id}`;
@@ -2698,15 +2871,16 @@
     beginLatestRefresh(shippingPullRequestGenerations, key);
     const cached = shippingPullRequests.get(key);
     if (cached) shippingPullRequests.set(key, { ...cached, state: 'OPEN' });
+    const warning = shipReopenHeadWarning(outcome.head, shipCheckpointCommit(issue));
     await restartShipIssue(
       run,
       issue,
-      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.`,
+      `Pull request ${outcome.pullRequest} was reopened at ${outcome.head.slice(0, 8)}. Reconcile it with the checkpoint and continue the pull request loop.${warning}`,
       { pullRequestState: 'OPEN', pullRequestHead: outcome.head },
     );
     return outcome.alreadyOpen
-      ? 'The pull request was already open. A fresh worker resumes from the saved checkpoint.'
-      : 'Pull request reopened. A fresh worker resumes from the saved checkpoint.';
+      ? `The pull request was already open. A fresh worker resumes from the saved checkpoint.${warning}`
+      : `Pull request reopened. A fresh worker resumes from the saved checkpoint.${warning}`;
   }
 
   async function stopShipRun(run: ShipRun): Promise<string> {
@@ -6547,6 +6721,7 @@
           request.arguments.expectedRevision,
           request.arguments.rebindRevision,
           Date.now(),
+          await cleanCheckpointCommit(request.directory, execution.revision),
         );
         await updateShipIssue(owner.run, owner.issue, { checkpoint: updated });
       } else if (!owner.issue.checkpoint) {
@@ -6664,6 +6839,7 @@
         checkpointBeforePolicy.revision,
         true,
         Date.now(),
+        await cleanCheckpointCommit(request.directory, revision),
       );
       const evidenceManifests = syncEvidenceManifest(
         owner.issue.evidenceManifests ?? [],
@@ -8049,7 +8225,17 @@
           )
         : new Map();
     if (generation !== inboxGeneration || disposed) return;
+    clearTimeout(pendingStatusRetryTimer);
+    if (acpResult.status === 'rejected' && pendingStatusRetries.size)
+      pendingStatusRetryTimer = setTimeout(() => scheduleInboxRefresh(), 1000);
     if (acpResult.status === 'fulfilled') {
+      for (const retry of pendingStatusRetries.values())
+        reconcilePendingSessionStatus(
+          retry.agent,
+          retry.directory,
+          retry.sessionId,
+          acpResult.value,
+        );
       for (const pending of acpResult.value) {
         const sessionId = pending.message.params?.sessionId;
         const requestId = pending.message.id;
@@ -9071,12 +9257,31 @@
 
   function scheduleSidebarInventoryRefresh() {
     clearTimeout(sidebarInventoryTimer);
+    sidebarInventoryReadyKey = '';
+    const key = sidebarDirectoryKey;
+    const schedule = ++sidebarInventorySchedule;
     sidebarInventoryTimer = setTimeout(() => {
+      sidebarInventoryTimer = undefined;
       void refreshSidebarOpenCodeThreads(JSON.parse(sidebarDirectoryKey)).then(
-        reportSidebarInventoryFailure,
+        (failure) => {
+          reportSidebarInventoryFailure(failure);
+          if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
+            sidebarInventoryReadyKey = key;
+          return undefined;
+        },
         (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
     }, 250);
+  }
+
+  if (import.meta.env.MODE === 'e2e') {
+    Object.assign(window, {
+      __SAIL_E2E_SIDEBAR_INVENTORY_READY__: () =>
+        agentDetectionSettled &&
+        (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available) ||
+          (sidebarInventoryReadyKey === sidebarDirectoryKey &&
+            sidebarInventoryTimer === undefined)),
+    });
   }
 
   $effect(() => {
@@ -11101,15 +11306,22 @@
       }).catch(() => undefined),
   });
 
-  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false) {
+  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false): Promise<boolean> {
     const key = checkKey(check);
-    if (
-      pendingPostTurnChecks.has(key) ||
-      (!retry && postTurnResults.some((item) => checkKey(item) === key))
-    )
-      return;
+    if (pendingPostTurnChecks.has(key)) return false;
     pendingPostTurnChecks.add(key);
+    let retryRecovered = false;
     try {
+      if (!retry) {
+        const stored = (await invoke<PostTurnCheck[]>('list_post_turn_checks')).find(
+          (item) => checkKey(item) === key,
+        );
+        if (stored) {
+          postTurnResults = upsertCheck(postTurnResults, stored);
+          retryRecovered = retryInterruptedCheck(stored);
+          if (!retryRecovered) return hasDurableCheckOutcome(stored);
+        }
+      }
       if (check.source === 'repository') {
         const approved = await invoke<boolean>('is_post_turn_check_approved', {
           directory: check.directory,
@@ -11122,21 +11334,26 @@
             'Approve command',
           );
           if (!allow) {
-            const canceled = await invoke<PostTurnCheck>('cancel_post_turn_check', check);
+            const canceled = await trackSettingsMutation(() =>
+              invoke<PostTurnCheck>('cancel_post_turn_check', check),
+            );
             postTurnResults = upsertCheck(postTurnResults, canceled);
-            return;
+            return hasDurableCheckOutcome(canceled);
           }
-          await invoke('approve_post_turn_check', {
-            directory: check.directory,
-            command: check.command,
-          });
+          await trackSettingsMutation(() =>
+            invoke('approve_post_turn_check', {
+              directory: check.directory,
+              command: check.command,
+            }),
+          );
         }
       }
       postTurnResults = upsertCheck(postTurnResults, { ...check, status: 'running' });
       const result = await invoke<PostTurnCheck>('run_post_turn_check', {
-        request: { ...check, retry },
+        request: { ...check, retry: retry || retryRecovered },
       });
       postTurnResults = upsertCheck(postTurnResults, result);
+      return hasDurableCheckOutcome(result);
     } catch (cause) {
       postTurnResults = upsertCheck(postTurnResults, {
         ...check,
@@ -11144,18 +11361,21 @@
         output: describe(cause),
         code: null,
       });
+      return false;
     } finally {
       pendingPostTurnChecks.delete(key);
       scheduleInboxRefresh();
     }
   }
 
-  async function runCompletedChecks(path: string, thread: string, turn: string) {
-    if (!path || !thread || !turn) return;
+  async function runCompletedChecks(path: string, thread: string, turn: string): Promise<boolean> {
+    if (!path || !thread || !turn) return false;
     const entries: { source: 'repository' | 'personal'; command: string }[] =
       personalPostTurnChecks.map((command) => ({ source: 'personal', command }));
+    let configLoaded = false;
     try {
       const config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
+      configLoaded = true;
       entries.push(
         ...(config?.postTurnChecks ?? []).map((command) => ({
           source: 'repository' as const,
@@ -11165,18 +11385,71 @@
     } catch (cause) {
       error = `Could not load repository post-turn checks: ${describe(cause)}`;
     }
-    for (const entry of entries) {
-      void runOnePostTurnCheck({
-        id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
-        updated: Date.now(),
-        directory: path,
-        thread,
-        turn,
-        ...entry,
-        status: 'running',
-        output: '',
-        code: null,
-      });
+    const durable = await Promise.all(
+      uniquePostTurnCheckCommands(entries).map((entry) =>
+        runOnePostTurnCheck({
+          id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
+          updated: Date.now(),
+          directory: path,
+          thread,
+          turn,
+          ...entry,
+          status: 'running',
+          output: '',
+          code: null,
+        }),
+      ),
+    );
+    return configLoaded && durable.every(Boolean);
+  }
+
+  async function runVerifiedCompletedChecks(
+    agent: AgentId,
+    path: string,
+    sessionId: string,
+    turnId: string,
+  ) {
+    const key = JSON.stringify([agent, path, sessionId, turnId]);
+    await queueTurnVerification(key, async () => {
+      try {
+        const evidence = await acp.turnEvidence(agent, path, sessionId, turnId);
+        if (
+          evidence?.status !== 'done' ||
+          !evidence.postTurnPending ||
+          evidence.agent !== agent ||
+          evidence.directory !== path ||
+          evidence.sessionId !== sessionId ||
+          evidence.turnId !== turnId
+        )
+          return;
+        const warning = pendingCompletionErrors.get(key);
+        pendingCompletionErrors.delete(key);
+        if (warning && error === warning) error = '';
+        if (!(await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId))) return;
+        await acp.finishPostTurnChecks(agent, path, sessionId, turnId);
+      } catch (cause) {
+        error = `Could not verify completed agent turn: ${describe(cause)}`;
+      }
+    });
+  }
+
+  async function retryPostTurnCheck(check: PostTurnCheck) {
+    if (!(await runOnePostTurnCheck(check, true))) return;
+    const match = /^acp:([^:]+):(.+)$/.exec(check.thread);
+    if (!match) return;
+    await runVerifiedCompletedChecks(match[1], check.directory, match[2], check.turn);
+  }
+
+  async function reconcilePendingPostTurnChecks() {
+    try {
+      const pending = await acp.pendingPostTurnChecks();
+      await Promise.all(
+        pending.map((turn) =>
+          runVerifiedCompletedChecks(turn.agent, turn.directory, turn.sessionId, turn.turnId),
+        ),
+      );
+    } catch (cause) {
+      error = `Could not restore completed agent checks: ${describe(cause)}`;
     }
   }
 
@@ -11201,6 +11474,22 @@
     const eventDirectory = event.directory ?? event.worktree;
     if (!eventDirectory) return;
     const eventSessionId = event.message.params?.sessionId;
+    const permissionStatusKey =
+      typeof eventSessionId === 'string'
+        ? JSON.stringify([event.agent, eventDirectory, eventSessionId])
+        : null;
+    if (
+      permissionStatusKey &&
+      (event.message.method === 'session/request_permission' ||
+        event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved' ||
+        event.message.method === 'elicitation/create' ||
+        event.message.method === '$/cancel_request')
+    )
+      permissionStatusRevisions.set(
+        permissionStatusKey,
+        (permissionStatusRevisions.get(permissionStatusKey) ?? 0) + 1,
+      );
     const eventThread =
       typeof eventSessionId === 'string'
         ? [...agentThreads, ...nativeChildThreads].find(
@@ -11248,14 +11537,13 @@
       void saveShipRuns().catch((cause) => (error = describe(cause)));
     if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
       recordAnsweredPermission(event.agent, eventDirectory, eventSessionId, event.message.params);
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string')
-      nativeSubagents = setNativeSubagentWaiting(
-        nativeSubagents,
-        event.agent,
-        eventDirectory,
-        eventSessionId,
-        false,
-      );
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved' ||
+        event.message.method === '$/cancel_request') &&
+      typeof eventSessionId === 'string'
+    )
+      reconcilePendingSessionStatus(event.agent, eventDirectory, eventSessionId);
     if (event.message.method === 'session/update') {
       const params = event.message.params;
       const sessionId = params?.sessionId;
@@ -11394,9 +11682,14 @@
         }
       }
     }
-    if (event.message.method === 'sail/permission_resolved' && typeof eventSessionId === 'string') {
+    if (
+      (event.message.method === 'sail/permission_resolved' ||
+        event.message.method === 'sail/elicitation_resolved') &&
+      typeof eventSessionId === 'string'
+    ) {
       // The scheduled refresh lags; the thread header already shows the request answered.
-      const resolvedKey = `acp:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
+      const prefix = event.message.method === 'sail/permission_resolved' ? 'acp' : 'elicitation';
+      const resolvedKey = `${prefix}:${eventDirectory}:${event.agent}:${eventSessionId}:${String(event.message.params?.requestId)}`;
       resolvedDuringRefresh.set(resolvedKey, inboxGeneration);
       if (inboxItems.some((item) => item.key === resolvedKey))
         inboxItems = inboxItems.filter((item) => item.key !== resolvedKey);
@@ -11406,6 +11699,7 @@
       event.message.method === 'elicitation/create' ||
       event.message.method === '$/cancel_request' ||
       event.message.method === 'sail/permission_resolved' ||
+      event.message.method === 'sail/elicitation_resolved' ||
       event.message.method === 'sail/disconnected'
     )
       scheduleInboxRefresh();
@@ -11418,6 +11712,13 @@
       )
         removeStructuredQuestion(event.agent, eventDirectory, sessionId, requestID);
     }
+    if (event.message.method === 'sail/post_turn_evidence_ready') {
+      const sessionId = event.message.params?.sessionId;
+      const turnId = event.message.params?.turnId;
+      if (typeof sessionId === 'string' && typeof turnId === 'string') {
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
+      }
+    }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
@@ -11427,20 +11728,17 @@
         (status !== 'done' && status !== 'failed' && status !== 'interrupted')
       )
         return;
-      if (
-        status === 'done' &&
-        typeof turnId === 'string' &&
-        event.message.params?.notify !== false
-      ) {
-        const thread = agentThreads.find(
-          (item) =>
-            item.agent === event.agent &&
-            item.sessionId === sessionId &&
-            item.directory === eventDirectory,
+      const evidenceError = event.message.params?.evidenceError;
+      if (typeof evidenceError === 'string' && typeof turnId === 'string') {
+        const warning = `Completed turn is waiting for its post-turn check record: ${evidenceError}`;
+        pendingCompletionErrors.set(
+          JSON.stringify([event.agent, eventDirectory, sessionId, turnId]),
+          warning,
         );
-        if (thread)
-          void runCompletedChecks(thread.directory, `acp:${event.agent}:${sessionId}`, turnId);
+        error = warning;
       }
+      if (status === 'done' && typeof turnId === 'string' && event.message.params?.notify !== false)
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
@@ -12174,7 +12472,7 @@
                     check.directory === directory &&
                     check.thread === `acp:${acpAgent}:${acpThread.sessionId}`,
                 )}
-                onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+                onretrycheck={(check) => void retryPostTurnCheck(check)}
               />
             {/key}
           {:else}
@@ -12267,7 +12565,7 @@
           startShippingRun(graph, provider, limit, source)}
         onshipit={adoptDirectShipRunWithAuthorization}
         postTurnChecks={postTurnResults}
-        onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+        onretrycheck={(check) => void retryPostTurnCheck(check)}
         {agentUsage}
         {agentRates}
         onentries={(id, entries, sessionId, ready) =>
@@ -12343,6 +12641,8 @@
       <ShipPanel
         repository={coordinationProject(directory) ?? directory}
         runs={shipRuns}
+        unparsedRuns={unparsedShipRuns}
+        ondiscardunparsed={discardUnparsedShipRun}
         busy={shippingBusy}
         {mergeOwner}
         nativeSubagents={Object.values(nativeSubagents)}
@@ -12521,6 +12821,8 @@
             repository={coordinationProject(directory) ?? directory}
             active={activeSideTab === 'ship' && detailsOpen && (acpAgent ? agentChangesOpen : true)}
             runs={shipRuns}
+            unparsedRuns={unparsedShipRuns}
+            ondiscardunparsed={discardUnparsedShipRun}
             busy={shippingBusy}
             {mergeOwner}
             nativeSubagents={Object.values(nativeSubagents)}

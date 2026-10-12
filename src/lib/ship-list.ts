@@ -137,14 +137,12 @@ export type ShipDetailFallback = { runId: string; issueId: string };
 export function shipDetailFallback(
   run: ShipRun | undefined,
   rows: ShipRow[],
-  remembered: ShipDetailFallback | null,
+  remembered: ReadonlyMap<string, string>,
 ): ShipDetailFallback | null {
   if (!run) return null;
-  if (
-    remembered?.runId === run.id &&
-    rows.some((row) => row.issue.id === remembered.issueId && row.group !== 'done')
-  )
-    return remembered;
+  const issueId = remembered.get(run.id);
+  if (issueId && rows.some((row) => row.issue.id === issueId && row.group !== 'done'))
+    return { runId: run.id, issueId };
   const first = rows.find((row) => row.group !== 'done')?.issue;
   return first ? { runId: run.id, issueId: first.id } : null;
 }

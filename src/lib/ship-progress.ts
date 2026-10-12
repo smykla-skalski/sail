@@ -1633,6 +1633,25 @@ const shipRunSchema = z.object({
 /** Runs Sail can use, plus stored entries it cannot parse and must write back unchanged. */
 export type ShipRunStore = { runs: ShipRun[]; unparsed: unknown[] };
 
+function preserveUnknownFields<T>(stored: unknown, parsed: T): T {
+  if (Array.isArray(stored) && Array.isArray(parsed)) {
+    parsed.forEach((item, index) => {
+      parsed[index] = preserveUnknownFields(stored[index], item);
+    });
+  } else if (stored && parsed && typeof stored === 'object' && typeof parsed === 'object') {
+    for (const [key, value] of Object.entries(stored)) {
+      const known = Object.hasOwn(parsed, key);
+      Object.defineProperty(parsed, key, {
+        value: known ? preserveUnknownFields(value, Reflect.get(parsed, key)) : value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+  }
+  return parsed;
+}
+
 export function loadShipRunStore(raw: string | null): ShipRunStore {
   let value: unknown;
   try {
@@ -1640,7 +1659,7 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
   } catch {
     return { runs: [], unparsed: raw?.trim() ? [raw] : [] };
   }
-  if (!Array.isArray(value)) return { runs: [], unparsed: value == null ? [] : [value] };
+  if (!Array.isArray(value)) return { runs: [], unparsed: [value] };
   const runs: ShipRun[] = [];
   const unparsed: unknown[] = [];
   for (const item of value) {
@@ -1667,7 +1686,7 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
           : handoff,
       );
     }
-    runs.push(parsed.data);
+    runs.push(preserveUnknownFields(item, parsed.data));
   }
   return { runs, unparsed };
 }

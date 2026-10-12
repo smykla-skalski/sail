@@ -15,7 +15,7 @@ Remote MCP registration behavior of the pinned client is re-verified by `node sc
 
 Run `npm ci && npm run build:e2e && npm run test:e2e` on a desktop. WDIO launches the actual Tauri binary against the scripted ACP agent in `test/e2e/acp-agent.mjs` and checks repository setup, missing paths, agent threads, Ship runs and settings.
 
-On macOS, set `SAIL_E2E_CONFIG_DIR` to an absolute private directory before `build:e2e` and keep the same value when launching the app or running `test:e2e`. The bundled context LaunchAgent uses this path for its approval store and the build fails when it is absent.
+On macOS, set `SAIL_E2E_CONFIG_DIR` to a private directory strictly inside the app process’s temporary directory before `build:e2e`, and keep the same value when launching the app or running `test:e2e`. Pass the same private `TMPDIR` to the build, app, and runner. The E2E app rejects config paths outside its temporary directory, including symlink aliases. The bundled context LaunchAgent uses this path for its approval store and the build fails when it is absent.
 
 Settings > Agents > Concurrent jobs caps active agent turns, embedded browser tabs, and E2E test runs separately. The WebdriverIO runner reads the E2E limit before launching workers and queues concurrent invocations in launch order. `SAIL_E2E_JOB_LIMIT` overrides the saved E2E limit for an isolated runner; `SAIL_E2E_LIMIT_DIR` selects a private queue directory when independent test environments must not share slots.
 
