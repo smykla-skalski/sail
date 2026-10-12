@@ -519,6 +519,7 @@
     settingsError,
     trackSettingsMutation,
   } from './lib/settings';
+  import { parseReefCanaryPercent, reefCanarySettingKey } from './lib/reef-canary';
   import {
     defaultResourceLimits,
     isCheckingMachinePressure,
@@ -1216,6 +1217,7 @@
   let agentWorktreesEnabled = $state(getSetting('sai-agent-worktrees-enabled') !== 'false');
   let agentTerminalsEnabled = $state(getSetting('sai-agent-terminals-enabled') === 'true');
   let backgroundPriorityEnabled = $state(getSetting('sai-background-priority-enabled') !== 'false');
+  let reefCanaryPercent = $state(parseReefCanaryPercent(getSetting(reefCanarySettingKey)));
   let agentStatusEnabled = $state(getSetting('sai-agent-status-enabled') !== 'false');
   let agentThreadListEnabled = $state(getSetting('sai-agent-thread-list-enabled') !== 'false');
   let agentMessagesEnabled = $state(getSetting('sai-agent-messages-enabled') !== 'false');
@@ -2154,6 +2156,7 @@
       agentWorktreesEnabled,
       agentTerminalsEnabled,
       backgroundPriorityEnabled,
+      reefCanaryPercent,
       agentStatusEnabled,
       agentThreadListEnabled,
       agentMessagesEnabled,
@@ -2356,6 +2359,14 @@
         } else if (action.type === 'background-priority') {
           backgroundPriorityEnabled = action.value;
           setSetting('sai-background-priority-enabled', String(action.value));
+        } else if (action.type === 'reef-canary-percent') {
+          if (
+            action.value === null ||
+            (Number.isInteger(action.value) && action.value >= 0 && action.value <= 100)
+          ) {
+            reefCanaryPercent = action.value;
+            setSetting(reefCanarySettingKey, action.value === null ? 'off' : String(action.value));
+          }
         } else if (action.type === 'agent-status') {
           agentStatusEnabled = action.value;
           setSetting('sai-agent-status-enabled', String(action.value));

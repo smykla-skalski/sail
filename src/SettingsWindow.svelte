@@ -1147,6 +1147,48 @@
         <Button size="sm" onclick={() => send({ type: 'detect-agents' })}>Detect again</Button>
       </section>
       <section class="settings-card">
+        <h2>Reef canary</h2>
+        <label class="attention-setting">
+          <input
+            type="checkbox"
+            checked={snapshot?.reefCanaryPercent !== null &&
+              snapshot?.reefCanaryPercent !== undefined}
+            onchange={(event) =>
+              send({
+                type: 'reef-canary-percent',
+                value: event.currentTarget.checked ? 10 : null,
+              })}
+          />
+          Measure new agent processes with Reef
+        </label>
+        {#if snapshot?.reefCanaryPercent !== null && snapshot?.reefCanaryPercent !== undefined}
+          <label for="reef-canary-percent">Treatment percentage</label>
+          <input
+            id="reef-canary-percent"
+            type="number"
+            min="0"
+            max="100"
+            step="1"
+            value={snapshot.reefCanaryPercent}
+            onchange={(event) => {
+              const value = event.currentTarget.valueAsNumber;
+              if (Number.isInteger(value) && value >= 0 && value <= 100)
+                send({ type: 'reef-canary-percent', value });
+              else {
+                event.currentTarget.value = String(snapshot?.reefCanaryPercent ?? 10);
+                requestError = 'Enter a Reef canary percentage from 0 to 100.';
+              }
+            }}
+          />
+        {/if}
+        <p>
+          Off by default. 0% measures a control baseline; higher values admit that share of eligible
+          build, test, and lint commands through Reef's background scheduler. Changes affect only
+          new agent processes. This is host-only best effort, not hard containment. On macOS or
+          Linux, new agents fail clearly if Reef or its adapter support is unavailable.
+        </p>
+      </section>
+      <section class="settings-card">
         <h2>Private agent storage</h2>
         {#if worktreeStorageError}<p class="runtime-diagnostic" role="alert">
             {worktreeStorageError}

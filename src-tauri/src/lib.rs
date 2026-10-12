@@ -232,6 +232,7 @@ mod opencode_config;
 mod owned_processes;
 mod post_turn_checks;
 mod project_knowledge;
+mod reef_canary;
 #[cfg(unix)]
 mod scratch_cleanup;
 
