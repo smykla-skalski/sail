@@ -242,13 +242,15 @@ describe('close worktree shortcut', () => {
       generation(detached),
     );
     await browser.refresh();
-    await browser.waitUntil(
-      () =>
-        browser.execute(() => {
-          const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
-          return typeof ready === 'function' && ready();
-        }),
-      { timeout: 20000, timeoutMsg: 'Detached catalog did not settle after reload' },
+    await diagnose('Changed detached catalog', () =>
+      browser.waitUntil(
+        () =>
+          browser.execute(() => {
+            const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
+            return typeof ready === 'function' && ready();
+          }),
+        { timeout: 20000, timeoutMsg: 'Detached catalog did not settle after reload' },
+      ),
     );
     await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
     await $('[aria-label="Delete worktree first"]').click();
@@ -334,13 +336,15 @@ describe('close worktree shortcut', () => {
       generation(detached),
     );
     await browser.refresh();
-    await browser.waitUntil(
-      () =>
-        browser.execute(() => {
-          const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
-          return typeof ready === 'function' && ready();
-        }),
-      { timeout: 20000, timeoutMsg: 'Detached catalog did not settle after reload' },
+    await diagnose('Clean detached catalog', () =>
+      browser.waitUntil(
+        () =>
+          browser.execute(() => {
+            const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
+            return typeof ready === 'function' && ready();
+          }),
+        { timeout: 20000, timeoutMsg: 'Detached catalog did not settle after reload' },
+      ),
     );
     await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
     await $('[aria-label="Delete worktree first"]').click();

@@ -441,13 +441,19 @@ fn source(worktree: &Path) -> Result<Option<Source>, String> {
     if dunce::canonicalize(&backlink).map_err(|error| error.to_string())? != pointer {
         return Err("Linked Git directory belongs to another worktree.".into());
     }
-    let branch =
-        output(
-            git_command()
-                .arg("-C")
-                .arg(&worktree)
-                .args(["symbolic-ref", "-q", "HEAD"]),
-        )?;
+    let branch = git_command()
+        .arg("-C")
+        .arg(&worktree)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if branch.status.code() == Some(1) && branch.stderr.is_empty() {
+        // A detached linked worktree has no branch to isolate in a Git overlay.
+        return Ok(None);
+    }
+    if !branch.status.success() {
+        return Err(String::from_utf8_lossy(&branch.stderr).trim().to_string());
+    }
     let branch = String::from_utf8(branch.stdout).map_err(|error| error.to_string())?;
     let branch = branch.trim().to_string();
     if !branch.starts_with("refs/heads/") {
@@ -1426,6 +1432,59 @@ mod tests {
         assert_eq!(git(&task, &["status", "--porcelain"]), "");
         assert!(require_shared_current_in_cache(&cache, &task).is_err());
         assert_eq!(overlay_git(&overlay, &["status", "--porcelain"]), "");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detached_linked_worktree_does_not_create_a_branch_overlay() {
+        let root =
+            std::env::temp_dir().join(format!("sail-overlay-detached-{}", uuid::Uuid::new_v4()));
+        let main = root.join("main");
+        let detached = root.join("detached");
+        let task = root.join("task");
+        let cache = root.join("cache");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main", main.to_str().unwrap()]);
+        git(&main, &["config", "user.name", "Sail Test"]);
+        git(&main, &["config", "user.email", "sail@example.test"]);
+        fs::write(main.join("initial.txt"), "base\n").unwrap();
+        git(&main, &["add", "initial.txt"]);
+        git(
+            &main,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "detached",
+                detached.to_str().unwrap(),
+            ],
+        );
+        git(&detached, &["checkout", "--detach", "-q"]);
+
+        assert!(source(&detached).unwrap().is_none());
+        assert!(GitOverlay::ensure(&cache, &detached).unwrap().is_none());
+        let (_, manifest, _) = paths(&cache, &detached.canonicalize().unwrap());
+        assert!(!manifest.exists());
+
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task",
+                task.to_str().unwrap(),
+            ],
+        );
+        assert!(GitOverlay::ensure(&cache, &task).unwrap().is_some());
+        git(&task, &["checkout", "--detach", "-q"]);
+        assert!(GitOverlay::existing(&cache, &task).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
