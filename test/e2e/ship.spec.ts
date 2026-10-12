@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ShipIssue, ShipRun } from '../../src/lib/issue-shipping';
+import { initialTaskCheckpoint, updateTaskCheckpoint } from '../../src/lib/task-checkpoint';
 
 const validationGates = () =>
   $("//h4[normalize-space()='Validation gates']/following-sibling::ol[1]");
@@ -636,6 +637,23 @@ describe('native Ship run history', () => {
   });
 
   it('offers a reply to a worker that is waiting on a request', async () => {
+    const waitingWorker = batchIssue(0, {
+      title: 'Worker with a question',
+      state: 'working',
+      path: repository,
+      threadId: 'acp:claude:request-fixture',
+      reportedStatus: 'blocked',
+      blockedReason: 'Which theme token should the badge use?',
+      workerRequest: 'Which theme token should the badge use?',
+    });
+    waitingWorker.checkpoint = updateTaskCheckpoint(
+      initialTaskCheckpoint(
+        { id: waitingWorker.id, url: waitingWorker.url, title: waitingWorker.title },
+        1,
+      ),
+      { unresolvedQuestions: ['Which theme token should the badge use?'] },
+      2,
+    );
     const run: ShipRun = {
       id: 'ship-request',
       source: 'plan',
@@ -646,14 +664,7 @@ describe('native Ship run history', () => {
       approvedAt: 6,
       externalClosed: {},
       issues: [
-        batchIssue(0, {
-          title: 'Worker with a question',
-          state: 'working',
-          path: repository,
-          threadId: 'acp:claude:request-fixture',
-          reportedStatus: 'blocked',
-          blockedReason: 'Which theme token should the badge use?',
-        }),
+        waitingWorker,
         batchIssue(1, {
           title: 'Busy worker',
           state: 'working',
@@ -700,7 +711,7 @@ describe('native Ship run history', () => {
     await browser.setWindowSize(1280, 850);
   });
 
-  it('reply to worker quotes the request in its composer and focuses it', async () => {
+  it('replies to idle and busy OpenCode workers without quoting recovery errors', async () => {
     await browser.setWindowSize(1920, 1200);
     await browser.tauri.execute(async ({ core }, path) => {
       await core.invoke('save_setting', { key: 'sai-ship-runs', value: '[]' });
@@ -716,42 +727,53 @@ describe('native Ship run history', () => {
       sessionStorage.setItem('sail-e2e-settings', 'enabled');
     });
     await browser.refresh();
-    await $('.agent-launches button').waitForExist({ timeout: 30_000 });
-    await $('.agent-launches button').click();
-    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer [data-pane-prompt]').setValue('Do a small thing');
-    await $('.agent-actions button').click();
-    await $('.agent-permission button').waitForExist({ timeout: 20_000 });
-    await $('.agent-permission button').click();
-    await expect($('.agent-conversation')).toHaveText(
-      expect.stringContaining('Done: Do a small thing'),
+    const { sessionId } = await browser.tauri.execute(async ({ core }, path) => {
+      await core.invoke('acp_connect', { agent: 'opencode', directory: path });
+      return core.invoke<{ sessionId: string }>('acp_new_session', {
+        params: { agent: 'opencode', cwd: path, title: 'OpenCode Ship worker' },
+      });
+    }, repository);
+    await browser.tauri.execute(
+      async ({ core }, { path, id }) => {
+        await core.invoke('save_setting', {
+          key: 'sail-agent-threads',
+          value: JSON.stringify([
+            {
+              agent: 'opencode',
+              sessionId: id,
+              directory: path,
+              title: 'OpenCode Ship worker',
+              updated: Date.now(),
+            },
+          ]),
+        });
+      },
+      { path: repository, id: sessionId },
     );
-    const sourceSessionId = await browser.execute(() => {
-      const threads: Array<{ title?: string; sessionId?: string }> = JSON.parse(
-        localStorage.getItem('sail-agent-threads') ?? '[]',
-      );
-      return threads.find((thread) => thread.title === 'Do a small thing')?.sessionId;
+    const issue = batchIssue(0, {
+      title: 'Worker with a question',
+      state: 'failed',
+      path: repository,
+      threadId: `acp:opencode:${sessionId}`,
+      reportedStatus: 'blocked',
+      workerState: 'interrupted',
+      blockedReason: 'Shipping claim recovery failed: GitHub is unavailable.',
     });
-    expect(sourceSessionId).toBeDefined();
+    issue.checkpoint = updateTaskCheckpoint(
+      initialTaskCheckpoint({ id: issue.id, url: issue.url, title: issue.title }, 1),
+      { unresolvedQuestions: ['Which token?\nSecond line'] },
+      2,
+    );
     const run: ShipRun = {
       id: 'ship-reply',
       source: 'plan',
       repository,
       remote: 'fixture/repo',
-      provider: 'claude',
+      provider: 'opencode',
       limit: 1,
       approvedAt: 7,
       externalClosed: {},
-      issues: [
-        batchIssue(0, {
-          title: 'Worker with a question',
-          state: 'working',
-          path: repository,
-          threadId: `acp:claude:${sourceSessionId}`,
-          reportedStatus: 'blocked',
-          blockedReason: 'Which token?\nSecond line',
-        }),
-      ],
+      issues: [issue],
     };
     await browser.tauri.execute(async ({ core }, input) => {
       await core.invoke('save_setting', { key: 'sai-details-width', value: '900' });
@@ -761,16 +783,33 @@ describe('native Ship run history', () => {
     await expect($('.app-shell')).toBeDisplayed();
     await openShip();
     await openIssue('batch-0');
-    // The isolated app has no GitHub login, so claim recovery can replace the fixture blocker.
-    const blocker = await $('.ship-issue-detail .ship-error').getText();
+    await expect($('.ship-issue-detail .ship-error')).toHaveText(
+      expect.stringContaining('Shipping claim recovery failed'),
+    );
     await $('.ship-issue-detail .ship-actions').$('button=Reply to worker').click();
     const composer = $('.agent-composer [data-pane-prompt]');
-    const quoted = blocker
+    const quoted = 'Which token?\nSecond line'
       .split('\n')
       .map((line) => `> ${line}`.trimEnd())
       .join('\n');
     await browser.waitUntil(async () => (await composer.getValue()).trimEnd() === quoted);
     await expect(composer).toBeFocused();
+    await composer.setValue('Delayed approval');
+    await $('.agent-actions button').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    await openShip();
+    await openIssue('batch-0');
+    await $('.ship-issue-detail .ship-actions').$('button=Reply to worker').click();
+    await browser.waitUntil(async () => (await composer.getValue()).trimEnd() === quoted);
+    await expect($('.agent-actions button')).toHaveText(expect.stringContaining('Queue'));
+    await $('.agent-actions button').click();
+    await expect($('.agent-conversation .queued-messages')).toHaveText(
+      expect.stringContaining('Which token?'),
+    );
+    await $('.agent-permission button').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    await $('.agent-permission button').click();
+    await expect($('.queued-messages')).not.toExist();
     await browser.setWindowSize(1280, 850);
   });
 });
