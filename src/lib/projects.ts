@@ -227,6 +227,37 @@ export function addWorktree(
   };
 }
 
+export function currentCatalogWorktrees(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; generation: string | null }[],
+): ProjectWorktree[] {
+  const live = new Map(registered.map((item) => [item.path, item.generation]));
+  return (catalog.worktrees[repository] ?? []).filter(
+    (worktree) =>
+      !worktree.generation ||
+      !live.has(worktree.path) ||
+      live.get(worktree.path) === worktree.generation,
+  );
+}
+
+export function externalGitWorktrees(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; branch: string | null; generation: string | null }[],
+): ProjectWorktree[] {
+  const known = new Set(
+    currentCatalogWorktrees(catalog, repository, registered).map((worktree) => worktree.path),
+  );
+  return registered
+    .filter((worktree) => worktree.path !== repository && !known.has(worktree.path))
+    .map((worktree) => ({
+      path: worktree.path,
+      branch: worktree.branch ?? 'detached',
+      generation: worktree.generation,
+    }));
+}
+
 export type WorktreeAncestryRow = {
   worktree: ProjectWorktree;
   depth: number;
@@ -240,7 +271,7 @@ export function worktreeAncestry(
   repository: string,
   registered: { path: string; generation: string | null }[],
 ): WorktreeAncestryRow[] {
-  const entries = catalog.worktrees[repository] ?? [];
+  const entries = currentCatalogWorktrees(catalog, repository, registered);
   const live = new Map(registered.map((item) => [item.path, item.generation]));
   const known = new Map(entries.map((item) => [item.path, item]));
   const parent = new Map<string, string>();

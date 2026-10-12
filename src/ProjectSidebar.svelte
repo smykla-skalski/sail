@@ -26,7 +26,12 @@
     type SpawnReceipt,
   } from './lib/agent-results';
   import type { ProjectCatalog, ProjectWorktree, WorktreeCreation } from './lib/projects';
-  import { ungroupedRepositories, worktreeAncestry } from './lib/projects';
+  import {
+    currentCatalogWorktrees,
+    externalGitWorktrees,
+    ungroupedRepositories,
+    worktreeAncestry,
+  } from './lib/projects';
   import type { RegisteredWorktree } from './lib/coordination';
   import { getSetting, setSetting } from './lib/settings';
   import { issueBranch, parseGitHubIssueLink, worktreeBranchName } from './lib/github-issues';
@@ -431,18 +436,14 @@
   function railWorktrees(path: string): ProjectWorktree[] {
     return repositoryCollapsed(path)
       ? []
-      : [...(catalog.worktrees[path] ?? []), ...externalWorktrees(path)];
+      : [
+          ...currentCatalogWorktrees(catalog, path, registeredWorktrees[path] ?? []),
+          ...externalWorktrees(path),
+        ];
   }
 
   function externalWorktrees(repository: string): ProjectWorktree[] {
-    const known = new Set((catalog.worktrees[repository] ?? []).map((worktree) => worktree.path));
-    return (registeredWorktrees[repository] ?? [])
-      .filter((worktree) => worktree.path !== repository && !known.has(worktree.path))
-      .map((worktree) => ({
-        path: worktree.path,
-        branch: worktree.branch ?? 'detached',
-        generation: worktree.generation,
-      }));
+    return externalGitWorktrees(catalog, repository, registeredWorktrees[repository] ?? []);
   }
 
   function isExternalWorktree(repository: string, path: string): boolean {

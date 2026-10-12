@@ -3,6 +3,8 @@ import test from 'node:test';
 import {
   addWorktree,
   assignRepository,
+  currentCatalogWorktrees,
+  externalGitWorktrees,
   loadProjectCatalog,
   owningRepository,
   removeRepository,
@@ -211,7 +213,28 @@ await test('restores sibling worktrees in their Sail creation ancestry', () => {
     registered[1],
     { path: second.path, generation: firstGeneration },
   ]);
-  assert.equal(reusedChild.find(({ worktree }) => worktree.path === second.path)?.origin, null);
+  assert.equal(
+    reusedChild.find(({ worktree }) => worktree.path === second.path),
+    undefined,
+  );
+});
+
+await test('shows an external worktree when Git reuses a stale catalog path', () => {
+  const old = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
+    path: '/sibling',
+    branch: 'old',
+    generation: 'old-generation',
+    statusComment: 'old task',
+  });
+  const registered = [
+    { path: '/repo', branch: 'main', generation: 'repo-generation' },
+    { path: '/sibling', branch: 'external', generation: 'new-generation' },
+  ];
+  assert.deepEqual(currentCatalogWorktrees(old, '/repo', registered), []);
+  assert.deepEqual(worktreeAncestry(old, '/repo', registered), []);
+  assert.deepEqual(externalGitWorktrees(old, '/repo', registered), [
+    { path: '/sibling', branch: 'external', generation: 'new-generation' },
+  ]);
 });
 
 await test('does not infer ancestry for an external worktree or a reused catalog path', () => {

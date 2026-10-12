@@ -1946,14 +1946,14 @@ fn add_worktree_with_branch_creation(
     let path = path
         .git_canonical()
         .map_err(|error| format!("Cannot resolve new worktree: {error}"))?;
-    let config = (|| -> Result<(Option<worktree_config::WorktreeConfig>, String), String> {
-        let generation = worktree_storage::generation(&path)?;
-        let config = worktree_config::read(&path)?;
-        if let Some(config) = &config {
-            worktree_config::copy_ignored(repository, &path, config)?;
-        }
-        Ok((config, generation))
-    })();
+    let config =
+        (|| -> Result<(Option<worktree_config::WorktreeConfig>, Option<String>), String> {
+            let config = worktree_config::read(&path)?;
+            if let Some(config) = &config {
+                worktree_config::copy_ignored(repository, &path, config)?;
+            }
+            Ok((config, worktree_storage::generation(&path).ok()))
+        })();
     let (config, generation) = match config {
         Ok(config) => config,
         Err(error) => {
@@ -1976,7 +1976,7 @@ fn add_worktree_with_branch_creation(
     Ok(CreatedWorktree {
         path: path.to_string_lossy().into_owned(),
         branch: name.to_string(),
-        generation: Some(generation),
+        generation,
         base,
         setup: config.map(|config| config.setup).unwrap_or_default(),
         shipping_target: None,
@@ -3434,6 +3434,56 @@ mod tests {
             .expect("managed data should be deleted after successful removal");
         assert!(!managed.exists());
         assert!(sibling.join("cache").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_creation_survives_generation_marker_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sail-worktree-marker-failure-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = root.join("repository");
+        let worktrees = root.join("worktrees");
+        fs::create_dir_all(&repository).unwrap();
+        fs::create_dir_all(&worktrees).unwrap();
+        let repository_arg = repository.to_str().unwrap();
+        git(repository_arg, &["init", "-q"]);
+        git(repository_arg, &["config", "user.name", "Sail Test"]);
+        git(
+            repository_arg,
+            &["config", "user.email", "sail@example.test"],
+        );
+        fs::write(repository.join("tracked"), "fixture").unwrap();
+        git(repository_arg, &["add", "tracked"]);
+        git(repository_arg, &["commit", "--quiet", "-m", "fixture"]);
+
+        let hooks = root.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\ngit_dir=$(git rev-parse --absolute-git-dir) || exit 1\nprintf 'invalid\n' > \"$git_dir/sail-worktree-generation-v1\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            repository_arg,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+
+        let created = add_worktree(
+            repository_arg.to_string(),
+            "created".to_string(),
+            Some(worktrees.to_string_lossy().into_owned()),
+            None,
+        )
+        .expect("Git worktree creation must survive an unavailable generation marker");
+        assert!(Path::new(&created.path).join("tracked").exists());
+        assert_eq!(created.generation, None);
         fs::remove_dir_all(root).unwrap();
     }
 
