@@ -132,6 +132,7 @@
   let memoryCorrectionOriginalValue = '';
   let memoryCorrectionOriginalTimestamp: number | null = null;
   let memorySupersedesId = $state('');
+  let memoryResolveConflicts = $state(false);
   let pendingConflict = $state('');
   let conflictOtherId = $state('');
   let memoryLoading = $state(false);
@@ -344,6 +345,7 @@
       memoryCorrectionOriginalValue = '';
       memoryCorrectionOriginalTimestamp = null;
       memorySupersedesId = '';
+      memoryResolveConflicts = false;
       pendingConflict = '';
       conflictOtherId = '';
       agentPreview = null;
@@ -581,6 +583,7 @@
           directory,
           id: memorySupersedesId,
           input,
+          resolveConflicts: memoryResolveConflicts,
         });
       } else {
         await invoke<MemoryRecord>('memory_remember', { directory, input });
@@ -591,6 +594,7 @@
       memoryCorrectionOriginalValue = '';
       memoryCorrectionOriginalTimestamp = null;
       memorySupersedesId = '';
+      memoryResolveConflicts = false;
       await refreshMemory(directory);
     } catch (cause) {
       memoryStorageError = `Storage: ${String(cause)}`;
@@ -2026,6 +2030,7 @@
                       onclick={() => {
                         memoryKind = 'handoff';
                         memorySupersedesId = record.id;
+                        memoryResolveConflicts = false;
                         memoryTags = record.tags.join(', ');
                         memoryExpiry =
                           record.expiresAt != null
@@ -2217,11 +2222,16 @@
         {#if memoryKind === 'handoff'}
           {#if memorySupersedesId}
             <p>Correction for handoff {memorySupersedesId}</p>
+            <label class="attention-setting">
+              <input type="checkbox" bind:checked={memoryResolveConflicts} />
+              This correction resolves the handoff's conflicts
+            </label>
             <Button
               size="sm"
               variant="secondary"
               onclick={() => {
                 memorySupersedesId = '';
+                memoryResolveConflicts = false;
                 memoryExpiry = '';
                 memoryCorrectionOriginalValue = '';
                 memoryCorrectionOriginalTimestamp = null;

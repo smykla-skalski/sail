@@ -952,6 +952,10 @@ fn memory_action(
         }
         "memory_supersede" => {
             let id = required(&arguments, "id")?.to_string();
+            let resolve_conflicts = arguments
+                .get("resolveConflicts")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let mut input: crate::memory::MemoryInput =
                 serde_json::from_value(arguments).map_err(|error| error.to_string())?;
             input.provenance = Some(crate::memory::MemoryProvenance {
@@ -959,7 +963,13 @@ fn memory_action(
                 session_id: Some(session.to_string()),
                 source: None,
             });
-            serde_json::to_value(crate::memory::supersede(app, &directory, &id, input)?)
+            serde_json::to_value(crate::memory::supersede(
+                app,
+                &directory,
+                &id,
+                input,
+                resolve_conflicts,
+            )?)
         }
         "memory_mark_conflict" => serde_json::to_value(crate::memory::mark_conflict(
             app,
@@ -1840,7 +1850,8 @@ fn memory_tool_schema(name: &str) -> Option<Value> {
                 "content":{"type":"string","minLength":1,"maxLength":4000},
                 "kind":{"type":"string","enum":["handoff"]},
                 "tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16},
-                "expiresAt":{"type":"integer","minimum":0}
+                "expiresAt":{"type":"integer","minimum":0},
+                "resolveConflicts":{"type":"boolean","description":"Mark existing disagreements resolved by this correction. Defaults to false."}
             },"required":["id","content","kind"]
         })),
         "memory_mark_conflict" => Some(json!({

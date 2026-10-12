@@ -2313,6 +2313,7 @@ mod tests {
                 provenance: None,
                 expires_at: None,
             },
+            false,
         )
         .unwrap();
         let other = remember_local(&root, &other_key);
@@ -2398,6 +2399,7 @@ mod tests {
                 provenance: None,
                 expires_at: None,
             },
+            false,
         )
         .unwrap();
         let old = crate::memory::list_at(&root, &key, true)
