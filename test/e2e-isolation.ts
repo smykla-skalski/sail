@@ -1,5 +1,54 @@
 import process from 'node:process';
-import { isAbsolute, join } from 'node:path';
+import { lstatSync, realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+
+function isNotFound(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT';
+}
+
+/** Reject an unsafe attach configuration before WDIO starts its services or specs. */
+export function assertPrivateE2eConfigRoot(config: string | undefined, temporary: string): void {
+  const components = process.platform === 'win32' ? config?.split(/[\\/]/) : config?.split('/');
+  if (
+    !config ||
+    !isAbsolute(config) ||
+    components?.some((component) => component === '.' || component === '..')
+  )
+    throw new Error('SAIL_E2E_CONFIG_DIR must be an absolute private path');
+
+  const tempRoot = realpathSync(temporary);
+  let existing = config;
+  const missing: string[] = [];
+  let configRoot: string;
+  for (;;) {
+    try {
+      configRoot = resolve(realpathSync(existing), ...missing);
+      break;
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+      try {
+        if (lstatSync(existing).isSymbolicLink())
+          throw new Error('SAIL_E2E_CONFIG_DIR contains a dangling symlink', { cause: error });
+      } catch (metadataError) {
+        if (!isNotFound(metadataError)) throw metadataError;
+      }
+      const parent = dirname(existing);
+      if (parent === existing)
+        throw new Error('Cannot resolve SAIL_E2E_CONFIG_DIR', { cause: error });
+      missing.unshift(basename(existing));
+      existing = parent;
+    }
+  }
+
+  const descendant = relative(tempRoot, configRoot);
+  if (
+    !descendant ||
+    descendant === '..' ||
+    descendant.startsWith(`..${sep}`) ||
+    isAbsolute(descendant)
+  )
+    throw new Error('SAIL_E2E_CONFIG_DIR must be inside the E2E temporary directory');
+}
 
 export function isolatedPaths(
   state: string,
@@ -10,6 +59,7 @@ export function isolatedPaths(
     Object.entries({
       SAIL_WORKTREE_ROOT: 'worktrees',
       SAIL_E2E_CONFIG_DIR: 'config',
+      CLAUDE_CONFIG_DIR: 'claude',
       XDG_CONFIG_HOME: 'config',
       XDG_DATA_HOME: 'data',
       XDG_CACHE_HOME: 'cache',

@@ -1662,6 +1662,8 @@ pub fn set_memory_provider(
     directory: String,
     input: ProviderInput,
 ) -> Result<ProviderStatus, String> {
+    #[cfg(feature = "e2e")]
+    let _writer = crate::settings::begin_e2e_settings_write()?;
     let key = project_key(&directory)?;
     let config = normalize_config(&input)?;
     let (root, _) = crate::memory::standalone_paths(&app)?;

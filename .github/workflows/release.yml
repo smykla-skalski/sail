@@ -113,7 +113,7 @@ jobs:
 
       - name: Build development installer
         if: runner.os != 'macOS' || env.SAIL_SIGNING_MODE == 'ad-hoc'
-        run: npm run tauri build -- --bundles ${{ matrix.bundles }} --ci
+        run: npm run tauri build -- --bundles ${{ matrix.bundles }} --ci ${{ matrix.target == 'macos-x64' && '-v' || '' }}
 
       - name: Build and notarize Developer ID installer
         if: runner.os == 'macOS' && env.SAIL_SIGNING_MODE == 'developer-id'
@@ -240,8 +240,10 @@ jobs:
       - name: Configure private fixture paths
         shell: bash
         run: |
-          private="$RUNNER_TEMP/sail-514-$GITHUB_RUN_ID"
+          test -n "${TMPDIR:-}"
+          private="$(mktemp -d "${TMPDIR%/}/sail-514-context.XXXXXX")"
           {
+            echo "SAIL_CONTEXT_AUTH_ROOT=$private"
             echo "SAIL_E2E_CONFIG_DIR=$private/config"
             echo "SAIL_TEST_SCRATCH=$private/test"
             echo "CARGO_TARGET_DIR=$private/target"
@@ -268,7 +270,7 @@ jobs:
           test -n "$APPLE_CERTIFICATE"
           test -n "$APPLE_CERTIFICATE_PASSWORD"
           test -n "$APPLE_SIGNING_IDENTITY"
-          private="$RUNNER_TEMP/sail-514-$GITHUB_RUN_ID"
+          private="$SAIL_CONTEXT_AUTH_ROOT"
           mkdir -p "$private"
           certificate="$private/certificate.p12"
           keychain="$private/signing.keychain-db"
@@ -301,8 +303,8 @@ jobs:
         if: always()
         shell: bash
         run: |
-          private="$RUNNER_TEMP/sail-514-$GITHUB_RUN_ID"
-          if [[ -n "$private" && "$private" == "$RUNNER_TEMP"/sail-514-* ]]; then
+          private="${SAIL_CONTEXT_AUTH_ROOT:-}"
+          if [[ -n "$private" && -n "${TMPDIR:-}" && "$(dirname "$private")" == "${TMPDIR%/}" && "$(basename "$private")" == sail-514-context.* ]]; then
             security delete-keychain "$private/signing.keychain-db" 2>/dev/null || true
             rm -rf "$private"
           fi
