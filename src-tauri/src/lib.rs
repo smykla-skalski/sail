@@ -213,6 +213,8 @@ pub mod context;
 pub mod context_output_store;
 mod dev_servers;
 mod diagnostics;
+#[cfg(feature = "e2e")]
+mod e2e_config;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
@@ -2985,6 +2987,7 @@ pub fn run() {
             diagnostics::diagnostic_event,
             worktree_storage_cleanup_status,
             retry_worktree_storage_cleanup,
+            settings::reset_test_settings,
             settings::load_settings,
             settings::migrate_settings,
             settings::save_setting,
@@ -3090,6 +3093,7 @@ pub fn run() {
             acp::acp_agents,
             acp::acp_connect,
             acp::acp_new_session,
+            acp::acp_reset_test_runtimes,
             acp::acp_forget_session,
             acp::acp_release_session_fence,
             acp::acp_load_session,

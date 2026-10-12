@@ -28,12 +28,30 @@ pub async fn machine_pressure(directory: Option<String>) -> Result<MachineReadin
         .filter(|disk| path.starts_with(disk.mount_point()))
         .max_by_key(|disk| disk.mount_point().components().count())
         .ok_or_else(|| format!("No mounted disk contains {}", path.display()))?;
-    Ok(MachineReading {
+    let reading = MachineReading {
         total_memory: system.total_memory(),
         available_memory: system.available_memory(),
         total_swap: system.total_swap(),
         used_swap: system.used_swap(),
         total_disk: disk.total_space(),
         available_disk: disk.available_space(),
-    })
+    };
+    #[cfg(feature = "e2e")]
+    let reading = e2e_machine_reading(reading)?;
+    Ok(reading)
+}
+
+#[cfg(feature = "e2e")]
+fn e2e_machine_reading(mut reading: MachineReading) -> Result<MachineReading, String> {
+    let Some(value) = std::env::var_os("SAIL_E2E_MACHINE_READING") else {
+        return Ok(reading);
+    };
+    if value != "healthy" {
+        return Err("SAIL_E2E_MACHINE_READING must be 'healthy' in E2E builds.".into());
+    }
+    reading.total_memory = 32_u64 * 1024 * 1024 * 1024;
+    reading.available_memory = 24_u64 * 1024 * 1024 * 1024;
+    reading.total_swap = 8_u64 * 1024 * 1024 * 1024;
+    reading.used_swap = 0;
+    Ok(reading)
 }

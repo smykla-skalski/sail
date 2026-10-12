@@ -1550,7 +1550,7 @@ mod tests {
 
         assert!(
             !directory.exists(),
-            "released stale data should be reclaimed"
+            "released stale data should be reclaimed; pending: {pending:?}"
         );
         assert!(!pending
             .iter()

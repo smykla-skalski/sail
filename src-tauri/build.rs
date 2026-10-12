@@ -27,6 +27,7 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "diagnostic_event",
+            "reset_test_settings",
             "load_settings",
             "machine_pressure",
             "migrate_settings",
@@ -133,6 +134,7 @@ fn main() {
             "acp_agents",
             "acp_connect",
             "acp_new_session",
+            "acp_reset_test_runtimes",
             "acp_forget_session",
             "acp_release_session_fence",
             "acp_load_session",
