@@ -11426,20 +11426,8 @@
         (status !== 'done' && status !== 'failed' && status !== 'interrupted')
       )
         return;
-      if (
-        status === 'done' &&
-        typeof turnId === 'string' &&
-        event.message.params?.notify !== false
-      ) {
-        const thread = agentThreads.find(
-          (item) =>
-            item.agent === event.agent &&
-            item.sessionId === sessionId &&
-            item.directory === eventDirectory,
-        );
-        if (thread)
-          void runCompletedChecks(thread.directory, `acp:${event.agent}:${sessionId}`, turnId);
-      }
+      if (status === 'done' && typeof turnId === 'string' && event.message.params?.notify !== false)
+        void runCompletedChecks(eventDirectory, `acp:${event.agent}:${sessionId}`, turnId);
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&

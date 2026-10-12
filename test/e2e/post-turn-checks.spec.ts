@@ -207,4 +207,31 @@ describe('post-turn checks', () => {
       async () => (await statuses()).filter((status) => status === 'passed').length === 2,
     );
   });
+
+  it('runs a post-turn check once after reloading during a turn', async () => {
+    const command = "printf 'run\\n' >> reload-runs.txt";
+    await browser.execute(async (value) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('save_setting', {
+        key: 'sai-post-turn-personal',
+        value: JSON.stringify([value]),
+      });
+      localStorage.setItem('sai-post-turn-personal', JSON.stringify([value]));
+    }, command);
+    await browser.refresh();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Long turn');
+    await $('.agent-actions button').click();
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-3 '));
+    await browser.refresh();
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-60 '), {
+      wait: 35_000,
+    });
+    await browser.waitUntil(() => existsSync(join(repository, 'reload-runs.txt')), {
+      timeoutMsg: 'The post-turn check did not run after the webview reloaded',
+    });
+    expect(readFileSync(join(repository, 'reload-runs.txt'), 'utf8')).toBe('run\n');
+    await browser.refresh();
+    expect(readFileSync(join(repository, 'reload-runs.txt'), 'utf8')).toBe('run\n');
+  });
 });
