@@ -347,6 +347,7 @@ export interface NativeSubagentSnapshotSet {
 export interface AcpPendingInboxItem {
   agent: AgentId;
   directory: string;
+  profile: CapabilityProfile;
   message: AgentEvent['message'];
   receivedAt: number;
 }

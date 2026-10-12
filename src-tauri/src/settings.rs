@@ -4,6 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "e2e")]
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(feature = "e2e")]
+use std::time::{Duration, Instant};
+#[cfg(not(feature = "e2e"))]
 use tauri::Manager;
 
 type Settings = BTreeMap<String, String>;
@@ -14,6 +19,98 @@ const INTERRUPTED_TURNS_KEY: &str = "sai-interrupted-agent-turns";
 const ACP_TURN_EVIDENCE_KEY: &str = "sai-acp-turn-evidence";
 const ACP_TURN_EVIDENCE_LIMIT: usize = 500;
 const ACP_UNSETTLED_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+#[cfg(feature = "e2e")]
+#[derive(Default)]
+struct E2eWriterState {
+    active: usize,
+    resetting: bool,
+}
+
+#[cfg(feature = "e2e")]
+struct E2eWriterGate {
+    state: Mutex<E2eWriterState>,
+    idle: Condvar,
+}
+
+#[cfg(feature = "e2e")]
+static E2E_WRITER_GATE: OnceLock<Arc<E2eWriterGate>> = OnceLock::new();
+
+#[cfg(feature = "e2e")]
+fn e2e_writer_gate() -> Arc<E2eWriterGate> {
+    E2E_WRITER_GATE
+        .get_or_init(|| {
+            Arc::new(E2eWriterGate {
+                state: Mutex::new(E2eWriterState::default()),
+                idle: Condvar::new(),
+            })
+        })
+        .clone()
+}
+
+#[cfg(feature = "e2e")]
+pub(crate) struct E2eWriterGuard(Arc<E2eWriterGate>);
+
+#[cfg(feature = "e2e")]
+impl Drop for E2eWriterGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.active -= 1;
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+#[cfg(feature = "e2e")]
+impl E2eWriterGate {
+    fn begin(self: &Arc<Self>) -> Result<E2eWriterGuard, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.resetting {
+            return Err("E2E settings writers are resetting".into());
+        }
+        state.active += 1;
+        Ok(E2eWriterGuard(self.clone()))
+    }
+
+    fn quiesce(&self, timeout: Duration) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.resetting = true;
+        let deadline = Instant::now() + timeout;
+        while state.active > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("Timed out quiescing E2E settings writers".into());
+            }
+            let (next, _) = self
+                .idle
+                .wait_timeout(state, remaining)
+                .map_err(|error| error.to_string())?;
+            state = next;
+        }
+        Ok(())
+    }
+
+    fn resume(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.resetting = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "e2e")]
+pub(crate) fn begin_e2e_settings_write() -> Result<E2eWriterGuard, String> {
+    e2e_writer_gate().begin()
+}
+
+#[cfg(feature = "e2e")]
+fn quiesce_e2e_settings_writes() -> Result<(), String> {
+    e2e_writer_gate().quiesce(Duration::from_secs(10))
+}
+
+#[cfg(feature = "e2e")]
+fn resume_e2e_settings_writes() -> Result<(), String> {
+    e2e_writer_gate().resume()
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -209,6 +306,8 @@ pub fn record_acp_turn_evidence(
     app: &tauri::AppHandle,
     evidence: AcpTurnEvidence,
 ) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
     let mut settings = read_settings(&path)?;
@@ -333,6 +432,8 @@ pub fn record_interrupted_turns(
     app: &tauri::AppHandle,
     interrupted: Vec<InterruptedAgentTurn>,
 ) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     if interrupted.is_empty() {
         return Ok(());
     }
@@ -350,6 +451,8 @@ pub fn clear_interrupted_turn(
     session_id: &str,
     turn_id: &str,
 ) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     let path = settings_path(app)?;
     let _lock = lock_settings(&path)?;
     let mut settings = read_settings(&path)?;
@@ -382,14 +485,18 @@ pub fn finish_interrupted_agent_turn(
 
 pub(crate) fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(feature = "e2e")]
-    if let Some(root) = std::env::var_os("SAIL_E2E_CONFIG_DIR") {
-        return Ok(PathBuf::from(root).join("settings.json"));
+    {
+        let _ = app;
+        Ok(crate::e2e_config::root()?.join("settings.json"))
     }
-    let config = app
-        .path()
-        .config_dir()
-        .map_err(|error| format!("Cannot locate the configuration directory: {error}"))?;
-    Ok(config.join("sail").join("settings.json"))
+    #[cfg(not(feature = "e2e"))]
+    {
+        let config = app
+            .path()
+            .config_dir()
+            .map_err(|error| format!("Cannot locate the configuration directory: {error}"))?;
+        Ok(config.join("sail").join("settings.json"))
+    }
 }
 
 fn lock_settings(path: &Path) -> Result<File, String> {
@@ -750,6 +857,26 @@ pub fn string_setting(app: &tauri::AppHandle, key: &str) -> Result<Option<String
     Ok(read_settings(&path)?.remove(key))
 }
 
+/// Clear disk-backed fixture settings between E2E specs under the normal settings lock.
+#[tauri::command]
+pub fn reset_test_settings(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        let path = settings_path(&app)?;
+        crate::post_turn_checks::quiesce_test_checks(&app)?;
+        quiesce_e2e_settings_writes()?;
+        let _lock = lock_settings(&path)?;
+        write_settings(&path, &Settings::new())?;
+        resume_e2e_settings_writes()?;
+        crate::post_turn_checks::resume_test_checks(&app)
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let _ = app;
+        Err("Settings reset requires the E2E build".into())
+    }
+}
+
 #[tauri::command]
 pub fn load_settings(app: tauri::AppHandle) -> Result<Settings, String> {
     let path = settings_path(&app)?;
@@ -763,6 +890,8 @@ pub fn migrate_settings(
     legacy: Settings,
     prefer_legacy: bool,
 ) -> Result<Settings, String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     let path = settings_path(&app)?;
     let _lock = lock_settings(&path)?;
     let mut saved = read_settings(&path)?;
@@ -822,6 +951,8 @@ pub fn save_setting(
     key: String,
     value: Option<String>,
 ) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = begin_e2e_settings_write()?;
     if !key.starts_with("sai-") && key != "sail-agent-threads" {
         return Err("Unknown settings key.".to_string());
     }
@@ -865,6 +996,12 @@ mod tests {
         InterruptedAgentTurn, Settings, ACP_TURN_EVIDENCE_LIMIT, ACP_UNSETTLED_RETENTION_MS,
         DELETIONS_KEY,
     };
+    #[cfg(feature = "e2e")]
+    use super::{E2eWriterGate, E2eWriterState};
+    #[cfg(feature = "e2e")]
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    #[cfg(feature = "e2e")]
+    use std::time::Duration;
 
     #[test]
     fn prepared_turn_keeps_pending_check_until_completion_but_legacy_history_is_silent() {
@@ -1271,5 +1408,39 @@ mod tests {
         }
         assert_eq!(read_settings(&path).unwrap().len(), 8);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "e2e")]
+    #[test]
+    fn e2e_settings_reset_waits_for_writers_and_fails_closed_on_timeout() {
+        let gate = Arc::new(E2eWriterGate {
+            state: Mutex::new(E2eWriterState::default()),
+            idle: Condvar::new(),
+        });
+        let writer = gate.begin().unwrap();
+        let waiting = gate.clone();
+        let (sender, receiver) = mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            sender
+                .send(waiting.quiesce(Duration::from_secs(1)))
+                .unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(25)).is_err());
+        drop(writer);
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        reset.join().unwrap();
+        assert!(gate.begin().is_err());
+        gate.resume().unwrap();
+        assert!(gate.begin().is_ok());
+
+        let writer = gate.begin().unwrap();
+        assert!(gate.quiesce(Duration::from_millis(1)).is_err());
+        assert!(gate.begin().is_err());
+        drop(writer);
+        gate.resume().unwrap();
+        assert!(gate.begin().is_ok());
     }
 }

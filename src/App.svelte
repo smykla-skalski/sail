@@ -505,6 +505,7 @@
     setSetting,
     setSettingDurable,
     settingsError,
+    trackSettingsMutation,
   } from './lib/settings';
   import {
     defaultResourceLimits,
@@ -1626,7 +1627,10 @@
   let selection = 0;
   const paneSelections = new SvelteMap<string, number>();
   let sidebarInventoryGeneration = 0;
+  let sidebarInventorySchedule = 0;
   let sidebarInventoryTimer: ReturnType<typeof setTimeout> | undefined;
+  let sidebarInventoryReadyKey = '';
+  let agentDetectionSettled = false;
   let projectLoadGeneration = 0;
 
   let actionAgentThread = $derived(
@@ -2100,6 +2104,7 @@
     } catch (cause) {
       agentDetectionError = `Could not detect agents: ${describe(cause)}`;
     }
+    agentDetectionSettled = true;
     await sendSettingsState();
   }
 
@@ -9081,12 +9086,31 @@
 
   function scheduleSidebarInventoryRefresh() {
     clearTimeout(sidebarInventoryTimer);
+    sidebarInventoryReadyKey = '';
+    const key = sidebarDirectoryKey;
+    const schedule = ++sidebarInventorySchedule;
     sidebarInventoryTimer = setTimeout(() => {
+      sidebarInventoryTimer = undefined;
       void refreshSidebarOpenCodeThreads(JSON.parse(sidebarDirectoryKey)).then(
-        reportSidebarInventoryFailure,
+        (failure) => {
+          reportSidebarInventoryFailure(failure);
+          if (!failure && key === sidebarDirectoryKey && schedule === sidebarInventorySchedule)
+            sidebarInventoryReadyKey = key;
+          return undefined;
+        },
         (cause: unknown) => reportSidebarInventoryFailure(describe(cause)),
       );
     }, 250);
+  }
+
+  if (import.meta.env.MODE === 'e2e') {
+    Object.assign(window, {
+      __SAIL_E2E_SIDEBAR_INVENTORY_READY__: () =>
+        agentDetectionSettled &&
+        (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available) ||
+          (sidebarInventoryReadyKey === sidebarDirectoryKey &&
+            sidebarInventoryTimer === undefined)),
+    });
   }
 
   $effect(() => {
@@ -11139,14 +11163,18 @@
             'Approve command',
           );
           if (!allow) {
-            const canceled = await invoke<PostTurnCheck>('cancel_post_turn_check', check);
+            const canceled = await trackSettingsMutation(() =>
+              invoke<PostTurnCheck>('cancel_post_turn_check', check),
+            );
             postTurnResults = upsertCheck(postTurnResults, canceled);
             return hasDurableCheckOutcome(canceled);
           }
-          await invoke('approve_post_turn_check', {
-            directory: check.directory,
-            command: check.command,
-          });
+          await trackSettingsMutation(() =>
+            invoke('approve_post_turn_check', {
+              directory: check.directory,
+              command: check.command,
+            }),
+          );
         }
       }
       postTurnResults = upsertCheck(postTurnResults, { ...check, status: 'running' });

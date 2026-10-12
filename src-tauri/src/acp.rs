@@ -834,6 +834,7 @@ fn resolve_session_permissions(
 pub struct PendingPermissionInfo {
     agent: String,
     directory: String,
+    profile: String,
     message: Value,
     received_at: u64,
 }
@@ -2398,6 +2399,7 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                profile: runtime.profile.as_str().to_string(),
                 directory: runtime
                     .session_directories
                     .lock()
@@ -2424,6 +2426,7 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                profile: runtime.profile.as_str().to_string(),
                 directory: runtime
                     .session_directories
                     .lock()
@@ -3833,6 +3836,22 @@ pub fn acp_release_session_fence(
     session_id: String,
 ) -> Result<(), String> {
     fence.release_session(&agent, Path::new(&directory), &session_id)
+}
+
+/// E2E specs share one app process; release their fixture runtimes between specs.
+/// The command is only permitted by the E2E capability and has no production effect.
+#[tauri::command]
+pub fn acp_reset_test_runtimes(manager: State<'_, AgentManager>) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        manager.shutdown();
+        Ok(())
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let _ = manager;
+        Err("ACP test runtime reset requires the E2E build".into())
+    }
 }
 
 /// Releases the browser token a deleted thread's session still holds.

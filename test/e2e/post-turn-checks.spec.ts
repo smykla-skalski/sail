@@ -284,4 +284,52 @@ describe('post-turn checks', () => {
     await browser.refresh();
     expect(readFileSync(join(repository, 'reload-runs.txt'), 'utf8')).toBe('run\n');
   });
+
+  it('does not restore check history after a fixture reset cancels a running check', async () => {
+    const command = 'sleep 8; printf stale-check';
+    await browser.execute(async (value) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('save_setting', {
+        key: 'sai-post-turn-personal',
+        value: JSON.stringify([value]),
+      });
+      Reflect.set(
+        window,
+        '__SAIL_E2E_POST_TURN_PENDING__',
+        tauri.core.invoke('run_post_turn_check', {
+          request: {
+            directory: localStorage.getItem('sai-directory'),
+            thread: 'reset-check-thread',
+            turn: 'reset-check-turn',
+            source: 'personal',
+            command: value,
+            retry: false,
+          },
+        }),
+      );
+    }, command);
+    await browser.waitUntil(() =>
+      browser.execute(async () => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        const checks: unknown = await tauri.core.invoke('list_post_turn_checks');
+        return Array.isArray(checks)
+          ? checks.some(
+              (check) =>
+                check.command === 'sleep 8; printf stale-check' && check.status === 'running',
+            )
+          : false;
+      }),
+    );
+    const result = await browser.execute(async () => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      const quiesce = Reflect.get(window, '__SAIL_E2E_QUIESCE_SETTINGS__');
+      if (typeof quiesce !== 'function') throw new Error('E2E settings quiescence is unavailable');
+      await quiesce();
+      await tauri.core.invoke('reset_test_settings');
+      const pending = Reflect.get(window, '__SAIL_E2E_POST_TURN_PENDING__');
+      return { check: await pending, settings: await tauri.core.invoke('load_settings') };
+    });
+    expect(result.check.status).toBe('canceled');
+    expect(result.settings).toEqual({});
+  });
 });
