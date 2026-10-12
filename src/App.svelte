@@ -259,7 +259,9 @@
   import { resolveTaskLocation, type TaskLocation as TaskLocationValue } from './lib/task-location';
   import {
     checkKey,
+    hasDurableCheckOutcome,
     personalChecks,
+    retryInterruptedCheck,
     upsertCheck,
     type PostTurnCheck,
   } from './lib/post-turn-checks';
@@ -11109,16 +11111,11 @@
       }).catch(() => undefined),
   });
 
-  function hasDurableCheckOutcome(status: PostTurnCheck['status']): boolean {
-    return (
-      status === 'passed' || status === 'failed' || status === 'timed_out' || status === 'canceled'
-    );
-  }
-
   async function runOnePostTurnCheck(check: PostTurnCheck, retry = false): Promise<boolean> {
     const key = checkKey(check);
     if (pendingPostTurnChecks.has(key)) return false;
     pendingPostTurnChecks.add(key);
+    let retryRecovered = false;
     try {
       if (!retry) {
         const stored = (await invoke<PostTurnCheck[]>('list_post_turn_checks')).find(
@@ -11126,7 +11123,8 @@
         );
         if (stored) {
           postTurnResults = upsertCheck(postTurnResults, stored);
-          return hasDurableCheckOutcome(stored.status);
+          retryRecovered = retryInterruptedCheck(stored);
+          if (!retryRecovered) return hasDurableCheckOutcome(stored);
         }
       }
       if (check.source === 'repository') {
@@ -11143,7 +11141,7 @@
           if (!allow) {
             const canceled = await invoke<PostTurnCheck>('cancel_post_turn_check', check);
             postTurnResults = upsertCheck(postTurnResults, canceled);
-            return hasDurableCheckOutcome(canceled.status);
+            return hasDurableCheckOutcome(canceled);
           }
           await invoke('approve_post_turn_check', {
             directory: check.directory,
@@ -11153,10 +11151,10 @@
       }
       postTurnResults = upsertCheck(postTurnResults, { ...check, status: 'running' });
       const result = await invoke<PostTurnCheck>('run_post_turn_check', {
-        request: { ...check, retry },
+        request: { ...check, retry: retry || retryRecovered },
       });
       postTurnResults = upsertCheck(postTurnResults, result);
-      return hasDurableCheckOutcome(result.status);
+      return hasDurableCheckOutcome(result);
     } catch (cause) {
       postTurnResults = upsertCheck(postTurnResults, {
         ...check,

@@ -319,6 +319,97 @@ describe('post-turn check recovery', () => {
     );
   });
 
+  it('retries a check interrupted by restart once and leaves a declined check settled', async () => {
+    const check = "printf 'recovered\\n' >> restart-runs.txt";
+    writeFileSync(
+      join(repository, '.sail', 'worktree.json'),
+      JSON.stringify({ postTurnChecks: [] }),
+    );
+    const recovered = await browser.execute(
+      async (path, checkCommand) => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        const turn = (sessionId: string, turnId: string) => ({
+          agent: 'claude',
+          directory: path,
+          sessionId,
+          turnId,
+          status: 'done',
+          error: null,
+          updatedAt: Date.now(),
+          postTurnPending: true,
+        });
+        const result = (sessionId: string, turnId: string, status: string) => ({
+          id: JSON.stringify([path, `acp:claude:${sessionId}`, turnId, 'personal', checkCommand]),
+          updated: Date.now(),
+          directory: path,
+          thread: `acp:claude:${sessionId}`,
+          turn: turnId,
+          source: 'personal',
+          command: checkCommand,
+          status,
+          output: '',
+          code: null,
+        });
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-acp-turn-evidence',
+          value: JSON.stringify([
+            turn('restart-session', 'restart-turn'),
+            turn('declined-session', 'declined-turn'),
+          ]),
+        });
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-post-turn-history',
+          value: JSON.stringify([
+            result('restart-session', 'restart-turn', 'running'),
+            result('declined-session', 'declined-turn', 'canceled'),
+          ]),
+        });
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-post-turn-personal',
+          value: JSON.stringify([checkCommand]),
+        });
+        localStorage.setItem('sai-post-turn-personal', JSON.stringify([checkCommand]));
+        return tauri.core.invoke('list_post_turn_checks');
+      },
+      repository,
+      check,
+    );
+    expect(recovered.find((item: { turn: string }) => item.turn === 'restart-turn')).toMatchObject({
+      status: 'canceled',
+      restartInterrupted: true,
+    });
+    expect(recovered.find((item: { turn: string }) => item.turn === 'declined-turn')).toMatchObject(
+      { status: 'canceled', restartInterrupted: false },
+    );
+
+    await browser.refresh();
+    await browser.waitUntil(() => existsSync(join(repository, 'restart-runs.txt')), {
+      timeoutMsg: 'Restart-interrupted check did not run automatically',
+    });
+    await browser.waitUntil(() =>
+      browser.execute(async (path) => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        const turns = await Promise.all(
+          [
+            ['restart-session', 'restart-turn'],
+            ['declined-session', 'declined-turn'],
+          ].map(([sessionId, turnId]) =>
+            tauri.core.invoke('get_acp_turn_evidence', {
+              agent: 'claude',
+              directory: path,
+              sessionId,
+              turnId,
+            }),
+          ),
+        );
+        return turns.every((turn) => turn?.postTurnPending === false);
+      }, repository),
+    );
+    expect(readFileSync(join(repository, 'restart-runs.txt'), 'utf8')).toBe('recovered\n');
+    await browser.refresh();
+    expect(readFileSync(join(repository, 'restart-runs.txt'), 'utf8')).toBe('recovered\n');
+  });
+
   it('shows a persistent write failure and waits for verified recovery before running', async () => {
     const check = "printf 'saved\\n' >> evidence-retry-runs.txt";
     writeFileSync(

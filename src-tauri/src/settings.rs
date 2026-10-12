@@ -118,6 +118,10 @@ fn merge_acp_turn_evidence_at(
 ) -> Result<(), String> {
     item.updated_at = now;
     let mut evidence = acp_turn_evidence(settings);
+    let previous_pending = evidence
+        .iter()
+        .filter(|saved| saved.post_turn_pending)
+        .count();
     let protected = protected_acp_turns(settings);
     if item.status == "prepared" {
         evidence.retain(|saved| {
@@ -165,12 +169,22 @@ fn merge_acp_turn_evidence_at(
             ))
             || now.saturating_sub(saved.updated_at) <= ACP_UNSETTLED_RETENTION_MS
     });
+    let pending = evidence
+        .iter()
+        .filter(|saved| saved.post_turn_pending)
+        .count();
+    if pending > ACP_TURN_EVIDENCE_LIMIT && pending > previous_pending {
+        return Err(format!(
+            "Post-turn check backlog is full ({ACP_TURN_EVIDENCE_LIMIT} turns). Resolve pending checks before sending another prompt."
+        ));
+    }
     let completed = evidence
         .iter()
         .filter(|item| !unsettled_acp_evidence(&item.status) && !item.post_turn_pending)
         .count();
-    if completed > ACP_TURN_EVIDENCE_LIMIT {
-        let mut remove = completed - ACP_TURN_EVIDENCE_LIMIT;
+    let completed_limit = ACP_TURN_EVIDENCE_LIMIT.saturating_sub(pending);
+    if completed > completed_limit {
+        let mut remove = completed - completed_limit;
         evidence.retain(|item| {
             if remove > 0 && !unsettled_acp_evidence(&item.status) && !item.post_turn_pending {
                 remove -= 1;
@@ -847,8 +861,9 @@ mod tests {
         acp_turn_evidence, filter_legacy, interrupted_turns, lock_settings,
         merge_acp_turn_evidence, merge_acp_turn_evidence_at, merge_catalog,
         merge_interrupted_turns, merge_threads, read_settings, remove_interrupted_turn,
-        update_deletions, write_settings, AcpTurnEvidence, Deletions, InterruptedAgentTurn,
-        Settings, ACP_TURN_EVIDENCE_LIMIT, ACP_UNSETTLED_RETENTION_MS, DELETIONS_KEY,
+        update_deletions, write_acp_turn_evidence, write_settings, AcpTurnEvidence, Deletions,
+        InterruptedAgentTurn, Settings, ACP_TURN_EVIDENCE_LIMIT, ACP_UNSETTLED_RETENTION_MS,
+        DELETIONS_KEY,
     };
 
     #[test]
@@ -911,6 +926,51 @@ mod tests {
             .iter()
             .any(|item| item.turn_id == "pending" && item.post_turn_pending));
         assert!(!saved.iter().any(|item| item.turn_id == "old-0"));
+    }
+
+    #[test]
+    fn pending_check_backlog_refuses_new_dispatch_without_losing_existing_recovery() {
+        let turn = |index: usize, status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: format!("session-{index}"),
+            turn_id: format!("turn-{index}"),
+            status: status.into(),
+            error: None,
+            updated_at: 1,
+            post_turn_pending: pending,
+        };
+        let mut settings = Settings::new();
+        let pending = (0..ACP_TURN_EVIDENCE_LIMIT)
+            .map(|index| turn(index, "done", true))
+            .collect::<Vec<_>>();
+        write_acp_turn_evidence(&mut settings, &pending).unwrap();
+
+        let error = merge_acp_turn_evidence_at(
+            &mut settings,
+            turn(ACP_TURN_EVIDENCE_LIMIT, "prepared", true),
+            2,
+        )
+        .unwrap_err();
+        assert!(error.contains("backlog is full"));
+        assert_eq!(acp_turn_evidence(&settings), pending);
+
+        let mut settled = pending;
+        settled[0].post_turn_pending = false;
+        write_acp_turn_evidence(&mut settings, &settled).unwrap();
+        merge_acp_turn_evidence_at(
+            &mut settings,
+            turn(ACP_TURN_EVIDENCE_LIMIT, "prepared", true),
+            3,
+        )
+        .unwrap();
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), ACP_TURN_EVIDENCE_LIMIT);
+        assert_eq!(
+            saved.iter().filter(|item| item.post_turn_pending).count(),
+            500
+        );
+        assert!(saved.iter().all(|item| item.turn_id != "turn-0"));
     }
 
     #[test]
