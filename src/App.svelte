@@ -266,6 +266,7 @@
     upsertCheck,
     type PostTurnCheck,
   } from './lib/post-turn-checks';
+  import { createTurnVerificationQueue } from './lib/turn-verification-queue';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import { promptSkill, type SkillChoice } from './lib/skills';
@@ -890,7 +891,7 @@
   };
   let postTurnResults = $state<PostTurnCheck[]>([]);
   const pendingPostTurnChecks = new SvelteSet<string>();
-  const verifyingCompletedTurns = new SvelteSet<string>();
+  const queueTurnVerification = createTurnVerificationQueue();
   const pendingCompletionErrors = new SvelteMap<string, string>();
   let personalPostTurnChecks = $state(personalChecks(getSetting('sai-post-turn-personal')));
   type TurnSnapshot = { id: string; kind: 'turn' | 'undo'; created: number };
@@ -11240,29 +11241,27 @@
     turnId: string,
   ) {
     const key = JSON.stringify([agent, path, sessionId, turnId]);
-    if (verifyingCompletedTurns.has(key)) return;
-    verifyingCompletedTurns.add(key);
-    try {
-      const evidence = await acp.turnEvidence(agent, path, sessionId, turnId);
-      if (
-        evidence?.status !== 'done' ||
-        !evidence.postTurnPending ||
-        evidence.agent !== agent ||
-        evidence.directory !== path ||
-        evidence.sessionId !== sessionId ||
-        evidence.turnId !== turnId
-      )
-        return;
-      const warning = pendingCompletionErrors.get(key);
-      pendingCompletionErrors.delete(key);
-      if (warning && error === warning) error = '';
-      if (!(await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId))) return;
-      await acp.finishPostTurnChecks(agent, path, sessionId, turnId);
-    } catch (cause) {
-      error = `Could not verify completed agent turn: ${describe(cause)}`;
-    } finally {
-      verifyingCompletedTurns.delete(key);
-    }
+    await queueTurnVerification(key, async () => {
+      try {
+        const evidence = await acp.turnEvidence(agent, path, sessionId, turnId);
+        if (
+          evidence?.status !== 'done' ||
+          !evidence.postTurnPending ||
+          evidence.agent !== agent ||
+          evidence.directory !== path ||
+          evidence.sessionId !== sessionId ||
+          evidence.turnId !== turnId
+        )
+          return;
+        const warning = pendingCompletionErrors.get(key);
+        pendingCompletionErrors.delete(key);
+        if (warning && error === warning) error = '';
+        if (!(await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId))) return;
+        await acp.finishPostTurnChecks(agent, path, sessionId, turnId);
+      } catch (cause) {
+        error = `Could not verify completed agent turn: ${describe(cause)}`;
+      }
+    });
   }
 
   async function retryPostTurnCheck(check: PostTurnCheck) {
