@@ -4738,6 +4738,7 @@ fn connect_blocking_inner(
                                 let scratch_owner = runtime.scratch_owner.as_deref();
                                 #[cfg(not(unix))]
                                 let scratch_owner = None;
+                                #[cfg(unix)]
                                 let build_directory =
                                     runtime.shared_build_directory.clone().or_else(|| {
                                         runtime
@@ -4747,6 +4748,8 @@ fn connect_blocking_inner(
                                             .as_ref()
                                             .map(|scratch| scratch.path().join("build"))
                                     });
+                                #[cfg(not(unix))]
+                                let build_directory = None::<PathBuf>;
                                 let session_id = params
                                     .get("sessionId")
                                     .and_then(Value::as_str)
@@ -7516,7 +7519,9 @@ time.sleep(10)
         Arc::new(Connection {
             agent: agent.to_owned(),
             profile,
-            worktree: worktree.to_path_buf(),
+            // Production connect stores the canonical worktree identity. macOS temp paths
+            // often pass through /var -> /private/var, so the test runtime must match it.
+            worktree: super::worktree_identity(worktree),
             owner: owner.map(str::to_string),
             #[cfg(unix)]
             shared_build_directory: build_directory,
