@@ -278,6 +278,7 @@ export function currentCatalogWorktrees(
   const live = new Map(registered.map((item) => [item.path, item.generation]));
   return (catalog.worktrees[repository] ?? []).filter(
     (worktree) =>
+      !!worktree.pendingCleanup ||
       !worktree.generation ||
       !live.has(worktree.path) ||
       live.get(worktree.path) === worktree.generation,
@@ -290,7 +291,15 @@ export function externalGitWorktrees(
   registered: { path: string; branch: string | null; generation: string | null }[],
 ): ProjectWorktree[] {
   const known = new Set(
-    currentCatalogWorktrees(catalog, repository, registered).map((worktree) => worktree.path),
+    currentCatalogWorktrees(catalog, repository, registered)
+      .filter(
+        (worktree) =>
+          !worktree.pendingCleanup ||
+          registered.some(
+            (entry) => entry.path === worktree.path && entry.generation === worktree.generation,
+          ),
+      )
+      .map((worktree) => worktree.path),
   );
   return registered
     .filter((worktree) => worktree.path !== repository && !known.has(worktree.path))

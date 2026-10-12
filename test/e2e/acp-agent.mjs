@@ -157,9 +157,12 @@ function runTerminal(sessionId, text, promptId) {
     return;
   }
   const stop = text.includes('stop');
-  const script = stop
-    ? 'echo started; sleep 30; echo done'
-    : 'echo started; sleep 1; echo finished; exit 7';
+  const script =
+    text === 'Terminal: Native build'
+      ? 'mkdir -p "$CARGO_TARGET_DIR"; printf marker > "$CARGO_TARGET_DIR/terminal-marker"; printf "CARGO_TARGET_DIR=%s\\n" "$CARGO_TARGET_DIR"'
+      : stop
+        ? 'echo started; sleep 30; echo done'
+        : 'echo started; sleep 1; echo finished; exit 7';
   terminalRequest(
     'terminal/create',
     { sessionId, command: '/bin/sh', args: ['-c', script], outputByteLimit: 1024 },
@@ -476,6 +479,21 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    if (text === 'Long owned history') {
+      for (let index = 0; index < 80; index++)
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: `owned-history-${index}`,
+          title: `Owned history ${index}`,
+          status: 'completed',
+        });
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Long history complete.' },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Native child controls') {
       for (const suffix of ['first', 'sibling']) {
         const childId = `${sessionId}:${suffix}`;

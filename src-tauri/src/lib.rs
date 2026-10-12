@@ -243,6 +243,13 @@ mod opencode_config;
 mod owned_processes;
 mod post_turn_checks;
 mod project_knowledge;
+#[cfg(unix)]
+mod scratch_cleanup;
+
+#[cfg(unix)]
+pub fn exec_with_scratch_owner() -> ! {
+    scratch_cleanup::exec_with_scratch_owner()
+}
 mod settings;
 mod shell_command;
 mod ship_actions;
@@ -2386,28 +2393,32 @@ async fn delete_worktree(
                             &directory,
                             expected_generation.as_deref(),
                         )?;
-                        let result = if archive_ignored == Some(true) {
-                            archive_ignored_and_remove(
+                        if archive_ignored == Some(true) {
+                            let result = archive_ignored_and_remove(
                                 checked,
                                 worktree,
                                 expected_revision,
                                 expected_branch,
-                            )
+                            );
+                            if result.is_ok() {
+                                removed_from_git = true;
+                            }
+                            result
                         } else {
-                            remove_worktree_guarded(
+                            remove_worktree_guarded_with_hook(
                                 checked,
                                 worktree,
                                 force,
                                 expected_revision.as_deref(),
                                 expected_branch.as_deref(),
                                 expected_generation.as_deref(),
+                                || {
+                                    removed_from_git = true;
+                                    Ok(())
+                                },
                             )?;
                             Ok(None)
-                        };
-                        if result.is_ok() {
-                            removed_from_git = true;
                         }
-                        result
                     })
                 },
             )
@@ -3460,6 +3471,7 @@ fn remove_worktree(
     )
 }
 
+#[cfg(test)]
 fn remove_worktree_guarded(
     repository: String,
     worktree: String,
@@ -3468,6 +3480,29 @@ fn remove_worktree_guarded(
     expected_branch: Option<&str>,
     expected_generation: Option<&str>,
 ) -> Result<(), String> {
+    remove_worktree_guarded_with_hook(
+        repository,
+        worktree,
+        force,
+        expected_revision,
+        expected_branch,
+        expected_generation,
+        || Ok(()),
+    )
+}
+
+fn remove_worktree_guarded_with_hook<F>(
+    repository: String,
+    worktree: String,
+    force: Option<bool>,
+    expected_revision: Option<&str>,
+    expected_branch: Option<&str>,
+    expected_generation: Option<&str>,
+    after_remove: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     remove_worktree_with_hooks(
         repository,
         worktree,
@@ -3475,7 +3510,7 @@ fn remove_worktree_guarded(
         expected_revision,
         expected_branch,
         expected_generation,
-        (|| Ok(()), || Ok(()), || Ok(()), |_| Ok(()), || Ok(())),
+        (|| Ok(()), || Ok(()), || Ok(()), |_| Ok(()), after_remove),
     )
 }
 
@@ -3890,10 +3925,15 @@ pub fn run() {
             if let Err(error) = diagnostics::init(_app.handle()) {
                 eprintln!("Sail diagnostics unavailable: {error}");
             }
-            if let Ok(cache_directory) = _app.path().app_cache_dir() {
-                worktree_storage::reconcile(&cache_directory);
-                git_overlay::initialize(&cache_directory);
+            let cache_directory = _app.path().app_cache_dir().ok();
+            if let Some(cache_directory) = cache_directory.as_ref() {
+                worktree_storage::reconcile(cache_directory);
+                git_overlay::initialize(cache_directory);
             }
+            #[cfg(unix)]
+            std::thread::spawn(move || {
+                scratch_cleanup::sweep_on_startup(cache_directory.as_deref())
+            });
             let process_directory = _app.path().app_config_dir()?.join("owned-processes");
             owned_processes::init(process_directory).map_err(std::io::Error::other)?;
             browser_agent::start_bridge(_app.handle())?;
@@ -3920,6 +3960,8 @@ pub fn run() {
             worktree_storage_cleanup_status,
             retry_worktree_storage_cleanup,
             retry_selected_removed_worktree_storage,
+            selected_removed_worktree_storage,
+            clean_pending_worktree_temp,
             settings::reset_test_settings,
             settings::load_settings,
             settings::migrate_settings,
@@ -4033,6 +4075,7 @@ pub fn run() {
             acp_terminal::acp_terminal_inspect_wait,
             acp::acp_agents,
             acp::acp_connect,
+            acp::acp_release_owner,
             acp::acp_new_session,
             acp::acp_reset_test_runtimes,
             acp::acp_forget_session,
@@ -4145,6 +4188,8 @@ fn worktree_storage_cleanup_status(
 fn retry_worktree_storage_cleanup(
     app: tauri::AppHandle,
 ) -> Result<Vec<worktree_storage::CleanupPending>, String> {
+    app.state::<acp::AgentManager>()
+        .retry_turn_temp_cleanup(&app);
     let cache = app
         .path()
         .app_cache_dir()
@@ -4176,6 +4221,45 @@ fn retry_selected_removed_worktree_storage(
         &expected_generation,
         &cache_key,
     )
+}
+
+#[tauri::command]
+fn selected_removed_worktree_storage(
+    app: tauri::AppHandle,
+    repository: String,
+    original_worktree: String,
+    expected_generation: String,
+) -> Result<Vec<worktree_storage::SelectedStorageLocation>, String> {
+    if !Path::new(&original_worktree).is_absolute() {
+        return Err("The selected original worktree path is invalid.".into());
+    }
+    let repository = validate_repository(repository)?;
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    worktree_storage::selected_removed_storage_locations(
+        &cache,
+        Path::new(&repository),
+        Path::new(&original_worktree),
+        &expected_generation,
+    )
+}
+
+#[tauri::command]
+fn clean_pending_worktree_temp(
+    app: tauri::AppHandle,
+    token: String,
+    confirmed_unused: bool,
+) -> Result<Vec<worktree_storage::CleanupPending>, String> {
+    if !confirmed_unused {
+        return Err("Confirm that no process is using this temporary data.".into());
+    }
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    worktree_storage::clean_pending_temp(&cache, &token)
 }
 
 #[cfg(test)]
@@ -5261,6 +5345,35 @@ mod tests {
             "new edits\n"
         );
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_removal_signals_git_success_before_later_cleanup_error() {
+        let (root, repository, worktree, revision) =
+            ignored_archive_fixture("sail-removal-post-git-error");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+        let signalled = std::cell::Cell::new(false);
+
+        let error = super::remove_worktree_guarded_with_hook(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            Some("child"),
+            Some(&generation),
+            || {
+                signalled.set(true);
+                Err("post-Git cleanup failed".into())
+            },
+        )
+        .unwrap_err();
+
+        assert!(signalled.get());
+        assert!(error.contains("post-Git cleanup failed"));
+        assert!(!Path::new(&worktree).exists());
         fs::remove_dir_all(root).unwrap();
     }
 

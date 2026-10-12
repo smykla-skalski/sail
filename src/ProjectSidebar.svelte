@@ -469,6 +469,16 @@
     return externalGitWorktrees(catalog, repository, registeredWorktrees[repository] ?? []);
   }
 
+  function pendingIdentityMissing(repository: string, worktree: ProjectWorktree): boolean {
+    return (
+      !!worktree.pendingCleanup &&
+      !!worktree.generation &&
+      !(registeredWorktrees[repository] ?? []).some(
+        (entry) => entry.path === worktree.path && entry.generation === worktree.generation,
+      )
+    );
+  }
+
   function pendingCleanupSize(bytes: number | null): string {
     if (bytes === null) return 'Unknown';
     if (bytes < 1024) return `${bytes} B`;
@@ -1204,7 +1214,10 @@
                     class="project-worktree-row"
                     role="group"
                     oncontextmenu={(event) => {
-                      if (!worktreeDeletions[worktree.path])
+                      if (
+                        !worktreeDeletions[worktree.path] &&
+                        !pendingIdentityMissing(path, worktree)
+                      )
                         openMenu({ kind: 'worktree', repository: path, worktree }, event);
                     }}
                   >
@@ -1219,9 +1232,15 @@
                         ? agentListID(worktree.path)
                         : undefined}
                       title={worktree.path}
-                      disabled={disabled || !!worktreeDeletions[worktree.path]}
+                      disabled={disabled ||
+                        !!worktreeDeletions[worktree.path] ||
+                        pendingIdentityMissing(path, worktree)}
                       onmousedown={(event) => {
-                        if (event.button === 2 && !worktreeDeletions[worktree.path])
+                        if (
+                          event.button === 2 &&
+                          !worktreeDeletions[worktree.path] &&
+                          !pendingIdentityMissing(path, worktree)
+                        )
                           void openMenu({ kind: 'worktree', repository: path, worktree }, event);
                       }}
                       onclick={() =>
@@ -1244,7 +1263,8 @@
                       aria-haspopup="menu"
                       aria-expanded={menu?.kind === 'worktree' &&
                         menu.worktree.path === worktree.path}
-                      disabled={!!worktreeDeletions[worktree.path]}
+                      disabled={!!worktreeDeletions[worktree.path] ||
+                        pendingIdentityMissing(path, worktree)}
                       onclick={(event) =>
                         openMenu(
                           { kind: 'worktree', repository: path, worktree },
@@ -1403,7 +1423,10 @@
                   class="project-worktree-row"
                   role="group"
                   oncontextmenu={(event) => {
-                    if (!worktreeDeletions[worktree.path])
+                    if (
+                      !worktreeDeletions[worktree.path] &&
+                      !pendingIdentityMissing(path, worktree)
+                    )
                       openMenu({ kind: 'worktree', repository: path, worktree }, event);
                   }}
                 >
@@ -1418,9 +1441,15 @@
                       ? agentListID(worktree.path)
                       : undefined}
                     title={worktree.path}
-                    disabled={disabled || !!worktreeDeletions[worktree.path]}
+                    disabled={disabled ||
+                      !!worktreeDeletions[worktree.path] ||
+                      pendingIdentityMissing(path, worktree)}
                     onmousedown={(event) => {
-                      if (event.button === 2 && !worktreeDeletions[worktree.path])
+                      if (
+                        event.button === 2 &&
+                        !worktreeDeletions[worktree.path] &&
+                        !pendingIdentityMissing(path, worktree)
+                      )
                         void openMenu({ kind: 'worktree', repository: path, worktree }, event);
                     }}
                     onclick={() =>
@@ -1443,7 +1472,8 @@
                     aria-haspopup="menu"
                     aria-expanded={menu?.kind === 'worktree' &&
                       menu.worktree.path === worktree.path}
-                    disabled={!!worktreeDeletions[worktree.path]}
+                    disabled={!!worktreeDeletions[worktree.path] ||
+                      pendingIdentityMissing(path, worktree)}
                     onclick={(event) =>
                       openMenu(
                         { kind: 'worktree', repository: path, worktree },

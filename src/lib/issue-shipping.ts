@@ -1,6 +1,6 @@
 import type { PublishedGraph } from './issue-graph';
 import type { RegisteredWorktree } from './coordination';
-import type { SpawnState } from './agent-results';
+import { receiptIsSettled, type SpawnState } from './agent-results.ts';
 import type { AgentActivity, InterruptedAgentTurn } from './acp';
 import type { ShipEvent, ShipGate, ShipCheck } from './ship-progress';
 import { initialTaskCheckpoint, type TaskCheckpoint } from './task-checkpoint.ts';
@@ -277,6 +277,25 @@ export interface ShipIssue {
   validationPolicyRequired?: boolean;
   validationPolicy?: ShipValidationPolicy;
   shippingTarget?: ShippingTarget;
+}
+
+export function shipOwnerReleaseReady(
+  issue: Pick<ShipIssue, 'path' | 'receiptId' | 'workerSettled' | 'state'>,
+  receipts: Array<{ targetDirectory: string | null; validation?: unknown; state: SpawnState }>,
+): issue is typeof issue & { path: string; receiptId: string } {
+  if (
+    !issue.path ||
+    !issue.receiptId ||
+    !issue.workerSettled ||
+    (issue.state !== 'merged' && issue.state !== 'failed')
+  )
+    return false;
+  return !receipts.some(
+    (receipt) =>
+      receipt.validation &&
+      receipt.targetDirectory === issue.path &&
+      !receiptIsSettled(receipt.state),
+  );
 }
 
 export type ShippingTarget = {

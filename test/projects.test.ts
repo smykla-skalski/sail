@@ -342,6 +342,32 @@ await test('shows an external worktree when Git reuses a stale catalog path', ()
   ]);
 });
 
+await test('keeps a pending original visible beside a replacement generation', () => {
+  const oldGeneration = testGeneration(31);
+  const replacementGeneration = testGeneration(32);
+  const catalog = markWorktreeCleanupPending(
+    addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
+      path: '/worktrees/child',
+      branch: 'old',
+      generation: oldGeneration,
+    }),
+    '/repo',
+    '/worktrees/child',
+    {
+      originalPath: '/worktrees/child',
+      recoveryPath: '/worktrees/child',
+      sizeBytes: 42,
+      reason: 'Awaiting recovery',
+    },
+  );
+  const registered = [
+    { path: '/worktrees/child', branch: 'replacement', generation: replacementGeneration },
+  ];
+
+  assert.equal(currentCatalogWorktrees(catalog, '/repo', registered)[0].branch, 'old');
+  assert.deepEqual(externalGitWorktrees(catalog, '/repo', registered), [registered[0]]);
+});
+
 await test('does not infer ancestry for an external worktree or a reused catalog path', () => {
   const oldGeneration = '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002';
   const newGeneration = '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000003';

@@ -95,20 +95,30 @@ pub(crate) fn worktree_contains(root: &Path, candidate: &Path) -> bool {
     candidate == root || candidate.starts_with(&root)
 }
 
-pub(crate) fn terminal_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
+pub(crate) fn terminal_environment(
+    data_directory: &Path,
+    temp_directory: &Path,
+) -> Vec<(&'static str, PathBuf)> {
     let shared_download_cache = data_directory
         .parent()
         .and_then(Path::parent)
         .unwrap_or(data_directory)
         .join("terminal-package-downloads");
     vec![
-        ("TMPDIR", data_directory.join("tmp")),
-        ("TEMP", data_directory.join("tmp")),
-        ("TMP", data_directory.join("tmp")),
+        ("TMPDIR", temp_directory.to_path_buf()),
+        ("TEMP", temp_directory.to_path_buf()),
+        ("TMP", temp_directory.to_path_buf()),
         ("XDG_CACHE_HOME", data_directory.join("cache")),
         ("PIP_CACHE_DIR", shared_download_cache.join("pip")),
         ("UV_CACHE_DIR", shared_download_cache.join("uv")),
         ("POETRY_CACHE_DIR", shared_download_cache.join("poetry")),
+    ]
+}
+
+fn owned_build_environment(build_directory: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        ("CARGO_TARGET_DIR", build_directory.join("cargo-target")),
+        ("GOCACHE", build_directory.join("go-cache")),
     ]
 }
 
@@ -210,15 +220,28 @@ impl WindowsTerminalJob {
         Ok(())
     }
 
-    fn spawn(command: &mut Command) -> Result<(Child, Self), String> {
+    fn spawn(
+        command: &mut Command,
+        storage_lease: &crate::worktree_storage::WorktreeDataLease,
+    ) -> Result<(Child, Self), String> {
         use std::os::windows::process::CommandExt;
         use windows::Win32::System::Threading::CREATE_SUSPENDED;
 
-        let job = Self::new()?;
+        let job = match Self::new() {
+            Ok(job) => job,
+            Err(error) => {
+                storage_lease.cancel_process_start()?;
+                return Err(error);
+            }
+        };
         command.creation_flags(CREATE_SUSPENDED.0);
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("Cannot start command: {error}"))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                storage_lease.cancel_process_start()?;
+                return Err(format!("Cannot start command: {error}"));
+            }
+        };
         if let Err(error) = job.assign_and_resume(&child) {
             let _ = child.kill();
             let _ = job.stop();
@@ -321,7 +344,7 @@ impl AcpTerminalManager {
         profile: CapabilityProfile,
         worktree: &Path,
         session_ids: &[String],
-    ) {
+    ) -> Result<(), String> {
         let scope = TerminalConnectionScope {
             agent,
             profile,
@@ -331,7 +354,7 @@ impl AcpTerminalManager {
         let terminals = self
             .active
             .lock()
-            .ok()
+            .map_err(|error| error.to_string())
             .map(|active| {
                 active
                     .iter()
@@ -346,10 +369,17 @@ impl AcpTerminalManager {
                     })
                     .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            })?;
+        let mut errors = Vec::new();
         for (id, terminal) in terminals {
-            let _ = self.archive(id, &terminal);
+            if let Err(error) = self.archive(id, &terminal) {
+                errors.push(error);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 
@@ -770,6 +800,12 @@ fn exited_without_reaping(child: &std::process::Child) -> Result<bool, String> {
     Ok(unsafe { status.si_pid() } == child.id() as i32)
 }
 
+pub struct TerminalContext<'a> {
+    pub directory: Option<PathBuf>,
+    pub scratch_owner: Option<&'a str>,
+    pub build_directory: Option<&'a Path>,
+}
+
 pub fn handle(
     app: &AppHandle,
     manager: &AcpTerminalManager,
@@ -777,7 +813,7 @@ pub fn handle(
     profile: CapabilityProfile,
     method: &str,
     params: Value,
-    session_directory: Option<PathBuf>,
+    context: TerminalContext<'_>,
 ) -> Result<Value, String> {
     if method == "terminal/create" {
         let params: CreateParams =
@@ -797,7 +833,8 @@ pub fn handle(
         {
             return Err("Command arguments or environment are invalid.".to_string());
         }
-        let fallback = session_directory
+        let fallback = context
+            .directory
             .ok_or("Unknown agent session.")?
             .canonicalize()
             .map_err(|error| error.to_string())?;
@@ -814,9 +851,9 @@ pub fn handle(
                     .map_err(|error| error.to_string())?,
                 worktree,
             )?;
-            let temp_directory = data_directory.join("tmp");
+            let temp_directory = storage_lease.temp_directory();
             let cache_directory = data_directory.join("cache");
-            std::fs::create_dir_all(&temp_directory).map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(temp_directory).map_err(|error| error.to_string())?;
             std::fs::create_dir_all(&cache_directory).map_err(|error| error.to_string())?;
             let background = crate::background_priority::enabled(app);
             #[cfg(unix)]
@@ -844,8 +881,22 @@ pub fn handle(
             for variable in params.env {
                 command.env(variable.name, variable.value);
             }
-            for (name, value) in terminal_environment(&data_directory) {
+            #[cfg(unix)]
+            if let Some(owner) = context.scratch_owner {
+                command.env("SAIL_SCRATCH_OWNER_IDENTITY", owner);
+            } else {
+                command.env_remove("SAIL_SCRATCH_OWNER_IDENTITY");
+            }
+            #[cfg(not(unix))]
+            let _ = context.scratch_owner;
+            for (name, value) in terminal_environment(&data_directory, temp_directory) {
                 command.env(name, value);
+            }
+            if let Some(build_directory) = context.build_directory {
+                std::fs::create_dir_all(build_directory).map_err(|error| error.to_string())?;
+                for (name, value) in owned_build_environment(build_directory) {
+                    command.env(name, value);
+                }
             }
             if let Some(overlay) = crate::git_overlay::GitOverlay::ensure(
                 &app.path()
@@ -856,12 +907,17 @@ pub fn handle(
                 overlay.apply(&mut command);
             }
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            storage_lease.prepare_process_start()?;
             #[cfg(windows)]
-            let (mut child, job) = WindowsTerminalJob::spawn(&mut command)?;
+            let (mut child, job) = WindowsTerminalJob::spawn(&mut command, &storage_lease)?;
             #[cfg(not(windows))]
-            let mut child = command
-                .spawn()
-                .map_err(|error| format!("Cannot start command: {error}"))?;
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    storage_lease.cancel_process_start()?;
+                    return Err(format!("Cannot start command: {error}"));
+                }
+            };
             let owner = format!(
                 "{}\0acp:{}:{}",
                 fallback.display(),
@@ -1777,9 +1833,10 @@ mod tests {
     #[test]
     fn terminal_environment_keeps_package_download_caches_shared() {
         let root = Path::new("/sail-cache/terminal-worktrees/worktree");
-        let environment = terminal_environment(root);
+        let temp = root.join("turn-temp/run-1");
+        let environment = terminal_environment(root, &temp);
 
-        assert!(environment.contains(&("TMPDIR", root.join("tmp"))));
+        assert!(environment.contains(&("TMPDIR", temp)));
         assert!(environment.contains(&("XDG_CACHE_HOME", root.join("cache"))));
         let shared = Path::new("/sail-cache/terminal-package-downloads");
         assert!(environment.contains(&("PIP_CACHE_DIR", shared.join("pip"))));
@@ -1791,6 +1848,17 @@ mod tests {
                 "HOME" | "XDG_CONFIG_HOME" | "NPM_CONFIG_CACHE" | "CARGO_HOME"
             )
         }));
+    }
+
+    #[test]
+    fn owned_terminal_build_environment_uses_run_root() {
+        let build = Path::new("/sail-339-worker/build");
+        let environment = owned_build_environment(build);
+        assert_eq!(
+            environment[0],
+            ("CARGO_TARGET_DIR", build.join("cargo-target"))
+        );
+        assert_eq!(environment[1], ("GOCACHE", build.join("go-cache")));
     }
 
     #[cfg(windows)]
@@ -1818,7 +1886,15 @@ mod tests {
             .env(HELPER, "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let (mut child, job) = WindowsTerminalJob::spawn(&mut command).unwrap();
+        let scratch =
+            std::env::temp_dir().join(format!("sail-terminal-job-{}", uuid::Uuid::new_v4()));
+        let worktree = scratch.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (_, storage_lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        storage_lease.prepare_process_start().unwrap();
+        let (mut child, job) = WindowsTerminalJob::spawn(&mut command, &storage_lease).unwrap();
+        storage_lease.mark_started();
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_secs(10);
         while child.try_wait().unwrap().is_none() {
@@ -1839,6 +1915,9 @@ mod tests {
         job.stop()
             .expect("terminate descendants after direct child exit");
         assert_eq!(job.active_processes().unwrap(), 0);
+        storage_lease.release_clean().unwrap();
+        drop(storage_lease);
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[test]
