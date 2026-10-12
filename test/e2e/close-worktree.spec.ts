@@ -190,6 +190,73 @@ describe('close worktree shortcut', () => {
     await expect($('dialog[open]')).not.toExist();
   });
 
+  it('preserves a detached descendant changed after preview', async () => {
+    const detached = join(worktrees, 'detached');
+    const newFile = join(detached, 'new.txt');
+    git('worktree', 'add', '-q', '-b', 'detached-child', detached);
+    execFileSync('git', ['-C', detached, 'checkout', '--detach', '-q']);
+    await select(first, false);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = (path: string) => {
+      const value = registered.find((worktree) => worktree.path === path)?.generation;
+      if (!value) throw new Error(`Missing worktree generation for ${path}`);
+      return value;
+    };
+    await browser.execute(
+      (repo, root, child, rootGeneration, childGeneration) => {
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({
+            repositories: [repo],
+            groups: [],
+            worktrees: {
+              [repo]: [
+                { path: root, branch: 'first', generation: rootGeneration },
+                {
+                  path: child,
+                  branch: 'detached-child',
+                  generation: childGeneration,
+                  origin: {
+                    sourcePath: root,
+                    sourceGeneration: rootGeneration,
+                    agent: 'codex',
+                    sessionId: 'detached-session',
+                    sessionTitle: 'Detached',
+                  },
+                },
+              ],
+            },
+          }),
+        );
+      },
+      repository,
+      first,
+      detached,
+      generation(first),
+      generation(detached),
+    );
+    await browser.refresh();
+    await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
+    await $('[aria-label="Delete worktree first"]').click();
+    const dialog = $('dialog.confirmation-dialog[open]');
+    await expect(dialog).toHaveText(expect.stringContaining('detached'));
+    writeFileSync(newFile, 'keep this file');
+    await dialog.$('button=Delete 2 worktrees').click();
+    await expect($('.app-shell [role="alert"]')).toHaveText(
+      expect.stringContaining('Worktree changed after validation'),
+    );
+    expect(existsSync(newFile)).toBe(true);
+    expect(existsSync(first)).toBe(true);
+    expect(await catalogPaths()).toEqual([first, detached]);
+    git('worktree', 'remove', '--force', detached);
+  });
+
   it('previews and removes only Sail descendants from the leaves inward', async () => {
     const child = join(worktrees, 'child');
     const grandchild = join(worktrees, 'grandchild');
@@ -276,6 +343,14 @@ describe('close worktree shortcut', () => {
       },
     );
     await browser.refresh();
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
+          return typeof ready === 'function' && ready();
+        }),
+      { timeout: 20000, timeoutMsg: 'Descendant catalog did not settle after reload' },
+    );
     const openRemoval = async () => {
       await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
       await $('[aria-label="Delete worktree first"]').click();

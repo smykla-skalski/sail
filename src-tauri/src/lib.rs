@@ -2020,6 +2020,36 @@ fn ensure_expected_worktree_generation(
     Ok(())
 }
 
+fn worktree_preview_state_with_hook<F>(
+    root: &Path,
+    after_status: F,
+) -> Result<(String, bool), String>
+where
+    F: FnOnce(),
+{
+    let revision = git_directory_revision(root)?;
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .output()
+        .map_err(|error| format!("Cannot inspect worktree changes: {error}"))?;
+    if !status.status.success() {
+        return Err(format!(
+            "Cannot inspect changes in {}. Refresh before deleting.",
+            root.display()
+        ));
+    }
+    after_status();
+    if git_directory_revision(root)? != revision {
+        return Err(format!(
+            "Worktree {} changed during preview. Refresh before deleting.",
+            root.display()
+        ));
+    }
+    Ok((revision, !status.stdout.is_empty()))
+}
+
 #[tauri::command]
 fn worktree_removal_preview(
     repository: String,
@@ -2058,18 +2088,7 @@ fn worktree_removal_preview(
                 canonical.display()
             )
         })?;
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&canonical)
-            .args(["status", "--porcelain=v1", "--untracked-files=normal"])
-            .output()
-            .map_err(|error| format!("Cannot inspect worktree changes: {error}"))?;
-        if !status.status.success() {
-            return Err(format!(
-                "Cannot inspect changes in {}. Refresh before deleting.",
-                canonical.display()
-            ));
-        }
+        let (revision, dirty) = worktree_preview_state_with_hook(&canonical, || {})?;
         let active_sessions = agents
             .active_sessions_in(&canonical)?
             .into_iter()
@@ -2079,8 +2098,8 @@ fn worktree_removal_preview(
             path,
             branch: entry.branch.clone(),
             generation,
-            revision: git_directory_revision(&canonical)?,
-            dirty: !status.stdout.is_empty(),
+            revision,
+            dirty,
             active_sessions,
         });
     }
@@ -3496,8 +3515,8 @@ mod tests {
         remove_worktree_with_hooks, replacement_worktree_at_checkpoint, repository_namespace,
         repository_worktrees, shipping_base_revision, shipping_changed_paths,
         shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
-        working_tree_diff, worktree_overviews, WorktreeOperationLocks,
-        NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
+        working_tree_diff, worktree_overviews, worktree_preview_state_with_hook,
+        WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::worktree_storage;
@@ -4752,6 +4771,49 @@ mod tests {
             git_reference(Path::new(&worktree), &["symbolic-ref", "--short", "HEAD"]).as_deref(),
             Some("child")
         );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preview_rejects_a_file_created_between_status_and_revision_reads() {
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-preview-status-race-test");
+        let new_file = Path::new(&worktree).join("new.txt");
+
+        let error = worktree_preview_state_with_hook(Path::new(&worktree), || {
+            fs::write(&new_file, "keep this file").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(error.contains("changed during preview"), "{error}");
+        assert_eq!(fs::read_to_string(&new_file).unwrap(), "keep this file");
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_detached_removal_preserves_changes_after_preview() {
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-detached-preview-race-test");
+        git(&worktree, &["checkout", "--detach"]);
+        let (revision, dirty) =
+            worktree_preview_state_with_hook(Path::new(&worktree), || {}).unwrap();
+        assert!(!dirty);
+        let new_file = Path::new(&worktree).join("new.txt");
+        fs::write(&new_file, "keep this file").unwrap();
+
+        let error = remove_worktree(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed after validation"), "{error}");
+        assert_eq!(fs::read_to_string(&new_file).unwrap(), "keep this file");
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }

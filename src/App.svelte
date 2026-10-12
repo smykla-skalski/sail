@@ -9024,7 +9024,7 @@
           repository,
           worktree: path,
           force: force || !!config,
-          expectedRevision: expected?.branch ? expected.revision : null,
+          expectedRevision: expected?.revision ?? null,
           expectedBranch: expected?.branch ?? null,
           expectedGeneration: expected?.generation,
           ...(stopAgents ? { stopAgents: true } : {}),
