@@ -1168,12 +1168,12 @@ fn log_lock_holder(path: &Path) {
     }
 }
 
-struct FileLock {
+pub(crate) struct FileLock {
     file: File,
 }
 
 impl FileLock {
-    fn acquire(path: &Path, exclusive: bool) -> Result<Self, String> {
+    pub(crate) fn acquire(path: &Path, exclusive: bool) -> Result<Self, String> {
         Self::acquire_mode(path, exclusive, false)
     }
 

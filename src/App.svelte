@@ -6107,7 +6107,9 @@
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available))
       return threads;
     const known = new Set(threads.map((thread) => thread.id));
-    const listed = await Promise.all(directories.map((path) => listOpenCodeRootThreads(path)));
+    const listed = await Promise.all(
+      directories.map((path) => listOpenCodeRootThreads(path).catch(() => [])),
+    );
     return [
       ...threads,
       ...listed
@@ -6145,6 +6147,47 @@
     setSetting('sai-coordination-messages', JSON.stringify(coordinationMessages));
   }
 
+  async function resolveCoordinationThread(
+    target: CoordinationThread,
+  ): Promise<AgentThread | null> {
+    const existing = [
+      ...agentThreads,
+      ...nativeChildThreads,
+      ...nativeThreads,
+      ...sidebarOpenCodeThreads,
+    ].find(
+      (item) =>
+        item.directory === target.directory && target.id === `acp:${item.agent}:${item.sessionId}`,
+    );
+    if (existing) return existing;
+
+    const match = /^acp:([^:]+):(.+)$/.exec(target.id);
+    if (!match) return null;
+    const [, agent, sessionId] = match;
+    const receipt = spawnReceipts.find(
+      (item) => item.targetId === target.id && item.targetDirectory === target.directory,
+    );
+    const listed =
+      agent === 'opencode'
+        ? await listSidebarAcpThreads(
+            agent,
+            (cursor) => acp.listSessions(agent, target.directory, cursor, 'explore'),
+            target.directory,
+          ).catch(() => [])
+        : [];
+    return (
+      listed.find((item) => item.sessionId === sessionId) ?? {
+        agent,
+        directory: target.directory,
+        sessionId,
+        title: target.title || receipt?.name || 'Recovered session',
+        updated: receipt?.updated ?? Date.now(),
+        model: receipt?.model,
+        capabilityProfile: capabilityProfileForAcpSession(agent, target.directory, sessionId),
+      }
+    );
+  }
+
   function queueCoordinationDelivery(target: CoordinationThread, message: CoordinationMessage) {
     const previous = coordinationDeliveries.get(message.target) ?? Promise.resolve();
     const delivery = previous
@@ -6153,11 +6196,7 @@
         if (disposed || coordinationMessages.find((item) => item.id === message.id)?.delivered)
           return;
         const text = coordinationPrompt(message);
-        const thread = [...agentThreads, ...sidebarOpenCodeThreads].find(
-          (item) =>
-            item.directory === target.directory &&
-            target.id === `acp:${item.agent}:${item.sessionId}`,
-        );
+        const thread = await resolveCoordinationThread(target);
         if (!thread) throw new Error('The receiving thread is unavailable.');
         const info = await acp.connect(thread.agent, thread.directory);
         const agentActivity = (await acp.activity(thread.directory))[thread.agent];
@@ -6178,6 +6217,15 @@
             await acp.resume(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
           else await acp.load(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
         }
+        if (
+          !agentThreads.some(
+            (item) =>
+              item.agent === thread.agent &&
+              item.directory === thread.directory &&
+              item.sessionId === thread.sessionId,
+          )
+        )
+          saveAgentThread(thread);
         await waitForCoordinationThread(thread);
         if (disposed) return;
         await invoke('record_turn_snapshot', {
@@ -8990,7 +9038,10 @@
   }
 
   function hasActiveAgentSessions(message: string) {
-    return message.startsWith('Worktree has active agent sessions');
+    return (
+      message.startsWith('Worktree has active agent sessions') ||
+      message === 'An agent session is starting in this worktree.'
+    );
   }
 
   async function deleteProjectWorktreeOnce(
@@ -9141,8 +9192,8 @@
     }
     if (retryStop) {
       const stopConfirmed = await confirmInApp(
-        'Agent is running',
-        `An agent is still running in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
+        'Agent is running or starting',
+        `An agent is running or starting in worktree “${branch}”. Stop it and delete the worktree at ${path}? Uncommitted and ignored files are removed. The branch will remain.`,
         'Stop agent and delete',
         { destructive: true },
       );
@@ -12088,6 +12139,10 @@
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
+      const promotionError = event.message.params?.gitPromotionError;
+      if (typeof promotionError === 'string')
+        error = `Private Git changes remain pending: ${promotionError}`;
+      else if (error.startsWith('Private Git changes remain pending: ')) error = '';
       if (
         typeof sessionId !== 'string' ||
         (status !== 'done' && status !== 'failed' && status !== 'interrupted')
@@ -12594,6 +12649,7 @@
         onselectdefault={(path) => void selectDefaultWorktree(path)}
         onselectthread={(key) => void selectSidebarThread(key)}
         onremovethread={removeSidebarThread}
+        oncopied={() => void announceCopied(null)}
         onaddrepository={(groupID) => void chooseProject(groupID)}
         onaddgroup={addProjectGroup}
         onrenamegroup={renameProjectGroup}

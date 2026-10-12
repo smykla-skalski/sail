@@ -326,17 +326,25 @@ for await (const line of createInterface({ input: process.stdin })) {
       message.params.cwd.includes('sail-attention-') &&
       !delayedSessionDirectories.has(message.params.cwd);
     if (delayFirstAttentionSession) delayedSessionDirectories.add(message.params.cwd);
+    const delayWorktreeDeleteSession = message.params.cwd.includes('sail-force-delete-');
+    if (delayWorktreeDeleteSession) {
+      writeFileSync(join(message.params.cwd, '.sail-e2e-session-starting'), 'ready');
+    }
     setTimeout(
       () =>
         send({
           id: message.id,
           result: { sessionId, configOptions: configOptions(sessionId), availableCommands },
         }),
-      delayFirstAttentionSession ? 3000 : 1000,
+      delayWorktreeDeleteSession ? 10_000 : delayFirstAttentionSession ? 3000 : 1000,
     );
   } else if (message.method === 'session/list') {
     const pageSize = 2;
     const cwd = message.params.cwd;
+    if (agent === 'opencode' && existsSync(join(cwd, '.acp-session-list-error'))) {
+      send({ id: message.id, error: { code: -1, message: 'Session listing unavailable' } });
+      continue;
+    }
     const known = [...sessions.entries()]
       .filter(([, session]) => !cwd || session.cwd === cwd)
       .map(([sessionId, session]) => ({

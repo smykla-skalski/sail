@@ -27,6 +27,7 @@ struct WorktreeOperationLockState {
 struct WorktreeOperationGuard {
     state: Arc<WorktreeOperationLockState>,
     repository: PathBuf,
+    shared: Option<worktree_storage::FileLock>,
 }
 
 impl WorktreeOperationLocks {
@@ -45,10 +46,19 @@ impl WorktreeOperationLocks {
                 .map_err(|_| "Worktree operations are unavailable.".to_string())?;
         }
         active.insert(repository.clone());
-        Ok(WorktreeOperationGuard {
+        drop(active);
+        let mut guard = WorktreeOperationGuard {
             state: Arc::clone(&self.0),
-            repository,
-        })
+            repository: repository.clone(),
+            shared: None,
+        };
+        // The condition variable coordinates commands in this Sail process.
+        // The common Git directory also serializes other Sail processes.
+        guard.shared = Some(worktree_storage::FileLock::acquire(
+            &repository.join("sail-worktree-operations.lock"),
+            true,
+        )?);
+        Ok(guard)
     }
 }
 
@@ -83,6 +93,7 @@ pub(crate) fn git_common_directory(repository: &Path) -> Result<PathBuf, String>
 
 impl Drop for WorktreeOperationGuard {
     fn drop(&mut self) {
+        drop(self.shared.take());
         if let Ok(mut active) = self.state.active.lock() {
             active.remove(&self.repository);
             self.state.available.notify_all();
@@ -105,6 +116,7 @@ fn existing_shipping_worktree(
     let path = PathBuf::from(existing.path)
         .git_canonical()
         .map_err(|_| "Shipping worktree is missing.")?;
+    git_overlay::require_shared_current(&path)?;
     let setup = worktree_config::read(&path)?
         .map(|config| config.setup)
         .unwrap_or_default();
@@ -216,6 +228,7 @@ mod dev_servers;
 mod diagnostics;
 #[cfg(feature = "e2e")]
 mod e2e_config;
+mod git_overlay;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
@@ -520,6 +533,52 @@ fn validate_repository(path: String) -> Result<String, String> {
     Ok(root.trim().to_string())
 }
 
+fn task_git_command(directory: &Path) -> Result<Command, String> {
+    let mut command = Command::new("git");
+    if let Some((worktree, git_dir)) = git_overlay::registered_paths(directory) {
+        command.env("GIT_DIR", git_dir);
+        command.env("GIT_WORK_TREE", worktree);
+        command.env_remove("GIT_COMMON_DIR");
+        command.env_remove("GIT_INDEX_FILE");
+    } else if let Some(worktree) = git_overlay::known_worktree(directory) {
+        return Err(format!(
+            "Private Git state for {} requires recovery; task Git command refused.",
+            worktree.display()
+        ));
+    }
+    Ok(command)
+}
+
+fn task_git_reference(repository: &Path, args: &[&str]) -> Result<Option<String>, String> {
+    let output = task_git_command(repository)?
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    let value = value.trim();
+    Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
+fn task_worktree_base(repository: &Path) -> Result<String, String> {
+    if let Some(reference) = task_git_reference(
+        repository,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )? {
+        return Ok(reference);
+    }
+    for reference in ["origin/main", "origin/master", "main", "master"] {
+        if task_git_reference(repository, &["rev-parse", "--verify", reference])?.is_some() {
+            return Ok(reference.to_string());
+        }
+    }
+    Ok("HEAD".to_string())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkingDiff {
@@ -534,7 +593,7 @@ struct WorkingDiff {
 }
 
 fn git_patch(root: &str, file: &str, area: &str, untracked: bool) -> Result<String, String> {
-    let mut command = Command::new("git");
+    let mut command = task_git_command(Path::new(root))?;
     command.args(["-C", root]);
     if untracked {
         command.args([
@@ -584,7 +643,7 @@ impl Drop for TemporaryIndex {
 /// index it reads, and only some commands honour `--no-optional-locks`, so a read that must not
 /// touch the user's index runs against a copy.
 fn index_copy(root: &str, copy_current: bool) -> Result<TemporaryIndex, String> {
-    let output = Command::new("git")
+    let output = task_git_command(Path::new(root))?
         .args(["-C", root, "rev-parse", "--git-path", "index"])
         .output()
         .map_err(|error| error.to_string())?;
@@ -616,7 +675,7 @@ fn index_with_intent(
         .iter()
         .map(|file| format!(":(literal){file}"))
         .collect::<Vec<_>>();
-    let output = Command::new("git")
+    let output = task_git_command(Path::new(root))?
         .args(["-C", root, "add", "-N", "--"])
         .args(&pathspecs)
         .env("GIT_INDEX_FILE", &temporary.0)
@@ -634,7 +693,7 @@ fn git_patches(
     index: Option<&Path>,
 ) -> Result<HashMap<String, String>, String> {
     let run = |names: bool| -> Result<Vec<u8>, String> {
-        let mut command = Command::new("git");
+        let mut command = task_git_command(Path::new(root))?;
         command.args([
             "--no-optional-locks",
             "-C",
@@ -695,7 +754,7 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = validate_repository(path)?;
         let snapshot = index_copy(&root, true)?;
-        let output = Command::new("git")
+        let output = task_git_command(Path::new(&root))?
             .args([
                 "--no-optional-locks",
                 "-C",
@@ -712,7 +771,7 @@ async fn working_tree_diff(path: String) -> Result<Vec<WorkingDiff>, String> {
         if !output.status.success() {
             return Err("Could not read working tree changes.".into());
         }
-        let has_head = Command::new("git")
+        let has_head = task_git_command(Path::new(&root))?
             .args(["-C", &root, "rev-parse", "--verify", "HEAD"])
             .output()
             .is_ok_and(|result| result.status.success());
@@ -826,7 +885,7 @@ async fn working_tree_generation(path: String) -> Result<String, String> {
 async fn working_tree_commit(path: String) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = validate_repository(path)?;
-        let status = Command::new("git")
+        let status = task_git_command(Path::new(&root))?
             .args([
                 "-C",
                 &root,
@@ -842,7 +901,7 @@ async fn working_tree_commit(path: String) -> Result<Option<String>, String> {
         if !status.stdout.is_empty() {
             return Ok(None);
         }
-        let head = Command::new("git")
+        let head = task_git_command(Path::new(&root))?
             .args(["-C", &root, "rev-parse", "HEAD"])
             .output()
             .map_err(|error| error.to_string())?;
@@ -866,12 +925,12 @@ async fn shipping_base_revision(path: String, base_ref: Option<String>) -> Resul
                 value
             }
             Some(_) => return Err("Invalid shipping base reference.".to_string()),
-            None => worktree_base(Path::new(&root)),
+            None => task_worktree_base(Path::new(&root))?,
         };
-        git_reference(
+        task_git_reference(
             Path::new(&root),
             &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
-        )
+        )?
         .ok_or("Cannot resolve the shipping base commit.".to_string())
     })
     .await
@@ -886,23 +945,23 @@ async fn shipping_changed_paths(
     tauri::async_runtime::spawn_blocking(move || {
         let root = validate_repository(path)?;
         let base = match base_revision {
-            Some(base) => git_reference(
+            Some(base) => task_git_reference(
                 Path::new(&root),
                 &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
-            )
+            )?
             .ok_or("The selected shipping base commit no longer exists.")?,
             None => {
-                let reference = worktree_base(Path::new(&root));
-                git_reference(
+                let reference = task_worktree_base(Path::new(&root))?;
+                task_git_reference(
                     Path::new(&root),
                     &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
-                )
+                )?
                 .ok_or("Cannot resolve the shipping base commit.")?
             }
         };
-        let merge_base = git_reference(Path::new(&root), &["merge-base", "HEAD", &base])
+        let merge_base = task_git_reference(Path::new(&root), &["merge-base", "HEAD", &base])?
             .ok_or("Cannot find the merge base for validation.")?;
-        let output = Command::new("git")
+        let output = task_git_command(Path::new(&root))?
             .args([
                 "-C",
                 &root,
@@ -918,7 +977,7 @@ async fn shipping_changed_paths(
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
-        let untracked = Command::new("git")
+        let untracked = task_git_command(Path::new(&root))?
             .args([
                 "-C",
                 &root,
@@ -953,6 +1012,7 @@ struct WorktreeOverview {
     path: String,
     branch: Option<String>,
     changed_files: Option<usize>,
+    git_state: Option<String>,
     error: Option<String>,
 }
 
@@ -964,33 +1024,57 @@ fn inspect_worktree(path: String) -> WorktreeOverview {
                 path,
                 branch: None,
                 changed_files: None,
+                git_state: None,
                 error: Some(error),
             };
         }
     };
-    let branch = Command::new("git")
-        .args(["-C", &root, "symbolic-ref", "--quiet", "--short", "HEAD"])
-        .output()
+    let branch = task_git_command(Path::new(&root))
+        .and_then(|mut command| {
+            command
+                .args(["-C", &root, "symbolic-ref", "--quiet", "--short", "HEAD"])
+                .output()
+                .map_err(|error| error.to_string())
+        })
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|branch| !branch.is_empty())
         .or_else(|| Some("Detached HEAD".into()));
-    let changes = Command::new("git")
-        .args([
-            "-C",
-            &root,
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--no-renames",
-            "--untracked-files=all",
-        ])
-        .output();
+    let changes = task_git_command(Path::new(&root)).and_then(|mut command| {
+        command
+            .args([
+                "-C",
+                &root,
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--no-renames",
+                "--untracked-files=all",
+            ])
+            .output()
+            .map_err(|error| error.to_string())
+    });
+    let git_state = git_overlay::known_worktree(Path::new(&root)).map(|_| {
+        match (
+            task_git_reference(Path::new(&root), &["rev-parse", "HEAD"]),
+            git_reference(Path::new(&root), &["rev-parse", "HEAD"]),
+        ) {
+            (Ok(Some(private)), Some(shared))
+                if private == shared
+                    && git_overlay::index_differs(Path::new(&root)) == Some(false) =>
+            {
+                "Private Git state ready".into()
+            }
+            (Ok(Some(_)), Some(_)) => "Private Git changes pending".into(),
+            _ => "Private Git state requires recovery".into(),
+        }
+    });
     match changes {
         Ok(output) if output.status.success() => WorktreeOverview {
             path,
             branch,
+            git_state,
             changed_files: Some(
                 output
                     .stdout
@@ -1000,10 +1084,18 @@ fn inspect_worktree(path: String) -> WorktreeOverview {
             ),
             error: None,
         },
+        Err(error) => WorktreeOverview {
+            path,
+            branch,
+            changed_files: None,
+            git_state,
+            error: Some(error),
+        },
         _ => WorktreeOverview {
             path,
             branch,
             changed_files: None,
+            git_state,
             error: Some("Could not read working tree status.".into()),
         },
     }
@@ -1025,7 +1117,7 @@ async fn worktree_overviews(paths: Vec<String>) -> Vec<WorktreeOverview> {
 }
 
 fn git_directory_revision(root: &Path) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = task_git_command(root)?
         .arg("-C")
         .arg(root)
         .args([
@@ -1077,7 +1169,7 @@ fn git_directory_revision(root: &Path) -> Result<String, String> {
             }
         }
     }
-    let head = Command::new("git")
+    let head = task_git_command(root)?
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "HEAD"])
@@ -1086,7 +1178,7 @@ fn git_directory_revision(root: &Path) -> Result<String, String> {
     if head.status.success() {
         head.stdout.hash(&mut hash);
     }
-    let staged = Command::new("git")
+    let staged = task_git_command(root)?
         .arg("-C")
         .arg(root)
         .args(["diff", "--cached", "--binary", "--no-ext-diff"])
@@ -1100,7 +1192,7 @@ fn git_directory_revision(root: &Path) -> Result<String, String> {
 }
 
 fn git_directory_generation(root: &Path) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = task_git_command(root)?
         .arg("-C")
         .arg(root)
         .args([
@@ -1231,7 +1323,7 @@ async fn git_change_action(
             return Err("Invalid change action.".to_string());
         }
         let pathspec = format!(":(literal){file}");
-        let untracked = !Command::new("git")
+        let untracked = !task_git_command(Path::new(&root))?
             .args(["-C", &root, "ls-files", "--error-unmatch", "--", &pathspec])
             .output()
             .map_err(|error| error.to_string())?
@@ -1246,7 +1338,7 @@ async fn git_change_action(
         } else {
             current
         };
-        let mut command = Command::new("git");
+        let mut command = task_git_command(Path::new(&root))?;
         command.args(["-C", &root, "apply"]);
         if area == "staged" || action == "stage" {
             command.arg("--cached");
@@ -1290,7 +1382,7 @@ fn diff_file_contents(path: String, file: String, side: String) -> Result<Option
         return Err("Invalid diff file path.".into());
     }
     if side == "old" {
-        let output = Command::new("git")
+        let output = task_git_command(Path::new(&root))?
             .args(["-C", &root, "show", &format!("HEAD:{file}")])
             .output()
             .map_err(|error| error.to_string())?;
@@ -1342,6 +1434,7 @@ fn shipping_target(
     worktree: &Path,
     branch: &str,
 ) -> Result<ShippingTarget, String> {
+    git_overlay::require_shared_current(worktree)?;
     let target = github::target_repository(repository)?;
     let (remote, configured_remote) = shipping_fetch_source(repository, &target)?;
     let base_branch = shipping_default_branch(repository, &remote)?;
@@ -1376,6 +1469,7 @@ async fn shipping_worktree_target(
     tauri::async_runtime::spawn_blocking(move || {
         let repository = validate_repository(repository)?;
         let worktree = validate_repository(worktree)?;
+        git_overlay::require_shared_current(Path::new(&worktree))?;
         let actual_branch = git_reference(Path::new(&worktree), &["branch", "--show-current"])
             .ok_or("Shipping worktree is detached.".to_string())?;
         if actual_branch != branch {
@@ -1447,8 +1541,10 @@ fn registered_worktrees(
 }
 
 #[tauri::command]
-fn repository_worktrees(repository: String) -> Result<Vec<RegisteredWorktree>, String> {
-    repository_worktrees_inner(repository)
+async fn repository_worktrees(repository: String) -> Result<Vec<RegisteredWorktree>, String> {
+    tauri::async_runtime::spawn_blocking(move || repository_worktrees_inner(repository))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 fn repository_worktrees_inner(repository: String) -> Result<Vec<RegisteredWorktree>, String> {
@@ -1807,6 +1903,12 @@ async fn find_shipping_worktree(
 async fn run_shipping_setup(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = validate_repository(path)?;
+        if git_overlay::known_worktree(Path::new(&path)).is_some() {
+            return Err(
+                "Shipping setup cannot use shared Git metadata while a private Git overlay exists."
+                    .into(),
+            );
+        }
         let command = worktree_config::read(Path::new(&path))?
             .ok_or("Worktree setup is no longer configured.")?
             .setup;
@@ -2217,39 +2319,45 @@ async fn delete_worktree(
             if stop_agents == Some(true) {
                 fence.stop_sessions_in(&app, &agents, &directory)?;
             }
-            fence.cleanup(&agents, &directory, native_generation, || {
-                terminal_manager.stop_worktree(&directory)?;
-                terminals.stop_worktree(&directory)?;
-                agents.stop_worktree(&directory)?;
-                remove_worktree_then_private_data_many(&cache_directory, &managed_data, || {
-                    ensure_expected_worktree_generation(
-                        &directory,
-                        expected_generation.as_deref(),
-                    )?;
-                    let result = if archive_ignored == Some(true) {
-                        archive_ignored_and_remove(
-                            checked,
-                            worktree,
-                            expected_revision,
-                            expected_branch,
-                        )
-                    } else {
-                        remove_worktree_guarded(
-                            checked,
-                            worktree,
-                            force,
-                            expected_revision.as_deref(),
-                            expected_branch.as_deref(),
+            fence.cleanup(
+                &agents,
+                &directory,
+                native_generation,
+                stop_agents == Some(true),
+                || {
+                    terminal_manager.stop_worktree(&directory)?;
+                    terminals.stop_worktree(&directory)?;
+                    agents.stop_worktree(&directory)?;
+                    remove_worktree_then_private_data_many(&cache_directory, &managed_data, || {
+                        ensure_expected_worktree_generation(
+                            &directory,
                             expected_generation.as_deref(),
                         )?;
-                        Ok(None)
-                    };
-                    if result.is_ok() {
-                        removed_from_git = true;
-                    }
-                    result
-                })
-            })
+                        let result = if archive_ignored == Some(true) {
+                            archive_ignored_and_remove(
+                                checked,
+                                worktree,
+                                expected_revision,
+                                expected_branch,
+                            )
+                        } else {
+                            remove_worktree_guarded(
+                                checked,
+                                worktree,
+                                force,
+                                expected_revision.as_deref(),
+                                expected_branch.as_deref(),
+                                expected_generation.as_deref(),
+                            )?;
+                            Ok(None)
+                        };
+                        if result.is_ok() {
+                            removed_from_git = true;
+                        }
+                        result
+                    })
+                },
+            )
         })();
         if result.is_err() && !removed_from_git {
             terminal_manager.allow_worktree_terminals(&directory);
@@ -3242,6 +3350,7 @@ where
                     "Worktree identity changed after preview. Refresh before deleting.".into(),
                 );
             }
+            git_overlay::require_no_private_state_at_missing(&requested_worktree)?;
             let listed = git_reference(&repository, &["worktree", "list", "--porcelain", "-z"])
                 .ok_or("Cannot inspect repository worktrees.")?;
             let still_registered = parse_registered_worktrees(&listed)
@@ -3261,6 +3370,7 @@ where
     if worktree == repository {
         return Err("Cannot delete the main repository.".to_string());
     }
+    git_overlay::require_shared_current(&worktree)?;
     let listed = git_reference(&repository, &["worktree", "list", "--porcelain"])
         .ok_or("Cannot inspect repository worktrees.")?;
     let registered = listed
@@ -3287,8 +3397,17 @@ where
         }
         Ok(())
     };
+    let preview_guarded = expected_revision.is_some() && expected_generation.is_some();
     let ensure_expected_branch = || -> Result<(), String> {
         let Some(expected) = expected_branch else {
+            if preview_guarded
+                && git_reference(&worktree, &["symbolic-ref", "--quiet", "HEAD"]).is_some()
+            {
+                return Err(
+                    "Worktree attached to a branch after preview. Revalidate before deleting it."
+                        .into(),
+                );
+            }
             return Ok(());
         };
         let expected = expected.strip_prefix("refs/heads/").unwrap_or(expected);
@@ -3306,7 +3425,6 @@ where
     let force = force == Some(true);
     // A descendant's confirmed preview carries a revision and generation. Git's
     // ordinary remove must reject content written after Sail's final check.
-    let preview_guarded = expected_revision.is_some() && expected_generation.is_some();
     let ensure_nonforce_clean = || -> Result<(), String> {
         if force && !preview_guarded {
             return Ok(());
@@ -3368,6 +3486,7 @@ where
         }
     }
     after_final_identity_check()?;
+    git_overlay::require_shared_current(&worktree)?;
     ensure_expected_worktree_generation(&worktree, expected_generation)?;
     ensure_expected_revision()?;
     ensure_expected_branch()?;
@@ -3445,6 +3564,12 @@ where
                 if actual != expected {
                     return Err(format!("Worktree branch changed from {expected} to {actual}. Revalidate before deleting it."));
                 }
+            } else if git_reference(removal_target, &["symbolic-ref", "--quiet", "HEAD"]).is_some()
+            {
+                return Err(
+                    "Worktree attached to a branch after preview. Revalidate before deleting it."
+                        .into(),
+                );
             }
             let status = Command::new("git")
                 .arg("-C")
@@ -3548,6 +3673,7 @@ where
             ));
         }
     }
+    git_overlay::forget_removed_worktree(&worktree)?;
     Ok(())
 }
 
@@ -3561,6 +3687,7 @@ pub fn run() {
             }
             if let Ok(cache_directory) = _app.path().app_cache_dir() {
                 worktree_storage::reconcile(&cache_directory);
+                git_overlay::initialize(&cache_directory);
             }
             let process_directory = _app.path().app_config_dir()?.join("owned-processes");
             owned_processes::init(process_directory).map_err(std::io::Error::other)?;
@@ -4687,6 +4814,41 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn guarded_removal_rejects_branch_attached_after_detached_preview() {
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-delete-detached-branch-switch");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        git(&worktree, &["checkout", "--detach", "-q"]);
+        let revision =
+            tauri::async_runtime::block_on(working_tree_revision(worktree.clone())).unwrap();
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+        git(&worktree, &["switch", "-q", "child"]);
+
+        assert_eq!(
+            tauri::async_runtime::block_on(working_tree_revision(worktree.clone())).unwrap(),
+            revision
+        );
+        let error = remove_worktree_guarded(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            None,
+            Some(&generation),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("attached to a branch after preview"),
+            "{error}"
+        );
+        assert!(Path::new(&worktree).exists());
+
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn ignored_archive_fixture(prefix: &str) -> (PathBuf, String, String, String) {
         let root = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         let repository = root.join("repository");
@@ -5630,6 +5792,59 @@ mod tests {
             .unwrap();
         waiter.join().unwrap();
 
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktree_operation_lock_child() {
+        let Ok(repository) = std::env::var("SAIL_WORKTREE_LOCK_PROBE_REPOSITORY") else {
+            return;
+        };
+        let ready = Path::new(&repository).join("child-ready");
+        let acquired = Path::new(&repository).join("child-acquired");
+        fs::write(ready, "ready").unwrap();
+        let _guard = WorktreeOperationLocks::default()
+            .lock(Path::new(&repository))
+            .unwrap();
+        fs::write(acquired, "acquired").unwrap();
+    }
+
+    #[test]
+    fn worktree_operations_serialize_across_processes() {
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-cross-process-worktree-lock-test");
+        let guard = WorktreeOperationLocks::default()
+            .lock(Path::new(&repository))
+            .unwrap();
+        let ready = Path::new(&repository).join("child-ready");
+        let acquired = Path::new(&repository).join("child-acquired");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::worktree_operation_lock_child",
+                "--nocapture",
+            ])
+            .env("SAIL_WORKTREE_LOCK_PROBE_REPOSITORY", &repository)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "child process did not reach the lock");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!acquired.exists(), "child bypassed the cross-process lock");
+        drop(guard);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !acquired.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(acquired.exists(), "child did not acquire the released lock");
+        assert!(child.wait().unwrap().success());
+
+        fs::remove_file(ready).unwrap();
+        fs::remove_file(acquired).unwrap();
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
