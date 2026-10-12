@@ -399,6 +399,7 @@
   });
 
   async function refreshWorktreeRegistrations() {
+    const repositories = catalog.repositories;
     ++registrationSequence;
     if (registrationRefreshRunning) {
       registrationRefreshPending = true;
@@ -407,7 +408,6 @@
     registrationRefreshRunning = true;
     try {
       const sequence = registrationSequence;
-      const repositories = catalog.repositories;
       const results = await Promise.all(
         repositories.map(async (repository) => {
           const worktrees = await invoke<RegisteredWorktree[]>('repository_worktrees', {
