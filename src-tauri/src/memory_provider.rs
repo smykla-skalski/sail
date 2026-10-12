@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CONFIG_PREFIX: &str = "sai-memory-provider:";
 const CREDENTIAL_SERVICE: &str = "dev.sail.shared-memory.mem0";
@@ -22,6 +22,13 @@ const MAX_RECONCILE_RECORDS: usize = 100_000;
 const SELF_HOSTED_SAFE_LIMIT: usize = 1_000;
 const EVENT_POLL_ATTEMPTS: usize = 25;
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -926,9 +933,13 @@ impl MemoryProvider for Mem0Provider {
         for memory in &remote {
             by_sail_id.entry(&memory.sail_id).or_default().push(memory);
         }
+        let timestamp = current_timestamp();
         for memory in memories {
             let existing = by_sail_id.remove(memory.id.as_str()).unwrap_or_default();
-            if memory.forgotten_at.is_some() {
+            if memory.forgotten_at.is_some()
+                || memory.superseded_by.is_some()
+                || crate::memory::is_expired(memory, timestamp)
+            {
                 for item in existing {
                     self.delete(&item.id)?;
                 }
@@ -1125,7 +1136,7 @@ impl AgentMemoryProvider {
     }
 
     fn delete(&self, id: &str) -> Result<(), String> {
-        let mut url = self.url("/memories/")?;
+        let mut url = self.url("/memories")?;
         url.path_segments_mut()
             .map_err(|_| "AgentMemory returned an invalid memory identifier.")?
             .push(id);
@@ -1209,9 +1220,13 @@ impl MemoryProvider for AgentMemoryProvider {
         for memory in &remote {
             by_sail_id.entry(&memory.sail_id).or_default().push(memory);
         }
+        let timestamp = current_timestamp();
         for memory in memories {
             let existing = by_sail_id.remove(memory.id.as_str()).unwrap_or_default();
-            if memory.forgotten_at.is_some() {
+            if memory.forgotten_at.is_some()
+                || memory.superseded_by.is_some()
+                || crate::memory::is_expired(memory, timestamp)
+            {
                 for item in existing {
                     self.delete(&item.id)?;
                 }
@@ -1529,6 +1544,7 @@ pub(crate) fn search_standalone(
             let canonical: HashMap<_, _> = crate::memory::list_at(root, key, false)?
                 .into_iter()
                 .filter(|memory| !crate::memory::is_expired(memory, timestamp))
+                .filter(|memory| memory.superseded_by.is_none())
                 .map(|memory| (memory.id.clone(), memory))
                 .collect();
             save_runtime_error(root, key, None);
@@ -1775,8 +1791,8 @@ mod tests {
         HOSTED_PAGE_SIZE, SELF_HOSTED_SAFE_LIMIT,
     };
     use crate::memory::{
-        forget_at, remember_at, MemoryInput, MemoryKind, MemoryProvenance, MemoryRecord,
-        MemorySearchResult,
+        forget_at, remember_at, supersede_at, MemoryInput, MemoryKind, MemoryProvenance,
+        MemoryRecord, MemorySearchResult,
     };
     use serde_json::json;
     use std::fs;
@@ -1798,6 +1814,8 @@ mod tests {
             rating: None,
             forgotten_at: None,
             expires_at: None,
+            superseded_by: None,
+            conflicts_with: Vec::new(),
         }
     }
 
@@ -2264,6 +2282,174 @@ mod tests {
         assert_eq!(results[0].memory.id, local.id);
         server.join().unwrap();
         session_credentials().lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn corrected_handoff_remains_findable_with_one_mem0_result() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        let key = Uuid::new_v4().to_string();
+        let other_key = Uuid::new_v4().to_string();
+        let old = remember_at(
+            &root,
+            &key,
+            MemoryInput {
+                content: "Prepare release notes".into(),
+                kind: Some(MemoryKind::Handoff),
+                tags: None,
+                provenance: None,
+                expires_at: None,
+            },
+        )
+        .unwrap();
+        let current = supersede_at(
+            &root,
+            &key,
+            &old.id,
+            MemoryInput {
+                content: "Use structured logs".into(),
+                kind: Some(MemoryKind::Handoff),
+                tags: None,
+                provenance: None,
+                expires_at: None,
+            },
+            false,
+        )
+        .unwrap();
+        let other = remember_local(&root, &other_key);
+        let old = crate::memory::list_at(&root, &key, true)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == old.id)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        write_provider_settings(&settings, &key, &endpoint);
+        session_credentials()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), "secret".into());
+        let old_remote = json!({"id":"old-remote","metadata":{"sail_memory_id":old.id,"sail_updated_at":old.updated_at}});
+        let current_remote = json!({"id":"current-remote","score":0.8,"metadata":{"sail_memory_id":current.id,"sail_updated_at":current.updated_at}});
+        let server = std::thread::spawn(move || {
+            let (mut list, _) = listener.accept().unwrap();
+            let request = read_request(&mut list);
+            assert!(request.starts_with("GET /memories?"));
+            respond(
+                &mut list,
+                &json!({"results":[old_remote,current_remote.clone()]}).to_string(),
+            );
+
+            let (mut delete, _) = listener.accept().unwrap();
+            let request = read_request(&mut delete);
+            assert!(
+                request.starts_with("DELETE /memories/old-remote "),
+                "{request}"
+            );
+            respond(&mut delete, "{}");
+
+            let (mut search, _) = listener.accept().unwrap();
+            let request = read_request(&mut search);
+            assert!(request.starts_with("POST /search "));
+            assert!(request.contains("\"limit\":1"));
+            respond(
+                &mut search,
+                &json!({"results":[current_remote]}).to_string(),
+            );
+        });
+
+        let results = search_standalone(&root, &settings, &key, "telemetry", Some(1)).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory.id, current.id);
+        assert_eq!(crate::memory::list_at(&root, &key, true).unwrap().len(), 2);
+        assert_eq!(
+            crate::memory::list_at(&root, &other_key, false).unwrap()[0].id,
+            other.id
+        );
+        server.join().unwrap();
+        session_credentials().lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn corrected_handoff_remains_findable_with_one_agentmemory_result() {
+        let root = temporary();
+        let settings = root.join("settings.json");
+        let key = Uuid::new_v4().to_string();
+        let old = remember_at(
+            &root,
+            &key,
+            MemoryInput {
+                content: "Prepare release notes".into(),
+                kind: Some(MemoryKind::Handoff),
+                tags: None,
+                provenance: None,
+                expires_at: None,
+            },
+        )
+        .unwrap();
+        let current = supersede_at(
+            &root,
+            &key,
+            &old.id,
+            MemoryInput {
+                content: "Use structured logs".into(),
+                kind: Some(MemoryKind::Handoff),
+                tags: None,
+                provenance: None,
+                expires_at: None,
+            },
+            false,
+        )
+        .unwrap();
+        let old = crate::memory::list_at(&root, &key, true)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == old.id)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let config = ProviderConfig {
+            provider: ProviderKind::AgentMemory,
+            endpoint: Some(endpoint),
+        };
+        fs::write(
+            &settings,
+            json!({ config_key(&key): serde_json::to_string(&config).unwrap() }).to_string(),
+        )
+        .unwrap();
+        let old_remote = json!({"id":"old-remote","metadata":{"sail_memory_id":old.id,"sail_updated_at":old.updated_at}});
+        let current_remote = json!({"id":"current-remote","score":0.8,"metadata":{"sail_memory_id":current.id,"sail_updated_at":current.updated_at}});
+        let server = std::thread::spawn(move || {
+            let (mut list, _) = listener.accept().unwrap();
+            let request = read_request(&mut list);
+            assert!(request.starts_with("GET /memories/page?"));
+            respond(
+                &mut list,
+                &json!({"items":[old_remote,current_remote.clone()],"next_cursor":null,"pagination_supported":true}).to_string(),
+            );
+
+            let (mut delete, _) = listener.accept().unwrap();
+            let request = read_request(&mut delete);
+            assert!(
+                request.starts_with("DELETE /memories/old-remote "),
+                "{request}"
+            );
+            respond(&mut delete, "{}");
+
+            let (mut search, _) = listener.accept().unwrap();
+            let request = read_request(&mut search);
+            assert!(request.starts_with("POST /search "));
+            assert!(request.contains("\"limit\":1"));
+            respond(&mut search, &json!([current_remote]).to_string());
+        });
+
+        let results = search_standalone(&root, &settings, &key, "telemetry", Some(1)).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory.id, current.id);
+        assert_eq!(crate::memory::list_at(&root, &key, true).unwrap().len(), 2);
+        server.join().unwrap();
     }
 
     #[test]

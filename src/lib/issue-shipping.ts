@@ -238,6 +238,7 @@ export interface ShipIssue {
   /** Set after a bot-comment merge request; cleared once a refresh sees the pull request closed. */
   mergeRequested?: ShipMergeRequest;
   blockedReason?: string | null;
+  workerRequest?: string | null;
   models?: string[];
   workerModel?: string;
   workerState?: SpawnState;
