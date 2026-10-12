@@ -150,6 +150,98 @@ await test('policy decision history keeps the latest twenty rows per session', (
   assert.equal(events.at(-1)?.sourceId, 'permission-5');
 });
 
+await test('a busy set of sessions retains each session’s latest policy decision', () => {
+  const scope = { agent: 'opencode', directory: '/repo', sessionId: 'session-0' };
+  const stored = saveActivityHistory(
+    Array.from({ length: 30 }, (_sessionValue, session) =>
+      Array.from({ length: 20 }, (_decisionValue, decision) => ({
+        workspace: scope.directory,
+        kind: 'decision' as const,
+        source: 'OpenCode',
+        sourceId: `permission-${session}-${decision}`,
+        title: `Decision ${session}-${decision}`,
+        outcome: 'allowed',
+        at: session * 20 + decision + 1,
+        agent: scope.agent,
+        sessionId: `session-${session}`,
+        automatic: true,
+        reason: 'Allowed by policy.',
+      })),
+    ).flat(),
+  );
+  const loaded = loadActivityHistory(stored);
+
+  assert.equal(loaded.length, 400);
+  assert.ok(decisionItems(loaded, scope).some((item) => item.title === 'Decision 0-19'));
+  for (let session = 0; session < 30; session += 1)
+    assert.ok(loaded.some((event) => event.sessionId === `session-${session}`));
+});
+
+await test('thousands of policy sessions remain bounded through save and reload', () => {
+  const stored = saveActivityHistory(
+    Array.from({ length: 1_000 }, (_sessionValue, session) =>
+      Array.from({ length: 20 }, (_decisionValue, decision) => ({
+        workspace: `/repo/${session}`,
+        kind: 'decision' as const,
+        source: 'OpenCode',
+        sourceId: `permission-${decision}`,
+        title: 'T'.repeat(240),
+        outcome: 'allowed',
+        at: session * 20 + decision + 1,
+        agent: 'opencode',
+        sessionId: `session-${session}`,
+        automatic: true,
+        reason: 'R'.repeat(240),
+      })),
+    ).flat(),
+  );
+  const loaded = loadActivityHistory(stored);
+
+  assert.equal(loaded.length, 400);
+  assert.ok(stored.length < 1_000_000, `stored history is ${stored.length} characters`);
+  assert.equal(saveActivityHistory(loaded), stored);
+  assert.ok(loaded.some((event) => event.sessionId === 'session-999'));
+  assert.ok(loaded.every((event) => Number(event.sessionId?.slice(8)) >= 600));
+});
+
+await test('oversized provenance cannot defeat the serialized history cap', () => {
+  const stored = saveActivityHistory(
+    recentActivityEvents([
+      {
+        workspace: '/repo',
+        kind: 'decision',
+        source: 'OpenCode',
+        sourceId: 'x'.repeat(20_000),
+        title: 'Oversized provider ID',
+        outcome: 'allowed',
+        at: 1,
+        agent: 'opencode',
+        sessionId: 'session',
+        automatic: true,
+        reason: 'Allowed by policy.',
+      },
+      {
+        workspace: '/repo',
+        kind: 'decision',
+        source: 'OpenCode',
+        sourceId: 'permission-normal',
+        title: 'Format notes',
+        outcome: 'allowed',
+        at: 2,
+        agent: 'opencode',
+        sessionId: 'session',
+        automatic: true,
+        reason: 'Allowed by policy.',
+      },
+    ]),
+  );
+
+  assert.deepEqual(
+    loadActivityHistory(stored).map((event) => event.sourceId),
+    ['permission-normal'],
+  );
+});
+
 await test('activity history bounds display text without storing output', () => {
   const [event] = recentActivityEvents([
     {
