@@ -2144,7 +2144,8 @@ struct WorktreeRemovalPreview {
     revision: String,
     dirty: bool,
     active_sessions: Vec<String>,
-    size_bytes: u64,
+    size_bytes: Option<u64>,
+    inspection_error: Option<String>,
 }
 
 fn worktree_size_bytes(root: &Path) -> Result<u64, String> {
@@ -2263,14 +2264,16 @@ fn worktree_removal_preview(
             .into_iter()
             .map(|(agent, _, session)| format!("{agent}:{session}"))
             .collect();
+        let size = worktree_size_bytes(&canonical);
         preview.push(WorktreeRemovalPreview {
             path,
             branch: entry.branch.clone(),
             generation,
             revision,
-            dirty,
+            dirty: dirty || size.is_err(),
             active_sessions,
-            size_bytes: worktree_size_bytes(&canonical)?,
+            size_bytes: size.as_ref().ok().copied(),
+            inspection_error: size.err(),
         });
     }
     Ok(preview)
@@ -2344,6 +2347,7 @@ async fn delete_worktree(
             }
         };
         let mut removed_from_git = false;
+        let mut managed_data_paths = Vec::new();
         let result = (|| {
             let persisted_roots =
                 discover_nested_worktree_terminal_roots(&cache_directory, &directory)?;
@@ -2360,6 +2364,7 @@ async fn delete_worktree(
                 &directory,
                 &roots,
             )?;
+            managed_data_paths = managed_data.clone();
             if stop_agents == Some(true) {
                 fence.stop_sessions_in(&app, &agents, &directory)?;
             }
@@ -2372,6 +2377,10 @@ async fn delete_worktree(
                     terminal_manager.stop_worktree(&directory)?;
                     terminals.stop_worktree(&directory)?;
                     agents.stop_worktree(&directory)?;
+                    worktree_storage::ensure_ready_before_worktree_removal(
+                        &cache_directory,
+                        &managed_data,
+                    )?;
                     remove_worktree_then_private_data_many(&cache_directory, &managed_data, || {
                         ensure_expected_worktree_generation(
                             &directory,
@@ -2407,7 +2416,45 @@ async fn delete_worktree(
             terminal_manager.allow_worktree_terminals(&directory);
             terminals.allow_worktree_terminals(&directory);
         }
-        result
+        match result {
+            Err(reason) if removed_from_git => {
+                let inspected = worktree_storage::retained_selected_storage_locations(
+                    &cache_directory,
+                    &managed_data_paths,
+                );
+                let retained = match &inspected {
+                    Ok(paths) if !paths.is_empty() => paths.clone(),
+                    _ => managed_data_paths
+                        .iter()
+                        .filter_map(|path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .map(|key| (key.to_owned(), path.clone()))
+                        })
+                        .collect::<Vec<_>>(),
+                };
+                let retained_size = retained.iter().try_fold(0_u64, |total, (_, path)| {
+                    worktree_size_bytes(path).map(|size| total.saturating_add(size))
+                });
+                let reason = match inspected {
+                    Ok(paths) if !paths.is_empty() => reason,
+                    Ok(_) => format!("{reason} Retained private storage location could not be verified."),
+                    Err(error) => format!("{reason} {error}"),
+                };
+                Err(format!(
+                    "SAIL_STORAGE_PENDING:{}",
+                    serde_json::json!({
+                        "originalPath": directory.to_string_lossy(),
+                        "recoveryPath": directory.to_string_lossy(),
+                        "storagePaths": retained.iter().map(|(_, path)| path.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+                        "storageKeys": retained.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+                        "sizeBytes": retained_size.ok(),
+                        "reason": reason,
+                    })
+                ))
+            }
+            other => other,
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -3872,6 +3919,7 @@ pub fn run() {
             diagnostics::diagnostic_event,
             worktree_storage_cleanup_status,
             retry_worktree_storage_cleanup,
+            retry_selected_removed_worktree_storage,
             settings::reset_test_settings,
             settings::load_settings,
             settings::migrate_settings,
@@ -4104,6 +4152,32 @@ fn retry_worktree_storage_cleanup(
     Ok(worktree_storage::retry_cleanup(&cache))
 }
 
+#[tauri::command]
+fn retry_selected_removed_worktree_storage(
+    app: tauri::AppHandle,
+    repository: String,
+    original_worktree: String,
+    expected_generation: String,
+    cache_key: String,
+    confirmed_unused: bool,
+) -> Result<(), String> {
+    if !confirmed_unused || !Path::new(&original_worktree).is_absolute() {
+        return Err("Confirm that the selected worktree storage is unused before retrying.".into());
+    }
+    let repository = validate_repository(repository)?;
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    worktree_storage::retry_selected_removed_worktree_storage(
+        &cache,
+        Path::new(&repository),
+        Path::new(&original_worktree),
+        &expected_generation,
+        &cache_key,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(any(unix, windows))]
@@ -4121,8 +4195,8 @@ mod tests {
         repository_worktrees_inner, restore_pending_worktree_inner, shipping_base_revision,
         shipping_changed_paths, shipping_default_branch, shipping_fetch_source,
         version_is_compatible, version_number, working_tree_diff, worktree_overviews,
-        worktree_preview_state_with_hook, ExpectedRegisteredWorktree, WorktreeOperationLocks,
-        NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
+        worktree_preview_state_with_hook, worktree_size_bytes, ExpectedRegisteredWorktree,
+        WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::worktree_storage;
@@ -5445,11 +5519,15 @@ mod tests {
         assert_eq!(pending["recoveryPath"], staged.to_string_lossy().as_ref());
         assert!(pending["sizeBytes"].as_u64().unwrap() > 0);
         assert_eq!(worktree_storage::generation(&staged).unwrap(), generation);
-        assert!(
-            git_reference(Path::new(&repository), &["worktree", "list", "--porcelain"])
-                .unwrap()
-                .contains(&format!("worktree {}", staged.display()))
-        );
+        let registered = git_reference(
+            Path::new(&repository),
+            &["worktree", "list", "--porcelain", "-z"],
+        )
+        .unwrap();
+        let staged_canonical = staged.git_canonical().unwrap();
+        assert!(parse_registered_worktrees(&registered).iter().any(|entry| {
+            Path::new(&entry.path).git_canonical().ok().as_ref() == Some(&staged_canonical)
+        }));
         assert_eq!(
             fs::read_to_string(staged.join("late.txt")).unwrap(),
             "keep staged content"
@@ -6017,6 +6095,29 @@ mod tests {
         let (_, dirty) = worktree_preview_state_with_hook(Path::new(&worktree), || {}).unwrap();
 
         assert!(dirty);
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_ignored_directory_does_not_require_discarding_the_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-preview-unreadable-ignored-test");
+        let unreadable = Path::new(&worktree).join("blocked.tmp");
+        fs::create_dir(&unreadable).unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let size = worktree_size_bytes(Path::new(&worktree));
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            size.is_err(),
+            "an unreadable directory needs an unknown size"
+        );
+        assert!(Path::new(&worktree).is_dir());
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }

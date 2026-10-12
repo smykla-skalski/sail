@@ -1281,9 +1281,19 @@
                       data-pending-worktree={worktree.path}
                       role="status"
                     >
-                      <strong>Pending cleanup</strong>
+                      <strong
+                        >{worktree.pendingCleanup.storagePaths?.length
+                          ? 'Private storage pending; checkout removed'
+                          : 'Pending cleanup'}</strong
+                      >
                       <span>Original: {worktree.pendingCleanup.originalPath}</span>
-                      <span>Recovery: {worktree.pendingCleanup.recoveryPath}</span>
+                      {#if worktree.pendingCleanup.storagePaths?.length}
+                        <span
+                          >Retained storage: {worktree.pendingCleanup.storagePaths.join(', ')}</span
+                        >
+                      {:else}
+                        <span>Recovery: {worktree.pendingCleanup.recoveryPath}</span>
+                      {/if}
                       <span
                         >Retained size: {pendingCleanupSize(
                           worktree.pendingCleanup.sizeBytes,
@@ -1293,12 +1303,16 @@
                       <button
                         class="project-worktree-retry"
                         onclick={() => void oncheckpendingcleanup(path, worktree.path)}
-                        >Recheck worktree</button
+                        >{worktree.pendingCleanup.storagePaths?.length
+                          ? 'Recheck storage'
+                          : 'Recheck worktree'}</button
                       >
                       <button
                         class="project-worktree-retry"
                         onclick={() => void onremovependingcleanup(path, worktree.path)}
-                        >Clean up this worktree…</button
+                        >{worktree.pendingCleanup.storagePaths?.length
+                          ? 'Retry selected storage cleanup…'
+                          : 'Clean up this worktree…'}</button
                       >
                     </div>
                   {/if}
@@ -1466,9 +1480,19 @@
                     data-pending-worktree={worktree.path}
                     role="status"
                   >
-                    <strong>Pending cleanup</strong>
+                    <strong
+                      >{worktree.pendingCleanup.storagePaths?.length
+                        ? 'Private storage pending; checkout removed'
+                        : 'Pending cleanup'}</strong
+                    >
                     <span>Original: {worktree.pendingCleanup.originalPath}</span>
-                    <span>Recovery: {worktree.pendingCleanup.recoveryPath}</span>
+                    {#if worktree.pendingCleanup.storagePaths?.length}
+                      <span
+                        >Retained storage: {worktree.pendingCleanup.storagePaths.join(', ')}</span
+                      >
+                    {:else}
+                      <span>Recovery: {worktree.pendingCleanup.recoveryPath}</span>
+                    {/if}
                     <span
                       >Retained size: {pendingCleanupSize(worktree.pendingCleanup.sizeBytes)}</span
                     >
@@ -1476,12 +1500,16 @@
                     <button
                       class="project-worktree-retry"
                       onclick={() => void oncheckpendingcleanup(path, worktree.path)}
-                      >Recheck worktree</button
+                      >{worktree.pendingCleanup.storagePaths?.length
+                        ? 'Recheck storage'
+                        : 'Recheck worktree'}</button
                     >
                     <button
                       class="project-worktree-retry"
                       onclick={() => void onremovependingcleanup(path, worktree.path)}
-                      >Clean up this worktree…</button
+                      >{worktree.pendingCleanup.storagePaths?.length
+                        ? 'Retry selected storage cleanup…'
+                        : 'Clean up this worktree…'}</button
                     >
                   </div>
                 {/if}

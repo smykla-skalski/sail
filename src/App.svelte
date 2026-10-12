@@ -8829,7 +8829,8 @@
     revision: string;
     dirty: boolean;
     activeSessions: string[];
-    sizeBytes: number;
+    sizeBytes: number | null;
+    inspectionError: string | null;
   };
 
   function pendingRecoveryFromError(cause: unknown): PendingWorktreeCleanup | null {
@@ -8856,6 +8857,45 @@
       )
         return null;
       return recovery as PendingWorktreeCleanup;
+    } catch {
+      return null;
+    }
+  }
+
+  function pendingStorageFromError(cause: unknown): PendingWorktreeCleanup | null {
+    const message = describe(cause);
+    const prefix = 'SAIL_STORAGE_PENDING:';
+    if (!message.startsWith(prefix)) return null;
+    try {
+      const value: unknown = JSON.parse(message.slice(prefix.length));
+      if (!value || typeof value !== 'object') return null;
+      const pending = value as Record<string, unknown>;
+      if (
+        typeof pending.originalPath !== 'string' ||
+        pending.recoveryPath !== pending.originalPath ||
+        typeof pending.reason !== 'string' ||
+        !pending.originalPath ||
+        !pending.reason ||
+        (pending.sizeBytes !== null &&
+          (typeof pending.sizeBytes !== 'number' ||
+            !Number.isSafeInteger(pending.sizeBytes) ||
+            pending.sizeBytes < 0)) ||
+        !Array.isArray(pending.storagePaths) ||
+        !pending.storagePaths.length ||
+        !pending.storagePaths.every((path) => typeof path === 'string' && !!path) ||
+        !Array.isArray(pending.storageKeys) ||
+        pending.storageKeys.length !== pending.storagePaths.length ||
+        !pending.storageKeys.every((key) => typeof key === 'string' && /^[0-9a-f]{64}$/.test(key))
+      )
+        return null;
+      return {
+        originalPath: pending.originalPath,
+        recoveryPath: pending.recoveryPath,
+        sizeBytes: pending.sizeBytes,
+        reason: pending.reason,
+        storagePaths: pending.storagePaths,
+        storageKeys: pending.storageKeys,
+      };
     } catch {
       return null;
     }
@@ -8938,6 +8978,7 @@
     const lines = targets.map((worktree, index) => {
       const state = preview[index];
       const warnings = [
+        state.inspectionError ? 'files cannot be fully inspected' : null,
         state.dirty ? 'uncommitted changes' : null,
         state.activeSessions.length ? `active: ${state.activeSessions.join(', ')}` : null,
       ].filter(Boolean);
@@ -8965,11 +9006,13 @@
     let pendingCatalog = projectCatalog;
     for (const [index, worktree] of targets.entries()) {
       const state = preview[index];
-      const reason = state.dirty
-        ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
-        : state.activeSessions.length
-          ? 'Agent sessions are active. Finish them before retrying cleanup.'
-          : 'Awaiting explicit confirmation that this worktree is unused.';
+      const reason = state.inspectionError
+        ? `Cannot verify checkout contents: ${state.inspectionError}`
+        : state.dirty
+          ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+          : state.activeSessions.length
+            ? 'Agent sessions are active. Finish them before retrying cleanup.'
+            : 'Awaiting explicit confirmation that this worktree is unused.';
       pendingCatalog = markWorktreeCleanupPending(
         pendingCatalog,
         repository,
@@ -9000,6 +9043,17 @@
           const pending = entry.pendingCleanup!;
           let reason: string;
           let sizeBytes = pending.sizeBytes;
+          if (pending.storagePaths?.length) {
+            const statuses = await invoke<{ cacheKey: string; reason: string }[]>(
+              'worktree_storage_cleanup_status',
+            );
+            const keys = new Set(pending.storagePaths.map((path) => path.split(/[/\\]/).at(-1)));
+            const retained = statuses.filter((status) => keys.has(status.cacheKey));
+            reason = retained.length
+              ? `Git checkout was removed; private storage remains pending: ${retained.map((status) => `${status.cacheKey}: ${status.reason}`).join(', ')}.`
+              : `Git checkout was removed; verify whether private storage remains at ${pending.storagePaths.join(', ')}.`;
+            return { entry, pending, sizeBytes, reason };
+          }
           const live = current.get(entry.path);
           if (!live || !entry.generation || live.generation !== entry.generation) {
             reason =
@@ -9014,11 +9068,13 @@
                 reason = 'The worktree identity changed during recheck. Its files were kept.';
               } else {
                 sizeBytes = state.sizeBytes;
-                reason = state.dirty
-                  ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
-                  : state.activeSessions.length
-                    ? 'Agent sessions are active. Finish them before retrying cleanup.'
-                    : 'Checkout verified clean and registered. Awaiting explicit unused confirmation.';
+                reason = state.inspectionError
+                  ? `Cannot verify checkout contents: ${state.inspectionError}`
+                  : state.dirty
+                    ? 'Files changed or are ignored. Resolve them before retrying cleanup.'
+                    : state.activeSessions.length
+                      ? 'Agent sessions are active. Finish them before retrying cleanup.'
+                      : 'Checkout verified clean and registered. Awaiting explicit unused confirmation.';
               }
             } catch (cause) {
               reason = `Could not verify checkout: ${describe(cause)}`;
@@ -9073,6 +9129,69 @@
     );
     if (!pending.length) return;
     const recovery = pending[0].pendingCleanup!;
+    if (recovery.storagePaths?.length) {
+      if (!pending[0].generation) {
+        error =
+          'The removed worktree generation cannot be verified. Private storage remains intact.';
+        return;
+      }
+      const confirmed = await confirmInApp(
+        'Retry selected private storage cleanup',
+        `The Git checkout was removed. Confirm no process uses this private storage or writes to it until cleanup finishes? Sail verifies its owner and Git generation before deleting it. Git can delete files written after the final check.\n\nOriginal worktree: ${recovery.originalPath}\nRetained storage: ${recovery.storagePaths.join(', ')}\nRetained size: ${recovery.sizeBytes ?? 'unknown'} bytes\nPending reason: ${recovery.reason}`,
+        'Clean up selected storage',
+        { destructive: true },
+      );
+      if (!confirmed) return;
+      let remainingStoragePaths = [...recovery.storagePaths];
+      let remainingStorageKeys = [...(recovery.storageKeys ?? [])];
+      try {
+        await recovery.storagePaths.reduce(
+          (previous, storagePath, index) =>
+            previous.then(async () => {
+              const cacheKey = recovery.storageKeys?.[index] ?? storagePath.split(/[/\\]/).at(-1);
+              if (!cacheKey) throw new Error('The selected private storage key is missing.');
+              await invoke('retry_selected_removed_worktree_storage', {
+                repository,
+                originalWorktree: recovery.originalPath,
+                expectedGeneration: pending[0].generation,
+                cacheKey,
+                confirmedUnused: true,
+              });
+              remainingStoragePaths = remainingStoragePaths.slice(1);
+              remainingStorageKeys = remainingStorageKeys.slice(1);
+              if (remainingStoragePaths.length) {
+                saveProjectCatalog(
+                  markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+                    ...recovery,
+                    storagePaths: remainingStoragePaths,
+                    storageKeys: remainingStorageKeys,
+                    sizeBytes: null,
+                    reason:
+                      'Some selected private storage was removed; the remaining paths are pending.',
+                  }),
+                );
+              }
+              return undefined;
+            }),
+          Promise.resolve(),
+        );
+        saveProjectCatalog(removeWorktree(projectCatalog, repository, selectedPath));
+        error = '';
+      } catch (cause) {
+        const reason = `Private storage remains pending: ${describe(cause)}`;
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
+            ...recovery,
+            storagePaths: remainingStoragePaths,
+            storageKeys: remainingStorageKeys,
+            sizeBytes: null,
+            reason,
+          }),
+        );
+        error = reason;
+      }
+      return;
+    }
     if (recovery.recoveryPath !== recovery.originalPath) {
       if (
         projectCatalog.worktrees[repository]?.some(
@@ -9349,6 +9468,25 @@
       error = '';
       return true;
     } catch (cause) {
+      const storage = pendingStorageFromError(cause);
+      if (storage) {
+        const prior = projectCatalog.worktrees[repository]?.find((item) => item.path === path);
+        saveProjectCatalog(
+          markWorktreeCleanupPending(
+            projectCatalog,
+            repository,
+            path,
+            {
+              ...storage,
+              originalPath: prior?.pendingCleanup?.originalPath ?? storage.originalPath,
+            },
+            expected?.generation ?? undefined,
+          ),
+        );
+        error = `The Git checkout was removed, but private agent storage remains at ${storage.storagePaths!.join(', ')}. ${storage.reason}`;
+        if (wasSelected && directory === path) await loadProject(repository);
+        return false;
+      }
       const recovery = pendingRecoveryFromError(cause);
       if (recovery) {
         const prior = projectCatalog.worktrees[repository]?.find((item) => item.path === path);

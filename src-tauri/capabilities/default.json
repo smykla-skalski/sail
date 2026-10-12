@@ -62,6 +62,8 @@
     "allow-worktree-removal-preview",
     "allow-restore-pending-worktree",
     "allow-delete-worktree",
+    "allow-worktree-storage-cleanup-status",
+    "allow-retry-selected-removed-worktree-storage",
     "allow-worktree-config",
     "allow-context-provider-status",
     "allow-context-register-provider",
