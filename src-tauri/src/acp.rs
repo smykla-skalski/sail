@@ -3868,6 +3868,7 @@ fn connect_blocking_inner(
     command.current_dir(worktree);
     #[cfg(unix)]
     isolate_agent_process(&mut command);
+    storage_lease.prepare_process_start()?;
     let spawn = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

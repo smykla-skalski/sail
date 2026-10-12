@@ -4,7 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { Button } from '@smykla-skalski/sui';
   import { invoke } from '@tauri-apps/api/core';
-  import { open as openDialog } from '@tauri-apps/plugin-dialog';
+  import { ask, open as openDialog } from '@tauri-apps/plugin-dialog';
   import OptionPicker from './OptionPicker.svelte';
   import { getSetting } from './lib/settings';
   import {
@@ -65,7 +65,12 @@
   } from './lib/shared-memory';
 
   let snapshot = $state<SettingsSnapshot | null>(null);
-  type WorktreeStoragePending = { cacheKey: string; reason: string };
+  type WorktreeStoragePending = {
+    cacheKey: string;
+    reason: string;
+    sizeBytes: number | null;
+    cleanupToken: string | null;
+  };
   let worktreeStoragePending = $state<WorktreeStoragePending[]>([]);
   let worktreeStorageLoading = $state(false);
   let worktreeStorageError = $state('');
@@ -239,6 +244,49 @@
       );
     } catch (cause) {
       worktreeStorageError = `Private agent storage status: ${String(cause)}`;
+    } finally {
+      worktreeStorageLoading = false;
+    }
+  }
+
+  function formatStorageSize(bytes: number | null): string {
+    if (bytes === null) return 'Size unavailable';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+    let value = bytes;
+    let unit = -1;
+    do {
+      value /= 1024;
+      unit += 1;
+    } while (value >= 1024 && unit < units.length - 1);
+    return `${value.toFixed(1)} ${units[unit]}`;
+  }
+
+  async function cleanPendingTemp(item: WorktreeStoragePending) {
+    if (!item.cleanupToken || worktreeStorageLoading) return;
+    let confirmed: boolean;
+    try {
+      confirmed = await ask(
+        `I checked that no process is using this ${formatStorageSize(item.sizeBytes)} of temporary data (${item.reason}). Remove it?`,
+        { title: 'Clean pending temporary data' },
+      );
+    } catch (cause) {
+      worktreeStorageError = `Private agent storage confirmation: ${String(cause)}`;
+      return;
+    }
+    if (!confirmed) return;
+    worktreeStorageLoading = true;
+    worktreeStorageError = '';
+    try {
+      worktreeStoragePending = await invoke<WorktreeStoragePending[]>(
+        'clean_pending_worktree_temp',
+        {
+          token: item.cleanupToken,
+          confirmedUnused: true,
+        },
+      );
+    } catch (cause) {
+      worktreeStorageError = `Private agent storage cleanup: ${String(cause)}`;
     } finally {
       worktreeStorageLoading = false;
     }
@@ -1109,8 +1157,17 @@
             Sail could not verify that no process still owns it or that its Git worktree identity is unchanged.
           </p>
           <ul>
-            {#each worktreeStoragePending as item (item.cacheKey)}
-              <li>{item.reason} <code>{item.cacheKey}</code></li>
+            {#each worktreeStoragePending as item (`${item.cacheKey}:${item.reason}:${item.cleanupToken ?? ''}`)}
+              <li>
+                {item.reason} · {formatStorageSize(item.sizeBytes)} <code>{item.cacheKey}</code>
+                {#if item.cleanupToken}
+                  <Button
+                    size="sm"
+                    disabled={worktreeStorageLoading}
+                    onclick={() => void cleanPendingTemp(item)}>Clean after checking unused</Button
+                  >
+                {/if}
+              </li>
             {/each}
           </ul>
         {:else}

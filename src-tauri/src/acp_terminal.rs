@@ -858,6 +858,7 @@ pub fn handle(
                 command.env(name, value);
             }
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            storage_lease.prepare_process_start()?;
             #[cfg(windows)]
             let (mut child, job) = WindowsTerminalJob::spawn(&mut command)?;
             #[cfg(not(windows))]

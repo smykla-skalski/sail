@@ -1200,6 +1200,9 @@ fn spawn(
     command.env("COLORTERM", "truecolor");
     #[cfg(windows)]
     command.env("PROMPT", "$E]9;9;$P$E\\$P$G");
+    if let Some(lease) = &storage_lease {
+        lease.prepare_process_start()?;
+    }
     #[cfg(windows)]
     let job = {
         let job = crate::acp_terminal::WindowsTerminalJob::new()?;

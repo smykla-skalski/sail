@@ -19,9 +19,11 @@ const ACTIVE_PREFIX: &str = ".active-";
 const QUARANTINE_PREFIX: &str = ".reclaim-";
 const TEMP_ROOT: &str = "turn-temp";
 const TEMP_OWNER_FILE: &str = "sail-temp-owner-v2";
-const TEMP_OWNER_HEADER: &str = "sail-temp-owner-v2";
+const TEMP_OWNER_HEADER: &str = "sail-temp-owner-v3";
+const PREVIOUS_TEMP_OWNER_HEADER: &str = "sail-temp-owner-v2";
 const LEGACY_TEMP_OWNER_FILE: &str = "sail-temp-owner-v1";
 const LEGACY_TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
+const TEMP_PROCESS_START_FILE: &str = "sail-temp-process-starting-v1";
 const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
 const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
 const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
@@ -40,6 +42,37 @@ struct WorktreeIdentity {
 pub(crate) struct CleanupPending {
     pub(crate) cache_key: String,
     pub(crate) reason: String,
+    pub(crate) size_bytes: Option<u64>,
+    pub(crate) cleanup_token: Option<String>,
+}
+
+fn pending_size(path: &Path) -> Option<u64> {
+    let mut total = 0u64;
+    let mut remaining = vec![path.to_path_buf()];
+    while let Some(path) = remaining.pop() {
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).ok()? {
+                remaining.push(entry.ok()?.path());
+            }
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Some(total)
+}
+
+fn pending_item(key: String, reason: &str, path: Option<&Path>, can_clean: bool) -> CleanupPending {
+    CleanupPending {
+        cache_key: key,
+        reason: reason.into(),
+        size_bytes: path.and_then(pending_size),
+        cleanup_token: if can_clean {
+            path.and_then(|path| cache_key(path).ok())
+        } else {
+            None
+        },
+    }
 }
 
 pub(crate) struct WorktreeDataLease {
@@ -61,9 +94,22 @@ struct TempLease {
 struct TempOwner {
     pid: u32,
     started_at: Option<u64>,
+    protocol_v3: bool,
 }
 
 impl TempLease {
+    fn prepare_process_start(&self) -> Result<(), String> {
+        self.verify_root()?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.directory.join(TEMP_PROCESS_START_FILE))
+            .map_err(|error| error.to_string())?;
+        file.write_all(b"sail-temp-process-starting-v1\n")
+            .and_then(|_| file.sync_all())
+            .map_err(|error| error.to_string())
+    }
+
     fn verify_root(&self) -> Result<(), String> {
         let root = self
             .directory
@@ -137,6 +183,7 @@ impl TempLease {
             if entry.file_name() == TEMP_OWNER_FILE
                 || entry.file_name() == LEGACY_TEMP_OWNER_FILE
                 || entry.file_name() == TEMP_PENDING_FILE
+                || entry.file_name() == TEMP_PROCESS_START_FILE
             {
                 continue;
             }
@@ -167,6 +214,10 @@ impl Drop for TempLease {
 }
 
 impl WorktreeDataLease {
+    pub(crate) fn prepare_process_start(&self) -> Result<(), String> {
+        self.temp.prepare_process_start()
+    }
+
     pub(crate) fn mark_started(&self) {
         self.temp.started.store(true, Ordering::Release);
         self.started.store(true, Ordering::Release);
@@ -532,6 +583,7 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             Ok(identity) => identity,
             Err(reason) => {
                 if read_plain_owner(cache_directory, &data_directory).is_ok() {
+                    reclaim_verified_unstarted_temp(cache_directory, &data_directory);
                     for item in temp_directory_status(cache_directory, &data_directory) {
                         report_pending(&data_directory, &item.reason);
                     }
@@ -552,6 +604,7 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             report_pending(&data_directory, "owner-cache-key-mismatch");
             continue;
         }
+        reclaim_verified_unstarted_temp(cache_directory, &data_directory);
         for item in temp_directory_status(cache_directory, &data_directory) {
             report_pending(&data_directory, &item.reason);
         }
@@ -673,20 +726,24 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return pending,
         Err(_) => {
-            return vec![CleanupPending {
-                cache_key: "unknown".into(),
-                reason: "storage-scan-failed".into(),
-            }]
+            return vec![pending_item(
+                "unknown".into(),
+                "storage-scan-failed",
+                None,
+                false,
+            )]
         }
     };
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
-                pending.push(CleanupPending {
-                    cache_key: "unknown".into(),
-                    reason: "storage-entry-unreadable".into(),
-                });
+                pending.push(pending_item(
+                    "unknown".into(),
+                    "storage-entry-unreadable",
+                    None,
+                    false,
+                ));
                 continue;
             }
         };
@@ -748,10 +805,7 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
             }
         };
         if let Some(reason) = reason {
-            pending.push(CleanupPending {
-                cache_key: name,
-                reason: reason.into(),
-            });
+            pending.push(pending_item(name, reason, Some(&directory), false));
         }
     }
     pending.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
@@ -763,15 +817,186 @@ pub(crate) fn retry_cleanup(cache_directory: &Path) -> Vec<CleanupPending> {
     cleanup_status(cache_directory)
 }
 
-fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<CleanupPending> {
-    let mut pending = Vec::new();
-    let verified_owner = read_owner(data_directory).ok().is_some_and(|identity| {
+fn reclaim_verified_unstarted_temp(cache_directory: &Path, data_directory: &Path) {
+    let Ok(mutation_path) = lock_path(cache_directory, "mutation", data_directory) else {
+        return;
+    };
+    let Ok(_mutation) = FileLock::try_acquire(&mutation_path, true) else {
+        return;
+    };
+    let root = data_directory.join(TEMP_ROOT);
+    if !fs::symlink_metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let directory = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let lock_directory = if name.starts_with("run-") {
+            directory.clone()
+        } else if name.starts_with(".run-") && name.ends_with(".tmp") {
+            root.join(&name[1..name.len() - 4])
+        } else {
+            continue;
+        };
+        let Ok(owner) = read_temp_owner(&directory, data_directory) else {
+            continue;
+        };
+        if !owner.protocol_v3 || process_owner_alive(&owner) {
+            continue;
+        }
+        if !matches!(
+            fs::symlink_metadata(directory.join(TEMP_PROCESS_START_FILE)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            continue;
+        }
+        let Ok(lock_path) = lock_path(cache_directory, "temp", &lock_directory) else {
+            continue;
+        };
+        let Ok(_lock) = FileLock::try_acquire(&lock_path, true) else {
+            continue;
+        };
+        if temp_directory_in_use(&directory) {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(&directory) {
+            let _ = fs::write(
+                directory.join(TEMP_PENDING_FILE),
+                b"verified-temp-removal-failed",
+            );
+            report_pending(
+                &directory,
+                &format!("verified-temp-removal-failed: {error}"),
+            );
+        }
+    }
+}
+
+/// Remove one pending temporary directory after the user has checked that it is unused.
+/// The token identifies a path already reported by cleanup_status; it is never a path
+/// supplied by the frontend.
+pub(crate) fn clean_pending_temp(
+    cache_directory: &Path,
+    token: &str,
+) -> Result<Vec<CleanupPending>, String> {
+    if !valid_cache_key(token) {
+        return Err("Invalid pending temporary data token.".into());
+    }
+    let (data_directory, target, lock_directory) = find_pending_temp(cache_directory, token)?;
+    let _mutation = FileLock::try_acquire(
+        &lock_path(cache_directory, "mutation", &data_directory)?,
+        true,
+    )
+    .map_err(|_| "Private storage is changing; retry after it becomes idle.".to_string())?;
+    if !verified_data_owner(cache_directory, &data_directory) {
+        return Err("Private storage ownership changed; refresh cleanup status.".into());
+    }
+    if !temp_directory_status(cache_directory, &data_directory)
+        .iter()
+        .any(|item| item.cleanup_token.as_deref() == Some(token))
+    {
+        return Err("Temporary data is no longer pending; refresh cleanup status.".into());
+    }
+    let _temp_lock = if let Some(lock_directory) = lock_directory {
+        Some(
+            FileLock::try_acquire(&lock_path(cache_directory, "temp", &lock_directory)?, true)
+                .map_err(|_| "Temporary data still has an active owner.".to_string())?,
+        )
+    } else {
+        None
+    };
+    if !fs::symlink_metadata(&target)
+        .map_err(|error| error.to_string())?
+        .is_dir()
+        || temp_directory_in_use(&target)
+    {
+        return Err("Temporary data is not an unused directory.".into());
+    }
+    if let Ok(owner) = read_temp_owner(&target, &data_directory) {
+        if owner.pid != std::process::id() && process_owner_alive(&owner) {
+            return Err("Temporary data still has a verified active owner.".into());
+        }
+    }
+    fs::remove_dir_all(&target).map_err(|error| {
+        report_pending(&target, "manual-temp-removal-failed");
+        format!("Cannot remove pending temporary data: {error}")
+    })?;
+    drop(_temp_lock);
+    drop(_mutation);
+    Ok(retry_cleanup(cache_directory))
+}
+
+fn find_pending_temp(
+    cache_directory: &Path,
+    token: &str,
+) -> Result<(PathBuf, PathBuf, Option<PathBuf>), String> {
+    let root = cache_directory.join("terminal-worktrees");
+    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let data_directory = entry.path();
+        if !entry.file_name().to_str().is_some_and(valid_cache_key)
+            || !verified_data_owner(cache_directory, &data_directory)
+        {
+            continue;
+        }
+        for target in [
+            data_directory.join("tmp"),
+            data_directory.join("build/go-tmp"),
+        ] {
+            if cache_key(&target)? == token {
+                if target.parent() == Some(data_directory.join("build").as_path())
+                    && !fs::symlink_metadata(data_directory.join("build"))
+                        .is_ok_and(|metadata| metadata.is_dir())
+                {
+                    return Err("Legacy temporary storage parent changed.".into());
+                }
+                return Ok((data_directory, target, None));
+            }
+        }
+        let temp_root = data_directory.join(TEMP_ROOT);
+        if !fs::symlink_metadata(&temp_root).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+        for entry in fs::read_dir(temp_root).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let target = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let lock_directory = if name.starts_with("run-") {
+                target.clone()
+            } else if name.starts_with(".run-") && name.ends_with(".tmp") {
+                data_directory
+                    .join(TEMP_ROOT)
+                    .join(&name[1..name.len() - 4])
+            } else {
+                continue;
+            };
+            if cache_key(&target)? == token {
+                return Ok((data_directory, target, Some(lock_directory)));
+            }
+        }
+    }
+    Err("Pending temporary data was not found; refresh cleanup status.".into())
+}
+
+fn verified_data_owner(cache_directory: &Path, data_directory: &Path) -> bool {
+    read_owner(data_directory).ok().is_some_and(|identity| {
         identity_data_directory(cache_directory, &identity)
             .ok()
             .as_deref()
             == Some(data_directory)
-    }) || read_plain_owner(cache_directory, data_directory).is_ok();
-    if !verified_owner {
+    }) || read_plain_owner(cache_directory, data_directory).is_ok()
+}
+
+fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<CleanupPending> {
+    let mut pending = Vec::new();
+    if !verified_data_owner(cache_directory, data_directory) {
         return pending;
     }
     for legacy in [
@@ -779,24 +1004,36 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
         data_directory.join("build/go-tmp"),
     ] {
         match fs::symlink_metadata(&legacy) {
-            Ok(_) => pending.push(CleanupPending {
-                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
-                reason: "legacy-temp-owner-unverified".into(),
-            }),
+            Ok(metadata) if metadata.is_dir() => pending.push(pending_item(
+                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                "legacy-temp-owner-unverified",
+                Some(&legacy),
+                true,
+            )),
+            Ok(_) => pending.push(pending_item(
+                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                "legacy-temp-root-unverifiable",
+                Some(&legacy),
+                false,
+            )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => pending.push(CleanupPending {
-                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
-                reason: "legacy-temp-scan-failed".into(),
-            }),
+            Err(_) => pending.push(pending_item(
+                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                "legacy-temp-scan-failed",
+                None,
+                false,
+            )),
         }
     }
     let root = data_directory.join(TEMP_ROOT);
     if let Ok(metadata) = fs::symlink_metadata(&root) {
         if !metadata.is_dir() {
-            pending.push(CleanupPending {
-                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
-                reason: "turn-temp-root-unverifiable".into(),
-            });
+            pending.push(pending_item(
+                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                "turn-temp-root-unverifiable",
+                Some(&root),
+                false,
+            ));
             return pending;
         }
     }
@@ -804,19 +1041,23 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return pending,
         Err(_) => {
-            pending.push(CleanupPending {
-                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
-                reason: "turn-temp-scan-failed".into(),
-            });
+            pending.push(pending_item(
+                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                "turn-temp-scan-failed",
+                None,
+                false,
+            ));
             return pending;
         }
     };
     for entry in entries {
         let Ok(entry) = entry else {
-            pending.push(CleanupPending {
-                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
-                reason: "turn-temp-entry-unreadable".into(),
-            });
+            pending.push(pending_item(
+                cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                "turn-temp-entry-unreadable",
+                None,
+                false,
+            ));
             continue;
         };
         let directory = entry.path();
@@ -843,18 +1084,35 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
                     Ok(_lock) if owner.pid != std::process::id() && process_owner_alive(&owner) => {
                         Some("turn-temp-process-active")
                     }
+                    Ok(_lock) if cleanup_failed => Some("turn-temp-cleanup-failed"),
                     Ok(_lock) => Some("turn-temp-owner-unverified"),
                     Err(_) if cleanup_failed => Some("turn-temp-cleanup-failed"),
                     Err(_) => None,
                 }
             }
-            Err(_) => Some("turn-temp-owner-unverifiable"),
+            Err(_) => {
+                let lock = lock_path(cache_directory, "temp", &lock_directory);
+                match lock.and_then(|path| FileLock::try_acquire(&path, true)) {
+                    Ok(_lock) if temp_directory_in_use(&directory) => {
+                        Some("turn-temp-process-active")
+                    }
+                    Ok(_lock) => Some("turn-temp-owner-unverifiable"),
+                    Err(_) => Some("turn-temp-process-active"),
+                }
+            }
         };
         if let Some(reason) = reason {
-            pending.push(CleanupPending {
-                cache_key: key,
-                reason: reason.into(),
-            });
+            pending.push(pending_item(
+                key,
+                reason,
+                Some(&directory),
+                matches!(
+                    reason,
+                    "turn-temp-owner-unverified"
+                        | "turn-temp-owner-unverifiable"
+                        | "turn-temp-cleanup-failed"
+                ),
+            ));
         }
     }
     pending
@@ -884,8 +1142,10 @@ fn read_temp_owner(directory: &Path, data_directory: &Path) -> Result<TempOwner,
     let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let mut lines = contents.lines();
     let header = lines.next();
-    if !matches!(header, Some(TEMP_OWNER_HEADER | LEGACY_TEMP_OWNER_HEADER))
-        || lines.next() != Some(cache_key(data_directory)?.as_str())
+    if !matches!(
+        header,
+        Some(TEMP_OWNER_HEADER | PREVIOUS_TEMP_OWNER_HEADER | LEGACY_TEMP_OWNER_HEADER)
+    ) || lines.next() != Some(cache_key(data_directory)?.as_str())
     {
         return Err("Temporary owner marker does not match its worktree.".into());
     }
@@ -894,7 +1154,7 @@ fn read_temp_owner(directory: &Path, data_directory: &Path) -> Result<TempOwner,
         .ok_or("Temporary owner marker lacks a process ID.")?
         .parse::<u32>()
         .map_err(|error| error.to_string())?;
-    let started_at = if header == Some(TEMP_OWNER_HEADER) {
+    let started_at = if matches!(header, Some(TEMP_OWNER_HEADER | PREVIOUS_TEMP_OWNER_HEADER)) {
         Some(
             lines
                 .next()
@@ -908,7 +1168,11 @@ fn read_temp_owner(directory: &Path, data_directory: &Path) -> Result<TempOwner,
     if pid == 0 || started_at == Some(0) || lines.next().is_some() {
         return Err("Temporary owner marker is malformed.".into());
     }
-    Ok(TempOwner { pid, started_at })
+    Ok(TempOwner {
+        pid,
+        started_at,
+        protocol_v3: header == Some(TEMP_OWNER_HEADER),
+    })
 }
 
 fn temp_directory_in_use(directory: &Path) -> bool {
@@ -1954,7 +2218,7 @@ mod tests {
         }
     }
 
-    fn write_expired_temp_owner(temp: &Path, data_directory: &Path) {
+    fn write_expired_temp_owner_with_header(temp: &Path, data_directory: &Path, header: &str) {
         let pid = std::process::id();
         let started_at = sysinfo::System::new_all()
             .process(sysinfo::Pid::from_u32(pid))
@@ -1963,12 +2227,16 @@ mod tests {
         fs::write(
             temp.join(TEMP_OWNER_FILE),
             format!(
-                "{TEMP_OWNER_HEADER}\n{}\n{pid}\n{}\n",
+                "{header}\n{}\n{pid}\n{}\n",
                 cache_key(data_directory).unwrap(),
                 started_at + 1
             ),
         )
         .unwrap();
+    }
+
+    fn write_expired_temp_owner(temp: &Path, data_directory: &Path) {
+        write_expired_temp_owner_with_header(temp, data_directory, PREVIOUS_TEMP_OWNER_HEADER);
     }
 
     #[test]
@@ -2108,15 +2376,45 @@ mod tests {
         assert!(cleanup_status(&fixture.cache)
             .iter()
             .any(|item| item.reason == "turn-temp-cleanup-failed"));
-        fs::write(runtime.temp_directory().join("next-turn"), "new").unwrap();
-        runtime.clear_turn_temp().unwrap();
-        assert!(!runtime.temp_directory().join("next-turn").exists());
+        for turn in 0..10 {
+            let artifact = runtime.temp_directory().join(format!("turn-{turn}"));
+            fs::write(&artifact, "new").unwrap();
+            runtime.clear_turn_temp().unwrap();
+            assert!(!artifact.exists());
+            assert_eq!(fs::read_to_string(&active).unwrap(), "running");
+        }
         assert!(!cleanup_status(&fixture.cache)
             .iter()
             .any(|item| item.reason == "turn-temp-cleanup-failed"));
         terminal.release_clean().unwrap();
         runtime.release_clean().unwrap();
         assert!(!active.exists());
+    }
+
+    #[test]
+    fn ten_exited_turns_do_not_accumulate_temp_while_terminal_runs() {
+        let fixture = GitFixture::new();
+        let (_, terminal) = register(&fixture.cache, &fixture.first).unwrap();
+        terminal.mark_started();
+        let active = terminal.temp_directory().join("terminal-artifact");
+        fs::write(&active, "running").unwrap();
+
+        for turn in 0..10 {
+            let (_, runtime) = register(&fixture.cache, &fixture.first).unwrap();
+            let temp = runtime.temp_directory().to_path_buf();
+            fs::write(temp.join(format!("turn-{turn}")), "finished").unwrap();
+            let mut child = std::process::Command::new("git")
+                .arg("--version")
+                .env("TMPDIR", &temp)
+                .spawn()
+                .unwrap();
+            runtime.mark_started();
+            assert!(child.wait().unwrap().success());
+            runtime.release_clean().unwrap();
+            assert!(!temp.exists());
+            assert_eq!(fs::read_to_string(&active).unwrap(), "running");
+        }
+        terminal.release_clean().unwrap();
     }
 
     #[test]
@@ -2129,7 +2427,13 @@ mod tests {
         lease.mark_started();
         drop(lease);
 
-        assert_cleanup_reason(&fixture.cache, "turn-temp-owner-unverified");
+        let pending = cleanup_status(&fixture.cache);
+        let abandoned_item = pending
+            .iter()
+            .find(|item| item.reason == "turn-temp-owner-unverified")
+            .unwrap();
+        assert!(abandoned_item.size_bytes.unwrap() >= 3);
+        let abandoned_token = abandoned_item.cleanup_token.clone().unwrap();
         retry_cleanup(&fixture.cache);
         assert_eq!(
             fs::read_to_string(abandoned.join("artifact")).unwrap(),
@@ -2152,6 +2456,54 @@ mod tests {
         assert!(cleanup_status(&fixture.cache)
             .iter()
             .any(|item| item.reason == "turn-temp-owner-unverifiable"));
+
+        let unverified_token = cleanup_status(&fixture.cache)
+            .iter()
+            .find(|item| item.reason == "turn-temp-owner-unverifiable")
+            .unwrap()
+            .cleanup_token
+            .clone()
+            .unwrap();
+        clean_pending_temp(&fixture.cache, &abandoned_token).unwrap();
+        assert!(!abandoned.exists());
+        assert!(unverified.exists());
+        clean_pending_temp(&fixture.cache, &unverified_token).unwrap();
+        assert!(!unverified.exists());
+    }
+
+    #[test]
+    fn crashed_owner_without_a_process_start_is_reclaimed_after_exit() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        fs::write(temp.join("artifact"), "unused").unwrap();
+        write_expired_temp_owner_with_header(&temp, &directory, TEMP_OWNER_HEADER);
+        lease.mark_started();
+        drop(lease);
+
+        retry_cleanup(&fixture.cache);
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn process_start_marker_retains_crashed_owner_temp() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        fs::write(temp.join("artifact"), "possibly-live").unwrap();
+        lease.prepare_process_start().unwrap();
+        write_expired_temp_owner_with_header(&temp, &directory, TEMP_OWNER_HEADER);
+        lease.mark_started();
+        drop(lease);
+
+        retry_cleanup(&fixture.cache);
+        assert_eq!(
+            fs::read_to_string(temp.join("artifact")).unwrap(),
+            "possibly-live"
+        );
+        assert!(cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "turn-temp-owner-unverified"));
     }
 
     #[test]
@@ -2222,6 +2574,15 @@ mod tests {
             remove_after_worktree_removal(&fixture.cache, std::slice::from_ref(&directory))
                 .is_err()
         );
+        let token = pending
+            .iter()
+            .find(|item| item.reason == "legacy-temp-owner-unverified")
+            .unwrap()
+            .cleanup_token
+            .clone()
+            .unwrap();
+        clean_pending_temp(&fixture.cache, &token).unwrap();
+        assert!(!artifact.exists());
     }
 
     #[cfg(unix)]
@@ -2237,7 +2598,7 @@ mod tests {
         fs::write(
             temp.join(TEMP_OWNER_FILE),
             format!(
-                "{TEMP_OWNER_HEADER}\n{}\n{}\n{}\n",
+                "{PREVIOUS_TEMP_OWNER_HEADER}\n{}\n{}\n{}\n",
                 cache_key(&directory).unwrap(),
                 owner.id(),
                 sysinfo::System::new_all()
@@ -2255,6 +2616,8 @@ mod tests {
         assert!(cleanup_status(&fixture.cache)
             .iter()
             .any(|item| item.reason == "turn-temp-process-active"));
+        assert!(clean_pending_temp(&fixture.cache, &cache_key(&temp).unwrap()).is_err());
+        assert!(temp.exists());
 
         owner.kill().unwrap();
         owner.wait().unwrap();
@@ -2263,6 +2626,8 @@ mod tests {
         assert!(cleanup_status(&fixture.cache)
             .iter()
             .any(|item| item.reason == "turn-temp-owner-unverified"));
+        clean_pending_temp(&fixture.cache, &cache_key(&temp).unwrap()).unwrap();
+        assert!(!temp.exists());
     }
 
     #[cfg(unix)]
@@ -2283,7 +2648,7 @@ mod tests {
         fs::write(
             temp.join(TEMP_OWNER_FILE),
             format!(
-                "{TEMP_OWNER_HEADER}\n{}\n{}\n{}\n",
+                "{PREVIOUS_TEMP_OWNER_HEADER}\n{}\n{}\n{}\n",
                 cache_key(&directory).unwrap(),
                 unrelated.id(),
                 started_at + 1
