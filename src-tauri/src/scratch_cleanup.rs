@@ -91,6 +91,7 @@ pub(crate) fn owner_identity_for_pid(pid: u32) -> Option<String> {
 pub(crate) struct OwnedRuntimeScratch {
     path: PathBuf,
     owner: Option<String>,
+    cleaned: bool,
 }
 
 impl OwnedRuntimeScratch {
@@ -105,7 +106,11 @@ impl OwnedRuntimeScratch {
             let _ = fs::remove_dir_all(&path);
             return Err(error);
         }
-        Ok(Self { path, owner: None })
+        Ok(Self {
+            path,
+            owner: None,
+            cleaned: false,
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -118,15 +123,24 @@ impl OwnedRuntimeScratch {
         self.owner = Some(owner);
         Ok(())
     }
+
+    pub(crate) fn cleanup_now(&mut self) -> std::io::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        if let Some(owner) = self.owner.as_deref() {
+            remove_owned_runtime_root(&self.path, owner)?;
+        } else {
+            fs::remove_dir_all(&self.path)?;
+        }
+        self.cleaned = true;
+        Ok(())
+    }
 }
 
 impl Drop for OwnedRuntimeScratch {
     fn drop(&mut self) {
-        if self.owner.is_none() {
-            let _ = fs::remove_dir_all(&self.path);
-        } else if let Err(error) =
-            remove_owned_runtime_root(&self.path, self.owner.as_deref().unwrap())
-        {
+        if let Err(error) = self.cleanup_now() {
             eprintln!(
                 "Sail runtime scratch retained {}: {error}",
                 self.path.display()
@@ -701,6 +715,7 @@ mod tests {
         let scratch = OwnedRuntimeScratch {
             path: path.clone(),
             owner: Some(fs::read_to_string(path.join(MARKER)).unwrap()),
+            cleaned: false,
         };
         drop(scratch);
         assert!(!path.exists());
@@ -716,6 +731,7 @@ mod tests {
         scratch.mark_owner(child.id()).unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
+        assert!(scratch.cleanup_now().is_err());
         drop(scratch);
         assert!(path.exists());
         drop(file);

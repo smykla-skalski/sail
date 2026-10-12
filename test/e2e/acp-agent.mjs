@@ -466,6 +466,21 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    if (text === 'Long owned history') {
+      for (let index = 0; index < 80; index++)
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: `owned-history-${index}`,
+          title: `Owned history ${index}`,
+          status: 'completed',
+        });
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Long history complete.' },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (text === 'Ask structured question') {
       const id = ++nextPermission;
       elicitations.set(id, { sessionId, promptId: message.id });

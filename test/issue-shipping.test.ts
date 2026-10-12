@@ -46,6 +46,7 @@ import {
   shippingClockWasSuspended,
   shippingClaimOwnedByInstance,
   shippingWorkerSettled,
+  shipOwnerReleaseReady,
   serializeShippingClaimOperation,
   shippingSetupAction,
   terminalClaimReleaseReady,
@@ -55,6 +56,30 @@ import {
 } from '../src/lib/issue-shipping.ts';
 import { shipOwner } from '../src/lib/ship-progress.ts';
 import type { PublishedGraph } from '../src/lib/issue-graph.ts';
+
+void test('a terminal worker releases its build root after gates settle in either order', () => {
+  const issue = {
+    path: '/tmp/ship-worktree',
+    receiptId: 'worker-owner',
+    workerSettled: true,
+    state: 'working' as 'working' | 'merged',
+  };
+  const gate = {
+    targetDirectory: issue.path,
+    validation: { gate: 'code-adversary' },
+    state: 'working' as 'working' | 'completed',
+  };
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), false);
+  issue.state = 'merged';
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), false);
+  gate.state = 'completed';
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), true);
+
+  issue.state = 'working';
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), false);
+  issue.state = 'merged';
+  assert.equal(shipOwnerReleaseReady(issue, [gate]), true);
+});
 
 const graph: PublishedGraph = {
   issues: [

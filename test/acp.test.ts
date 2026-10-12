@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   acp,
   acpDisconnectAffectsSession,
+  acpSessionOwner,
   acpCancelMatchesSession,
   acpEventMatchesSession,
   applyLiveTranscriptUpdate,
@@ -18,6 +19,7 @@ import {
   rememberSessionState,
   recoverMissingCodexSession,
   restoreEntryTimes,
+  restoreOwnedEntries,
   saveRecentTranscript,
   sessionState,
   takeLiveTranscript,
@@ -134,6 +136,13 @@ void test('scoped ACP disconnect only affects sessions from the exited connectio
   assert.equal(acpDisconnectAffectsSession(message, 'build-session', 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'build'), false);
   assert.equal(acpDisconnectAffectsSession(message, null, 'review'), true);
+});
+
+void test('a reopened owned thread reconnects to its run', () => {
+  const owner = '0d66d3a1-5c47-45d1-8c3d-4a789f129001';
+  assert.equal(acpSessionOwner(`sail-owned:${owner}:wire-session`), owner);
+  assert.equal(acpSessionOwner('wire-session'), null);
+  assert.equal(acpSessionOwner('sail-owned:invalid:wire-session'), null);
 });
 
 void test('ACP replay ignores updates from a sibling worktree with the same session ID', () => {
@@ -456,6 +465,18 @@ void test('history replay keeps recent message times for subagent order', () => 
     restoreEntryTimes(history, recent).map((entry) => entry.created),
     [undefined, 10, 30],
   );
+});
+
+void test('owned restore retains a complete local transcript when provider replay is empty or partial', () => {
+  const saved: AgentEntry[] = Array.from({ length: 80 }, (_, index) => ({
+    id: `saved-${index}`,
+    type: 'assistant',
+    text: `Owned history ${index}`,
+    created: index,
+  }));
+  assert.deepEqual(restoreOwnedEntries([], saved), saved);
+  assert.deepEqual(restoreOwnedEntries(saved.slice(-50), saved), saved);
+  assert.equal(restoreOwnedEntries(saved, saved).length, 80);
 });
 
 void test('recent transcript cache keeps the latest entries within a size budget', () => {

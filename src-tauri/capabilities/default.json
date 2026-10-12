@@ -101,6 +101,7 @@
     "allow-local-plugin-version",
     "allow-acp-agents",
     "allow-acp-connect",
+    "allow-acp-release-owner",
     "allow-acp-new-session",
     "allow-acp-forget-session",
     "allow-acp-release-session-fence",

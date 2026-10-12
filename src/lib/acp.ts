@@ -4,6 +4,11 @@ import { resourceQueues } from './resource-limits.ts';
 import { acpPlans } from './acp-plans.ts';
 import { forgetPlanningState } from './planning-state.ts';
 import { toolCommand } from './tool-display.ts';
+import {
+  flushOwnedTranscriptWrites,
+  forgetOwnedTranscript,
+  saveOwnedTranscript,
+} from './owned-transcripts.ts';
 import type { CapabilityProfile, PermissionPolicyDecision } from './capability-profiles.ts';
 
 export type AgentId = string;
@@ -237,6 +242,11 @@ export function restoreEntryTimes(history: AgentEntry[], recent: AgentEntry[]): 
   return restored;
 }
 
+/** A provider may accept session/load while replaying no history. Keep Sail's complete owned copy. */
+export function restoreOwnedEntries(history: AgentEntry[], saved: AgentEntry[]): AgentEntry[] {
+  return history.length >= saved.length ? restoreEntryTimes(history, saved) : saved;
+}
+
 export interface AgentPermission {
   id: string | number;
   sessionId: string;
@@ -316,6 +326,14 @@ export function acpDisconnectedSessionIds(message: AgentEvent['message']): strin
   const sessionIds = message.params?.sessionIds;
   if (!Array.isArray(sessionIds)) return null;
   return sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string');
+}
+
+export function acpSessionOwner(sessionId: string | null): string | null {
+  if (!sessionId) return null;
+  const match = /^sail-owned:([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}):/.exec(
+    sessionId,
+  );
+  return match?.[1] ?? null;
 }
 
 export function acpDisconnectAffectsSession(
@@ -407,6 +425,7 @@ export function loadRecentTranscript(thread: AgentThread): AgentEntry[] {
 
 export function saveRecentTranscript(thread: AgentThread, entries: AgentEntry[]): void {
   const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  if (acpSessionOwner(thread.sessionId)) saveOwnedTranscript(id, entries);
   const recent: AgentEntry[] = [];
   const encoder = new TextEncoder();
   let remaining = 128 * 1024 - encoder.encode(JSON.stringify({ id, entries: [] })).length;
@@ -441,6 +460,7 @@ export function saveRecentTranscript(thread: AgentThread, entries: AgentEntry[])
 
 export function forgetRecentTranscript(thread: AgentThread): void {
   const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  if (acpSessionOwner(thread.sessionId)) forgetOwnedTranscript(id);
   setSetting(transcriptKey, JSON.stringify(savedTranscripts().filter((item) => item.id !== id)));
 }
 
@@ -960,6 +980,9 @@ async function limitedConnect(
     directory?: string;
     onQueue?: (limit: number | null, reason: string | null) => void;
     signal?: AbortSignal;
+    owner?: string;
+    buildOwner?: string;
+    buildRevision?: string;
   },
 ): Promise<Record<string, unknown>> {
   if (options?.signal?.aborted) throw new Error('Agent connection was cancelled.');
@@ -970,7 +993,16 @@ async function limitedConnect(
   try {
     release = await acquireTurnSlot(id, options?.onQueue, options?.directory ?? directory);
     if (options?.signal?.aborted) throw new Error('Agent connection was cancelled.');
-    return await invoke<Record<string, unknown>>('acp_connect', { agent, directory, profile });
+    return await invoke<Record<string, unknown>>('acp_connect', {
+      agent,
+      directory,
+      profile,
+      owner: options?.owner,
+      buildLease:
+        options?.buildOwner && options?.buildRevision
+          ? { owner: options.buildOwner, revision: options.buildRevision }
+          : undefined,
+    });
   } finally {
     options?.signal?.removeEventListener('abort', cancel);
     release?.();
@@ -1012,13 +1044,19 @@ async function limitedPrompt(
 export const acp = {
   agents: () => invoke<AgentAvailability[]>('acp_agents'),
   connect: limitedConnect,
-  create: (agent: AgentId, cwd: string, profile?: CapabilityProfile, nativeGeneration?: number) =>
+  create: (
+    agent: AgentId,
+    cwd: string,
+    profile?: CapabilityProfile,
+    nativeGeneration?: number,
+    owner?: string,
+  ) =>
     invoke<{
       sessionId: string;
       configOptions?: AgentConfigOption[];
       availableCommands?: AgentCommand[];
     }>('acp_new_session', {
-      params: { agent, cwd, profile, nativeGeneration },
+      params: { agent, cwd, profile, nativeGeneration, owner },
     }).then((session) => {
       rememberRestoredState(agent, cwd, session.sessionId, session);
       return session;
@@ -1027,6 +1065,10 @@ export const acp = {
     invoke<AgentSessionListing>('acp_list_sessions', { agent, cwd, cursor, profile }),
   releaseSessionFence: (agent: AgentId, directory: string, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, directory, sessionId }),
+  releaseOwner: async (directory: string, owner: string) => {
+    await flushOwnedTranscriptWrites(owner);
+    await invoke<void>('acp_release_owner', { directory, owner });
+  },
   beginRestore: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
     invoke<{
       liveTurn?: string;
@@ -1091,7 +1133,8 @@ export const acp = {
         (turnId === null || target.sessionId === sessionId) &&
         (turnId === null || id === queuedPromptKey(agent, directory, sessionId, turnId)),
     );
-    for (const [id] of queued) {
+    for (const [id, pending] of queued) {
+      pending.cancelled = true;
       queuedPrompts.delete(id);
       resourceQueues.agent.cancel(id);
     }

@@ -245,6 +245,36 @@ void test('Stop cancels queued workspace turns with or without a session', async
   }
 });
 
+void test('cancelling a queued owned prompt prevents late dispatch', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const invoked: string[] = [];
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string) => {
+          if (command === 'machine_pressure') return healthy;
+          invoked.push(command);
+          return undefined;
+        },
+      },
+    },
+  });
+  resourceQueues.agent.setLimit(0);
+  try {
+    const prompt = acp.prompt('codex', '/repo', 'owned-session', 'work', 'queued-turn');
+    assert.equal(await settled(prompt), false);
+    await acp.cancel('codex', '/repo', 'owned-session', null);
+    resourceQueues.agent.setLimit(1);
+    await assert.rejects(prompt, /cancelled/i);
+    assert.ok(!invoked.includes('acp_prompt'));
+  } finally {
+    resourceQueues.agent.setLimit(4);
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
+});
+
 void test('closed pane turns run when retained and cancel before deletion', async () => {
   const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
   const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');

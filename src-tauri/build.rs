@@ -139,6 +139,7 @@ fn main() {
             "local_plugin_version",
             "acp_agents",
             "acp_connect",
+            "acp_release_owner",
             "acp_new_session",
             "acp_reset_test_runtimes",
             "acp_forget_session",

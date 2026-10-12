@@ -84,6 +84,7 @@
     acpDisconnectAffectsSession,
     acpFinishedPromptStatus,
     acpPromptInterrupted,
+    acpSessionOwner,
     groupAgentEntries,
     liveSessionView,
     markLiveMessageBoundary,
@@ -91,6 +92,7 @@
     recoverMissingCodexSession,
     loadRecentTranscript,
     restoreEntryTimes,
+    restoreOwnedEntries,
     saveRecentTranscript,
     sessionState,
     takeLiveTranscript,
@@ -107,6 +109,7 @@
     type AgentPermission,
     type AgentThread,
   } from './lib/acp';
+  import { loadOwnedTranscript, ownedTranscriptKey } from './lib/owned-transcripts';
   import type { ThreadStatus } from './lib/attention';
   import type { AgentUsage } from './lib/agent-usage';
   import type { SpawnReceipt } from './lib/agent-results';
@@ -1129,7 +1132,9 @@
       historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
       if (!configOptions.length && Array.isArray(session.configOptions))
         configOptions = session.configOptions as AgentConfigOption[];
-      entries = restoreEntryTimes(replayEntries, entries);
+      entries = acpSessionOwner(id)
+        ? restoreOwnedEntries(replayEntries, entries)
+        : restoreEntryTimes(replayEntries, entries);
       // Switch the event sink before yielding to Svelte. An update delivered during tick()
       // must reach entries rather than a replay buffer that finally discards.
       setReplaying(false);
@@ -1331,6 +1336,11 @@
     elicitationDrafts = {};
     onnativeplan?.(nativePlan);
     entries = id && thread ? loadRecentTranscript(thread) : [];
+    if (id && thread && acpSessionOwner(id)) {
+      const durable = await loadOwnedTranscript(ownedTranscriptKey(agent, directory, id));
+      if (current !== generation) return;
+      if (durable.length > entries.length) entries = durable;
+    }
     const kept = id && !nativeEntries ? takeLiveTranscript(agent, directory, id) : null;
     const liveView =
       id && !nativeEntries
@@ -1400,6 +1410,7 @@
       connectAbort = controller;
       const info = await acp.connect(agent, directory, activeCapabilityProfile, {
         directory,
+        owner: acpSessionOwner(id) ?? undefined,
         signal: controller.signal,
         onQueue: (limit, reason) => {
           if (current !== generation) return;
@@ -1496,7 +1507,9 @@
                 );
             if (current === generation && needsReplay) {
               historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
-              entries = restoreEntryTimes(replayEntries, entries);
+              entries = acpSessionOwner(id)
+                ? restoreOwnedEntries(replayEntries, entries)
+                : restoreEntryTimes(replayEntries, entries);
               historyLoaded = true;
               rememberTranscript();
             }
@@ -1692,8 +1705,12 @@
         }
         ready = false;
         busy = false;
-        if (thread) onstatus(thread, 'failed');
-        error = `${name} stopped. Reopen the thread to reconnect.`;
+        if (message.params?.releasedOwner === true) {
+          error = 'This run finished. Choose Retry to resume the conversation.';
+        } else {
+          if (thread) onstatus(thread, 'failed');
+          error = `${name} stopped. Reopen the thread to reconnect.`;
+        }
         return;
       }
       const params = message.params;

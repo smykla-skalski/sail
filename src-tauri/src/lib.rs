@@ -3380,6 +3380,7 @@ pub fn run() {
             acp_terminal::acp_terminal_inspect_wait,
             acp::acp_agents,
             acp::acp_connect,
+            acp::acp_release_owner,
             acp::acp_new_session,
             acp::acp_reset_test_runtimes,
             acp::acp_forget_session,

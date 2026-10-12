@@ -152,6 +152,7 @@
     shippingClockWasSuspended,
     shippingClaimOwnedByInstance,
     shippingWorkerSettled,
+    shipOwnerReleaseReady,
     shipWorkerPrompt,
     parseMergeOwner,
     type MergeOwner,
@@ -428,6 +429,7 @@
     acpEventMatchesSession,
     acpFailedPromptInterrupted,
     acpPromptInterrupted,
+    acpSessionOwner,
     applyLiveTranscriptUpdate,
     forgetRecentTranscript,
     invalidateLiveTranscript,
@@ -3049,6 +3051,23 @@
       setSetting('sai-ship-runs', serializeShipRuns(shipRuns, unparsedShipRuns));
       throw cause;
     }
+    await maybeReleaseShipOwner(current);
+  }
+
+  async function maybeReleaseShipOwner(issue: ShipIssue): Promise<void> {
+    if (!shipOwnerReleaseReady(issue, spawnReceipts)) return;
+    await acp.releaseOwner(issue.path, issue.receiptId).catch((cause) => {
+      if (describe(cause).includes('active validation gate')) return;
+      throw cause;
+    });
+  }
+
+  async function releaseTerminalShipOwners(path: string): Promise<void> {
+    await Promise.all(
+      shipRuns.flatMap((run) =>
+        run.issues.filter((issue) => issue.path === path).map(maybeReleaseShipOwner),
+      ),
+    );
   }
 
   function contextProvider(threadId: string): ContextProvider {
@@ -4280,7 +4299,7 @@
       const available = (await acp.agents()).find((agent) => agent.id === run.provider);
       if (!available?.available)
         throw new Error(available?.reason ?? `${run.provider} is unavailable.`);
-      await acp.connect(run.provider, created.path);
+      await acp.connect(run.provider, created.path, 'build', { owner: receiptId });
       ensureClaimHeld();
       const gateExecution =
         'Before validation, call validation_policy with your explicit low, medium, or high risk choice. Inspect its selected risk, required gates, and sources, then run every selected review or test gate through validation_gate in a fresh subagent session for each pass or retry. The session may use the implementation provider and model. If a fresh gate session cannot launch, pause and report the reason in this thread.';
@@ -4545,6 +4564,20 @@
     return waitForAcpWorkerTermination(agent, worktreeDirectory, sessionId, turnId, deadline);
   }
 
+  async function waitForOwnedPromptSettlement(
+    agent: string,
+    worktreeDirectory: string,
+    sessionId: string,
+    deadline: number,
+  ): Promise<void> {
+    const activity = (await acp.activity(worktreeDirectory))[agent];
+    if (!activity?.active.includes(sessionId) && !activity?.waiting.includes(sessionId)) return;
+    if (monotonicDeadlineExpired(performance.now(), deadline))
+      throw new Error('Owned agent prompt did not settle after cancellation.');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return waitForOwnedPromptSettlement(agent, worktreeDirectory, sessionId, deadline);
+  }
+
   async function stopShippingThread(issue: ShipIssue, threadId: string): Promise<void> {
     const match = /^acp:([^:]+):(.+)$/.exec(threadId);
     if (!match) throw new Error('Worker thread cannot be interrupted automatically.');
@@ -4569,6 +4602,7 @@
     } catch (cause) {
       if (!shippingWorkerGone(cause)) throw cause;
     }
+    if (receipt && issue.path) await acp.releaseOwner(issue.path, receipt.receiptId);
     if (receipt) updateSpawnReceipt(receipt.receiptId, { state: 'interrupted' });
   }
 
@@ -5497,6 +5531,7 @@
     await settleShipRefresh(
       run.issues.map((issue) =>
         (async () => {
+          await maybeReleaseShipOwner(issue);
           const receipt = spawnReceipts.find((item) => item.receiptId === issue.receiptId);
           const claim = issue.claim;
           const claimOwned = shippingClaimOwnedByInstance(claim, shippingInstanceId);
@@ -7538,14 +7573,6 @@
       await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
       await saveShipRuns();
       try {
-        try {
-          await acp.connect(choice.agent, request.directory);
-        } catch (cause) {
-          throw new ValidationCandidateUnavailable(
-            `Provider ${choice.agent} is unavailable`,
-            cause,
-          );
-        }
         await ensureSelected();
         const [revision, mutationGeneration, baseRevision] = await Promise.all([
           invoke<string>('working_tree_revision', { path: request.directory }),
@@ -7570,6 +7597,19 @@
           },
         });
         await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        try {
+          await acp.connect(choice.agent, request.directory, 'review', {
+            owner: receiptId,
+            ...(gateOwner?.issue.receiptId
+              ? { buildOwner: gateOwner.issue.receiptId, buildRevision: revision }
+              : {}),
+          });
+        } catch (cause) {
+          throw new ValidationCandidateUnavailable(
+            `Provider ${choice.agent} is unavailable`,
+            cause,
+          );
+        }
         const ensureLaunchState = async () => {
           await ensureSelected();
           const currentRevision = await invoke<string>('working_tree_revision', {
@@ -7611,6 +7651,8 @@
         };
       } catch (cause) {
         updateSpawnReceipt(receiptId, { state: 'failed', error: describe(cause) });
+        await setSettingDurable('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+        await acp.releaseOwner(request.directory, receiptId);
         if (!(cause instanceof ValidationCandidateUnavailable)) throw cause;
         return tryChoice(
           candidates.filter((item) => item !== choice),
@@ -7972,6 +8014,16 @@
     promptAuthorization?: DirectShipAuthorization,
     onPromptQueue?: (limit: number | null, reason: string | null) => void,
   ) {
+    const receipt = receiptId
+      ? spawnReceipts.find((item) => item.receiptId === receiptId)
+      : undefined;
+    const runOwner =
+      receiptId &&
+      (validation ||
+        receipt?.requestId.startsWith('ship:') ||
+        receipt?.requestId.startsWith('handoff:'))
+        ? receiptId
+        : undefined;
     const requestedModel =
       validation && source.model && hasUnresolvedModelAlias(source.model)
         ? undefined
@@ -7993,11 +8045,12 @@
         ? routedProfile
         : 'build';
     const session = await acp
-      .create(source.agent, created.path, capabilityProfile, nativeGeneration)
+      .create(source.agent, created.path, capabilityProfile, nativeGeneration, runOwner)
       .catch((cause) => {
         if (!validation) throw cause;
         throw new ValidationCandidateUnavailable(`${source.agent} is unavailable`, cause);
       });
+    let dispatchedTurnId: string | null = null;
     try {
       let configOptions = session.configOptions ?? [];
       const reportedModel = configOptions.find(
@@ -8062,16 +8115,16 @@
       };
       saveAgentThread(thread);
       if (receiptId) {
-        const receipt = spawnReceipts.find((item) => item.receiptId === receiptId);
+        const existingReceipt = spawnReceipts.find((item) => item.receiptId === receiptId);
         updateSpawnReceipt(receiptId, {
           targetId: `acp:${source.agent}:${session.sessionId}`,
           model: requestedModel ?? reportedModel,
           targetDirectory: created.path,
           worktreeId: created.path,
-          ...(receipt?.routing
+          ...(existingReceipt?.routing
             ? {
                 routing: {
-                  ...receipt.routing,
+                  ...existingReceipt.routing,
                   actual: {
                     provider: source.agent as 'claude' | 'codex' | 'opencode',
                     model: requestedModel ?? reportedModel ?? null,
@@ -8118,7 +8171,7 @@
           activeSpawnTargets.set(spawnTargetKey(created.path, targetId), receiptId);
         }
         try {
-          return acp.prompt(
+          const pending = acp.prompt(
             source.agent,
             created.path,
             session.sessionId,
@@ -8131,6 +8184,8 @@
             },
             false,
           );
+          dispatchedTurnId = turnId;
+          return pending;
         } catch (cause) {
           if (
             receiptId &&
@@ -8167,6 +8222,10 @@
                 spawnTargetKey(created.path, `acp:${source.agent}:${session.sessionId}`),
               );
           }
+          if (runOwner && validation) {
+            await acp.releaseOwner(created.path, runOwner);
+            await releaseTerminalShipOwners(created.path);
+          }
           return undefined;
         },
         async (cause) => {
@@ -8199,6 +8258,13 @@
               );
           }
           if (!interrupted) error = describe(cause);
+          if (runOwner && validation)
+            await acp
+              .releaseOwner(created.path, runOwner)
+              .then(() => releaseTerminalShipOwners(created.path))
+              .catch((releaseCause) => {
+                error = `Validation agent cleanup failed: ${describe(releaseCause)}`;
+              });
           throw cause;
         },
       );
@@ -8224,6 +8290,23 @@
       };
     } catch (cause) {
       await acp.cancel(source.agent, created.path, session.sessionId, null).catch(() => undefined);
+      if (runOwner) {
+        let cleanupError: unknown;
+        if (dispatchedTurnId)
+          await waitForOwnedPromptSettlement(
+            source.agent,
+            created.path,
+            session.sessionId,
+            performance.now() + 5_000,
+          ).catch((failure) => {
+            cleanupError = failure;
+          });
+        await acp.releaseOwner(created.path, runOwner).catch((failure) => {
+          cleanupError = failure;
+        });
+        if (cleanupError)
+          throw new Error(`Agent run cleanup failed: ${describe(cleanupError)}`, { cause });
+      }
       if (nativeGeneration !== undefined)
         await acp.releaseSessionFence(source.agent, created.path, session.sessionId);
       throw cause;
@@ -8834,8 +8917,9 @@
     forgetMissingRecentThreads();
     for (const thread of [...removedThreads, ...removedNative]) {
       forgetThreadAttention(thread);
-      if (thread.agent !== 'opencode') {
+      if (thread.agent !== 'opencode' || acpSessionOwner(thread.sessionId))
         forgetRecentTranscript(thread);
+      if (thread.agent !== 'opencode') {
         void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
       }
     }
@@ -8953,8 +9037,9 @@
       forgetMissingRecentThreads();
       for (const thread of [...removedThreads, ...removedNative]) {
         forgetThreadAttention(thread);
-        if (thread.agent !== 'opencode') {
+        if (thread.agent !== 'opencode' || acpSessionOwner(thread.sessionId))
           forgetRecentTranscript(thread);
+        if (thread.agent !== 'opencode') {
           void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
         }
       }
@@ -11986,6 +12071,7 @@
       ))
         updateSpawnReceipt(receipt.receiptId, { state: 'waiting' });
     } else if (event.message.method === 'sail/disconnected') {
+      const releasedOwner = event.message.params?.releasedOwner === true;
       const disconnectedSessionIds =
         acpDisconnectedSessionIds(event.message) ??
         Object.values(nativeSubagents)
@@ -12008,6 +12094,7 @@
             item.sessionId,
             item.capabilityProfile ?? 'build',
           ) &&
+          !releasedOwner &&
           ['working', 'waiting'].includes(threadAttention[threadKey(item)]?.status ?? ''),
       ))
         updateAgentThreadStatus(thread, 'failed');
@@ -12020,6 +12107,7 @@
           item.provider === event.agent &&
           item.targetDirectory === eventDirectory &&
           acpDisconnectAffectsSession(event.message, sessionId) &&
+          !releasedOwner &&
           !receiptIsSettled(item.state)
         );
       }))
