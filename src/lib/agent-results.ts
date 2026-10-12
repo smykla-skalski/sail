@@ -52,6 +52,7 @@ export type SpawnReceipt = {
   name?: string;
   /** Tool calls the child made, when its transcript reports them. */
   toolCount?: number;
+  nativeCapabilities?: Record<string, unknown>;
   model?: string;
   routing?: SpawnRouting;
   validation?: GateMetadata;

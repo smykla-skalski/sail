@@ -1018,6 +1018,8 @@ await test('a child accepts prompts only when its adapter advertises the capabil
   assert.equal(nativeSubagentAcceptsPrompts(spawnWithCapabilities({})), false);
   assert.equal(nativeSubagentAcceptsPrompts(spawnWithCapabilities({ prompt: {} })), true);
   assert.equal(nativeSubagentAcceptsPrompts(undefined), false);
+  assert.equal(nativeSubagentAcceptsPrompts(spawnWithCapabilities({ prompt: false })), false);
+  assert.equal(nativeSubagentAcceptsPrompts(spawnWithCapabilities({ prompt: 'yes' })), false);
 });
 
 function opencode(sessionId: string, update: Record<string, unknown>): AgentEvent {

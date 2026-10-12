@@ -869,11 +869,17 @@ pub fn reset_test_settings(app: tauri::AppHandle) -> Result<(), String> {
     {
         let path = settings_path(&app)?;
         crate::post_turn_checks::quiesce_test_checks(&app)?;
-        quiesce_e2e_settings_writes()?;
-        let _lock = lock_settings(&path)?;
-        write_settings(&path, &Settings::new())?;
-        resume_e2e_settings_writes()?;
-        crate::post_turn_checks::resume_test_checks(&app)
+        let result = (|| {
+            quiesce_e2e_settings_writes()?;
+            let _lock = lock_settings(&path)?;
+            write_settings(&path, &Settings::new())?;
+            crate::local_claims::reset_test_store(&app)
+        })();
+        let writers = resume_e2e_settings_writes();
+        let checks = crate::post_turn_checks::resume_test_checks(&app);
+        result?;
+        writers?;
+        checks
     }
     #[cfg(not(feature = "e2e"))]
     {

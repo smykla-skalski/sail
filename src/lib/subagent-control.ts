@@ -1,5 +1,6 @@
 import type { InboxItem } from './inbox.ts';
 import type { SpawnReceipt } from './agent-results.ts';
+import { nativeSubagentSupports } from './native-subagents.ts';
 
 export type PermissionResolution = 'answered' | 'cancelled';
 
@@ -104,7 +105,10 @@ export function subagentStop(
   receipt: SpawnReceipt,
   shipOwnedTargets: ReadonlySet<string> = new Set(),
 ): SubagentStop {
-  if (receipt.receiptId.startsWith('native:')) return 'parent-turn';
+  if (receipt.receiptId.startsWith('native:')) {
+    if (!['queued', 'starting', 'working', 'waiting'].includes(receipt.state)) return 'none';
+    return nativeSubagentSupports(receipt.nativeCapabilities, 'cancel') ? 'stop' : 'parent-turn';
+  }
   if (
     receipt.validation ||
     (receipt.targetId &&

@@ -383,19 +383,20 @@ describe('Ship queue, archive and actions', () => {
     await setTheme('light');
   });
 
-  it('merge posts exactly the repository comment after confirmation', async () => {
+  it('merge never posts the repository bot comment', async () => {
     await row('ready').$('[data-ship-action="merge"]').click();
+    await captureThemes(2560, 1440, 'ship-queue-merge-confirmation');
+    await captureThemes(1920, 1200, 'ship-queue-merge-confirmation');
+    await browser.setWindowSize(390, 850);
+    expect(await browser.execute(() => document.documentElement.scrollWidth <= innerWidth)).toBe(
+      true,
+    );
     await confirm(/Merge #11 Ready fixture 11\?/);
-    await expect($('[data-ship-result]')).toHaveText(expect.stringContaining('Posted “squash”'));
-    const posted = calls();
-    expect(posted).toHaveLength(1);
-    expect(posted[0]).toMatchObject({
-      method: 'POST',
-      endpoint: 'repos/fixture/repo/issues/7/comments',
-      fields: ['body=squash'],
-    });
-    expect(JSON.stringify(posted)).not.toContain('admin');
-    expect(JSON.stringify(posted)).not.toContain('/merge');
+    await browser.setWindowSize(1280, 850);
+    await expect($('[data-ship-result]')).toHaveText(
+      expect.stringContaining('Sail does not post GitHub comments'),
+    );
+    expect(calls()).toHaveLength(0);
   });
 
   it('merge refuses when the pull request head moved past the checkpoint revision', async () => {
@@ -407,17 +408,16 @@ describe('Ship queue, archive and actions', () => {
     await expect($('[data-ship-result]')).toHaveText(
       expect.stringContaining('differs from the checkpoint revision'),
     );
-    expect(calls()).toHaveLength(1);
+    expect(calls()).toHaveLength(0);
   });
 
   it('declining the confirmation merges nothing', async () => {
-    await expect(row('ready').$('[data-ship-action="merge"]')).toBeDisabled();
-    await row('moved').$('[data-ship-action="merge"]').click();
+    await row('ready').$('[data-ship-action="merge"]').click();
     const dialog = $('.confirmation-dialog');
     await expect(dialog).toBeDisplayed();
     await dialog.$('button=Cancel').click();
     await expect(dialog).not.toBeDisplayed();
-    expect(calls()).toHaveLength(1);
+    expect(calls()).toHaveLength(0);
   });
 
   it('retry queues a failed issue again from its saved checkpoint', async () => {

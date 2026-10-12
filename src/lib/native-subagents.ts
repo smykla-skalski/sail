@@ -34,7 +34,7 @@ export type NativeSubagent = {
   restored: boolean;
   error?: string;
   capabilityProfile: CapabilityProfile;
-  /** What the adapter advertised in `subagent_spawned.capabilities`. Absent until it spawns. */
+  /** Child controls advertised by the adapter. Absent until it spawns. */
   capabilities?: Record<string, unknown>;
 };
 
@@ -610,6 +610,7 @@ export function nativeSubagentReceipts(store: NativeSubagentStore): SpawnReceipt
       activity: status.activity,
       name: child.name,
       toolCount: child.toolCount,
+      nativeCapabilities: child.capabilities,
     };
   });
 }
@@ -642,6 +643,13 @@ export function nativeSubagentCounts(
 /** A child takes messages only when its adapter advertises a prompt capability. claude-agent-acp
  * advertises none, so its children stay read-only. */
 export function nativeSubagentAcceptsPrompts(child: NativeSubagent | undefined): boolean {
-  const prompt = child?.capabilities?.prompt;
-  return prompt !== undefined && prompt !== null && prompt !== false;
+  return nativeSubagentSupports(child?.capabilities, 'prompt');
+}
+
+export function nativeSubagentSupports(
+  capabilities: Record<string, unknown> | undefined,
+  control: 'prompt' | 'cancel',
+): boolean {
+  const value = capabilities?.[control];
+  return value === true || (value !== null && typeof value === 'object' && !Array.isArray(value));
 }

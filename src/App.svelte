@@ -501,6 +501,7 @@
     nativeSubagentAcceptsPrompts,
     nativeSubagentId,
     nativeSubagentReceipts,
+    nativeSubagentSupports,
     nativeSubagentThreads as threadsForNativeSubagents,
     reconcileNativeSubagents,
     setNativeSubagentWaiting,
@@ -2726,9 +2727,7 @@
     const ready = shipMergeAction(issue);
     if (!ready.enabled) throw new Error(ready.reason ?? 'This pull request cannot merge.');
     const outcome = await invoke<{
-      method: 'github' | 'bot-comment';
       strategy: string;
-      comment: string | null;
     }>('ship_merge_pull_request', {
       request: {
         repository: run.repository,
@@ -2738,31 +2737,8 @@
         evidenceReady: shipEvidenceReadiness(issue).ready,
       },
     });
-    if (outcome.method !== 'bot-comment') {
-      void tickShippingRuns(true);
-      return `Merged the pull request (${outcome.strategy}).`;
-    }
-    const posted = `Posted “${outcome.comment}” on the pull request. The repository's bot merges it.`;
-    // Kept in memory even if saving fails, so this session cannot post the comment again.
-    await updateShipIssue(
-      run,
-      issue,
-      {
-        mergeRequested: {
-          at: Date.now(),
-          head: issue.pullRequestHead ?? null,
-          comment: outcome.comment ?? '',
-        },
-      },
-      false,
-    );
     void tickShippingRuns(true);
-    try {
-      await saveShipRuns();
-    } catch (cause) {
-      return `${posted} Sail could not save that the merge was requested: ${describe(cause)}`;
-    }
-    return posted;
+    return `Merged the pull request (${outcome.strategy}).`;
   }
 
   function requireShipClaimOwnership(issue: ShipIssue, action: string): void {
@@ -12820,6 +12796,14 @@
                       nativeSubagents[
                         nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
                       ],
+                    )
+                  : false}
+                childStops={acpThread
+                  ? nativeSubagentSupports(
+                      nativeSubagents[
+                        nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                      ]?.capabilities,
+                      'cancel',
                     )
                   : false}
                 nativeEntries={acpThread

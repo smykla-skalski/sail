@@ -1,6 +1,6 @@
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -162,6 +162,67 @@ describe('subagent navigation and control', () => {
     await $('.spawn-permission-option.allow').click();
     await expect($('.spawn-permission-answered')).toHaveText(expect.stringContaining('Answered'));
     await expect($('.spawn-permission')).not.toExist();
+  });
+
+  it('prompts and stops one capable child while its parent and sibling continue', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Native child controls');
+    await $('.agent-actions button:last-child').click();
+    await expect($$('.spawn-open')).toBeElementsArrayOfSize(2);
+    await expect($('.spawn-stop-hint')).not.toExist();
+    await $$('.spawn-open')[0].click();
+    await expect($('.agent-readonly')).not.toExist();
+    await expect($('.agent-composer [data-pane-prompt]')).toHaveAttribute(
+      'contenteditable',
+      'true',
+    );
+    await $('.agent-composer [data-pane-prompt]').setValue('Continue first');
+    await $('.agent-actions button:last-child').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Child follow-up: Continue first'),
+    );
+    await $('button[aria-label="Go to parent thread"]').click();
+    await $('button[aria-label="Stop first subagent"]').click();
+    await expect($('button[aria-label="Stop first subagent"]')).not.toExist();
+    await expect($('.spawn-activity')).toHaveText(expect.stringContaining('sibling'));
+    await expect($('button[aria-label="Stop sibling subagent"]')).toBeDisplayed();
+    await expect($('.agent-busy')).toBeDisplayed();
+    const evidence = process.env.SAIL_VISUAL_AUDIT_DIR;
+    if (evidence) {
+      mkdirSync(evidence, { recursive: true });
+      await [
+        [2560, 1440],
+        [1920, 1200],
+        [390, 800],
+      ].reduce(async (previous, [requestedWidth, height]) => {
+        await previous;
+        await browser.setWindowSize(requestedWidth, height);
+        const width = await browser.execute(() => innerWidth);
+        console.log('Native child controls viewport', { requestedWidth, width });
+        if (requestedWidth === 390)
+          expect(
+            await browser.execute(() => document.documentElement.scrollWidth),
+          ).toBeLessThanOrEqual(width);
+        await ['light', 'dark'].reduce(async (previousTheme, theme) => {
+          await previousTheme;
+          await browser.execute((value) => {
+            document.documentElement.dataset.suiTheme = value;
+          }, theme);
+          await browser.saveScreenshot(join(evidence, `native-child-${width}-${theme}.png`));
+        }, Promise.resolve());
+      }, Promise.resolve());
+    }
   });
 
   it('replays a pending child permission in the child view and navigates back', async () => {
