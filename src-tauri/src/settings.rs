@@ -125,6 +125,7 @@ fn merge_acp_turn_evidence_at(
                 || saved.directory != item.directory
                 || saved.session_id != item.session_id
                 || !unsettled_acp_evidence(&saved.status)
+                || saved.post_turn_pending
                 || protected.contains(&(
                     saved.agent.clone(),
                     saved.directory.clone(),
@@ -1073,6 +1074,33 @@ mod tests {
         let saved = acp_turn_evidence(&settings);
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].turn_id, "new");
+    }
+
+    #[test]
+    fn a_new_prompt_keeps_a_completed_turn_waiting_for_evidence_retry() {
+        let evidence = |turn: &str, status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "session".into(),
+            turn_id: turn.into(),
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+            post_turn_pending: pending,
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "prepared", true), 1).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "dispatched", false), 2).unwrap();
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("new", "prepared", true), 3).unwrap();
+        assert!(acp_turn_evidence(&settings)
+            .iter()
+            .any(|item| item.turn_id == "old" && item.post_turn_pending));
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "done", true), 4).unwrap();
+        assert!(acp_turn_evidence(&settings)
+            .iter()
+            .any(|item| item.turn_id == "old" && item.status == "done" && item.post_turn_pending));
     }
 
     #[test]

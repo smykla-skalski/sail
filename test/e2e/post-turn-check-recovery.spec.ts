@@ -318,4 +318,156 @@ describe('post-turn check recovery', () => {
       'repository\n',
     );
   });
+
+  it('shows a persistent write failure and waits for verified recovery before running', async () => {
+    const check = "printf 'saved\\n' >> evidence-retry-runs.txt";
+    writeFileSync(
+      join(repository, '.sail', 'worktree.json'),
+      JSON.stringify({ postTurnChecks: [] }),
+    );
+    await browser.execute(async (value) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('save_setting', { key: 'sai-acp-turn-evidence', value: null });
+      await tauri.core.invoke('save_setting', {
+        key: 'sai-post-turn-personal',
+        value: JSON.stringify([value]),
+      });
+      localStorage.setItem('sai-post-turn-personal', JSON.stringify([value]));
+    }, check);
+    const previousDocument = await browser.execute(() => performance.timeOrigin);
+    await browser.refresh();
+    await browser.waitUntil(() =>
+      browser.execute(
+        (previous) =>
+          performance.timeOrigin > previous &&
+          typeof Reflect.get(window, 'sailE2eStopAgentEvents') === 'function',
+        previousDocument,
+      ),
+    );
+
+    const emitReady = async () =>
+      browser.execute(async (path) => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        await tauri.event.emitTo('main', 'acp-event', {
+          agent: 'claude',
+          directory: path,
+          worktree: path,
+          message: {
+            method: 'sail/post_turn_evidence_ready',
+            params: { sessionId: 'retry-session', turnId: 'retry-turn' },
+          },
+        });
+      }, repository);
+    await browser.execute(async (path) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.event.emitTo('main', 'acp-event', {
+        agent: 'claude',
+        directory: path,
+        worktree: path,
+        message: {
+          method: 'sail/prompt_finished',
+          params: {
+            sessionId: 'retry-session',
+            turnId: 'retry-turn',
+            status: 'done',
+            notify: false,
+            evidenceError: 'injected settings write failure',
+          },
+        },
+      });
+    }, repository);
+    await browser.waitUntil(() =>
+      browser.execute(() =>
+        [...document.querySelectorAll('[role="alert"]')].some((item) =>
+          item.textContent?.includes('Completed turn is waiting for its post-turn check record'),
+        ),
+      ),
+    );
+    await emitReady();
+    expect(existsSync(join(repository, 'evidence-retry-runs.txt'))).toBe(false);
+    expect(
+      await browser.execute(() =>
+        [...document.querySelectorAll('[role="alert"]')].some((item) =>
+          item.textContent?.includes('Completed turn is waiting for its post-turn check record'),
+        ),
+      ),
+    ).toBe(true);
+    const auditDir = process.env.SAIL_VISUAL_AUDIT_DIR;
+    if (auditDir) {
+      mkdirSync(auditDir, { recursive: true });
+      const captureSize = async (theme: 'light' | 'dark', width: number, height: number) => {
+        await browser.setWindowSize(width, height);
+        const viewport = await browser.execute(() => ({
+          width: innerWidth,
+          height: innerHeight,
+        }));
+        console.log(
+          `Evidence warning ${theme}: requested ${width}x${height}, viewport ${viewport.width}x${viewport.height}`,
+        );
+        await browser.saveScreenshot(
+          join(auditDir, `evidence-warning-${theme}-${viewport.width}x${viewport.height}.png`),
+        );
+      };
+      const captureTheme = async (theme: 'light' | 'dark') => {
+        await browser.tauri.execute(
+          async ({ core }, value) =>
+            core.invoke('plugin:window|set_theme', { label: 'main', value }),
+          theme,
+        );
+        await browser.waitUntil(
+          async () =>
+            (await browser.execute(() => document.documentElement.dataset.suiTheme)) === theme,
+        );
+        await captureSize(theme, 2560, 1440);
+        await captureSize(theme, 1920, 1200);
+      };
+      await captureTheme('light');
+      await captureTheme('dark');
+      await browser.setWindowSize(390, 800);
+      expect(await browser.execute(() => document.documentElement.scrollWidth > innerWidth)).toBe(
+        false,
+      );
+      await browser.execute(() => {
+        document.documentElement.style.zoom = '2';
+      });
+      expect(await browser.execute(() => document.querySelector('[role="alert"]') !== null)).toBe(
+        true,
+      );
+      await browser.execute(() => {
+        document.documentElement.style.zoom = '';
+      });
+    }
+    await browser.execute(async (path) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('save_setting', {
+        key: 'sai-acp-turn-evidence',
+        value: JSON.stringify([
+          {
+            agent: 'claude',
+            directory: path,
+            sessionId: 'retry-session',
+            turnId: 'retry-turn',
+            status: 'done',
+            error: null,
+            updatedAt: Date.now(),
+            postTurnPending: true,
+          },
+        ]),
+      });
+    }, repository);
+    await emitReady();
+    await browser.waitUntil(() => existsSync(join(repository, 'evidence-retry-runs.txt')), {
+      timeoutMsg: 'The recovered completion did not run its check',
+    });
+    await browser.waitUntil(() =>
+      browser.execute(() =>
+        [...document.querySelectorAll('[role="alert"]')].every(
+          (item) =>
+            !item.textContent?.includes('Completed turn is waiting for its post-turn check record'),
+        ),
+      ),
+    );
+    await emitReady();
+    expect(readFileSync(join(repository, 'evidence-retry-runs.txt'), 'utf8')).toBe('saved\n');
+  });
 });

@@ -887,6 +887,7 @@
   let postTurnResults = $state<PostTurnCheck[]>([]);
   const pendingPostTurnChecks = new SvelteSet<string>();
   const verifyingCompletedTurns = new SvelteSet<string>();
+  const pendingCompletionErrors = new SvelteMap<string, string>();
   let personalPostTurnChecks = $state(personalChecks(getSetting('sai-post-turn-personal')));
   type TurnSnapshot = { id: string; kind: 'turn' | 'undo'; created: number };
   let selectedWorktreeConfig = $state<WorktreeConfig | null>(null);
@@ -11225,6 +11226,9 @@
         evidence.turnId !== turnId
       )
         return;
+      const warning = pendingCompletionErrors.get(key);
+      pendingCompletionErrors.delete(key);
+      if (warning && error === warning) error = '';
       if (!(await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId))) return;
       await acp.finishPostTurnChecks(agent, path, sessionId, turnId);
     } catch (cause) {
@@ -11485,6 +11489,13 @@
       )
         removeStructuredQuestion(event.agent, eventDirectory, sessionId, requestID);
     }
+    if (event.message.method === 'sail/post_turn_evidence_ready') {
+      const sessionId = event.message.params?.sessionId;
+      const turnId = event.message.params?.turnId;
+      if (typeof sessionId === 'string' && typeof turnId === 'string') {
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
+      }
+    }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
@@ -11494,6 +11505,15 @@
         (status !== 'done' && status !== 'failed' && status !== 'interrupted')
       )
         return;
+      const evidenceError = event.message.params?.evidenceError;
+      if (typeof evidenceError === 'string' && typeof turnId === 'string') {
+        const warning = `Completed turn is waiting for its post-turn check record: ${evidenceError}`;
+        pendingCompletionErrors.set(
+          JSON.stringify([event.agent, eventDirectory, sessionId, turnId]),
+          warning,
+        );
+        error = warning;
+      }
       if (status === 'done' && typeof turnId === 'string' && event.message.params?.notify !== false)
         void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
       for (const thread of agentThreads.filter(
