@@ -814,6 +814,22 @@ impl GitOverlay {
             .open(&config)
             .and_then(|mut file| file.write_all(config_entries.as_bytes()))
             .map_err(|error| error.to_string())?;
+        #[cfg(all(test, windows))]
+        {
+            let check = git_command()
+                .args(["config", "--file"])
+                .arg(&config)
+                .arg("--list")
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !check.status.success() {
+                eprintln!(
+                    "Windows overlay config diagnostic: stderr={:?} bytes={:?}",
+                    String::from_utf8_lossy(&check.stderr),
+                    fs::read(&config).map_err(|error| error.to_string())?
+                );
+            }
+        }
         seed_refs(&current, &git_dir)?;
         output(git_command().args(["--git-dir"]).arg(&git_dir).args([
             "symbolic-ref",
