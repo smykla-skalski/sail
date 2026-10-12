@@ -117,6 +117,20 @@ impl TempLease {
             .map_err(|error| error.to_string())
     }
 
+    fn cancel_process_start(&self) -> Result<(), String> {
+        self.verify_root()?;
+        match fs::remove_file(self.directory.join(TEMP_PROCESS_START_FILE)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                self.mark_pending("turn-temp-process-start-reset-failed");
+                Err(format!(
+                    "Cannot reset private temporary process start: {error}"
+                ))
+            }
+        }
+    }
+
     fn verify_root(&self) -> Result<(), String> {
         let root = self
             .directory
@@ -147,7 +161,11 @@ impl TempLease {
             return Ok(());
         }
         let removal = if self.exposed_to_process() {
-            self.mark_pending("turn-temp-owner-unverified");
+            if let Ok(reason) = fs::read_to_string(self.directory.join(TEMP_PENDING_FILE)) {
+                report_pending(&self.directory, &reason);
+            } else {
+                self.mark_pending("turn-temp-owner-unverified");
+            }
             Ok(())
         } else {
             self.verify_root().and_then(|_| {
@@ -222,6 +240,10 @@ impl Drop for TempLease {
 impl WorktreeDataLease {
     pub(crate) fn prepare_process_start(&self) -> Result<(), String> {
         self.temp.prepare_process_start()
+    }
+
+    pub(crate) fn cancel_process_start(&self) -> Result<(), String> {
+        self.temp.cancel_process_start()
     }
 
     pub(crate) fn mark_started(&self) {
@@ -2499,6 +2521,42 @@ mod tests {
         assert_eq!(fs::read_to_string(&artifact).unwrap(), "retain");
         clean_pending_temp(&fixture.cache, item.cleanup_token.as_deref().unwrap()).unwrap();
         assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn failed_process_start_releases_unexposed_temp() {
+        let fixture = GitFixture::new();
+        let (_, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        fs::write(temp.join("artifact"), "unused").unwrap();
+        lease.prepare_process_start().unwrap();
+        assert!(std::process::Command::new(temp.join("missing-program"))
+            .spawn()
+            .is_err());
+        lease.cancel_process_start().unwrap();
+        drop(lease);
+
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn failed_process_start_reset_remains_visible_and_retryable() {
+        let fixture = GitFixture::new();
+        let (_, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        lease.prepare_process_start().unwrap();
+        fs::remove_file(temp.join(TEMP_PROCESS_START_FILE)).unwrap();
+        fs::create_dir(temp.join(TEMP_PROCESS_START_FILE)).unwrap();
+        assert!(lease.cancel_process_start().is_err());
+        drop(lease);
+
+        let pending = cleanup_status(&fixture.cache);
+        let item = pending
+            .iter()
+            .find(|item| item.reason == "turn-temp-cleanup-failed")
+            .unwrap();
+        clean_pending_temp(&fixture.cache, item.cleanup_token.as_deref().unwrap()).unwrap();
+        assert!(!temp.exists());
     }
 
     #[test]

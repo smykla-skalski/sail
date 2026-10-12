@@ -3945,8 +3945,13 @@ fn connect_blocking_inner(
             .stderr(Stdio::piped())
             .spawn()
     });
-    let mut child =
-        spawn.map_err(|error| format!("Could not start {}: {error}", definition.name))?;
+    let mut child = match spawn {
+        Ok(child) => child,
+        Err(error) => {
+            storage_lease.cancel_process_start()?;
+            return Err(format!("Could not start {}: {error}", definition.name));
+        }
+    };
     storage_lease.mark_started();
     if !is_test_agent {
         observe_agent_with_reef(&agent, child.id());

@@ -1200,19 +1200,25 @@ fn spawn(
     command.env("COLORTERM", "truecolor");
     #[cfg(windows)]
     command.env("PROMPT", "$E]9;9;$P$E\\$P$G");
+    #[cfg(windows)]
+    let job = crate::acp_terminal::WindowsTerminalJob::new()?;
     if let Some(lease) = &storage_lease {
         lease.prepare_process_start()?;
     }
     #[cfg(windows)]
     let job = {
-        let job = crate::acp_terminal::WindowsTerminalJob::new()?;
         command.set_job_handle(job.raw_handle());
         job
     };
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| error.to_string())?;
+    let mut child = match pair.slave.spawn_command(command) {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(lease) = &storage_lease {
+                lease.cancel_process_start()?;
+            }
+            return Err(error.to_string());
+        }
+    };
     if let Some(lease) = &storage_lease {
         lease.mark_started();
     }

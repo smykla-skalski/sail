@@ -213,15 +213,28 @@ impl WindowsTerminalJob {
         Ok(())
     }
 
-    fn spawn(command: &mut Command) -> Result<(Child, Self), String> {
+    fn spawn(
+        command: &mut Command,
+        storage_lease: &crate::worktree_storage::WorktreeDataLease,
+    ) -> Result<(Child, Self), String> {
         use std::os::windows::process::CommandExt;
         use windows::Win32::System::Threading::CREATE_SUSPENDED;
 
-        let job = Self::new()?;
+        let job = match Self::new() {
+            Ok(job) => job,
+            Err(error) => {
+                storage_lease.cancel_process_start()?;
+                return Err(error);
+            }
+        };
         command.creation_flags(CREATE_SUSPENDED.0);
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("Cannot start command: {error}"))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                storage_lease.cancel_process_start()?;
+                return Err(format!("Cannot start command: {error}"));
+            }
+        };
         if let Err(error) = job.assign_and_resume(&child) {
             let _ = child.kill();
             let _ = job.stop();
@@ -860,11 +873,15 @@ pub fn handle(
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
             storage_lease.prepare_process_start()?;
             #[cfg(windows)]
-            let (mut child, job) = WindowsTerminalJob::spawn(&mut command)?;
+            let (mut child, job) = WindowsTerminalJob::spawn(&mut command, &storage_lease)?;
             #[cfg(not(windows))]
-            let mut child = command
-                .spawn()
-                .map_err(|error| format!("Cannot start command: {error}"))?;
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    storage_lease.cancel_process_start()?;
+                    return Err(format!("Cannot start command: {error}"));
+                }
+            };
             let owner = format!(
                 "{}\0acp:{}:{}",
                 fallback.display(),
