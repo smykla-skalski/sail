@@ -1232,11 +1232,16 @@ impl Connection {
             .map_err(|error| error.to_string())?
             .active
             .is_empty();
+        let requests_idle = self
+            .pending
+            .lock()
+            .map_err(|error| error.to_string())?
+            .is_empty();
         let subagents = self
             .native_subagents
             .lock()
             .map_err(|error| error.to_string())?;
-        if idle && subagents.active_in(&self.worktree).is_empty() {
+        if idle && requests_idle && subagents.active_in(&self.worktree).is_empty() {
             let child_id = self.child.lock().map_err(|error| error.to_string())?.id();
             let _pause = PausedAgent::new(child_id)?;
             if runtime_has_live_children(
@@ -1336,10 +1341,15 @@ impl Connection {
             json!({"agent":self.agent,"method":method,"requestId":id,"sessionId":session_id}),
         );
         let (sender, receiver) = mpsc::channel();
+        let temp_gate = self
+            .temp_cleanup_gate
+            .lock()
+            .map_err(|error| error.to_string())?;
         self.pending
             .lock()
             .map_err(|error| error.to_string())?
             .insert(id, sender);
+        drop(temp_gate);
         if let Err(error) =
             write_message(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
         {
@@ -1579,7 +1589,7 @@ impl AgentManager {
             .map(|agents| agents.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         for connection in connections {
-            if let Err(error) = connection.clear_idle_temp(true) {
+            if let Err(error) = connection.clear_idle_temp(false) {
                 crate::diagnostics::record(
                     "turn_temp_cleanup_failed",
                     json!({"agent":connection.agent,"error":error}),
@@ -6502,6 +6512,61 @@ time.sleep(10)
             nix::sys::signal::Signal::SIGTERM,
         )
         .unwrap();
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_waits_for_inflight_session_request() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-request-temp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let (_, lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        lease.mark_started();
+        let artifact = lease.temp_directory().join("init");
+        std::fs::write(&artifact, "live").unwrap();
+        let mut command = Command::new("sleep");
+        command.arg("30").stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let mut runtime = test_runtime_with_child(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            child,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        let (started_tx, started_rx) = mpsc::channel();
+        let request_runtime = Arc::clone(&runtime);
+        let request = std::thread::spawn(move || {
+            request_runtime.request_response_around_write(
+                "session/new",
+                json!({}),
+                Duration::from_millis(500),
+                |_| Ok(()),
+                || started_tx.send(()).unwrap(),
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        runtime.clear_idle_temp(true).unwrap();
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
+        assert!(request.join().unwrap().is_err());
+        runtime.clear_idle_temp(false).unwrap();
+        assert!(!artifact.exists());
         runtime.stop_child().unwrap();
         drop(runtime);
         std::fs::remove_dir_all(scratch).unwrap();

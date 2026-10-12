@@ -350,10 +350,17 @@ impl AcpTerminalManager {
                     .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
                     .collect::<Vec<_>>()
             })?;
+        let mut errors = Vec::new();
         for (id, terminal) in terminals {
-            self.archive(id, &terminal)?;
+            if let Err(error) = self.archive(id, &terminal) {
+                errors.push(error);
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {

@@ -532,7 +532,7 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             Ok(identity) => identity,
             Err(reason) => {
                 if read_plain_owner(cache_directory, &data_directory).is_ok() {
-                    for item in temp_directory_status(cache_directory, &data_directory, true) {
+                    for item in temp_directory_status(cache_directory, &data_directory) {
                         report_pending(&data_directory, &item.reason);
                     }
                 } else {
@@ -552,7 +552,7 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             report_pending(&data_directory, "owner-cache-key-mismatch");
             continue;
         }
-        for item in temp_directory_status(cache_directory, &data_directory, true) {
+        for item in temp_directory_status(cache_directory, &data_directory) {
             report_pending(&data_directory, &item.reason);
         }
         // An active sibling shares the repository lock but has a separate lease. Check
@@ -634,7 +634,7 @@ pub(crate) fn reconcile(cache_directory: &Path) {
                 continue;
             }
         }
-        let pending_temp = temp_directory_status(cache_directory, &data_directory, true);
+        let pending_temp = temp_directory_status(cache_directory, &data_directory);
         if !pending_temp.is_empty() {
             for item in pending_temp {
                 report_pending(&data_directory, &item.reason);
@@ -692,7 +692,7 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
         };
         let name = entry.file_name().to_string_lossy().into_owned();
         let directory = entry.path();
-        pending.extend(temp_directory_status(cache_directory, &directory, false));
+        pending.extend(temp_directory_status(cache_directory, &directory));
         let reason = if name.starts_with(QUARANTINE_PREFIX) {
             Some("cleanup-interrupted")
         } else if !valid_cache_key(&name) {
@@ -763,11 +763,7 @@ pub(crate) fn retry_cleanup(cache_directory: &Path) -> Vec<CleanupPending> {
     cleanup_status(cache_directory)
 }
 
-fn temp_directory_status(
-    cache_directory: &Path,
-    data_directory: &Path,
-    remove: bool,
-) -> Vec<CleanupPending> {
+fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<CleanupPending> {
     let mut pending = Vec::new();
     let verified_owner = read_owner(data_directory).ok().is_some_and(|identity| {
         identity_data_directory(cache_directory, &identity)
@@ -777,6 +773,22 @@ fn temp_directory_status(
     }) || read_plain_owner(cache_directory, data_directory).is_ok();
     if !verified_owner {
         return pending;
+    }
+    for legacy in [
+        data_directory.join("tmp"),
+        data_directory.join("build/go-tmp"),
+    ] {
+        match fs::symlink_metadata(&legacy) {
+            Ok(_) => pending.push(CleanupPending {
+                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                reason: "legacy-temp-owner-unverified".into(),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => pending.push(CleanupPending {
+                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                reason: "legacy-temp-scan-failed".into(),
+            }),
+        }
     }
     let root = data_directory.join(TEMP_ROOT);
     if let Ok(metadata) = fs::symlink_metadata(&root) {
@@ -831,11 +843,7 @@ fn temp_directory_status(
                     Ok(_lock) if owner.pid != std::process::id() && process_owner_alive(&owner) => {
                         Some("turn-temp-process-active")
                     }
-                    Ok(_lock) if remove => match fs::remove_dir_all(&directory) {
-                        Ok(()) => None,
-                        Err(_) => Some("turn-temp-removal-failed"),
-                    },
-                    Ok(_lock) => Some("abandoned-turn-temp"),
+                    Ok(_lock) => Some("turn-temp-owner-unverified"),
                     Err(_) if cleanup_failed => Some("turn-temp-cleanup-failed"),
                     Err(_) => None,
                 }
@@ -1167,7 +1175,7 @@ pub(crate) fn remove_after_worktree_removal(
                 "Private agent data is retained because Git still identifies this worktree.".into(),
             );
         }
-        let pending_temp = temp_directory_status(cache_directory, data_directory, true);
+        let pending_temp = temp_directory_status(cache_directory, data_directory);
         if !pending_temp.is_empty() {
             for item in pending_temp {
                 report_pending(data_directory, &item.reason);
@@ -2112,7 +2120,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_temp_is_reconciled_only_after_ownership_is_verified() {
+    fn abandoned_temp_is_retained_until_process_ownership_is_verified() {
         let fixture = GitFixture::new();
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let abandoned = lease.temp_directory().to_path_buf();
@@ -2121,9 +2129,12 @@ mod tests {
         lease.mark_started();
         drop(lease);
 
-        assert_cleanup_reason(&fixture.cache, "abandoned-turn-temp");
+        assert_cleanup_reason(&fixture.cache, "turn-temp-owner-unverified");
         retry_cleanup(&fixture.cache);
-        assert!(!abandoned.exists());
+        assert_eq!(
+            fs::read_to_string(abandoned.join("artifact")).unwrap(),
+            "old"
+        );
         assert!(directory.exists());
 
         let (_, lease) = register(&fixture.cache, &fixture.first).unwrap();
@@ -2144,7 +2155,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_plain_folder_temp_is_reconciled() {
+    fn abandoned_plain_folder_temp_is_retained_without_process_proof() {
         let fixture = GitFixture::new();
         let plain = fixture.root.join("plain-folder");
         fs::create_dir(&plain).unwrap();
@@ -2157,9 +2168,9 @@ mod tests {
 
         assert!(cleanup_status(&fixture.cache)
             .iter()
-            .any(|item| item.reason == "abandoned-turn-temp"));
+            .any(|item| item.reason == "turn-temp-owner-unverified"));
         retry_cleanup(&fixture.cache);
-        assert!(!temp.exists());
+        assert_eq!(fs::read_to_string(temp.join("artifact")).unwrap(), "old");
         assert!(directory.exists());
 
         let (_, lease) = register(&fixture.cache, &plain).unwrap();
@@ -2189,6 +2200,28 @@ mod tests {
 
         assert_eq!(read_plain_owner(&fixture.cache, &directory).unwrap(), plain);
         lease.release_clean().unwrap();
+    }
+
+    #[test]
+    fn legacy_temp_is_reported_and_retained_without_process_ownership() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let artifact = directory.join("tmp/artifact");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "legacy").unwrap();
+        lease.release_clean().unwrap();
+        fixture.remove(&fixture.first);
+
+        let pending = retry_cleanup(&fixture.cache);
+
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "legacy");
+        assert!(pending
+            .iter()
+            .any(|item| item.reason == "legacy-temp-owner-unverified"));
+        assert!(
+            remove_after_worktree_removal(&fixture.cache, std::slice::from_ref(&directory))
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -2226,12 +2259,15 @@ mod tests {
         owner.kill().unwrap();
         owner.wait().unwrap();
         retry_cleanup(&fixture.cache);
-        assert!(!temp.exists());
+        assert!(temp.exists());
+        assert!(cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "turn-temp-owner-unverified"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn reused_process_id_does_not_retain_abandoned_temp() {
+    fn reused_process_id_is_not_treated_as_the_temp_owner() {
         let fixture = GitFixture::new();
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
@@ -2259,7 +2295,10 @@ mod tests {
 
         retry_cleanup(&fixture.cache);
 
-        assert!(!temp.exists());
+        assert!(temp.exists());
+        assert!(cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "turn-temp-owner-unverified"));
         assert!(unrelated.try_wait().unwrap().is_none());
         unrelated.kill().unwrap();
         unrelated.wait().unwrap();
