@@ -337,6 +337,10 @@ for await (const line of createInterface({ input: process.stdin })) {
   } else if (message.method === 'session/list') {
     const pageSize = 2;
     const cwd = message.params.cwd;
+    if (agent === 'opencode' && existsSync(join(cwd, '.acp-session-list-error'))) {
+      send({ id: message.id, error: { code: -1, message: 'Session listing unavailable' } });
+      continue;
+    }
     const known = [...sessions.entries()]
       .filter(([, session]) => !cwd || session.cwd === cwd)
       .map(([sessionId, session]) => ({

@@ -6147,7 +6147,7 @@
             agent,
             (cursor) => acp.listSessions(agent, target.directory, cursor, 'explore'),
             target.directory,
-          )
+          ).catch(() => [])
         : [];
     return (
       listed.find((item) => item.sessionId === sessionId) ?? {
@@ -6198,17 +6198,8 @@
               item.directory === thread.directory &&
               item.sessionId === thread.sessionId,
           )
-        ) {
-          if (thread.agent === 'opencode') {
-            if (
-              !nativeSubagents[nativeSubagentId(thread.agent, thread.directory, thread.sessionId)]
-            )
-              sidebarOpenCodeThreads = [
-                thread,
-                ...sidebarOpenCodeThreads.filter((item) => threadKey(item) !== threadKey(thread)),
-              ];
-          } else saveAgentThread(thread);
-        }
+        )
+          saveAgentThread(thread);
         await waitForCoordinationThread(thread);
         if (disposed) return;
         await invoke('record_turn_snapshot', {

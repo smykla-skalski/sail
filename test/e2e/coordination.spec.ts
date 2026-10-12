@@ -146,6 +146,64 @@ describe('agent coordination bridge', () => {
     }
   });
 
+  it('recovers an OpenCode session when listing fails and registers its source', async () => {
+    const path = realpathSync(repository);
+    const sessionId = 'opencode-external-coordination';
+    const messageId = 'opencode-external-message';
+    writeFileSync(join(path, '.acp-session-list-error'), '');
+    writeFileSync(
+      join(path, '.acp-external-sessions.json'),
+      JSON.stringify([
+        { sessionId, title: 'External OpenCode recipient', updatedAt: new Date().toISOString() },
+      ]),
+    );
+    await browser.execute(
+      ({ directory, session, message }) => {
+        localStorage.setItem('sai-directory', directory);
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+        );
+        localStorage.setItem('sail-agent-threads', '[]');
+        localStorage.setItem(
+          'sai-coordination-messages',
+          JSON.stringify([
+            {
+              id: message,
+              target: `${directory}\0acp:opencode:${session}`,
+              sender: 'Another agent',
+              text: 'Read the recovered message',
+              created: Date.now(),
+            },
+          ]),
+        );
+      },
+      { directory: path, session: sessionId, message: messageId },
+    );
+    await browser.refresh();
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          ({ message, session }) => {
+            const messages = JSON.parse(localStorage.getItem('sai-coordination-messages') ?? '[]');
+            const threads = JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]');
+            return (
+              messages.find((item: { id: string }) => item.id === message)?.delivered === true &&
+              threads.some(
+                (thread: { agent: string; sessionId: string }) =>
+                  thread.agent === 'opencode' && thread.sessionId === session,
+              )
+            );
+          },
+          { message: messageId, session: sessionId },
+        ),
+      {
+        timeout: 30_000,
+        timeoutMsg: 'OpenCode message was not delivered with the source session registered',
+      },
+    );
+  });
+
   it('rejects a saved ACP source session that is no longer running', async () => {
     const path = realpathSync(repository);
     await browser.execute((directory) => {
