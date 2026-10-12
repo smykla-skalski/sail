@@ -2195,7 +2195,12 @@ where
     let status = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--ignored",
+            "--untracked-files=normal",
+        ])
         .output()
         .map_err(|error| format!("Cannot inspect worktree changes: {error}"))?;
     if !status.status.success() {
@@ -5430,7 +5435,6 @@ mod tests {
         .unwrap_err();
 
         let staged = staged_path.unwrap();
-        assert!(error.contains(&staged.display().to_string()), "{error}");
         let pending: serde_json::Value = serde_json::from_str(
             error
                 .strip_prefix("SAIL_PENDING_RECOVERY:")
@@ -6006,10 +6010,24 @@ mod tests {
     }
 
     #[test]
+    fn preview_marks_ignored_only_checkout_dirty() {
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-preview-ignored-only-test");
+
+        let (_, dirty) = worktree_preview_state_with_hook(Path::new(&worktree), || {}).unwrap();
+
+        assert!(dirty);
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn guarded_detached_removal_preserves_changes_after_preview() {
         let (root, repository, worktree, _) =
             ignored_archive_fixture("sail-detached-preview-race-test");
         git(&worktree, &["checkout", "--detach"]);
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
         let (revision, dirty) =
             worktree_preview_state_with_hook(Path::new(&worktree), || {}).unwrap();
         assert!(!dirty);

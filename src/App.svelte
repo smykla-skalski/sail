@@ -9134,7 +9134,7 @@
     }
     const confirmed = await confirmInApp(
       'Confirm unused worktrees',
-      `Confirm this pending worktree is unused, with no process writing to it during cleanup? Sail rechecks its identity and files immediately before removal. Detected changes stop cleanup, and its branch remains.\n\n• ${target.branch}: ${target.path} (original: ${target.pendingCleanup!.originalPath})`,
+      `Confirm this pending worktree is unused, with no process writing to it until cleanup finishes? Sail rechecks its identity and files immediately before removal. Detected changes stop cleanup, and its branch remains. Git can delete files written after the final check, including ignored files.\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${target.pendingCleanup!.sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
       'Remove this worktree',
       { destructive: true },
     );
