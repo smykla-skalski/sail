@@ -432,6 +432,37 @@ struct Connection {
 struct RestoreClaim {
     token: String,
     expires: Instant,
+    request_active: bool,
+    release_pending: bool,
+}
+
+struct RestoreRequestGuard<'a> {
+    runtime: &'a Connection,
+    session_id: &'a str,
+    token: &'a str,
+}
+
+impl Drop for RestoreRequestGuard<'_> {
+    fn drop(&mut self) {
+        let mut claims = self
+            .runtime
+            .restores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(claim) = claims
+            .get_mut(self.session_id)
+            .filter(|claim| claim.token == self.token)
+        {
+            if claim.release_pending {
+                claims.remove(self.session_id);
+            } else {
+                claim.request_active = false;
+                // The frontend gets a fresh window after the backend finishes replay.
+                claim.expires = Instant::now() + Duration::from_secs(65);
+            }
+            self.runtime.restore_ready.notify_all();
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -460,16 +491,24 @@ impl Connection {
         Ok(())
     }
 
-    fn extend_restore(&self, session_id: &str, token: &str) -> Result<(), String> {
+    fn begin_restore_request<'a>(
+        &'a self,
+        session_id: &'a str,
+        token: &'a str,
+    ) -> Result<RestoreRequestGuard<'a>, String> {
         let mut claims = self.restores.lock().map_err(|error| error.to_string())?;
         let claim = claims
             .get_mut(session_id)
-            .filter(|claim| claim.token == token && claim.expires > Instant::now())
+            .filter(|claim| {
+                claim.token == token && !claim.request_active && claim.expires > Instant::now()
+            })
             .ok_or("Session restore reservation expired.")?;
-        // The frontend releases this claim after it has applied replayed updates.
-        // Expiry also releases it if the webview disappears before that finalizer runs.
-        claim.expires = Instant::now() + Duration::from_secs(65);
-        Ok(())
+        claim.request_active = true;
+        Ok(RestoreRequestGuard {
+            runtime: self,
+            session_id,
+            token,
+        })
     }
 
     fn begin_restore(&self, session_id: &str) -> Result<Value, String> {
@@ -502,6 +541,8 @@ impl Connection {
             RestoreClaim {
                 token: token.clone(),
                 expires: Instant::now() + Duration::from_secs(10),
+                request_active: false,
+                release_pending: false,
             },
         );
         Ok(json!({"restoreToken":token}))
@@ -513,6 +554,13 @@ impl Connection {
         session_id: &str,
     ) -> Result<std::sync::MutexGuard<'a, HashMap<String, RestoreClaim>>, String> {
         while let Some(claim) = claims.get(session_id) {
+            if claim.request_active {
+                claims = self
+                    .restore_ready
+                    .wait(claims)
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
             let remaining = claim.expires.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 claims.remove(session_id);
@@ -530,12 +578,16 @@ impl Connection {
 
     fn release_restore(&self, session_id: &str, token: &str) -> Result<(), String> {
         let mut claims = self.restores.lock().map_err(|error| error.to_string())?;
-        if claims
-            .get(session_id)
-            .is_some_and(|claim| claim.token == token)
+        if let Some(claim) = claims
+            .get_mut(session_id)
+            .filter(|claim| claim.token == token)
         {
-            claims.remove(session_id);
-            self.restore_ready.notify_all();
+            if claim.request_active {
+                claim.release_pending = true;
+            } else {
+                claims.remove(session_id);
+                self.restore_ready.notify_all();
+            }
         }
         Ok(())
     }
@@ -4273,15 +4325,10 @@ fn with_restore_claim<T>(
     token: Option<&str>,
     request: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    if let Some(token) = token {
-        runtime.extend_restore(session_id, token)?;
-    }
-    let result = request()?;
-    if let Some(token) = token {
-        // Give the webview its own bounded window to apply the replay.
-        runtime.extend_restore(session_id, token)?;
-    }
-    Ok(result)
+    let _guard = token
+        .map(|token| runtime.begin_restore_request(session_id, token))
+        .transpose()?;
+    request()
 }
 
 async fn restore_session(
@@ -5352,7 +5399,7 @@ mod session_config_tests {
             .as_str()
             .unwrap()
             .to_owned();
-        runtime.extend_restore("session", &token).unwrap();
+        with_restore_claim(&runtime, "session", Some(&token), || Ok(())).unwrap();
         let waiting = Arc::clone(&runtime);
         let (started, receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -5411,14 +5458,6 @@ mod session_config_tests {
             .as_str()
             .unwrap()
             .to_owned();
-        // Compress the initial ten-second reservation so the request crosses its expiry.
-        runtime
-            .restores
-            .lock()
-            .unwrap()
-            .get_mut("session")
-            .unwrap()
-            .expires = Instant::now() + Duration::from_millis(25);
         let waiting = Arc::clone(&runtime);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (dispatched_tx, dispatched_rx) = std::sync::mpsc::channel();
@@ -5430,7 +5469,21 @@ mod session_config_tests {
         });
         with_restore_claim(&runtime, "session", Some(&token), || {
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            // Compress a slow backend request past the reservation's expiry.
+            runtime
+                .restores
+                .lock()
+                .unwrap()
+                .get_mut("session")
+                .unwrap()
+                .expires = Instant::now() + Duration::from_millis(25);
             std::thread::sleep(Duration::from_millis(75));
+            assert!(matches!(
+                dispatched_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            // A disappearing webview may release early, but replay still owns the session.
+            runtime.release_restore("session", &token).unwrap();
             assert!(matches!(
                 dispatched_rx.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
@@ -5438,11 +5491,6 @@ mod session_config_tests {
             Ok(())
         })
         .unwrap();
-        assert!(matches!(
-            dispatched_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
-        runtime.release_restore("session", &token).unwrap();
         dispatched_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         worker.join().unwrap();
         runtime.child.lock().unwrap().kill().unwrap();
