@@ -1,6 +1,10 @@
 import type { AgentEntry, AgentMessage } from './acp';
 import { receiptSourceId, type SpawnReceipt, type SpawnState } from './agent-results.ts';
-import { nativeSubagentStatus, type NativeSubagentStore } from './native-subagents.ts';
+import {
+  nativeSubagentStatus,
+  nativeSubagentSupports,
+  type NativeSubagentStore,
+} from './native-subagents.ts';
 import {
   isFailedStatus,
   splitTaskNotifications,
@@ -69,8 +73,6 @@ export type SubagentRunSources = {
   transcripts?: readonly ParentTranscript[];
 };
 
-/** claude-agent-acp 0.84.0 advertises no child capabilities: a child prompt fails with "Session
- * not found" and a child cancel is ignored, so only the parent turn can stop its children. */
 const nativeControls: SubagentControls = { prompt: false, cancel: false };
 
 function nativeRuns(store: NativeSubagentStore): SubagentRun[] {
@@ -102,7 +104,10 @@ function nativeRuns(store: NativeSubagentStore): SubagentRun[] {
       updated: child.updated,
       receiptId: null,
       usage: null,
-      controls: nativeControls,
+      controls: {
+        prompt: nativeSubagentSupports(child.capabilities, 'prompt'),
+        cancel: nativeSubagentSupports(child.capabilities, 'cancel'),
+      },
     };
   });
 }

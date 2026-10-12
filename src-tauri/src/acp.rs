@@ -437,7 +437,7 @@ pub(crate) fn promote_idle_worktree(app: &AppHandle, worktree: &Path) -> Result<
             }
             let fence = app.state::<AgentWorktreeFence>();
             let agents = app.state::<AgentManager>();
-            fence.cleanup(&agents, worktree, None, || {
+            fence.cleanup(&agents, worktree, None, false, || {
                 let cache = app
                     .path()
                     .app_cache_dir()

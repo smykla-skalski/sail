@@ -501,6 +501,7 @@
     nativeSubagentAcceptsPrompts,
     nativeSubagentId,
     nativeSubagentReceipts,
+    nativeSubagentSupports,
     nativeSubagentThreads as threadsForNativeSubagents,
     reconcileNativeSubagents,
     setNativeSubagentWaiting,
@@ -12590,6 +12591,14 @@
                       nativeSubagents[
                         nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
                       ],
+                    )
+                  : false}
+                childStops={acpThread
+                  ? nativeSubagentSupports(
+                      nativeSubagents[
+                        nativeSubagentId(acpThread.agent, acpThread.directory, acpThread.sessionId)
+                      ]?.capabilities,
+                      'cancel',
                     )
                   : false}
                 nativeEntries={acpThread
