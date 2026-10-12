@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "e2e")]
 use tauri::Manager;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 const APPROVALS_KEY: &str = "sai-post-turn-approvals";
 const HISTORY_KEY: &str = "sai-post-turn-history";
@@ -235,6 +235,8 @@ pub fn cancel_post_turn_check(
         checks.push(result.clone());
     }
     save_history(&app, &checks)?;
+    drop(guard);
+    let _ = app.emit("post-turn-check-completed", &result);
     Ok(result)
 }
 
@@ -377,6 +379,8 @@ pub async fn run_post_turn_check(
             *item = result.clone();
         }
         save_history(&app, &checks)?;
+        drop(active);
+        let _ = app.emit("post-turn-check-completed", &result);
         Ok(result)
     })
     .await

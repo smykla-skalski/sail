@@ -717,4 +717,103 @@ describe('post-turn check recovery', () => {
     await browser.refresh();
     expect(readFileSync(join(repository, 'manual-retry-runs.txt'), 'utf8')).toBe('manual\n');
   });
+
+  it('acknowledges a backend check that finishes after the webview reloads', async () => {
+    const checkCommand =
+      "printf 'started\\n' > live-reload-started.txt; while [ ! -f live-reload-release.txt ]; do sleep 0.1; done; printf 'run\\n' >> live-reload-runs.txt";
+    writeFileSync(
+      join(repository, '.sail', 'worktree.json'),
+      JSON.stringify({ postTurnChecks: [] }),
+    );
+    await browser.execute(
+      async (path, checkToRun) => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-post-turn-history',
+          value: null,
+        });
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-post-turn-personal',
+          value: JSON.stringify([checkToRun]),
+        });
+        await tauri.core.invoke('save_setting', {
+          key: 'sai-acp-turn-evidence',
+          value: JSON.stringify([
+            {
+              agent: 'claude',
+              directory: path,
+              sessionId: 'live-reload-session',
+              turnId: 'live-reload-turn',
+              status: 'done',
+              error: null,
+              updatedAt: Date.now(),
+              postTurnPending: true,
+            },
+          ]),
+        });
+        localStorage.setItem('sai-post-turn-personal', JSON.stringify([checkToRun]));
+        localStorage.setItem('sai-directory', path);
+        void tauri.core
+          .invoke('run_post_turn_check', {
+            request: {
+              directory: path,
+              thread: 'acp:claude:live-reload-session',
+              turn: 'live-reload-turn',
+              source: 'personal',
+              command: checkToRun,
+              retry: false,
+            },
+          })
+          .catch(() => undefined);
+      },
+      repository,
+      checkCommand,
+    );
+    await browser.waitUntil(() => existsSync(join(repository, 'live-reload-started.txt')), {
+      timeoutMsg: 'The backend check did not start before reload',
+    });
+
+    const release = () => writeFileSync(join(repository, 'live-reload-release.txt'), 'release\n');
+    try {
+      await browser.refresh();
+      await browser.waitUntil(
+        () => browser.execute(() => Reflect.get(window, 'sailE2eAcpRecoveryReady') === true),
+        {
+          timeoutMsg: 'Startup did not reconcile the running backend check',
+        },
+      );
+      const state = async () =>
+        browser.execute(async (path) => {
+          const tauri = Reflect.get(window, '__TAURI__');
+          const [evidence, history] = await Promise.all([
+            tauri.core.invoke('get_acp_turn_evidence', {
+              agent: 'claude',
+              directory: path,
+              sessionId: 'live-reload-session',
+              turnId: 'live-reload-turn',
+            }),
+            tauri.core.invoke('list_post_turn_checks'),
+          ]);
+          return {
+            pending: evidence?.postTurnPending,
+            check: history.find((item: { turn: string }) => item.turn === 'live-reload-turn'),
+          };
+        }, repository);
+      expect((await state()).pending).toBe(true);
+      expect((await state()).check?.status).toBe('running');
+      expect(existsSync(join(repository, 'live-reload-runs.txt'))).toBe(false);
+
+      release();
+      await browser.waitUntil(async () => (await state()).pending === false, {
+        timeout: 20_000,
+        timeoutMsg: 'The completed backend check did not wake the reloaded webview',
+      });
+      expect((await state()).check?.status).toBe('passed');
+      expect(readFileSync(join(repository, 'live-reload-runs.txt'), 'utf8')).toBe('run\n');
+      await browser.refresh();
+      expect(readFileSync(join(repository, 'live-reload-runs.txt'), 'utf8')).toBe('run\n');
+    } finally {
+      release();
+    }
+  });
 });

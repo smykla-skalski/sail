@@ -2154,6 +2154,7 @@
   onMount(() => {
     window.addEventListener(OPEN_IN_SPLIT_EVENT, openLinkInSplit);
     let unlistenAgentEvents: (() => void) | undefined;
+    let unlistenPostTurnCheckEvents: (() => void) | undefined;
     let unlistenBrowserAccess: (() => void) | undefined;
     let unlistenCoordination: (() => void) | undefined;
     const unsubscribePlans = acpPlans().subscribe((change) => {
@@ -2358,28 +2359,40 @@
       void listen<(typeof agentTerminals)[number]>('acp-terminal-created', ({ payload }) => {
         agentTerminals = [...agentTerminals, payload];
       }).then((unlisten) => (unlistenAgentTerminals = unlisten));
-      void listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)).then(
-        (unlisten) => {
-          if (disposed) unlisten();
-          else {
-            unlistenAgentEvents = unlisten;
-            if (import.meta.env.MODE === 'e2e')
-              Reflect.set(window, 'sailE2eStopAgentEvents', () => {
-                unlistenAgentEvents?.();
-                unlistenAgentEvents = undefined;
-              });
-            void recoverInterruptedAgentTurns()
-              .then(() => restoreAgentActivity())
-              .then(() => reconcilePendingPostTurnChecks())
-              .finally(() => {
-                acpRecoveryReady = true;
-                void tickShippingRuns();
-              });
-            scheduleInboxRefresh();
-          }
-          return undefined;
-        },
-      );
+      void Promise.all([
+        listen<PostTurnCheck>('post-turn-check-completed', ({ payload }) => {
+          postTurnResults = upsertCheck(postTurnResults, payload);
+          if (!hasDurableCheckOutcome(payload)) return;
+          const match = /^acp:([^:]+):(.+)$/.exec(payload.thread);
+          if (match)
+            void runVerifiedCompletedChecks(match[1], payload.directory, match[2], payload.turn);
+        }),
+        listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)),
+      ]).then(([unlistenChecks, unlistenAgent]) => {
+        if (disposed) {
+          unlistenChecks();
+          unlistenAgent();
+        } else {
+          unlistenPostTurnCheckEvents = unlistenChecks;
+          unlistenAgentEvents = unlistenAgent;
+          if (import.meta.env.MODE === 'e2e')
+            Reflect.set(window, 'sailE2eStopAgentEvents', () => {
+              unlistenAgentEvents?.();
+              unlistenAgentEvents = undefined;
+            });
+          void recoverInterruptedAgentTurns()
+            .then(() => restoreAgentActivity())
+            .then(() => reconcilePendingPostTurnChecks())
+            .finally(() => {
+              acpRecoveryReady = true;
+              if (import.meta.env.MODE === 'e2e')
+                Reflect.set(window, 'sailE2eAcpRecoveryReady', true);
+              void tickShippingRuns();
+            });
+          scheduleInboxRefresh();
+        }
+        return undefined;
+      });
       if (import.meta.env.MODE === 'e2e') {
         const emulateClick = (event: Event) =>
           void openNotificationTarget((event as CustomEvent<unknown>).detail);
@@ -2434,6 +2447,8 @@
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
       if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eStopAgentEvents');
+      unlistenPostTurnCheckEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eAcpRecoveryReady');
       unlistenBrowserAccess?.();
       unlistenCoordination?.();
       unsubscribePlans();
