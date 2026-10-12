@@ -265,11 +265,12 @@ fn forget_removed_worktree_in_cache(cache: &Path, worktree: &Path) -> Result<(),
         return Err("Removed worktree private Git state requires recovery.".into());
     }
     validate_overlay(&private, &manifest.common_dir)?;
-    let head = output(git_command().arg("--git-dir").arg(&private).args([
-        "rev-parse",
-        "--verify",
-        "HEAD^{commit}",
-    ]))?;
+    let head = output(
+        git_command()
+            .arg("--git-dir")
+            .arg(git_config_path(&private))
+            .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+    )?;
     if String::from_utf8_lossy(&head.stdout).trim() != manifest.promoted_oid
         || index_hash(&private.join("index"))? != manifest.source_index_hash
     {
@@ -1053,7 +1054,7 @@ impl GitOverlay {
             output(
                 git_command()
                     .arg("--git-dir")
-                    .arg(&manifest.common_dir)
+                    .arg(git_config_path(&manifest.common_dir))
                     .args(["fetch", "--no-write-fetch-head", "--no-tags"])
                     .arg(git_config_path(&self.git_dir))
                     .arg(&promotion.new_oid),
@@ -1061,7 +1062,7 @@ impl GitOverlay {
             output(
                 git_command()
                     .arg("--git-dir")
-                    .arg(&manifest.common_dir)
+                    .arg(git_config_path(&manifest.common_dir))
                     .args([
                         "update-ref",
                         &manifest.branch,

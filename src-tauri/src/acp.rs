@@ -6712,9 +6712,10 @@ mod session_config_tests {
                     )
             })
         }));
-        assert!(overrides.iter().any(|value| value
-            .as_str()
-            .is_some_and(|value| value.contains(build_cache.to_str().unwrap()))));
+        assert!(overrides
+            .iter()
+            .any(|value| value.as_str().is_some_and(|value| value
+                .contains(&serde_json::to_string(&build_cache.to_string_lossy()).unwrap()))));
         let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
         assert_eq!(
             restored["additionalDirectories"],
