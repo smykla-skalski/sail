@@ -97,7 +97,7 @@ fn register(worktree: &Path, git_dir: &Path, source_git_dir: &Path) {
 }
 
 pub(crate) fn registered_paths(directory: &Path) -> Option<(PathBuf, PathBuf)> {
-    let directory = directory.canonicalize().ok()?;
+    let directory = dunce::canonicalize(directory).ok()?;
     ACTIVE
         .get()?
         .lock()
@@ -119,7 +119,7 @@ pub(crate) fn registered_directory(directory: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn index_differs(directory: &Path) -> Option<bool> {
-    let directory = directory.canonicalize().ok()?;
+    let directory = dunce::canonicalize(directory).ok()?;
     let entries = ACTIVE.get()?.lock().ok()?;
     let (_, private, source) = entries
         .iter()
@@ -131,7 +131,7 @@ pub(crate) fn index_differs(directory: &Path) -> Option<bool> {
 }
 
 pub(crate) fn known_worktree(directory: &Path) -> Option<PathBuf> {
-    let directory = directory.canonicalize().ok()?;
+    let directory = dunce::canonicalize(directory).ok()?;
     if let Some(root) = ACTIVE
         .get()
         .and_then(|entries| entries.lock().ok())
@@ -181,7 +181,7 @@ pub(crate) fn initialize(cache: &Path) {
 }
 
 pub(crate) fn require_shared_current(worktree: &Path) -> Result<(), String> {
-    let worktree = worktree.canonicalize().map_err(|error| error.to_string())?;
+    let worktree = dunce::canonicalize(worktree).map_err(|error| error.to_string())?;
     let Some(cache) = CACHE.get() else {
         return if known_worktree(&worktree).is_some() {
             Err(
@@ -311,19 +311,21 @@ fn require_shared_current_in_cache(cache: &Path, worktree: &Path) -> Result<(), 
     if overlay.manifest.promotion.is_some() || current.head != overlay.manifest.promoted_oid {
         return Err("Private Git promotion is pending; shared Git operation refused.".into());
     }
-    let branch = output(git_command().arg("--git-dir").arg(&overlay.git_dir).args([
-        "symbolic-ref",
-        "-q",
-        "HEAD",
-    ]))?;
+    let branch = output(
+        git_command()
+            .arg("--git-dir")
+            .arg(git_config_path(&overlay.git_dir))
+            .args(["symbolic-ref", "-q", "HEAD"]),
+    )?;
     if String::from_utf8_lossy(&branch.stdout).trim() != overlay.manifest.branch {
         return Err("Private Git branch changed; shared Git operation refused.".into());
     }
-    let head = output(git_command().arg("--git-dir").arg(&overlay.git_dir).args([
-        "rev-parse",
-        "--verify",
-        "HEAD^{commit}",
-    ]))?;
+    let head = output(
+        git_command()
+            .arg("--git-dir")
+            .arg(git_config_path(&overlay.git_dir))
+            .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+    )?;
     if String::from_utf8_lossy(&head.stdout).trim() != current.head {
         return Err("Private Git commits are pending; shared Git operation refused.".into());
     }
@@ -396,7 +398,7 @@ fn output(command: &mut Command) -> Result<Output, String> {
 }
 
 fn source(worktree: &Path) -> Result<Option<Source>, String> {
-    let worktree = worktree.canonicalize().map_err(|error| error.to_string())?;
+    let worktree = dunce::canonicalize(worktree).map_err(|error| error.to_string())?;
     let pointer = worktree.join(".git");
     if !fs::symlink_metadata(&pointer).is_ok_and(|metadata| metadata.file_type().is_file()) {
         return Ok(None);
@@ -436,7 +438,7 @@ fn source(worktree: &Path) -> Result<Option<Source>, String> {
     } else {
         git_dir.join(backlink)
     };
-    if backlink.canonicalize().map_err(|error| error.to_string())? != pointer {
+    if dunce::canonicalize(&backlink).map_err(|error| error.to_string())? != pointer {
         return Err("Linked Git directory belongs to another worktree.".into());
     }
     let branch =
@@ -754,7 +756,7 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
         output(
             git_command()
                 .arg("--git-dir")
-                .arg(git_dir)
+                .arg(git_config_path(git_dir))
                 .args(["update-ref", reference, oid]),
         )?;
     }
@@ -763,7 +765,7 @@ fn seed_refs(source: &Source, git_dir: &Path) -> Result<(), String> {
 
 impl GitOverlay {
     pub(crate) fn existing(cache: &Path, worktree: &Path) -> Result<Option<Self>, String> {
-        let worktree = worktree.canonicalize().map_err(|error| error.to_string())?;
+        let worktree = dunce::canonicalize(worktree).map_err(|error| error.to_string())?;
         let (git_dir, manifest_path, _) = paths(cache, &worktree);
         let Some(manifest) = read_manifest(&manifest_path)? else {
             return Ok(None);
@@ -885,11 +887,12 @@ impl GitOverlay {
             }
         }
         seed_refs(&current, &git_dir)?;
-        output(git_command().args(["--git-dir"]).arg(&git_dir).args([
-            "symbolic-ref",
-            "HEAD",
-            &current.branch,
-        ]))?;
+        output(
+            git_command()
+                .args(["--git-dir"])
+                .arg(git_config_path(&git_dir))
+                .args(["symbolic-ref", "HEAD", &current.branch]),
+        )?;
         let source_index = current.git_dir.join("index");
         let source_index_hash = index_hash(&source_index)?;
         if source_index.is_file() {
@@ -899,16 +902,16 @@ impl GitOverlay {
             if split {
                 output(
                     git_command()
-                        .env("GIT_DIR", &git_dir)
-                        .env("GIT_WORK_TREE", &current.worktree)
+                        .env("GIT_DIR", git_config_path(&git_dir))
+                        .env("GIT_WORK_TREE", git_config_path(&current.worktree))
                         .args(["update-index", "--no-split-index"]),
                 )?;
             }
         } else {
             output(
                 git_command()
-                    .env("GIT_DIR", &git_dir)
-                    .env("GIT_WORK_TREE", &current.worktree)
+                    .env("GIT_DIR", git_config_path(&git_dir))
+                    .env("GIT_WORK_TREE", git_config_path(&current.worktree))
                     .args(["read-tree", "HEAD"]),
             )?;
         }
@@ -942,8 +945,8 @@ impl GitOverlay {
     }
 
     pub(crate) fn apply(&self, command: &mut Command) {
-        command.env("GIT_DIR", &self.git_dir);
-        command.env("GIT_WORK_TREE", &self.worktree);
+        command.env("GIT_DIR", git_config_path(&self.git_dir));
+        command.env("GIT_WORK_TREE", git_config_path(&self.worktree));
         command.env_remove("GIT_COMMON_DIR");
         command.env_remove("GIT_INDEX_FILE");
     }
@@ -980,19 +983,21 @@ impl GitOverlay {
         if manifest.worktree != self.worktree || manifest.version != VERSION {
             return Err("Git overlay owner changed; promotion refused.".into());
         }
-        let branch = output(git_command().arg("--git-dir").arg(&self.git_dir).args([
-            "symbolic-ref",
-            "-q",
-            "HEAD",
-        ]))?;
+        let branch = output(
+            git_command()
+                .arg("--git-dir")
+                .arg(git_config_path(&self.git_dir))
+                .args(["symbolic-ref", "-q", "HEAD"]),
+        )?;
         if String::from_utf8_lossy(&branch.stdout).trim() != manifest.branch {
             return Err("Private Git HEAD changed branch; promotion refused.".into());
         }
-        let head = output(git_command().arg("--git-dir").arg(&self.git_dir).args([
-            "rev-parse",
-            "--verify",
-            "HEAD^{commit}",
-        ]))?;
+        let head = output(
+            git_command()
+                .arg("--git-dir")
+                .arg(git_config_path(&self.git_dir))
+                .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+        )?;
         let head = String::from_utf8(head.stdout).map_err(|error| error.to_string())?;
         let head = head.trim();
         let source_index = manifest.source_git_dir.join("index");
@@ -1000,15 +1005,15 @@ impl GitOverlay {
         if manifest.promotion.is_none()
             && shared_index_path(
                 git_command()
-                    .env("GIT_DIR", &self.git_dir)
-                    .env("GIT_WORK_TREE", &self.worktree),
+                    .env("GIT_DIR", git_config_path(&self.git_dir))
+                    .env("GIT_WORK_TREE", git_config_path(&self.worktree)),
             )?
             .is_some()
         {
             output(
                 git_command()
-                    .env("GIT_DIR", &self.git_dir)
-                    .env("GIT_WORK_TREE", &self.worktree)
+                    .env("GIT_DIR", git_config_path(&self.git_dir))
+                    .env("GIT_WORK_TREE", git_config_path(&self.worktree))
                     .args(["update-index", "--no-split-index"]),
             )?;
         }
@@ -1051,7 +1056,7 @@ impl GitOverlay {
                     .arg("--git-dir")
                     .arg(&manifest.common_dir)
                     .args(["fetch", "--no-write-fetch-head", "--no-tags"])
-                    .arg(&self.git_dir)
+                    .arg(git_config_path(&self.git_dir))
                     .arg(&promotion.new_oid),
             )?;
             output(
@@ -1173,7 +1178,9 @@ mod tests {
         );
         assert_eq!(
             overlay_git(&overlay, &["config", "--get", "core.hooksPath"]),
-            git_config_path(&main.join(".git/hooks")).to_str().unwrap()
+            git_config_path(&main.canonicalize().unwrap().join(".git/hooks"))
+                .to_str()
+                .unwrap()
         );
         fs::write(task.join("agent.txt"), "task change\n").unwrap();
         overlay_git(&overlay, &["add", "agent.txt"]);

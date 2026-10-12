@@ -6707,7 +6707,9 @@ mod session_config_tests {
         assert!(overrides.iter().any(|value| {
             value.as_str().is_some_and(|value| {
                 value.contains("filesystem")
-                    && value.contains(&overlay.git_dir.to_string_lossy().to_string())
+                    && value.contains(
+                        &serde_json::to_string(&overlay.git_dir.to_string_lossy()).unwrap(),
+                    )
             })
         }));
         assert!(overrides.iter().any(|value| value
