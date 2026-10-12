@@ -23,6 +23,16 @@ fn git_config_path(path: &Path) -> OsString {
     }
 }
 
+fn git_config_quoted_path(path: &Path) -> Result<String, String> {
+    let path = git_config_path(path)
+        .into_string()
+        .map_err(|_| "Git config path is not valid UTF-8.".to_string())?;
+    Ok(format!(
+        "\"{}\"",
+        path.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
 fn register(worktree: &Path, git_dir: &Path, source_git_dir: &Path) {
     let entries = ACTIVE.get_or_init(|| Mutex::new(Vec::new()));
     if let Ok(mut entries) = entries.lock() {
@@ -771,29 +781,17 @@ impl GitOverlay {
         .map_err(|error| error.to_string())?;
         let config = git_dir.join("config");
         let source_config = current.common_dir.join("config");
-        output(
-            git_command()
-                .args(["config", "--file"])
-                .arg(&config)
-                .args(["--add", "include.path"])
-                .arg(git_config_path(&source_config)),
-        )?;
+        let mut config_entries = format!(
+            "\n[include]\n\tpath = {}\n",
+            git_config_quoted_path(&source_config)?
+        );
         let worktree_config = current.git_dir.join("config.worktree");
         if worktree_config.is_file() {
-            output(
-                git_command()
-                    .args(["config", "--file"])
-                    .arg(&config)
-                    .args(["--add", "include.path"])
-                    .arg(git_config_path(&worktree_config)),
-            )?;
+            config_entries.push_str(&format!(
+                "[include]\n\tpath = {}\n",
+                git_config_quoted_path(&worktree_config)?
+            ));
         }
-        output(
-            git_command()
-                .args(["config", "--file"])
-                .arg(&config)
-                .args(["core.bare", "false"]),
-        )?;
         let configured_hooks = git_command()
             .arg("-C")
             .arg(&current.worktree)
@@ -803,20 +801,18 @@ impl GitOverlay {
             .status
             .success();
         if !configured_hooks {
-            output(
-                git_command()
-                    .args(["config", "--file"])
-                    .arg(&config)
-                    .arg("core.hooksPath")
-                    .arg(git_config_path(&current.common_dir.join("hooks"))),
-            )?;
+            config_entries.push_str(&format!(
+                "[core]\n\thooksPath = {}\n",
+                git_config_quoted_path(&current.common_dir.join("hooks"))?
+            ));
         }
         // The source includes follow the initial [core] section. A final section
         // overrides any inherited core.splitIndex=true for every task Git command.
+        config_entries.push_str("[core]\n\tbare = false\n\tsplitIndex = false\n");
         OpenOptions::new()
             .append(true)
             .open(&config)
-            .and_then(|mut file| file.write_all(b"\n[core]\n\tsplitIndex = false\n"))
+            .and_then(|mut file| file.write_all(config_entries.as_bytes()))
             .map_err(|error| error.to_string())?;
         seed_refs(&current, &git_dir)?;
         output(git_command().args(["--git-dir"]).arg(&git_dir).args([
@@ -1261,6 +1257,10 @@ mod tests {
         assert_eq!(
             git_config_path(Path::new(r"C:\task\repo\.git\config")),
             OsString::from("C:/task/repo/.git/config")
+        );
+        assert_eq!(
+            git_config_quoted_path(Path::new(r"C:\task\repo\.git\config")).unwrap(),
+            "\"C:/task/repo/.git/config\""
         );
     }
 
