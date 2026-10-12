@@ -772,6 +772,29 @@
     initialSelection: number;
   };
   const worktreeCreationRequests = new SvelteMap<string, WorktreeCreationRequest>();
+  const pendingAgentWorktreeRegistrations = new SvelteMap<string, number>();
+  const deletingWorktreeRepositories = new SvelteSet<string>();
+
+  function beginAgentWorktreeRegistration(repository: string): () => void {
+    if (deletingWorktreeRepositories.has(repository))
+      throw new Error('A worktree deletion is in progress. Retry creation when it finishes.');
+    pendingAgentWorktreeRegistrations.set(
+      repository,
+      (pendingAgentWorktreeRegistrations.get(repository) ?? 0) + 1,
+    );
+    return () => {
+      const remaining = (pendingAgentWorktreeRegistrations.get(repository) ?? 1) - 1;
+      if (remaining) pendingAgentWorktreeRegistrations.set(repository, remaining);
+      else pendingAgentWorktreeRegistrations.delete(repository);
+    };
+  }
+
+  function worktreeRegistrationPending(repository: string): boolean {
+    return (
+      (pendingAgentWorktreeRegistrations.get(repository) ?? 0) > 0 ||
+      worktreeCreations.some((creation) => creation.repository === repository && !creation.error)
+    );
+  }
   type CreatedWorktree = {
     path: string;
     branch: string;
@@ -7016,20 +7039,26 @@
     if (!(await approval)) throw new Error('User declined the worktree request.');
     if (Date.now() >= request.expiresAt)
       throw new Error('The worktree request expired before approval.');
-    const origin = await agentWorktreeOrigin(
-      project,
-      request.directory,
-      source.agent,
-      request.sessionId,
-      source.title,
-    );
-    const created = await invoke<CreatedWorktree>('create_worktree', {
-      repository: request.directory,
-      name,
-      destinationParent: null,
-      baseRef: null,
-    });
-    saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
+    const finishRegistration = beginAgentWorktreeRegistration(project);
+    let created: CreatedWorktree;
+    try {
+      const origin = await agentWorktreeOrigin(
+        project,
+        request.directory,
+        source.agent,
+        request.sessionId,
+        source.title,
+      );
+      created = await invoke<CreatedWorktree>('create_worktree', {
+        repository: request.directory,
+        name,
+        destinationParent: null,
+        baseRef: null,
+      });
+      saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
+    } finally {
+      finishRegistration();
+    }
     if (created.setup) {
       await loadProject(created.path);
       if (directory !== created.path) throw new Error('Worktree changed before setup started.');
@@ -7791,20 +7820,26 @@
       if (Date.now() >= responseDeadline)
         throw new Error('Agent spawn timed out while waiting to launch.');
       if (!destination) {
-        const origin = await agentWorktreeOrigin(
-          project,
-          request.directory,
-          source.agent,
-          request.sessionId,
-          source.title,
-        );
-        const created = await invoke<CreatedWorktree>('create_worktree', {
-          repository: project,
-          name,
-          destinationParent: null,
-          baseRef: null,
-        });
-        saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
+        const finishRegistration = beginAgentWorktreeRegistration(project);
+        let created: CreatedWorktree;
+        try {
+          const origin = await agentWorktreeOrigin(
+            project,
+            request.directory,
+            source.agent,
+            request.sessionId,
+            source.title,
+          );
+          created = await invoke<CreatedWorktree>('create_worktree', {
+            repository: project,
+            name,
+            destinationParent: null,
+            baseRef: null,
+          });
+          saveProjectCatalog(addWorktree(projectCatalog, project, { ...created, origin }));
+        } finally {
+          finishRegistration();
+        }
         destination = created;
         updateSpawnReceipt(receiptId, {
           worktreeId: created.path,
@@ -8676,6 +8711,8 @@
       worktreeCreations = worktreeCreations.map((creation) =>
         creation.id === id ? { ...creation, stage: 'Creating worktree' } : creation,
       );
+      if (deletingWorktreeRepositories.has(path))
+        throw new Error('A worktree deletion is in progress. Retry creation when it finishes.');
       created = await invoke('create_worktree', {
         repository: path,
         name,
@@ -8775,9 +8812,20 @@
     force = false,
   ) {
     if (deletingWorktreeRequests.has(path)) return;
+    if (deletingWorktreeRepositories.has(repository)) {
+      error = 'Another worktree deletion is in progress. Retry when it finishes.';
+      return;
+    }
+    if (worktreeRegistrationPending(repository)) {
+      error = 'A worktree is being created. Retry deletion when it finishes.';
+      return;
+    }
+    deletingWorktreeRepositories.add(repository);
     deletingWorktreeRequests.add(path);
     try {
       const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+      if (worktreeRegistrationPending(repository))
+        throw new Error('A worktree is being created. Retry deletion when it finishes.');
       const descendants = worktreeDescendants(projectCatalog, repository, registered, path);
       if (descendants.length) {
         await deleteProjectWorktreeWithDescendants(
@@ -8803,6 +8851,7 @@
       error = describe(cause);
     } finally {
       deletingWorktreeRequests.delete(path);
+      deletingWorktreeRepositories.delete(repository);
     }
   }
 
@@ -9039,7 +9088,9 @@
           force: force || !!config,
           expectedRevision: expected?.revision ?? null,
           expectedBranch: expected?.branch ?? null,
-          expectedGeneration: expected?.generation,
+          expectedGeneration:
+            expected?.generation ??
+            expectedRegisteredWorktrees?.find((registered) => registered.path === path)?.generation,
           expectedRegisteredWorktrees: expectedRegisteredWorktrees?.map(
             ({ path: registeredPath, generation }) => ({ path: registeredPath, generation }),
           ),

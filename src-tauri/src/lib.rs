@@ -1448,6 +1448,10 @@ fn registered_worktrees(
 
 #[tauri::command]
 fn repository_worktrees(repository: String) -> Result<Vec<RegisteredWorktree>, String> {
+    repository_worktrees_inner(repository)
+}
+
+fn repository_worktrees_inner(repository: String) -> Result<Vec<RegisteredWorktree>, String> {
     let repository = validate_repository(repository)?;
     let listed = git_reference(
         Path::new(&repository),
@@ -2012,7 +2016,7 @@ fn ensure_expected_worktree_inventory(
     let Some(expected) = expected else {
         return Ok(());
     };
-    let current = repository_worktrees(repository.to_string())?;
+    let current = repository_worktrees_inner(repository.to_string())?;
     let expected = expected
         .iter()
         .map(|entry| (entry.path.as_str(), entry.generation.as_deref()))
@@ -2090,7 +2094,7 @@ fn worktree_removal_preview(
     let main = Path::new(&repository)
         .git_canonical()
         .map_err(|_| "Repository folder no longer exists.".to_string())?;
-    let registered = repository_worktrees(repository)?;
+    let registered = repository_worktrees_inner(repository)?;
     let registered = registered
         .into_iter()
         .map(|entry| (PathBuf::from(&entry.path), entry))
@@ -2230,12 +2234,13 @@ async fn delete_worktree(
                             expected_branch,
                         )
                     } else {
-                        remove_worktree(
+                        remove_worktree_guarded(
                             checked,
                             worktree,
                             force,
                             expected_revision.as_deref(),
                             expected_branch.as_deref(),
+                            expected_generation.as_deref(),
                         )?;
                         Ok(None)
                     };
@@ -2963,11 +2968,53 @@ struct GuardedRemovalState {
     head: String,
 }
 
-struct WorktreeHeadLock(PathBuf);
+struct WorktreeHeadLock {
+    path: PathBuf,
+    token: String,
+}
+
+struct WorktreeRegistrationLock {
+    path: PathBuf,
+    reason: String,
+}
+
+impl Drop for WorktreeRegistrationLock {
+    fn drop(&mut self) {
+        if std::fs::read_to_string(&self.path).ok().as_deref() == Some(&self.reason) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn lock_worktree_registration(worktree: &Path) -> Result<WorktreeRegistrationLock, String> {
+    use std::fs::OpenOptions;
+
+    let admin = git_reference(worktree, &["rev-parse", "--absolute-git-dir"])
+        .ok_or("Cannot locate the worktree registration before deletion.")?;
+    let path = PathBuf::from(admin).join("locked");
+    let reason = format!("Sail deletion {}\n", uuid::Uuid::new_v4());
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("Cannot lock the Git worktree before deletion: {error}"))?;
+    if let Err(error) = file
+        .write_all(reason.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!(
+            "Cannot lock the Git worktree before deletion: {error}"
+        ));
+    }
+    Ok(WorktreeRegistrationLock { path, reason })
+}
 
 impl Drop for WorktreeHeadLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if std::fs::read_to_string(&self.path).ok().as_deref() == Some(&self.token) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -2986,12 +3033,22 @@ fn lock_worktree_head(worktree: &Path) -> Result<WorktreeHeadLock, String> {
     let mut lock_name = OsString::from(head.as_os_str());
     lock_name.push(".lock");
     let lock = PathBuf::from(lock_name);
-    OpenOptions::new()
+    let token = format!("Sail checkout lock {}\n", uuid::Uuid::new_v4());
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&lock)
         .map_err(|error| format!("Cannot lock the worktree checkout before deletion: {error}"))?;
-    Ok(WorktreeHeadLock(lock))
+    if let Err(error) = file
+        .write_all(token.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&lock);
+        return Err(format!(
+            "Cannot lock the worktree checkout before deletion: {error}"
+        ));
+    }
+    Ok(WorktreeHeadLock { path: lock, token })
 }
 
 fn guarded_removal_state(
@@ -3074,6 +3131,25 @@ fn remove_worktree(
     )
 }
 
+fn remove_worktree_guarded(
+    repository: String,
+    worktree: String,
+    force: Option<bool>,
+    expected_revision: Option<&str>,
+    expected_branch: Option<&str>,
+    expected_generation: Option<&str>,
+) -> Result<(), String> {
+    remove_worktree_with_hooks(
+        repository,
+        worktree,
+        force,
+        expected_revision,
+        expected_branch,
+        expected_generation,
+        (|| Ok(()), || Ok(()), || Ok(())),
+    )
+}
+
 fn remove_worktree_with_hook<F>(
     repository: String,
     worktree: String,
@@ -3091,6 +3167,7 @@ where
         force,
         expected_revision,
         expected_branch,
+        None,
         (before_remove, || Ok(()), || Ok(())),
     )
 }
@@ -3101,6 +3178,7 @@ fn remove_worktree_with_hooks<F, G, H>(
     force: Option<bool>,
     expected_revision: Option<&str>,
     expected_branch: Option<&str>,
+    expected_generation: Option<&str>,
     hooks: (F, G, H),
 ) -> Result<(), String>
 where
@@ -3116,6 +3194,11 @@ where
     let worktree = match Path::new(&worktree).git_canonical() {
         Ok(worktree) => worktree,
         Err(_) if !requested_worktree.exists() => {
+            if expected_generation.is_some() {
+                return Err(
+                    "Worktree identity changed after preview. Refresh before deleting.".into(),
+                );
+            }
             let listed = git_reference(&repository, &["worktree", "list", "--porcelain", "-z"])
                 .ok_or("Cannot inspect repository worktrees.")?;
             let still_registered = parse_registered_worktrees(&listed)
@@ -3176,7 +3259,10 @@ where
     ensure_expected_revision()?;
     ensure_expected_branch()?;
     let force = force == Some(true);
-    if !force {
+    let ensure_nonforce_clean = || -> Result<(), String> {
+        if force {
+            return Ok(());
+        }
         let status = Command::new("git")
             .arg("-C")
             .arg(&worktree)
@@ -3199,14 +3285,25 @@ where
                 "Worktree has ignored files. Move or remove them before deleting.".to_string(),
             );
         }
-    }
+        if expected_generation.is_some() && !status.stdout.is_empty() {
+            return Err(
+                "Worktree contains modified or untracked files. Confirm force deletion.".into(),
+            );
+        }
+        Ok(())
+    };
+    ensure_nonforce_clean()?;
     ensure_expected_revision()?;
     ensure_expected_branch()?;
     let guarded = guarded_removal_state(
         &worktree,
-        expected_revision.is_some() || expected_branch.is_some(),
+        expected_revision.is_some() || expected_branch.is_some() || expected_generation.is_some(),
     )?;
     before_final_identity_check()?;
+    let _registration_lock = expected_generation
+        .map(|_| lock_worktree_registration(&worktree))
+        .transpose()?;
+    ensure_expected_worktree_generation(&worktree, expected_generation)?;
     let _head_lock = guarded
         .as_ref()
         .map(|_| lock_worktree_head(&worktree))
@@ -3222,6 +3319,10 @@ where
         }
     }
     after_final_identity_check()?;
+    ensure_expected_worktree_generation(&worktree, expected_generation)?;
+    ensure_expected_revision()?;
+    ensure_expected_branch()?;
+    ensure_nonforce_clean()?;
     let preserved_detached_ref = guarded
         .as_ref()
         .filter(|state| state.reference.is_none())
@@ -3232,7 +3333,10 @@ where
         .arg("-C")
         .arg(&repository)
         .args(["worktree", "remove"]);
-    if force {
+    if expected_generation.is_some() {
+        // Git requires two force flags to remove a worktree under our lock.
+        command.args(["--force", "--force"]);
+    } else if force {
         command.arg("--force");
     }
     let output = command
@@ -3569,9 +3673,10 @@ mod tests {
         existing_shipping_worktree, git_change_action, git_patch, git_reference,
         normalize_picker_path, parse_registered_worktrees, persist_worktree_data_manifest,
         register_worktree_terminal_data, registered_worktrees, remove_worktree,
-        remove_worktree_then_terminal_data, remove_worktree_then_terminal_data_many,
-        remove_worktree_with_hook, remove_worktree_with_hooks, replacement_worktree_at_checkpoint,
-        repository_namespace, repository_worktrees, shipping_base_revision, shipping_changed_paths,
+        remove_worktree_guarded, remove_worktree_then_terminal_data,
+        remove_worktree_then_terminal_data_many, remove_worktree_with_hook,
+        remove_worktree_with_hooks, replacement_worktree_at_checkpoint, repository_namespace,
+        repository_worktrees_inner, shipping_base_revision, shipping_changed_paths,
         shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
         working_tree_diff, worktree_overviews, worktree_preview_state_with_hook,
         ExpectedRegisteredWorktree, WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER,
@@ -4063,7 +4168,7 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].path, alias);
         assert_eq!(matched[0].branch.as_deref(), Some("child"));
-        let discovered = repository_worktrees(repository_path.into()).unwrap();
+        let discovered = repository_worktrees_inner(repository_path.into()).unwrap();
         let canonical_child = child.git_canonical().unwrap();
         assert!(discovered
             .iter()
@@ -4490,6 +4595,145 @@ mod tests {
     }
 
     #[test]
+    fn guarded_removal_keeps_an_external_replacement_with_the_same_branch_and_commit() {
+        let (root, repository, worktree, revision) =
+            ignored_archive_fixture("sail-removal-late-replacement");
+        let original = worktree_storage::generation(Path::new(&worktree)).unwrap();
+
+        let error = remove_worktree_with_hooks(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            Some("child"),
+            Some(&original),
+            (
+                || {
+                    git(&repository, &["worktree", "remove", "--force", &worktree]);
+                    git(&repository, &["worktree", "add", "-q", &worktree, "child"]);
+                    fs::write(Path::new(&worktree).join("replacement.tmp"), "preserve").unwrap();
+                    Ok(())
+                },
+                || Ok(()),
+                || Ok(()),
+            ),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("identity changed after preview"), "{error}");
+        assert_ne!(
+            worktree_storage::generation(Path::new(&worktree)).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("replacement.tmp")).unwrap(),
+            "preserve"
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_removal_holds_a_git_lock_through_final_remove() {
+        let (root, repository, worktree, revision) =
+            ignored_archive_fixture("sail-removal-registration-lock");
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+
+        remove_worktree_with_hooks(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            Some("child"),
+            Some(&generation),
+            (
+                || Ok(()),
+                || {
+                    let attempted = Command::new("git")
+                        .arg("-C")
+                        .arg(&repository)
+                        .args(["worktree", "remove", "--force", &worktree])
+                        .output()
+                        .unwrap();
+                    assert!(!attempted.status.success());
+                    assert!(String::from_utf8_lossy(&attempted.stderr).contains("locked"));
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+        )
+        .unwrap();
+
+        assert!(!Path::new(&worktree).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_removal_keeps_a_dirty_descendant_changed_in_the_final_window() {
+        let (root, repository, worktree, revision) =
+            ignored_archive_fixture("sail-removal-final-dirty-change");
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+
+        let error = remove_worktree_with_hooks(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            Some("child"),
+            Some(&generation),
+            (
+                || Ok(()),
+                || {
+                    fs::write(Path::new(&worktree).join("tracked.txt"), "new edits\n").unwrap();
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed after validation"), "{error}");
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
+            "new edits\n"
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("one.tmp")).unwrap(),
+            "one"
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_nonforce_removal_preserves_modified_files() {
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-removal-locked-nonforce");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        fs::write(Path::new(&worktree).join("tracked.txt"), "modified\n").unwrap();
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+
+        let error = remove_worktree_guarded(
+            repository.clone(),
+            worktree.clone(),
+            None,
+            None,
+            None,
+            Some(&generation),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("modified or untracked files"), "{error}");
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
+            "modified\n"
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn replacement_worktree_uses_the_saved_commit_and_recovers_after_a_retry() {
         let root = std::env::temp_dir().join(format!("sail-replacement-{}", uuid::Uuid::new_v4()));
         let repository = root.join("repository");
@@ -4720,7 +4964,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_race_restores_checkout_at_the_new_commit() {
+    fn removal_race_keeps_checkout_when_branch_moves_before_git_remove() {
         let (root, repository, worktree, expected) =
             ignored_archive_fixture("sail-delete-race-test");
         fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
@@ -4748,6 +4992,7 @@ mod tests {
             Some(true),
             Some(&expected),
             None,
+            None,
             (
                 || Ok(()),
                 || {
@@ -4759,11 +5004,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("changed during deletion"), "{error}");
-        assert!(error.contains("checkout was restored"));
+        assert!(error.contains("changed after validation"), "{error}");
+        assert!(Path::new(&worktree).is_dir());
         assert_eq!(
             fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
-            "after\n"
+            "before\n"
         );
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
@@ -4813,6 +5058,7 @@ mod tests {
             None,
             Some(&expected),
             Some("child"),
+            None,
             (
                 || Ok(()),
                 || Ok(()),
@@ -4938,7 +5184,7 @@ mod tests {
     fn changed_worktree_inventory_keeps_parent_and_new_child() {
         let (root, repository, worktree, _) =
             ignored_archive_fixture("sail-new-descendant-during-removal-test");
-        let expected = repository_worktrees(repository.clone())
+        let expected = repository_worktrees_inner(repository.clone())
             .unwrap()
             .into_iter()
             .map(|entry| ExpectedRegisteredWorktree {
