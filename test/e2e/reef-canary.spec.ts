@@ -58,7 +58,7 @@ describe('Reef canary settings', () => {
     await expect($('#reef-canary-percent')).not.toExist();
 
     await toggle.click();
-    await expect($('#reef-canary-percent')).toHaveValue('10');
+    await expect($('#reef-canary-percent')).toHaveValue('0');
     await browser.execute(() => {
       const input = document.getElementById('reef-canary-percent');
       if (!(input instanceof HTMLInputElement)) throw new Error('Missing Reef canary input');

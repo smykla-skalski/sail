@@ -4306,8 +4306,11 @@ fn connect_blocking_inner(
     #[cfg(unix)]
     let reef_canary = canary_percent
         .map(|percent| {
-            crate::reef_canary::verify_executable(find_executable("reef"))
-                .map(|reef| (reef, percent))
+            let reef = crate::reef_canary::verify_executable(find_executable("reef"))?;
+            if percent > 0 {
+                crate::reef_canary::verify_scheduler(&reef)?;
+            }
+            Ok::<_, String>((reef, percent))
         })
         .transpose()?;
     #[cfg(not(unix))]

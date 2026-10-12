@@ -1156,7 +1156,7 @@
             onchange={(event) =>
               send({
                 type: 'reef-canary-percent',
-                value: event.currentTarget.checked ? 10 : null,
+                value: event.currentTarget.checked ? 0 : null,
               })}
           />
           Measure new agent processes with Reef
@@ -1175,17 +1175,20 @@
               if (Number.isInteger(value) && value >= 0 && value <= 100)
                 send({ type: 'reef-canary-percent', value });
               else {
-                event.currentTarget.value = String(snapshot?.reefCanaryPercent ?? 10);
+                event.currentTarget.value = String(snapshot?.reefCanaryPercent ?? 0);
                 requestError = 'Enter a Reef canary percentage from 0 to 100.';
               }
             }}
           />
         {/if}
         <p>
-          Off by default. 0% measures a control baseline; higher values admit that share of eligible
-          build, test, and lint commands through Reef's background scheduler. Changes affect only
-          new agent processes. This is host-only best effort, not hard containment. On macOS or
-          Linux, new agents fail clearly if Reef or its adapter support is unavailable.
+          Off by default. Enabling starts at 0%, which measures a control baseline. Set a higher
+          percentage explicitly to admit that share of eligible build, test, and lint commands
+          through Reef's background scheduler. Under sustained machine pressure, treated commands
+          can wait and then fail at Reef's admission deadline. Changes affect only new agent
+          processes. This is host-only best effort, not hard containment. On macOS or Linux, new
+          agents fail clearly if Reef or its adapter support is unavailable. Nonzero treatment also
+          requires a running <code>reef serve</code> scheduler.
         </p>
       </section>
       <section class="settings-card">

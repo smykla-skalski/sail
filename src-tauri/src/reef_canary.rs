@@ -1,8 +1,12 @@
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::process::Command;
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::time::Duration;
 use tauri::AppHandle;
+#[cfg(unix)]
+use wait_timeout::ChildExt;
 
 const SETTING: &str = "sai-reef-canary-percent";
 
@@ -34,6 +38,42 @@ pub(crate) fn verify_executable(reef: Option<PathBuf>) -> Result<PathBuf, String
         return Err("Upgrade Reef to a version with ACP adapter --exec support.".into());
     }
     Ok(reef)
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_scheduler(reef: &Path) -> Result<(), String> {
+    if !probe_command(Command::new(reef).arg("queue"), Duration::from_secs(2))? {
+        return Err("Reef canary treatment requires a running `reef serve` scheduler.".into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn probe_command(command: &mut Command, timeout: Duration) -> Result<bool, String> {
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Could not check the Reef scheduler: {error}"))?;
+    match child.wait_timeout(timeout) {
+        Ok(Some(status)) => Ok(status.success()),
+        Ok(None) => {
+            child
+                .kill()
+                .map_err(|error| format!("Could not stop the stalled Reef check: {error}"))?;
+            child
+                .wait()
+                .map_err(|error| format!("Could not reap the stalled Reef check: {error}"))?;
+            Err("Reef scheduler health check timed out; agent was not started.".into())
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!(
+                "Could not wait for the Reef scheduler check: {error}"
+            ))
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -133,5 +173,30 @@ mod tests {
             (OsStr::new("CODEX_PATH"), Some(OsStr::new("/private/codex")))
         );
         assert_eq!(environment[1], (OsStr::new("OPENCODE_CONFIG_DIR"), None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_treatment_requires_a_healthy_scheduler() {
+        use std::path::Path;
+
+        assert!(super::verify_scheduler(Path::new("/usr/bin/true")).is_ok());
+        assert!(super::verify_scheduler(Path::new("/usr/bin/false"))
+            .unwrap_err()
+            .contains("running `reef serve`"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_scheduler_probe_has_a_deadline() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        assert!(super::probe_command(
+            Command::new("/bin/sleep").arg("2"),
+            Duration::from_millis(10)
+        )
+        .unwrap_err()
+        .contains("timed out"));
     }
 }
