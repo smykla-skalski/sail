@@ -1786,13 +1786,14 @@ mod tests {
     fn windows_terminal_job_stops_descendant_after_direct_child_exits() {
         const HELPER: &str = "SAIL_WINDOWS_TERMINAL_JOB_DESCENDANT_HELPER";
         if std::env::var_os(HELPER).is_some() {
-            Command::new("ping.exe")
+            let mut descendant = Command::new("ping.exe")
                 .args(["-n", "60", "127.0.0.1"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("start descendant inside terminal job");
+            std::thread::spawn(move || descendant.wait().expect("reap terminal descendant"));
             return;
         }
 

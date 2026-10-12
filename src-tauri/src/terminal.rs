@@ -373,13 +373,14 @@ mod tests {
 
         const HELPER: &str = "SAIL_WINDOWS_PTY_DESCENDANT_HELPER";
         if std::env::var_os(HELPER).is_some() {
-            std::process::Command::new("ping.exe")
+            let mut descendant = std::process::Command::new("ping.exe")
                 .args(["-n", "60", "127.0.0.1"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .expect("start descendant inside PTY job");
+            std::thread::spawn(move || descendant.wait().expect("reap PTY descendant"));
             return;
         }
 
