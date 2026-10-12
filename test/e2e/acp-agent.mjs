@@ -326,13 +326,17 @@ for await (const line of createInterface({ input: process.stdin })) {
       message.params.cwd.includes('sail-attention-') &&
       !delayedSessionDirectories.has(message.params.cwd);
     if (delayFirstAttentionSession) delayedSessionDirectories.add(message.params.cwd);
+    const delayWorktreeDeleteSession = message.params.cwd.includes('sail-force-delete-');
+    if (delayWorktreeDeleteSession) {
+      writeFileSync(join(message.params.cwd, '.sail-e2e-session-starting'), 'ready');
+    }
     setTimeout(
       () =>
         send({
           id: message.id,
           result: { sessionId, configOptions: configOptions(sessionId), availableCommands },
         }),
-      delayFirstAttentionSession ? 3000 : 1000,
+      delayWorktreeDeleteSession ? 10_000 : delayFirstAttentionSession ? 3000 : 1000,
     );
   } else if (message.method === 'session/list') {
     const pageSize = 2;

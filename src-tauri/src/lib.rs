@@ -2072,34 +2072,40 @@ async fn delete_worktree(
             if stop_agents == Some(true) {
                 fence.stop_sessions_in(&app, &agents, &directory)?;
             }
-            fence.cleanup(&agents, &directory, native_generation, || {
-                terminal_manager.stop_worktree(&directory)?;
-                terminals.stop_worktree(&directory)?;
-                agents.stop_worktree(&directory)?;
-                remove_worktree_then_private_data_many(&cache_directory, &managed_data, || {
-                    let result = if archive_ignored == Some(true) {
-                        archive_ignored_and_remove(
-                            checked,
-                            worktree,
-                            expected_revision,
-                            expected_branch,
-                        )
-                    } else {
-                        remove_worktree(
-                            checked,
-                            worktree,
-                            force,
-                            expected_revision.as_deref(),
-                            expected_branch.as_deref(),
-                        )?;
-                        Ok(None)
-                    };
-                    if result.is_ok() {
-                        removed_from_git = true;
-                    }
-                    result
-                })
-            })
+            fence.cleanup(
+                &agents,
+                &directory,
+                native_generation,
+                stop_agents == Some(true),
+                || {
+                    terminal_manager.stop_worktree(&directory)?;
+                    terminals.stop_worktree(&directory)?;
+                    agents.stop_worktree(&directory)?;
+                    remove_worktree_then_private_data_many(&cache_directory, &managed_data, || {
+                        let result = if archive_ignored == Some(true) {
+                            archive_ignored_and_remove(
+                                checked,
+                                worktree,
+                                expected_revision,
+                                expected_branch,
+                            )
+                        } else {
+                            remove_worktree(
+                                checked,
+                                worktree,
+                                force,
+                                expected_revision.as_deref(),
+                                expected_branch.as_deref(),
+                            )?;
+                            Ok(None)
+                        };
+                        if result.is_ok() {
+                            removed_from_git = true;
+                        }
+                        result
+                    })
+                },
+            )
         })();
         if result.is_err() && !removed_from_git {
             terminal_manager.allow_worktree_terminals(&directory);

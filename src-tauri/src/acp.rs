@@ -361,9 +361,10 @@ impl AgentWorktreeFence {
         agents: &AgentManager,
         directory: &Path,
         expected_generation: Option<u64>,
+        stop_agents: bool,
         cleanup: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let state = self.0.lock().map_err(|error| error.to_string())?;
+        let mut state = self.0.lock().map_err(|error| error.to_string())?;
         let generation = state
             .generations
             .get(directory)
@@ -372,17 +373,18 @@ impl AgentWorktreeFence {
         if expected_generation.is_some_and(|expected| expected != generation) {
             return Err("Task-owned subagents changed before worktree cleanup.".into());
         }
-        if state.starting_sessions.iter().any(|(starting, count)| {
-            *count > 0 && crate::acp_terminal::worktree_contains(directory, starting)
-        }) || state
-            .guarded_sessions
-            .values()
-            .any(|guard| crate::acp_terminal::worktree_contains(directory, &guard.directory))
+        if !stop_agents
+            && (state.starting_sessions.iter().any(|(starting, count)| {
+                *count > 0 && crate::acp_terminal::worktree_contains(directory, starting)
+            }) || state
+                .guarded_sessions
+                .values()
+                .any(|guard| crate::acp_terminal::worktree_contains(directory, &guard.directory)))
         {
             return Err("An agent session is starting in this worktree.".into());
         }
         let active = agents.active_sessions_in(directory)?;
-        if !active.is_empty() {
+        if !stop_agents && !active.is_empty() {
             return Err(format!(
                 "Worktree has active agent sessions: {}.",
                 active
@@ -391,6 +393,32 @@ impl AgentWorktreeFence {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+        }
+        if stop_agents {
+            let directories = std::iter::once(directory.to_path_buf())
+                .chain(
+                    state
+                        .starting_sessions
+                        .keys()
+                        .filter(|starting| {
+                            crate::acp_terminal::worktree_contains(directory, starting)
+                        })
+                        .cloned(),
+                )
+                .chain(
+                    state
+                        .guarded_sessions
+                        .values()
+                        .filter(|guard| {
+                            crate::acp_terminal::worktree_contains(directory, &guard.directory)
+                        })
+                        .map(|guard| guard.directory.clone()),
+                )
+                .collect::<HashSet<_>>();
+            for directory in directories {
+                let generation = state.generations.entry(directory).or_default();
+                *generation = generation.saturating_add(1);
+            }
         }
         cleanup()
     }
@@ -3645,6 +3673,9 @@ fn connect_blocking(
     fence.begin_session(&worktree, None)?;
     let result = connect_blocking_inner(app.clone(), manager, agent, profile, &worktree);
     let finish = fence.finish_session(&worktree, None);
+    if finish.is_err() {
+        manager.stop_worktree(&worktree)?;
+    }
     match (result, finish) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), _) => Err(error),
@@ -6800,7 +6831,7 @@ mod native_subagent_fence_tests {
             .record_native_update(&directory)
             .expect("native generation should advance");
         let error = fence
-            .cleanup(&agents, &directory, Some(0), || {
+            .cleanup(&agents, &directory, Some(0), false, || {
                 cleaned = true;
                 Ok(())
             })
@@ -6878,7 +6909,7 @@ mod native_subagent_fence_tests {
         let mut cleaned = false;
 
         let error = AgentWorktreeFence::default()
-            .cleanup(&agents, &directory, None, || {
+            .cleanup(&agents, &directory, None, false, || {
                 cleaned = true;
                 Ok(())
             })
@@ -6900,7 +6931,7 @@ mod native_subagent_fence_tests {
         let (finished_tx, finished_rx) = mpsc::channel();
 
         let worker = fence
-            .cleanup(&agents, &directory, Some(0), || {
+            .cleanup(&agents, &directory, Some(0), false, || {
                 let queued_fence = fence.clone();
                 let queued_directory = directory.clone();
                 let worker = std::thread::spawn(move || {
@@ -6965,7 +6996,9 @@ mod native_subagent_fence_tests {
             .arm_session("codex", "replacement", &directory, 0)
             .expect("replacement should remain guarded");
         let cleanup_error = fence
-            .cleanup(&AgentManager::default(), &directory, Some(0), || Ok(()))
+            .cleanup(&AgentManager::default(), &directory, Some(0), false, || {
+                Ok(())
+            })
             .expect_err("guarded replacement must keep cleanup fenced");
         assert_eq!(
             cleanup_error,
@@ -6989,6 +7022,67 @@ mod native_subagent_fence_tests {
         );
         assert!(!dispatched);
         std::fs::remove_dir(&directory).expect("test worktree should be removable");
+    }
+
+    #[test]
+    fn confirmed_cleanup_removes_worktree_with_starting_and_guarded_sessions() {
+        let fence = AgentWorktreeFence::default();
+        let directory =
+            std::env::temp_dir().join(format!("sail-forced-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("test worktree should exist");
+        fence
+            .begin_session(&directory, None)
+            .expect("agent connection should start");
+        fence
+            .begin_session(&directory, Some(0))
+            .expect("replacement should start");
+        fence
+            .arm_session("codex", "replacement", &directory, 0)
+            .expect("replacement should remain guarded");
+
+        fence
+            .cleanup(&AgentManager::default(), &directory, None, true, || {
+                std::fs::remove_dir(&directory).map_err(|error| error.to_string())
+            })
+            .expect("confirmed cleanup should remove the worktree");
+
+        assert_eq!(
+            fence.finish_session(&directory, None).unwrap_err(),
+            "Repository directory no longer exists."
+        );
+        assert_eq!(
+            fence
+                .dispatch_session("codex", &directory, "replacement", || Ok(()))
+                .unwrap_err(),
+            "Task-owned subagents changed before replacement prompt dispatch."
+        );
+    }
+
+    #[test]
+    fn confirmed_cleanup_invalidates_nested_guarded_session() {
+        let fence = AgentWorktreeFence::default();
+        let outer =
+            std::env::temp_dir().join(format!("sail-nested-cleanup-{}", uuid::Uuid::new_v4()));
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested worktree should exist");
+        fence
+            .begin_session(&nested, Some(0))
+            .expect("nested replacement should start");
+        fence
+            .arm_session("codex", "replacement", &nested, 0)
+            .expect("nested replacement should remain guarded");
+
+        fence
+            .cleanup(&AgentManager::default(), &outer, None, true, || Ok(()))
+            .expect("confirmed outer cleanup should run");
+
+        assert_eq!(
+            fence
+                .dispatch_session("codex", &nested, "replacement", || Ok(()))
+                .unwrap_err(),
+            "Task-owned subagents changed before replacement prompt dispatch."
+        );
+        std::fs::remove_dir_all(outer).expect("test worktree should be removable");
     }
 }
 

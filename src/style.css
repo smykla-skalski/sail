@@ -2918,6 +2918,7 @@ time {
 .confirmation-dialog p {
   line-height: 1.5;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .confirmation-actions,
 .path-picker-actions,
