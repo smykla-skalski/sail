@@ -4267,6 +4267,23 @@ pub struct RestoreSessionCommand {
     restore_token: Option<String>,
 }
 
+fn with_restore_claim<T>(
+    runtime: &Connection,
+    session_id: &str,
+    token: Option<&str>,
+    request: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if let Some(token) = token {
+        runtime.extend_restore(session_id, token)?;
+    }
+    let result = request()?;
+    if let Some(token) = token {
+        // Give the webview its own bounded window to apply the replay.
+        runtime.extend_restore(session_id, token)?;
+    }
+    Ok(result)
+}
+
 async fn restore_session(
     manager: State<'_, AgentManager>,
     app: AppHandle,
@@ -4294,7 +4311,7 @@ async fn restore_session(
         )?;
         let runtime =
             register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
-        let result = (|| {
+        with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
             let (params, minted_token) = {
                 let mut configs = runtime
                     .session_configs
@@ -4357,14 +4374,7 @@ async fn restore_session(
             let result = result?;
             runtime.remember_session_ui(&session_id, &result)?;
             Ok(result)
-        })();
-        if result.is_ok() {
-            if let Some(token) = &restore_token {
-                // Give the webview its own bounded window to apply the replay.
-                runtime.extend_restore(&session_id, token)?;
-            }
-        }
-        result
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -5384,6 +5394,57 @@ mod session_config_tests {
         assert_eq!(live["configOptions"][0]["currentValue"], "second");
         assert_eq!(live["availableCommands"][0]["name"], "inspect");
         assert_eq!(live["liveTurn"], "new-turn");
+        runtime.child.lock().unwrap().kill().unwrap();
+        runtime.child.lock().unwrap().wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_restore_keeps_queued_prompt_out_of_replay() {
+        let runtime = test_runtime(
+            "claude",
+            CapabilityProfile::Build,
+            Path::new("/worktree"),
+            "session",
+        );
+        let token = runtime.begin_restore("session").unwrap()["restoreToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Compress the initial ten-second reservation so the request crosses its expiry.
+        runtime
+            .restores
+            .lock()
+            .unwrap()
+            .get_mut("session")
+            .unwrap()
+            .expires = Instant::now() + Duration::from_millis(25);
+        let waiting = Arc::clone(&runtime);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (dispatched_tx, dispatched_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let claims = waiting.restores.lock().unwrap();
+            started_tx.send(()).unwrap();
+            let _claims = waiting.wait_for_restore(claims, "session").unwrap();
+            dispatched_tx.send(()).unwrap();
+        });
+        with_restore_claim(&runtime, "session", Some(&token), || {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            std::thread::sleep(Duration::from_millis(75));
+            assert!(matches!(
+                dispatched_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            dispatched_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        runtime.release_restore("session", &token).unwrap();
+        dispatched_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
         runtime.child.lock().unwrap().kill().unwrap();
         runtime.child.lock().unwrap().wait().unwrap();
     }
