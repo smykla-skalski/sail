@@ -148,11 +148,15 @@ describe('close worktree shortcut', () => {
     });
   }
 
-  async function cleanPending(path: string) {
+  async function cleanPending(path: string, expectedSize?: number) {
     await $(`[data-pending-worktree="${path}"]`).$('button=Clean up this worktree…').click();
     await diagnose(`Pending cleanup dialog ${path}`, async () => {
       const dialog = $('dialog.confirmation-dialog[open]');
       await expect(dialog).toExist();
+      if (expectedSize !== undefined)
+        await expect(dialog).toHaveText(
+          expect.stringContaining(`Retained size: ${expectedSize} bytes`),
+        );
       await dialog.$('button=Remove this worktree').click();
     });
     await diagnose(`Pending checkout result ${path}`, () =>
@@ -240,7 +244,32 @@ describe('close worktree shortcut', () => {
     await expect($(`[data-pending-worktree="${second}"]`)).toHaveText(
       expect.stringContaining('Retained size:'),
     );
-    await cleanPending(second);
+    await browser.execute(
+      (repo, path) => {
+        const saved = localStorage.getItem('sai-project-catalog');
+        if (!saved) throw new Error('Missing catalog for stale-size fixture');
+        const catalog = JSON.parse(saved);
+        const row = catalog.worktrees[repo].find((item: { path: string }) => item.path === path);
+        if (!row?.pendingCleanup) throw new Error('Missing pending cleanup for stale-size fixture');
+        row.pendingCleanup.sizeBytes = 0;
+        localStorage.setItem('sai-project-catalog', JSON.stringify(catalog));
+      },
+      repository,
+      second,
+    );
+    await browser.refresh();
+    await expect($(`[data-pending-worktree="${second}"]`)).toBeDisplayed();
+    const [current] = await browser.tauri.execute(
+      async ({ core }, [repo, selected]) =>
+        core.invoke<{ sizeBytes: number | null }[]>('worktree_removal_preview', {
+          repository: repo,
+          paths: [selected],
+        }),
+      [repository, second],
+    );
+    if (current.sizeBytes === null || current.sizeBytes === 0)
+      throw new Error('The stale-size fixture did not differ from the current checkout');
+    await cleanPending(second, current.sizeBytes);
     await diagnose('Explicit cleanup', async () => {
       await browser.waitUntil(async () => !existsSync(second));
       await browser.waitUntil(async () => (await catalogPaths()).length === 1);
@@ -791,7 +820,9 @@ describe('close worktree shortcut', () => {
             return (
               (!existsSync(original) && !pending) ||
               !!pending?.storagePaths?.length ||
-              /(An agent session is starting|Private Git state)/i.test(pending?.reason ?? '')
+              /(An agent session is starting|Private Git state|unverifiable owner)/i.test(
+                pending?.reason ?? '',
+              )
             );
           },
           { timeout: 30000 },
@@ -805,7 +836,9 @@ describe('close worktree shortcut', () => {
         expect(existsSync(original)).toBe(false);
       } else if (await pendingCleanup(original)) {
         await expect($(`[data-pending-worktree="${original}"]`)).toHaveText(
-          expect.stringMatching(/An agent session is starting|Private Git state/i),
+          expect.stringMatching(
+            /An agent session is starting|Private Git state|unverifiable owner/i,
+          ),
         );
         expect(existsSync(original)).toBe(true);
         expect(git('worktree', 'list')).toContain(original);

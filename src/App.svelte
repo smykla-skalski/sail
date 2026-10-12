@@ -9342,24 +9342,63 @@
           'The removed worktree generation cannot be verified. Private storage remains intact.';
         return;
       }
+      let currentStorage: { cacheKey: string; path: string; sizeBytes: number | null }[];
+      try {
+        currentStorage = await invoke('selected_removed_worktree_storage', {
+          repository,
+          originalWorktree: recovery.originalPath,
+          expectedGeneration: pending[0].generation,
+        });
+      } catch (cause) {
+        error = `Cannot verify the retained private storage before confirmation: ${describe(cause)}`;
+        return;
+      }
+      const savedStorage = new Map(
+        recovery.storagePaths.map((path, index) => [
+          recovery.storageKeys?.[index] ?? path.split(/[/\\]/).at(-1),
+          path,
+        ]),
+      );
+      if (
+        currentStorage.length !== recovery.storagePaths.length ||
+        savedStorage.size !== recovery.storagePaths.length ||
+        currentStorage.some((item) => savedStorage.get(item.cacheKey) !== item.path)
+      ) {
+        error =
+          'The selected private storage locations changed. Recheck the pending entry before confirming cleanup.';
+        return;
+      }
+      const currentSize = currentStorage.every((item) => item.sizeBytes !== null)
+        ? currentStorage.reduce((total, item) => total + item.sizeBytes!, 0)
+        : null;
+      const verifiedRecovery = {
+        ...recovery,
+        storagePaths: recovery.storagePaths,
+        sizeBytes: currentSize,
+      };
+      if (currentSize !== recovery.sizeBytes)
+        saveProjectCatalog(
+          markWorktreeCleanupPending(projectCatalog, repository, selectedPath, verifiedRecovery),
+        );
       const confirmed = await confirmInApp(
         'Retry selected private storage cleanup',
-        `The Git checkout was removed. Confirm no process uses this private storage or writes to it until cleanup finishes? Sail verifies its owner and Git generation before deleting it. Git can delete files written after the final check.\n\nOriginal worktree: ${recovery.originalPath}\nRetained storage: ${recovery.storagePaths.join(', ')}\nRetained size: ${recovery.sizeBytes ?? 'unknown'} bytes\nPending reason: ${recovery.reason}`,
+        `The Git checkout was removed. Confirm no process uses this private storage or writes to it until cleanup finishes? Sail verifies its owner and Git generation before deleting it. Git can delete files written after the final check.\n\nOriginal worktree: ${verifiedRecovery.originalPath}\nRetained storage: ${verifiedRecovery.storagePaths.join(', ')}\nRetained size: ${verifiedRecovery.sizeBytes ?? 'unknown'} bytes\nPending reason: ${verifiedRecovery.reason}`,
         'Clean up selected storage',
         { destructive: true },
       );
       if (!confirmed) return;
-      let remainingStoragePaths = [...recovery.storagePaths];
-      let remainingStorageKeys = [...(recovery.storageKeys ?? [])];
+      let remainingStoragePaths = [...verifiedRecovery.storagePaths];
+      let remainingStorageKeys = [...(verifiedRecovery.storageKeys ?? [])];
       try {
-        await recovery.storagePaths.reduce(
+        await verifiedRecovery.storagePaths.reduce(
           (previous, storagePath, index) =>
             previous.then(async () => {
-              const cacheKey = recovery.storageKeys?.[index] ?? storagePath.split(/[/\\]/).at(-1);
+              const cacheKey =
+                verifiedRecovery.storageKeys?.[index] ?? storagePath.split(/[/\\]/).at(-1);
               if (!cacheKey) throw new Error('The selected private storage key is missing.');
               await invoke('retry_selected_removed_worktree_storage', {
                 repository,
-                originalWorktree: recovery.originalPath,
+                originalWorktree: verifiedRecovery.originalPath,
                 expectedGeneration: pending[0].generation,
                 cacheKey,
                 confirmedUnused: true,
@@ -9369,7 +9408,7 @@
               if (remainingStoragePaths.length) {
                 saveProjectCatalog(
                   markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
-                    ...recovery,
+                    ...verifiedRecovery,
                     storagePaths: remainingStoragePaths,
                     storageKeys: remainingStorageKeys,
                     sizeBytes: null,
@@ -9405,7 +9444,7 @@
         const reason = `Private storage remains pending: ${describe(cause)}`;
         saveProjectCatalog(
           markWorktreeCleanupPending(projectCatalog, repository, selectedPath, {
-            ...recovery,
+            ...verifiedRecovery,
             storagePaths: remainingStoragePaths,
             storageKeys: remainingStorageKeys,
             sizeBytes: null,
@@ -9477,7 +9516,7 @@
     }
     const confirmed = await confirmInApp(
       'Confirm unused worktrees',
-      `Confirm this pending worktree is unused, with no process writing to it until cleanup finishes? Sail rechecks its identity and files immediately before removal. Detected changes stop cleanup, and its branch remains. Git can delete files written after the final check, including ignored files.\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${target.pendingCleanup!.sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
+      `Confirm this pending worktree is unused, with no process writing to it until cleanup finishes? Sail rechecks its identity and files immediately before removal. Detected changes stop cleanup, and its branch remains. Git can delete files written after the final check, including ignored files.\n\nBranch: ${target.branch}\nOriginal: ${target.pendingCleanup!.originalPath}\nCurrent/recovery: ${target.path}\nRetained size: ${preview[0].sizeBytes ?? 'unknown'} bytes\nPending reason: ${target.pendingCleanup!.reason}`,
       'Remove this worktree',
       { destructive: true },
     );

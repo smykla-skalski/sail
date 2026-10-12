@@ -1695,6 +1695,31 @@ pub(crate) fn data_directory_for_root(cache_directory: &Path, root: &Path) -> Op
     match_path
 }
 
+pub(crate) fn data_directory_for_removal(
+    cache_directory: &Path,
+    root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let identity = resolve_identity(root)?;
+    let directory = identity_data_directory(cache_directory, &identity)?;
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect selected private storage at {}: {error}",
+                directory.display()
+            ));
+        }
+    };
+    if !metadata.is_dir() || read_owner(&directory).ok().as_ref() != Some(&identity) {
+        return Err(format!(
+            "Selected private storage at {} has an unverifiable owner. Its files were kept.",
+            directory.display()
+        ));
+    }
+    Ok(Some(directory))
+}
+
 pub(crate) fn is_managed_directory(path: &Path) -> bool {
     read_owner(path).is_ok()
 }

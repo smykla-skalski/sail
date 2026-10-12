@@ -2357,9 +2357,8 @@ async fn delete_worktree(
             .app_cache_dir()
             .map_err(|error| error.to_string())?;
         let managed_terminal_data =
-            worktree_storage::data_directory_for_root(&cache_directory, &directory).unwrap_or_else(
-                || acp_terminal::worktree_data_directory(&cache_directory, &directory),
-            );
+            worktree_storage::data_directory_for_removal(&cache_directory, &directory)?
+                .unwrap_or_else(|| acp_terminal::worktree_data_directory(&cache_directory, &directory));
         let terminals = app.state::<acp_terminal::AcpTerminalManager>().inner();
         let terminal_manager = app.state::<terminal::TerminalManager>();
         let acp_roots = match terminals.begin_worktree_removal(&directory) {
@@ -2780,9 +2779,27 @@ fn persist_worktree_data_manifest(
         }
     }
     if !worktree_storage::is_managed_directory(outer_data) {
-        return Ok(Vec::new());
+        // Legacy terminal caches without a Git identity remain outside this
+        // generation-scoped cleanup. A current Git worktree with existing but
+        // unverifiable storage must stop before its checkout is removed.
+        if worktree_storage::generation(&outer_worktree).is_err() {
+            return Ok(Vec::new());
+        }
+        let current =
+            worktree_storage::data_directory_for_removal(cache_directory, &outer_worktree)?;
+        if current.is_none()
+            && outer_data
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "Selected private storage at {} has an unverifiable owner. Its files were kept.",
+            outer_data.display()
+        ));
     }
-    if worktree_storage::data_directory_for_root(cache_directory, &outer_worktree).as_deref()
+    if worktree_storage::data_directory_for_removal(cache_directory, &outer_worktree)?.as_deref()
         != Some(outer_data)
     {
         return Err("Selected worktree storage generation changed before cleanup.".into());
@@ -4513,6 +4530,62 @@ mod tests {
 
         assert!(!new_data.exists());
         assert!(old_data.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_current_storage_owner_refuses_worktree_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-unreadable-storage-owner-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = root.join("repository");
+        let worktree = root.join("worktree");
+        let cache = root.join("cache");
+        fs::create_dir_all(&repository).unwrap();
+        let repository_arg = repository.to_str().unwrap();
+        let worktree_arg = worktree.to_str().unwrap();
+        git(repository_arg, &["init", "-q"]);
+        git(repository_arg, &["config", "user.name", "Sail Test"]);
+        git(
+            repository_arg,
+            &["config", "user.email", "sail@example.test"],
+        );
+        git(
+            repository_arg,
+            &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+        );
+        git(
+            repository_arg,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                worktree_arg,
+                "HEAD",
+            ],
+        );
+        let (data, lease) = worktree_storage::register(&cache, &worktree).unwrap();
+        lease.release_clean().unwrap();
+        let retained = data.join("keep.txt");
+        fs::write(&retained, "retained private data").unwrap();
+        fs::write(data.join("worktree-owner-v2"), "unreadable owner").unwrap();
+
+        let error = worktree_storage::data_directory_for_removal(&cache, &worktree).unwrap_err();
+        assert!(error.contains("unverifiable owner"), "{error}");
+        let error = persist_worktree_data_manifest(&cache, &data, &worktree, &[]).unwrap_err();
+        assert!(error.contains("unverifiable owner"), "{error}");
+        assert!(worktree.exists());
+        assert_eq!(
+            fs::read_to_string(&retained).unwrap(),
+            "retained private data"
+        );
+
+        git(
+            repository_arg,
+            &["worktree", "remove", "--force", worktree_arg],
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
