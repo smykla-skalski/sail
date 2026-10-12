@@ -388,12 +388,12 @@ mod tests {
         let output_tail = Arc::new(Mutex::new(VecDeque::new()));
         let output_drain =
             drain_conpty_output(pair.master.as_ref(), Some(Arc::clone(&output_tail)));
-        let mut command = CommandBuilder::new("powershell.exe");
+        let mut command = CommandBuilder::new("cmd.exe");
         command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Start-Process -FilePath 'ping.exe' -ArgumentList @('-n','60','127.0.0.1'); exit 0",
+            "/D",
+            "/Q",
+            "/C",
+            "start \"\" /B ping.exe -n 60 127.0.0.1 >NUL",
         ]);
         command.set_job_handle(job.raw_handle());
         let mut child = pair
@@ -414,7 +414,7 @@ mod tests {
                 let output =
                     String::from_utf8_lossy(&tail.iter().copied().collect::<Vec<_>>()).into_owned();
                 panic!(
-                    "PowerShell parent did not exit: pid={:?}, elapsed={:?}, job active processes={:?}, ConPTY output tail={output:?}",
+                    "cmd.exe parent did not exit: pid={:?}, elapsed={:?}, job active processes={:?}, ConPTY output tail={output:?}",
                     child.process_id(),
                     started.elapsed(),
                     job.active_processes(),

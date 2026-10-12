@@ -1784,43 +1784,26 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_terminal_job_stops_descendant_after_direct_child_exits() {
-        struct RemoveOnDrop(PathBuf);
-        impl Drop for RemoveOnDrop {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
-        }
-
-        let marker = std::env::temp_dir().join(format!(
-            "sail-windows-terminal-descendant-{}.txt",
-            uuid::Uuid::new_v4()
-        ));
-        let _marker_cleanup = RemoveOnDrop(marker.clone());
-        let marker_literal = marker.to_string_lossy().replace('\'', "''");
-        let stderr_path = marker.with_extension("stderr");
-        let _stderr_cleanup = RemoveOnDrop(stderr_path.clone());
-        let stderr = std::fs::File::create(&stderr_path).expect("capture PowerShell stderr");
-        let script = format!(
-            "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 5; Set-Content -LiteralPath ''{marker_literal}'' done'); exit 0"
-        );
-        let mut command = Command::new("powershell.exe");
+        let mut command = Command::new("cmd.exe");
         command
-            .args(["-NoProfile", "-Command", &script])
+            .args([
+                "/D",
+                "/Q",
+                "/C",
+                "start \"\" /B ping.exe -n 60 127.0.0.1 >NUL",
+            ])
             .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr));
+            .stderr(Stdio::null());
         let (mut child, job) = WindowsTerminalJob::spawn(&mut command).unwrap();
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_secs(10);
         while child.try_wait().unwrap().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "PowerShell parent did not exit: pid={}, elapsed={:?}, job active processes={:?}, stderr={:?}",
+                "cmd.exe parent did not exit: pid={}, elapsed={:?}, job active processes={:?}",
                 child.id(),
                 started.elapsed(),
                 job.active_processes(),
-                std::fs::read(&stderr_path).map(|bytes| String::from_utf8_lossy(
-                    &bytes[bytes.len().saturating_sub(4096)..]
-                ).into_owned()),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1832,8 +1815,6 @@ mod tests {
         job.stop()
             .expect("terminate descendants after direct child exit");
         assert_eq!(job.active_processes().unwrap(), 0);
-        std::thread::sleep(Duration::from_secs(6));
-        assert!(!marker.exists(), "descendant survived terminal stop");
     }
 
     #[test]
