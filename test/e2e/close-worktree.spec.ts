@@ -44,6 +44,7 @@ describe('close worktree shortcut', () => {
       (repo, selected, firstPath, secondPath) => {
         sessionStorage.removeItem('sai-e2e-delete-worktree');
         localStorage.setItem('sai-directory', selected);
+        localStorage.setItem(`sai-main-pane-empty:${selected}`, 'true');
         localStorage.setItem(
           'sai-project-catalog',
           JSON.stringify({
@@ -65,6 +66,17 @@ describe('close worktree shortcut', () => {
     );
     await browser.refresh();
     await diagnose('Workspace load', () => expect(topbarMenuTrigger('New agent')).toBeDisplayed());
+    await diagnose('Empty main pane', () =>
+      expect($('[data-pane-id="main"] [data-pane-picker]')).toBeDisplayed(),
+    );
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
+          return typeof ready === 'function' && ready();
+        }),
+      { timeout: 20000, timeoutMsg: 'Sidebar OpenCode inventory did not settle' },
+    );
   }
 
   const catalogPaths = async () => {
@@ -125,26 +137,25 @@ describe('close worktree shortcut', () => {
   });
 
   it('deletes only the selected worktree once when pressed repeatedly', async () => {
-    await select(first);
+    await select(second);
     await browser.execute(() => {
       sessionStorage.setItem('sai-e2e-delete-worktree', 'Yes');
-      localStorage.setItem(`sai-main-pane-empty:${localStorage.getItem('sai-directory')}`, 'true');
       for (let press = 0; press < 2; press++)
         window.dispatchEvent(
           new KeyboardEvent('keydown', { key: 'w', metaKey: true, shiftKey: true }),
         );
     });
     await diagnose('Repeated delete', async () => {
-      await browser.waitUntil(async () => !existsSync(first));
+      await browser.waitUntil(async () => !existsSync(second));
       await browser.waitUntil(async () => (await catalogPaths()).length === 1);
     });
-    expect(await catalogPaths()).toEqual([second]);
-    expect(existsSync(second)).toBe(true);
-    expect(git('worktree', 'list')).not.toContain(first);
+    expect(await catalogPaths()).toEqual([first]);
+    expect(existsSync(first)).toBe(true);
+    expect(git('worktree', 'list')).not.toContain(second);
     await expect($('.app-shell [role="alert"]')).not.toExist();
     expect(await browser.execute(() => localStorage.getItem('sai-directory'))).toBe(repository);
     expect(
-      await browser.execute((path) => localStorage.getItem(`sai-main-pane-empty:${path}`), first),
+      await browser.execute((path) => localStorage.getItem(`sai-main-pane-empty:${path}`), second),
     ).toBeNull();
     await expect($('dialog[open]')).not.toExist();
   });

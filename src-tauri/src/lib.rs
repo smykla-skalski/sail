@@ -204,6 +204,7 @@ fn configure_pane_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 mod acp;
 mod acp_terminal;
 mod attention;
+pub mod background_priority;
 mod browser;
 pub mod browser_agent;
 #[cfg(unix)]
@@ -212,6 +213,8 @@ pub mod context;
 pub mod context_output_store;
 mod dev_servers;
 mod diagnostics;
+#[cfg(feature = "e2e")]
+mod e2e_config;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
@@ -222,7 +225,9 @@ mod memory_import;
 mod memory_install;
 mod memory_provider;
 mod opencode_config;
+mod owned_processes;
 mod post_turn_checks;
+mod project_knowledge;
 mod settings;
 mod shell_command;
 mod ship_actions;
@@ -2957,6 +2962,8 @@ pub fn run() {
             if let Ok(cache_directory) = _app.path().app_cache_dir() {
                 worktree_storage::reconcile(&cache_directory);
             }
+            let process_directory = _app.path().app_config_dir()?.join("owned-processes");
+            owned_processes::init(process_directory).map_err(std::io::Error::other)?;
             browser_agent::start_bridge(_app.handle())?;
             if let Err(error) = hook_activity::start_bridge(_app.handle()) {
                 eprintln!("Sail hook receiver unavailable: {error}");
@@ -2974,11 +2981,13 @@ pub fn run() {
         .manage(shell_command::ShellRuns::default())
         .manage(browser_agent::BrowserManager::default())
         .manage(browser::CaptureStore::default())
+        .manage(project_knowledge::PendingProposal::default())
         .manage(hook_activity::HookActivityManager::default())
         .invoke_handler(tauri::generate_handler![
             diagnostics::diagnostic_event,
             worktree_storage_cleanup_status,
             retry_worktree_storage_cleanup,
+            settings::reset_test_settings,
             settings::load_settings,
             settings::migrate_settings,
             settings::save_setting,
@@ -2993,7 +3002,11 @@ pub fn run() {
             memory::memory_remember,
             memory::memory_inspect,
             memory::memory_forget,
+            memory::memory_set_expiry,
             memory::memory_rate,
+            project_knowledge::preview_project_knowledge,
+            project_knowledge::accept_project_knowledge,
+            project_knowledge::reject_project_knowledge,
             memory_import::preview_memory_import,
             memory_import::import_agent_memories,
             memory_provider::memory_provider_status,
@@ -3080,6 +3093,7 @@ pub fn run() {
             acp::acp_agents,
             acp::acp_connect,
             acp::acp_new_session,
+            acp::acp_reset_test_runtimes,
             acp::acp_forget_session,
             acp::acp_release_session_fence,
             acp::acp_load_session,
@@ -3159,6 +3173,12 @@ pub fn run() {
                 }
                 if let Some(terminals) = app.try_state::<terminal::TerminalManager>() {
                     terminals.shutdown();
+                }
+                if let Err(error) = owned_processes::shutdown() {
+                    diagnostics::record(
+                        "owned_process_cleanup_failed",
+                        serde_json::json!({"error": error}),
+                    );
                 }
                 if let Some(manager) = app.try_state::<hook_activity::HookActivityManager>() {
                     hook_activity::cleanup(&manager);

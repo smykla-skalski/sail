@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(not(feature = "e2e"))]
 use tauri::Manager;
 use uuid::Uuid;
 
@@ -52,6 +53,8 @@ pub struct MemoryRecord {
     pub provenance: MemoryProvenance,
     pub rating: Option<MemoryRating>,
     pub forgotten_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -61,6 +64,7 @@ pub struct MemoryInput {
     pub kind: Option<MemoryKind>,
     pub tags: Option<Vec<String>>,
     pub provenance: Option<MemoryProvenance>,
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -111,13 +115,17 @@ pub fn project_key_for(directory: &Path) -> Result<String, String> {
 
 fn memory_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     #[cfg(feature = "e2e")]
-    if let Some(root) = std::env::var_os("SAIL_E2E_CONFIG_DIR") {
-        return Ok(PathBuf::from(root).join("memory"));
+    {
+        let _ = app;
+        Ok(crate::e2e_config::root()?.join("memory"))
     }
-    app.path()
-        .app_local_data_dir()
-        .map(|path| path.join("memory"))
-        .map_err(|error| format!("Cannot locate shared memory storage: {error}"))
+    #[cfg(not(feature = "e2e"))]
+    {
+        app.path()
+            .app_local_data_dir()
+            .map(|path| path.join("memory"))
+            .map_err(|error| format!("Cannot locate shared memory storage: {error}"))
+    }
 }
 
 pub fn standalone_paths(app: &tauri::AppHandle) -> Result<(PathBuf, PathBuf), String> {
@@ -276,7 +284,25 @@ fn validate(mut input: MemoryInput) -> Result<MemoryInput, String> {
     }
     tags.sort();
     tags.dedup();
+    if input.expires_at.is_some() && input.kind != Some(MemoryKind::Handoff) {
+        return Err("Only handoff memories can expire.".into());
+    }
+    validate_expiry(input.expires_at)?;
     Ok(input)
+}
+
+fn validate_expiry(expires_at: Option<u64>) -> Result<(), String> {
+    if expires_at.is_some_and(|timestamp| timestamp > 253_402_300_799_999) {
+        return Err("Handoff expiry must be before year 10000.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn is_expired(memory: &MemoryRecord, timestamp: u64) -> bool {
+    memory.kind == MemoryKind::Handoff
+        && memory
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= timestamp)
 }
 
 pub(crate) fn list_at(
@@ -327,6 +353,7 @@ pub(crate) fn remember_at(
         provenance: input.provenance.unwrap_or_default(),
         rating: None,
         forgotten_at: None,
+        expires_at: input.expires_at,
     };
     store.memories.push(memory.clone());
     write_store(&paths, &store)?;
@@ -371,6 +398,22 @@ pub(crate) fn forget_at(root: &Path, key: &str, id: &str) -> Result<MemoryRecord
     })
 }
 
+pub(crate) fn set_expiry_at(
+    root: &Path,
+    key: &str,
+    id: &str,
+    expires_at: Option<u64>,
+) -> Result<MemoryRecord, String> {
+    validate_expiry(expires_at)?;
+    mutate_at(root, key, id, |memory| {
+        if memory.kind != MemoryKind::Handoff {
+            return Err("Only handoff memories can expire.".into());
+        }
+        memory.expires_at = expires_at;
+        Ok(())
+    })
+}
+
 fn rate_at(root: &Path, key: &str, id: &str, rating: i8) -> Result<MemoryRecord, String> {
     if !(-1..=1).contains(&rating) {
         return Err("Memory rating must be -1, 0, or 1.".into());
@@ -395,8 +438,10 @@ pub(crate) fn search_at(
     }
     let query = query.trim().to_lowercase();
     let terms: Vec<_> = query.split_whitespace().collect();
+    let timestamp = now();
     let mut results: Vec<_> = list_at(root, key, false)?
         .into_iter()
+        .filter(|memory| !is_expired(memory, timestamp))
         .filter_map(|memory| {
             let haystack = format!(
                 "{} {} {:?}",
@@ -488,6 +533,7 @@ pub(crate) fn remember_unique_batch(
             provenance: input.provenance.unwrap_or_default(),
             rating: None,
             forgotten_at: None,
+            expires_at: input.expires_at,
         };
         store.memories.push(memory.clone());
         imported.push(memory);
@@ -516,6 +562,18 @@ pub fn inspect(app: &tauri::AppHandle, directory: &str, id: &str) -> Result<Memo
 pub fn forget(app: &tauri::AppHandle, directory: &str, id: &str) -> Result<MemoryRecord, String> {
     let (root, key) = context(app, directory)?;
     let memory = forget_at(&root, &key, id)?;
+    crate::memory_provider::sync_later(app.clone(), directory.to_string());
+    Ok(memory)
+}
+
+pub fn set_expiry(
+    app: &tauri::AppHandle,
+    directory: &str,
+    id: &str,
+    expires_at: Option<u64>,
+) -> Result<MemoryRecord, String> {
+    let (root, key) = context(app, directory)?;
+    let memory = set_expiry_at(&root, &key, id, expires_at)?;
     crate::memory_provider::sync_later(app.clone(), directory.to_string());
     Ok(memory)
 }
@@ -616,6 +674,17 @@ pub fn memory_forget(
 ) -> Result<MemoryRecord, String> {
     ensure_enabled(&app, &directory)?;
     forget(&app, &directory, &id)
+}
+
+#[tauri::command]
+pub fn memory_set_expiry(
+    app: tauri::AppHandle,
+    directory: String,
+    id: String,
+    expires_at: Option<u64>,
+) -> Result<MemoryRecord, String> {
+    ensure_enabled(&app, &directory)?;
+    set_expiry(&app, &directory, &id, expires_at)
 }
 
 #[tauri::command]
@@ -738,6 +807,23 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
             );
             serde_json::to_value(memory).map_err(|error| error.to_string())
         }
+        "memory_set_expiry" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("id is required")?;
+            let expires_at = match arguments.get("expiresAt") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .ok_or("expiresAt must be a nonnegative integer")?,
+                ),
+            };
+            let memory = set_expiry_at(&root, &key, id, expires_at)?;
+            crate::memory_provider::sync_standalone_later(root, settings, key);
+            serde_json::to_value(memory).map_err(|error| error.to_string())
+        }
         "memory_rate" => {
             let id = arguments
                 .get("id")
@@ -758,10 +844,11 @@ fn standalone_call(name: &str, arguments: Value, session: Option<&str>) -> Resul
 
 fn memory_tools() -> Value {
     json!({"tools":[
-        {"name":"memory_remember","description":"Store one concise durable project fact. Never store raw transcripts, complete tool output, secrets, or temporary progress.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"content":{"type":"string","minLength":1,"maxLength":4000},"kind":{"type":"string","enum":["decision","constraint","discovery","preference","handoff","other"]},"tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16}},"required":["content"]}},
+        {"name":"memory_remember","description":"Store one concise durable project fact. Set expiresAt in Unix milliseconds only for a handoff. Never store raw transcripts, complete tool output, secrets, or temporary progress.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"content":{"type":"string","minLength":1,"maxLength":4000},"kind":{"type":"string","enum":["decision","constraint","discovery","preference","handoff","other"]},"tags":{"type":"array","items":{"type":"string","minLength":1,"maxLength":64},"maxItems":16},"expiresAt":{"type":"integer","minimum":0}},"required":["content"]}},
         {"name":"memory_search","description":"Search this Git project's durable memories. External agents use this server; inside Sail, prefer sail-browser, which shares the same store.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"query":{"type":"string","maxLength":1000},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["query"]}},
         {"name":"memory_inspect","description":"Inspect one project memory by ID.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"}},"required":["id"]}},
         {"name":"memory_forget","description":"Forget one project memory by ID and remove its stored content.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"}},"required":["id"]}},
+        {"name":"memory_set_expiry","description":"Set or clear the expiry of a handoff memory. Omit expiresAt to keep it indefinitely.","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"},"expiresAt":{"type":"integer","minimum":0}},"required":["id"]}},
         {"name":"memory_rate","description":"Rate one project memory as unhelpful (-1), unrated (0), or helpful (1).","inputSchema":{"type":"object","additionalProperties":false,"properties":{"id":{"type":"string","format":"uuid"},"rating":{"type":"integer","enum":[-1,0,1]}},"required":["id","rating"]}}
     ]})
 }
@@ -847,6 +934,7 @@ mod tests {
                 session_id: Some("session".into()),
                 source: None,
             }),
+            expires_at: None,
         }
     }
 
@@ -943,6 +1031,67 @@ mod tests {
         assert!(inspect_at(&root, "project", &saved.id).is_err());
         assert!(list_at(&root, "project", false).unwrap().is_empty());
         assert_eq!(list_at(&root, "project", true).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expired_handoff_is_hidden_from_search_but_can_be_inspected_and_forgotten() {
+        let root = temporary("expiry");
+        let mut expiring = input("Continue the release task");
+        expiring.kind = Some(MemoryKind::Handoff);
+        expiring.expires_at = Some(now().saturating_sub(1));
+        let saved = remember_at(&root, "project", expiring).unwrap();
+        let lasting = remember_at(&root, "project", input("Continue with SQLite")).unwrap();
+
+        assert_eq!(
+            search_at(&root, "project", "continue", None).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            search_at(&root, "project", "continue", None).unwrap()[0]
+                .memory
+                .id,
+            lasting.id
+        );
+        assert_eq!(list_at(&root, "project", false).unwrap().len(), 2);
+        assert_eq!(
+            inspect_at(&root, "project", &saved.id).unwrap().expires_at,
+            saved.expires_at
+        );
+        assert!(forget_at(&root, "project", &saved.id)
+            .unwrap()
+            .content
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expiry_is_only_allowed_for_handoffs() {
+        let root = temporary("expiry-kind");
+        let mut invalid = input("Use SQLite");
+        invalid.expires_at = Some(now());
+        assert!(remember_at(&root, "project", invalid)
+            .unwrap_err()
+            .contains("Only handoff"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_handoff_expiry_can_be_set_and_cleared() {
+        let root = temporary("expiry-edit");
+        let mut handoff = input("Resume release");
+        handoff.kind = Some(MemoryKind::Handoff);
+        let saved = remember_at(&root, "project", handoff).unwrap();
+
+        set_expiry_at(&root, "project", &saved.id, Some(now().saturating_sub(1))).unwrap();
+        assert!(search_at(&root, "project", "release", None)
+            .unwrap()
+            .is_empty());
+        set_expiry_at(&root, "project", &saved.id, None).unwrap();
+        assert_eq!(
+            search_at(&root, "project", "release", None).unwrap().len(),
+            1
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

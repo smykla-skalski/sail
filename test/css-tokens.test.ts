@@ -94,16 +94,21 @@ function styleChunks(source: Source): Chunk[] {
       css: `${css.replaceAll(/\{[^{}]*\}/g, 'dynamic-value')};`,
       line: lineAt(source.text, index),
     });
-  for (const match of source.text.matchAll(/\sstyle=(?:"([^"]*)"|\{(['"`])([\s\S]*?)\2\})/g))
-    markup(inlineExpressions(match[1] ?? match[3]), match.index);
+  for (const match of source.text.matchAll(
+    /\sstyle\s*=\s*(?:"([^"]*)"|'([^']*)'|\{(['"`])([\s\S]*?)\3\})/gi,
+  ))
+    markup(inlineExpressions(match[1] ?? match[2] ?? match[4]), match.index);
   for (const match of source.text.matchAll(
     /\sstyle:([\w-]+)(?:\|important)?=(?:"([^"]*)"|\{(['"`])([\s\S]*?)\3\})/g,
   ))
     markup(`${match[1]}: ${inlineExpressions(match[2] ?? match[4])}`, match.index);
   for (const match of source.text.matchAll(
-    /\s(fill|stroke|stop-color|flood-color|lighting-color|font-size)="([^"]*)"/g,
-  ))
-    markup(`${match[1]}: ${match[2]}`, match.index);
+    /\s(fill|stroke|stop-color|flood-color|lighting-color|font-size)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>/]+))/gi,
+  )) {
+    const value = match[2] ?? match[3] ?? match[4];
+    const size = match[1].toLowerCase() === 'font-size' && /^\d*\.?\d+$/.test(value);
+    markup(`${match[1]}: ${size ? `${value}px` : value}`, match.index);
+  }
   for (const match of source.text.matchAll(/\s(?:style:)?(font-size|font)=\{(?!['"`])/g))
     markup(`${match[1]}: dynamic-value`, match.index);
   return chunks;
@@ -215,6 +220,7 @@ function resolveVar(value: string, tokens: Theme): string | null {
 }
 
 function fontSize(property: string, raw: string, tokens: Theme, depth = 0): FontSize {
+  property = property.toLowerCase();
   if (property !== 'font-size' && property !== 'font') return null;
   const value = raw.replace(/\s*!\s*important\s*$/i, '').trim();
   if (inheritedSize.has(value.toLowerCase())) return null;
@@ -262,6 +268,26 @@ void test('font sizes resolve to px, or fail unless reviewed', () => {
   ];
   for (const [property, value, expected] of cases)
     assert.deepEqual(fontSize(property, value, tokens), expected, `${property}: ${value}`);
+});
+
+void test('font-size checks cover CSS, inline styles and SVG attributes', () => {
+  const cases: [string, number][] = [
+    ['<style>p { FONT-SIZE: 11px; }</style>', 11],
+    ['<style>p { FoNt-SiZe: 11px; }</style>', 11],
+    ["<p style='font-size: 11px'>text</p>", 11],
+    ['<svg><text font-size = "11px">text</text></svg>', 11],
+    ['<svg><text font-size=11>text</text></svg>', 11],
+    ['<svg><text font-size=11/></svg>', 11],
+    ['<svg><text font-size="14">text</text></svg>', 14],
+  ];
+  for (const [text, px] of cases) {
+    const found = styleChunks({ file: 'fixture.svelte', text }).flatMap(declarations);
+    assert.deepEqual(
+      found.map(({ property, value }) => fontSize(property, value, {})),
+      [{ px }],
+      text,
+    );
+  }
 });
 
 void test('font sizes stay at or above 12 px outside the reviewed allowlist', () => {

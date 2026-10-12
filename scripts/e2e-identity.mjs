@@ -9,9 +9,20 @@ export function e2eIdentity() {
   };
 }
 
-export function e2eContextService(identity, template, configDir) {
+const escapeXml = (value) =>
+  value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+
+export function e2eContextService(identity, template, configDir, temporaryDir) {
   if (!configDir || !isAbsolute(configDir)) {
     throw new Error('Set an absolute private SAIL_E2E_CONFIG_DIR before building the E2E app');
+  }
+  if (!temporaryDir || !isAbsolute(temporaryDir)) {
+    throw new Error('Set an absolute private TMPDIR before building the E2E app');
   }
   const releaseLabel = 'dev.smykla.sai-harness.context-supervisor';
   const occurrences = template.split(releaseLabel).length - 1;
@@ -21,13 +32,7 @@ export function e2eContextService(identity, template, configDir) {
   const closing = '</dict></plist>';
   const end = template.lastIndexOf(closing);
   if (end < 0) throw new Error('Unexpected context service plist structure');
-  const escapedDir = configDir
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&apos;');
-  const environment = `  <key>EnvironmentVariables</key><dict>\n    <key>SAIL_E2E_CONFIG_DIR</key><string>${escapedDir}</string>\n  </dict>\n`;
+  const environment = `  <key>EnvironmentVariables</key><dict>\n    <key>SAIL_E2E_CONFIG_DIR</key><string>${escapeXml(configDir)}</string>\n    <key>TMPDIR</key><string>${escapeXml(temporaryDir)}</string>\n  </dict>\n`;
   return {
     label,
     destination: `Library/LaunchAgents/${label}.plist`,

@@ -499,6 +499,7 @@ struct AcpTerminal {
     agent: String,
     profile: CapabilityProfile,
     session_id: String,
+    owner: Option<String>,
     directory: PathBuf,
     _storage_lease: Option<std::sync::Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
@@ -717,10 +718,16 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     }
     #[cfg(unix)]
     {
+        let ownership_stop = terminal
+            .owner
+            .as_deref()
+            .map(|owner| crate::owned_processes::stop_pid(owner, child.id()))
+            .unwrap_or(Ok(()));
         crate::terminal::kill_terminal_process_groups(child.id())?;
         child
             .wait()
             .map_err(|error| format!("Cannot wait for terminal process to stop: {error}"))?;
+        ownership_stop?;
     }
     #[cfg(windows)]
     terminal.job.stop()?;
@@ -728,6 +735,10 @@ fn stop(terminal: &AcpTerminal) -> Result<(), String> {
     child
         .wait()
         .map_err(|error| format!("Cannot wait for terminal process to stop: {error}"))?;
+    #[cfg(windows)]
+    if let Some(owner) = terminal.owner.as_deref() {
+        crate::owned_processes::stop_pid(owner, child.id())?;
+    }
     #[cfg(unix)]
     if let Ok(mut watchdog) = terminal.watchdog.lock() {
         watchdog.stop();
@@ -807,6 +818,17 @@ pub fn handle(
             let cache_directory = data_directory.join("cache");
             std::fs::create_dir_all(&temp_directory).map_err(|error| error.to_string())?;
             std::fs::create_dir_all(&cache_directory).map_err(|error| error.to_string())?;
+            let background = crate::background_priority::enabled(app);
+            #[cfg(unix)]
+            let mut command =
+                if let Some(nice) = crate::background_priority::nice_program(background) {
+                    let mut command = Command::new(nice);
+                    command.args(["-n", "10"]).arg(&params.command);
+                    command
+                } else {
+                    Command::new(&params.command)
+                };
+            #[cfg(windows)]
             let mut command = Command::new(&params.command);
             command.args(&params.args).current_dir(directory);
             #[cfg(unix)]
@@ -832,13 +854,38 @@ pub fn handle(
             let mut child = command
                 .spawn()
                 .map_err(|error| format!("Cannot start command: {error}"))?;
+            let owner = format!(
+                "{}\0acp:{}:{}",
+                fallback.display(),
+                agent,
+                params.session_id
+            );
+            if let Err(error) =
+                crate::owned_processes::register_session(&owner, child.id(), child.id())
+            {
+                #[cfg(unix)]
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(child.id() as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Cannot track command ownership: {error}"));
+            }
+            #[cfg(windows)]
+            if background {
+                crate::background_priority::lower_process(child.id());
+            }
             storage_lease.mark_started();
             #[cfg(unix)]
             let watchdog = start_watchdog_or_cleanup(
                 &mut child,
                 &storage_lease,
                 crate::child_watchdog::ChildWatchdog::start,
-            )?;
+            )
+            .inspect_err(|_| {
+                let _ = crate::owned_processes::stop_pid(&owner, child.id());
+            })?;
             let stdout = child
                 .stdout
                 .take()
@@ -856,6 +903,7 @@ pub fn handle(
                 agent: agent.to_string(),
                 profile,
                 session_id: params.session_id.clone(),
+                owner: Some(owner),
                 directory: worktree.to_path_buf(),
                 _storage_lease: Some(storage_lease),
                 child: Mutex::new(child),
@@ -1596,6 +1644,7 @@ mod tests {
             agent: "codex".to_string(),
             profile: CapabilityProfile::Review,
             session_id: "nested-session".to_string(),
+            owner: None,
             directory: nested.clone(),
             _storage_lease: None,
             child: Mutex::new(child),
@@ -1735,11 +1784,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_terminal_job_stops_descendant_after_direct_child_exits() {
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
         let marker = std::env::temp_dir().join(format!(
             "sail-windows-terminal-descendant-{}.txt",
             uuid::Uuid::new_v4()
         ));
+        let _marker_cleanup = RemoveOnDrop(marker.clone());
         let marker_literal = marker.to_string_lossy().replace('\'', "''");
+        let stderr_path = marker.with_extension("stderr");
+        let _stderr_cleanup = RemoveOnDrop(stderr_path.clone());
+        let stderr = std::fs::File::create(&stderr_path).expect("capture PowerShell stderr");
         let script = format!(
             "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 5; Set-Content -LiteralPath ''{marker_literal}'' done'); exit 0"
         );
@@ -1747,13 +1807,20 @@ mod tests {
         command
             .args(["-NoProfile", "-Command", &script])
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(stderr));
         let (mut child, job) = WindowsTerminalJob::spawn(&mut command).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(10);
         while child.try_wait().unwrap().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "terminal command did not exit"
+                "PowerShell parent did not exit: pid={}, elapsed={:?}, job active processes={:?}, stderr={:?}",
+                child.id(),
+                started.elapsed(),
+                job.active_processes(),
+                std::fs::read(&stderr_path).map(|bytes| String::from_utf8_lossy(
+                    &bytes[bytes.len().saturating_sub(4096)..]
+                ).into_owned()),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1767,7 +1834,6 @@ mod tests {
         assert_eq!(job.active_processes().unwrap(), 0);
         std::thread::sleep(Duration::from_secs(6));
         assert!(!marker.exists(), "descendant survived terminal stop");
-        let _ = std::fs::remove_file(marker);
     }
 
     #[test]
