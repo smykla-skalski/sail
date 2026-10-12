@@ -46,7 +46,11 @@
       return;
     }
     const measure = () => {
-      if (!expanded) overflowing = element.scrollHeight > element.clientHeight + 1;
+      if (expanded) element.classList.add('clamped');
+      const overflows = element.scrollHeight > element.clientHeight + 1;
+      if (expanded) element.classList.remove('clamped');
+      overflowing = overflows;
+      if (!overflows) expanded = false;
     };
     measure();
     const observer = new ResizeObserver(measure);

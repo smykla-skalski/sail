@@ -2311,8 +2311,7 @@
 
   async function stop() {
     stopRequested = true;
-    if (activeTurnId && activeSessionId)
-      acp.cancelQueuedTurn(agent, directory, activeSessionId, activeTurnId);
+    if (activeTurnId) acp.cancelQueuedTurn(agent, directory, activeSessionId, activeTurnId);
     if (activePlanRevision)
       reportPlanRevision(activePlanRevision.id, 'Plan revision was cancelled.');
     diagnostic('stop_requested');
@@ -3009,8 +3008,7 @@
     pointer-events: none;
   }
   .agent-composer [data-pane-prompt]:focus {
-    outline: 2px solid var(--sui-primary);
-    outline-offset: -2px;
+    box-shadow: inset 0 -2px var(--sui-muted);
   }
   .agent-composer [data-pane-prompt] :global(.composer-image) {
     display: inline-flex;

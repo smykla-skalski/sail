@@ -49,6 +49,7 @@
     exportMemories,
     memoryKinds,
     parseMemoryTags,
+    resolveHandoffExpiry,
     type MemoryAgentInstallPreview,
     type MemoryAgentStatus,
     type MemoryImportCandidate,
@@ -59,6 +60,8 @@
     type MemoryRecord,
     type MemorySearchResult,
     type MemoryStatus,
+    type KnowledgePreview,
+    type KnowledgeChange,
   } from './lib/shared-memory';
 
   let snapshot = $state<SettingsSnapshot | null>(null);
@@ -125,13 +128,41 @@
   let memoryContent = $state('');
   let memoryKind = $state<MemoryKind>('other');
   let memoryTags = $state('');
+  let memoryExpiry = $state('');
   let memoryLoading = $state(false);
   let memoryStorageError = $state('');
+  let knowledgeMemoryId = $state('');
+  let knowledgeDestination = $state('');
+  let knowledgeText = $state('');
+  let knowledgePreview = $state<{
+    result: KnowledgePreview;
+    memoryId: string;
+    destination: string;
+    text: string;
+    directory: string;
+  } | null>(null);
+  let knowledgeChange = $state<KnowledgeChange | null>(null);
+  let knowledgeError = $state('');
+  let knowledgeLoading = $state(false);
+  const knowledgeReviewCurrent = $derived(
+    knowledgePreview !== null &&
+      knowledgePreview.memoryId === knowledgeMemoryId &&
+      knowledgePreview.destination === knowledgeDestination &&
+      knowledgePreview.text === knowledgeText &&
+      knowledgePreview.directory === snapshot?.directory,
+  );
+  const selectedKnowledgeMemory = $derived(
+    memoryRecords.find((record) => record.id === knowledgeMemoryId),
+  );
   let memoryAgentError = $state('');
   let memoryConfigError = $state('');
   let memoryRequest = 0;
   let memoryDirectory = '';
   let pendingForget = $state('');
+  let pendingExpiry = $state('');
+  let expiryEditValue = $state('');
+  let expiryEditOriginalValue = '';
+  let expiryEditOriginalTimestamp: number | null = null;
   let agentPreview = $state<{
     action: 'install' | 'uninstall';
     result: MemoryAgentInstallPreview;
@@ -252,7 +283,8 @@
       await invoke('context_approve_provider', { directory, expectedFingerprint });
       if (snapshot?.directory === directory) {
         await refreshContext(directory);
-        contextMessage = 'Provider approved for this project. Connection is not available yet.';
+        contextMessage =
+          'Provider approved for this project. Approval does not show connection health.';
       }
     } catch (cause) {
       if (snapshot?.directory === directory) {
@@ -286,6 +318,12 @@
   async function refreshMemory(directory: string, query = memoryQuery.trim()) {
     const request = ++memoryRequest;
     if (memoryDirectory !== directory) {
+      knowledgeMemoryId = '';
+      knowledgeDestination = '';
+      knowledgeText = '';
+      knowledgePreview = null;
+      knowledgeChange = null;
+      knowledgeError = '';
       memoryStatus = null;
       memoryRecords = [];
       memoryImportCandidates = [];
@@ -293,6 +331,11 @@
       memoryImportMessage = '';
       memoryQuery = '';
       pendingForget = '';
+      pendingExpiry = '';
+      expiryEditValue = '';
+      expiryEditOriginalValue = '';
+      expiryEditOriginalTimestamp = null;
+      memoryExpiry = '';
       agentPreview = null;
       previewRequest += 1;
       memoryProviderStatus = null;
@@ -449,18 +492,82 @@
     }
   }
 
+  async function previewKnowledge() {
+    const directory = snapshot?.directory;
+    if (!directory || !knowledgeMemoryId || !knowledgeDestination.trim() || !knowledgeText.trim())
+      return;
+    knowledgeLoading = true;
+    knowledgeError = '';
+    knowledgeChange = null;
+    knowledgePreview = null;
+    const memoryId = knowledgeMemoryId;
+    const destination = knowledgeDestination;
+    const text = knowledgeText;
+    try {
+      const result = await invoke<KnowledgePreview>('preview_project_knowledge', {
+        directory,
+        memoryId,
+        destination,
+        proposedText: text,
+      });
+      if (snapshot?.directory === directory) {
+        knowledgePreview = { result, memoryId, destination, text, directory };
+      }
+    } catch (cause) {
+      knowledgeError = String(cause);
+    } finally {
+      knowledgeLoading = false;
+    }
+  }
+
+  async function rejectKnowledge() {
+    const preview = knowledgePreview;
+    knowledgePreview = null;
+    if (!preview) return;
+    try {
+      await invoke('reject_project_knowledge', { token: preview.result.token });
+    } catch (cause) {
+      knowledgeError = String(cause);
+    }
+  }
+
+  async function acceptKnowledge() {
+    const preview = knowledgePreview;
+    if (!preview || !knowledgeReviewCurrent) return;
+    knowledgeLoading = true;
+    knowledgeError = '';
+    try {
+      knowledgeChange = await invoke<KnowledgeChange>('accept_project_knowledge', {
+        token: preview.result.token,
+      });
+      knowledgePreview = null;
+    } catch (cause) {
+      knowledgePreview = null;
+      knowledgeError = String(cause);
+    } finally {
+      knowledgeLoading = false;
+    }
+  }
+
   async function rememberMemory() {
     const directory = snapshot?.directory;
     const content = memoryContent.trim();
     if (!directory || !content) return;
     memoryStorageError = '';
+    const expiresAt =
+      memoryKind === 'handoff' && memoryExpiry ? new Date(memoryExpiry).getTime() : undefined;
+    if (expiresAt !== undefined && !Number.isFinite(expiresAt)) {
+      memoryStorageError = 'Storage: Enter a valid handoff expiry.';
+      return;
+    }
     try {
       await invoke<MemoryRecord>('memory_remember', {
         directory,
-        input: { content, kind: memoryKind, tags: parseMemoryTags(memoryTags) },
+        input: { content, kind: memoryKind, tags: parseMemoryTags(memoryTags), expiresAt },
       });
       memoryContent = '';
       memoryTags = '';
+      memoryExpiry = '';
       await refreshMemory(directory);
     } catch (cause) {
       memoryStorageError = `Storage: ${String(cause)}`;
@@ -497,6 +604,29 @@
     try {
       await invoke('memory_forget', { directory, id });
       pendingForget = '';
+      await refreshMemory(directory);
+    } catch (cause) {
+      memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function saveMemoryExpiry(id: string) {
+    const directory = snapshot?.directory;
+    if (!directory) return;
+    const expiresAt = resolveHandoffExpiry(
+      expiryEditValue,
+      expiryEditOriginalValue,
+      expiryEditOriginalTimestamp,
+    );
+    if (expiresAt !== null && !Number.isFinite(expiresAt)) {
+      memoryStorageError = 'Storage: Enter a valid handoff expiry.';
+      return;
+    }
+    memoryStorageError = '';
+    try {
+      await invoke<MemoryRecord>('memory_set_expiry', { directory, id, expiresAt });
+      pendingExpiry = '';
+      expiryEditValue = '';
       await refreshMemory(directory);
     } catch (cause) {
       memoryStorageError = `Storage: ${String(cause)}`;
@@ -868,6 +998,21 @@
             Copy selected text automatically
           </label>
           <p>Selecting text outside inputs copies it and announces "Copied".</p>
+        </section>
+        <section class="settings-card">
+          <h2>Performance</h2>
+          <label class="attention-setting">
+            <input
+              type="checkbox"
+              checked={snapshot.backgroundPriorityEnabled}
+              onchange={(event) =>
+                send({ type: 'background-priority', value: event.currentTarget.checked })}
+            />
+            Run agent commands and browser tools at background priority
+          </label>
+          <p>
+            Turn this off to troubleshoot slow agent commands. New jobs use the changed setting.
+          </p>
         </section>
       {:else}<p role="status">Loading settings…</p>{/if}
     {:else if selectedSection === 'opencode'}
@@ -1364,10 +1509,15 @@
           <p role="status">Checking committed context configuration…</p>
         {:else if contextStatus?.state === 'not-configured'}
           <p role="status">This project has no committed context provider selection.</p>
+          <p>
+            To set up a provider, add its selection to this project's Sail context configuration,
+            commit the configuration, then refresh this view. Sail uses the committed selection.
+          </p>
         {:else if contextStatus?.state === 'invalid'}
           <p class="runtime-diagnostic" role="alert">
             {contextStatus.reason || 'The committed context configuration is invalid.'}
           </p>
+          <p>Fix and commit the project context configuration, then refresh this view.</p>
         {:else if contextStatus}
           <dl class="integration-preview context-provider-details">
             <dt>Provider</dt>
@@ -1383,14 +1533,29 @@
             <dt>Committed revision</dt>
             <dd><code>{contextStatus.revision}</code></dd>
             <dt>Approval</dt>
-            <dd>{contextStatus.state === 'approved' ? 'Approved' : 'Approval required'}</dd>
+            <dd>
+              {contextStatus.state === 'approved'
+                ? 'Approved'
+                : contextStatus.state === 'unavailable'
+                  ? 'Unavailable'
+                  : 'Approval required'}
+            </dd>
           </dl>
           {#if contextStatus.reason}<p class="runtime-diagnostic" role="status">
               {contextStatus.reason}
             </p>{/if}
-          <p>
-            Approval records your choice. Sail does not start the provider or add it to agents yet.
-          </p>
+          {#if contextStatus.state === 'unavailable'}
+            <p>
+              Select an available executable for this registry command, then review its identity.
+            </p>
+          {:else if contextStatus.state === 'approval-required'}
+            <p>Review the executable and capabilities before approving this project.</p>
+          {:else}
+            <p>
+              Approval records your choice for this project. It does not show live connection
+              health.
+            </p>
+          {/if}
           <label for="context-executable">Provider executable</label>
           <input
             id="context-executable"
@@ -1784,6 +1949,65 @@
                 </div>
                 <p>{record.content}</p>
                 {#if record.tags.length}<p class="memory-tags">{record.tags.join(' · ')}</p>{/if}
+                {#if record.provenance.sessionId}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onclick={() => {
+                      knowledgeMemoryId = record.id;
+                      knowledgePreview = null;
+                      knowledgeChange = null;
+                      knowledgeError = '';
+                    }}>Propose for project docs</Button
+                  >
+                {/if}
+                {#if record.kind === 'handoff' && record.expiresAt != null}
+                  <p class="memory-tags">
+                    {record.expiresAt <= Date.now() ? 'Expired' : 'Expires'}
+                    <span aria-hidden="true"> · </span>
+                    <time datetime={new Date(record.expiresAt).toISOString()}>
+                      {new Date(record.expiresAt).toLocaleString()}
+                    </time>
+                  </p>
+                {/if}
+                {#if record.kind === 'handoff'}
+                  {#if pendingExpiry === record.id}
+                    <div
+                      class="memory-forget-confirm"
+                      role="group"
+                      aria-label="Edit handoff expiry"
+                    >
+                      <label for="expiry-{record.id}">Expires (leave empty to remove)</label>
+                      <input
+                        id="expiry-{record.id}"
+                        type="datetime-local"
+                        bind:value={expiryEditValue}
+                      />
+                      <Button size="sm" onclick={() => void saveMemoryExpiry(record.id)}
+                        >Save expiry</Button
+                      >
+                      <Button size="sm" variant="secondary" onclick={() => (pendingExpiry = '')}
+                        >Cancel</Button
+                      >
+                    </div>
+                  {:else}
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={() => {
+                        pendingExpiry = record.id;
+                        const expiry = record.expiresAt;
+                        expiryEditValue = expiry
+                          ? new Date(expiry - new Date(expiry).getTimezoneOffset() * 60_000)
+                              .toISOString()
+                              .slice(0, 16)
+                          : '';
+                        expiryEditOriginalValue = expiryEditValue;
+                        expiryEditOriginalTimestamp = expiry ?? null;
+                      }}>Edit expiry</Button
+                    >
+                  {/if}
+                {/if}
                 {#if pendingForget === record.id}
                   <div class="memory-forget-confirm" role="group" aria-label="Confirm forget">
                     <span>Forget this memory?</span>
@@ -1810,6 +2034,72 @@
       </section>
 
       <section class="settings-card">
+        <h2>Propose project knowledge</h2>
+        <p>
+          Select a memory with a source session above, then choose a tracked Markdown file in this
+          repository. Sail prepares an uncommitted change in a separate worktree for your review.
+        </p>
+        {#if selectedKnowledgeMemory}
+          <p><strong>Private memory</strong></p>
+          <p>{selectedKnowledgeMemory.content}</p>
+          <p class="runtime-binary">
+            Source session: {selectedKnowledgeMemory.provenance.sessionId}
+          </p>
+        {:else}
+          <p class="memory-empty">Select a memory with a source session to start.</p>
+        {/if}
+        <label for="knowledge-destination">Tracked Markdown destination</label>
+        <input
+          id="knowledge-destination"
+          bind:value={knowledgeDestination}
+          placeholder="docs/project-context.md"
+          autocomplete="off"
+        />
+        <label for="knowledge-text">Text to add to the document</label>
+        <textarea
+          id="knowledge-text"
+          rows="5"
+          bind:value={knowledgeText}
+          placeholder="Write only the knowledge you want to share."></textarea>
+        <Button
+          size="sm"
+          disabled={!selectedKnowledgeMemory ||
+            !knowledgeDestination.trim() ||
+            !knowledgeText.trim() ||
+            knowledgeLoading}
+          onclick={() => void previewKnowledge()}>Preview exact diff</Button
+        >
+        {#if knowledgeError}<p role="alert" class="runtime-diagnostic">{knowledgeError}</p>{/if}
+        {#if knowledgePreview && knowledgeReviewCurrent}
+          <div class="memory-install-preview">
+            <h3>Review proposed document change</h3>
+            <p><strong>Original memory:</strong> {knowledgePreview.result.memory}</p>
+            <p><strong>Source session:</strong> {knowledgePreview.result.sourceSession}</p>
+            <p><strong>Destination:</strong> <code>{knowledgePreview.result.destination}</code></p>
+            <p><strong>Base revision:</strong> <code>{knowledgePreview.result.revision}</code></p>
+            <pre class="knowledge-diff">{knowledgePreview.result.diff}</pre>
+            <Button size="sm" disabled={knowledgeLoading} onclick={() => void acceptKnowledge()}
+              >Accept and prepare worktree</Button
+            >
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={knowledgeLoading}
+              onclick={() => void rejectKnowledge()}>Reject</Button
+            >
+          </div>
+        {:else if knowledgePreview}
+          <p role="status">The proposal inputs changed. Preview the diff again before accepting.</p>
+        {/if}
+        {#if knowledgeChange}
+          <p role="status">
+            Review the uncommitted change in <code>{knowledgeChange.worktree}</code>, then commit
+            and share it through your normal repository review process.
+          </p>
+        {/if}
+      </section>
+
+      <section class="settings-card">
         <h2>Add memory</h2>
         <label for="memory-content">What should agents remember?</label>
         <textarea id="memory-content" rows="4" bind:value={memoryContent}></textarea>
@@ -1817,6 +2107,10 @@
         <select id="memory-kind" bind:value={memoryKind}>
           {#each memoryKinds as kind (kind)}<option value={kind}>{kind}</option>{/each}
         </select>
+        {#if memoryKind === 'handoff'}
+          <label for="memory-expiry">Expires (optional)</label>
+          <input id="memory-expiry" type="datetime-local" bind:value={memoryExpiry} />
+        {/if}
         <label for="memory-tags">Tags, separated by commas</label>
         <input id="memory-tags" bind:value={memoryTags} />
         <Button

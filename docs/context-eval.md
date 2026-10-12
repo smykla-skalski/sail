@@ -7,10 +7,21 @@ achieve with and without hub retrieval.
 
 ## Versioned task set
 
-`test/fixtures/context-eval/tasks-v1.json` is the first version of the task
-set. Each task declares its type, a redacted prompt, task-specific checks, and
-the relevant source and revision that retrieved context should cite. The set
-covers every required task type:
+`test/fixtures/context-eval/tasks-v1.json` is a public schema fixture, not a
+real-agent benchmark. Its prompts contain placeholders and its runner returns
+scripted observations. It exercises the seven required task types and the
+report pipeline, but its results do not support a rollout decision.
+
+A real evaluation needs a separately versioned task set with concrete prompts,
+task-specific checks, and the relevant source and revision. Keep restricted
+tasks and grading material outside the agent's workspace. The adapter receives
+the full invocation for grading, but must send only the prompt and allowed
+task inputs to the agent. Do not expose checks, expected answers,
+relevant-source metadata, or the preregistered threshold to the agent. Give
+the blind reviewer the answer and a rubric without the arm,
+retrieval trace, or other metadata that reveals which arm produced it.
+
+The public fixture covers every required task type:
 
 | Task type          | Measures                                                    |
 | ------------------ | ----------------------------------------------------------- |
@@ -35,7 +46,10 @@ Claude Code, Codex, and OpenCode each run the same tasks in two arms:
 - `hub`: after hub rollout, with hub retrieval.
 
 The matrix in the run config names the source revision, providers, arms with
-their tool permissions, and the number of repeated trials. Every run records
+their tool permissions, and the number of repeated trials. Both arms must have
+the same ordinary permissions regardless of order; only the hub arm adds
+`read:hub`. Duplicate, missing, or unrelated permissions fail validation
+before any runner starts. Every run records
 the model version, the task prompt, the granted tool permissions, the source
 revision, the trial, and a stable seed derived from those identities, so a
 rerun after a provider or agent change repeats the same work deterministically.

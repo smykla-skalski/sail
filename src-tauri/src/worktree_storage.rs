@@ -264,7 +264,9 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         };
         let repo_lock = match FileLock::try_acquire(&repo_lock_path, true) {
             Ok(lock) => lock,
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                eprintln!("reconcile repository lock: {_error}");
                 report_pending(&data_directory, "active-use");
                 continue;
             }
@@ -278,7 +280,9 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         };
         let mutation = match FileLock::try_acquire(&mutation_path, true) {
             Ok(lock) => lock,
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                eprintln!("reconcile mutation lock: {_error}");
                 report_pending(&data_directory, "active-use");
                 continue;
             }
@@ -292,7 +296,9 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         };
         let lease = match FileLock::try_acquire(&lease_path, true) {
             Ok(lock) => lock,
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                eprintln!("reconcile lease lock: {_error}");
                 report_pending(&data_directory, "active-use");
                 continue;
             }
@@ -384,10 +390,26 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
             match read_owner(&directory) {
                 Err(reason) => Some(reason),
                 Ok(identity) => {
-                    let lease_path = lock_path(cache_directory, "lease", &directory);
-                    let lease = lease_path
-                        .ok()
-                        .and_then(|path| FileLock::try_acquire(&path, true).ok());
+                    let lease = match lock_path(cache_directory, "lease", &directory) {
+                        Ok(path) => {
+                            let acquisition = FileLock::try_acquire(&path, true);
+                            #[cfg(test)]
+                            if let Err(error) = &acquisition {
+                                eprintln!("cleanup_status lease lock {}: {error}", path.display());
+                                #[cfg(unix)]
+                                log_lock_holder(&path);
+                            }
+                            acquisition.ok()
+                        }
+                        Err(_error) => {
+                            #[cfg(test)]
+                            eprintln!(
+                                "cleanup_status lease lock path for {}: {_error}",
+                                directory.display()
+                            );
+                            None
+                        }
+                    };
                     if lease.is_none() {
                         Some("active-use")
                     } else if has_active_markers(&directory) {
@@ -1112,6 +1134,29 @@ fn lexical_absolute(path: &Path) -> PathBuf {
     result
 }
 
+#[cfg(all(test, unix))]
+fn log_lock_holder(path: &Path) {
+    let program = if cfg!(target_os = "macos") {
+        "/usr/sbin/lsof"
+    } else {
+        "lsof"
+    };
+    match std::process::Command::new(program)
+        .arg("-nP")
+        .arg(path)
+        .output()
+    {
+        Ok(output) => eprintln!(
+            "lease lock holders for {}: status={} stdout={} stderr={}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => eprintln!("Cannot inspect lease lock holders: {error}"),
+    }
+}
+
 struct FileLock {
     file: File,
 }
@@ -1123,7 +1168,9 @@ impl FileLock {
 
     fn acquire_mode(path: &Path, exclusive: bool, nonblocking: bool) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("Cannot create lock directory {}: {error}", parent.display())
+            })?;
         }
         let file = OpenOptions::new()
             .read(true)
@@ -1131,8 +1178,9 @@ impl FileLock {
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|error| error.to_string())?;
-        lock_file(&file, exclusive, nonblocking).map_err(|error| error.to_string())?;
+            .map_err(|error| format!("Cannot open lock file {}: {error}", path.display()))?;
+        lock_file(&file, exclusive, nonblocking)
+            .map_err(|error| format!("Cannot lock file {}: {error}", path.display()))?;
         Ok(Self { file })
     }
 
@@ -1327,6 +1375,18 @@ mod tests {
         }
     }
 
+    fn assert_cleanup_reason(cache: &Path, expected: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            let status = cleanup_status(cache);
+            if status.iter().any(|item| item.reason == expected) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn lexical_identity_does_not_follow_a_reused_path() {
         let root = Path::new("/tmp/worktree/../worktree");
@@ -1490,7 +1550,7 @@ mod tests {
 
         assert!(
             !directory.exists(),
-            "released stale data should be reclaimed"
+            "released stale data should be reclaimed; pending: {pending:?}"
         );
         assert!(!pending
             .iter()
@@ -1562,13 +1622,9 @@ mod tests {
 
         reconcile(&fixture.cache);
         assert!(directory.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "unclean-active-use"));
+        assert_cleanup_reason(&fixture.cache, "unclean-active-use");
 
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "unclean-active-use"));
+        assert_cleanup_reason(&fixture.cache, "unclean-active-use");
     }
 
     #[test]
@@ -1582,9 +1638,7 @@ mod tests {
         reconcile(&fixture.cache);
 
         assert!(directory.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "git-worktree-registration-still-present"));
+        assert_cleanup_reason(&fixture.cache, "git-worktree-registration-still-present");
     }
 
     #[test]
@@ -1678,9 +1732,7 @@ mod tests {
         reconcile(&fixture.cache);
 
         assert!(directory.exists());
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "git-common-dir-missing-or-unreadable"));
+        assert_cleanup_reason(&fixture.cache, "git-common-dir-missing-or-unreadable");
     }
 
     #[test]

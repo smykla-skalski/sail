@@ -129,6 +129,7 @@ pub fn store_completed(app: &tauri::AppHandle, candidates: Vec<MemoryCaptureCand
                     session_id: Some(candidate.session_id.clone()),
                     source: None,
                 }),
+                expires_at: None,
             };
             if let Err(error) = crate::memory::remember(&app, &candidate.directory, input) {
                 crate::diagnostics::record(

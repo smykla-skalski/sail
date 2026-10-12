@@ -322,6 +322,99 @@ describe('palette actions and accessibility', () => {
     });
   });
 
+  it('places Copied in the focused top modal even when it precedes another in the DOM', async () => {
+    await browser.waitUntil(async () => (await $('.copy-status').getText()) === '');
+    await browser.execute(async () => {
+      const top = document.createElement('dialog');
+      top.id = 'copy-top-modal';
+      top.textContent = 'Top dialog copy';
+      const lower = document.createElement('dialog');
+      lower.id = 'copy-lower-modal';
+      lower.textContent = 'Lower dialog copy';
+      document.body.append(top, lower);
+      lower.showModal();
+      top.showModal();
+      const range = document.createRange();
+      range.selectNodeContents(top);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      top.focus();
+      const clipboard = navigator.clipboard;
+      const original = Object.getOwnPropertyDescriptor(clipboard, 'writeText');
+      Object.defineProperty(clipboard, 'writeText', {
+        configurable: true,
+        value: async () => new Promise((done) => setTimeout(done, 30)),
+      });
+      window.dispatchEvent(new PointerEvent('pointerup'));
+      top.blur();
+      selection?.removeAllRanges();
+      await new Promise((done) => setTimeout(done, 200));
+      if (original) Object.defineProperty(clipboard, 'writeText', original);
+      else Reflect.deleteProperty(clipboard, 'writeText');
+    });
+    try {
+      await expect($('#copy-top-modal .copy-status')).toHaveText('Copied');
+    } finally {
+      await browser.execute(() => {
+        document.querySelector<HTMLDialogElement>('#copy-top-modal')?.close();
+        document.querySelector<HTMLDialogElement>('#copy-lower-modal')?.close();
+        const region = document.querySelector('.copy-status');
+        if (region) document.querySelector('.app-shell')?.append(region);
+        document.querySelector('#copy-top-modal')?.remove();
+        document.querySelector('#copy-lower-modal')?.remove();
+        window.getSelection()?.removeAllRanges();
+      });
+    }
+  });
+
+  it('announces Copied outside a modal that closes during placement', async () => {
+    await browser.waitUntil(async () => (await $('.copy-status').getText()) === '');
+    await pressShortcut('/');
+    await expect($('.shortcuts-dialog[open]')).toBeDisplayed();
+    await browser.execute(async () => {
+      const dialog = document.querySelector<HTMLDialogElement>('.shortcuts-dialog')!;
+      const range = document.createRange();
+      range.selectNodeContents(dialog.querySelector('.shortcuts-list')!);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      const clipboard = navigator.clipboard;
+      const original = Object.getOwnPropertyDescriptor(clipboard, 'writeText');
+      Object.defineProperty(clipboard, 'writeText', {
+        configurable: true,
+        value: async () => {},
+      });
+      window.dispatchEvent(new PointerEvent('pointerup'));
+      setTimeout(() => dialog.close(), 30);
+      await new Promise((done) => setTimeout(done, 250));
+      if (original) Object.defineProperty(clipboard, 'writeText', original);
+      else Reflect.deleteProperty(clipboard, 'writeText');
+    });
+    await browser.waitUntil(() =>
+      browser.execute(() => {
+        const region = document.querySelector('.copy-status');
+        return !region?.closest('dialog') && region?.textContent?.trim() === 'Copied';
+      }),
+    );
+    await browser.execute(() => window.getSelection()?.removeAllRanges());
+  });
+
+  it('keeps Copied visible when its host closes after placement', async () => {
+    await browser.waitUntil(async () => (await $('.copy-status').getText()) === '');
+    await pressShortcut('/');
+    await expect($('.shortcuts-dialog[open]')).toBeDisplayed();
+    expect((await selectText('.shortcuts-list')).join(' ')).toContain('Toggle sidebar');
+    await expect($('.shortcuts-dialog .copy-status')).toHaveText('Copied');
+    await browser.keys('Escape');
+    await browser.waitUntil(() =>
+      browser.execute(() => {
+        const region = document.querySelector('.copy-status');
+        return !region?.closest('dialog') && region?.textContent?.trim() === 'Copied';
+      }),
+    );
+  });
+
   it('copies selections only when select-to-copy is on and announces "Copied"', async () => {
     expect((await selectText()).join(' ')).toContain('Accessibility thread');
     await expect($('.copy-status[role="status"]')).toHaveText('Copied');

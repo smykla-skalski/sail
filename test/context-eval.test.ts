@@ -232,6 +232,53 @@ void test('rejects duplicate checks, unsafe revisions, and unpaired arms', () =>
   );
 });
 
+void test('paired arms differ only by hub read permission', () => {
+  const ordinary = ['read:repository', 'write:workspace'];
+  assert.doesNotThrow(() =>
+    contextEvalMatrixSchema.parse({
+      ...matrix,
+      arms: [
+        { ...arms[0], toolPermissions: ordinary },
+        { ...arms[1], toolPermissions: ['read:hub', ...ordinary.toReversed()] },
+      ],
+    }),
+  );
+
+  for (const toolPermissions of [
+    ['read:repository'],
+    ['read:hub', 'write:workspace'],
+    ['read:repository', 'read:hub', 'read:outside', 'write:workspace'],
+  ])
+    assert.throws(
+      () =>
+        contextEvalMatrixSchema.parse({
+          ...matrix,
+          arms: [
+            { ...arms[0], toolPermissions: ordinary },
+            { ...arms[1], toolPermissions },
+          ],
+        }),
+      /Hub permissions must equal baseline permissions plus read:hub/,
+    );
+
+  for (const duplicate of [
+    [{ ...arms[0], toolPermissions: ['read:repository', 'read:repository'] }, arms[1]],
+    [arms[0], { ...arms[1], toolPermissions: ['read:repository', 'read:hub', 'read:hub'] }],
+  ])
+    assert.throws(
+      () => contextEvalMatrixSchema.parse({ ...matrix, arms: duplicate }),
+      /Context eval arm permissions must be unique/,
+    );
+  assert.throws(
+    () =>
+      contextEvalMatrixSchema.parse({
+        ...matrix,
+        arms: [{ ...arms[0], toolPermissions: ['read:repository', 'read:hub'] }, arms[1]],
+      }),
+    /Hub permissions must equal baseline permissions plus read:hub/,
+  );
+});
+
 void test('long valid identifiers keep run directory names within filesystem limits', async () => {
   const longIdentifier = 'x'.repeat(100);
   const { results } = await runContextEval(

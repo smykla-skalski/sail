@@ -67,7 +67,7 @@ export function acpToolFailure(tool: AgentTool): AcpToolFailure | null {
   return {
     kind,
     event: kind === 'tool' ? null : hookPhase,
-    action: kind === 'tool' ? (toolCommand(tool.input) ?? tool.title) : tool.title,
+    action: toolCommand(tool.input) ?? tool.title,
     rule: kind === 'tool' ? null : rule,
     reason: reason.slice(0, 1000),
     output: output.slice(0, 4000),
