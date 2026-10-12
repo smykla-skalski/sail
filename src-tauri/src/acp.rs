@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
+use uuid::Uuid;
 
 use crate::browser_agent::CapabilityProfile;
 
@@ -28,6 +29,7 @@ enum Launch {
     },
     // Native binary resolved by the shared OpenCode settings; started as `<binary> acp`.
     OpenCode,
+    VendoredCodex,
 }
 
 const OPENCODE_BINARY_SETTING: &str = "sai-opencode-bin";
@@ -48,10 +50,7 @@ const AGENTS: &[AgentDefinition] = &[
         name: "Codex",
         executable: "codex",
         binary_env: Some("CODEX_PATH"),
-        launch: Launch::Npx {
-            package: "@agentclientprotocol/codex-acp@2.0.0",
-            min_node_major: 18,
-        },
+        launch: Launch::VendoredCodex,
     },
     AgentDefinition {
         id: "opencode",
@@ -396,6 +395,40 @@ impl AgentWorktreeFence {
     }
 }
 
+pub(crate) fn promote_idle_worktree(app: &AppHandle, worktree: &Path) -> Result<(), String> {
+    let acp_terminals = app.state::<crate::acp_terminal::AcpTerminalManager>();
+    let user_terminals = app.state::<crate::terminal::TerminalManager>();
+    let acp_roots = acp_terminals.begin_worktree_removal(worktree)?;
+    let result = (|| {
+        let user_roots = user_terminals.begin_worktree_removal(worktree)?;
+        let result = (|| {
+            if !acp_roots.is_empty() || !user_roots.is_empty() {
+                return Err(
+                    "Private Git changes remain pending while task terminals are active.".into(),
+                );
+            }
+            let fence = app.state::<AgentWorktreeFence>();
+            let agents = app.state::<AgentManager>();
+            fence.cleanup(&agents, worktree, None, || {
+                let cache = app
+                    .path()
+                    .app_cache_dir()
+                    .map_err(|error| error.to_string())?;
+                if let Some(mut overlay) =
+                    crate::git_overlay::GitOverlay::existing(&cache, worktree)?
+                {
+                    overlay.promote_quiescent(|| Ok(()))?;
+                }
+                Ok(())
+            })
+        })();
+        user_terminals.allow_worktree_terminals(worktree);
+        result
+    })();
+    acp_terminals.allow_worktree_terminals(worktree);
+    result
+}
+
 struct Connection {
     agent: String,
     profile: CapabilityProfile,
@@ -428,6 +461,23 @@ struct Connection {
     restores: Mutex<HashMap<String, RestoreClaim>>,
     restore_ready: Condvar,
     ready: Condvar,
+    _owned_temp: Option<OwnedTempDir>,
+}
+
+struct OwnedTempDir(PathBuf);
+
+impl OwnedTempDir {
+    fn create() -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!("sail-codex-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).map_err(|error| error.to_string())?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for OwnedTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 struct RestoreClaim {
@@ -616,10 +666,49 @@ fn mcp_server(config: &crate::browser_agent::McpConfig) -> Value {
 
 fn session_request_params(cwd: &str, session_id: Option<&str>, servers: &[Value]) -> Value {
     let mut params = json!({"cwd":cwd,"mcpServers":servers});
+    if let Some(overlay) = crate::git_overlay::registered_directory(Path::new(cwd)) {
+        params["additionalDirectories"] = json!([overlay]);
+    }
     if let Some(session_id) = session_id {
         params["sessionId"] = json!(session_id);
     }
     params
+}
+
+fn codex_overlay_profile_config(
+    scope: &Path,
+    overlay: &crate::git_overlay::GitOverlay,
+    temp: &Path,
+    extra_writable: &[PathBuf],
+) -> Result<String, String> {
+    let mut writable = vec![
+        scope.to_path_buf(),
+        overlay.git_dir.clone(),
+        temp.to_path_buf(),
+    ];
+    writable.extend_from_slice(extra_writable);
+    let mut rules = vec![
+        "\":tmpdir\"=\"read\"".to_string(),
+        "\":slash_tmp\"=\"read\"".to_string(),
+    ];
+    for path in writable {
+        let key =
+            serde_json::to_string(&path.to_string_lossy()).map_err(|error| error.to_string())?;
+        rules.push(format!("{key}=\"write\""));
+    }
+    serde_json::to_string(&json!({
+        "configOverrides": [
+            "default_permissions=\"sail-agent\"",
+            "permissions.sail-read-only={extends=\":read-only\"}",
+            format!("permissions.sail-agent={{extends=\":workspace\",filesystem={{{}}}}}", rules.join(","))
+        ],
+        "modeProfiles": {
+            "read-only": "sail-read-only",
+            "agent": "sail-agent",
+            "agent-full-access": "sail-agent"
+        }
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn session_servers(browser: Value) -> Vec<Value> {
@@ -3592,6 +3681,24 @@ fn agent_availability(
                     },
                 }
             }
+            Launch::VendoredCodex => {
+                let binary = find_executable(agent.executable);
+                AgentAvailability {
+                    id: agent.id.into(),
+                    name: agent.name.into(),
+                    binary_path: binary
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    available: binary.is_some() && major.is_some_and(|version| version >= 18),
+                    reason: if binary.is_none() {
+                        Some(format!("Install {} first.", agent.name))
+                    } else if major.is_none_or(|version| version < 18) {
+                        Some("Codex requires Node.js 18 or newer.".into())
+                    } else {
+                        None
+                    },
+                }
+            }
         })
         .collect()
 }
@@ -3628,6 +3735,26 @@ fn agent_availability_for(app: &AppHandle, agent: &str) -> Result<AgentAvailabil
             .reason
             .unwrap_or_else(|| "Agent unavailable.".into()))
     }
+}
+
+fn vendored_codex_adapter(app: &AppHandle) -> Result<PathBuf, String> {
+    let bundled = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?
+        .join("codex-acp/index.js.txt");
+    if bundled.is_file() {
+        return Ok(bundled);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/codex-acp/dist/index.js.txt");
+        if source.is_file() {
+            return Ok(source);
+        }
+    }
+    Err("The bundled Codex ACP adapter is missing.".into())
 }
 
 fn connect_blocking(
@@ -3725,6 +3852,7 @@ fn connect_blocking_inner(
     let test_agent: Option<std::ffi::OsString> = None;
     let mut paths = Vec::new();
     let is_test_agent = test_agent.is_some();
+    let mut owned_temp = None;
     let background = crate::background_priority::enabled(&app);
     let mut command = if let Some(path) = test_agent {
         let node = find_executable("node").ok_or("Node.js not found.")?;
@@ -3756,6 +3884,20 @@ fn connect_blocking_inner(
                 command.env_remove("OPENCODE_CONFIG_DIR");
                 command
             }
+            Launch::VendoredCodex => {
+                let node = find_executable("node").ok_or("Node.js not found.")?;
+                paths.push(node.parent().ok_or("Invalid Node.js path.")?.to_path_buf());
+                let temp = OwnedTempDir::create()?;
+                let adapter = temp.0.join("index.mjs");
+                std::fs::copy(vendored_codex_adapter(&app)?, &adapter)
+                    .map_err(|error| format!("Could not stage Codex ACP adapter: {error}"))?;
+                let mut command =
+                    crate::background_priority::worker_command(node.as_os_str(), background);
+                command.arg(adapter);
+                command.env_remove("CODEX_ACP_PERMISSION_PROFILE_CONFIG");
+                owned_temp = Some(temp);
+                command
+            }
         }
     };
     paths.extend(std::env::split_paths(&original_path));
@@ -3776,11 +3918,34 @@ fn connect_blocking_inner(
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
+    let overlay = crate::git_overlay::GitOverlay::ensure(&cache_directory, worktree)?;
     let (data_directory, storage_lease) =
         crate::register_worktree_storage(&cache_directory, worktree)?;
     prepare_runtime_directories(&data_directory)?;
+    if let Some(temp) = owned_temp.as_ref() {
+        if let Some(overlay) = overlay.as_ref() {
+            let shared_cache = data_directory
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(&data_directory)
+                .join("terminal-package-downloads");
+            std::fs::create_dir_all(&shared_cache).map_err(|error| error.to_string())?;
+            command.env(
+                "CODEX_ACP_PERMISSION_PROFILE_CONFIG",
+                codex_overlay_profile_config(
+                    worktree,
+                    overlay,
+                    &temp.0,
+                    &[data_directory.clone(), shared_cache],
+                )?,
+            );
+        }
+    }
     for (name, value) in runtime_environment(&data_directory) {
         command.env(name, value);
+    }
+    if let Some(overlay) = overlay.as_ref() {
+        overlay.apply(&mut command);
     }
     command.current_dir(worktree);
     #[cfg(unix)]
@@ -3868,6 +4033,7 @@ fn connect_blocking_inner(
         restores: Mutex::new(HashMap::new()),
         restore_ready: Condvar::new(),
         ready: Condvar::new(),
+        _owned_temp: owned_temp,
     });
     let reader = Arc::clone(&runtime);
     let reader_manager = manager.clone();
@@ -5465,6 +5631,11 @@ pub async fn acp_prompt(
                 cleanup_session_processes(&app, &runtime, &agent, &session_id);
             },
         );
+        let promotion_error = if latest {
+            promote_idle_worktree(&app, &runtime.worktree).err()
+        } else {
+            None
+        };
         let finished_event = AgentEvent {
             agent: agent.clone(),
             directory: directory.map(|path| path.to_string_lossy().into_owned()),
@@ -5472,6 +5643,7 @@ pub async fn acp_prompt(
             message: json!({"method":"sail/prompt_finished","params":{
                 "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
                 "error":result.as_ref().err(),
+                "gitPromotionError":promotion_error,
                 "sailCapabilityProfile":runtime.profile.as_str()
             }}),
         };
@@ -6026,6 +6198,7 @@ mod session_config_tests {
             restores: Mutex::new(HashMap::new()),
             restore_ready: Condvar::new(),
             ready: Condvar::new(),
+            _owned_temp: None,
         })
     }
 
@@ -6368,6 +6541,7 @@ mod session_config_tests {
                 restores: Mutex::new(HashMap::new()),
                 restore_ready: Condvar::new(),
                 ready: Condvar::new(),
+                _owned_temp: None,
             })
         };
         let first_runtime = spawn(&first);
@@ -6452,6 +6626,157 @@ mod session_config_tests {
         let request = session_request_params("/work/repo", None, &servers);
         assert_eq!(request["mcpServers"].as_array().unwrap().len(), 1);
         assert_eq!(request["mcpServers"][0]["name"], "sail-browser");
+    }
+
+    #[test]
+    fn linked_worktree_session_grants_only_its_private_git_overlay() {
+        let root = scratch("linked-git");
+        let main = root.join("main");
+        let linked = root.join("linked");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .arg(&main)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&main)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&main)
+            .args(["worktree", "add", "-q", "-b", "sail/test"])
+            .arg(&linked)
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(session_request_params(linked.to_str().unwrap(), None, &[])
+            .get("additionalDirectories")
+            .is_none());
+        let overlay = crate::git_overlay::GitOverlay::ensure(&root.join("cache"), &linked)
+            .unwrap()
+            .unwrap();
+        let request = session_request_params(linked.to_str().unwrap(), None, &[]);
+        let common = main.join(".git").canonicalize().unwrap();
+        let roots = request["additionalDirectories"].as_array().unwrap();
+        assert_eq!(roots, &vec![json!(overlay.git_dir)]);
+        assert!(!roots.iter().any(|root| root == &json!(common.join("refs"))));
+        assert!(!roots
+            .iter()
+            .any(|root| root == &json!(common.join("logs/refs"))));
+        assert!(!roots.iter().any(|root| root == &json!(common)));
+        assert_eq!(
+            worktree_identity(&linked),
+            crate::acp_terminal::stable_worktree_identity(&linked.canonicalize().unwrap())
+        );
+        let build_cache = root.join("task-build-cache");
+        let profile: Value = serde_json::from_str(
+            &codex_overlay_profile_config(
+                &linked,
+                &overlay,
+                &root.join("task-tmp"),
+                std::slice::from_ref(&build_cache),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let overrides = profile["configOverrides"].as_array().unwrap();
+        assert!(overrides.iter().all(|value| !value
+            .as_str()
+            .is_some_and(|value| value.contains(&common.to_string_lossy().to_string()))));
+        assert!(overrides.iter().all(|value| !value
+            .as_str()
+            .is_some_and(|value| value.contains("filesystem.\""))));
+        assert!(overrides.iter().any(|value| {
+            value.as_str().is_some_and(|value| {
+                value.contains("filesystem")
+                    && value.contains(&overlay.git_dir.to_string_lossy().to_string())
+            })
+        }));
+        assert!(overrides.iter().any(|value| value
+            .as_str()
+            .is_some_and(|value| value.contains(build_cache.to_str().unwrap()))));
+        let restored = session_request_params(linked.to_str().unwrap(), Some("session"), &[]);
+        assert_eq!(
+            restored["additionalDirectories"],
+            request["additionalDirectories"]
+        );
+        assert!(session_request_params(main.to_str().unwrap(), None, &[])
+            .get("additionalDirectories")
+            .is_none());
+
+        let copied = root.join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::copy(linked.join(".git"), copied.join(".git")).unwrap();
+        assert!(session_request_params(copied.to_str().unwrap(), None, &[])
+            .get("additionalDirectories")
+            .is_none());
+
+        let sibling = root.join("sibling");
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&main)
+            .args(["worktree", "add", "-q", "-b", "sail/sibling"])
+            .arg(&sibling)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&linked)
+            .args(["symbolic-ref", "HEAD", "refs/heads/sail/sibling"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(crate::git_overlay::GitOverlay::existing(&root.join("cache"), &linked).is_err());
+        assert!(Command::new("git")
+            .args(["-C"])
+            .arg(&linked)
+            .args(["symbolic-ref", "HEAD", "refs/heads/sail/test"])
+            .status()
+            .unwrap()
+            .success());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let pointer = linked.join(".git");
+            let original = linked.join(".git-original");
+            std::fs::rename(&pointer, &original).unwrap();
+            symlink(sibling.join(".git"), &pointer).unwrap();
+            assert!(session_request_params(linked.to_str().unwrap(), None, &[])
+                .get("additionalDirectories")
+                .is_none());
+            assert!(
+                crate::git_overlay::GitOverlay::existing(&root.join("cache"), &linked).is_err()
+            );
+            std::fs::remove_file(&pointer).unwrap();
+            std::fs::rename(&original, &pointer).unwrap();
+        }
+
+        std::fs::create_dir(linked.join("nested")).unwrap();
+        assert_eq!(
+            session_request_params(linked.join("nested").to_str().unwrap(), None, &[])
+                ["additionalDirectories"],
+            request["additionalDirectories"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6851,6 +7176,7 @@ mod native_subagent_fence_tests {
             restores: Mutex::new(HashMap::new()),
             restore_ready: Condvar::new(),
             ready: Condvar::new(),
+            _owned_temp: None,
         });
         let directory = PathBuf::from("/worktree");
         runtime
