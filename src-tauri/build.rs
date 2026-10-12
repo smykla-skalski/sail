@@ -36,6 +36,8 @@ fn main() {
             "list_interrupted_agent_turns",
             "finish_interrupted_agent_turn",
             "get_acp_turn_evidence",
+            "list_pending_acp_post_turn_checks",
+            "finish_acp_post_turn_checks",
             "memory_project_key",
             "memory_status",
             "memory_list",

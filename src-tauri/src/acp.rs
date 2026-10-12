@@ -3982,6 +3982,7 @@ pub async fn acp_prompt(
             status: "prepared".into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: true,
         },
     ) {
         if let Ok(mut prompts) = runtime.prompt_state.lock() {
@@ -4040,6 +4041,7 @@ pub async fn acp_prompt(
                             status: "dispatch_uncertain".into(),
                             error: None,
                             updated_at: 0,
+                            post_turn_pending: false,
                         },
                     )
                     .map_err(|error| {
@@ -4062,6 +4064,7 @@ pub async fn acp_prompt(
                         status: "dispatched".into(),
                         error: None,
                         updated_at: 0,
+                        post_turn_pending: false,
                     },
                 ) {
                     Ok(()) => dispatched_phase.store(2, Ordering::Release),
@@ -4150,6 +4153,7 @@ pub async fn acp_prompt(
             result.is_err() && settlement_generation.is_none(),
             dispatch_phase.load(Ordering::Acquire),
         );
+        let notify = !explicitly_cancelled && !interrupted;
         if let Err(error) = crate::settings::record_acp_turn_evidence(
             &app,
             crate::settings::AcpTurnEvidence {
@@ -4160,6 +4164,7 @@ pub async fn acp_prompt(
                 status: evidence_status.into(),
                 error: result.as_ref().err().cloned(),
                 updated_at: 0,
+                post_turn_pending: evidence_status == "done" && notify,
             },
         ) {
             crate::diagnostics::record(
@@ -4174,7 +4179,6 @@ pub async fn acp_prompt(
             "reportedErrorInterruption":reported_error_interruption,
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
-        let notify = !explicitly_cancelled && !interrupted;
         let stop_reason = result
             .as_ref()
             .ok()

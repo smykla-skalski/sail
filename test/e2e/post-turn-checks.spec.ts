@@ -208,7 +208,7 @@ describe('post-turn checks', () => {
     );
   });
 
-  it('runs a post-turn check once after reloading during a turn', async () => {
+  it('runs a post-turn check once when the turn finishes between listeners', async () => {
     const command = "printf 'run\\n' >> reload-runs.txt";
     await browser.execute(async (value) => {
       const tauri = Reflect.get(window, '__TAURI__');
@@ -242,6 +242,37 @@ describe('post-turn checks', () => {
     await $('.agent-composer [data-pane-prompt]').setValue('Long turn');
     await $('.agent-actions button').click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-3 '));
+    const active = await browser.execute(async (path) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      const activity = await tauri.core.invoke('acp_activity', { directory: path });
+      const turns = Object.entries(activity.claude.activeTurns);
+      if (turns.length !== 1)
+        throw new Error(`Expected one active Claude turn, got ${turns.length}`);
+      const stopEvents = Reflect.get(window, 'sailE2eStopAgentEvents');
+      if (typeof stopEvents !== 'function') throw new Error('E2E agent listener hook missing');
+      stopEvents();
+      return { sessionId: turns[0][0], turnId: turns[0][1] };
+    }, repository);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          async (path, sessionId, turnId) => {
+            const tauri = Reflect.get(window, '__TAURI__');
+            const evidence = await tauri.core.invoke('get_acp_turn_evidence', {
+              agent: 'claude',
+              directory: path,
+              sessionId,
+              turnId,
+            });
+            return evidence?.status === 'done';
+          },
+          repository,
+          active.sessionId,
+          active.turnId,
+        ),
+      { timeout: 35_000, timeoutMsg: 'The turn did not finish while the listener was stopped' },
+    );
+    expect(existsSync(join(repository, 'reload-runs.txt'))).toBe(false);
     await browser.refresh();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-60 '), {
       wait: 35_000,

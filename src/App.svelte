@@ -886,6 +886,7 @@
   };
   let postTurnResults = $state<PostTurnCheck[]>([]);
   const pendingPostTurnChecks = new SvelteSet<string>();
+  const verifyingCompletedTurns = new SvelteSet<string>();
   let personalPostTurnChecks = $state(personalChecks(getSetting('sai-post-turn-personal')));
   type TurnSnapshot = { id: string; kind: 'turn' | 'undo'; created: number };
   let selectedWorktreeConfig = $state<WorktreeConfig | null>(null);
@@ -2352,8 +2353,14 @@
           if (disposed) unlisten();
           else {
             unlistenAgentEvents = unlisten;
+            if (import.meta.env.MODE === 'e2e')
+              Reflect.set(window, 'sailE2eStopAgentEvents', () => {
+                unlistenAgentEvents?.();
+                unlistenAgentEvents = undefined;
+              });
             void recoverInterruptedAgentTurns()
               .then(() => restoreAgentActivity())
+              .then(() => reconcilePendingPostTurnChecks())
               .finally(() => {
                 acpRecoveryReady = true;
                 void tickShippingRuns();
@@ -2416,6 +2423,7 @@
       clearTimeout(sidebarInventoryTimer);
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eStopAgentEvents');
       unlistenBrowserAccess?.();
       unlistenCoordination?.();
       unsubscribePlans();
@@ -11164,19 +11172,21 @@
     } catch (cause) {
       error = `Could not load repository post-turn checks: ${describe(cause)}`;
     }
-    for (const entry of entries) {
-      void runOnePostTurnCheck({
-        id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
-        updated: Date.now(),
-        directory: path,
-        thread,
-        turn,
-        ...entry,
-        status: 'running',
-        output: '',
-        code: null,
-      });
-    }
+    await Promise.all(
+      entries.map((entry) =>
+        runOnePostTurnCheck({
+          id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
+          updated: Date.now(),
+          directory: path,
+          thread,
+          turn,
+          ...entry,
+          status: 'running',
+          output: '',
+          code: null,
+        }),
+      ),
+    );
   }
 
   async function runVerifiedCompletedChecks(
@@ -11185,18 +11195,39 @@
     sessionId: string,
     turnId: string,
   ) {
+    const key = JSON.stringify([agent, path, sessionId, turnId]);
+    if (verifyingCompletedTurns.has(key)) return;
+    verifyingCompletedTurns.add(key);
     try {
       const evidence = await acp.turnEvidence(agent, path, sessionId, turnId);
       if (
         evidence?.status !== 'done' ||
+        !evidence.postTurnPending ||
         evidence.agent !== agent ||
+        evidence.directory !== path ||
         evidence.sessionId !== sessionId ||
         evidence.turnId !== turnId
       )
         return;
       await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId);
+      await acp.finishPostTurnChecks(agent, path, sessionId, turnId);
     } catch (cause) {
       error = `Could not verify completed agent turn: ${describe(cause)}`;
+    } finally {
+      verifyingCompletedTurns.delete(key);
+    }
+  }
+
+  async function reconcilePendingPostTurnChecks() {
+    try {
+      const pending = await acp.pendingPostTurnChecks();
+      await Promise.all(
+        pending.map((turn) =>
+          runVerifiedCompletedChecks(turn.agent, turn.directory, turn.sessionId, turn.turnId),
+        ),
+      );
+    } catch (cause) {
+      error = `Could not restore completed agent checks: ${describe(cause)}`;
     }
   }
 
