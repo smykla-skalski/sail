@@ -146,25 +146,42 @@ describe('agent coordination bridge', () => {
     }
   });
 
-  it('recovers an OpenCode session when listing fails and registers its source', async () => {
+  it('recovers an OpenCode session and accepts its reply when listing fails', async () => {
     const path = realpathSync(repository);
     const sessionId = 'opencode-external-coordination';
+    const targetSessionId = 'claude-external-reply-target';
     const messageId = 'opencode-external-message';
     writeFileSync(join(path, '.acp-session-list-error'), '');
     writeFileSync(
       join(path, '.acp-external-sessions.json'),
       JSON.stringify([
         { sessionId, title: 'External OpenCode recipient', updatedAt: new Date().toISOString() },
+        {
+          sessionId: targetSessionId,
+          title: 'Claude reply target',
+          updatedAt: new Date().toISOString(),
+        },
       ]),
     );
     await browser.execute(
-      ({ directory, session, message }) => {
+      ({ directory, session, targetSession, message }) => {
         localStorage.setItem('sai-directory', directory);
         localStorage.setItem(
           'sai-project-catalog',
           JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
         );
-        localStorage.setItem('sail-agent-threads', '[]');
+        localStorage.setItem(
+          'sail-agent-threads',
+          JSON.stringify([
+            {
+              agent: 'claude',
+              directory,
+              sessionId: targetSession,
+              title: 'Claude reply target',
+              updated: Date.now(),
+            },
+          ]),
+        );
         localStorage.setItem(
           'sai-coordination-messages',
           JSON.stringify([
@@ -178,7 +195,12 @@ describe('agent coordination bridge', () => {
           ]),
         );
       },
-      { directory: path, session: sessionId, message: messageId },
+      {
+        directory: path,
+        session: sessionId,
+        targetSession: targetSessionId,
+        message: messageId,
+      },
     );
     await browser.refresh();
     await browser.waitUntil(
@@ -201,6 +223,48 @@ describe('agent coordination bridge', () => {
         timeout: 30_000,
         timeoutMsg: 'OpenCode message was not delivered with the source session registered',
       },
+    );
+    const config = await browser.tauri.execute(
+      async ({ core }, directory) =>
+        core.invoke<{ command: string; args: string[]; env: Record<string, string> }>(
+          'browser_mcp_config',
+          { directory, agent: 'opencode' },
+        ),
+      path,
+    );
+    const response = execFileSync(config.command, config.args, {
+      env: { ...process.env, ...config.env },
+      input: `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'thread_message',
+          arguments: {
+            threadId: `acp:claude:${targetSessionId}`,
+            text: 'Reply from recovered OpenCode session',
+          },
+          _meta: { sessionID: sessionId },
+        },
+      })}\n`,
+      timeout: 30_000,
+      encoding: 'utf8',
+    });
+    const result = JSON.parse(response.trim());
+    expect(result.result.isError).not.toBe(true);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (targetSession) =>
+            JSON.parse(localStorage.getItem('sai-coordination-messages') ?? '[]').some(
+              (item: { target: string; text: string; delivered?: boolean }) =>
+                item.target.endsWith(`acp:claude:${targetSession}`) &&
+                item.text === 'Reply from recovered OpenCode session' &&
+                item.delivered === true,
+            ),
+          targetSessionId,
+        ),
+      { timeout: 30_000, timeoutMsg: 'OpenCode reply was not delivered to the Claude target' },
     );
   });
 

@@ -6083,7 +6083,9 @@
     if (!agentAvailability.some((agent) => agent.id === 'opencode' && agent.available))
       return threads;
     const known = new Set(threads.map((thread) => thread.id));
-    const listed = await Promise.all(directories.map((path) => listOpenCodeRootThreads(path)));
+    const listed = await Promise.all(
+      directories.map((path) => listOpenCodeRootThreads(path).catch(() => [])),
+    );
     return [
       ...threads,
       ...listed
