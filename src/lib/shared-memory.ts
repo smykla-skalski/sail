@@ -22,6 +22,8 @@ export type MemoryRecord = {
   rating?: { value: -1 | 0 | 1; updatedAt: number };
   forgottenAt?: number;
   expiresAt?: number;
+  supersededBy?: string;
+  conflictsWith?: string[];
 };
 
 export type MemorySearchResult = { memory: MemoryRecord; score: number };

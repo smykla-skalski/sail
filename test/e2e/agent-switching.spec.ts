@@ -391,6 +391,111 @@ describe('agent sessions survive thread switches', () => {
     expect(restarts(first)).toBe(before);
   });
 
+  it('keeps live reload output separate from history and captures only new text in its receipt', async () => {
+    await openThread('Continuity main');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await sendPrompt('Clipboard fixture replay history');
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Clipboard received: Clipboard fixture replay history'),
+    );
+    await sendPrompt('Long turn');
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-3 '));
+
+    const receiptId = 'live-reload-receipt';
+    const activity = await browser.tauri.execute(
+      async ({ core }, directory) =>
+        core.invoke<Record<string, { activeTurns: Record<string, string> }>>('acp_activity', {
+          directory,
+        }),
+      first,
+    );
+    const rawReceipt = await browser.execute(
+      ({ directory, id, activeTurns }) => {
+        const savedThreads: Array<{ agent: string; directory: string; sessionId: string }> =
+          JSON.parse(localStorage.getItem('sail-agent-threads') ?? '[]');
+        const sessionId = savedThreads.find(
+          (thread) => thread.agent === 'claude' && thread.directory === directory,
+        )?.sessionId;
+        if (!sessionId) throw new Error('Continuity main session is missing');
+        const turnId = activeTurns[sessionId];
+        if (!turnId) throw new Error('Continuity main turn is not active');
+        const now = Date.now();
+        const receipt = {
+          receiptId: id,
+          accessKey: 'live-reload-access',
+          requestId: 'live-reload-request',
+          project: directory,
+          sourceId: 'acp:claude:source',
+          sourceDirectory: directory,
+          targetId: `acp:claude:${sessionId}`,
+          turnId,
+          targetDirectory: directory,
+          worktreeId: directory,
+          provider: 'claude',
+          prompt: 'Long turn',
+          state: 'working',
+          created: now,
+          updated: now,
+          result: null,
+          error: null,
+        };
+        const value = JSON.stringify([receipt]);
+        localStorage.setItem('sai-agent-spawn-receipts', value);
+        return value;
+      },
+      { directory: first, id: receiptId, activeTurns: activity.claude?.activeTurns ?? {} },
+    );
+    await browser.tauri.execute(
+      async ({ core }, value) =>
+        core.invoke('save_setting', { key: 'sai-agent-spawn-receipts', value }),
+      rawReceipt,
+    );
+    await browser.refresh();
+    await openThread('Continuity main');
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Working'));
+    await expect($('.agent-picker-controls .option-trigger[aria-label^="Model:"]')).toHaveText(
+      'Test model',
+    );
+    await expect($('.agent-picker-controls .option-trigger[aria-label^="Effort:"]')).toHaveText(
+      'Medium',
+    );
+    await expect($('.agent-history-gap')).toBeDisplayed();
+    await browser.waitUntil(
+      async () =>
+        browser.execute((id) => {
+          const receipts: Array<{ receiptId: string; result: string | null }> = JSON.parse(
+            localStorage.getItem('sai-agent-spawn-receipts') ?? '[]',
+          );
+          return receipts.find((receipt) => receipt.receiptId === id)?.result?.includes('part-');
+        }, receiptId),
+      { timeout: 15_000, timeoutMsg: 'Live chunks did not reach the restored receipt' },
+    );
+    const duringTurn = await browser.execute((id) => {
+      const messages = [
+        ...document.querySelectorAll('.agent-conversation .agent-message.assistant-message'),
+      ].map((message) => message.textContent ?? '');
+      const receipts: Array<{ receiptId: string; result: string | null }> = JSON.parse(
+        localStorage.getItem('sai-agent-spawn-receipts') ?? '[]',
+      );
+      return { messages, receipt: receipts.find((receipt) => receipt.receiptId === id)?.result };
+    }, receiptId);
+    expect(duringTurn.messages.some((message) => message.includes('part-'))).toBe(true);
+    expect(
+      duringTurn.messages.some(
+        (message) =>
+          message.includes('Clipboard received: Clipboard fixture replay history') &&
+          message.includes('part-'),
+      ),
+    ).toBe(false);
+    expect(duringTurn.receipt).toContain('part-');
+    expect(duringTurn.receipt).not.toContain(
+      'Clipboard received: Clipboard fixture replay history',
+    );
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'), {
+      wait: 45_000,
+    });
+  });
+
   it('lets background work finish after switching away and back', async () => {
     await openThread('Continuity main');
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));

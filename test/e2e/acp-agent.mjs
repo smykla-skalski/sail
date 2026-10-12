@@ -1061,7 +1061,11 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
-    if (text === 'Native child permission') {
+    if (
+      text === 'Native child permission' ||
+      text === 'Native child permission and question' ||
+      text === 'Native child permission and cancelled question'
+    ) {
       const child = `${sessionId}:permission-child`;
       update(sessionId, {
         sessionUpdate: 'subagent_spawned',
@@ -1074,6 +1078,24 @@ for await (const line of createInterface({ input: process.stdin })) {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Child waits for approval.' },
       });
+      if (text !== 'Native child permission') {
+        const id = ++nextPermission;
+        elicitations.set(id, { sessionId: child, promptId: message.id });
+        send({
+          id,
+          method: 'elicitation/create',
+          params: {
+            sessionId: child,
+            mode: 'form',
+            message: 'Choose the delivery approach',
+            requestedSchema: {
+              type: 'object',
+              properties: { approach: { type: 'string', enum: ['safe', 'fast'] } },
+              required: ['approach'],
+            },
+          },
+        });
+      }
       requestPermission(child, text, message.id, sessionId);
       continue;
     }
@@ -1271,7 +1293,16 @@ for await (const line of createInterface({ input: process.stdin })) {
               result: { stopReason: pending.text === 'Cancel ignored' ? 'end_turn' : 'cancelled' },
             });
         };
-        if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
+        if (pending.text === 'Delete with browser call') {
+          setTimeout(() => {
+            const session = sessions.get(pending.sessionId);
+            const server = session.mcpServers.find((item) => item.name === 'sail-browser');
+            callWorktreeList(server, (result) => {
+              writeFileSync(join(session.cwd, 'acp-delete-browser-result.txt'), result);
+              finish();
+            });
+          }, 250);
+        } else if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
         else finish();
       }
     }
@@ -1298,6 +1329,13 @@ for await (const line of createInterface({ input: process.stdin })) {
       status: 'completed',
     });
     if (pending.parent) {
+      if (pending.text === 'Native child permission and cancelled question') {
+        for (const [id, question] of elicitations) {
+          if (question.sessionId !== pending.sessionId) continue;
+          elicitations.delete(id);
+          send({ method: '$/cancel_request', params: { id } });
+        }
+      }
       // The child keeps working after the answer, as a real one does.
       update(pending.sessionId, {
         sessionUpdate: 'agent_message_chunk',

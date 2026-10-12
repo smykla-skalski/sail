@@ -15,6 +15,7 @@
     checkItems,
     hookItems,
     nativeItems,
+    presentToolIds,
     pendingCoordinationItems,
     queuedItems,
     shellItems,
@@ -72,6 +73,7 @@
   import {
     agentQueuePaused,
     queuedAgentMessages,
+    queuedTurnDisposition,
     saveQueuedAgentMessages,
     setAgentQueuePaused,
     type QueuedAgentMessage,
@@ -84,6 +86,8 @@
     acpPromptInterrupted,
     groupAgentEntries,
     liveSessionView,
+    markLiveMessageBoundary,
+    restoredLiveTurnIsCurrent,
     loadRecentTranscript,
     restoreEntryTimes,
     saveRecentTranscript,
@@ -96,6 +100,7 @@
     type AgentTool,
     type AgentEvent,
     type AgentConfigOption,
+    type AgentCommand,
     type AgentAuthMethod,
     type AgentId,
     type AgentPermission,
@@ -328,6 +333,7 @@
   });
   let queued = $state<QueuedAgentMessage[]>([]);
   let queuePaused = $state(false);
+  let queueDispatching = $state(false);
   let steering = $state(false);
   function diagnostic(event: DiagnosticEvent, sessionId = activeSessionId, turnId = activeTurnId) {
     recordDiagnostic(event, {
@@ -338,12 +344,33 @@
     });
   }
   $effect(() => {
-    if (isBusy || !ready || queuePaused || steering || !queued.length) return;
+    if (isBusy || !ready || queuePaused || queueDispatching || steering || !queued.length) return;
     const [next, ...remaining] = queued;
+    const dispatchAgent = agent;
+    const dispatchDirectory = directory;
+    const dispatchSessionId = activeSessionId;
+    queueDispatching = true;
     queued = remaining;
     diagnostic('queue_dispatch_started');
     if (activeSessionId) saveQueuedAgentMessages(agent, directory, activeSessionId, queued);
-    void send(next.text, next);
+    void send(next.text, next)
+      .catch((cause) => {
+        if (!dispatchSessionId) return;
+        const restored = [
+          next,
+          ...queuedAgentMessages(dispatchAgent, dispatchDirectory, dispatchSessionId),
+        ];
+        saveQueuedAgentMessages(dispatchAgent, dispatchDirectory, dispatchSessionId, restored);
+        setAgentQueuePaused(dispatchAgent, dispatchDirectory, dispatchSessionId, true);
+        if (activeSessionId === dispatchSessionId) {
+          queued = restored;
+          queuePaused = true;
+          error = describe(cause);
+        }
+      })
+      .finally(() => {
+        queueDispatching = false;
+      });
   });
   $effect(() => {
     if (ephemeral || !activeSessionId || !onshipit || (!busy && !running)) return;
@@ -491,6 +518,7 @@
   let historyLoaded = $state(true);
   let historyLoading = $state(false);
   let historyAttempted = $state(false);
+  let historicalToolIds = $state.raw<ReadonlySet<string>>(new Set());
   let showingEarlier = false;
   const visibleEntries = $derived(entries.slice(-visibleCount));
   let seenEntryCount = 0;
@@ -507,6 +535,7 @@
     if (sessionId) onreplaychange?.(agent, directory, sessionId, value);
   }
   let replayEntries: AgentEntry[] = [];
+  let liveMessageBoundary = { pending: false };
   let pendingUpdates: Record<string, unknown>[] = [];
   let updateTimer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
@@ -656,6 +685,7 @@
         name,
         provider: agent,
         toolOutput: (tool) => tool.content || toolInput(tool.output),
+        historicalToolIds,
       }),
       timed: [
         ...hookItems(visibleHookActivities),
@@ -688,6 +718,7 @@
     }),
   );
   let liveTurn = $state(false);
+  let finishedTurnIds: string[] = [];
   // The app marks a thread done from the turn-finished event, before this pane's prompt call
   // returns; the header follows that event so both settle in the same frame.
   let turnEnded = $state(false);
@@ -997,10 +1028,12 @@
       acpPlans().observe({ agent, directory, sessionId: activeSessionId }, update);
     onnativeplan?.(nativePlan);
     if (replay.active) {
+      // ACP does not identify live updates interleaved with session/load replay (#342).
+      // A mutable running flag cannot establish provenance for old failed tools.
       updateEntriesInPlace(replayEntries, update);
       return;
     }
-    pendingUpdates.push(update);
+    pendingUpdates.push(markLiveMessageBoundary(update, liveMessageBoundary));
     if (!updateTimer) updateTimer = setTimeout(flushUpdates, 50);
   }
 
@@ -1046,14 +1079,39 @@
     const current = generation;
     historyAttempted = true;
     historyLoading = true;
-    setReplaying(true);
-    replayEntries = [];
+    if (!historyLoaded) liveMessageBoundary.pending = true;
+    let restoreToken: string | undefined;
     try {
-      const session = await acp.load(agent, directory, id, activeCapabilityProfile);
+      const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
+      restoreToken = reservation.restoreToken;
       if (current !== generation) return;
+      if (reservation.liveTurn) {
+        const turnId = reservation.liveTurn;
+        const latest = (await acp.activity(directory))[agent];
+        if (current !== generation) return;
+        if (!restoredLiveTurnIsCurrent(turnId, latest?.activeTurns[id], finishedTurnIds)) {
+          historyAttempted = false;
+          return;
+        }
+        liveTurn = true;
+        activeTurnId = turnId;
+        historyAttempted = false;
+        return;
+      }
+      if (!restoreToken) throw new Error('Session restore reservation is missing.');
+      setReplaying(true);
+      liveMessageBoundary.pending = false;
+      replayEntries = [];
+      const session = await acp.load(agent, directory, id, activeCapabilityProfile, restoreToken);
+      if (current !== generation) return;
+      historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
       if (!configOptions.length && Array.isArray(session.configOptions))
         configOptions = session.configOptions as AgentConfigOption[];
       entries = restoreEntryTimes(replayEntries, entries);
+      // Switch the event sink before yielding to Svelte. An update delivered during tick()
+      // must reach entries rather than a replay buffer that finally discards.
+      setReplaying(false);
+      replayEntries = [];
       visibleCount = 50;
       historyLoaded = true;
       rememberTranscript();
@@ -1073,6 +1131,7 @@
         replayEntries = [];
         historyLoading = false;
       }
+      if (restoreToken) await acp.endRestore(agent, directory, id, restoreToken);
     }
   }
 
@@ -1204,7 +1263,8 @@
       elicitations = elicitations.filter((item) => String(item.id) !== id);
       delete elicitationDrafts[id];
       if (activeSessionId)
-        saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
+        if (activeSessionId)
+          saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
       if (thread && !elicitations.length && !permissions.length) onstatus(thread, 'working');
     } catch (cause) {
       error = describe(cause);
@@ -1232,6 +1292,7 @@
     pendingUpdates = [];
     setReplaying(false);
     replayEntries = [];
+    liveMessageBoundary = { pending: false };
     permissions = [];
     answeredNotes = [];
     settledElsewhere = [];
@@ -1247,7 +1308,14 @@
       id && !nativeEntries
         ? liveSessionView(entries, kept, sessionState(agent, directory, id))
         : null;
-    if (liveView) entries = liveView.entries;
+    if (liveView) {
+      entries = liveView.entries;
+      // Events can arrive while connect and restore reservation are still awaiting.
+      liveMessageBoundary = liveView.messageBoundary;
+    }
+    // Tools already present when this pane opens are history, even if the child is still working.
+    // A failed tool arriving afterward is absent from this set and announces on its first render.
+    historicalToolIds = presentToolIds(nativeEntries ?? entries);
     visibleCount = 50;
     historyLoaded = !id;
     historyLoading = false;
@@ -1276,6 +1344,7 @@
     liveTurn = false;
     stopRequested = false;
     activeTurnId = null;
+    finishedTurnIds = [];
     turnEnded = false;
     error = '';
     ready = false;
@@ -1318,51 +1387,87 @@
             ? capabilities.loadSession
             : false;
         if (!canLoad) throw new Error(`${name} does not support restoring threads.`);
-        const runtime = (await acp.activity(directory).catch(() => null))?.[agent];
-        if (current !== generation) return;
-        const runningTurn = runtime?.alive ? runtime.activeTurns[id] : undefined;
-        if (liveView && runningTurn !== undefined) {
+        const showLiveTurn = async (
+          turnId: string,
+          cached: { configOptions?: AgentConfigOption[]; availableCommands?: AgentCommand[] },
+        ) => {
+          if (!liveView) return;
           liveTurn = true;
-          activeTurnId = runningTurn;
+          activeTurnId = turnId;
           historyLoaded = liveView.complete;
-          configOptions = await restoreClaudeThreadConfig(liveView.configOptions);
+          configOptions = await restoreClaudeThreadConfig(
+            cached.configOptions ?? liveView.configOptions,
+          );
           rememberThreadConfig(configOptions);
-          if (liveView.availableCommands) updateSkills(liveView.availableCommands);
+          const availableCommands = cached.availableCommands ?? liveView.availableCommands;
+          if (availableCommands) updateSkills(availableCommands);
           if (commandUpdates[id]) updateSkills(commandUpdates[id]);
           const latest = (await acp.activity(directory).catch(() => null))?.[agent];
-          if (current === generation && latest?.activeTurns[id] !== runningTurn) {
+          if (
+            current === generation &&
+            !restoredLiveTurnIsCurrent(turnId, latest?.activeTurns[id], finishedTurnIds)
+          ) {
             liveTurn = false;
             activeTurnId = null;
           }
+        };
+        const sessionCapabilities =
+          capabilities && typeof capabilities === 'object' && 'sessionCapabilities' in capabilities
+            ? capabilities.sessionCapabilities
+            : null;
+        const canResume =
+          sessionCapabilities &&
+          typeof sessionCapabilities === 'object' &&
+          'resume' in sessionCapabilities;
+        const restoresSubagents =
+          sessionCapabilities &&
+          typeof sessionCapabilities === 'object' &&
+          'subagents' in sessionCapabilities;
+        const needsReplay = restoresSubagents || !canResume;
+        const reservation = await acp.beginRestore(agent, directory, id, activeCapabilityProfile);
+        if (current !== generation) {
+          if (reservation.restoreToken)
+            await acp.endRestore(agent, directory, id, reservation.restoreToken);
+          return;
+        }
+        if (reservation.liveTurn) {
+          await showLiveTurn(reservation.liveTurn, reservation);
         } else {
-          const sessionCapabilities =
-            capabilities &&
-            typeof capabilities === 'object' &&
-            'sessionCapabilities' in capabilities
-              ? capabilities.sessionCapabilities
-              : null;
-          const canResume =
-            sessionCapabilities &&
-            typeof sessionCapabilities === 'object' &&
-            'resume' in sessionCapabilities;
-          const restoresSubagents =
-            sessionCapabilities &&
-            typeof sessionCapabilities === 'object' &&
-            'subagents' in sessionCapabilities;
-          if (restoresSubagents || !canResume) {
+          if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
+          if (needsReplay) {
             setReplaying(true);
+            liveMessageBoundary.pending = false;
             replayEntries = [];
           }
-          const session =
-            restoresSubagents || !canResume
-              ? await acp.load(agent, directory, id, activeCapabilityProfile)
-              : await acp.resume(agent, directory, id, activeCapabilityProfile);
-          if (current === generation && (restoresSubagents || !canResume)) {
-            entries = restoreEntryTimes(replayEntries, entries);
-            setReplaying(false);
-            replayEntries = [];
-            historyLoaded = true;
-            rememberTranscript();
+          let session: Record<string, unknown>;
+          try {
+            session = needsReplay
+              ? await acp.load(
+                  agent,
+                  directory,
+                  id,
+                  activeCapabilityProfile,
+                  reservation.restoreToken,
+                )
+              : await acp.resume(
+                  agent,
+                  directory,
+                  id,
+                  activeCapabilityProfile,
+                  reservation.restoreToken,
+                );
+            if (current === generation && needsReplay) {
+              historicalToolIds = new Set([...historicalToolIds, ...presentToolIds(replayEntries)]);
+              entries = restoreEntryTimes(replayEntries, entries);
+              historyLoaded = true;
+              rememberTranscript();
+            }
+          } finally {
+            if (current === generation && needsReplay) {
+              setReplaying(false);
+              replayEntries = [];
+            }
+            await acp.endRestore(agent, directory, id, reservation.restoreToken);
           }
           if (current === generation) {
             configOptions = await restoreClaudeThreadConfig(
@@ -1567,6 +1672,10 @@
           commandUpdates[params.sessionId] = update.availableCommands;
       }
       if (message.method === 'sail/prompt_finished' && typeof params?.sessionId === 'string') {
+        if (params.sessionId === activeSessionId && typeof params.turnId === 'string') {
+          if (!finishedTurnIds.includes(params.turnId)) finishedTurnIds.push(params.turnId);
+          if (finishedTurnIds.length > 32) finishedTurnIds.shift();
+        }
         if (
           busy &&
           params.sessionId === activeSessionId &&
@@ -1611,7 +1720,14 @@
         return;
       }
       if (!params || params.sessionId !== activeSessionId) return;
-      if (message.method === 'sail/permission_resolved') {
+      if (message.method === 'sail/elicitation_resolved') {
+        const requestId = params.requestId;
+        if (typeof requestId !== 'string' && typeof requestId !== 'number') return;
+        elicitations = elicitations.filter((item) => String(item.id) !== String(requestId));
+        delete elicitationDrafts[String(requestId)];
+        if (activeSessionId)
+          saveStructuredQuestions({ agent, directory, sessionId: activeSessionId }, elicitations);
+      } else if (message.method === 'sail/permission_resolved') {
         if (
           (typeof params.requestId !== 'string' && typeof params.requestId !== 'number') ||
           typeof params.sessionId !== 'string'
@@ -1638,7 +1754,8 @@
         settledElsewhere = removeResolvedAcpPermission(waiting, resolvedIdentity);
         for (const gone of waiting)
           if (!settledElsewhere.includes(gone)) noteAnswered(gone, outcome);
-        if (thread && running && permissions.length === 0) onstatus(thread, 'working');
+        if (thread && running && permissions.length === 0 && elicitations.length === 0)
+          onstatus(thread, 'working');
       } else if (message.method === 'session/update') {
         const update = params.update;
         if (!update || typeof update !== 'object') return;
@@ -1754,6 +1871,7 @@
       shipIssue = await beginShipItRun(directory, text, promptSkill(skills, text)?.name ?? null);
     } catch (cause) {
       error = describe(cause);
+      if (queuedMessage) throw cause;
       return;
     }
     const command = text.toLowerCase();
@@ -1779,7 +1897,7 @@
       return;
     }
     if ((!text && (external || !clipboardAttachments.length)) || !ready || isBusy || !directory) {
-      if (external) throw new Error('Wait for the current agent turn.');
+      if (external || queuedMessage) throw new Error('Wait for the current agent turn.');
       return;
     }
     const sentImages = queuedMessage?.images ?? (external ? [] : [...images]);
@@ -1842,6 +1960,7 @@
           queuedReason = reason;
         },
         turnDirectory,
+        { agent: turnAgent, sessionId: activeSessionId },
       );
       if (stopRequested) throw new Error('Agent turn was cancelled.');
       if (!activeSessionId || !activityThread)
@@ -1963,15 +2082,25 @@
         ]);
       if (activityThread) onactivity({ ...activityThread, updated: Date.now() });
     } catch (cause) {
-      restoreShell();
       const backendStatus =
         phase === 'prompt' && deliverySessionId
           ? await acpFinishedPromptStatus(turnAgent, turnDirectory, deliverySessionId, turnId)
           : null;
+      const evidence =
+        phase === 'prompt' && deliverySessionId
+          ? await acp
+              .turnEvidence(turnAgent, turnDirectory, deliverySessionId, turnId)
+              .catch(() => null)
+          : null;
+      const disposition = queuedTurnDisposition(backendStatus, evidence?.status ?? null);
+      const delivered = disposition === 'completed';
+      const mayRetry = disposition === 'unsent';
+      if (mayRetry) restoreShell();
       const interrupted =
         backendStatus === 'interrupted' ||
+        evidence?.status === 'interrupted' ||
         (backendStatus !== 'failed' && (finalStatus === 'interrupted' || stopRequested));
-      finalStatus = interrupted ? 'interrupted' : 'failed';
+      finalStatus = delivered ? 'done' : interrupted ? 'interrupted' : 'failed';
       if (interrupted) notifyOnDone = false;
       if (!deliverySessionId && current !== generation && disposed && !ephemeral && !external) {
         const recovered =
@@ -1991,18 +2120,18 @@
       const steer =
         deliverySessionId && inFlightSteer?.sessionId === deliverySessionId ? inFlightSteer : null;
       const retryQueued =
+        !delivered &&
         !!deliverySessionId &&
-        (queuedMessage !== undefined ||
+        ((mayRetry && (queuedMessage !== undefined || (current !== generation && disposed))) ||
           following.length > 0 ||
-          steer !== null ||
-          (current !== generation && disposed));
+          steer !== null);
       if (retryQueued && deliverySessionId) {
         if (recoveredDraft) {
           recoveredDraft = false;
         }
-        const retry = { text, images: sentImages, attachments: sentClipboard };
+        const retry = !mayRetry ? [] : [{ text, images: sentImages, attachments: sentClipboard }];
         if (steer) steer.requeued = true;
-        const messages = [retry, ...(steer ? [steer.message] : []), ...following];
+        const messages = [...retry, ...(steer ? [steer.message] : []), ...following];
         saveQueuedAgentMessages(turnAgent, turnDirectory, deliverySessionId, messages);
         setAgentQueuePaused(turnAgent, turnDirectory, deliverySessionId, true);
         recordDiagnostic('queue_paused', {
@@ -2011,7 +2140,7 @@
           turnId,
           queueLength: messages.length,
         });
-        keepImages = true;
+        keepImages = mayRetry;
         if (current === generation && activeSessionId === deliverySessionId) {
           queued = messages;
           queuePaused = true;
@@ -2028,11 +2157,15 @@
           errorName: cause instanceof Error ? cause.name : typeof cause,
           phase,
         });
-        error = describe(cause);
+        error = delivered
+          ? `Message delivered, but Sail could not finish local bookkeeping: ${describe(cause)}`
+          : disposition === 'uncertain'
+            ? `Message delivery is uncertain. Check the agent thread before retrying: ${describe(cause)}`
+            : describe(cause);
         authNeeded = /auth|login|sign.?in/i.test(error);
-        if (retryQueued) {
+        if (retryQueued && mayRetry) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
-        } else if (!external || queuedMessage) {
+        } else if (mayRetry && (!external || queuedMessage)) {
           entries = entries.filter((entry) => entry.id !== userEntryId);
           draft = [composerDraft, draft.trim()].filter(Boolean).join('\n\n');
           images = [...sentImages, ...images];
@@ -2041,7 +2174,7 @@
         }
         if (stopRequested) markTools('status unconfirmed', ['stopping']);
       }
-      if (external && !queuedMessage) throw cause;
+      if (external && !queuedMessage && !delivered) throw cause;
     } finally {
       releaseSlot?.();
       if (inFlightSteer?.sessionId === deliverySessionId && inFlightSteer.turnId === turnId)
@@ -2646,6 +2779,7 @@
       {/snippet}
       <Transcript
         items={transcriptItems}
+        activityScope={JSON.stringify([agent, directory, activeSessionId])}
         busy={shownBusy}
         {coordinationMessages}
         onopen={onopensubagent}
@@ -2864,7 +2998,7 @@
 <style>
   .agent-permission-answered,
   .agent-readonly {
-    margin: 0;
+    margin: 0 16px;
     color: var(--sui-muted);
     font-size: 0.8rem;
   }

@@ -14,7 +14,7 @@ import { join } from 'node:path';
 
 async function completeTurn(text: string) {
   await $('.agent-composer [data-pane-prompt]').setValue(text);
-  await $('.agent-actions button').click();
+  await $('.agent-actions button:last-child').click();
   await expect($('.agent-permission')).toBeDisplayed();
   await $('.agent-permission button').click();
   await expect($('.agent-conversation')).toHaveText(expect.stringContaining(`Done: ${text}`));
@@ -206,5 +206,130 @@ describe('post-turn checks', () => {
     await browser.waitUntil(
       async () => (await statuses()).filter((status) => status === 'passed').length === 2,
     );
+  });
+
+  it('runs a post-turn check once when the turn finishes between listeners', async () => {
+    const command = "printf 'run\\n' >> reload-runs.txt";
+    await browser.execute(async (value) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('save_setting', {
+        key: 'sai-post-turn-personal',
+        value: JSON.stringify([value]),
+      });
+      localStorage.setItem('sai-post-turn-personal', JSON.stringify([value]));
+    }, command);
+    await browser.refresh();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await browser.execute(async (path) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.event.emitTo('main', 'acp-event', {
+        agent: 'claude',
+        directory: path,
+        worktree: path,
+        message: {
+          method: 'sail/prompt_finished',
+          params: {
+            sessionId: 'unknown-session',
+            turnId: 'unknown-turn',
+            status: 'done',
+            notify: true,
+          },
+        },
+      });
+    }, repository);
+    await browser.pause(1_000);
+    expect(existsSync(join(repository, 'reload-runs.txt'))).toBe(false);
+    await $('.agent-composer [data-pane-prompt]').setValue('Long turn');
+    await $('.agent-actions button:last-child').click();
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-3 '));
+    const active = await browser.execute(async (path) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      const activity = await tauri.core.invoke('acp_activity', { directory: path });
+      const turns = Object.entries(activity.claude.activeTurns);
+      if (turns.length !== 1)
+        throw new Error(`Expected one active Claude turn, got ${turns.length}`);
+      const stopEvents = Reflect.get(window, 'sailE2eStopAgentEvents');
+      if (typeof stopEvents !== 'function') throw new Error('E2E agent listener hook missing');
+      stopEvents();
+      return { sessionId: turns[0][0], turnId: turns[0][1] };
+    }, repository);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          async (path, sessionId, turnId) => {
+            const tauri = Reflect.get(window, '__TAURI__');
+            const evidence = await tauri.core.invoke('get_acp_turn_evidence', {
+              agent: 'claude',
+              directory: path,
+              sessionId,
+              turnId,
+            });
+            return evidence?.status === 'done';
+          },
+          repository,
+          active.sessionId,
+          active.turnId,
+        ),
+      { timeout: 35_000, timeoutMsg: 'The turn did not finish while the listener was stopped' },
+    );
+    expect(existsSync(join(repository, 'reload-runs.txt'))).toBe(false);
+    await browser.refresh();
+    await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-60 '), {
+      wait: 35_000,
+    });
+    await browser.waitUntil(() => existsSync(join(repository, 'reload-runs.txt')), {
+      timeoutMsg: 'The post-turn check did not run after the webview reloaded',
+    });
+    expect(readFileSync(join(repository, 'reload-runs.txt'), 'utf8')).toBe('run\n');
+    await browser.refresh();
+    expect(readFileSync(join(repository, 'reload-runs.txt'), 'utf8')).toBe('run\n');
+  });
+
+  it('does not restore check history after a fixture reset cancels a running check', async () => {
+    const command = 'sleep 8; printf stale-check';
+    await browser.execute(async (value) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('save_setting', {
+        key: 'sai-post-turn-personal',
+        value: JSON.stringify([value]),
+      });
+      Reflect.set(
+        window,
+        '__SAIL_E2E_POST_TURN_PENDING__',
+        tauri.core.invoke('run_post_turn_check', {
+          request: {
+            directory: localStorage.getItem('sai-directory'),
+            thread: 'reset-check-thread',
+            turn: 'reset-check-turn',
+            source: 'personal',
+            command: value,
+            retry: false,
+          },
+        }),
+      );
+    }, command);
+    await browser.waitUntil(() =>
+      browser.execute(async () => {
+        const tauri = Reflect.get(window, '__TAURI__');
+        const checks: unknown = await tauri.core.invoke('list_post_turn_checks');
+        return Array.isArray(checks)
+          ? checks.some(
+              (check) =>
+                check.command === 'sleep 8; printf stale-check' && check.status === 'running',
+            )
+          : false;
+      }),
+    );
+    const result = await browser.execute(async () => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      const quiesce = Reflect.get(window, '__SAIL_E2E_QUIESCE_SETTINGS__');
+      if (typeof quiesce !== 'function') throw new Error('E2E settings quiescence is unavailable');
+      await quiesce();
+      await tauri.core.invoke('reset_test_settings');
+      const pending = Reflect.get(window, '__SAIL_E2E_POST_TURN_PENDING__');
+      return { check: await pending, settings: await tauri.core.invoke('load_settings') };
+    });
+    expect(result.check.status).toBe('canceled');
+    expect(result.settings).toEqual({});
   });
 });

@@ -2,7 +2,20 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ResourceQueue } from '../src/lib/resource-queue.ts';
 import { isSetting } from '../src/lib/settings.ts';
-import { acp } from '../src/lib/acp.ts';
+import {
+  acp,
+  rememberSessionState,
+  sessionState,
+  trackLiveTranscript,
+  tracksLiveTranscript,
+} from '../src/lib/acp.ts';
+import { acpPlans } from '../src/lib/acp-plans.ts';
+import {
+  loadNativePlan,
+  loadStructuredQuestions,
+  saveNativePlan,
+  saveStructuredQuestions,
+} from '../src/lib/planning-state.ts';
 import { pressureReasonsForResults, resourceQueues } from '../src/lib/resource-limits.ts';
 import {
   defaultPressureThresholds,
@@ -229,6 +242,152 @@ void test('Stop cancels queued workspace turns with or without a session', async
     assert.equal(resourceQueues.agent.status.active, 0);
   } finally {
     resourceQueues.agent.setLimit(4);
+  }
+});
+
+void test('closed pane turns run when retained and cancel before deletion', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const settings = new Map<string, string>();
+  const invokes: { command: string; waiting: number }[] = [];
+  let forgetGate: Promise<void> | undefined;
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string) => {
+          if (command === 'machine_pressure') return healthy;
+          invokes.push({ command, waiting: resourceQueues.agent.status.waiting });
+          if (command === 'acp_forget_session') await forgetGate;
+          return undefined;
+        },
+      },
+    },
+  });
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => settings.get(key) ?? null,
+      setItem: (key: string, value: string) => settings.set(key, value),
+    },
+  });
+  resourceQueues.agent.setLimit(0);
+  try {
+    const retained = acp.acquireTurnSlot('retained-turn', undefined, '/repo', {
+      agent: 'codex',
+      sessionId: 'retained-thread',
+    });
+    assert.equal(await settled(retained), false);
+    resourceQueues.agent.setLimit(1);
+    const releaseRetained = await retained;
+    assert.equal(resourceQueues.agent.status.active, 1);
+    releaseRetained();
+    resourceQueues.agent.setLimit(0);
+
+    const queued = acp.acquireTurnSlot('closed-pane-turn', undefined, '/repo', {
+      agent: 'codex',
+      sessionId: 'saved-thread',
+    });
+    assert.equal(await settled(queued), false);
+    assert.equal(resourceQueues.agent.status.waiting, 1);
+
+    // Closing the pane leaves the turn queued; deletion happens after reopening the thread.
+    await acp.forget('codex', '/repo', 'saved-thread');
+    await assert.rejects(queued, /cancelled/);
+    assert.deepEqual(invokes, [{ command: 'acp_forget_session', waiting: 0 }]);
+    resourceQueues.agent.setLimit(1);
+    assert.equal(resourceQueues.agent.status.active, 0);
+    const release = await acp.acquireTurnSlot('granted-turn', undefined, '/repo', {
+      agent: 'codex',
+      sessionId: 'granted-thread',
+    });
+    try {
+      await acp.forget('codex', '/repo', 'granted-thread');
+      await assert.rejects(
+        acp.prompt(
+          'codex',
+          '/repo',
+          'granted-thread',
+          'late prompt',
+          'granted-turn',
+          [],
+          undefined,
+          true,
+        ),
+        /cancelled/,
+      );
+    } finally {
+      release();
+    }
+
+    const scope = { agent: 'codex' as const, directory: '/repo', sessionId: 'saved-state-thread' };
+    const nativePlan = {
+      provider: 'codex' as const,
+      markdown: 'Keep the plan',
+      updated: 1,
+      tasks: [{ title: 'One step', status: 'pending' }],
+    };
+    const questions = [
+      { id: 'question-1', sessionId: scope.sessionId, message: 'Keep the question?', schema: {} },
+    ];
+    rememberSessionState(scope.agent, scope.directory, scope.sessionId, { configOptions: [] });
+    trackLiveTranscript(scope.agent, scope.directory, scope.sessionId, [], true);
+    saveNativePlan(scope, nativePlan);
+    saveStructuredQuestions(scope, questions);
+    const plans = acpPlans();
+    assert.match(
+      plans.runTool(scope, 'sail_plan_propose', {
+        title: 'Keep history',
+        summary: 'A saved plan.',
+        sequence: ['User->>Agent: plan', 'Agent-->>User: review'],
+        overview: ['Agent[agent] --> Plan[plan]'],
+        steps: [{ id: 'step-1', title: 'Work', detail: 'Do the work.', files: ['file.ts'] }],
+      }),
+      /Plan v1/,
+    );
+    plans.runTool(scope, 'sail_plan_ask', {
+      questions: [{ id: 'question-2', question: 'Proceed?', kind: 'confirm' }],
+    });
+    const savedPlan = plans.snapshot(scope);
+    const savedHistory = plans.history(scope);
+    assert.equal(savedHistory.length, 1);
+
+    let rejectForget: ((error: Error) => void) | undefined;
+    forgetGate = new Promise<void>((_resolve, reject) => {
+      rejectForget = reject;
+    });
+    const failedForget = acp.forget(scope.agent, scope.directory, scope.sessionId);
+    assert.equal(
+      sessionState(scope.agent, scope.directory, scope.sessionId)?.configOptions?.length,
+      0,
+    );
+    assert.equal(tracksLiveTranscript(scope.agent, scope.directory, scope.sessionId), true);
+    assert.deepEqual(loadNativePlan(scope), nativePlan);
+    assert.deepEqual(loadStructuredQuestions(scope), questions);
+    assert.deepEqual(plans.snapshot(scope), savedPlan);
+    assert.deepEqual(plans.history(scope), savedHistory);
+    rejectForget!(new Error('cancel timed out'));
+    await assert.rejects(failedForget, /cancel timed out/);
+    assert.equal(tracksLiveTranscript(scope.agent, scope.directory, scope.sessionId), true);
+    assert.deepEqual(loadNativePlan(scope), nativePlan);
+    assert.deepEqual(loadStructuredQuestions(scope), questions);
+    assert.deepEqual(plans.snapshot(scope), savedPlan);
+    assert.deepEqual(plans.history(scope), savedHistory);
+
+    forgetGate = undefined;
+    await acp.forget(scope.agent, scope.directory, scope.sessionId);
+    assert.equal(sessionState(scope.agent, scope.directory, scope.sessionId), undefined);
+    assert.equal(tracksLiveTranscript(scope.agent, scope.directory, scope.sessionId), false);
+    assert.equal(loadNativePlan(scope), null);
+    assert.deepEqual(loadStructuredQuestions(scope), []);
+    assert.deepEqual(plans.snapshot(scope), { plan: null, questions: null });
+    assert.deepEqual(plans.history(scope), []);
+  } finally {
+    resourceQueues.agent.setLimit(4);
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+    if (previousStorage) Object.defineProperty(globalThis, 'localStorage', previousStorage);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
   }
 });
 

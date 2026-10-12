@@ -1,16 +1,25 @@
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, statSync, writeFileSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import process from 'node:process';
 
 const app = process.env.SAIL_E2E_APP;
 const config = process.env.SAIL_E2E_CONFIG_DIR;
 const scratch = process.env.SAIL_TEST_SCRATCH;
+const temporary = process.env.TMPDIR;
 if (!app || !config || !scratch) {
   throw new Error('Set SAIL_E2E_APP, SAIL_E2E_CONFIG_DIR, and SAIL_TEST_SCRATCH');
+}
+if (
+  !temporary ||
+  !isAbsolute(temporary) ||
+  !existsSync(temporary) ||
+  !statSync(temporary).isDirectory()
+) {
+  throw new Error('Set TMPDIR to an existing absolute private directory');
 }
 const binary = join(app, 'Contents', 'MacOS', 'sail');
 const env = { ...process.env, SAIL_E2E_CONFIG_DIR: config };
@@ -166,6 +175,8 @@ try {
     '-g',
     '--env',
     `SAIL_E2E_CONFIG_DIR=${config}`,
+    '--env',
+    `TMPDIR=${temporary}`,
     '--env',
     `TAURI_WEBDRIVER_PORT=${port}`,
     '--env',

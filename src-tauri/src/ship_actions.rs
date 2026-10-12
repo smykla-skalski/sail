@@ -332,26 +332,54 @@ pub(crate) fn reopen_pull_request(
     if details["merged"] == true {
         return Err("The pull request is already merged.".to_string());
     }
-    let head = details["head"]["sha"]
-        .as_str()
-        .ok_or("GitHub returned a pull request without a head revision.")?
-        .to_string();
     let already_open = details["state"] == "open";
-    if !already_open {
+    let patch_error = if already_open {
+        None
+    } else {
         github(vec![
             "api".to_string(),
             "--method".to_string(),
             "PATCH".to_string(),
-            endpoint,
+            endpoint.clone(),
             "-f".to_string(),
             "state=open".to_string(),
         ])
-        .map_err(|error| {
-            format!(
+        .err()
+    };
+    let details = github(vec!["api".to_string(), endpoint]).map_err(|error| {
+        if patch_error.is_some() {
+            format!("Cannot verify the pull request after the reopen request failed. Refresh and retry. {error}")
+        } else {
+            error
+        }
+    })?;
+    let details: serde_json::Value = serde_json::from_str(&details).map_err(|_| {
+        if patch_error.is_some() {
+            "Cannot verify the pull request after the reopen request failed. Refresh and retry. GitHub returned invalid details.".to_string()
+        } else {
+            "GitHub returned invalid pull request details after reopening.".to_string()
+        }
+    })?;
+    if let Some(error) = patch_error {
+        if details["state"] == "closed" && details["merged"] == false && error.contains("HTTP 422")
+        {
+            return Err(format!(
                 "GitHub could not reopen the pull request. Its branch may have been deleted or force-pushed. {error}"
-            )
-        })?;
+            ));
+        }
+        if details["state"] != "open" || details["merged"] == true {
+            return Err(format!(
+                "Cannot confirm whether the pull request reopened. Refresh its GitHub state before retrying. {error}"
+            ));
+        }
     }
+    if details["state"] != "open" || details["merged"] == true {
+        return Err("The pull request did not remain open after reopening.".to_string());
+    }
+    let head = details["head"]["sha"]
+        .as_str()
+        .ok_or("GitHub returned a pull request without a head revision.")?
+        .to_string();
     Ok(ShipReopenOutcome {
         head,
         pull_request: request.pull_request.clone(),
@@ -467,8 +495,10 @@ mod tests {
                 calls.push(arguments.join(" "));
                 Ok(if calls.len() == 1 {
                     closed.clone()
-                } else {
+                } else if calls.len() == 2 {
                     "{}".to_string()
+                } else {
+                    open_pull_request(HEAD)
                 })
             },
         )
@@ -480,6 +510,7 @@ mod tests {
             [
                 "api repos/owner/repo/pulls/7",
                 "api --method PATCH repos/owner/repo/pulls/7 -f state=open",
+                "api repos/owner/repo/pulls/7",
             ]
         );
     }
@@ -523,6 +554,63 @@ mod tests {
     }
 
     #[test]
+    fn reopen_patch_timeout_uses_the_reread_state_instead_of_starting_a_replacement() {
+        let closed = format!(r#"{{"state":"closed","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
+        let moved = "fedcba9876543210fedcba9876543210fedcba98";
+        let mut calls = 0;
+        let outcome = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                match calls {
+                    1 => Ok(closed.clone()),
+                    2 => Err("request timed out after GitHub applied PATCH".to_string()),
+                    _ => Ok(open_pull_request(moved)),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(outcome.head, moved);
+        assert!(!outcome.already_open);
+
+        let mut calls = 0;
+        let error = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                match calls {
+                    1 | 3 => Ok(closed.clone()),
+                    _ => Err("request timed out before GitHub responded".to_string()),
+                }
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert!(error.contains("Cannot confirm whether"));
+        assert!(!error.starts_with("GitHub could not reopen the pull request."));
+
+        let mut calls = 0;
+        let error = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(closed.clone())
+                } else {
+                    Err("request timed out".to_string())
+                }
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert!(error.contains("Cannot verify the pull request"));
+        assert!(!error.starts_with("GitHub could not reopen the pull request."));
+    }
+
+    #[test]
     fn reopen_leaves_an_open_pull_request_alone() {
         let open = format!(r#"{{"state":"open","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
         let mut calls = 0;
@@ -535,7 +623,28 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.already_open);
-        assert_eq!(calls, 1);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn reopen_returns_the_head_seen_after_github_accepts_the_patch() {
+        let closed = format!(r#"{{"state":"closed","merged":false,"head":{{"sha":"{HEAD}"}}}}"#);
+        let moved = "fedcba9876543210fedcba9876543210fedcba98";
+        let mut calls = 0;
+        let outcome = reopen_pull_request(
+            &reopen_request("https://github.com/owner/repo/pull/7"),
+            &mut |_| {
+                calls += 1;
+                Ok(if calls == 1 {
+                    closed.clone()
+                } else {
+                    open_pull_request(moved)
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(outcome.head, moved);
     }
 
     #[test]

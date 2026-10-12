@@ -412,17 +412,186 @@ struct Connection {
     elicitation_state: Mutex<HashMap<String, PendingElicitation>>,
     next_permission_generation: AtomicU64,
     prompt_state: Mutex<PromptState>,
+    prompt_dispatch: Mutex<()>,
     cancelled_prompts: Mutex<HashSet<String>>,
     next_id: AtomicU64,
     alive: AtomicBool,
     capabilities: Mutex<Value>,
     session_directories: Mutex<HashMap<String, PathBuf>>,
     session_configs: Mutex<HashMap<String, SessionConfig>>,
+    per_load_tokens: Mutex<HashMap<String, Vec<String>>>,
     native_subagents: Mutex<NativeSubagentRegistry>,
     session_profiles: Mutex<HashMap<String, CapabilityProfile>>,
+    session_ui: Mutex<HashMap<String, SessionUiState>>,
     pending_directory: Mutex<Option<PathBuf>>,
     session_creation: Mutex<()>,
+    restores: Mutex<HashMap<String, RestoreClaim>>,
+    restore_ready: Condvar,
     ready: Condvar,
+}
+
+struct RestoreClaim {
+    token: String,
+    expires: Instant,
+    request_active: bool,
+    release_pending: bool,
+}
+
+struct RestoreRequestGuard<'a> {
+    runtime: &'a Connection,
+    session_id: &'a str,
+    token: &'a str,
+}
+
+impl Drop for RestoreRequestGuard<'_> {
+    fn drop(&mut self) {
+        let mut claims = self
+            .runtime
+            .restores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(claim) = claims
+            .get_mut(self.session_id)
+            .filter(|claim| claim.token == self.token)
+        {
+            if claim.release_pending {
+                claims.remove(self.session_id);
+            } else {
+                claim.request_active = false;
+                // The frontend gets a fresh window after the backend finishes replay.
+                claim.expires = Instant::now() + Duration::from_secs(65);
+            }
+            self.runtime.restore_ready.notify_all();
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SessionUiState {
+    config_options: Option<Value>,
+    available_commands: Option<Value>,
+}
+
+impl Connection {
+    fn remember_session_ui(&self, session_id: &str, source: &Value) -> Result<(), String> {
+        let config_options = source.get("configOptions").filter(|value| value.is_array());
+        let available_commands = source
+            .get("availableCommands")
+            .filter(|value| value.is_array());
+        if config_options.is_none() && available_commands.is_none() {
+            return Ok(());
+        }
+        let mut sessions = self.session_ui.lock().map_err(|error| error.to_string())?;
+        let state = sessions.entry(session_id.to_owned()).or_default();
+        if let Some(options) = config_options {
+            state.config_options = Some(options.clone());
+        }
+        if let Some(commands) = available_commands {
+            state.available_commands = Some(commands.clone());
+        }
+        Ok(())
+    }
+
+    fn begin_restore_request<'a>(
+        &'a self,
+        session_id: &'a str,
+        token: &'a str,
+    ) -> Result<RestoreRequestGuard<'a>, String> {
+        let mut claims = self.restores.lock().map_err(|error| error.to_string())?;
+        let claim = claims
+            .get_mut(session_id)
+            .filter(|claim| {
+                claim.token == token && !claim.request_active && claim.expires > Instant::now()
+            })
+            .ok_or("Session restore reservation expired.")?;
+        claim.request_active = true;
+        Ok(RestoreRequestGuard {
+            runtime: self,
+            session_id,
+            token,
+        })
+    }
+
+    fn begin_restore(&self, session_id: &str) -> Result<Value, String> {
+        let claims = self.restores.lock().map_err(|error| error.to_string())?;
+        let mut claims = self.wait_for_restore(claims, session_id)?;
+        let prompts = self
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if let Some(prompt) = prompts.active.get(session_id) {
+            let mut response = json!({"liveTurn":prompt.turn_id});
+            if let Some(state) = self
+                .session_ui
+                .lock()
+                .map_err(|error| error.to_string())?
+                .get(session_id)
+            {
+                if let Some(options) = &state.config_options {
+                    response["configOptions"] = options.clone();
+                }
+                if let Some(commands) = &state.available_commands {
+                    response["availableCommands"] = commands.clone();
+                }
+            }
+            return Ok(response);
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        claims.insert(
+            session_id.to_owned(),
+            RestoreClaim {
+                token: token.clone(),
+                expires: Instant::now() + Duration::from_secs(10),
+                request_active: false,
+                release_pending: false,
+            },
+        );
+        Ok(json!({"restoreToken":token}))
+    }
+
+    fn wait_for_restore<'a>(
+        &self,
+        mut claims: std::sync::MutexGuard<'a, HashMap<String, RestoreClaim>>,
+        session_id: &str,
+    ) -> Result<std::sync::MutexGuard<'a, HashMap<String, RestoreClaim>>, String> {
+        while let Some(claim) = claims.get(session_id) {
+            if claim.request_active {
+                claims = self
+                    .restore_ready
+                    .wait(claims)
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
+            let remaining = claim.expires.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                claims.remove(session_id);
+                self.restore_ready.notify_all();
+                break;
+            }
+            claims = self
+                .restore_ready
+                .wait_timeout(claims, remaining)
+                .map_err(|error| error.to_string())?
+                .0;
+        }
+        Ok(claims)
+    }
+
+    fn release_restore(&self, session_id: &str, token: &str) -> Result<(), String> {
+        let mut claims = self.restores.lock().map_err(|error| error.to_string())?;
+        if let Some(claim) = claims
+            .get_mut(session_id)
+            .filter(|claim| claim.token == token)
+        {
+            if claim.request_active {
+                claim.release_pending = true;
+            } else {
+                claims.remove(session_id);
+                self.restore_ready.notify_all();
+            }
+        }
+        Ok(())
+    }
 }
 
 // The adapter fingerprints `cwd` and `mcpServers`, and recreates a live
@@ -495,26 +664,121 @@ fn reuse_session_config(
     Ok(next)
 }
 
+fn store_session_config(
+    alive: &AtomicBool,
+    configs: &mut HashMap<String, SessionConfig>,
+    session_id: &str,
+    config: SessionConfig,
+    mut release: impl FnMut(&str),
+) -> bool {
+    if !alive.load(Ordering::Acquire) {
+        release(&config.token);
+        return false;
+    }
+    if let Some(previous) = configs.insert(session_id.to_string(), config) {
+        release(&previous.token);
+    }
+    true
+}
+
+fn store_per_load_token(
+    alive: &AtomicBool,
+    tokens: &mut HashMap<String, Vec<String>>,
+    session_id: &str,
+    token: String,
+    mut release: impl FnMut(&str),
+) -> bool {
+    if !alive.load(Ordering::Acquire) {
+        release(&token);
+        return false;
+    }
+    tokens
+        .entry(session_id.to_string())
+        .or_default()
+        .push(token);
+    true
+}
+
+fn release_session_tokens(
+    tokens: &mut HashMap<String, Vec<String>>,
+    session_id: &str,
+    mut release: impl FnMut(&str),
+) {
+    if let Some(session_tokens) = tokens.remove(session_id) {
+        for token in session_tokens {
+            release(&token);
+        }
+    }
+}
+
+fn release_per_load_token(
+    tokens: &mut HashMap<String, Vec<String>>,
+    session_id: &str,
+    token: &str,
+    mut release: impl FnMut(&str),
+) {
+    let Some(session_tokens) = tokens.get_mut(session_id) else {
+        return;
+    };
+    let Some(index) = session_tokens.iter().position(|stored| stored == token) else {
+        return;
+    };
+    session_tokens.swap_remove(index);
+    if session_tokens.is_empty() {
+        tokens.remove(session_id);
+    }
+    release(token);
+}
+
+fn release_all_per_load_tokens(
+    tokens: &mut HashMap<String, Vec<String>>,
+    mut release: impl FnMut(&str),
+) {
+    for (_, session_tokens) in tokens.drain() {
+        for token in session_tokens {
+            release(&token);
+        }
+    }
+}
+
+struct RestoreConfigState<'a> {
+    alive: &'a AtomicBool,
+    configs: &'a mut HashMap<String, SessionConfig>,
+    per_load_tokens: &'a mut HashMap<String, Vec<String>>,
+}
+
 /// Returns the parameters to send for a restored session. Reuse keeps the adapter's live session;
 /// `per_load` is the documented rollback switch and mints a fresh config for every load.
 fn restore_params(
     per_load: bool,
-    configs: &mut HashMap<String, SessionConfig>,
+    state: RestoreConfigState<'_>,
     session_id: &str,
     cwd: &str,
     mint: impl FnOnce() -> Result<crate::browser_agent::McpConfig, String>,
     release: impl FnMut(&str),
-) -> Result<Value, String> {
+) -> Result<(Value, Option<String>), String> {
     if per_load {
         let config = mint()?;
         let servers = session_servers(mcp_server(&config));
-        return Ok(session_request_params(cwd, Some(session_id), &servers));
+        let token = config.token.clone();
+        if !store_per_load_token(
+            state.alive,
+            state.per_load_tokens,
+            session_id,
+            config.token,
+            release,
+        ) {
+            return Err("Agent process stopped. Reopen the thread to reconnect.".into());
+        }
+        return Ok((
+            session_request_params(cwd, Some(session_id), &servers),
+            Some(token),
+        ));
     }
-    let config = reuse_session_config(configs, session_id, cwd, mint, release)?;
-    Ok(session_request_params(
-        &config.cwd,
-        Some(session_id),
-        &config.servers,
+    let config = reuse_session_config(state.configs, session_id, cwd, mint, release)?;
+    Ok((
+        session_request_params(&config.cwd, Some(session_id), &config.servers),
+        None,
     ))
 }
 
@@ -834,6 +1098,7 @@ fn resolve_session_permissions(
 pub struct PendingPermissionInfo {
     agent: String,
     directory: String,
+    profile: String,
     message: Value,
     received_at: u64,
 }
@@ -1224,10 +1489,78 @@ fn prepare_runtime_directories(data_directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct ForgetGenerationKey {
+    agent: String,
+    directory: PathBuf,
+    session_id: String,
+}
+
+impl ForgetGenerationKey {
+    fn new(agent: &str, directory: &str, session_id: &str) -> Self {
+        Self {
+            agent: agent.to_string(),
+            directory: canonical_directory(directory),
+            session_id: session_id.to_string(),
+        }
+    }
+}
+
+type ForgetGenerations = HashMap<ForgetGenerationKey, u64>;
+
 #[derive(Clone, Default)]
-pub struct AgentManager(Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>);
+pub struct AgentManager(
+    Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>,
+    Arc<Mutex<ForgetGenerations>>,
+);
 
 impl AgentManager {
+    fn forget_generation(
+        &self,
+        agent: &str,
+        directory: &str,
+        session_id: &str,
+    ) -> Result<u64, String> {
+        Ok(*self
+            .1
+            .lock()
+            .map_err(|error| error.to_string())?
+            .get(&ForgetGenerationKey::new(agent, directory, session_id))
+            .unwrap_or(&0))
+    }
+
+    fn mark_forget(&self, agent: &str, directory: &str, session_id: &str) -> Result<(), String> {
+        *self
+            .1
+            .lock()
+            .map_err(|error| error.to_string())?
+            .entry(ForgetGenerationKey::new(agent, directory, session_id))
+            .or_default() += 1;
+        Ok(())
+    }
+
+    fn with_current_forget_generation<T>(
+        &self,
+        agent: &str,
+        directory: &str,
+        session_id: &str,
+        expected: u64,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let generations = self.1.lock().map_err(|error| error.to_string())?;
+        if generations
+            .get(&ForgetGenerationKey::new(agent, directory, session_id))
+            .copied()
+            .unwrap_or(0)
+            != expected
+        {
+            return Err("This agent thread was deleted while reconnecting.".into());
+        }
+        let result = operation();
+        drop(generations);
+        result
+    }
+
     fn active_sessions_in(
         &self,
         directory: &Path,
@@ -1425,6 +1758,10 @@ struct PromptState {
     active: HashMap<String, ActivePrompt>,
     finishing: HashSet<String>,
     finished: HashMap<String, PromptOutcome>,
+    forgotten: HashSet<String>,
+    forget_generation: HashMap<String, u64>,
+    pending_forgets: HashMap<String, usize>,
+    committed_forgets: HashSet<String>,
     tool_turns: HashMap<String, HashMap<String, String>>,
     retired_tool_turns: HashMap<String, VecDeque<(String, String)>>,
 }
@@ -1432,6 +1769,54 @@ struct PromptState {
 impl PromptState {
     const ACTIVE_TOOL_TURN_LIMIT: usize = 512;
     const RETIRED_TOOL_TURN_LIMIT: usize = 4096;
+
+    fn mark_forgotten(&mut self, session_id: &str) {
+        self.forgotten.insert(session_id.to_string());
+        *self
+            .pending_forgets
+            .entry(session_id.to_string())
+            .or_default() += 1;
+        *self
+            .forget_generation
+            .entry(session_id.to_string())
+            .or_default() += 1;
+    }
+
+    fn finish_forget(&mut self, session_id: &str, committed: bool) {
+        let Some(pending) = self.pending_forgets.get_mut(session_id) else {
+            return;
+        };
+        *pending -= 1;
+        if *pending == 0 {
+            self.pending_forgets.remove(session_id);
+        }
+        if committed {
+            self.committed_forgets.insert(session_id.to_string());
+        } else if !self.pending_forgets.contains_key(session_id)
+            && !self.committed_forgets.contains(session_id)
+        {
+            self.forgotten.remove(session_id);
+        }
+    }
+
+    fn ensure_prompt_available(&self, session_id: &str) -> Result<(), String> {
+        if self.forgotten.contains(session_id) {
+            return Err("This agent thread was deleted.".into());
+        }
+        Ok(())
+    }
+
+    fn complete_restore(&mut self, session_id: &str, generation: u64) -> Result<(), String> {
+        if self.forget_generation.get(session_id).copied().unwrap_or(0) != generation {
+            return Err("This agent thread was deleted while reconnecting.".into());
+        }
+        if self.pending_forgets.contains_key(session_id) {
+            return Err("This agent thread is being deleted.".into());
+        }
+        self.forgotten.remove(session_id);
+        self.committed_forgets.remove(session_id);
+        Ok(())
+    }
 
     fn remember_retired_tool_turns(
         &mut self,
@@ -1610,6 +1995,55 @@ fn durable_prompt_status(status: &'static str, failed: bool, dispatch_phase: u8)
     }
 }
 
+fn retry_completed_turn_evidence(
+    mut write: impl FnMut() -> Result<(), String>,
+    mut report: impl FnMut(&str),
+    mut pause: impl FnMut(Duration),
+    attempts: usize,
+) -> Result<(), String> {
+    let mut delay = Duration::from_millis(50);
+    for attempt in 0..attempts {
+        match write() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                report(&error);
+                if attempt + 1 == attempts {
+                    return Err(error);
+                }
+            }
+        }
+        pause(delay);
+        delay = delay.saturating_mul(2).min(Duration::from_secs(2));
+    }
+    Err("No completion evidence write was attempted.".into())
+}
+
+async fn retry_completion_evidence_after_cleanup<F, R, P, Fut, S>(
+    mut write: F,
+    mut report: R,
+    mut pause: P,
+    on_saved: S,
+) where
+    F: FnMut() -> Result<(), String>,
+    R: FnMut(&str),
+    P: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+    S: FnOnce(),
+{
+    let mut delay = Duration::from_millis(50);
+    loop {
+        match write() {
+            Ok(()) => {
+                on_saved();
+                return;
+            }
+            Err(error) => report(&error),
+        }
+        pause(delay).await;
+        delay = delay.saturating_mul(2).min(Duration::from_secs(2));
+    }
+}
+
 impl ActivePrompt {
     fn observe_update(&mut self, update: &Value) {
         match update.get("sessionUpdate").and_then(Value::as_str) {
@@ -1664,6 +2098,7 @@ impl ActivePrompt {
 #[cfg(test)]
 mod interruption_report_tests {
     use super::*;
+    use std::cell::Cell;
 
     fn prompt() -> ActivePrompt {
         ActivePrompt {
@@ -1675,6 +2110,279 @@ mod interruption_report_tests {
             agent_message_overflow: false,
             known_tool_calls: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn forgetting_waits_for_the_cancelled_turn_to_settle() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Arc::new(Mutex::new(prompts));
+        let settling = Arc::clone(&state);
+        let settled = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            settling.lock().unwrap().active.remove("target");
+        });
+        let started = Instant::now();
+        let mut cancelled = false;
+
+        cancel_before_forget(
+            &state,
+            &Mutex::new(()),
+            "target",
+            || {
+                cancelled = true;
+                Ok(())
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        settled.join().unwrap();
+        assert!(cancelled);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(!state.lock().unwrap().active.contains_key("target"));
+        assert!(state.lock().unwrap().forgotten.contains("target"));
+        state.lock().unwrap().finish_forget("target", true);
+        assert!(state
+            .lock()
+            .unwrap()
+            .ensure_prompt_available("target")
+            .is_err());
+    }
+
+    #[test]
+    fn forgetting_keeps_the_turn_active_when_cancel_fails() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Mutex::new(prompts);
+
+        let result = cancel_before_forget(
+            &state,
+            &Mutex::new(()),
+            "target",
+            || Err("cancel failed".into()),
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(result.unwrap_err(), "cancel failed");
+        assert!(state.lock().unwrap().active.contains_key("target"));
+        assert!(!state.lock().unwrap().forgotten.contains("target"));
+        state.lock().unwrap().active.remove("target");
+        assert!(state
+            .lock()
+            .unwrap()
+            .ensure_prompt_available("target")
+            .is_ok());
+    }
+
+    #[test]
+    fn timeout_keeps_token_and_allows_prompt_after_turn_settles() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Mutex::new(prompts);
+
+        let result =
+            cancel_before_forget(&state, &Mutex::new(()), "target", || Ok(()), Duration::ZERO);
+
+        assert_eq!(
+            result.unwrap_err(),
+            "Agent turn did not stop; browser token remains active."
+        );
+        assert!(!state.lock().unwrap().forgotten.contains("target"));
+        state.lock().unwrap().active.remove("target");
+        assert!(state
+            .lock()
+            .unwrap()
+            .ensure_prompt_available("target")
+            .is_ok());
+    }
+
+    #[test]
+    fn cancel_before_prompt_write_fences_late_dispatch() {
+        let mut prompts = PromptState::default();
+        prompts.active.insert("target".into(), prompt());
+        let state = Arc::new(Mutex::new(prompts));
+        let dispatch = Arc::new(Mutex::new(()));
+        let waiting = Arc::clone(&state);
+        let waiting_dispatch = Arc::clone(&dispatch);
+        let (cancelled, observed) = mpsc::channel();
+        let forget = std::thread::spawn(move || {
+            cancel_before_forget(
+                &waiting,
+                &waiting_dispatch,
+                "target",
+                || {
+                    cancelled.send(()).unwrap();
+                    Ok(())
+                },
+                Duration::from_secs(1),
+            )
+        });
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let mut wrote_prompt = false;
+        let result = dispatch_prompt_if_current(&dispatch, &state, "target", "turn", || {
+            wrote_prompt = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!wrote_prompt);
+        state.lock().unwrap().active.remove("target");
+        forget.join().unwrap().unwrap();
+        state.lock().unwrap().finish_forget("target", true);
+        assert!(state
+            .lock()
+            .unwrap()
+            .ensure_prompt_available("target")
+            .is_err());
+    }
+
+    #[test]
+    fn failed_forget_cannot_clear_another_pending_or_committed_deletion() {
+        let mut prompts = PromptState::default();
+        prompts.mark_forgotten("target");
+        prompts.mark_forgotten("target");
+
+        prompts.finish_forget("target", false);
+        assert!(prompts.ensure_prompt_available("target").is_err());
+        assert!(prompts.complete_restore("target", 2).is_err());
+        prompts.finish_forget("target", true);
+        assert!(prompts.ensure_prompt_available("target").is_err());
+
+        prompts.mark_forgotten("target");
+        prompts.finish_forget("target", false);
+        assert!(prompts.ensure_prompt_available("target").is_err());
+
+        let mut retryable = PromptState::default();
+        retryable.mark_forgotten("target");
+        retryable.mark_forgotten("target");
+        retryable.finish_forget("target", false);
+        assert!(retryable.ensure_prompt_available("target").is_err());
+        retryable.finish_forget("target", false);
+        assert!(retryable.ensure_prompt_available("target").is_ok());
+    }
+
+    #[test]
+    fn forgetting_idle_session_fences_late_turns() {
+        let state = Mutex::new(PromptState::default());
+
+        cancel_before_forget(
+            &state,
+            &Mutex::new(()),
+            "target",
+            || panic!("idle session must not be cancelled"),
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        assert!(state.lock().unwrap().forgotten.contains("target"));
+    }
+
+    #[test]
+    fn restore_started_before_forget_cannot_revive_deleted_session() {
+        let manager = AgentManager::default();
+        let directory = "/example/worktree";
+        let manager_generation = manager
+            .forget_generation("claude", directory, "target")
+            .unwrap();
+        let prompts = Mutex::new(PromptState::default());
+        manager.mark_forget("claude", directory, "target").unwrap();
+        prompts.lock().unwrap().mark_forgotten("target");
+        prompts.lock().unwrap().finish_forget("target", true);
+        // The restore reaches the runtime after deletion, so its local snapshot is current.
+        let restore_generation = prompts.lock().unwrap().forget_generation["target"];
+
+        assert_ne!(
+            manager
+                .forget_generation("claude", directory, "target")
+                .unwrap(),
+            manager_generation
+        );
+        assert_eq!(restore_generation, 1);
+        assert!(complete_restore_if_current(
+            &manager,
+            &prompts,
+            "claude",
+            directory,
+            "target",
+            manager_generation,
+            restore_generation,
+        )
+        .is_err());
+        assert!(prompts.lock().unwrap().forgotten.contains("target"));
+        let explicit_restore_generation = manager
+            .forget_generation("claude", directory, "target")
+            .unwrap();
+        assert_eq!(explicit_restore_generation, 1);
+        assert!(complete_restore_if_current(
+            &manager,
+            &prompts,
+            "claude",
+            directory,
+            "target",
+            explicit_restore_generation,
+            restore_generation,
+        )
+        .is_ok());
+        assert!(!prompts.lock().unwrap().forgotten.contains("target"));
+    }
+
+    #[test]
+    fn deletion_during_connect_prevents_late_registration_and_token_creation() {
+        let manager = AgentManager::default();
+        let directory = "/example/worktree";
+        let started_generation = manager
+            .forget_generation("claude", directory, "target")
+            .unwrap();
+        // Forget sees no connection while connect_blocking is still in progress.
+        manager.mark_forget("claude", directory, "target").unwrap();
+        let mut registered_or_minted = false;
+
+        let stale = manager.with_current_forget_generation(
+            "claude",
+            directory,
+            "target",
+            started_generation,
+            || {
+                registered_or_minted = true;
+                Ok(())
+            },
+        );
+
+        assert!(stale.is_err());
+        assert!(!registered_or_minted);
+        let explicit_generation = manager
+            .forget_generation("claude", directory, "target")
+            .unwrap();
+        manager
+            .with_current_forget_generation(
+                "claude",
+                directory,
+                "target",
+                explicit_generation,
+                || {
+                    registered_or_minted = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(registered_or_minted);
+    }
+
+    #[test]
+    fn restore_already_using_runtime_cannot_clear_later_forget() {
+        let mut prompts = PromptState::default();
+        let restore_generation = prompts
+            .forget_generation
+            .get("target")
+            .copied()
+            .unwrap_or(0);
+        prompts.mark_forgotten("target");
+
+        assert!(prompts
+            .complete_restore("target", restore_generation)
+            .is_err());
+        assert!(prompts.forgotten.contains("target"));
     }
 
     #[test]
@@ -2129,6 +2837,117 @@ mod interruption_report_tests {
     }
 
     #[test]
+    fn transient_completion_write_failure_delays_finished_event_until_evidence_is_durable() {
+        let attempts = Cell::new(0);
+        let reports = Cell::new(0);
+        let pauses = Cell::new(0);
+        let finished = Cell::new(false);
+        retry_completed_turn_evidence(
+            || {
+                assert!(!finished.get());
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err("injected settings write failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |error| {
+                assert_eq!(error, "injected settings write failure");
+                assert!(!finished.get());
+                reports.set(reports.get() + 1);
+            },
+            |delay| {
+                assert_eq!(delay, Duration::from_millis(50));
+                assert!(!finished.get());
+                pauses.set(pauses.get() + 1);
+            },
+            3,
+        )
+        .unwrap();
+        finished.set(true);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(reports.get(), 1);
+        assert_eq!(pauses.get(), 1);
+    }
+
+    #[test]
+    fn persistent_completion_write_failure_returns_without_signaling_a_finish() {
+        let attempts = Cell::new(0);
+        let pauses = Cell::new(0);
+        let result = retry_completed_turn_evidence(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err("injected persistent settings failure".into())
+            },
+            |_| {},
+            |_| pauses.set(pauses.get() + 1),
+            3,
+        );
+        assert_eq!(result.unwrap_err(), "injected persistent settings failure");
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(pauses.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_completion_write_retries_after_cleanup_and_signals_once_after_recovery() {
+        let attempts = Cell::new(0);
+        let ready_events = Cell::new(0);
+        let pauses = Cell::new(0);
+        retry_completion_evidence_after_cleanup(
+            || {
+                assert_eq!(ready_events.get(), 0);
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= 4 {
+                    Err("injected persistent settings failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| assert_eq!(ready_events.get(), 0),
+            |delay| {
+                pauses.set(pauses.get() + 1);
+                assert!(delay <= Duration::from_secs(2));
+                async {}
+            },
+            || ready_events.set(ready_events.get() + 1),
+        )
+        .await;
+        assert_eq!(attempts.get(), 5);
+        assert_eq!(pauses.get(), 4);
+        assert_eq!(ready_events.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn background_completion_retry_can_be_cancelled_when_the_app_stops() {
+        use std::sync::atomic::AtomicUsize;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let ready_events = Arc::new(AtomicUsize::new(0));
+        let retry_attempts = attempts.clone();
+        let retry_events = ready_events.clone();
+        let retry = tokio::spawn(async move {
+            retry_completion_evidence_after_cleanup(
+                || {
+                    retry_attempts.fetch_add(1, Ordering::SeqCst);
+                    Err("settings remain unwritable".into())
+                },
+                |_| {},
+                |_| std::future::pending::<()>(),
+                || {
+                    retry_events.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        retry.abort();
+        assert!(retry.await.unwrap_err().is_cancelled());
+        assert_eq!(ready_events.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn prompt_response_waits_for_reader_acknowledgement() {
         let progress = Arc::new(ReaderProgress::default());
         let generation = progress.next_generation();
@@ -2237,6 +3056,7 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                profile: runtime.profile.as_str().to_string(),
                 directory: runtime
                     .session_directories
                     .lock()
@@ -2263,6 +3083,7 @@ pub fn acp_pending_inbox(
         {
             pending.push(PendingPermissionInfo {
                 agent: runtime.agent.clone(),
+                profile: runtime.profile.as_str().to_string(),
                 directory: runtime
                     .session_directories
                     .lock()
@@ -3031,16 +3852,21 @@ fn connect_blocking_inner(
         elicitation_state: Mutex::new(HashMap::new()),
         next_permission_generation: AtomicU64::new(1),
         prompt_state: Mutex::new(PromptState::default()),
+        prompt_dispatch: Mutex::new(()),
         cancelled_prompts: Mutex::new(HashSet::new()),
         next_id: AtomicU64::new(1),
         alive: AtomicBool::new(true),
         capabilities: Mutex::new(Value::Null),
         session_directories: Mutex::new(HashMap::new()),
         session_configs: Mutex::new(HashMap::new()),
+        per_load_tokens: Mutex::new(HashMap::new()),
         native_subagents: Mutex::new(NativeSubagentRegistry::default()),
         session_profiles: Mutex::new(HashMap::new()),
+        session_ui: Mutex::new(HashMap::new()),
         pending_directory: Mutex::new(None),
         session_creation: Mutex::new(()),
+        restores: Mutex::new(HashMap::new()),
+        restore_ready: Condvar::new(),
         ready: Condvar::new(),
     });
     let reader = Arc::clone(&runtime);
@@ -3063,6 +3889,17 @@ fn connect_blocking_inner(
                 };
                 message = translated;
             }
+            if message
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| method.starts_with("sail/"))
+            {
+                crate::diagnostics::record(
+                    "acp_reserved_method",
+                    json!({"agent":agent_id,"method":message.get("method")}),
+                );
+                continue;
+            }
             if message.get("method").is_some() {
                 if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
                     params.insert("sailCapabilityProfile".into(), profile.as_str().into());
@@ -3074,6 +3911,12 @@ fn connect_blocking_inner(
                 {
                     if let Ok(mut prompts) = reader.prompt_state.lock() {
                         prompts.observe_update(session_id, update);
+                    }
+                    if let Err(error) = reader.remember_session_ui(session_id, update) {
+                        crate::diagnostics::record(
+                            "acp_session_ui_cache_failed",
+                            json!({"agent":agent_id,"sessionId":session_id,"error":error}),
+                        );
                     }
                 }
                 if update.get("sessionUpdate").and_then(Value::as_str) == Some("subagent_spawned") {
@@ -3342,6 +4185,10 @@ fn connect_blocking_inner(
                 browser.release(&config.token);
             }
         }
+        if let Ok(mut tokens) = reader.per_load_tokens.lock() {
+            let browser = app.state::<crate::browser_agent::BrowserManager>();
+            release_all_per_load_tokens(&mut tokens, |token| browser.release(token));
+        }
         let mut session_ids = reader
             .session_profiles
             .lock()
@@ -3494,6 +4341,7 @@ pub struct AcpElicitationParams {
 
 #[tauri::command]
 pub fn acp_elicitation(
+    app: AppHandle,
     manager: State<'_, AgentManager>,
     params: AcpElicitationParams,
 ) -> Result<(), String> {
@@ -3521,6 +4369,17 @@ pub fn acp_elicitation(
             .insert(key, pending);
         return Err(error);
     }
+    let _ = app.emit(
+        "acp-event",
+        AgentEvent {
+            agent: params.agent,
+            directory: Some(params.directory),
+            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+            message: json!({"method":"sail/elicitation_resolved","params":{
+                "sessionId":params.session_id,"requestId":params.request_id
+            }}),
+        },
+    );
     Ok(())
 }
 
@@ -3603,28 +4462,40 @@ pub async fn acp_new_session(
             let _ = fence.finish_session(&directory, native_generation);
             return Err("Agent did not return a session ID.".into());
         };
-        if !per_load_mcp() {
+        if per_load_mcp() {
+            let mut tokens = runtime
+                .per_load_tokens
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if !store_per_load_token(
+                &runtime.alive,
+                &mut tokens,
+                id,
+                config.token.clone(),
+                |token| browser.release(token),
+            ) {
+                let _ = fence.finish_session(&directory, native_generation);
+                return Err("Agent process stopped. Reopen the thread to reconnect.".into());
+            }
+        } else {
             let mut configs = runtime
                 .session_configs
                 .lock()
                 .map_err(|error| error.to_string())?;
-            // The reader drains this map when it exits, so a config stored for a stopped agent
-            // would keep its token for the life of the process.
-            if runtime.alive.load(Ordering::Acquire) {
-                let previous = configs.insert(
-                    id.to_string(),
-                    SessionConfig {
-                        cwd: cwd.clone(),
-                        directory: canonical_directory(&cwd),
-                        servers,
-                        token: config.token.clone(),
-                    },
-                );
-                if let Some(previous) = previous {
-                    browser.release(&previous.token);
-                }
-            } else {
-                browser.release(&config.token);
+            if !store_session_config(
+                &runtime.alive,
+                &mut configs,
+                id,
+                SessionConfig {
+                    cwd: cwd.clone(),
+                    directory: canonical_directory(&cwd),
+                    servers,
+                    token: config.token.clone(),
+                },
+                |token| browser.release(token),
+            ) {
+                let _ = fence.finish_session(&directory, native_generation);
+                return Err("Agent process stopped. Reopen the thread to reconnect.".into());
             }
         }
         if let Err(error) = register_session(&manager, &agent, profile, id, directory.clone()) {
@@ -3646,6 +4517,13 @@ pub async fn acp_new_session(
             let _ = fence.release_session(&agent, &directory, id);
             return Err(error);
         }
+        runtime
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .forgotten
+            .remove(id);
+        runtime.remember_session_ui(id, &result)?;
         browser.identify(&config.token, id);
         Ok(result)
     })
@@ -3663,15 +4541,129 @@ pub fn acp_release_session_fence(
     fence.release_session(&agent, Path::new(&directory), &session_id)
 }
 
-/// Releases the browser token a deleted thread's session still holds.
+fn cancel_before_forget(
+    prompts: &Mutex<PromptState>,
+    dispatch: &Mutex<()>,
+    session_id: &str,
+    cancel: impl FnOnce() -> Result<(), String>,
+    timeout: Duration,
+) -> Result<(), String> {
+    // Serialize deletion's fence and cancel with the prompt write. An adapter can ignore
+    // cancellation sent before it receives the prompt.
+    let active = {
+        let _dispatch = dispatch.lock().map_err(|error| error.to_string())?;
+        let active = {
+            let mut prompts = prompts.lock().map_err(|error| error.to_string())?;
+            prompts.mark_forgotten(session_id);
+            prompts.active.contains_key(session_id)
+        };
+        if active {
+            if let Err(error) = cancel() {
+                prompts
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(session_id, false);
+                return Err(error);
+            }
+        }
+        active
+    };
+    let result = (|| {
+        if !active {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !prompts
+                .lock()
+                .map_err(|error| error.to_string())?
+                .active
+                .contains_key(session_id)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("Agent turn did not stop; browser token remains active.".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })();
+    if result.is_err() {
+        prompts
+            .lock()
+            .map_err(|error| error.to_string())?
+            .finish_forget(session_id, false);
+    }
+    result
+}
+
+fn dispatch_prompt_if_current<T>(
+    dispatch: &Mutex<()>,
+    prompts: &Mutex<PromptState>,
+    session_id: &str,
+    turn_id: &str,
+    write: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _dispatch = dispatch.lock().map_err(|error| error.to_string())?;
+    let prompts = prompts.lock().map_err(|error| error.to_string())?;
+    prompts.ensure_prompt_available(session_id)?;
+    if !prompts
+        .active
+        .get(session_id)
+        .is_some_and(|prompt| prompt.turn_id == turn_id)
+        || prompts.finishing.contains(session_id)
+    {
+        return Err("This agent turn is no longer active.".into());
+    }
+    drop(prompts);
+    write()
+}
+
+fn complete_restore_if_current(
+    manager: &AgentManager,
+    prompts: &Mutex<PromptState>,
+    agent: &str,
+    directory: &str,
+    session_id: &str,
+    manager_generation: u64,
+    runtime_generation: u64,
+) -> Result<(), String> {
+    if manager.forget_generation(agent, directory, session_id)? != manager_generation {
+        return Err("This agent thread was deleted while reconnecting.".into());
+    }
+    prompts
+        .lock()
+        .map_err(|error| error.to_string())?
+        .complete_restore(session_id, runtime_generation)
+}
+
+/// E2E specs share one app process; release their fixture runtimes between specs.
+/// The command is only permitted by the E2E capability and has no production effect.
 #[tauri::command]
-pub fn acp_forget_session(
+pub fn acp_reset_test_runtimes(manager: State<'_, AgentManager>) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    {
+        manager.shutdown();
+        Ok(())
+    }
+    #[cfg(not(feature = "e2e"))]
+    {
+        let _ = manager;
+        Err("ACP test runtime reset requires the E2E build".into())
+    }
+}
+
+/// Cancels a deleted thread's active turn before releasing its browser token.
+#[tauri::command]
+pub async fn acp_forget_session(
+    app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
     agent: String,
     directory: String,
     session_id: String,
 ) -> Result<(), String> {
+    manager.mark_forget(&agent, &directory, &session_id)?;
     for profile in [
         CapabilityProfile::Explore,
         CapabilityProfile::Review,
@@ -3682,14 +4674,171 @@ pub fn acp_forget_session(
         else {
             continue;
         };
-        let removed = runtime
-            .session_configs
+        let waiting = Arc::clone(&runtime);
+        let waiting_session = session_id.clone();
+        let waiting_agent = agent.clone();
+        let waiting_app = app.clone();
+        let stopped = tauri::async_runtime::spawn_blocking(move || {
+            cancel_before_forget(
+                &waiting.prompt_state,
+                &waiting.prompt_dispatch,
+                &waiting_session,
+                || {
+                    cancel_session(
+                        &waiting_app,
+                        &waiting,
+                        &waiting_agent,
+                        &waiting_session,
+                        None,
+                    )
+                },
+                Duration::from_secs(30),
+            )
+        })
+        .await;
+        match stopped {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                runtime
+                    .prompt_state
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(&session_id, false);
+                return Err(error.to_string());
+            }
+        }
+        if let Err(error) = runtime
+            .restores
             .lock()
-            .map_err(|error| error.to_string())?
-            .remove(&session_id);
+            .map(|mut claims| claims.remove(&session_id))
+        {
+            runtime
+                .prompt_state
+                .lock()
+                .map_err(|cause| cause.to_string())?
+                .finish_forget(&session_id, false);
+            return Err(error.to_string());
+        }
+        runtime.restore_ready.notify_all();
+        let mut configs = match runtime.session_configs.lock() {
+            Ok(configs) => configs,
+            Err(error) => {
+                runtime
+                    .prompt_state
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(&session_id, false);
+                return Err(error.to_string());
+            }
+        };
+        let mut session_ui = match runtime.session_ui.lock() {
+            Ok(session_ui) => session_ui,
+            Err(error) => {
+                drop(configs);
+                runtime
+                    .prompt_state
+                    .lock()
+                    .map_err(|cause| cause.to_string())?
+                    .finish_forget(&session_id, false);
+                return Err(error.to_string());
+            }
+        };
+        let removed = configs.remove(&session_id);
+        session_ui.remove(&session_id);
+        drop((configs, session_ui));
         if let Some(config) = removed {
             browser.release(&config.token);
         }
+        let mut tokens = runtime
+            .per_load_tokens
+            .lock()
+            .map_err(|error| error.to_string())?;
+        release_session_tokens(&mut tokens, &session_id, |token| browser.release(token));
+        runtime
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .finish_forget(&session_id, true);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn acp_begin_session_restore(
+    app: AppHandle,
+    manager: State<'_, AgentManager>,
+    agent: String,
+    cwd: String,
+    session_id: String,
+    profile: Option<String>,
+) -> Result<Value, String> {
+    let manager_generation = manager.forget_generation(&agent, &cwd, &session_id)?;
+    let profile = parse_profile(profile.as_deref())?;
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        connect_blocking(app, &manager, agent.clone(), profile, Path::new(&cwd))?;
+        let runtime = manager.with_current_forget_generation(
+            &agent,
+            &cwd,
+            &session_id,
+            manager_generation,
+            || register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd)),
+        )?;
+        let result = runtime.begin_restore(&session_id)?;
+        if let Err(error) = manager.with_current_forget_generation(
+            &agent,
+            &cwd,
+            &session_id,
+            manager_generation,
+            || Ok(()),
+        ) {
+            if let Some(token) = result.get("restoreToken").and_then(Value::as_str) {
+                runtime.release_restore(&session_id, token)?;
+            }
+            return Err(error);
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn acp_end_session_restore(
+    manager: State<'_, AgentManager>,
+    agent: String,
+    directory: String,
+    session_id: String,
+    restore_token: String,
+) -> Result<(), String> {
+    release_session_restore(
+        &manager,
+        &agent,
+        Path::new(&directory),
+        &session_id,
+        &restore_token,
+    )
+}
+
+fn release_session_restore(
+    manager: &AgentManager,
+    agent: &str,
+    directory: &Path,
+    session_id: &str,
+    token: &str,
+) -> Result<(), String> {
+    let worktree = worktree_identity(directory);
+    let runtimes = manager
+        .0
+        .lock()
+        .map_err(|error| error.to_string())?
+        .values()
+        .filter(|runtime| runtime.agent == agent && runtime.worktree == worktree)
+        .cloned()
+        .collect::<Vec<_>>();
+    for runtime in runtimes {
+        runtime.release_restore(session_id, token)?;
     }
     Ok(())
 }
@@ -3699,24 +4848,9 @@ pub async fn acp_load_session(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
-    agent: String,
-    cwd: String,
-    session_id: String,
-    profile: Option<String>,
+    params: RestoreSessionCommand,
 ) -> Result<Value, String> {
-    restore_session(
-        manager,
-        app,
-        browser,
-        RestoreSessionParams {
-            agent,
-            cwd,
-            session_id,
-            profile,
-            method: "session/load",
-        },
-    )
-    .await
+    restore_session(manager, app, browser, params, "session/load").await
 }
 
 #[tauri::command]
@@ -3724,24 +4858,9 @@ pub async fn acp_resume_session(
     app: AppHandle,
     manager: State<'_, AgentManager>,
     browser: State<'_, crate::browser_agent::BrowserManager>,
-    agent: String,
-    cwd: String,
-    session_id: String,
-    profile: Option<String>,
+    params: RestoreSessionCommand,
 ) -> Result<Value, String> {
-    restore_session(
-        manager,
-        app,
-        browser,
-        RestoreSessionParams {
-            agent,
-            cwd,
-            session_id,
-            profile,
-            method: "session/resume",
-        },
-    )
-    .await
+    restore_session(manager, app, browser, params, "session/resume").await
 }
 
 /// One page of the agent's own session history for a working directory.
@@ -3776,27 +4895,43 @@ pub async fn acp_list_sessions(
     .map_err(|error| error.to_string())?
 }
 
-struct RestoreSessionParams {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreSessionCommand {
     agent: String,
     cwd: String,
     session_id: String,
     profile: Option<String>,
-    method: &'static str,
+    restore_token: Option<String>,
+}
+
+fn with_restore_claim<T>(
+    runtime: &Connection,
+    session_id: &str,
+    token: Option<&str>,
+    request: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = token
+        .map(|token| runtime.begin_restore_request(session_id, token))
+        .transpose()?;
+    request()
 }
 
 async fn restore_session(
     manager: State<'_, AgentManager>,
     app: AppHandle,
     browser: State<'_, crate::browser_agent::BrowserManager>,
-    params: RestoreSessionParams,
+    params: RestoreSessionCommand,
+    method: &'static str,
 ) -> Result<Value, String> {
-    let RestoreSessionParams {
+    let RestoreSessionCommand {
         agent,
         cwd,
         session_id,
         profile,
-        method,
+        restore_token,
     } = params;
+    let manager_generation = manager.forget_generation(&agent, &cwd, &session_id)?;
     let profile = parse_profile(profile.as_deref())?;
     let manager = manager.inner().clone();
     let browser = browser.inner().clone();
@@ -3808,50 +4943,112 @@ async fn restore_session(
             profile,
             Path::new(&cwd),
         )?;
-        let runtime =
-            register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd))?;
-        let params = {
-            let mut configs = runtime
-                .session_configs
-                .lock()
-                .map_err(|error| error.to_string())?;
-            // The reader drains this map when it exits, so minting for a stopped agent would
-            // leak the token.
-            if !runtime.alive.load(Ordering::Acquire) {
-                return Err("Agent process stopped. Reopen the thread to reconnect.".to_string());
+        let runtime = manager.with_current_forget_generation(
+            &agent,
+            &cwd,
+            &session_id,
+            manager_generation,
+            || register_session(&manager, &agent, profile, &session_id, PathBuf::from(&cwd)),
+        )?;
+        with_restore_claim(&runtime, &session_id, restore_token.as_deref(), || {
+            // Forget must not finish while this restore mints a browser token.
+            let (forget_generation, params, minted_token) = manager
+                .with_current_forget_generation(
+                    &agent,
+                    &cwd,
+                    &session_id,
+                    manager_generation,
+                    || {
+                        let forget_generation = runtime
+                            .prompt_state
+                            .lock()
+                            .map_err(|error| error.to_string())?
+                            .forget_generation
+                            .get(&session_id)
+                            .copied()
+                            .unwrap_or(0);
+                        let (params, minted_token) = {
+                            let mut configs = runtime
+                                .session_configs
+                                .lock()
+                                .map_err(|error| error.to_string())?;
+                            if !runtime.alive.load(Ordering::Acquire) {
+                                return Err(
+                                    "Agent process stopped. Reopen the thread to reconnect."
+                                        .to_string(),
+                                );
+                            }
+                            let mut tokens = runtime
+                                .per_load_tokens
+                                .lock()
+                                .map_err(|error| error.to_string())?;
+                            restore_params(
+                                per_load_mcp(),
+                                RestoreConfigState {
+                                    alive: &runtime.alive,
+                                    configs: &mut configs,
+                                    per_load_tokens: &mut tokens,
+                                },
+                                &session_id,
+                                &cwd,
+                                || {
+                                    browser.config_for_profile(
+                                        &cwd,
+                                        Some(&session_id),
+                                        Some(&agent),
+                                        Some(profile.as_str()),
+                                        crate::background_priority::enabled(&app),
+                                    )
+                                },
+                                |token| browser.release(token),
+                            )?
+                        };
+                        Ok((forget_generation, params, minted_token))
+                    },
+                )?;
+            let result = runtime.request(method, params, Duration::from_secs(60));
+            if result.is_err() {
+                if let Some(token) = minted_token {
+                    let mut tokens = runtime
+                        .per_load_tokens
+                        .lock()
+                        .map_err(|error| error.to_string())?;
+                    release_per_load_token(&mut tokens, &session_id, &token, |token| {
+                        browser.release(token)
+                    });
+                }
+                runtime
+                    .session_directories
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .remove(&session_id);
+                runtime
+                    .session_profiles
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .remove(&session_id);
             }
-            restore_params(
-                per_load_mcp(),
-                &mut configs,
-                &session_id,
+            let result = result?;
+            complete_restore_if_current(
+                &manager,
+                &runtime.prompt_state,
+                &agent,
                 &cwd,
+                &session_id,
+                manager_generation,
+                forget_generation,
+            )?;
+            manager.with_current_forget_generation(
+                &agent,
+                &cwd,
+                &session_id,
+                manager_generation,
                 || {
-                    browser.config_for_profile(
-                        &cwd,
-                        Some(&session_id),
-                        Some(&agent),
-                        Some(profile.as_str()),
-                        crate::background_priority::enabled(&app),
-                    )
+                    runtime.remember_session_ui(&session_id, &result)?;
+                    Ok(result)
                 },
-                |token| browser.release(token),
-            )?
-        };
-        let result = runtime.request(method, params, Duration::from_secs(60));
-        if result.is_err() {
-            runtime
-                .session_directories
-                .lock()
-                .map_err(|error| error.to_string())?
-                .remove(&session_id);
-            runtime
-                .session_profiles
-                .lock()
-                .map_err(|error| error.to_string())?
-                .remove(&session_id);
-        }
-        let result = result?;
-        Ok(result)
+            )
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -3930,29 +5127,41 @@ pub async fn acp_prompt(
     } = params;
     let content = prepare_prompt_content(&app, &text, image_paths).await?;
     let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
-    {
-        let mut prompts = runtime
+    let preflight_runtime = Arc::clone(&runtime);
+    let preflight_session = session_id.clone();
+    let preflight_turn = turn_id.clone();
+    let preflight_text = text.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let claims = preflight_runtime
+            .restores
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let _claims = preflight_runtime.wait_for_restore(claims, &preflight_session)?;
+        let mut prompts = preflight_runtime
             .prompt_state
             .lock()
             .map_err(|error| error.to_string())?;
-        if prompts.active.contains_key(&session_id) || prompts.finishing.contains(&session_id) {
+        prompts.ensure_prompt_available(&preflight_session)?;
+        if prompts.active.contains_key(&preflight_session)
+            || prompts.finishing.contains(&preflight_session)
+        {
             return Err("This agent thread already has an active turn.".to_string());
         }
-        let processed_generation = runtime.reader_progress.processed()?;
-        if !runtime
+        let processed_generation = preflight_runtime.reader_progress.processed()?;
+        if !preflight_runtime
             .permission_state
             .lock()
             .map_err(|error| error.to_string())?
-            .begin_turn(&session_id, processed_generation)
+            .begin_turn(&preflight_session, processed_generation)
         {
             return Err("The previous cancelled turn is still settling.".into());
         }
-        prompts.finished.remove(&session_id);
+        prompts.finished.remove(&preflight_session);
         prompts.active.insert(
-            session_id.clone(),
+            preflight_session,
             ActivePrompt {
-                turn_id: turn_id.clone(),
-                text: text.clone(),
+                turn_id: preflight_turn,
+                text: preflight_text,
                 memory_capture: crate::memory_capture::TurnCapture::default(),
                 last_agent_message: String::new(),
                 agent_message_open: false,
@@ -3960,7 +5169,10 @@ pub async fn acp_prompt(
                 known_tool_calls: HashSet::new(),
             },
         );
-    }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     if let Err(error) = crate::settings::record_acp_turn_evidence(
         &app,
         crate::settings::AcpTurnEvidence {
@@ -3971,6 +5183,7 @@ pub async fn acp_prompt(
             status: "prepared".into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: true,
         },
     ) {
         if let Ok(mut prompts) = runtime.prompt_state.lock() {
@@ -4009,6 +5222,7 @@ pub async fn acp_prompt(
         let uncertain_directory = directory.clone();
         let dispatch_agent = agent.clone();
         let dispatch_session = session_id.clone();
+        let dispatch_turn = turn_id.clone();
         let dispatch_directory = PathBuf::from(directory.clone());
         let writer = Arc::clone(&runtime);
         let response = runtime.request_response_around_write(
@@ -4018,27 +5232,41 @@ pub async fn acp_prompt(
             }),
             Duration::from_secs(60 * 60 * 3),
             move |message| {
-                dispatch_fence.dispatch_session(&dispatch_agent, &dispatch_directory, &dispatch_session, || {
-                    crate::settings::record_acp_turn_evidence(
-                        &uncertain_app,
-                        crate::settings::AcpTurnEvidence {
-                            agent: uncertain_agent,
-                            directory: uncertain_directory,
-                            session_id: uncertain_session,
-                            turn_id: uncertain_turn,
-                            status: "dispatch_uncertain".into(),
-                            error: None,
-                            updated_at: 0,
-                        },
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "Cannot persist uncertain prompt dispatch before sending: {error}"
+                dispatch_prompt_if_current(
+                    &writer.prompt_dispatch,
+                    &writer.prompt_state,
+                    &dispatch_session,
+                    &dispatch_turn,
+                    || {
+                        dispatch_fence.dispatch_session(
+                            &dispatch_agent,
+                            &dispatch_directory,
+                            &dispatch_session,
+                            || {
+                                crate::settings::record_acp_turn_evidence(
+                                    &uncertain_app,
+                                    crate::settings::AcpTurnEvidence {
+                                        agent: uncertain_agent,
+                                        directory: uncertain_directory,
+                                        session_id: uncertain_session,
+                                        turn_id: uncertain_turn,
+                                        status: "dispatch_uncertain".into(),
+                                        error: None,
+                                        updated_at: 0,
+                                        post_turn_pending: false,
+                                    },
+                                )
+                                .map_err(|error| {
+                                    format!(
+                                        "Cannot persist uncertain prompt dispatch before sending: {error}"
+                                    )
+                                })?;
+                                uncertain_phase.store(1, Ordering::Release);
+                                writer.write(message)
+                            },
                         )
-                    })?;
-                    uncertain_phase.store(1, Ordering::Release);
-                    writer.write(message)
-                })
+                    },
+                )
             },
             move || {
                 match crate::settings::record_acp_turn_evidence(
@@ -4051,6 +5279,7 @@ pub async fn acp_prompt(
                         status: "dispatched".into(),
                         error: None,
                         updated_at: 0,
+                        post_turn_pending: false,
                     },
                 ) {
                     Ok(()) => dispatched_phase.store(2, Ordering::Release),
@@ -4139,23 +5368,39 @@ pub async fn acp_prompt(
             result.is_err() && settlement_generation.is_none(),
             dispatch_phase.load(Ordering::Acquire),
         );
-        if let Err(error) = crate::settings::record_acp_turn_evidence(
-            &app,
-            crate::settings::AcpTurnEvidence {
-                agent: agent.clone(),
-                directory: directory.clone(),
-                session_id: session_id.clone(),
-                turn_id: turn_id.clone(),
-                status: evidence_status.into(),
-                error: result.as_ref().err().cloned(),
-                updated_at: 0,
-            },
-        ) {
+        let notify = !explicitly_cancelled && !interrupted;
+        let completion_evidence = crate::settings::AcpTurnEvidence {
+            agent: agent.clone(),
+            directory: directory.clone(),
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            status: evidence_status.into(),
+            error: result.as_ref().err().cloned(),
+            updated_at: 0,
+            post_turn_pending: evidence_status == "done" && notify,
+        };
+        let report_evidence_error = |error: &str| {
             crate::diagnostics::record(
                 "acp_turn_evidence_failed",
                 json!({"agent":agent,"sessionId":session_id,"turnId":turn_id,"error":error}),
             );
-        }
+        };
+        let completion_write_error = if completion_evidence.post_turn_pending {
+            retry_completed_turn_evidence(
+                || crate::settings::record_acp_turn_evidence(&app, completion_evidence.clone()),
+                |error| report_evidence_error(error),
+                std::thread::sleep,
+                4,
+            )
+            .err()
+        } else if let Err(error) =
+            crate::settings::record_acp_turn_evidence(&app, completion_evidence.clone())
+        {
+            report_evidence_error(&error);
+            None
+        } else {
+            None
+        };
         crate::diagnostics::record("prompt_finished", json!({
             "agent":agent,"sessionId":session_id,"turnId":turn_id,
             "status":status,"explicitlyCancelled":explicitly_cancelled,
@@ -4163,7 +5408,6 @@ pub async fn acp_prompt(
             "reportedErrorInterruption":reported_error_interruption,
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
-        let notify = !explicitly_cancelled && !interrupted;
         let stop_reason = result
             .as_ref()
             .ok()
@@ -4221,20 +5465,63 @@ pub async fn acp_prompt(
                 cleanup_session_processes(&app, &runtime, &agent, &session_id);
             },
         );
-        if latest {
-            let _ = app.emit(
-                "acp-event",
-                AgentEvent {
-                    agent,
-                    directory: directory.map(|path| path.to_string_lossy().into_owned()),
-                    worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
-                    message: json!({"method":"sail/prompt_finished","params":{
-                        "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
-                        "error":result.as_ref().err(),
-                        "sailCapabilityProfile":runtime.profile.as_str()
-                    }}),
-                },
-            );
+        let finished_event = AgentEvent {
+            agent: agent.clone(),
+            directory: directory.map(|path| path.to_string_lossy().into_owned()),
+            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+            message: json!({"method":"sail/prompt_finished","params":{
+                "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
+                "error":result.as_ref().err(),
+                "sailCapabilityProfile":runtime.profile.as_str()
+            }}),
+        };
+        if let Some(write_error) = completion_write_error {
+            if latest {
+                let mut pending_event = finished_event.clone();
+                pending_event.message["params"]["notify"] = Value::Bool(false);
+                pending_event.message["params"]["evidenceError"] = Value::String(write_error);
+                let _ = app.emit("acp-event", pending_event);
+            }
+            let retry_app = app.clone();
+            let evidence_directory = completion_evidence.directory.clone();
+            // The retry belongs to the app, not the ACP connection: disconnecting the agent
+            // must not discard a completion whose check is still pending.
+            drop(tauri::async_runtime::spawn(async move {
+                retry_completion_evidence_after_cleanup(
+                    || {
+                        crate::settings::record_acp_turn_evidence(
+                            &retry_app,
+                            completion_evidence.clone(),
+                        )
+                    },
+                    |error| {
+                        crate::diagnostics::record(
+                            "acp_turn_evidence_failed",
+                            json!({"agent":agent,"sessionId":session_id,"turnId":turn_id,
+                                "error":error}),
+                        );
+                    },
+                    tokio::time::sleep,
+                    || {
+                        if latest {
+                            let _ = retry_app.emit(
+                                "acp-event",
+                                AgentEvent {
+                                    agent: finished_event.agent,
+                                    directory: Some(evidence_directory),
+                                    worktree: finished_event.worktree,
+                                    message: json!({"method":"sail/post_turn_evidence_ready","params":{
+                                        "sessionId":session_id,"turnId":turn_id
+                                    }}),
+                                },
+                            );
+                        }
+                    },
+                )
+                .await;
+            }));
+        } else if latest {
+            let _ = app.emit("acp-event", finished_event);
         }
         result
     })
@@ -4604,11 +5891,13 @@ pub async fn acp_set_config(
 ) -> Result<Value, String> {
     let runtime = connection_for_session(&manager, &agent, &session_id, Path::new(&directory))?;
     tauri::async_runtime::spawn_blocking(move || {
-        runtime.request(
+        let result = runtime.request(
             "session/set_config_option",
             json!({"sessionId":session_id,"configId":config_id,"value":value}),
             Duration::from_secs(30),
-        )
+        )?;
+        runtime.remember_session_ui(&session_id, &result)?;
+        Ok(result)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -4718,6 +6007,7 @@ mod session_config_tests {
             )])),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
+            prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
@@ -4727,12 +6017,153 @@ mod session_config_tests {
                 worktree.to_path_buf(),
             )])),
             session_configs: Mutex::new(HashMap::new()),
+            per_load_tokens: Mutex::new(HashMap::new()),
             native_subagents: Mutex::new(NativeSubagentRegistry::default()),
             session_profiles: Mutex::new(HashMap::from([(session_id.to_owned(), profile)])),
+            session_ui: Mutex::new(HashMap::new()),
             pending_directory: Mutex::new(None),
             session_creation: Mutex::new(()),
+            restores: Mutex::new(HashMap::new()),
+            restore_ready: Condvar::new(),
             ready: Condvar::new(),
         })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_claim_survives_backend_result_until_frontend_finalizes() {
+        let runtime = test_runtime(
+            "claude",
+            CapabilityProfile::Build,
+            Path::new("/worktree"),
+            "session",
+        );
+        let token = runtime.begin_restore("session").unwrap()["restoreToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        with_restore_claim(&runtime, "session", Some(&token), || Ok(())).unwrap();
+        let waiting = Arc::clone(&runtime);
+        let (started, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let claims = waiting.restores.lock().unwrap();
+            started.send(()).unwrap();
+            let _claims = waiting.wait_for_restore(claims, "session").unwrap();
+            waiting.prompt_state.lock().unwrap().active.insert(
+                "session".into(),
+                ActivePrompt {
+                    turn_id: "new-turn".into(),
+                    text: "hello".into(),
+                    memory_capture: crate::memory_capture::TurnCapture::default(),
+                    last_agent_message: String::new(),
+                    agent_message_open: false,
+                    agent_message_overflow: false,
+                    known_tool_calls: HashSet::new(),
+                },
+            );
+        });
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        // The backend load has returned, but the frontend has not applied replay yet.
+        assert!(runtime.prompt_state.lock().unwrap().active.is_empty());
+        runtime.release_restore("session", &token).unwrap();
+        worker.join().unwrap();
+        runtime
+            .remember_session_ui(
+                "session",
+                &json!({"configOptions":[{"id":"model","currentValue":"first"}],
+                    "availableCommands":[{"name":"inspect"}]}),
+            )
+            .unwrap();
+        runtime
+            .remember_session_ui(
+                "session",
+                &json!({"configOptions":[{"id":"model","currentValue":"second"}]}),
+            )
+            .unwrap();
+        let live = runtime.begin_restore("session").unwrap();
+        assert_eq!(live["configOptions"][0]["currentValue"], "second");
+        assert_eq!(live["availableCommands"][0]["name"], "inspect");
+        assert_eq!(live["liveTurn"], "new-turn");
+        runtime.child.lock().unwrap().kill().unwrap();
+        runtime.child.lock().unwrap().wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_restore_keeps_queued_prompt_out_of_replay() {
+        let runtime = test_runtime(
+            "claude",
+            CapabilityProfile::Build,
+            Path::new("/worktree"),
+            "session",
+        );
+        let token = runtime.begin_restore("session").unwrap()["restoreToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let waiting = Arc::clone(&runtime);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (dispatched_tx, dispatched_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let claims = waiting.restores.lock().unwrap();
+            started_tx.send(()).unwrap();
+            let _claims = waiting.wait_for_restore(claims, "session").unwrap();
+            dispatched_tx.send(()).unwrap();
+        });
+        with_restore_claim(&runtime, "session", Some(&token), || {
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            // Compress a slow backend request past the reservation's expiry.
+            runtime
+                .restores
+                .lock()
+                .unwrap()
+                .get_mut("session")
+                .unwrap()
+                .expires = Instant::now() + Duration::from_millis(25);
+            std::thread::sleep(Duration::from_millis(75));
+            assert!(matches!(
+                dispatched_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            // A disappearing webview may release early, but replay still owns the session.
+            runtime.release_restore("session", &token).unwrap();
+            assert!(matches!(
+                dispatched_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            Ok(())
+        })
+        .unwrap();
+        dispatched_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        runtime.child.lock().unwrap().kill().unwrap();
+        runtime.child.lock().unwrap().wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_finalizer_releases_claim_after_failed_load_forgets_session() {
+        let directory = Path::new("/worktree");
+        let runtime = test_runtime("claude", CapabilityProfile::Build, directory, "session");
+        let manager = AgentManager::default();
+        manager.0.lock().unwrap().insert(
+            connection_key("claude", CapabilityProfile::Build, directory),
+            Arc::clone(&runtime),
+        );
+        let token = runtime.begin_restore("session").unwrap()["restoreToken"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        runtime.session_profiles.lock().unwrap().remove("session");
+        runtime
+            .session_directories
+            .lock()
+            .unwrap()
+            .remove("session");
+        release_session_restore(&manager, "claude", directory, "session", &token).unwrap();
+        assert!(runtime.restores.lock().unwrap().is_empty());
+        runtime.child.lock().unwrap().kill().unwrap();
+        runtime.child.lock().unwrap().wait().unwrap();
     }
 
     #[test]
@@ -4921,16 +6352,21 @@ mod session_config_tests {
                 elicitation_state: Mutex::new(HashMap::new()),
                 next_permission_generation: AtomicU64::new(1),
                 prompt_state: Mutex::new(PromptState::default()),
+                prompt_dispatch: Mutex::new(()),
                 cancelled_prompts: Mutex::new(HashSet::new()),
                 next_id: AtomicU64::new(1),
                 alive: AtomicBool::new(true),
                 capabilities: Mutex::new(Value::Null),
                 session_directories: Mutex::new(HashMap::new()),
                 session_configs: Mutex::new(HashMap::new()),
+                per_load_tokens: Mutex::new(HashMap::new()),
                 native_subagents: Mutex::new(NativeSubagentRegistry::default()),
                 session_profiles: Mutex::new(HashMap::new()),
+                session_ui: Mutex::new(HashMap::new()),
                 pending_directory: Mutex::new(None),
                 session_creation: Mutex::new(()),
+                restores: Mutex::new(HashMap::new()),
+                restore_ready: Condvar::new(),
                 ready: Condvar::new(),
             })
         };
@@ -5061,11 +6497,17 @@ mod session_config_tests {
     #[test]
     fn the_per_load_switch_mints_parameters_for_every_load() {
         let mut configs = HashMap::new();
+        let mut tokens = HashMap::new();
+        let alive = AtomicBool::new(true);
         let mut minted = 0;
         let mut released = 0;
         let first = restore_params(
             true,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             "/work/repo",
             || {
@@ -5077,7 +6519,11 @@ mod session_config_tests {
         .unwrap();
         let second = restore_params(
             true,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             "/work/repo",
             || {
@@ -5090,7 +6536,108 @@ mod session_config_tests {
         assert_eq!(minted, 2);
         assert_eq!(released, 0);
         assert!(configs.is_empty());
+        assert_eq!(tokens["session"], ["first", "second"]);
+        assert_eq!(first.1.as_deref(), Some("first"));
+        assert_eq!(second.1.as_deref(), Some("second"));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn failed_restore_releases_only_its_new_token() {
+        let mut configs = HashMap::new();
+        let mut tokens = HashMap::from([("session".to_string(), vec!["older".to_string()])]);
+        let alive = AtomicBool::new(true);
+        let (_, minted_token) = restore_params(
+            true,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
+            "session",
+            "/work/repo",
+            || Ok(config("failed", &[])),
+            |_| unreachable!(),
+        )
+        .unwrap();
+
+        let mut released = Vec::new();
+        release_per_load_token(
+            &mut tokens,
+            "session",
+            minted_token.as_deref().unwrap(),
+            |token| released.push(token.to_string()),
+        );
+        assert_eq!(released, ["failed"]);
+        assert_eq!(tokens["session"], ["older"]);
+
+        release_per_load_token(&mut tokens, "session", "failed", |_| unreachable!());
+    }
+
+    #[test]
+    fn a_stopped_agent_releases_the_config_instead_of_storing_it() {
+        let alive = AtomicBool::new(false);
+        let mut configs = HashMap::new();
+        let mut released = Vec::new();
+        let stored = store_session_config(
+            &alive,
+            &mut configs,
+            "session",
+            SessionConfig {
+                cwd: "/work/repo".into(),
+                directory: PathBuf::from("/work/repo"),
+                servers: vec![],
+                token: "stopped".into(),
+            },
+            |token| released.push(token.to_string()),
+        );
+        assert!(!stored);
+        assert!(configs.is_empty());
+        assert_eq!(released, ["stopped"]);
+    }
+
+    #[test]
+    fn a_stopped_agent_releases_a_new_per_load_token() {
+        let alive = AtomicBool::new(false);
+        let mut configs = HashMap::new();
+        let mut tokens = HashMap::new();
+        let mut released = Vec::new();
+        let result = restore_params(
+            true,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
+            "session",
+            "/work/repo",
+            || Ok(config("stopped", &[])),
+            |token| released.push(token.to_string()),
+        );
+        assert!(result.is_err());
+        assert!(tokens.is_empty());
+        assert_eq!(released, ["stopped"]);
+    }
+
+    #[test]
+    fn per_load_tokens_are_released_on_forget_and_reader_exit() {
+        let mut tokens = HashMap::from([
+            (
+                "first".to_string(),
+                vec!["new".to_string(), "load".to_string()],
+            ),
+            ("second".to_string(), vec!["other".to_string()]),
+        ]);
+        let mut released = Vec::new();
+        release_session_tokens(&mut tokens, "first", |token| {
+            released.push(token.to_string())
+        });
+        assert_eq!(released, ["new", "load"]);
+        assert_eq!(tokens["second"], ["other"]);
+
+        release_all_per_load_tokens(&mut tokens, |token| released.push(token.to_string()));
+        assert_eq!(released, ["new", "load", "other"]);
+        assert!(tokens.is_empty());
     }
 
     #[test]
@@ -5098,10 +6645,16 @@ mod session_config_tests {
         let directory = scratch("restore");
         let cwd = directory.to_string_lossy().into_owned();
         let mut configs = HashMap::new();
+        let mut tokens = HashMap::new();
+        let alive = AtomicBool::new(true);
         let mut minted = 0;
         let first = restore_params(
             false,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             &cwd,
             || {
@@ -5113,7 +6666,11 @@ mod session_config_tests {
         .unwrap();
         let second = restore_params(
             false,
-            &mut configs,
+            RestoreConfigState {
+                alive: &alive,
+                configs: &mut configs,
+                per_load_tokens: &mut tokens,
+            },
             "session",
             &cwd,
             || {
@@ -5278,16 +6835,21 @@ mod native_subagent_fence_tests {
             elicitation_state: Mutex::new(HashMap::new()),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
+            prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),
             alive: AtomicBool::new(true),
             capabilities: Mutex::new(Value::Null),
             session_directories: Mutex::new(HashMap::new()),
             session_configs: Mutex::new(HashMap::new()),
+            per_load_tokens: Mutex::new(HashMap::new()),
             native_subagents: Mutex::new(NativeSubagentRegistry::default()),
             session_profiles: Mutex::new(HashMap::new()),
+            session_ui: Mutex::new(HashMap::new()),
             pending_directory: Mutex::new(None),
             session_creation: Mutex::new(()),
+            restores: Mutex::new(HashMap::new()),
+            restore_ready: Condvar::new(),
             ready: Condvar::new(),
         });
         let directory = PathBuf::from("/worktree");

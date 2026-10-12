@@ -115,11 +115,13 @@ export interface AcpPromptOutcome {
 
 export interface AcpTurnEvidence {
   agent: AgentId;
+  directory: string;
   sessionId: string;
   turnId: string;
   status: 'prepared' | 'dispatch_uncertain' | 'dispatched' | 'done' | 'failed' | 'interrupted';
   error: string | null;
   updatedAt: number;
+  postTurnPending: boolean;
 }
 
 export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
@@ -345,6 +347,7 @@ export interface NativeSubagentSnapshotSet {
 export interface AcpPendingInboxItem {
   agent: AgentId;
   directory: string;
+  profile: CapabilityProfile;
   message: AgentEvent['message'];
   receivedAt: number;
 }
@@ -534,7 +537,7 @@ function applyEntryUpdate(
           ? 'thought'
           : 'assistant';
     const last = entries.at(-1);
-    if (last?.type === role) {
+    if (last?.type === role && update.sailStartNewMessage !== true) {
       entries[entries.length - 1] = { ...last, text: last.text + block.text };
       return true;
     }
@@ -738,15 +741,36 @@ export function liveSessionView(
 ): {
   entries: AgentEntry[];
   complete: boolean;
+  messageBoundary: { pending: boolean };
   configOptions: AgentConfigOption[];
   availableCommands?: AgentCommand[];
 } {
   return {
     complete: live?.complete ?? false,
+    messageBoundary: { pending: !live?.complete },
     entries: live ? live.entries.slice() : cached,
     configOptions: state?.configOptions ?? [],
     ...(state?.availableCommands ? { availableCommands: state.availableCommands } : {}),
   };
+}
+
+/** Marks the first assistant chunk received while an incomplete transcript is being activated. */
+export function markLiveMessageBoundary(
+  update: Record<string, unknown>,
+  boundary: { pending: boolean },
+): Record<string, unknown> {
+  if (!boundary.pending || update.sessionUpdate !== 'agent_message_chunk') return update;
+  boundary.pending = false;
+  return { ...update, sailStartNewMessage: true };
+}
+
+/** A restore's live-turn snapshot can become stale before the webview receives it. */
+export function restoredLiveTurnIsCurrent(
+  turnId: string,
+  activeTurnId: string | undefined,
+  finishedTurnIds: readonly string[],
+): boolean {
+  return activeTurnId === turnId && !finishedTurnIds.includes(turnId);
 }
 
 function isConfigOption(value: unknown): value is AgentConfigOption {
@@ -792,37 +816,79 @@ function restoreSession(
   cwd: string,
   sessionId: string,
   profile: CapabilityProfile,
+  restoreToken?: string,
 ) {
-  const key = JSON.stringify([agent, cwd, sessionId, profile]);
-  const existing = restoringSessions.get(key);
+  // Explicit reservations have their own replay consumer and must never join another restore.
+  const key = restoreToken ? null : JSON.stringify([method, agent, cwd, sessionId, profile]);
+  const existing = key === null ? undefined : restoringSessions.get(key);
   if (existing) return existing;
-  // A restore replays history, so this session's kept transcript can no longer be trusted.
-  invalidateLiveTranscript(agent, cwd, sessionId);
   const live = sessionKey(agent, cwd, sessionId);
-  restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
-  const request = invoke<Record<string, unknown>>(method, {
-    agent,
-    cwd,
-    sessionId,
-    profile,
-  }).then((session) => {
+  const request = async () => {
+    let token = restoreToken;
+    let ownsToken = false;
+    if (!token) {
+      const reservation = await invoke<{ liveTurn?: string; restoreToken?: string }>(
+        'acp_begin_session_restore',
+        { agent, cwd, sessionId, profile },
+      );
+      if (reservation.liveTurn) return { sailLiveTurn: reservation.liveTurn };
+      if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
+      token = reservation.restoreToken;
+      ownsToken = true;
+    }
+    // A replay invalidates the kept transcript only after a live turn has been ruled out.
     invalidateLiveTranscript(agent, cwd, sessionId);
-    rememberRestoredState(agent, cwd, sessionId, session);
-    return session;
-  });
-  restoringSessions.set(key, request);
-  void request
-    .finally(() => {
-      if (restoringSessions.get(key) === request) restoringSessions.delete(key);
+    restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
+    try {
+      const session = await invoke<Record<string, unknown>>(method, {
+        params: { agent, cwd, sessionId, profile, restoreToken: token },
+      });
+      invalidateLiveTranscript(agent, cwd, sessionId);
+      rememberRestoredState(agent, cwd, sessionId, session);
+      return session;
+    } finally {
       const remaining = (restoringTranscripts.get(live) ?? 1) - 1;
       if (remaining > 0) restoringTranscripts.set(live, remaining);
       else restoringTranscripts.delete(live);
-    })
-    .catch(() => undefined);
-  return request;
+      if (ownsToken && token)
+        await invoke('acp_end_session_restore', {
+          agent,
+          directory: cwd,
+          sessionId,
+          restoreToken: token,
+        });
+    }
+  };
+  const pending = request();
+  if (key !== null) {
+    restoringSessions.set(key, pending);
+    void pending
+      .finally(() => {
+        if (restoringSessions.get(key) === pending) restoringSessions.delete(key);
+      })
+      .catch(() => undefined);
+  }
+  return pending;
 }
 
-const queuedPrompts = new Map<string, { agent: string; directory: string; sessionId: string }>();
+type PendingTurn = {
+  agent: AgentId;
+  directory: string;
+  sessionId: string;
+  cancelled: boolean;
+};
+
+const queuedPrompts = new Map<string, PendingTurn>();
+const workspaceTurns = new Map<string, PendingTurn>();
+
+function cancelSessionQueues(agent: AgentId, directory: string, sessionId: string): void {
+  for (const [id, target] of [...workspaceTurns, ...queuedPrompts]) {
+    if (target.agent !== agent || target.directory !== directory || target.sessionId !== sessionId)
+      continue;
+    target.cancelled = true;
+    resourceQueues.agent.cancel(id);
+  }
+}
 
 function queuedPromptKey(
   agent: AgentId,
@@ -837,15 +903,31 @@ async function acquireTurnSlot(
   turnId: string,
   onQueue?: (limit: number | null, reason: string | null) => void,
   directory = '',
+  target?: { agent: AgentId; sessionId: string | null },
 ): Promise<() => void> {
   const queue = resourceQueues.agent;
+  const pending = target?.sessionId
+    ? { agent: target.agent, directory, sessionId: target.sessionId, cancelled: false }
+    : null;
+  if (pending) workspaceTurns.set(turnId, pending);
   if (queue.reason || queue.status.active >= queue.status.limit || queue.status.waiting)
     onQueue?.(queue.status.limit, queue.reason);
   const unsubscribe = queue.subscribe(() => {
     if (queue.isQueued(turnId)) onQueue?.(queue.status.limit, queue.reasonFor(turnId));
   });
   try {
-    return await queue.acquire(turnId, directory);
+    const release = await queue.acquire(turnId, directory);
+    if (pending?.cancelled) {
+      release();
+      throw new Error('Agent turn was cancelled.');
+    }
+    return () => {
+      if (workspaceTurns.get(turnId) === pending) workspaceTurns.delete(turnId);
+      release();
+    };
+  } catch (cause) {
+    if (workspaceTurns.get(turnId) === pending) workspaceTurns.delete(turnId);
+    throw cause;
   } finally {
     unsubscribe();
     onQueue?.(null, null);
@@ -887,24 +969,25 @@ async function limitedPrompt(
   onQueue?: (limit: number | null, reason: string | null) => void,
   slotHeld = false,
 ): Promise<AcpPromptOutcome> {
-  if (slotHeld)
+  if (slotHeld) {
+    if (workspaceTurns.get(turnId)?.cancelled) throw new Error('Agent turn was cancelled.');
     return invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
+  }
   const queueId = queuedPromptKey(agent, directory, sessionId, turnId);
-  queuedPrompts.set(queueId, { agent, directory, sessionId });
-  let release: () => void;
+  const pending = { agent, directory, sessionId, cancelled: false };
+  queuedPrompts.set(queueId, pending);
+  let release: (() => void) | null = null;
   try {
     release = await acquireTurnSlot(queueId, onQueue, directory);
-  } finally {
-    queuedPrompts.delete(queueId);
-  }
-  try {
+    if (pending.cancelled) throw new Error('Agent turn was cancelled.');
     return await invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
   } finally {
-    release();
+    queuedPrompts.delete(queueId);
+    release?.();
   }
 }
 
@@ -926,15 +1009,35 @@ export const acp = {
     invoke<AgentSessionListing>('acp_list_sessions', { agent, cwd, cursor, profile }),
   releaseSessionFence: (agent: AgentId, directory: string, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, directory, sessionId }),
-  load: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
-    restoreSession('acp_load_session', agent, cwd, sessionId, profile),
-  resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
-    restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
-  forget: (agent: AgentId, directory: string, sessionId: string) => {
+  beginRestore: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
+    invoke<{
+      liveTurn?: string;
+      restoreToken?: string;
+      configOptions?: AgentConfigOption[];
+      availableCommands?: AgentCommand[];
+    }>('acp_begin_session_restore', { agent, cwd, sessionId, profile }),
+  endRestore: (agent: AgentId, directory: string, sessionId: string, restoreToken: string) =>
+    invoke<void>('acp_end_session_restore', { agent, directory, sessionId, restoreToken }),
+  load: (
+    agent: AgentId,
+    cwd: string,
+    sessionId: string,
+    profile: CapabilityProfile,
+    restoreToken?: string,
+  ) => restoreSession('acp_load_session', agent, cwd, sessionId, profile, restoreToken),
+  resume: (
+    agent: AgentId,
+    cwd: string,
+    sessionId: string,
+    profile: CapabilityProfile,
+    restoreToken?: string,
+  ) => restoreSession('acp_resume_session', agent, cwd, sessionId, profile, restoreToken),
+  forget: async (agent: AgentId, directory: string, sessionId: string) => {
+    cancelSessionQueues(agent, directory, sessionId);
+    await invoke<void>('acp_forget_session', { agent, directory, sessionId });
     forgetSessionState(agent, directory, sessionId);
     forgetPlanningState({ agent, directory, sessionId });
     acpPlans().forget({ agent, directory, sessionId });
-    return invoke<void>('acp_forget_session', { agent, directory, sessionId });
   },
   prompt: (
     agent: AgentId,
@@ -1041,6 +1144,9 @@ export const acp = {
       sessionId,
       turnId,
     }),
+  pendingPostTurnChecks: () => invoke<AcpTurnEvidence[]>('list_pending_acp_post_turn_checks'),
+  finishPostTurnChecks: (agent: AgentId, directory: string, sessionId: string, turnId: string) =>
+    invoke<void>('finish_acp_post_turn_checks', { agent, directory, sessionId, turnId }),
   interruptedTurns: () => invoke<InterruptedAgentTurn[]>('list_interrupted_agent_turns'),
   finishInterruptedTurn: (turn: InterruptedAgentTurn) =>
     invoke<void>('finish_interrupted_agent_turn', {

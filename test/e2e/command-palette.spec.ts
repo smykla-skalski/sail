@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { minPaneSpan } from '../../src/lib/panes';
 import { topbarMenuTrigger } from './topbar';
 
 const input = () => $('[aria-label="Search command palette"]');
@@ -219,6 +220,18 @@ describe('command palette project flow', () => {
     }, repoPath);
     await browser.refresh();
     await expect(topbarMenuTrigger('New agent')).toBeDisplayed();
+    await browser.waitUntil(() =>
+      browser.execute(
+        (minimumWidth) => {
+          const main = document.querySelector('.pane-leaf.focused[data-pane-id="main"]');
+          return (
+            !!main?.querySelector('.agent-header') &&
+            main.getBoundingClientRect().width >= minimumWidth
+          );
+        },
+        2 * minPaneSpan + 8,
+      ),
+    );
     await openPalette();
     await searchAndEnter(repoPath.split('/').at(-1)!);
     await $('[data-kind="worktree"]').click();

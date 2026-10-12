@@ -8,7 +8,7 @@ async function createThread(title: string) {
   await $('.agent-launches button').click();
   await expect($('.agent-composer [data-pane-prompt]')).toBeEnabled();
   await $('.agent-composer [data-pane-prompt]').setValue(title);
-  await $('.agent-actions button').click();
+  await $('.agent-actions button:last-child').click();
   await expect($('.agent-permission')).toBeDisplayed();
   await $('.agent-permission button').click();
   await expect($('.agent-conversation')).toHaveText(expect.stringContaining(`Done: ${title}`));

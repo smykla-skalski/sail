@@ -1784,25 +1784,38 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_terminal_job_stops_descendant_after_direct_child_exits() {
-        let marker = std::env::temp_dir().join(format!(
-            "sail-windows-terminal-descendant-{}.txt",
-            uuid::Uuid::new_v4()
-        ));
-        let marker_literal = marker.to_string_lossy().replace('\'', "''");
-        let script = format!(
-            "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 5; Set-Content -LiteralPath ''{marker_literal}'' done'); exit 0"
-        );
-        let mut command = Command::new("powershell.exe");
+        const HELPER: &str = "SAIL_WINDOWS_TERMINAL_JOB_DESCENDANT_HELPER";
+        if std::env::var_os(HELPER).is_some() {
+            let mut descendant = Command::new("ping.exe")
+                .args(["-n", "60", "127.0.0.1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start descendant inside terminal job");
+            std::thread::spawn(move || descendant.wait().expect("reap terminal descendant"));
+            return;
+        }
+
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
-            .args(["-NoProfile", "-Command", &script])
+            .args([
+                "--exact",
+                "acp_terminal::tests::windows_terminal_job_stops_descendant_after_direct_child_exits",
+            ])
+            .env(HELPER, "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let (mut child, job) = WindowsTerminalJob::spawn(&mut command).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(10);
         while child.try_wait().unwrap().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "terminal command did not exit"
+                "test helper did not exit: pid={}, elapsed={:?}, job active processes={:?}",
+                child.id(),
+                started.elapsed(),
+                job.active_processes(),
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1814,9 +1827,6 @@ mod tests {
         job.stop()
             .expect("terminate descendants after direct child exit");
         assert_eq!(job.active_processes().unwrap(), 0);
-        std::thread::sleep(Duration::from_secs(6));
-        assert!(!marker.exists(), "descendant survived terminal stop");
-        let _ = std::fs::remove_file(marker);
     }
 
     #[test]
