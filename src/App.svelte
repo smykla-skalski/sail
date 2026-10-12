@@ -8788,7 +8788,16 @@
           registered,
         );
       } else {
-        await deleteProjectWorktreeOnce(repository, path, branch, force);
+        await deleteProjectWorktreeOnce(
+          repository,
+          path,
+          branch,
+          force,
+          false,
+          undefined,
+          false,
+          registered,
+        );
       }
     } catch (cause) {
       error = describe(cause);
@@ -8860,6 +8869,7 @@
       ...Object.fromEntries(targets.map((worktree) => [worktree.path, 'Queued for deletion'])),
     };
     try {
+      const removedPaths = new SvelteSet<string>();
       async function removeNext(index: number): Promise<void> {
         const worktree = targets[index];
         if (!worktree) return;
@@ -8876,12 +8886,14 @@
           true,
           preview[index],
           true,
+          registered.filter((entry) => !removedPaths.has(entry.path)),
         );
         if (!removed) {
           if (!error)
             error = `Deletion stopped at “${worktree.branch}”. That worktree and the remaining worktrees were kept; retry when ready.`;
           return;
         }
+        removedPaths.add(worktree.path);
         return removeNext(index + 1);
       }
       await removeNext(0);
@@ -8940,6 +8952,7 @@
     stopAgents = false,
     expected?: WorktreeRemovalPreview,
     preconfirmed = false,
+    expectedRegisteredWorktrees?: RegisteredWorktree[],
   ): Promise<boolean> {
     let retryForce = false;
     let retryStop = false;
@@ -9027,6 +9040,9 @@
           expectedRevision: expected?.revision ?? null,
           expectedBranch: expected?.branch ?? null,
           expectedGeneration: expected?.generation,
+          expectedRegisteredWorktrees: expectedRegisteredWorktrees?.map(
+            ({ path: registeredPath, generation }) => ({ path: registeredPath, generation }),
+          ),
           ...(stopAgents ? { stopAgents: true } : {}),
         },
       });
@@ -9079,8 +9095,28 @@
         'Stop agent and delete',
         { destructive: true },
       );
-      if (stopConfirmed) return deleteProjectWorktreeOnce(repository, path, branch, true, true);
-    } else if (retryForce) return deleteProjectWorktreeOnce(repository, path, branch, true);
+      if (stopConfirmed)
+        return deleteProjectWorktreeOnce(
+          repository,
+          path,
+          branch,
+          true,
+          true,
+          expected,
+          preconfirmed,
+          expectedRegisteredWorktrees,
+        );
+    } else if (retryForce)
+      return deleteProjectWorktreeOnce(
+        repository,
+        path,
+        branch,
+        true,
+        stopAgents,
+        expected,
+        preconfirmed,
+        expectedRegisteredWorktrees,
+      );
     return false;
   }
 

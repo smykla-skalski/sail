@@ -257,6 +257,96 @@ describe('close worktree shortcut', () => {
     git('worktree', 'remove', '--force', detached);
   });
 
+  it('removes a clean detached descendant and preserves its commit', async () => {
+    const detached = join(worktrees, 'clean-detached');
+    git('worktree', 'add', '-q', '-b', 'clean-detached', detached);
+    execFileSync('git', ['-C', detached, 'checkout', '--detach', '-q']);
+    execFileSync('git', [
+      '-C',
+      detached,
+      '-c',
+      'user.name=Sail Test',
+      '-c',
+      'user.email=sail@example.invalid',
+      '-c',
+      'commit.gpgsign=false',
+      'commit',
+      '--allow-empty',
+      '-q',
+      '-m',
+      'detached work',
+    ]);
+    const head = execFileSync('git', ['-C', detached, 'rev-parse', 'HEAD'], {
+      encoding: 'utf8',
+    }).trim();
+    await select(first, false);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = (path: string) => {
+      const value = registered.find((worktree) => worktree.path === path)?.generation;
+      if (!value) throw new Error(`Missing worktree generation for ${path}`);
+      return value;
+    };
+    await browser.execute(
+      (repo, root, child, rootGeneration, childGeneration) => {
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({
+            repositories: [repo],
+            groups: [],
+            worktrees: {
+              [repo]: [
+                { path: root, branch: 'first', generation: rootGeneration },
+                {
+                  path: child,
+                  branch: 'clean-detached',
+                  generation: childGeneration,
+                  origin: {
+                    sourcePath: root,
+                    sourceGeneration: rootGeneration,
+                    agent: 'codex',
+                    sessionId: 'clean-detached-session',
+                    sessionTitle: 'Clean detached',
+                  },
+                },
+              ],
+            },
+          }),
+        );
+      },
+      repository,
+      first,
+      detached,
+      generation(first),
+      generation(detached),
+    );
+    await browser.refresh();
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
+          return typeof ready === 'function' && ready();
+        }),
+      { timeout: 20000, timeoutMsg: 'Detached catalog did not settle after reload' },
+    );
+    await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
+    await $('[aria-label="Delete worktree first"]').click();
+    const dialog = $('dialog.confirmation-dialog[open]');
+    await expect(dialog).toHaveText(expect.stringContaining('detached'));
+    await dialog.$('button=Delete 2 worktrees').click();
+    await browser.waitUntil(() => !existsSync(first) && !existsSync(detached));
+    await browser.waitUntil(async () => (await catalogPaths()).length === 0);
+    expect(
+      git('for-each-ref', '--format=%(objectname)', 'refs/sail/preserved-detached').trim(),
+    ).toBe(head);
+    git('worktree', 'add', '-q', first, 'first');
+  });
+
   it('previews and removes only Sail descendants from the leaves inward', async () => {
     const child = join(worktrees, 'child');
     const grandchild = join(worktrees, 'grandchild');

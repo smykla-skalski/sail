@@ -1995,6 +1995,36 @@ struct DeleteWorktreeRequest {
     native_generation: Option<u64>,
     stop_agents: Option<bool>,
     expected_generation: Option<String>,
+    expected_registered_worktrees: Option<Vec<ExpectedRegisteredWorktree>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpectedRegisteredWorktree {
+    path: String,
+    generation: Option<String>,
+}
+
+fn ensure_expected_worktree_inventory(
+    repository: &str,
+    expected: Option<&[ExpectedRegisteredWorktree]>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let current = repository_worktrees(repository.to_string())?;
+    let expected = expected
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.generation.as_deref()))
+        .collect::<HashSet<_>>();
+    let current = current
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.generation.as_deref()))
+        .collect::<HashSet<_>>();
+    if current != expected {
+        return Err("Repository worktrees changed after preview. Refresh before deleting.".into());
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2124,6 +2154,7 @@ async fn delete_worktree(
         native_generation,
         stop_agents,
         expected_generation,
+        expected_registered_worktrees,
     } = request;
     let operation_locks = operation_locks.inner().clone();
     let agents = agents.inner().clone();
@@ -2131,6 +2162,8 @@ async fn delete_worktree(
     tauri::async_runtime::spawn_blocking(move || {
         let checked = validate_repository(repository)?;
         let _lock = operation_locks.lock(Path::new(&checked))?;
+        // Sail worktree creation takes this same Git-directory lock.
+        ensure_expected_worktree_inventory(&checked, expected_registered_worktrees.as_deref())?;
         let directory = PathBuf::from(&worktree)
             .git_canonical()
             .unwrap_or_else(|_| PathBuf::from(&worktree));
@@ -2974,6 +3007,27 @@ fn guarded_removal_state(
     Ok(Some(GuardedRemovalState { reference, head }))
 }
 
+fn preserve_detached_head(repository: &Path, head: &str) -> Result<String, String> {
+    // Removing the worktree also removes the only ref to a detached commit.
+    let reference = format!(
+        "refs/sail/preserved-detached/{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["update-ref", &reference, head])
+        .output()
+        .map_err(|error| format!("Cannot preserve the detached commit: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Cannot preserve the detached commit: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(reference)
+}
+
 fn restore_changed_worktree(
     repository: &Path,
     worktree: &Path,
@@ -3152,14 +3206,6 @@ where
         &worktree,
         expected_revision.is_some() || expected_branch.is_some(),
     )?;
-    if guarded
-        .as_ref()
-        .is_some_and(|state| state.reference.is_none())
-    {
-        return Err(
-            "Guarded cleanup requires a branch checkout; the worktree is detached.".to_string(),
-        );
-    }
     before_final_identity_check()?;
     let _head_lock = guarded
         .as_ref()
@@ -3176,6 +3222,11 @@ where
         }
     }
     after_final_identity_check()?;
+    let preserved_detached_ref = guarded
+        .as_ref()
+        .filter(|state| state.reference.is_none())
+        .map(|state| preserve_detached_head(&repository, &state.head))
+        .transpose()?;
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -3216,17 +3267,24 @@ where
         let reference = state
             .reference
             .as_deref()
-            .ok_or("Cannot verify the removed detached worktree.")?;
+            .or(preserved_detached_ref.as_deref())
+            .ok_or("Cannot verify the removed worktree commit.")?;
         let current = git_reference(&repository, &["rev-parse", "--verify", reference]);
         if current.as_deref() != Some(state.head.as_str()) {
-            let restore = restore_changed_worktree(&repository, &worktree, &state);
+            if state.reference.is_some() {
+                let restore = restore_changed_worktree(&repository, &worktree, &state);
+                return Err(format!(
+                    "Worktree changed during deletion. Its branch {} preserves the new commit.{}",
+                    reference,
+                    restore
+                        .err()
+                        .map(|error| format!(" {error}"))
+                        .unwrap_or_else(|| " The checkout was restored.".to_string())
+                ));
+            }
             return Err(format!(
-                "Worktree changed during deletion. Its branch {} preserves the new commit.{}",
-                reference,
-                restore
-                    .err()
-                    .map(|error| format!(" {error}"))
-                    .unwrap_or_else(|| " The checkout was restored.".to_string())
+                "Detached worktree was removed, but its preserved ref {reference} changed. The original commit was {}.",
+                state.head
             ));
         }
     }
@@ -3507,16 +3565,17 @@ mod tests {
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
         discover_nested_worktree_terminal_roots, encode_manifest_path,
-        ensure_expected_worktree_generation, existing_shipping_worktree, git_change_action,
-        git_patch, git_reference, normalize_picker_path, parse_registered_worktrees,
-        persist_worktree_data_manifest, register_worktree_terminal_data, registered_worktrees,
-        remove_worktree, remove_worktree_then_terminal_data,
-        remove_worktree_then_terminal_data_many, remove_worktree_with_hook,
-        remove_worktree_with_hooks, replacement_worktree_at_checkpoint, repository_namespace,
-        repository_worktrees, shipping_base_revision, shipping_changed_paths,
+        ensure_expected_worktree_generation, ensure_expected_worktree_inventory,
+        existing_shipping_worktree, git_change_action, git_patch, git_reference,
+        normalize_picker_path, parse_registered_worktrees, persist_worktree_data_manifest,
+        register_worktree_terminal_data, registered_worktrees, remove_worktree,
+        remove_worktree_then_terminal_data, remove_worktree_then_terminal_data_many,
+        remove_worktree_with_hook, remove_worktree_with_hooks, replacement_worktree_at_checkpoint,
+        repository_namespace, repository_worktrees, shipping_base_revision, shipping_changed_paths,
         shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
         working_tree_diff, worktree_overviews, worktree_preview_state_with_hook,
-        WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
+        ExpectedRegisteredWorktree, WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER,
+        WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::worktree_storage;
@@ -4814,6 +4873,95 @@ mod tests {
 
         assert!(error.contains("changed after validation"), "{error}");
         assert_eq!(fs::read_to_string(&new_file).unwrap(), "keep this file");
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_detached_removal_preserves_its_commit() {
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-detached-clean-removal-test");
+        git(&worktree, &["checkout", "--detach"]);
+        fs::write(
+            Path::new(&worktree).join("tracked.txt"),
+            "detached commit\n",
+        )
+        .unwrap();
+        git(&worktree, &["add", "tracked.txt"]);
+        git(
+            &worktree,
+            &[
+                "-c",
+                "user.name=Sail Test",
+                "-c",
+                "user.email=sail@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "detached",
+            ],
+        );
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        let head = git_reference(Path::new(&worktree), &["rev-parse", "HEAD"]).unwrap();
+        let (revision, dirty) =
+            worktree_preview_state_with_hook(Path::new(&worktree), || {}).unwrap();
+        assert!(!dirty);
+
+        remove_worktree(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            None,
+        )
+        .unwrap();
+
+        assert!(!Path::new(&worktree).exists());
+        assert_eq!(
+            git_reference(
+                Path::new(&repository),
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname)",
+                    "refs/sail/preserved-detached",
+                ],
+            )
+            .as_deref(),
+            Some(head.as_str())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_worktree_inventory_keeps_parent_and_new_child() {
+        let (root, repository, worktree, _) =
+            ignored_archive_fixture("sail-new-descendant-during-removal-test");
+        let expected = repository_worktrees(repository.clone())
+            .unwrap()
+            .into_iter()
+            .map(|entry| ExpectedRegisteredWorktree {
+                path: entry.path,
+                generation: entry.generation,
+            })
+            .collect::<Vec<_>>();
+        let child = add_worktree(
+            worktree.clone(),
+            "new-descendant".into(),
+            Some(root.join("worktrees").to_string_lossy().into_owned()),
+            None,
+        )
+        .unwrap();
+        let locks = WorktreeOperationLocks::default();
+        let _guard = locks.lock(Path::new(&repository)).unwrap();
+
+        let error = ensure_expected_worktree_inventory(&repository, Some(&expected)).unwrap_err();
+
+        assert!(error.contains("changed after preview"), "{error}");
+        assert!(Path::new(&worktree).exists());
+        assert!(Path::new(&child.path).exists());
+        remove_worktree(repository.clone(), child.path, Some(true), None, None).unwrap();
         remove_worktree(repository, worktree, Some(true), None, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
