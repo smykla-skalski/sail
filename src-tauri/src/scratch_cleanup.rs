@@ -14,13 +14,63 @@ const PRIVATE_MARKER: &str = ".sail-cleanup-private";
 const PRIVATE_MARKER_VALUE: &str = "sail-cleanup-private-v1\n";
 const PRIVATE_OWNER: &str = ".sail-cleanup-owner";
 
-pub(crate) fn sweep_on_startup() {
+pub(crate) fn sweep_on_startup(cache_directory: Option<&Path>) {
     let root = std::env::temp_dir();
-    let result = sweep(&root, SystemTime::now(), has_open_files);
+    let now = SystemTime::now();
+    let result = sweep(&root, now, has_open_files).and_then(|bytes| {
+        if let Some(cache_directory) = cache_directory {
+            sweep_worktree_temp_dirs(cache_directory, now, has_open_files)
+                .map(|worktree_bytes| bytes + worktree_bytes)
+        } else {
+            Ok(bytes)
+        }
+    });
     match result {
         Ok(bytes) => eprintln!("Sail scratch cleanup freed {bytes} bytes"),
         Err(error) => eprintln!("Sail scratch cleanup unavailable: {error}"),
     }
+}
+
+fn sweep_worktree_temp_dirs(
+    cache_directory: &Path,
+    now: SystemTime,
+    open_files: impl Fn(&Path) -> Option<bool>,
+) -> std::io::Result<u64> {
+    let storage = cache_directory.join("terminal-worktrees");
+    let entries = match fs::read_dir(storage) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let owner = unsafe { nix::libc::geteuid() };
+    let mut freed = 0;
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.uid() != owner {
+            continue;
+        }
+        let temp = path.join("tmp");
+        let Ok(metadata) = fs::symlink_metadata(&temp) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.uid() != owner {
+            continue;
+        }
+        match sweep(&temp, now, &open_files) {
+            Ok(bytes) => freed += bytes,
+            Err(error) => eprintln!("Sail scratch cleanup kept {}: {error}", temp.display()),
+        }
+    }
+    Ok(freed)
 }
 
 pub(crate) fn owner_identity() -> Option<String> {
@@ -672,6 +722,30 @@ mod tests {
         let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
         sweep(&temp, future, |_| Some(false)).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn startup_reaches_marked_roots_in_worktree_temp_dirs() {
+        let cache = fixture();
+        let storage = cache.join("terminal-worktrees");
+        let temp = storage.join("a".repeat(64)).join("tmp");
+        fs::create_dir_all(&temp).unwrap();
+        let stale = temp.join("sail-339-worker.stale");
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+        fs::write(stale.join("artifact"), "build output").unwrap();
+        let outside = storage.join("unverified").join("tmp");
+        fs::create_dir_all(&outside).unwrap();
+        let untouched = outside.join("sail-339-worker.stale");
+        fs::create_dir(&untouched).unwrap();
+        fs::write(untouched.join(MARKER), format!("{} 1", i32::MAX)).unwrap();
+
+        let future = SystemTime::now() + IDLE_AGE + Duration::from_secs(1);
+        let freed = sweep_worktree_temp_dirs(&cache, future, |_| Some(false)).unwrap();
+
+        assert!(freed > 0);
+        assert!(!stale.exists());
+        assert!(untouched.exists());
     }
 
     #[test]

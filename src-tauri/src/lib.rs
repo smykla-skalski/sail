@@ -3235,12 +3235,15 @@ pub fn run() {
             if let Err(error) = diagnostics::init(_app.handle()) {
                 eprintln!("Sail diagnostics unavailable: {error}");
             }
-            #[cfg(unix)]
-            std::thread::spawn(scratch_cleanup::sweep_on_startup);
-            if let Ok(cache_directory) = _app.path().app_cache_dir() {
-                worktree_storage::reconcile(&cache_directory);
-                git_overlay::initialize(&cache_directory);
+            let cache_directory = _app.path().app_cache_dir().ok();
+            if let Some(cache_directory) = cache_directory.as_ref() {
+                worktree_storage::reconcile(cache_directory);
+                git_overlay::initialize(cache_directory);
             }
+            #[cfg(unix)]
+            std::thread::spawn(move || {
+                scratch_cleanup::sweep_on_startup(cache_directory.as_deref())
+            });
             let process_directory = _app.path().app_config_dir()?.join("owned-processes");
             owned_processes::init(process_directory).map_err(std::io::Error::other)?;
             browser_agent::start_bridge(_app.handle())?;

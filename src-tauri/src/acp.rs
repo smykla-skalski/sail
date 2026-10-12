@@ -3995,6 +3995,7 @@ fn connect_blocking_inner(
         overlay.apply(&mut command);
     }
     command.current_dir(worktree);
+    let retry = crate::background_priority::normal_priority_copy(&command);
     #[cfg(unix)]
     let mut wrapped = crate::scratch_cleanup::wrap_command(&command)
         .map_err(|error| format!("Could not prepare agent owner: {error}"))?;
@@ -4015,7 +4016,6 @@ fn connect_blocking_inner(
             "Background priority launch failed for {}: {error}; retrying at normal priority",
             definition.name
         );
-        let retry = crate::background_priority::normal_priority_copy(&command);
         #[cfg(unix)]
         let mut retry = crate::scratch_cleanup::wrap_command(&retry)?;
         #[cfg(not(unix))]
