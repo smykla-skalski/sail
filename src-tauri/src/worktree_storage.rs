@@ -26,6 +26,7 @@ const LEGACY_TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
 const TEMP_PROCESS_UNSTARTED: &str = "sail-temp-process-state-v1\nunstarted\n";
 const TEMP_PROCESS_EXPOSED: &str = "sail-temp-process-state-v1\nexposed\n";
 const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
+const TEMP_ORIGINAL_RUN_FILE: &str = "sail-temp-original-run-v1";
 const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
 const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
 
@@ -262,6 +263,7 @@ impl TempLease {
             if entry.file_name() == TEMP_OWNER_FILE
                 || entry.file_name() == LEGACY_TEMP_OWNER_FILE
                 || entry.file_name() == TEMP_PENDING_FILE
+                || entry.file_name() == TEMP_ORIGINAL_RUN_FILE
             {
                 continue;
             }
@@ -500,6 +502,16 @@ fn create_temp_lease(cache_directory: &Path, data_directory: &Path) -> Result<Te
             .and_then(|_| owner.sync_all())
             .map_err(|error| error.to_string())?;
         drop(owner);
+        let mut original_run = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(staging.join(TEMP_ORIGINAL_RUN_FILE))
+            .map_err(|error| error.to_string())?;
+        original_run
+            .write_all(format!("{TEMP_ORIGINAL_RUN_FILE}\n{name}\n").as_bytes())
+            .and_then(|_| original_run.sync_all())
+            .map_err(|error| error.to_string())?;
+        drop(original_run);
         create_process_state(&process_state_file)?;
         state_created = true;
         fs::rename(&staging, &directory).map_err(|error| error.to_string())
@@ -856,7 +868,15 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
             match read_owner(&directory) {
                 Err(reason) => {
                     if read_plain_owner(cache_directory, &directory).is_ok() {
-                        None
+                        match lock_path(cache_directory, "lease", &directory)
+                            .and_then(|path| FileLock::try_acquire(&path, true))
+                        {
+                            Ok(_lease) if has_active_markers(&directory) => {
+                                Some("unclean-active-use")
+                            }
+                            Ok(_lease) => None,
+                            Err(_) => Some("active-use"),
+                        }
                     } else {
                         Some(reason)
                     }
@@ -1029,6 +1049,9 @@ pub(crate) fn clean_pending_temp(
         }
     }
     if let Some(lock_directory) = &lock_directory {
+        if lock_directory != &target && fs::symlink_metadata(lock_directory).is_ok() {
+            return Err("Original temporary path changed; refresh cleanup status.".into());
+        }
         let process_state_file = process_state_path(cache_directory, lock_directory)?;
         if let Err(error) = fs::remove_file(process_state_file) {
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -1089,7 +1112,7 @@ fn find_pending_temp(
                 Some(name) if name.starts_with(".run-") && name.ends_with(".tmp") => {
                     Some(temp_root.join(&name[1..name.len() - 4]))
                 }
-                _ => None,
+                _ => original_run_directory(&target, &temp_root, &data_directory),
             };
             if cache_key(&target)? == token {
                 return Ok((data_directory, target, lock_directory));
@@ -1097,6 +1120,27 @@ fn find_pending_temp(
         }
     }
     Err("Pending temporary data was not found; refresh cleanup status.".into())
+}
+
+fn original_run_directory(target: &Path, root: &Path, data_directory: &Path) -> Option<PathBuf> {
+    read_temp_owner(target, data_directory).ok()?;
+    let marker = target.join(TEMP_ORIGINAL_RUN_FILE);
+    if !fs::symlink_metadata(&marker).ok()?.is_file() {
+        return None;
+    }
+    let contents = fs::read_to_string(marker).ok()?;
+    let name = contents
+        .strip_prefix(&format!("{TEMP_ORIGINAL_RUN_FILE}\n"))?
+        .strip_suffix('\n')?;
+    let uuid = name.strip_prefix("run-")?;
+    if uuid::Uuid::parse_str(uuid).ok()?.to_string() != uuid {
+        return None;
+    }
+    let original = root.join(name);
+    if fs::symlink_metadata(&original).is_ok() {
+        return None;
+    }
+    Some(original)
 }
 
 fn verified_data_owner(cache_directory: &Path, data_directory: &Path) -> bool {
@@ -2835,6 +2879,28 @@ mod tests {
     }
 
     #[test]
+    fn crashed_plain_folder_active_marker_remains_visible_after_temp_reclaim() {
+        let fixture = GitFixture::new();
+        let plain = fixture.root.join("plain-folder");
+        fs::create_dir(&plain).unwrap();
+        let (directory, lease) = register(&fixture.cache, &plain).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        write_expired_temp_owner_with_header(&temp, &directory, TEMP_OWNER_HEADER);
+        lease.mark_started();
+        drop(lease);
+
+        retry_cleanup(&fixture.cache);
+
+        assert!(!temp.exists());
+        let pending = pending_with_reason(&fixture.cache, "unclean-active-use");
+        assert_eq!(
+            pending.cache_key,
+            directory.file_name().unwrap().to_string_lossy()
+        );
+        assert!(pending.size_bytes.is_some());
+    }
+
+    #[test]
     fn incomplete_plain_folder_owner_is_republished_before_creating_temp() {
         let fixture = GitFixture::new();
         let plain = fixture.root.join("plain-folder");
@@ -3115,6 +3181,7 @@ mod tests {
         let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
         let temp = lease.temp_directory().to_path_buf();
         let orphan = temp.parent().unwrap().join("orphan");
+        let process_state = process_state_path(&fixture.cache, &temp).unwrap();
         let artifact = temp.join("artifact");
         let ready = fixture.root.join("worker-ready");
         fs::write(&artifact, "live").unwrap();
@@ -3174,6 +3241,7 @@ mod tests {
         assert!(item.size_bytes.is_some_and(|size| size > 0));
         assert_pending_temp_cleaned(&fixture.cache, item.cleanup_token.as_deref().unwrap());
         assert!(!orphan.exists());
+        assert!(!process_state.exists());
     }
 
     #[cfg(unix)]
