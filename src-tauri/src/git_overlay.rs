@@ -817,7 +817,7 @@ impl GitOverlay {
         #[cfg(all(test, windows))]
         {
             let check = git_command()
-                .args(["config", "--file"])
+                .args(["config", "--includes", "--file"])
                 .arg(&config)
                 .arg("--list")
                 .output()
