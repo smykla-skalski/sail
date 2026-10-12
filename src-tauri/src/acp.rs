@@ -412,7 +412,7 @@ struct Connection {
     elicitation_state: Mutex<HashMap<String, PendingElicitation>>,
     next_permission_generation: AtomicU64,
     prompt_state: Mutex<PromptState>,
-    temp_cleanup_gate: Mutex<()>,
+    temp_cleanup_gate: Mutex<TempCleanupState>,
     prompt_dispatch: Mutex<()>,
     cancelled_prompts: Mutex<HashSet<String>>,
     next_id: AtomicU64,
@@ -1206,33 +1206,46 @@ impl Drop for Connection {
     }
 }
 
+#[derive(Default)]
+struct TempCleanupState {
+    pending: bool,
+}
+
 impl Connection {
-    fn clear_idle_temp(&self) -> Result<(), String> {
+    fn clear_idle_temp(&self, request: bool) -> Result<(), String> {
         if self.stopped.load(Ordering::Acquire) {
             return Ok(());
         }
-        let _temp_gate = self
+        let mut temp_gate = self
             .temp_cleanup_gate
             .lock()
             .map_err(|error| error.to_string())?;
+        if request {
+            temp_gate.pending = true;
+        }
+        if !temp_gate.pending {
+            return Ok(());
+        }
         let idle = self
             .prompt_state
             .lock()
             .map_err(|error| error.to_string())?
             .active
             .is_empty();
-        let subagents_idle = self
+        let subagents = self
             .native_subagents
             .lock()
-            .map_err(|error| error.to_string())?
-            .active_in(&self.worktree)
-            .is_empty();
-        let process_idle =
-            !runtime_has_live_children(self.child.lock().map_err(|error| error.to_string())?.id());
-        if idle && subagents_idle && process_idle {
+            .map_err(|error| error.to_string())?;
+        if idle && subagents.active_in(&self.worktree).is_empty() {
+            let child_id = self.child.lock().map_err(|error| error.to_string())?.id();
+            let _pause = PausedAgent::new(child_id)?;
+            if runtime_has_live_children(child_id) {
+                return Ok(());
+            }
             if let Some(lease) = &self._storage_lease {
                 lease.clear_turn_temp()?;
             }
+            temp_gate.pending = false;
         }
         Ok(())
     }
@@ -1561,7 +1574,7 @@ impl AgentManager {
             .map(|agents| agents.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         for connection in connections {
-            if let Err(error) = connection.clear_idle_temp() {
+            if let Err(error) = connection.clear_idle_temp(true) {
                 crate::diagnostics::record(
                     "turn_temp_cleanup_failed",
                     json!({"agent":connection.agent,"error":error}),
@@ -3907,7 +3920,7 @@ fn connect_blocking_inner(
         elicitation_state: Mutex::new(HashMap::new()),
         next_permission_generation: AtomicU64::new(1),
         prompt_state: Mutex::new(PromptState::default()),
-        temp_cleanup_gate: Mutex::new(()),
+        temp_cleanup_gate: Mutex::new(TempCleanupState::default()),
         prompt_dispatch: Mutex::new(()),
         cancelled_prompts: Mutex::new(HashSet::new()),
         next_id: AtomicU64::new(1),
@@ -3925,6 +3938,7 @@ fn connect_blocking_inner(
         restore_ready: Condvar::new(),
         ready: Condvar::new(),
     });
+    start_temp_cleanup_watcher(&runtime)?;
     let reader = Arc::clone(&runtime);
     let reader_manager = manager.clone();
     let agent_id = agent.clone();
@@ -5535,7 +5549,7 @@ pub async fn acp_prompt(
             },
         );
         if latest && process_cleanup_succeeded {
-            if let Err(error) = runtime.clear_idle_temp() {
+            if let Err(error) = runtime.clear_idle_temp(true) {
                 crate::diagnostics::record(
                     "turn_temp_cleanup_failed",
                     json!({"agent":agent,"turnId":turn_id,"error":error}),
@@ -5677,6 +5691,186 @@ fn runtime_has_live_children(root: u32) -> bool {
         }
         false
     })
+}
+
+fn start_temp_cleanup_watcher(runtime: &Arc<Connection>) -> Result<(), String> {
+    let weak = Arc::downgrade(runtime);
+    std::thread::Builder::new()
+        .name("sail-turn-temp-cleanup".into())
+        .spawn(move || {
+            let mut last_error = None;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let Some(runtime) = weak.upgrade() else {
+                    break;
+                };
+                if runtime.stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                match runtime.clear_idle_temp(false) {
+                    Ok(()) => last_error = None,
+                    Err(error) => {
+                        if last_error.as_ref() != Some(&error) {
+                            crate::diagnostics::record(
+                                "turn_temp_cleanup_failed",
+                                json!({"agent":runtime.agent,"error":error}),
+                            );
+                            last_error = Some(error);
+                        }
+                    }
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Cannot watch private temporary cleanup: {error}"))
+}
+
+#[cfg(unix)]
+struct PausedAgent {
+    pid: u32,
+    started_at: u64,
+}
+
+#[cfg(unix)]
+impl PausedAgent {
+    fn new(pid: u32) -> Result<Self, String> {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        let system = sysinfo::System::new_all();
+        let process = system
+            .process(sysinfo::Pid::from_u32(pid))
+            .ok_or("Agent exited before temporary cleanup.")?;
+        if process.status() == sysinfo::ProcessStatus::Stop {
+            return Err("Agent was already paused before temporary cleanup.".into());
+        }
+        let started_at = process.start_time();
+        kill(Pid::from_raw(pid as i32), Signal::SIGSTOP)
+            .map_err(|error| format!("Cannot pause agent for temporary cleanup: {error}"))?;
+        let pause = Self { pid, started_at };
+        let pid = sysinfo::Pid::from_u32(pid);
+        for _ in 0..100 {
+            let system = sysinfo::System::new_all();
+            match system.process(pid) {
+                Some(process)
+                    if process.start_time() == started_at
+                        && process.status() == sysinfo::ProcessStatus::Stop =>
+                {
+                    return Ok(pause);
+                }
+                None => return Err("Agent exited before temporary cleanup.".into()),
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        Err("Agent did not pause for temporary cleanup.".into())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PausedAgent {
+    fn drop(&mut self) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        let system = sysinfo::System::new_all();
+        if !system
+            .process(sysinfo::Pid::from_u32(self.pid))
+            .is_some_and(|process| process.start_time() == self.started_at)
+        {
+            return;
+        }
+        if let Err(error) = kill(Pid::from_raw(self.pid as i32), Signal::SIGCONT) {
+            crate::diagnostics::record(
+                "turn_temp_cleanup_failed",
+                json!({"error":format!("Cannot resume agent after temporary cleanup: {error}")}),
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+struct PausedAgent(Vec<std::os::windows::io::OwnedHandle>);
+
+#[cfg(windows)]
+impl PausedAgent {
+    fn new(pid: u32) -> Result<Self, String> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows::Win32::System::Threading::{OpenThread, SuspendThread, THREAD_SUSPEND_RESUME};
+
+        let mut pause = Self(Vec::new());
+        let mut suspended = HashSet::new();
+        for _ in 0..16 {
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+                .map_err(|error| format!("Cannot inspect agent threads: {error}"))?;
+            let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.0) };
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
+            let mut first = true;
+            let mut newly_suspended = 0;
+            loop {
+                let result = unsafe {
+                    if first {
+                        first = false;
+                        Thread32First(HANDLE(snapshot.as_raw_handle() as _), &mut entry)
+                    } else {
+                        Thread32Next(HANDLE(snapshot.as_raw_handle() as _), &mut entry)
+                    }
+                };
+                if result.is_err() {
+                    break;
+                }
+                if entry.th32OwnerProcessID != pid || !suspended.insert(entry.th32ThreadID) {
+                    continue;
+                }
+                let Ok(thread) =
+                    (unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) })
+                else {
+                    continue;
+                };
+                let thread = unsafe { OwnedHandle::from_raw_handle(thread.0) };
+                if unsafe { SuspendThread(HANDLE(thread.as_raw_handle() as _)) } == u32::MAX {
+                    return Err(format!(
+                        "Cannot pause agent thread: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                pause.0.push(thread);
+                newly_suspended += 1;
+            }
+            if newly_suspended == 0 {
+                return if pause.0.is_empty() {
+                    Err("Agent exited before temporary cleanup.".into())
+                } else {
+                    Ok(pause)
+                };
+            }
+        }
+        Err("Agent threads did not pause for temporary cleanup.".into())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PausedAgent {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::ResumeThread;
+
+        for thread in self.0.iter().rev() {
+            if unsafe { ResumeThread(HANDLE(thread.as_raw_handle() as _)) } == u32::MAX {
+                crate::diagnostics::record(
+                    "turn_temp_cleanup_failed",
+                    json!({"error":format!("Cannot resume agent thread: {}", std::io::Error::last_os_error())}),
+                );
+            }
+        }
+    }
 }
 
 fn finish_prompt_after_cleanup(
@@ -6072,6 +6266,86 @@ mod session_config_tests {
         child.wait().unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_pauses_and_resumes_agent_process() {
+        let mut child = super::spawn_test_session_process();
+        let pause = PausedAgent::new(child.id()).unwrap();
+        let system = sysinfo::System::new_all();
+        assert_eq!(
+            system
+                .process(sysinfo::Pid::from_u32(child.id()))
+                .map(sysinfo::Process::status),
+            Some(sysinfo::ProcessStatus::Stop)
+        );
+        drop(pause);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_retries_after_worker_exits() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-turn-temp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let cache = scratch.join("cache");
+        let (_, lease) = crate::worktree_storage::register(&cache, &worktree).unwrap();
+        lease.mark_started();
+        let artifact = lease.temp_directory().join("turn-artifact");
+        std::fs::write(&artifact, "complete").unwrap();
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 2 & wait; exec sleep 10"])
+            .stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let mut runtime = test_runtime_with_child(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            child,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        let root = runtime.child.lock().unwrap().id();
+        for _ in 0..100 {
+            if runtime_has_live_children(root) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(runtime_has_live_children(root));
+        start_temp_cleanup_watcher(&runtime).unwrap();
+        runtime.clear_idle_temp(true).unwrap();
+        assert!(artifact.exists());
+
+        for _ in 0..100 {
+            if !artifact.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !artifact.exists(),
+            "watcher did not reclaim completed-turn data"
+        );
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     fn config(token: &str, env: &[(&str, &str)]) -> McpConfig {
         McpConfig {
             command: "/Applications/Sail.app/Contents/MacOS/sail".into(),
@@ -6091,7 +6365,23 @@ mod session_config_tests {
         worktree: &Path,
         session_id: &str,
     ) -> Arc<Connection> {
-        let mut child = super::spawn_test_session_process();
+        test_runtime_with_child(
+            agent,
+            profile,
+            worktree,
+            session_id,
+            super::spawn_test_session_process(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn test_runtime_with_child(
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_id: &str,
+        mut child: Child,
+    ) -> Arc<Connection> {
         let input = child.stdin.take().expect("test runtime stdin");
         let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
             .expect("test runtime watchdog should start");
@@ -6116,7 +6406,7 @@ mod session_config_tests {
             )])),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
-            temp_cleanup_gate: Mutex::new(()),
+            temp_cleanup_gate: Mutex::new(TempCleanupState::default()),
             prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),
@@ -6464,7 +6754,7 @@ mod session_config_tests {
                 elicitation_state: Mutex::new(HashMap::new()),
                 next_permission_generation: AtomicU64::new(1),
                 prompt_state: Mutex::new(PromptState::default()),
-                temp_cleanup_gate: Mutex::new(()),
+                temp_cleanup_gate: Mutex::new(TempCleanupState::default()),
                 prompt_dispatch: Mutex::new(()),
                 cancelled_prompts: Mutex::new(HashSet::new()),
                 next_id: AtomicU64::new(1),
@@ -6948,7 +7238,7 @@ mod native_subagent_fence_tests {
             elicitation_state: Mutex::new(HashMap::new()),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
-            temp_cleanup_gate: Mutex::new(()),
+            temp_cleanup_gate: Mutex::new(TempCleanupState::default()),
             prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),

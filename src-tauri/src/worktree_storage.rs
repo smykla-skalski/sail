@@ -21,6 +21,8 @@ const TEMP_ROOT: &str = "turn-temp";
 const TEMP_OWNER_FILE: &str = "sail-temp-owner-v1";
 const TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
 const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
+const PLAIN_OWNER_FILE: &str = "sail-plain-folder-owner-v1";
+const PLAIN_OWNER_HEADER: &str = "sail-plain-folder-owner-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorktreeIdentity {
@@ -266,6 +268,11 @@ fn register_plain_folder(
     let data_directory = legacy_data_directory(cache_directory, &root)?;
     let key = cache_key(&data_directory)?;
     fs::create_dir_all(&data_directory).map_err(|error| error.to_string())?;
+    let _mutation = FileLock::acquire(
+        &lock_path(cache_directory, "mutation", &data_directory)?,
+        true,
+    )?;
+    verify_or_publish_plain_owner(cache_directory, &data_directory, &root)?;
     let lease_path = lock_path(cache_directory, "lease", &data_directory)?;
     let lease_lock = FileLock::acquire(&lease_path, false)?;
     let temp = create_temp_lease(cache_directory, &data_directory)?;
@@ -365,6 +372,75 @@ fn legacy_data_directory(cache_directory: &Path, root: &Path) -> Result<PathBuf,
     Ok(cache_directory.join("terminal-worktrees").join(name))
 }
 
+fn read_plain_owner(
+    cache_directory: &Path,
+    data_directory: &Path,
+) -> Result<PathBuf, &'static str> {
+    if !fs::symlink_metadata(data_directory)
+        .map_err(|_| "plain-folder-owner-unverifiable")?
+        .is_dir()
+    {
+        return Err("plain-folder-owner-unverifiable");
+    }
+    let metadata = fs::symlink_metadata(data_directory.join(PLAIN_OWNER_FILE))
+        .map_err(|_| "plain-folder-owner-missing")?;
+    if !metadata.is_file() {
+        return Err("plain-folder-owner-unverifiable");
+    }
+    let contents = fs::read_to_string(data_directory.join(PLAIN_OWNER_FILE))
+        .map_err(|_| "plain-folder-owner-unverifiable")?;
+    let mut lines = contents.lines();
+    if lines.next() != Some(PLAIN_OWNER_HEADER) {
+        return Err("plain-folder-owner-unverifiable");
+    }
+    let root = decode_path(lines.next().ok_or("plain-folder-owner-unverifiable")?)
+        .map_err(|_| "plain-folder-owner-unverifiable")?;
+    if !root.is_absolute()
+        || lines.next().is_some()
+        || legacy_data_directory(cache_directory, &root)
+            .ok()
+            .as_deref()
+            != Some(data_directory)
+    {
+        return Err("plain-folder-owner-unverifiable");
+    }
+    Ok(root)
+}
+
+fn verify_or_publish_plain_owner(
+    cache_directory: &Path,
+    data_directory: &Path,
+    root: &Path,
+) -> Result<(), String> {
+    if !fs::symlink_metadata(data_directory)
+        .map_err(|error| error.to_string())?
+        .is_dir()
+    {
+        return Err("Plain-folder storage root is not a directory.".into());
+    }
+    match read_plain_owner(cache_directory, data_directory) {
+        Ok(registered) if registered == root => return Ok(()),
+        Ok(_) => return Err("Plain-folder storage owner does not match.".into()),
+        Err("plain-folder-owner-missing") => {}
+        Err(reason) => {
+            return Err(format!(
+                "Plain-folder storage owner is unverifiable: {reason}"
+            ))
+        }
+    }
+    if data_directory.join(TEMP_ROOT).exists() {
+        return Err("Existing plain-folder temporary data has no verifiable owner.".into());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(data_directory.join(PLAIN_OWNER_FILE))
+        .map_err(|error| error.to_string())?;
+    file.write_all(format!("{PLAIN_OWNER_HEADER}\n{}\n", encode_path(root)).as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| error.to_string())
+}
+
 fn has_git_metadata(path: &Path) -> bool {
     let mut current = Some(path);
     while let Some(directory) = current {
@@ -411,7 +487,13 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         let identity = match read_owner(&data_directory) {
             Ok(identity) => identity,
             Err(reason) => {
-                report_pending(&data_directory, reason);
+                if read_plain_owner(cache_directory, &data_directory).is_ok() {
+                    for item in temp_directory_status(cache_directory, &data_directory, true) {
+                        report_pending(&data_directory, &item.reason);
+                    }
+                } else {
+                    report_pending(&data_directory, reason);
+                }
                 continue;
             }
         };
@@ -566,7 +648,13 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
             None
         } else {
             match read_owner(&directory) {
-                Err(reason) => Some(reason),
+                Err(reason) => {
+                    if read_plain_owner(cache_directory, &directory).is_ok() {
+                        None
+                    } else {
+                        Some(reason)
+                    }
+                }
                 Ok(identity) => {
                     let lease = match lock_path(cache_directory, "lease", &directory) {
                         Ok(path) => {
@@ -630,14 +718,13 @@ fn temp_directory_status(
     remove: bool,
 ) -> Vec<CleanupPending> {
     let mut pending = Vec::new();
-    let Ok(identity) = read_owner(data_directory) else {
-        return pending;
-    };
-    if identity_data_directory(cache_directory, &identity)
-        .ok()
-        .as_deref()
-        != Some(data_directory)
-    {
+    let verified_owner = read_owner(data_directory).ok().is_some_and(|identity| {
+        identity_data_directory(cache_directory, &identity)
+            .ok()
+            .as_deref()
+            == Some(data_directory)
+    }) || read_plain_owner(cache_directory, data_directory).is_ok();
+    if !verified_owner {
         return pending;
     }
     let root = data_directory.join(TEMP_ROOT);
@@ -1885,6 +1972,38 @@ mod tests {
         assert!(cleanup_status(&fixture.cache)
             .iter()
             .any(|item| item.reason == "turn-temp-owner-unverifiable"));
+    }
+
+    #[test]
+    fn abandoned_plain_folder_temp_is_reconciled() {
+        let fixture = GitFixture::new();
+        let plain = fixture.root.join("plain-folder");
+        fs::create_dir(&plain).unwrap();
+        let (directory, lease) = register(&fixture.cache, &plain).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        fs::write(temp.join("artifact"), "old").unwrap();
+        lease.mark_started();
+        drop(lease);
+
+        assert!(cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "abandoned-turn-temp"));
+        retry_cleanup(&fixture.cache);
+        assert!(!temp.exists());
+        assert!(directory.exists());
+
+        let (_, lease) = register(&fixture.cache, &plain).unwrap();
+        let unverified = lease.temp_directory().to_path_buf();
+        fs::write(unverified.join("artifact"), "retain").unwrap();
+        fs::write(directory.join(PLAIN_OWNER_FILE), "invalid").unwrap();
+        lease.mark_started();
+        drop(lease);
+        retry_cleanup(&fixture.cache);
+        assert_eq!(
+            fs::read_to_string(unverified.join("artifact")).unwrap(),
+            "retain"
+        );
+        assert!(!cleanup_status(&fixture.cache).is_empty());
     }
 
     #[cfg(unix)]
