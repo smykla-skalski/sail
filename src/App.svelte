@@ -29,6 +29,7 @@
   import PlanPanel from './PlanPanel.svelte';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
+  import { updateReplayingAgentSessions } from './lib/agent-replay';
   import { isPlanTool } from './lib/plan-engine';
   import { openCodeSessionId, sameThreadId } from './lib/thread-id';
   import {
@@ -11913,12 +11914,13 @@
     replaying: boolean,
   ) {
     if (!sessionId) return;
-    const key = JSON.stringify([agent, worktreeDirectory, sessionId]);
-    const next = { ...replayingAgentSessions };
-    const count = (next[key] ?? 0) + (replaying ? 1 : -1);
-    if (count > 0) next[key] = count;
-    else delete next[key];
-    replayingAgentSessions = next;
+    replayingAgentSessions = updateReplayingAgentSessions(
+      replayingAgentSessions,
+      agent,
+      worktreeDirectory,
+      sessionId,
+      replaying,
+    );
     if (!replaying && sessionId)
       nativeSubagents = finalizeNativeSubagentRestore(
         nativeSubagents,

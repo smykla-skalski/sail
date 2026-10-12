@@ -67,6 +67,7 @@ describe('agent switching', () => {
     const sessions = await browser.tauri.execute(async ({ core }, titles) => {
       const path = sessionStorage.getItem('sai-e2e-switch-target');
       if (!path) throw new Error('Missing target repository');
+      await core.invoke('acp_connect', { agent: 'opencode', directory: path });
       return Promise.all(
         titles.map((title) =>
           core.invoke<{ sessionId: string }>('acp_new_session', {
@@ -230,27 +231,30 @@ describe('agent sessions survive thread switches', () => {
     await browser.execute((value) => {
       sessionStorage.setItem('sai-e2e-continuity-threads', value);
     }, JSON.stringify(threads));
-    const sessions = await browser.tauri.execute(async ({ core }) => {
-      const pending: { agent: string; directory: string }[] = JSON.parse(
-        sessionStorage.getItem('sai-e2e-continuity-threads') ?? '[]',
-      );
-      const codexDirectory = pending.find((thread) => thread.agent === 'codex')?.directory;
-      if (!codexDirectory) throw new Error('Codex fixture directory is missing');
-      await core.invoke('acp_connect', { agent: 'codex', directory: codexDirectory });
-      await core.invoke('acp_authenticate', {
-        agent: 'codex',
-        directory: codexDirectory,
-        methodId: 'chat-gpt',
-      });
-      const created = await Promise.all(
-        pending.map((thread) =>
-          core.invoke<{ sessionId: string }>('acp_new_session', {
-            params: { agent: thread.agent, cwd: thread.directory },
-          }),
-        ),
-      );
-      return created.map((session) => session.sessionId);
-    });
+    const sessions = await browser.tauri.execute(
+      async ({ core }, directories) => {
+        const pending: { agent: string; directory: string }[] = JSON.parse(
+          sessionStorage.getItem('sai-e2e-continuity-threads') ?? '[]',
+        );
+        await core.invoke('acp_connect', { agent: 'claude', directory: directories[0] });
+        await core.invoke('acp_connect', { agent: 'claude', directory: directories[1] });
+        await core.invoke('acp_connect', { agent: 'codex', directory: directories[2] });
+        await core.invoke('acp_authenticate', {
+          agent: 'codex',
+          directory: directories[2],
+          methodId: 'chat-gpt',
+        });
+        const created = await Promise.all(
+          pending.map((thread) =>
+            core.invoke<{ sessionId: string }>('acp_new_session', {
+              params: { agent: thread.agent, cwd: thread.directory },
+            }),
+          ),
+        );
+        return created.map((session) => session.sessionId);
+      },
+      [first, second, codex],
+    );
     await browser.execute(
       (saved, personalCheck, directories) => {
         sessionStorage.removeItem('sai-e2e-continuity-threads');
