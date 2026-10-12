@@ -1195,7 +1195,7 @@ fn temp_directory_status(cache_directory: &Path, data_directory: &Path) -> Vec<C
                     Ok(_lock) => Some("turn-temp-owner-unverified"),
                     Err(_) if owner_unverified => Some("turn-temp-owner-unverified-active"),
                     Err(_) if cleanup_failed => Some("turn-temp-cleanup-failed"),
-                    Err(_) => None,
+                    Err(_) => Some("turn-temp-process-active"),
                 }
             }
             Err(_) => {
@@ -2314,14 +2314,52 @@ mod tests {
         }
     }
 
-    fn assert_cleanup_reason(cache: &Path, expected: &str) {
+    fn pending_with_reason(cache: &Path, expected: &str) -> CleanupPending {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let status = cleanup_status(cache);
-            if status.iter().any(|item| item.reason == expected) {
-                return;
+            if let Some(item) = status.iter().find(|item| item.reason == expected) {
+                return item.clone();
             }
             assert!(std::time::Instant::now() < deadline, "{status:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn assert_pending_temp_cleaned(cache: &Path, token: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match clean_pending_temp(cache, token) {
+                Ok(_) => return,
+                Err(error)
+                    if std::time::Instant::now() < deadline
+                        && matches!(
+                            error.as_str(),
+                            "Temporary data still has an active owner."
+                                | "Temporary data is no longer pending; refresh cleanup status."
+                                | "Private storage is changing; retry after it becomes idle."
+                                | "Temporary data is not an unused directory."
+                        ) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("pending temporary cleanup failed: {error}"),
+            }
+        }
+    }
+
+    fn assert_verified_temp_reclaimed(cache: &Path, temp: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            retry_cleanup(cache);
+            if !temp.exists() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "verified temporary data remained: {:?}",
+                cleanup_status(cache)
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
@@ -2500,6 +2538,26 @@ mod tests {
     }
 
     #[test]
+    fn active_turn_temp_is_visible_without_a_manual_cleanup_action() {
+        let fixture = GitFixture::new();
+        let (_, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let artifact = lease.temp_directory().join("active-artifact");
+        fs::write(&artifact, "running").unwrap();
+
+        let pending = cleanup_status(&fixture.cache);
+        let item = pending
+            .iter()
+            .find(|item| item.reason == "turn-temp-process-active")
+            .unwrap();
+        assert!(item.size_bytes.unwrap() >= 7);
+        assert!(item.cleanup_token.is_none());
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "running");
+
+        lease.release_clean().unwrap();
+        assert!(!artifact.exists());
+    }
+
+    #[test]
     fn ten_verified_unexposed_turns_do_not_accumulate_temp_while_terminal_runs() {
         let fixture = GitFixture::new();
         let (_, terminal) = register(&fixture.cache, &fixture.first).unwrap();
@@ -2554,8 +2612,7 @@ mod tests {
             owner.kill().unwrap();
             owner.wait().unwrap();
 
-            retry_cleanup(&fixture.cache);
-            assert!(!temp.exists());
+            assert_verified_temp_reclaimed(&fixture.cache, &temp);
             assert_eq!(fs::read_to_string(&active).unwrap(), "running");
         }
         terminal.release_clean().unwrap();
@@ -2583,14 +2640,10 @@ mod tests {
         assert!(child.wait().unwrap().success());
         runtime.release_clean().unwrap();
 
-        let pending = cleanup_status(&fixture.cache);
-        let item = pending
-            .iter()
-            .find(|item| item.reason == "turn-temp-owner-unverified")
-            .unwrap();
+        let item = pending_with_reason(&fixture.cache, "turn-temp-owner-unverified");
         assert!(item.size_bytes.unwrap() >= 6);
         assert_eq!(fs::read_to_string(&artifact).unwrap(), "retain");
-        clean_pending_temp(&fixture.cache, item.cleanup_token.as_deref().unwrap()).unwrap();
+        assert_pending_temp_cleaned(&fixture.cache, item.cleanup_token.as_deref().unwrap());
         assert!(!artifact.exists());
     }
 
@@ -2622,14 +2675,10 @@ mod tests {
         assert!(lease.cancel_process_start().is_err());
         drop(lease);
 
-        let pending = cleanup_status(&fixture.cache);
-        let item = pending
-            .iter()
-            .find(|item| item.reason == "turn-temp-cleanup-failed")
-            .unwrap();
+        let item = pending_with_reason(&fixture.cache, "turn-temp-cleanup-failed");
         fs::remove_dir(&state).unwrap();
         fs::write(&state, "invalid").unwrap();
-        clean_pending_temp(&fixture.cache, item.cleanup_token.as_deref().unwrap()).unwrap();
+        assert_pending_temp_cleaned(&fixture.cache, item.cleanup_token.as_deref().unwrap());
         assert!(!temp.exists());
     }
 
@@ -2645,12 +2694,8 @@ mod tests {
 
         retry_cleanup(&fixture.cache);
         assert_eq!(fs::read_to_string(temp.join("artifact")).unwrap(), "retain");
-        let pending = cleanup_status(&fixture.cache);
-        let item = pending
-            .iter()
-            .find(|item| item.reason == "turn-temp-owner-unverified")
-            .unwrap();
-        clean_pending_temp(&fixture.cache, item.cleanup_token.as_deref().unwrap()).unwrap();
+        let item = pending_with_reason(&fixture.cache, "turn-temp-owner-unverified");
+        assert_pending_temp_cleaned(&fixture.cache, item.cleanup_token.as_deref().unwrap());
         assert!(!temp.exists());
     }
 
@@ -2664,11 +2709,7 @@ mod tests {
         lease.mark_started();
         drop(lease);
 
-        let pending = cleanup_status(&fixture.cache);
-        let abandoned_item = pending
-            .iter()
-            .find(|item| item.reason == "turn-temp-owner-unverified")
-            .unwrap();
+        let abandoned_item = pending_with_reason(&fixture.cache, "turn-temp-owner-unverified");
         assert!(abandoned_item.size_bytes.unwrap() >= 3);
         let abandoned_token = abandoned_item.cleanup_token.clone().unwrap();
         retry_cleanup(&fixture.cache);
@@ -2690,21 +2731,13 @@ mod tests {
             fs::read_to_string(unverified.join("artifact")).unwrap(),
             "retain"
         );
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "turn-temp-owner-unverifiable"));
-
-        let unverified_token = cleanup_status(&fixture.cache)
-            .iter()
-            .find(|item| item.reason == "turn-temp-owner-unverifiable")
-            .unwrap()
+        let unverified_token = pending_with_reason(&fixture.cache, "turn-temp-owner-unverifiable")
             .cleanup_token
-            .clone()
             .unwrap();
-        clean_pending_temp(&fixture.cache, &abandoned_token).unwrap();
+        assert_pending_temp_cleaned(&fixture.cache, &abandoned_token);
         assert!(!abandoned.exists());
         assert!(unverified.exists());
-        clean_pending_temp(&fixture.cache, &unverified_token).unwrap();
+        assert_pending_temp_cleaned(&fixture.cache, &unverified_token);
         assert!(!unverified.exists());
     }
 
@@ -2738,9 +2771,7 @@ mod tests {
             fs::read_to_string(temp.join("artifact")).unwrap(),
             "possibly-live"
         );
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "turn-temp-owner-unverified"));
+        pending_with_reason(&fixture.cache, "turn-temp-owner-unverified");
     }
 
     #[test]
@@ -2755,9 +2786,7 @@ mod tests {
         lease.mark_started();
         drop(lease);
 
-        assert!(cleanup_status(&fixture.cache)
-            .iter()
-            .any(|item| item.reason == "turn-temp-owner-unverified"));
+        pending_with_reason(&fixture.cache, "turn-temp-owner-unverified");
         retry_cleanup(&fixture.cache);
         assert_eq!(fs::read_to_string(temp.join("artifact")).unwrap(), "old");
         assert!(directory.exists());
@@ -2818,7 +2847,7 @@ mod tests {
             .cleanup_token
             .clone()
             .unwrap();
-        clean_pending_temp(&fixture.cache, &token).unwrap();
+        assert_pending_temp_cleaned(&fixture.cache, &token);
         assert!(!artifact.exists());
     }
 
@@ -2863,7 +2892,7 @@ mod tests {
         assert!(cleanup_status(&fixture.cache)
             .iter()
             .any(|item| item.reason == "turn-temp-owner-unverified"));
-        clean_pending_temp(&fixture.cache, &cache_key(&temp).unwrap()).unwrap();
+        assert_pending_temp_cleaned(&fixture.cache, &cache_key(&temp).unwrap());
         assert!(!temp.exists());
     }
 
@@ -3092,9 +3121,9 @@ mod tests {
 
         reconcile(&fixture.cache);
         assert!(directory.exists());
-        assert_cleanup_reason(&fixture.cache, "unclean-active-use");
+        pending_with_reason(&fixture.cache, "unclean-active-use");
 
-        assert_cleanup_reason(&fixture.cache, "unclean-active-use");
+        pending_with_reason(&fixture.cache, "unclean-active-use");
     }
 
     #[test]
@@ -3108,7 +3137,7 @@ mod tests {
         reconcile(&fixture.cache);
 
         assert!(directory.exists());
-        assert_cleanup_reason(&fixture.cache, "git-worktree-registration-still-present");
+        pending_with_reason(&fixture.cache, "git-worktree-registration-still-present");
     }
 
     #[test]
@@ -3226,7 +3255,7 @@ mod tests {
         reconcile(&fixture.cache);
 
         assert!(directory.exists());
-        assert_cleanup_reason(&fixture.cache, "git-common-dir-missing-or-unreadable");
+        pending_with_reason(&fixture.cache, "git-common-dir-missing-or-unreadable");
     }
 
     #[test]

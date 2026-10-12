@@ -1835,7 +1835,15 @@ mod tests {
             .env(HELPER, "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let (mut child, job) = WindowsTerminalJob::spawn(&mut command).unwrap();
+        let scratch =
+            std::env::temp_dir().join(format!("sail-terminal-job-{}", uuid::Uuid::new_v4()));
+        let worktree = scratch.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (_, storage_lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        storage_lease.prepare_process_start().unwrap();
+        let (mut child, job) = WindowsTerminalJob::spawn(&mut command, &storage_lease).unwrap();
+        storage_lease.mark_started();
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_secs(10);
         while child.try_wait().unwrap().is_none() {
@@ -1856,6 +1864,9 @@ mod tests {
         job.stop()
             .expect("terminate descendants after direct child exit");
         assert_eq!(job.active_processes().unwrap(), 0);
+        storage_lease.release_clean().unwrap();
+        drop(storage_lease);
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[test]

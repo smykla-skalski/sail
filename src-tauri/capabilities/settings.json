@@ -14,6 +14,7 @@
     "allow-save-setting",
     "allow-worktree-storage-cleanup-status",
     "allow-retry-worktree-storage-cleanup",
+    "allow-clean-pending-worktree-temp",
     "allow-inspect-agent-hooks",
     "allow-inspect-hook-integration",
     "allow-enable-hook-integration",
