@@ -437,7 +437,7 @@ pub(crate) fn promote_idle_worktree(app: &AppHandle, worktree: &Path) -> Result<
             }
             let fence = app.state::<AgentWorktreeFence>();
             let agents = app.state::<AgentManager>();
-            fence.cleanup(&agents, worktree, None, || {
+            fence.cleanup(&agents, worktree, None, false, || {
                 let cache = app
                     .path()
                     .app_cache_dir()
@@ -463,6 +463,10 @@ struct Connection {
     worktree: PathBuf,
     _storage_lease: Option<Arc<crate::worktree_storage::WorktreeDataLease>>,
     child: Mutex<Child>,
+    #[cfg(unix)]
+    scratch_owner: Option<String>,
+    #[cfg(unix)]
+    _runtime_scratch: Option<crate::scratch_cleanup::OwnedRuntimeScratch>,
     #[cfg(unix)]
     watchdog: Mutex<crate::child_watchdog::ChildWatchdog>,
     stopped: AtomicBool,
@@ -1575,14 +1579,17 @@ fn session_directory(runtime: &Connection, session_id: &str) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
-fn runtime_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
+fn runtime_environment(
+    data_directory: &Path,
+    runtime_scratch: Option<&Path>,
+) -> Vec<(&'static str, PathBuf)> {
     let mut environment = crate::acp_terminal::terminal_environment(data_directory);
     let shared_download_cache = data_directory
         .parent()
         .and_then(Path::parent)
         .unwrap_or(data_directory)
         .join("terminal-package-downloads");
-    let build_directory = data_directory.join("build");
+    let build_directory = runtime_scratch.unwrap_or(data_directory).join("build");
     environment.extend([
         ("CARGO_TARGET_DIR", build_directory.join("cargo-target")),
         ("GOCACHE", build_directory.join("go-cache")),
@@ -3953,6 +3960,11 @@ fn connect_blocking_inner(
     let (data_directory, storage_lease) =
         crate::register_worktree_storage(&cache_directory, worktree)?;
     prepare_runtime_directories(&data_directory)?;
+    #[cfg(unix)]
+    let mut runtime_scratch = Some(
+        crate::scratch_cleanup::OwnedRuntimeScratch::create()
+            .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
+    );
     if let Some(temp) = owned_temp.as_ref() {
         if let Some(overlay) = overlay.as_ref() {
             let shared_cache = data_directory
@@ -3972,7 +3984,11 @@ fn connect_blocking_inner(
             );
         }
     }
-    for (name, value) in runtime_environment(&data_directory) {
+    #[cfg(unix)]
+    let scratch_path = runtime_scratch.as_ref().map(|scratch| scratch.path());
+    #[cfg(not(unix))]
+    let scratch_path = None;
+    for (name, value) in runtime_environment(&data_directory, scratch_path) {
         command.env(name, value);
     }
     if let Some(overlay) = overlay.as_ref() {
@@ -3980,8 +3996,13 @@ fn connect_blocking_inner(
     }
     command.current_dir(worktree);
     #[cfg(unix)]
-    isolate_agent_process(&mut command);
-    let spawn = command
+    let mut wrapped = crate::scratch_cleanup::wrap_command(&command)
+        .map_err(|error| format!("Could not prepare agent owner: {error}"))?;
+    #[cfg(unix)]
+    isolate_agent_process(&mut wrapped);
+    #[cfg(not(unix))]
+    let mut wrapped = command;
+    let spawn = wrapped
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3994,7 +4015,11 @@ fn connect_blocking_inner(
             "Background priority launch failed for {}: {error}; retrying at normal priority",
             definition.name
         );
-        let mut retry = crate::background_priority::normal_priority_copy(&command);
+        let retry = crate::background_priority::normal_priority_copy(&command);
+        #[cfg(unix)]
+        let mut retry = crate::scratch_cleanup::wrap_command(&retry)?;
+        #[cfg(not(unix))]
+        let mut retry = retry;
         #[cfg(unix)]
         isolate_agent_process(&mut retry);
         retry
@@ -4005,7 +4030,16 @@ fn connect_blocking_inner(
     });
     let mut child =
         spawn.map_err(|error| format!("Could not start {}: {error}", definition.name))?;
+    #[cfg(unix)]
+    if let Some(scratch) = runtime_scratch.as_mut() {
+        if let Err(error) = scratch.mark_owner(child.id()) {
+            let _ = stop_process(&mut child);
+            return Err(format!("Could not record runtime scratch owner: {error}"));
+        }
+    }
     storage_lease.mark_started();
+    #[cfg(unix)]
+    let scratch_owner = crate::scratch_cleanup::owner_identity_for_pid(child.id());
     if !is_test_agent {
         observe_agent_with_reef(&agent, child.id());
     }
@@ -4038,6 +4072,10 @@ fn connect_blocking_inner(
         worktree: worktree.to_path_buf(),
         _storage_lease: Some(storage_lease),
         child: Mutex::new(child),
+        #[cfg(unix)]
+        scratch_owner,
+        #[cfg(unix)]
+        _runtime_scratch: runtime_scratch,
         #[cfg(unix)]
         watchdog: Mutex::new(watchdog),
         stopped: AtomicBool::new(false),
@@ -4229,6 +4267,10 @@ fn connect_blocking_inner(
                                     .or_else(|| runtime.pending_directory.lock().ok()?.clone());
                                 let manager =
                                     app.state::<crate::acp_terminal::AcpTerminalManager>();
+                                #[cfg(unix)]
+                                let scratch_owner = runtime.scratch_owner.as_deref();
+                                #[cfg(not(unix))]
+                                let scratch_owner = None;
                                 let session_id = params
                                     .get("sessionId")
                                     .and_then(Value::as_str)
@@ -4241,7 +4283,10 @@ fn connect_blocking_inner(
                                         runtime.profile,
                                         &method,
                                         params,
-                                        directory,
+                                        crate::acp_terminal::TerminalContext {
+                                            directory,
+                                            scratch_owner,
+                                        },
                                     )
                                 };
                                 let result = if method == "terminal/create" {
@@ -6195,6 +6240,8 @@ mod session_config_tests {
             worktree: worktree.to_path_buf(),
             _storage_lease: None,
             child: Mutex::new(child),
+            scratch_owner: None,
+            _runtime_scratch: None,
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
             input: Mutex::new(input),
@@ -6387,8 +6434,10 @@ mod session_config_tests {
         let second_data = crate::acp_terminal::worktree_data_directory(&cache, &second);
         prepare_runtime_directories(&first_data).unwrap();
         prepare_runtime_directories(&second_data).unwrap();
-        let first_environment = runtime_environment(&first_data);
-        let second_environment = runtime_environment(&second_data);
+        let first_scratch = scratch.join("first-runtime");
+        let second_scratch = scratch.join("second-runtime");
+        let first_environment = runtime_environment(&first_data, Some(&first_scratch));
+        let second_environment = runtime_environment(&second_data, Some(&second_scratch));
         let path = |environment: &[(&str, PathBuf)], name| {
             environment
                 .iter()
@@ -6409,6 +6458,11 @@ mod session_config_tests {
                 path(&second_environment, name)
             );
         }
+        assert_eq!(
+            path(&first_environment, "CARGO_TARGET_DIR"),
+            first_scratch.join("build/cargo-target")
+        );
+        assert_eq!(path(&first_environment, "TMPDIR"), first_data.join("tmp"));
         for directory in [
             first_data.join("tmp"),
             first_data.join("cache"),
@@ -6547,6 +6601,8 @@ mod session_config_tests {
                 worktree: worktree.to_path_buf(),
                 _storage_lease: None,
                 child: Mutex::new(child),
+                scratch_owner: None,
+                _runtime_scratch: None,
                 watchdog: Mutex::new(watchdog),
                 stopped: AtomicBool::new(false),
                 input: Mutex::new(input),
@@ -7185,6 +7241,8 @@ mod native_subagent_fence_tests {
             worktree: PathBuf::from("/worktree"),
             _storage_lease: None,
             child: Mutex::new(child),
+            scratch_owner: None,
+            _runtime_scratch: None,
             watchdog: Mutex::new(watchdog),
             stopped: AtomicBool::new(false),
             input: Mutex::new(input),
