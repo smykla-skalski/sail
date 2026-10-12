@@ -44,6 +44,7 @@
     "allow-context-register-provider",
     "allow-context-approve-provider",
     "allow-context-revoke-provider",
+    "dialog:allow-message",
     "dialog:allow-open",
     "allow-open-external-url",
     "core:event:allow-listen",
