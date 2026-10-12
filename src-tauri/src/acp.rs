@@ -481,6 +481,7 @@ struct Connection {
     elicitation_state: Mutex<HashMap<String, PendingElicitation>>,
     next_permission_generation: AtomicU64,
     prompt_state: Mutex<PromptState>,
+    temp_cleanup_gate: Mutex<TempCleanupState>,
     prompt_dispatch: Mutex<()>,
     cancelled_prompts: Mutex<HashSet<String>>,
     next_id: AtomicU64,
@@ -1330,8 +1331,85 @@ impl Drop for Connection {
     }
 }
 
+#[derive(Default)]
+struct TempCleanupState {
+    pending: bool,
+    failed_process_sessions: HashSet<String>,
+}
+
 impl Connection {
+    fn record_process_cleanup(&self, session_id: &str, succeeded: bool) -> Result<(), String> {
+        let mut temp_gate = self
+            .temp_cleanup_gate
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if succeeded {
+            temp_gate.failed_process_sessions.remove(session_id);
+        } else {
+            temp_gate.pending = true;
+            temp_gate
+                .failed_process_sessions
+                .insert(session_id.to_string());
+            if let Some(lease) = &self._storage_lease {
+                lease.mark_temp_pending("turn-temp-process-cleanup-failed");
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_idle_temp(&self, request: bool) -> Result<(), String> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut temp_gate = self
+            .temp_cleanup_gate
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if request {
+            temp_gate.pending = true;
+        }
+        if !temp_gate.pending || !temp_gate.failed_process_sessions.is_empty() {
+            return Ok(());
+        }
+        let idle = self
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .active
+            .is_empty();
+        let requests_idle = self
+            .pending
+            .lock()
+            .map_err(|error| error.to_string())?
+            .is_empty();
+        let subagents = self
+            .native_subagents
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if idle && requests_idle && subagents.active_in(&self.worktree).is_empty() {
+            let child_id = self.child.lock().map_err(|error| error.to_string())?.id();
+            let _pause = PausedAgent::new(child_id)?;
+            if runtime_has_live_children(
+                child_id,
+                self._storage_lease
+                    .as_ref()
+                    .map(|lease| lease.temp_directory()),
+            ) {
+                return Ok(());
+            }
+            if let Some(lease) = &self._storage_lease {
+                lease.clear_turn_temp()?;
+            }
+            temp_gate.pending = false;
+        }
+        Ok(())
+    }
+
     fn stop_child(&self) -> Result<(), String> {
+        let _temp_gate = self
+            .temp_cleanup_gate
+            .lock()
+            .map_err(|error| error.to_string())?;
         if let Ok(mut child) = self.child.lock() {
             if !self.stopped.swap(true, Ordering::AcqRel) {
                 if let Err(error) = stop_process(&mut child) {
@@ -1420,10 +1498,15 @@ impl Connection {
             json!({"agent":self.agent,"method":method,"requestId":id,"sessionId":session_id}),
         );
         let (sender, receiver) = mpsc::channel();
+        let temp_gate = self
+            .temp_cleanup_gate
+            .lock()
+            .map_err(|error| error.to_string())?;
         self.pending
             .lock()
             .map_err(|error| error.to_string())?
             .insert(id, sender);
+        drop(temp_gate);
         if let Err(error) =
             write_message(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
         {
@@ -1653,10 +1736,11 @@ fn session_directory(runtime: &Connection, session_id: &str) -> Option<String> {
 
 fn runtime_environment(
     data_directory: &Path,
+    temp_directory: &Path,
     runtime_scratch: Option<&Path>,
     shared_build_directory: Option<&Path>,
 ) -> Vec<(&'static str, PathBuf)> {
-    let mut environment = crate::acp_terminal::terminal_environment(data_directory);
+    let mut environment = crate::acp_terminal::terminal_environment(data_directory, temp_directory);
     let shared_download_cache = data_directory
         .parent()
         .and_then(Path::parent)
@@ -1668,7 +1752,7 @@ fn runtime_environment(
     environment.extend([
         ("CARGO_TARGET_DIR", build_directory.join("cargo-target")),
         ("GOCACHE", build_directory.join("go-cache")),
-        ("GOTMPDIR", build_directory.join("go-tmp")),
+        ("GOTMPDIR", temp_directory.join("go-tmp")),
         ("NPM_CONFIG_CACHE", shared_download_cache.join("npm")),
         ("YARN_CACHE_FOLDER", shared_download_cache.join("yarn")),
         ("COREPACK_HOME", shared_download_cache.join("corepack")),
@@ -1696,12 +1780,12 @@ fn gate_build_directory(
     }
 }
 
-fn prepare_runtime_directories(data_directory: &Path) -> Result<(), String> {
+fn prepare_runtime_directories(data_directory: &Path, temp_directory: &Path) -> Result<(), String> {
     for directory in [
-        data_directory.join("tmp"),
+        temp_directory.to_path_buf(),
         data_directory.join("cache"),
         data_directory.join("build"),
-        data_directory.join("build/go-tmp"),
+        temp_directory.join("go-tmp"),
     ] {
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     }
@@ -1727,6 +1811,26 @@ impl ForgetGenerationKey {
 
 type ForgetGenerations = HashMap<ForgetGenerationKey, u64>;
 
+fn retryable_process_cleanup_sessions(
+    failed: &HashSet<String>,
+    prompts: &PromptState,
+    cancelled_turns: &HashSet<String>,
+) -> Vec<(String, bool)> {
+    let busy = !prompts.active.is_empty() || !prompts.finishing.is_empty();
+    failed
+        .iter()
+        .filter_map(|session_id| {
+            let cancelled_and_finishing = prompts.finishing.contains(session_id)
+                && prompts
+                    .active
+                    .get(session_id)
+                    .is_some_and(|prompt| cancelled_turns.contains(&prompt.turn_id));
+            (!busy || cancelled_and_finishing)
+                .then(|| (session_id.clone(), cancelled_and_finishing))
+        })
+        .collect()
+}
+
 #[derive(Clone, Default)]
 pub struct AgentManager(
     Arc<Mutex<HashMap<ConnectionKey, Arc<Connection>>>>,
@@ -1734,6 +1838,70 @@ pub struct AgentManager(
 );
 
 impl AgentManager {
+    pub fn retry_turn_temp_cleanup(&self, app: &AppHandle) {
+        let connections = self
+            .0
+            .lock()
+            .ok()
+            .map(|agents| agents.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for connection in connections {
+            let process_retry = (|| -> Result<(), String> {
+                let mut temp_gate = connection
+                    .temp_cleanup_gate
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                if temp_gate.failed_process_sessions.is_empty() {
+                    return Ok(());
+                }
+                let prompts = connection
+                    .prompt_state
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                let cancelled_turns = connection
+                    .cancelled_prompts
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                let sessions = retryable_process_cleanup_sessions(
+                    &temp_gate.failed_process_sessions,
+                    &prompts,
+                    &cancelled_turns,
+                );
+                drop(cancelled_turns);
+                drop(prompts);
+                let mut cancelled_retry_succeeded = false;
+                for (session_id, cancelled_and_finishing) in sessions {
+                    if cleanup_session_processes(app, &connection, &connection.agent, &session_id) {
+                        temp_gate.failed_process_sessions.remove(&session_id);
+                        cancelled_retry_succeeded |= cancelled_and_finishing;
+                    }
+                }
+                if cancelled_retry_succeeded && temp_gate.failed_process_sessions.is_empty() {
+                    if let Some(lease) = &connection._storage_lease {
+                        lease.mark_temp_pending("turn-temp-owner-unverified");
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = process_retry {
+                crate::diagnostics::record(
+                    "turn_temp_cleanup_failed",
+                    json!({"agent":connection.agent,"error":error}),
+                );
+                continue;
+            }
+            if let Err(error) = connection.clear_idle_temp(false) {
+                if let Some(lease) = &connection._storage_lease {
+                    lease.mark_temp_pending("turn-temp-cleanup-failed");
+                }
+                crate::diagnostics::record(
+                    "turn_temp_cleanup_failed",
+                    json!({"agent":connection.agent,"error":error}),
+                );
+            }
+        }
+    }
+
     fn forget_generation(
         &self,
         agent: &str,
@@ -4238,12 +4406,12 @@ fn connect_blocking_inner(
     let overlay = crate::git_overlay::GitOverlay::ensure(&cache_directory, worktree)?;
     let (data_directory, storage_lease) =
         crate::register_worktree_storage(&cache_directory, worktree)?;
-    prepare_runtime_directories(&data_directory)?;
     #[cfg(unix)]
     let mut runtime_scratch = Some(
         crate::scratch_cleanup::OwnedRuntimeScratch::create()
             .map_err(|error| format!("Could not prepare runtime scratch: {error}"))?,
     );
+    prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
     if let Some(temp) = owned_temp.as_ref() {
         if let Some(overlay) = overlay.as_ref() {
             let shared_cache = data_directory
@@ -4269,6 +4437,7 @@ fn connect_blocking_inner(
     let scratch_path = None;
     for (name, value) in runtime_environment(
         &data_directory,
+        storage_lease.temp_directory(),
         scratch_path,
         shared_build_directory.as_deref(),
     ) {
@@ -4286,6 +4455,7 @@ fn connect_blocking_inner(
     isolate_agent_process(&mut wrapped);
     #[cfg(not(unix))]
     let mut wrapped = command;
+    storage_lease.prepare_process_start()?;
     let spawn = wrapped
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -4311,8 +4481,14 @@ fn connect_blocking_inner(
             .stderr(Stdio::piped())
             .spawn()
     });
-    let mut child =
-        spawn.map_err(|error| format!("Could not start {}: {error}", definition.name))?;
+    let mut child = match spawn {
+        Ok(child) => child,
+        Err(error) => {
+            storage_lease.cancel_process_start()?;
+            return Err(format!("Could not start {}: {error}", definition.name));
+        }
+    };
+    storage_lease.mark_started();
     #[cfg(unix)]
     if let Some(scratch) = runtime_scratch.as_mut() {
         if let Err(error) = scratch.mark_owner(child.id()) {
@@ -4320,7 +4496,6 @@ fn connect_blocking_inner(
             return Err(format!("Could not record runtime scratch owner: {error}"));
         }
     }
-    storage_lease.mark_started();
     #[cfg(unix)]
     let scratch_owner = crate::scratch_cleanup::owner_identity_for_pid(child.id());
     if !is_test_agent {
@@ -4373,6 +4548,7 @@ fn connect_blocking_inner(
         elicitation_state: Mutex::new(HashMap::new()),
         next_permission_generation: AtomicU64::new(1),
         prompt_state: Mutex::new(PromptState::default()),
+        temp_cleanup_gate: Mutex::new(TempCleanupState::default()),
         prompt_dispatch: Mutex::new(()),
         cancelled_prompts: Mutex::new(HashSet::new()),
         next_id: AtomicU64::new(1),
@@ -4391,6 +4567,7 @@ fn connect_blocking_inner(
         ready: Condvar::new(),
         _owned_temp: owned_temp,
     });
+    start_temp_cleanup_watcher(&runtime)?;
     let reader = Arc::clone(&runtime);
     let reader_manager = manager.clone();
     let agent_id = agent.clone();
@@ -4745,8 +4922,15 @@ fn connect_blocking_inner(
             "agent_disconnected",
             json!({"agent":agent_id,"profile":profile.as_str(),"sessionIds":session_ids}),
         );
-        app.state::<crate::acp_terminal::AcpTerminalManager>()
-            .stop_sessions(&agent_id, profile, &reader.worktree, &session_ids);
+        if let Err(error) = app
+            .state::<crate::acp_terminal::AcpTerminalManager>()
+            .stop_sessions(&agent_id, profile, &reader.worktree, &session_ids)
+        {
+            crate::diagnostics::record(
+                "owned_process_cleanup_failed",
+                json!({"agent":agent_id,"error":error}),
+            );
+        }
         reader.ready.notify_all();
         if let Ok(mut state) = reader.permission_state.lock() {
             state.pending.clear();
@@ -5728,6 +5912,10 @@ pub async fn acp_prompt(
             .lock()
             .map_err(|error| error.to_string())?;
         let _claims = preflight_runtime.wait_for_restore(claims, &preflight_session)?;
+        let _temp_gate = preflight_runtime
+            .temp_cleanup_gate
+            .lock()
+            .map_err(|error| error.to_string())?;
         let mut prompts = preflight_runtime
             .prompt_state
             .lock()
@@ -6031,6 +6219,7 @@ pub async fn acp_prompt(
             cancelled.remove(&turn_id);
         }
         crate::memory_capture::store_completed(&app, candidates);
+        let mut process_cleanup_succeeded = false;
         let latest = finish_prompt_after_cleanup(
             &runtime.prompt_state,
             &session_id,
@@ -6053,9 +6242,22 @@ pub async fn acp_prompt(
                     );
                     }
                 }
-                cleanup_session_processes(&app, &runtime, &agent, &session_id);
+                let clean = cleanup_session_processes(&app, &runtime, &agent, &session_id);
+                process_cleanup_succeeded =
+                    runtime.record_process_cleanup(&session_id, clean).is_ok() && clean;
             },
         );
+        if latest && process_cleanup_succeeded {
+            if let Err(error) = runtime.clear_idle_temp(true) {
+                if let Some(lease) = &runtime._storage_lease {
+                    lease.mark_temp_pending("turn-temp-cleanup-failed");
+                }
+                crate::diagnostics::record(
+                    "turn_temp_cleanup_failed",
+                    json!({"agent":agent,"turnId":turn_id,"error":error}),
+                );
+            }
+        }
         let promotion_error = if latest {
             promote_idle_worktree(&app, &runtime.worktree).err()
         } else {
@@ -6184,6 +6386,220 @@ pub async fn acp_steer(
     .map_err(|error| error.to_string())?
 }
 
+fn runtime_has_live_children(root: u32, temp_directory: Option<&Path>) -> bool {
+    let system = sysinfo::System::new_all();
+    let root = sysinfo::Pid::from_u32(root);
+    system.processes().values().any(|process| {
+        if process.pid() == root
+            || matches!(
+                process.status(),
+                sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+            )
+        {
+            return false;
+        }
+        #[cfg(unix)]
+        if process.session_id() == Some(root) {
+            return true;
+        }
+        if temp_directory
+            .is_some_and(|directory| crate::worktree_storage::process_uses_temp(process, directory))
+        {
+            return true;
+        }
+        let mut parent = process.parent();
+        while let Some(pid) = parent {
+            if pid == root {
+                return true;
+            }
+            parent = system.process(pid).and_then(sysinfo::Process::parent);
+        }
+        false
+    })
+}
+
+fn start_temp_cleanup_watcher(runtime: &Arc<Connection>) -> Result<(), String> {
+    let weak = Arc::downgrade(runtime);
+    std::thread::Builder::new()
+        .name("sail-turn-temp-cleanup".into())
+        .spawn(move || {
+            let mut last_error = None;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let Some(runtime) = weak.upgrade() else {
+                    break;
+                };
+                if runtime.stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                match runtime.clear_idle_temp(false) {
+                    Ok(()) => last_error = None,
+                    Err(error) => {
+                        if let Some(lease) = &runtime._storage_lease {
+                            lease.mark_temp_pending("turn-temp-cleanup-failed");
+                        }
+                        if last_error.as_ref() != Some(&error) {
+                            crate::diagnostics::record(
+                                "turn_temp_cleanup_failed",
+                                json!({"agent":runtime.agent,"error":error}),
+                            );
+                            last_error = Some(error);
+                        }
+                    }
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Cannot watch private temporary cleanup: {error}"))
+}
+
+#[cfg(unix)]
+struct PausedAgent {
+    pid: u32,
+    started_at: u64,
+}
+
+#[cfg(unix)]
+impl PausedAgent {
+    fn new(pid: u32) -> Result<Self, String> {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        let system = sysinfo::System::new_all();
+        let process = system
+            .process(sysinfo::Pid::from_u32(pid))
+            .ok_or("Agent exited before temporary cleanup.")?;
+        if process.status() == sysinfo::ProcessStatus::Stop {
+            return Err("Agent was already paused before temporary cleanup.".into());
+        }
+        let started_at = process.start_time();
+        kill(Pid::from_raw(pid as i32), Signal::SIGSTOP)
+            .map_err(|error| format!("Cannot pause agent for temporary cleanup: {error}"))?;
+        let pause = Self { pid, started_at };
+        let pid = sysinfo::Pid::from_u32(pid);
+        for _ in 0..100 {
+            let system = sysinfo::System::new_all();
+            match system.process(pid) {
+                Some(process)
+                    if process.start_time() == started_at
+                        && process.status() == sysinfo::ProcessStatus::Stop =>
+                {
+                    return Ok(pause);
+                }
+                None => return Err("Agent exited before temporary cleanup.".into()),
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        Err("Agent did not pause for temporary cleanup.".into())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PausedAgent {
+    fn drop(&mut self) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        let system = sysinfo::System::new_all();
+        if !system
+            .process(sysinfo::Pid::from_u32(self.pid))
+            .is_some_and(|process| process.start_time() == self.started_at)
+        {
+            return;
+        }
+        if let Err(error) = kill(Pid::from_raw(self.pid as i32), Signal::SIGCONT) {
+            crate::diagnostics::record(
+                "turn_temp_cleanup_failed",
+                json!({"error":format!("Cannot resume agent after temporary cleanup: {error}")}),
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+struct PausedAgent(Vec<std::os::windows::io::OwnedHandle>);
+
+#[cfg(windows)]
+impl PausedAgent {
+    fn new(pid: u32) -> Result<Self, String> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows::Win32::System::Threading::{OpenThread, SuspendThread, THREAD_SUSPEND_RESUME};
+
+        let mut pause = Self(Vec::new());
+        let mut suspended = HashSet::new();
+        for _ in 0..16 {
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+                .map_err(|error| format!("Cannot inspect agent threads: {error}"))?;
+            let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.0) };
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
+            let mut first = true;
+            let mut newly_suspended = 0;
+            loop {
+                let result = unsafe {
+                    if first {
+                        first = false;
+                        Thread32First(HANDLE(snapshot.as_raw_handle() as _), &mut entry)
+                    } else {
+                        Thread32Next(HANDLE(snapshot.as_raw_handle() as _), &mut entry)
+                    }
+                };
+                if result.is_err() {
+                    break;
+                }
+                if entry.th32OwnerProcessID != pid || suspended.contains(&entry.th32ThreadID) {
+                    continue;
+                }
+                let thread =
+                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
+                        .map_err(|error| format!("Cannot open agent thread for pause: {error}"))?;
+                let thread = unsafe { OwnedHandle::from_raw_handle(thread.0) };
+                if unsafe { SuspendThread(HANDLE(thread.as_raw_handle() as _)) } == u32::MAX {
+                    return Err(format!(
+                        "Cannot pause agent thread: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                pause.0.push(thread);
+                suspended.insert(entry.th32ThreadID);
+                newly_suspended += 1;
+            }
+            if newly_suspended == 0 {
+                return if pause.0.is_empty() {
+                    Err("Agent exited before temporary cleanup.".into())
+                } else {
+                    Ok(pause)
+                };
+            }
+        }
+        Err("Agent threads did not pause for temporary cleanup.".into())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PausedAgent {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::ResumeThread;
+
+        for thread in self.0.iter().rev() {
+            if unsafe { ResumeThread(HANDLE(thread.as_raw_handle() as _)) } == u32::MAX {
+                crate::diagnostics::record(
+                    "turn_temp_cleanup_failed",
+                    json!({"error":format!("Cannot resume agent thread: {}", std::io::Error::last_os_error())}),
+                );
+            }
+        }
+    }
+}
+
 fn finish_prompt_after_cleanup(
     state: &Mutex<PromptState>,
     session_id: &str,
@@ -6269,7 +6685,13 @@ pub fn with_active_owned_terminal<T>(
     with_active_terminal_prompt(&runtime, session_id, action)
 }
 
-fn cleanup_session_processes(app: &AppHandle, runtime: &Connection, agent: &str, session_id: &str) {
+fn cleanup_session_processes(
+    app: &AppHandle,
+    runtime: &Connection,
+    agent: &str,
+    session_id: &str,
+) -> bool {
+    let mut clean = true;
     let directory = runtime
         .session_directories
         .lock()
@@ -6278,6 +6700,7 @@ fn cleanup_session_processes(app: &AppHandle, runtime: &Connection, agent: &str,
     if let Some(directory) = directory {
         let owner = format!("{}\0acp:{}:{}", directory.display(), agent, session_id);
         if let Err(error) = crate::owned_processes::stop_run(&owner) {
+            clean = false;
             crate::diagnostics::record(
                 "owned_process_cleanup_failed",
                 json!({
@@ -6289,19 +6712,29 @@ fn cleanup_session_processes(app: &AppHandle, runtime: &Connection, agent: &str,
             .state::<crate::terminal::TerminalManager>()
             .stop_owner(&owner)
         {
+            clean = false;
             crate::diagnostics::record(
                 "owned_process_cleanup_failed",
                 json!({"run":owner,"error":error}),
             );
         }
     }
-    app.state::<crate::acp_terminal::AcpTerminalManager>()
+    if let Err(error) = app
+        .state::<crate::acp_terminal::AcpTerminalManager>()
         .stop_sessions(
             agent,
             runtime.profile,
             &runtime.worktree,
             &[session_id.to_string()],
+        )
+    {
+        clean = false;
+        crate::diagnostics::record(
+            "owned_process_cleanup_failed",
+            json!({"agent":agent,"sessionId":session_id,"error":error}),
         );
+    }
+    clean
 }
 
 #[tauri::command]
@@ -6383,7 +6816,16 @@ fn cancel_session(
         return result;
     }
     if cleanup_current {
-        cleanup_session_processes(app, runtime, &agent, &session_id);
+        let clean = cleanup_session_processes(app, runtime, &agent, &session_id);
+        if let Err(error) = runtime.record_process_cleanup(&session_id, clean) {
+            if let Some(lease) = &runtime._storage_lease {
+                lease.mark_temp_pending("turn-temp-process-cleanup-failed");
+            }
+            crate::diagnostics::record(
+                "turn_temp_cleanup_failed",
+                json!({"agent":agent,"sessionId":session_id,"error":error}),
+            );
+        }
     }
     resolve_session_permissions(
         &mut permission_state.pending,
@@ -6545,6 +6987,43 @@ mod session_config_tests {
     use crate::browser_agent::McpConfig;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn retry_can_clean_cancelled_session_while_its_prompt_is_unanswered() {
+        let mut prompts = PromptState::default();
+        let prompt = |turn_id: &str| ActivePrompt {
+            turn_id: turn_id.into(),
+            text: String::new(),
+            memory_capture: crate::memory_capture::TurnCapture::default(),
+            last_agent_message: String::new(),
+            agent_message_open: false,
+            agent_message_overflow: false,
+            known_tool_calls: HashSet::new(),
+        };
+        prompts
+            .active
+            .insert("cancelled".into(), prompt("turn-cancelled"));
+        prompts
+            .active
+            .insert("running".into(), prompt("turn-running"));
+        prompts.finishing.insert("cancelled".into());
+        let failed = HashSet::from([
+            "cancelled".to_string(),
+            "running".to_string(),
+            "old".to_string(),
+        ]);
+        let cancelled_turns = HashSet::from(["turn-cancelled".to_string()]);
+
+        let sessions = retryable_process_cleanup_sessions(&failed, &prompts, &cancelled_turns);
+        assert_eq!(sessions, vec![("cancelled".to_string(), true)]);
+
+        prompts.active.clear();
+        prompts.finishing.clear();
+        assert_eq!(
+            retryable_process_cleanup_sessions(&failed, &prompts, &cancelled_turns).len(),
+            3
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn normal_priority_retry_keeps_its_own_session() {
@@ -6558,6 +7037,403 @@ mod session_config_tests {
         assert_eq!(session, child.id() as i32);
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_pauses_and_resumes_agent_process() {
+        let mut child = super::spawn_test_session_process();
+        let pause = PausedAgent::new(child.id()).unwrap();
+        let system = sysinfo::System::new_all();
+        assert_eq!(
+            system
+                .process(sysinfo::Pid::from_u32(child.id()))
+                .map(sysinfo::Process::status),
+            Some(sysinfo::ProcessStatus::Stop)
+        );
+        drop(pause);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_retries_after_worker_exits() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-turn-temp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let cache = scratch.join("cache");
+        let (_, lease) = crate::worktree_storage::register(&cache, &worktree).unwrap();
+        lease.mark_started();
+        let artifact = lease.temp_directory().join("turn-artifact");
+        std::fs::write(&artifact, "complete").unwrap();
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 2 & wait; exec sleep 10"])
+            .stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let mut runtime = test_runtime_with_child(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            child,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        let root = runtime.child.lock().unwrap().id();
+        for _ in 0..100 {
+            if runtime_has_live_children(root, None) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(runtime_has_live_children(root, None));
+        start_temp_cleanup_watcher(&runtime).unwrap();
+        runtime.clear_idle_temp(true).unwrap();
+        assert!(artifact.exists());
+
+        for _ in 0..100 {
+            if !artifact.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !artifact.exists(),
+            "watcher did not reclaim completed-turn data"
+        );
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_preserves_orphaned_worker() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-orphan-temp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let (_, lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        lease.mark_started();
+        let temp = lease.temp_directory().to_path_buf();
+        let artifact = temp.join("artifact");
+        let ready = scratch.join("ready");
+        let code = r#"import os,sys,time
+p=os.fork()
+if p==0:
+    p2=os.fork()
+    if p2>0: os._exit(0)
+    open(sys.argv[1], 'w').write('live')
+    open(sys.argv[2], 'w').write(str(os.getpid()))
+    time.sleep(10)
+    os._exit(0)
+os.waitpid(p, 0)
+time.sleep(10)
+"#;
+        let mut command = Command::new("python3");
+        command
+            .arg("-c")
+            .arg(code)
+            .arg(&artifact)
+            .arg(&ready)
+            .stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let mut runtime = test_runtime_with_child(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            child,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        for _ in 0..100 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists());
+        let root = runtime.child.lock().unwrap().id();
+        assert!(runtime_has_live_children(root, Some(&temp)));
+        runtime.clear_idle_temp(true).unwrap();
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_detects_detached_worker_with_temp_argument() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-detached-temp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let (_, lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        lease.mark_started();
+        let temp = lease.temp_directory().to_path_buf();
+        let artifact = temp.join("artifact");
+        let ready = scratch.join("ready");
+        let code = r#"import os,sys,time
+p=os.fork()
+if p==0:
+    p2=os.fork()
+    if p2>0: os._exit(0)
+    os.setsid()
+    worker="import os,sys,time; open(sys.argv[1], 'w').write('live'); open(sys.argv[2], 'w').write(str(os.getpid())); time.sleep(10)"
+    os.execve(sys.executable, [sys.executable, '-c', worker, sys.argv[1], sys.argv[2]], {})
+os.waitpid(p, 0)
+time.sleep(10)
+"#;
+        let mut command = Command::new("python3");
+        command
+            .arg("-c")
+            .arg(code)
+            .arg(&artifact)
+            .arg(&ready)
+            .stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let mut runtime = test_runtime_with_child(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            child,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        for _ in 0..100 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists());
+        let root = runtime.child.lock().unwrap().id();
+        assert!(!runtime_has_live_children(root, None));
+        assert!(runtime_has_live_children(root, Some(&temp)));
+        runtime.clear_idle_temp(true).unwrap();
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
+        let worker: i32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(worker),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_cleanup_waits_for_inflight_session_request() {
+        let scratch =
+            std::env::temp_dir().join(format!("sail-request-temp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let (_, lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        lease.mark_started();
+        let artifact = lease.temp_directory().join("init");
+        std::fs::write(&artifact, "live").unwrap();
+        let mut command = Command::new("sleep");
+        command.arg("30").stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let mut runtime = test_runtime_with_child(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            child,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        let (started_tx, started_rx) = mpsc::channel();
+        let request_runtime = Arc::clone(&runtime);
+        let request = std::thread::spawn(move || {
+            request_runtime.request_response_around_write(
+                "session/new",
+                json!({}),
+                Duration::from_millis(500),
+                |_| Ok(()),
+                || started_tx.send(()).unwrap(),
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        runtime.clear_idle_temp(true).unwrap();
+        assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "live");
+        assert!(request.join().unwrap().is_err());
+        runtime.clear_idle_temp(false).unwrap();
+        assert!(!artifact.exists());
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_process_cleanup_stays_pending_until_retry_succeeds() {
+        let scratch = std::env::temp_dir().join(format!(
+            "sail-process-cleanup-temp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let (_, lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        lease.mark_started();
+        let artifact = lease.temp_directory().join("artifact");
+        std::fs::write(&artifact, "retain").unwrap();
+        let mut runtime = test_runtime(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            None,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+
+        runtime.record_process_cleanup("session", false).unwrap();
+        runtime.clear_idle_temp(false).unwrap();
+        assert!(artifact.exists());
+        assert!(
+            crate::worktree_storage::cleanup_status(&scratch.join("cache"))
+                .iter()
+                .any(|item| item.reason == "turn-temp-cleanup-failed")
+        );
+
+        runtime.record_process_cleanup("session", true).unwrap();
+        runtime.clear_idle_temp(false).unwrap();
+        assert!(!artifact.exists());
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_detached_fd_owner_keeps_turn_temp_pending() {
+        let scratch = std::env::temp_dir().join(format!(
+            "sail-detached-fd-temp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&scratch).unwrap();
+        let worktree = scratch.join("plain-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        let (_, lease) =
+            crate::worktree_storage::register(&scratch.join("cache"), &worktree).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        let artifact = temp.join("artifact");
+        let ready = scratch.join("ready");
+        lease.prepare_process_start().unwrap();
+        let code = r#"import os,sys,time
+fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT)
+os.set_inheritable(fd, True)
+p=os.fork()
+if p==0:
+    p2=os.fork()
+    if p2>0: os._exit(0)
+    os.setsid()
+    os.chdir('/')
+    worker="import os,sys,time; time.sleep(1); os.write(int(sys.argv[1]), b'live')"
+    os.execve(sys.executable, [sys.executable, '-c', worker, str(fd)], {})
+os.waitpid(p, 0)
+open(sys.argv[2], 'w').write('ready')
+time.sleep(10)
+"#;
+        let mut command = Command::new("python3");
+        command
+            .arg("-c")
+            .arg(code)
+            .arg(&artifact)
+            .arg(&ready)
+            .stdin(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        lease.mark_started();
+        let mut runtime = test_runtime_with_child(
+            "claude",
+            CapabilityProfile::Build,
+            &worktree,
+            "session",
+            child,
+        );
+        Arc::get_mut(&mut runtime).unwrap()._storage_lease = Some(lease);
+        for _ in 0..100 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists());
+        assert!(!runtime_has_live_children(
+            runtime.child.lock().unwrap().id(),
+            Some(&temp)
+        ));
+        runtime.clear_idle_temp(true).unwrap();
+        for _ in 0..200 {
+            if std::fs::read(&artifact).is_ok_and(|bytes| bytes == b"live") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"live");
+        runtime.stop_child().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     fn config(token: &str, env: &[(&str, &str)]) -> McpConfig {
@@ -6592,7 +7468,38 @@ mod session_config_tests {
         owner: Option<&str>,
         build_directory: Option<PathBuf>,
     ) -> Arc<Connection> {
-        let mut child = super::spawn_test_session_process();
+        test_runtime_with_child_and_build(
+            agent,
+            profile,
+            worktree,
+            session_id,
+            owner,
+            build_directory,
+            super::spawn_test_session_process(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn test_runtime_with_child(
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_id: &str,
+        child: Child,
+    ) -> Arc<Connection> {
+        test_runtime_with_child_and_build(agent, profile, worktree, session_id, None, None, child)
+    }
+
+    #[cfg(unix)]
+    fn test_runtime_with_child_and_build(
+        agent: &str,
+        profile: CapabilityProfile,
+        worktree: &Path,
+        session_id: &str,
+        owner: Option<&str>,
+        build_directory: Option<PathBuf>,
+        mut child: Child,
+    ) -> Arc<Connection> {
         let input = child.stdin.take().expect("test runtime stdin");
         let watchdog = crate::child_watchdog::ChildWatchdog::start(child.id())
             .expect("test runtime watchdog should start");
@@ -6623,6 +7530,7 @@ mod session_config_tests {
             )])),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
+            temp_cleanup_gate: Mutex::new(TempCleanupState::default()),
             prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),
@@ -6806,12 +7714,16 @@ mod session_config_tests {
         let cache = scratch.join("app-cache");
         let first_data = crate::acp_terminal::worktree_data_directory(&cache, &first);
         let second_data = crate::acp_terminal::worktree_data_directory(&cache, &second);
-        prepare_runtime_directories(&first_data).unwrap();
-        prepare_runtime_directories(&second_data).unwrap();
         let first_scratch = scratch.join("first-runtime");
         let second_scratch = scratch.join("second-runtime");
-        let first_environment = runtime_environment(&first_data, Some(&first_scratch), None);
-        let second_environment = runtime_environment(&second_data, Some(&second_scratch), None);
+        let first_temp = first_data.join("turn-temp/run-one");
+        let second_temp = second_data.join("turn-temp/run-two");
+        prepare_runtime_directories(&first_data, &first_temp).unwrap();
+        prepare_runtime_directories(&second_data, &second_temp).unwrap();
+        let first_environment =
+            runtime_environment(&first_data, &first_temp, Some(&first_scratch), None);
+        let second_environment =
+            runtime_environment(&second_data, &second_temp, Some(&second_scratch), None);
         let path = |environment: &[(&str, PathBuf)], name| {
             environment
                 .iter()
@@ -6836,14 +7748,14 @@ mod session_config_tests {
             path(&first_environment, "CARGO_TARGET_DIR"),
             first_scratch.join("build/cargo-target")
         );
-        assert_eq!(path(&first_environment, "TMPDIR"), first_data.join("tmp"));
+        assert_eq!(path(&first_environment, "TMPDIR"), first_temp);
         for directory in [
-            first_data.join("tmp"),
+            first_temp.clone(),
             first_data.join("cache"),
-            first_data.join("build/go-tmp"),
-            second_data.join("tmp"),
+            first_temp.join("go-tmp"),
+            second_temp.clone(),
             second_data.join("cache"),
-            second_data.join("build/go-tmp"),
+            second_temp.join("go-tmp"),
         ] {
             assert!(
                 directory.is_dir(),
@@ -6992,6 +7904,7 @@ mod session_config_tests {
                 elicitation_state: Mutex::new(HashMap::new()),
                 next_permission_generation: AtomicU64::new(1),
                 prompt_state: Mutex::new(PromptState::default()),
+                temp_cleanup_gate: Mutex::new(TempCleanupState::default()),
                 prompt_dispatch: Mutex::new(()),
                 cancelled_prompts: Mutex::new(HashSet::new()),
                 next_id: AtomicU64::new(1),
@@ -7114,7 +8027,12 @@ mod session_config_tests {
         assert_ne!(first, concurrent);
         assert_ne!(first, changed);
         assert!(concurrent.starts_with(&first));
-        let environment = runtime_environment(&root, Some(&root.join("gate")), Some(&first));
+        let environment = runtime_environment(
+            &root,
+            &root.join("turn-temp"),
+            Some(&root.join("gate")),
+            Some(&first),
+        );
         assert!(environment.contains(&("CARGO_TARGET_DIR", first.join("cargo-target"))));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -7896,6 +8814,7 @@ mod native_subagent_fence_tests {
             elicitation_state: Mutex::new(HashMap::new()),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
+            temp_cleanup_gate: Mutex::new(TempCleanupState::default()),
             prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),

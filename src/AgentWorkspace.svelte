@@ -237,6 +237,7 @@
     nativeEntries?: AgentEntry[];
     /** The child's adapter advertised a prompt capability, so its composer is enabled. */
     childPrompts?: boolean;
+    childStops?: boolean;
     subagentControl?: SubagentControl;
     capabilityProfile?: CapabilityProfile;
   }
@@ -280,6 +281,7 @@
     onshipit,
     nativeEntries,
     childPrompts = false,
+    childStops = false,
     subagentControl,
     capabilityProfile = 'build',
   }: Props = $props();
@@ -2951,10 +2953,10 @@
           {permissionResolutionLabel(note.outcome)} · {note.title}
         </p>
       {/each}
-      {#if nativeEntries}
+      {#if readOnlyChild}
         <p class="agent-readonly" role="status">
-          {#if readOnlyChild}Read-only: the agent doesn't accept messages for subagents yet.
-            {parentTurnStopHint}.{:else}This subagent accepts messages.{/if}
+          Read-only: the agent doesn't accept messages for subagents yet.
+          {#if !childStops}{parentTurnStopHint}.{/if}
         </p>
       {/if}
       {#each elicitations as elicitation (elicitation.id)}

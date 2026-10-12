@@ -221,6 +221,7 @@ mod git_overlay;
 mod github;
 pub mod hook_activity;
 mod hook_inspector;
+mod local_claims;
 mod machine_pressure;
 pub mod memory;
 mod memory_capture;
@@ -3269,6 +3270,7 @@ pub fn run() {
             diagnostics::diagnostic_event,
             worktree_storage_cleanup_status,
             retry_worktree_storage_cleanup,
+            clean_pending_worktree_temp,
             settings::reset_test_settings,
             settings::load_settings,
             settings::migrate_settings,
@@ -3359,11 +3361,11 @@ pub fn run() {
             github::shipping_target_repository,
             github::shipping_pull_request,
             github::shipping_dependency_closed,
-            github::acquire_shipping_claim,
-            github::observe_shipping_claim,
-            github::complete_predecessor_shipping_claim_fence,
-            github::heartbeat_shipping_claim,
-            github::release_shipping_claim,
+            local_claims::acquire_shipping_claim,
+            local_claims::observe_shipping_claim,
+            local_claims::complete_predecessor_shipping_claim_fence,
+            local_claims::heartbeat_shipping_claim,
+            local_claims::release_shipping_claim,
             ship_actions::ship_merge_pull_request,
             ship_actions::ship_reopen_pull_request,
             ship_actions::ship_issue_title,
@@ -3493,11 +3495,29 @@ fn worktree_storage_cleanup_status(
 fn retry_worktree_storage_cleanup(
     app: tauri::AppHandle,
 ) -> Result<Vec<worktree_storage::CleanupPending>, String> {
+    app.state::<acp::AgentManager>()
+        .retry_turn_temp_cleanup(&app);
     let cache = app
         .path()
         .app_cache_dir()
         .map_err(|error| error.to_string())?;
     Ok(worktree_storage::retry_cleanup(&cache))
+}
+
+#[tauri::command]
+fn clean_pending_worktree_temp(
+    app: tauri::AppHandle,
+    token: String,
+    confirmed_unused: bool,
+) -> Result<Vec<worktree_storage::CleanupPending>, String> {
+    if !confirmed_unused {
+        return Err("Confirm that no process is using this temporary data.".into());
+    }
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
+    worktree_storage::clean_pending_temp(&cache, &token)
 }
 
 #[cfg(test)]

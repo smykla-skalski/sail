@@ -34,6 +34,7 @@ fn main() {
             "save_setting",
             "worktree_storage_cleanup_status",
             "retry_worktree_storage_cleanup",
+            "clean_pending_worktree_temp",
             "list_interrupted_agent_turns",
             "finish_interrupted_agent_turn",
             "get_acp_turn_evidence",

@@ -460,6 +460,16 @@ for await (const line of createInterface({ input: process.stdin })) {
     setTimeout(() => send({ id: message.id, result: { outcome: 'injected' } }), 200);
   } else if (message.method === 'session/prompt') {
     const { sessionId } = message.params;
+    const controlledChild = sessions.get(sessionId);
+    if (controlledChild?.nativeControlParent) {
+      const text = message.params.prompt[0].text;
+      recordUpdate(controlledChild.nativeControlParent, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Child follow-up: ${text}` },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (sessions.get(sessionId)?.evicted) {
       send({ id: message.id, error: { code: -32002, message: `Session not found: ${sessionId}` } });
       continue;
@@ -479,6 +489,29 @@ for await (const line of createInterface({ input: process.stdin })) {
         content: { type: 'text', text: 'Long history complete.' },
       });
       send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Native child controls') {
+      for (const suffix of ['first', 'sibling']) {
+        const childId = `${sessionId}:${suffix}`;
+        sessions.set(childId, {
+          ...sessions.get(sessionId),
+          history: [],
+          nativeControlParent: sessionId,
+        });
+        update(sessionId, {
+          sessionUpdate: 'subagent_spawned',
+          subagentSessionId: childId,
+          name: suffix,
+          task: `Controlled ${suffix}`,
+          capabilities: { prompt: {}, cancel: {} },
+        });
+      }
+      const timer = setTimeout(() => {
+        stop();
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }, 120_000);
+      const stop = trackWork(sessionId, () => clearTimeout(timer));
       continue;
     }
     if (text === 'Ask structured question') {
@@ -1336,6 +1369,15 @@ for await (const line of createInterface({ input: process.stdin })) {
       setTimeout(() => requestPermission(sessionId, text, message.id, undefined, toolCallId), 1500);
     else requestPermission(sessionId, text, message.id, undefined, toolCallId);
   } else if (message.method === 'session/cancel') {
+    const child = sessions.get(message.params.sessionId);
+    if (child?.nativeControlParent) {
+      update(child.nativeControlParent, {
+        sessionUpdate: 'subagent_state_update',
+        subagentSessionId: message.params.sessionId,
+        state: 'cancelled',
+      });
+      continue;
+    }
     const activePromptId = activePrompts.get(message.params.sessionId);
     const awaitingPermission = [...permissions.values()].some(
       (pending) => pending.sessionId === message.params.sessionId,

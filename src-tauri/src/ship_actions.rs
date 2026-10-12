@@ -193,18 +193,10 @@ pub struct ShipMergeOutcome {
     policy_source: String,
 }
 
-/// Arguments for the GitHub call that merges. A bot-comment repository never
-/// reaches the merge endpoint, and no argument bypasses branch protection.
+/// Arguments for the GitHub merge call. No argument bypasses branch protection.
 fn merge_call(policy: &MergePolicy, target: &str, number: u64, head: &str) -> Vec<String> {
     match &policy.method {
-        MergeMethod::BotComment(comment) => vec![
-            "api".to_string(),
-            "--method".to_string(),
-            "POST".to_string(),
-            format!("repos/{target}/issues/{number}/comments"),
-            "-f".to_string(),
-            format!("body={comment}"),
-        ],
+        MergeMethod::BotComment(_) => unreachable!("bot comment merges are rejected first"),
         MergeMethod::Github => vec![
             "api".to_string(),
             "--method".to_string(),
@@ -263,6 +255,9 @@ pub(crate) fn merge_pull_request(
             short(head),
             short(&request.expected_head)
         ));
+    }
+    if matches!(policy.method, MergeMethod::BotComment(_)) {
+        return Err("This repository merges through a PR comment. Sail does not post GitHub comments; merge the pull request outside Sail.".to_string());
     }
     github(merge_call(policy, &target, number, head))?;
     let (method, comment) = match &policy.method {
@@ -745,31 +740,15 @@ mod tests {
     }
 
     #[test]
-    fn a_bot_comment_repository_posts_exactly_the_comment() {
+    fn a_bot_comment_repository_does_not_post_a_comment() {
         let mut calls: Vec<Vec<String>> = Vec::new();
-        let outcome = merge_pull_request(&request(HEAD, true), &bot("squash"), &mut |arguments| {
+        let error = merge_pull_request(&request(HEAD, true), &bot("squash"), &mut |arguments| {
             calls.push(arguments.clone());
             Ok(open_pull_request(HEAD))
         })
-        .unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[1],
-            [
-                "api",
-                "--method",
-                "POST",
-                "repos/owner/repo/issues/7/comments",
-                "-f",
-                "body=squash"
-            ]
-        );
-        assert_eq!(outcome.method, "bot-comment");
-        assert_eq!(outcome.comment.as_deref(), Some("squash"));
-        assert!(calls
-            .iter()
-            .flatten()
-            .all(|argument| !argument.contains("/merge") && argument != "pr"));
+        .unwrap_err();
+        assert!(error.contains("Sail does not post GitHub comments"));
+        assert_eq!(calls, vec![vec!["api", "repos/owner/repo/pulls/7"]]);
     }
 
     #[test]
@@ -863,17 +842,13 @@ mod tests {
         let production = source.split("#[cfg(test)]").next().unwrap();
         assert!(!production.to_lowercase().contains("admin"));
         assert!(!production.contains("pr\", \"merge"));
-        for policy in [
-            bot("squash"),
-            MergePolicy {
-                method: MergeMethod::Github,
-                strategy: "squash".to_string(),
-                source: "default".to_string(),
-            },
-        ] {
-            for argument in merge_call(&policy, "owner/repo", 7, HEAD) {
-                assert!(!argument.to_lowercase().contains("admin"), "{argument}");
-            }
+        let policy = MergePolicy {
+            method: MergeMethod::Github,
+            strategy: "squash".to_string(),
+            source: "default".to_string(),
+        };
+        for argument in merge_call(&policy, "owner/repo", 7, HEAD) {
+            assert!(!argument.to_lowercase().contains("admin"), "{argument}");
         }
     }
 }

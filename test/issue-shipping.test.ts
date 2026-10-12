@@ -1421,6 +1421,15 @@ void test('fences a worker only when its monotonic lease expires or ownership is
     true,
   );
   assert.equal(
+    claimRefreshRequiresFence(
+      claim,
+      new Error('Local shipping claim no longer exists.'),
+      119_999,
+      120_000,
+    ),
+    true,
+  );
+  assert.equal(
     claimRefreshRequiresFence(claim, new Error('temporary network failure'), 120_000, 120_000),
     true,
   );
@@ -1800,6 +1809,8 @@ void test('the worker prompt tells the worker to stop at a mergeable pull reques
   assert.match(you, /do not post a merge comment or run a merge command/);
 
   const agent = shipWorkerPrompt({ ...promptInput, mergeOwner: 'agent' });
+  assert.match(agent, /Sail holds local claim claim-1/);
+  assert.match(agent, /Never post a GitHub comment/);
   assert.doesNotMatch(agent, /Merge owner/);
   assert.doesNotMatch(agent, /awaiting_merge/);
   assert.doesNotMatch(agent, /mergeable pull request/);

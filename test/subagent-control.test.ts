@@ -53,8 +53,22 @@ function permission(sessionId: string, agentId = 'codex'): InboxItem {
   };
 }
 
-void test('native children cannot be stopped alone', () => {
+void test('native children stop only when cancel is advertised', () => {
   assert.equal(subagentStop(receipt('native:claude:x')), 'parent-turn');
+  assert.equal(
+    subagentStop(receipt('native:claude:x', { nativeCapabilities: { cancel: {} } })),
+    'stop',
+  );
+  assert.equal(
+    subagentStop(receipt('native:claude:x', { nativeCapabilities: { prompt: {} } })),
+    'parent-turn',
+  );
+  assert.equal(
+    subagentStop(
+      receipt('native:claude:x', { state: 'completed', nativeCapabilities: { cancel: {} } }),
+    ),
+    'none',
+  );
 });
 
 void test('Ship gates and Ship workers are managed by Stop run', () => {
@@ -97,6 +111,7 @@ void test('stop all skips native, Ship-managed and settled children', () => {
   const receipts = [
     receipt('a'),
     receipt('native:claude:b'),
+    receipt('native:claude:enabled', { nativeCapabilities: { cancel: true } }),
     receipt('c', { state: 'completed' }),
     receipt('d'),
   ];
@@ -104,7 +119,7 @@ void test('stop all skips native, Ship-managed and settled children', () => {
     stoppableSubagents(receipts, new Set([shipOwnedTargetKey('/a', 'acp:codex:d')])).map(
       (item) => item.receiptId,
     ),
-    ['a'],
+    ['a', 'native:claude:enabled'],
   );
 });
 

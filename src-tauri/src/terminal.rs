@@ -93,10 +93,10 @@ impl TerminalSession {
                 .exit_code
                 .is_some()
             {
+                ownership_stop?;
                 if let Some(lease) = &self._storage_lease {
                     lease.release_clean()?;
                 }
-                ownership_stop?;
                 return Ok(());
             }
             kill_terminal_process_groups(
@@ -108,10 +108,10 @@ impl TerminalSession {
         {
             self.job.stop()?;
         }
+        ownership_stop?;
         if let Some(lease) = &self._storage_lease {
             lease.release_clean()?;
         }
-        ownership_stop?;
         Ok(())
     }
 }
@@ -1188,8 +1188,9 @@ fn spawn(
             .map_err(|error| error.to_string())?;
         let (data_directory, lease) =
             crate::register_worktree_storage(&cache_directory, &worktree)?;
-        storage_lease = Some(lease);
-        for (key, value) in crate::acp_terminal::terminal_environment(&data_directory) {
+        for (key, value) in
+            crate::acp_terminal::terminal_environment(&data_directory, lease.temp_directory())
+        {
             std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
             command.env(key, value);
         }
@@ -1200,21 +1201,31 @@ fn spawn(
             command.env_remove("GIT_COMMON_DIR");
             command.env_remove("GIT_INDEX_FILE");
         }
+        storage_lease = Some(lease);
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     #[cfg(windows)]
     command.env("PROMPT", "$E]9;9;$P$E\\$P$G");
     #[cfg(windows)]
+    let job = crate::acp_terminal::WindowsTerminalJob::new()?;
+    if let Some(lease) = &storage_lease {
+        lease.prepare_process_start()?;
+    }
+    #[cfg(windows)]
     let job = {
-        let job = crate::acp_terminal::WindowsTerminalJob::new()?;
         command.set_job_handle(job.raw_handle());
         job
     };
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| error.to_string())?;
+    let mut child = match pair.slave.spawn_command(command) {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(lease) = &storage_lease {
+                lease.cancel_process_start()?;
+            }
+            return Err(error.to_string());
+        }
+    };
     if let Some(lease) = &storage_lease {
         lease.mark_started();
     }
