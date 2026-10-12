@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import { SvelteMap } from 'svelte/reactivity';
   import ActivityStatus from './ActivityStatus.svelte';
   import ShipActions from './ShipActions.svelte';
   import WorkerDependencyMap from './WorkerDependencyMap.svelte';
@@ -38,7 +39,6 @@
     shipTaskCriteria,
     shipTaskObjective,
     shipWorkerRequest,
-    type ShipDetailFallback,
     type ShipOrderSnapshot,
     type ShipRow,
   } from './lib/ship-list';
@@ -53,6 +53,8 @@
     repository,
     active = true,
     runs,
+    unparsedRuns = [],
+    ondiscardunparsed,
     busy,
     mergeOwner = 'you',
     onclose,
@@ -69,6 +71,8 @@
     repository: string;
     active?: boolean;
     runs: ShipRun[];
+    unparsedRuns?: unknown[];
+    ondiscardunparsed?: (index: number) => Promise<void>;
     busy: boolean;
     mergeOwner?: MergeOwner;
     onclose: () => void;
@@ -100,6 +104,8 @@
   let showDone = $state(false);
   let showArchived = $state(false);
   let result = $state({ text: '', failed: false });
+  let discardCandidate = $state<number | null>(null);
+  let discardBusy = $state(false);
   let focusedId = $state('');
   let frozen = $state<ShipOrderSnapshot | null>(null);
   const detailId = `ship-selected-issue-${crypto.randomUUID()}`;
@@ -119,11 +125,11 @@
   const pinned = $derived(new Set([selectedIssue, focusedId].filter(Boolean)));
   const groups = $derived(shipGroups(rows, { showDone, pinned }));
   const visibleIds = $derived(groups.flatMap((group) => group.rows.map((row) => row.issue.id)));
-  // Kept once shown so a re-sort does not switch the detail to another issue.
-  const shown: { fallback: ShipDetailFallback | null } = { fallback: null };
-  const fallback = $derived(wide ? shipDetailFallback(run, rows, shown.fallback) : null);
+  // Keep each run's detail stable when its rows re-sort.
+  const shown = new SvelteMap<string, string>();
+  const fallback = $derived(wide ? shipDetailFallback(run, rows, shown) : null);
   $effect(() => {
-    if (fallback && !selectedIssue) shown.fallback = fallback;
+    if (fallback && !selectedIssue) shown.set(fallback.runId, fallback.issueId);
   });
   const issue = $derived(
     run?.issues.find((item) => item.id === selectedIssue) ??
@@ -286,6 +292,20 @@
     result = { text, failed };
   }
 
+  async function discardUnparsed(index: number) {
+    if (!ondiscardunparsed || discardBusy) return;
+    discardCandidate = null;
+    discardBusy = true;
+    try {
+      await act(async () => {
+        await ondiscardunparsed(index);
+        showResult('Stored entry discarded.', false);
+      });
+    } finally {
+      discardBusy = false;
+    }
+  }
+
   function chooseArchived(archived: boolean) {
     showArchived = archived;
     selectedRun = '';
@@ -436,6 +456,22 @@
     >
       {result.text}
     </p>{/if}
+  {#if unparsedRuns.length}<section class="ship-unparsed" aria-label="Unreadable Ship runs">
+      <h3>Unreadable stored runs ({unparsedRuns.length})</h3>
+      <p>Sail cannot use these entries. Inspect their stored data before discarding them.</p>
+      {#each unparsedRuns as item, index (index)}<details>
+          <summary>Stored entry {index + 1}</summary>
+          <pre>{typeof item === 'string' ? item : JSON.stringify(item, null, 2)}</pre>
+          {#if discardCandidate === index}<p>Discard this stored entry permanently?</p>
+            <button disabled={discardBusy} onclick={() => discardUnparsed(index)}
+              >Discard entry</button
+            >
+            <button onclick={() => (discardCandidate = null)}>Cancel</button>
+          {:else}<button disabled={discardBusy} onclick={() => (discardCandidate = index)}
+              >Discard…</button
+            >{/if}
+        </details>{/each}
+    </section>{/if}
   {#if archivedCount || showArchived}<div class="ship-scope" role="group" aria-label="Run state">
       <button aria-pressed={!showArchived} onclick={() => chooseArchived(false)}>Active</button
       ><button aria-pressed={showArchived} onclick={() => chooseArchived(true)}
@@ -1271,6 +1307,16 @@
   }
   .ship-empty {
     padding: 24px 0;
+  }
+  .ship-unparsed {
+    padding: 12px;
+    border: 1px solid var(--shell-divider);
+  }
+  .ship-unparsed pre {
+    overflow: auto;
+    max-height: 320px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   @media (max-width: 520px) {
     .ship-panel {

@@ -71,6 +71,38 @@ void test('compare-and-swap rejects drift and concurrent stale updates', () => {
   );
 });
 
+void test('checkpoint stores a clean full commit separately from its worktree revision', () => {
+  const commit = 'a'.repeat(40);
+  const clean = prepareTaskCheckpointUpdate(
+    initialTaskCheckpoint(task, 10),
+    {},
+    '0123456789abcdef',
+    0,
+    null,
+    true,
+    20,
+    commit,
+  );
+  assert.equal(clean.revision, '0123456789abcdef');
+  assert.equal(clean.commit, commit);
+  const dirty = prepareTaskCheckpointUpdate(
+    clean,
+    {},
+    'fedcba9876543210',
+    1,
+    clean.revision,
+    true,
+    30,
+  );
+  assert.equal(dirty.commit, null);
+  assert.equal(taskCheckpointSchema.parse({ ...dirty, commit: undefined }).commit, undefined);
+  assert.throws(() => taskCheckpointSchema.parse({ ...clean, commit: 'bad' }), /Invalid string/);
+  assert.equal(
+    taskCheckpointSchema.parse({ ...clean, commit: 'b'.repeat(64) }).commit,
+    'b'.repeat(64),
+  );
+});
+
 void test('reconciliation stops stale, blocked, and externally inconsistent resumes', () => {
   const unbound = reconcileTaskCheckpoint(initialTaskCheckpoint(task, 10), 'current', {
     issueState: 'OPEN',

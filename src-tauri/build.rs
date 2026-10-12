@@ -27,6 +27,7 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "diagnostic_event",
+            "reset_test_settings",
             "load_settings",
             "machine_pressure",
             "migrate_settings",
@@ -45,6 +46,9 @@ fn main() {
             "memory_forget",
             "memory_set_expiry",
             "memory_rate",
+            "preview_project_knowledge",
+            "accept_project_knowledge",
+            "reject_project_knowledge",
             "preview_memory_import",
             "import_agent_memories",
             "memory_provider_status",
@@ -74,6 +78,7 @@ fn main() {
             "create_worktree",
             "worktree_pressure_directory",
             "create_shipping_worktree",
+            "create_shipping_replacement_worktree",
             "find_shipping_worktree",
             "run_shipping_setup",
             "registered_worktrees",
@@ -130,6 +135,7 @@ fn main() {
             "acp_agents",
             "acp_connect",
             "acp_new_session",
+            "acp_reset_test_runtimes",
             "acp_forget_session",
             "acp_release_session_fence",
             "acp_load_session",

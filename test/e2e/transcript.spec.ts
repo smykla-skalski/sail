@@ -33,7 +33,11 @@ describe('shared transcript view', () => {
     await expect(card).toBeDisplayed();
     await expect(card).not.toHaveText(expect.stringContaining('Always'));
     await expect($('.agent-tool-group, .agent-tool-current')).toBeDisplayed();
+    await browser.execute(() => {
+      document.querySelector<HTMLDetailsElement>('.tool-activity')!.open = false;
+    });
     await $('.permission-card .permission-link').click();
+    await expect($('.tool-activity')).toHaveAttribute('open');
     await $('.permission-card .permission-actions button').click();
     await expect($('.agent-conversation')).toHaveText(
       expect.stringContaining('Done: Do a small thing'),
