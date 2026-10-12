@@ -6097,6 +6097,47 @@
     setSetting('sai-coordination-messages', JSON.stringify(coordinationMessages));
   }
 
+  async function resolveCoordinationThread(
+    target: CoordinationThread,
+  ): Promise<AgentThread | null> {
+    const existing = [
+      ...agentThreads,
+      ...nativeChildThreads,
+      ...nativeThreads,
+      ...sidebarOpenCodeThreads,
+    ].find(
+      (item) =>
+        item.directory === target.directory && target.id === `acp:${item.agent}:${item.sessionId}`,
+    );
+    if (existing) return existing;
+
+    const match = /^acp:([^:]+):(.+)$/.exec(target.id);
+    if (!match) return null;
+    const [, agent, sessionId] = match;
+    const receipt = spawnReceipts.find(
+      (item) => item.targetId === target.id && item.targetDirectory === target.directory,
+    );
+    const listed =
+      agent === 'opencode'
+        ? await listSidebarAcpThreads(
+            agent,
+            (cursor) => acp.listSessions(agent, target.directory, cursor, 'explore'),
+            target.directory,
+          )
+        : [];
+    return (
+      listed.find((item) => item.sessionId === sessionId) ?? {
+        agent,
+        directory: target.directory,
+        sessionId,
+        title: target.title || receipt?.name || 'Recovered session',
+        updated: receipt?.updated ?? Date.now(),
+        model: receipt?.model,
+        capabilityProfile: capabilityProfileForAcpSession(agent, target.directory, sessionId),
+      }
+    );
+  }
+
   function queueCoordinationDelivery(target: CoordinationThread, message: CoordinationMessage) {
     const previous = coordinationDeliveries.get(message.target) ?? Promise.resolve();
     const delivery = previous
@@ -6105,11 +6146,7 @@
         if (disposed || coordinationMessages.find((item) => item.id === message.id)?.delivered)
           return;
         const text = coordinationPrompt(message);
-        const thread = [...agentThreads, ...sidebarOpenCodeThreads].find(
-          (item) =>
-            item.directory === target.directory &&
-            target.id === `acp:${item.agent}:${item.sessionId}`,
-        );
+        const thread = await resolveCoordinationThread(target);
         if (!thread) throw new Error('The receiving thread is unavailable.');
         const info = await acp.connect(thread.agent, thread.directory);
         const agentActivity = (await acp.activity(thread.directory))[thread.agent];
@@ -6129,6 +6166,24 @@
           if (canResume)
             await acp.resume(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
           else await acp.load(thread.agent, thread.directory, thread.sessionId, capabilityProfile);
+        }
+        if (
+          !agentThreads.some(
+            (item) =>
+              item.agent === thread.agent &&
+              item.directory === thread.directory &&
+              item.sessionId === thread.sessionId,
+          )
+        ) {
+          if (thread.agent === 'opencode') {
+            if (
+              !nativeSubagents[nativeSubagentId(thread.agent, thread.directory, thread.sessionId)]
+            )
+              sidebarOpenCodeThreads = [
+                thread,
+                ...sidebarOpenCodeThreads.filter((item) => threadKey(item) !== threadKey(thread)),
+              ];
+          } else saveAgentThread(thread);
         }
         await waitForCoordinationThread(thread);
         if (disposed) return;

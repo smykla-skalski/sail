@@ -1,6 +1,6 @@
 import { browser, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -84,6 +84,66 @@ describe('agent coordination bridge', () => {
       }),
     );
     expect(skill.result.content[0].text).toBe(initialization.result.instructions);
+  });
+
+  it('delivers a queued message to a session absent from the saved threads', async () => {
+    const path = realpathSync(repository);
+    const sessionId = 'claude-external-coordination';
+    const messageId = 'external-coordination-message';
+    writeFileSync(
+      join(path, '.acp-external-sessions.json'),
+      JSON.stringify([
+        { sessionId, title: 'External recipient', updatedAt: new Date().toISOString() },
+      ]),
+    );
+    await browser.execute(
+      ({ directory, session, message }) => {
+        localStorage.setItem('sai-directory', directory);
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({ repositories: [directory], groups: [], worktrees: {} }),
+        );
+        localStorage.setItem('sail-agent-threads', '[]');
+        localStorage.setItem(
+          'sai-coordination-messages',
+          JSON.stringify([
+            {
+              id: message,
+              target: `${directory}\0acp:claude:${session}`,
+              sender: 'Another agent',
+              text: 'Read the recovered message',
+              created: Date.now(),
+            },
+          ]),
+        );
+      },
+      { directory: path, session: sessionId, message: messageId },
+    );
+    await browser.refresh();
+    try {
+      await browser.waitUntil(
+        () =>
+          browser.execute(
+            (message) =>
+              JSON.parse(localStorage.getItem('sai-coordination-messages') ?? '[]').find(
+                (item: { id: string }) => item.id === message,
+              )?.delivered === true,
+            messageId,
+          ),
+        { timeout: 30_000, timeoutMsg: 'Message was not delivered to the recovered session' },
+      );
+    } catch (cause) {
+      console.error('Coordination recovery diagnostic', {
+        state: await browser.execute(() => ({
+          messages: localStorage.getItem('sai-coordination-messages'),
+          catalog: localStorage.getItem('sai-project-catalog'),
+          threads: localStorage.getItem('sail-agent-threads'),
+          visibleText: document.body.innerText.slice(0, 2000),
+        })),
+        activity: await browser.tauri.execute(async ({ core }) => core.invoke('acp_activity')),
+      });
+      throw cause;
+    }
   });
 
   it('rejects a saved ACP source session that is no longer running', async () => {
