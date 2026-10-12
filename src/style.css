@@ -2919,6 +2919,10 @@ time {
   line-height: 1.5;
   white-space: pre-wrap;
 }
+.confirmation-dialog p.multi {
+  max-height: 50vh;
+  overflow-y: auto;
+}
 .confirmation-actions,
 .path-picker-actions,
 .path-picker-heading,

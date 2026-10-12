@@ -582,6 +582,7 @@
     owningRepository,
     removeRepository,
     removeWorktree,
+    worktreeDescendants,
     worktreeAt,
     replaceRepositoryPath,
     setWorktreePullRequest,
@@ -8758,6 +8759,15 @@
 
   const deletingWorktreeRequests = new SvelteSet<string>();
 
+  type WorktreeRemovalPreview = {
+    path: string;
+    branch: string | null;
+    generation: string;
+    revision: string;
+    dirty: boolean;
+    activeSessions: string[];
+  };
+
   async function deleteProjectWorktree(
     repository: string,
     path: string,
@@ -8767,9 +8777,119 @@
     if (deletingWorktreeRequests.has(path)) return;
     deletingWorktreeRequests.add(path);
     try {
-      await deleteProjectWorktreeOnce(repository, path, branch, force);
+      const registered = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+      const descendants = worktreeDescendants(projectCatalog, repository, registered, path);
+      if (descendants.length) {
+        await deleteProjectWorktreeWithDescendants(
+          repository,
+          path,
+          branch,
+          descendants,
+          registered,
+        );
+      } else {
+        await deleteProjectWorktreeOnce(repository, path, branch, force);
+      }
+    } catch (cause) {
+      error = describe(cause);
     } finally {
       deletingWorktreeRequests.delete(path);
+    }
+  }
+
+  async function deleteProjectWorktreeWithDescendants(
+    repository: string,
+    path: string,
+    branch: string,
+    descendants: ProjectWorktree[],
+    registered: RegisteredWorktree[],
+  ) {
+    const targets = [...descendants, { path, branch }];
+    const live = new Map(registered.map((worktree) => [worktree.path, worktree]));
+    if (descendants.some((worktree) => deletingWorktreeRequests.has(worktree.path))) {
+      error = 'Another descendant deletion is in progress. Retry after it finishes.';
+      return;
+    }
+    const preview = await invoke<WorktreeRemovalPreview[]>('worktree_removal_preview', {
+      repository,
+      paths: targets.map((worktree) => worktree.path),
+    });
+    if (
+      preview.length !== targets.length ||
+      preview.some(
+        (entry, index) =>
+          entry.path !== targets[index].path ||
+          !live.get(entry.path)?.generation ||
+          entry.generation !== live.get(entry.path)?.generation ||
+          entry.branch !== live.get(entry.path)?.branch,
+      )
+    ) {
+      error = 'Worktree identities changed during the preview. Refresh and retry.';
+      return;
+    }
+    const lines = targets.map((worktree, index) => {
+      const state = preview[index];
+      const warnings = [
+        state.dirty ? 'uncommitted changes' : null,
+        state.activeSessions.length ? `active: ${state.activeSessions.join(', ')}` : null,
+      ].filter(Boolean);
+      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}`;
+    });
+    const e2eAnswer =
+      import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
+    if (e2eAnswer) sessionStorage.removeItem('sai-e2e-delete-worktree');
+    const confirmed =
+      e2eAnswer === 'Yes'
+        ? true
+        : e2eAnswer === 'No'
+          ? false
+          : await confirmInApp(
+              'Delete worktree and descendants',
+              `Delete these ${targets.length} worktrees from the leaves inward? Active agent sessions will stop. Uncommitted and ignored files will be permanently removed. Their branches will remain.\n\n${lines.join('\n')}`,
+              `Delete ${targets.length} worktrees`,
+              { destructive: true },
+            );
+    if (!confirmed) return;
+    if (descendants.some((worktree) => deletingWorktreeRequests.has(worktree.path))) {
+      error = 'Another descendant deletion started during the preview. Retry after it finishes.';
+      return;
+    }
+    for (const worktree of descendants) deletingWorktreeRequests.add(worktree.path);
+    worktreeDeletions = {
+      ...worktreeDeletions,
+      ...Object.fromEntries(targets.map((worktree) => [worktree.path, 'Queued for deletion'])),
+    };
+    try {
+      async function removeNext(index: number): Promise<void> {
+        const worktree = targets[index];
+        if (!worktree) return;
+        const current = await invoke<RegisteredWorktree[]>('repository_worktrees', { repository });
+        if (worktreeDescendants(projectCatalog, repository, current, worktree.path).length) {
+          error = `New descendants appeared under “${worktree.branch}”. Remaining worktrees were kept; refresh and retry.`;
+          return;
+        }
+        const removed = await deleteProjectWorktreeOnce(
+          repository,
+          worktree.path,
+          preview[index].branch ?? 'detached',
+          true,
+          true,
+          preview[index],
+          true,
+        );
+        if (!removed) {
+          if (!error)
+            error = `Deletion stopped at “${worktree.branch}”. That worktree and the remaining worktrees were kept; retry when ready.`;
+          return;
+        }
+        return removeNext(index + 1);
+      }
+      await removeNext(0);
+    } finally {
+      for (const worktree of descendants) deletingWorktreeRequests.delete(worktree.path);
+      const remaining = { ...worktreeDeletions };
+      for (const worktree of targets) delete remaining[worktree.path];
+      worktreeDeletions = remaining;
     }
   }
 
@@ -8818,7 +8938,9 @@
     branch: string,
     force: boolean,
     stopAgents = false,
-  ) {
+    expected?: WorktreeRemovalPreview,
+    preconfirmed = false,
+  ): Promise<boolean> {
     let retryForce = false;
     let retryStop = false;
     let config: WorktreeConfig | null;
@@ -8826,17 +8948,21 @@
       config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
     } catch (cause) {
       if (missingRepositoryPath(cause)) {
+        if (expected) {
+          error = `Worktree “${branch}” changed after preview. Refresh before deleting.`;
+          return false;
+        }
         await removeMissingWorktreeFromGui(repository, path);
-        return;
+        return true;
       }
       error = describe(cause);
-      return;
+      return false;
     }
     const e2eAnswer =
       import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
     if (e2eAnswer) sessionStorage.removeItem('sai-e2e-delete-worktree');
     const confirmed =
-      stopAgents || e2eAnswer === 'Yes'
+      preconfirmed || stopAgents || e2eAnswer === 'Yes'
         ? true
         : e2eAnswer === 'No'
           ? false
@@ -8848,21 +8974,29 @@
               force ? 'Force delete' : 'Delete worktree',
               { destructive: true },
             );
-    if (!confirmed) return;
+    if (!confirmed) return false;
     const wasSelected = directory === path;
     worktreeDeletions = {
       ...worktreeDeletions,
       [path]: config?.archive ? 'Archiving' : 'Preparing deletion',
     };
     try {
-      if (config?.archive && !stopAgents) {
+      if (config?.archive && (!stopAgents || preconfirmed)) {
         if (!wasSelected) await loadProject(path);
         const paneId = splitFocusedPane('row', 'terminal', config.archive);
-        if (!paneId) return;
+        if (!paneId) {
+          if (preconfirmed)
+            error = `Could not start the archive command for “${branch}”. Remaining worktrees were kept; retry when ready.`;
+          return false;
+        }
         const code = await new Promise<number>((resolve) =>
           terminalExitWaiters.set(paneId, resolve),
         );
-        if (code < 0) return;
+        if (code < 0) {
+          if (preconfirmed)
+            error = `The archive command for “${branch}” did not finish. Remaining worktrees were kept; retry when ready.`;
+          return false;
+        }
         if (code !== 0) {
           const deleteAnyway = await confirmInApp(
             'Archive failed',
@@ -8870,7 +9004,11 @@
             'Delete anyway',
             { destructive: true },
           );
-          if (!deleteAnyway) return;
+          if (!deleteAnyway) {
+            if (preconfirmed)
+              error = `The archive command for “${branch}” exited with code ${code}. Remaining worktrees were kept; retry when ready.`;
+            return false;
+          }
         }
       }
       if (directory === path) await loadProject(repository);
@@ -8886,8 +9024,9 @@
           repository,
           worktree: path,
           force: force || !!config,
-          expectedRevision: null,
-          expectedBranch: null,
+          expectedRevision: expected?.branch ? expected.revision : null,
+          expectedBranch: expected?.branch ?? null,
+          expectedGeneration: expected?.generation,
           ...(stopAgents ? { stopAgents: true } : {}),
         },
       });
@@ -8915,10 +9054,13 @@
       removeSetting(`sai-pending-worktree-start:${path}`);
       removeSetting(`sai-main-pane-empty:${path}`);
       error = '';
+      return true;
     } catch (cause) {
       if (wasSelected && directory === repository) await loadProject(path);
       const deletionError = describe(cause);
-      if (!stopAgents && hasActiveAgentSessions(deletionError)) {
+      if (preconfirmed) {
+        error = `Could not delete “${branch}” at ${path}: ${deletionError}. Remaining worktrees were kept; fix the cause and retry.`;
+      } else if (!stopAgents && hasActiveAgentSessions(deletionError)) {
         error = '';
         retryStop = true;
       } else if (!force && needsForceDelete(deletionError)) {
@@ -8937,8 +9079,9 @@
         'Stop agent and delete',
         { destructive: true },
       );
-      if (stopConfirmed) await deleteProjectWorktreeOnce(repository, path, branch, true, true);
-    } else if (retryForce) await deleteProjectWorktreeOnce(repository, path, branch, true);
+      if (stopConfirmed) return deleteProjectWorktreeOnce(repository, path, branch, true, true);
+    } else if (retryForce) return deleteProjectWorktreeOnce(repository, path, branch, true);
+    return false;
   }
 
   let closingWorktree: string | null = null;

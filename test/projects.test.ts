@@ -15,8 +15,12 @@ import {
   setWorktreeStatus,
   ungroupedRepositories,
   worktreeAncestry,
+  worktreeDescendants,
   worktreeAt,
 } from '../src/lib/projects.ts';
+
+const testGeneration = (id: number) =>
+  `00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-${String(id).padStart(12, '0')}`;
 
 await test('restores the current repository and ignores malformed saved groups', () => {
   assert.deepEqual(loadProjectCatalog('{bad', '/repo'), {
@@ -217,6 +221,49 @@ await test('restores sibling worktrees in their Sail creation ancestry', () => {
     reusedChild.find(({ worktree }) => worktree.path === second.path),
     undefined,
   );
+});
+
+await test('selects only live Sail descendants in leaf-first order', () => {
+  const created = (path: string, sourcePath: string, sourceGeneration: string, id: number) => ({
+    path,
+    branch: path.slice(1),
+    generation: testGeneration(id),
+    origin: {
+      sourcePath,
+      sourceGeneration,
+      agent: 'codex',
+      sessionId: path,
+      sessionTitle: path,
+    },
+  });
+  const entries = [
+    created('/child', '/root', testGeneration(1), 2),
+    created('/grandchild', '/child', testGeneration(2), 3),
+    created('/sibling', '/root', testGeneration(1), 4),
+    created('/stale', '/root', testGeneration(1), 5),
+    created('/old-source', '/root', testGeneration(9), 6),
+    { path: '/external', branch: 'external', generation: testGeneration(7) },
+    created('/external-child', '/external', testGeneration(7), 8),
+  ];
+  const catalog = loadProjectCatalog(
+    JSON.stringify({ repositories: ['/repo'], worktrees: { '/repo': entries } }),
+    '/repo',
+  );
+  const registered = [
+    { path: '/root', generation: testGeneration(1) },
+    ...entries.map((entry) => ({
+      path: entry.path,
+      generation: entry.path === '/stale' ? testGeneration(10) : entry.generation,
+    })),
+  ];
+  assert.deepEqual(
+    worktreeDescendants(catalog, '/repo', registered, '/root').map((entry) => entry.path),
+    ['/grandchild', '/child', '/sibling'],
+  );
+  assert.deepEqual(worktreeDescendants(catalog, '/repo', registered, '/external'), [
+    catalog.worktrees['/repo'].find((entry) => entry.path === '/external-child'),
+  ]);
+  assert.deepEqual(worktreeDescendants(catalog, '/repo', registered, '/missing'), []);
 });
 
 await test('shows an external worktree when Git reuses a stale catalog path', () => {

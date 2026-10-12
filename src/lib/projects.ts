@@ -318,6 +318,36 @@ export function worktreeAncestry(
   return rows;
 }
 
+export function worktreeDescendants(
+  catalog: ProjectCatalog,
+  repository: string,
+  registered: { path: string; generation: string | null }[],
+  root: string,
+): ProjectWorktree[] {
+  const live = new Map(registered.map((item) => [item.path, item.generation]));
+  const entries = currentCatalogWorktrees(catalog, repository, registered);
+  const visited = new Set<string>([root]);
+  const descendants: ProjectWorktree[] = [];
+  function append(sourcePath: string, sourceGeneration: string | null | undefined) {
+    if (!sourceGeneration) return;
+    for (const worktree of entries) {
+      if (
+        visited.has(worktree.path) ||
+        !worktree.generation ||
+        live.get(worktree.path) !== worktree.generation ||
+        worktree.origin?.sourcePath !== sourcePath ||
+        worktree.origin.sourceGeneration !== sourceGeneration
+      )
+        continue;
+      visited.add(worktree.path);
+      append(worktree.path, worktree.generation);
+      descendants.push(worktree);
+    }
+  }
+  append(root, live.get(root));
+  return descendants;
+}
+
 export function setWorktreeSetupStatus(
   catalog: ProjectCatalog,
   repository: string,

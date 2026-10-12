@@ -1561,7 +1561,7 @@ impl AgentManager {
         result
     }
 
-    fn active_sessions_in(
+    pub(crate) fn active_sessions_in(
         &self,
         directory: &Path,
     ) -> Result<Vec<(String, PathBuf, String)>, String> {

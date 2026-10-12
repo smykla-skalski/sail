@@ -1994,6 +1994,97 @@ struct DeleteWorktreeRequest {
     expected_branch: Option<String>,
     native_generation: Option<u64>,
     stop_agents: Option<bool>,
+    expected_generation: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeRemovalPreview {
+    path: String,
+    branch: Option<String>,
+    generation: String,
+    revision: String,
+    dirty: bool,
+    active_sessions: Vec<String>,
+}
+
+fn ensure_expected_worktree_generation(
+    directory: &Path,
+    expected: Option<&str>,
+) -> Result<(), String> {
+    if let Some(expected) = expected {
+        if worktree_storage::generation(directory).ok().as_deref() != Some(expected) {
+            return Err("Worktree identity changed after preview. Refresh before deleting.".into());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn worktree_removal_preview(
+    repository: String,
+    paths: Vec<String>,
+    agents: State<'_, acp::AgentManager>,
+) -> Result<Vec<WorktreeRemovalPreview>, String> {
+    let repository = validate_repository(repository)?;
+    let main = Path::new(&repository)
+        .git_canonical()
+        .map_err(|_| "Repository folder no longer exists.".to_string())?;
+    let registered = repository_worktrees(repository)?;
+    let registered = registered
+        .into_iter()
+        .map(|entry| (PathBuf::from(&entry.path), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut preview = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = Path::new(&path).git_canonical().map_err(|_| {
+            format!(
+                "Worktree {} no longer exists. Refresh before deleting.",
+                path
+            )
+        })?;
+        if canonical == main {
+            return Err("Cannot delete the main repository.".to_string());
+        }
+        let entry = registered.get(&canonical).ok_or_else(|| {
+            format!(
+                "Worktree {} is no longer registered. Refresh before deleting.",
+                path
+            )
+        })?;
+        let generation = entry.generation.clone().ok_or_else(|| {
+            format!(
+                "Cannot verify Git worktree identity for {}.",
+                canonical.display()
+            )
+        })?;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&canonical)
+            .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+            .output()
+            .map_err(|error| format!("Cannot inspect worktree changes: {error}"))?;
+        if !status.status.success() {
+            return Err(format!(
+                "Cannot inspect changes in {}. Refresh before deleting.",
+                canonical.display()
+            ));
+        }
+        let active_sessions = agents
+            .active_sessions_in(&canonical)?
+            .into_iter()
+            .map(|(agent, _, session)| format!("{agent}:{session}"))
+            .collect();
+        preview.push(WorktreeRemovalPreview {
+            path,
+            branch: entry.branch.clone(),
+            generation,
+            revision: git_directory_revision(&canonical)?,
+            dirty: !status.stdout.is_empty(),
+            active_sessions,
+        });
+    }
+    Ok(preview)
 }
 
 #[tauri::command]
@@ -2013,6 +2104,7 @@ async fn delete_worktree(
         expected_branch,
         native_generation,
         stop_agents,
+        expected_generation,
     } = request;
     let operation_locks = operation_locks.inner().clone();
     let agents = agents.inner().clone();
@@ -2023,6 +2115,7 @@ async fn delete_worktree(
         let directory = PathBuf::from(&worktree)
             .git_canonical()
             .unwrap_or_else(|_| PathBuf::from(&worktree));
+        ensure_expected_worktree_generation(&directory, expected_generation.as_deref())?;
         let cache_directory = app
             .path()
             .app_cache_dir()
@@ -2073,6 +2166,10 @@ async fn delete_worktree(
                 terminals.stop_worktree(&directory)?;
                 agents.stop_worktree(&directory)?;
                 remove_worktree_then_private_data_many(&cache_directory, &managed_data, || {
+                    ensure_expected_worktree_generation(
+                        &directory,
+                        expected_generation.as_deref(),
+                    )?;
                     let result = if archive_ignored == Some(true) {
                         archive_ignored_and_remove(
                             checked,
@@ -3210,6 +3307,7 @@ pub fn run() {
             run_shipping_setup,
             registered_worktrees,
             repository_worktrees,
+            worktree_removal_preview,
             delete_worktree,
             worktree_config,
             context::context_provider_status,
@@ -3389,13 +3487,14 @@ mod tests {
     use super::working_tree_generation;
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
-        discover_nested_worktree_terminal_roots, encode_manifest_path, existing_shipping_worktree,
-        git_change_action, git_patch, git_reference, normalize_picker_path,
-        parse_registered_worktrees, persist_worktree_data_manifest,
-        register_worktree_terminal_data, registered_worktrees, remove_worktree,
-        remove_worktree_then_terminal_data, remove_worktree_then_terminal_data_many,
-        remove_worktree_with_hook, remove_worktree_with_hooks, replacement_worktree_at_checkpoint,
-        repository_namespace, repository_worktrees, shipping_base_revision, shipping_changed_paths,
+        discover_nested_worktree_terminal_roots, encode_manifest_path,
+        ensure_expected_worktree_generation, existing_shipping_worktree, git_change_action,
+        git_patch, git_reference, normalize_picker_path, parse_registered_worktrees,
+        persist_worktree_data_manifest, register_worktree_terminal_data, registered_worktrees,
+        remove_worktree, remove_worktree_then_terminal_data,
+        remove_worktree_then_terminal_data_many, remove_worktree_with_hook,
+        remove_worktree_with_hooks, replacement_worktree_at_checkpoint, repository_namespace,
+        repository_worktrees, shipping_base_revision, shipping_changed_paths,
         shipping_default_branch, shipping_fetch_source, version_is_compatible, version_number,
         working_tree_diff, worktree_overviews, WorktreeOperationLocks,
         NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
@@ -4287,6 +4386,29 @@ mod tests {
         let expected =
             tauri::async_runtime::block_on(working_tree_revision(created.path.clone())).unwrap();
         (root, repository_path, created.path, expected)
+    }
+
+    #[test]
+    fn removal_rejects_a_replaced_worktree_generation() {
+        let (root, repository, worktree, _) = ignored_archive_fixture("sail-removal-generation");
+        let original = worktree_storage::generation(Path::new(&worktree)).unwrap();
+        assert!(ensure_expected_worktree_generation(Path::new(&worktree), Some(&original)).is_ok());
+        git(&repository, &["worktree", "remove", "--force", &worktree]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "replacement", &worktree, "HEAD"],
+        );
+        let replacement = worktree_storage::generation(Path::new(&worktree)).unwrap();
+        assert_ne!(original, replacement);
+        assert!(
+            ensure_expected_worktree_generation(Path::new(&worktree), Some(&original))
+                .unwrap_err()
+                .contains("identity changed after preview")
+        );
+        assert!(
+            ensure_expected_worktree_generation(Path::new(&worktree), Some(&replacement)).is_ok()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

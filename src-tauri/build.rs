@@ -87,6 +87,7 @@ fn main() {
             "run_shipping_setup",
             "registered_worktrees",
             "repository_worktrees",
+            "worktree_removal_preview",
             "delete_worktree",
             "worktree_config",
             "context_provider_status",

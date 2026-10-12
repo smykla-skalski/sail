@@ -1,10 +1,37 @@
 import { browser, $, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { topbarMenuTrigger } from './topbar';
 import { loadProjectCatalog } from '../../src/lib/projects.ts';
+
+async function captureDescendantPreviewTheme(theme: 'light' | 'dark') {
+  await browser.tauri.execute(
+    async ({ core }, chosenTheme) =>
+      core.invoke('plugin:window|set_theme', { label: 'main', value: chosenTheme }),
+    theme,
+  );
+  await [
+    [2560, 1440],
+    [1920, 1200],
+    [390, 850],
+  ].reduce<Promise<void>>(async (previous, [width, height]) => {
+    await previous;
+    await browser.setWindowSize(width, height);
+    const actual = await browser.execute(() => innerWidth);
+    console.log(`Descendant removal preview: ${theme}, requested ${width}, actual ${actual}`);
+    expect(
+      await browser.execute(() => document.documentElement.scrollWidth <= innerWidth + 1),
+    ).toBe(true);
+    if (process.env.SAIL_VISUAL_AUDIT_DIR) {
+      mkdirSync(process.env.SAIL_VISUAL_AUDIT_DIR, { recursive: true });
+      await browser.saveScreenshot(
+        join(process.env.SAIL_VISUAL_AUDIT_DIR, `descendant-removal-${theme}-${actual}.png`),
+      );
+    }
+  }, Promise.resolve());
+}
 
 describe('close worktree shortcut', () => {
   const repository = realpathSync(mkdtempSync(join(tmpdir(), 'sail-close-worktree-')));
@@ -39,7 +66,7 @@ describe('close worktree shortcut', () => {
     rmSync(worktrees, { recursive: true, force: true });
   });
 
-  async function select(directory: string) {
+  async function select(directory: string, waitForInventory = true) {
     await browser.execute(
       (repo, selected, firstPath, secondPath) => {
         sessionStorage.removeItem('sai-e2e-delete-worktree');
@@ -69,14 +96,17 @@ describe('close worktree shortcut', () => {
     await diagnose('Empty main pane', () =>
       expect($('[data-pane-id="main"] [data-pane-picker]')).toBeDisplayed(),
     );
-    await browser.waitUntil(
-      () =>
-        browser.execute(() => {
-          const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
-          return typeof ready === 'function' && ready();
-        }),
-      { timeout: 20000, timeoutMsg: 'Sidebar OpenCode inventory did not settle' },
-    );
+    if (waitForInventory)
+      await diagnose('Sidebar inventory', () =>
+        browser.waitUntil(
+          () =>
+            browser.execute(() => {
+              const ready = Reflect.get(window, '__SAIL_E2E_SIDEBAR_INVENTORY_READY__');
+              return typeof ready === 'function' && ready();
+            }),
+          { timeout: 20000, timeoutMsg: 'Sidebar OpenCode inventory did not settle' },
+        ),
+      );
   }
 
   const catalogPaths = async () => {
@@ -158,5 +188,129 @@ describe('close worktree shortcut', () => {
       await browser.execute((path) => localStorage.getItem(`sai-main-pane-empty:${path}`), second),
     ).toBeNull();
     await expect($('dialog[open]')).not.toExist();
+  });
+
+  it('previews and removes only Sail descendants from the leaves inward', async () => {
+    const child = join(worktrees, 'child');
+    const grandchild = join(worktrees, 'grandchild');
+    const external = join(worktrees, 'external');
+    git('worktree', 'add', '-q', '-b', 'child', child);
+    git('worktree', 'add', '-q', '-b', 'grandchild', grandchild);
+    git('worktree', 'add', '-q', '-b', 'external', external);
+    writeFileSync(join(grandchild, 'uncommitted.txt'), 'keep until confirmed');
+    await select(first, false);
+    const registered = await browser.execute(async (repo) => {
+      const internals: unknown = Reflect.get(window, '__TAURI_INTERNALS__');
+      if (!internals || typeof internals !== 'object') throw new Error('Tauri bridge unavailable');
+      const invoke: unknown = Reflect.get(internals, 'invoke');
+      if (typeof invoke !== 'function') throw new Error('Tauri invoke unavailable');
+      const result: unknown = await Reflect.apply(invoke, internals, [
+        'repository_worktrees',
+        { repository: repo },
+      ]);
+      if (!Array.isArray(result)) throw new Error('Invalid worktree registration');
+      return result.map((item: unknown) => {
+        if (!item || typeof item !== 'object') throw new Error('Invalid worktree registration');
+        const path: unknown = Reflect.get(item, 'path');
+        const generation: unknown = Reflect.get(item, 'generation');
+        if (typeof path !== 'string' || (generation !== null && typeof generation !== 'string'))
+          throw new Error('Invalid worktree identity');
+        return { path, generation };
+      });
+    }, repository);
+    const generation = (path: string) => {
+      const value = registered.find((worktree) => worktree.path === path)?.generation;
+      if (!value) throw new Error(`Missing worktree generation for ${path}`);
+      return value;
+    };
+    await browser.execute(
+      (repo, root, descendant, leaf, unrelated, identities) => {
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({
+            repositories: [repo],
+            groups: [],
+            worktrees: {
+              [repo]: [
+                { path: root, branch: 'first', generation: identities.root },
+                {
+                  path: descendant,
+                  branch: 'child',
+                  generation: identities.child,
+                  origin: {
+                    sourcePath: root,
+                    sourceGeneration: identities.root,
+                    agent: 'codex',
+                    sessionId: 'child-session',
+                    sessionTitle: 'Child',
+                  },
+                },
+                {
+                  path: leaf,
+                  branch: 'grandchild',
+                  generation: identities.grandchild,
+                  origin: {
+                    sourcePath: descendant,
+                    sourceGeneration: identities.child,
+                    agent: 'codex',
+                    sessionId: 'grandchild-session',
+                    sessionTitle: 'Grandchild',
+                  },
+                },
+                { path: unrelated, branch: 'external', generation: identities.external },
+              ],
+            },
+          }),
+        );
+      },
+      repository,
+      first,
+      child,
+      grandchild,
+      external,
+      {
+        root: generation(first),
+        child: generation(child),
+        grandchild: generation(grandchild),
+        external: generation(external),
+      },
+    );
+    await browser.refresh();
+    const openRemoval = async () => {
+      await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
+      await $('[aria-label="Delete worktree first"]').click();
+    };
+    await openRemoval();
+    const dialog = $('dialog.confirmation-dialog[open]');
+    await diagnose('Descendant dialog', () =>
+      expect(dialog).toHaveText(expect.stringContaining('grandchild')),
+    );
+    await expect(dialog).toHaveText(expect.stringContaining('uncommitted changes'));
+    await expect(dialog).not.toHaveText(expect.stringContaining('external'));
+    await captureDescendantPreviewTheme('light');
+    await captureDescendantPreviewTheme('dark');
+    await browser.setWindowSize(1920, 1200);
+    await browser.execute(() => {
+      document.documentElement.style.zoom = '2';
+    });
+    expect(
+      await browser.execute(() => document.documentElement.scrollWidth <= innerWidth + 1),
+    ).toBe(true);
+    await browser.execute(() => {
+      document.documentElement.style.zoom = '';
+    });
+    await dialog.$('button=Cancel').click();
+    expect(existsSync(first)).toBe(true);
+    expect(existsSync(child)).toBe(true);
+    expect(existsSync(grandchild)).toBe(true);
+
+    await openRemoval();
+    await $('dialog.confirmation-dialog[open]').$('button=Delete 3 worktrees').click();
+    await browser.waitUntil(
+      () => !existsSync(first) && !existsSync(child) && !existsSync(grandchild),
+    );
+    await browser.waitUntil(async () => (await catalogPaths()).length === 1);
+    expect(existsSync(external)).toBe(true);
+    expect(await catalogPaths()).toEqual([external]);
   });
 });

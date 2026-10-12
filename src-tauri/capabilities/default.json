@@ -59,6 +59,7 @@
     "allow-run-shipping-setup",
     "allow-registered-worktrees",
     "allow-repository-worktrees",
+    "allow-worktree-removal-preview",
     "allow-delete-worktree",
     "allow-worktree-config",
     "allow-context-provider-status",
