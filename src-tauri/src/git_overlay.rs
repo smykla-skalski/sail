@@ -411,8 +411,7 @@ fn source(worktree: &Path) -> Result<Option<Source>, String> {
     ]))?;
     let stdout = String::from_utf8(result.stdout).map_err(|error| error.to_string())?;
     let mut paths = stdout.lines();
-    let top = PathBuf::from(paths.next().ok_or("Missing Git worktree root.")?)
-        .canonicalize()
+    let top = dunce::canonicalize(Path::new(paths.next().ok_or("Missing Git worktree root.")?))
         .map_err(|error| error.to_string())?;
     if top != worktree {
         return Ok(None);
