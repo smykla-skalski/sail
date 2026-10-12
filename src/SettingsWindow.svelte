@@ -129,6 +129,12 @@
   let memoryKind = $state<MemoryKind>('other');
   let memoryTags = $state('');
   let memoryExpiry = $state('');
+  let memoryCorrectionOriginalValue = '';
+  let memoryCorrectionOriginalTimestamp: number | null = null;
+  let memorySupersedesId = $state('');
+  let memoryResolveConflicts = $state(false);
+  let pendingConflict = $state('');
+  let conflictOtherId = $state('');
   let memoryLoading = $state(false);
   let memoryStorageError = $state('');
   let knowledgeMemoryId = $state('');
@@ -336,6 +342,12 @@
       expiryEditOriginalValue = '';
       expiryEditOriginalTimestamp = null;
       memoryExpiry = '';
+      memoryCorrectionOriginalValue = '';
+      memoryCorrectionOriginalTimestamp = null;
+      memorySupersedesId = '';
+      memoryResolveConflicts = false;
+      pendingConflict = '';
+      conflictOtherId = '';
       agentPreview = null;
       previewRequest += 1;
       memoryProviderStatus = null;
@@ -554,20 +566,53 @@
     const content = memoryContent.trim();
     if (!directory || !content) return;
     memoryStorageError = '';
-    const expiresAt =
-      memoryKind === 'handoff' && memoryExpiry ? new Date(memoryExpiry).getTime() : undefined;
+    const resolvedExpiry = resolveHandoffExpiry(
+      memoryExpiry,
+      memoryCorrectionOriginalValue,
+      memoryCorrectionOriginalTimestamp,
+    );
+    const expiresAt = memoryKind === 'handoff' ? (resolvedExpiry ?? undefined) : undefined;
     if (expiresAt !== undefined && !Number.isFinite(expiresAt)) {
       memoryStorageError = 'Storage: Enter a valid handoff expiry.';
       return;
     }
     try {
-      await invoke<MemoryRecord>('memory_remember', {
-        directory,
-        input: { content, kind: memoryKind, tags: parseMemoryTags(memoryTags), expiresAt },
-      });
+      const input = { content, kind: memoryKind, tags: parseMemoryTags(memoryTags), expiresAt };
+      if (memorySupersedesId) {
+        await invoke<MemoryRecord>('memory_supersede', {
+          directory,
+          id: memorySupersedesId,
+          input,
+          resolveConflicts: memoryResolveConflicts,
+        });
+      } else {
+        await invoke<MemoryRecord>('memory_remember', { directory, input });
+      }
       memoryContent = '';
       memoryTags = '';
       memoryExpiry = '';
+      memoryCorrectionOriginalValue = '';
+      memoryCorrectionOriginalTimestamp = null;
+      memorySupersedesId = '';
+      memoryResolveConflicts = false;
+      await refreshMemory(directory);
+    } catch (cause) {
+      memoryStorageError = `Storage: ${String(cause)}`;
+    }
+  }
+
+  async function markMemoryConflict(id: string) {
+    const directory = snapshot?.directory;
+    if (!directory || !conflictOtherId) return;
+    memoryStorageError = '';
+    try {
+      await invoke('memory_mark_conflict', {
+        directory,
+        firstId: id,
+        secondId: conflictOtherId,
+      });
+      pendingConflict = '';
+      conflictOtherId = '';
       await refreshMemory(directory);
     } catch (cause) {
       memoryStorageError = `Storage: ${String(cause)}`;
@@ -1948,6 +1993,13 @@
                   >
                 </div>
                 <p>{record.content}</p>
+                {#if record.supersededBy}
+                  <p class="memory-tags">Superseded by {record.supersededBy}</p>
+                {:else if record.conflictsWith?.length}
+                  <p class="memory-tags">
+                    Unresolved conflict with {record.conflictsWith.join(', ')}
+                  </p>
+                {/if}
                 {#if record.tags.length}<p class="memory-tags">{record.tags.join(' · ')}</p>{/if}
                 {#if record.provenance.sessionId}
                   <Button
@@ -1971,6 +2023,66 @@
                   </p>
                 {/if}
                 {#if record.kind === 'handoff'}
+                  {#if !record.supersededBy && record.forgottenAt == null}
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={() => {
+                        memoryKind = 'handoff';
+                        memorySupersedesId = record.id;
+                        memoryResolveConflicts = false;
+                        memoryTags = record.tags.join(', ');
+                        memoryExpiry =
+                          record.expiresAt != null
+                            ? new Date(
+                                record.expiresAt -
+                                  new Date(record.expiresAt).getTimezoneOffset() * 60_000,
+                              )
+                                .toISOString()
+                                .slice(0, 16)
+                            : '';
+                        memoryCorrectionOriginalValue = memoryExpiry;
+                        memoryCorrectionOriginalTimestamp = record.expiresAt ?? null;
+                        document.getElementById('memory-content')?.focus();
+                      }}>Correct</Button
+                    >
+                    {#if record.expiresAt == null || record.expiresAt > Date.now()}
+                      {#if pendingConflict === record.id}
+                        <div
+                          class="memory-forget-confirm"
+                          role="group"
+                          aria-label="Mark handoff conflict"
+                        >
+                          <label for="conflict-{record.id}">Conflicts with</label>
+                          <select id="conflict-{record.id}" bind:value={conflictOtherId}>
+                            <option value="">Select another handoff</option>
+                            {#each memoryRecords.filter((candidate) => candidate.kind === 'handoff' && candidate.id !== record.id && !candidate.supersededBy && candidate.forgottenAt == null && (candidate.expiresAt == null || candidate.expiresAt > Date.now())) as candidate (candidate.id)}
+                              <option value={candidate.id}>{candidate.content.slice(0, 80)}</option>
+                            {/each}
+                          </select>
+                          <Button
+                            size="sm"
+                            disabled={!conflictOtherId}
+                            onclick={() => void markMemoryConflict(record.id)}>Mark conflict</Button
+                          >
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onclick={() => (pendingConflict = '')}>Cancel</Button
+                          >
+                        </div>
+                      {:else}
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onclick={() => {
+                            pendingConflict = record.id;
+                            conflictOtherId = '';
+                          }}>Mark conflict</Button
+                        >
+                      {/if}
+                    {/if}
+                  {/if}
                   {#if pendingExpiry === record.id}
                     <div
                       class="memory-forget-confirm"
@@ -2104,10 +2216,28 @@
         <label for="memory-content">What should agents remember?</label>
         <textarea id="memory-content" rows="4" bind:value={memoryContent}></textarea>
         <label for="memory-kind">Kind</label>
-        <select id="memory-kind" bind:value={memoryKind}>
+        <select id="memory-kind" bind:value={memoryKind} disabled={!!memorySupersedesId}>
           {#each memoryKinds as kind (kind)}<option value={kind}>{kind}</option>{/each}
         </select>
         {#if memoryKind === 'handoff'}
+          {#if memorySupersedesId}
+            <p>Correction for handoff {memorySupersedesId}</p>
+            <label class="attention-setting">
+              <input type="checkbox" bind:checked={memoryResolveConflicts} />
+              This correction resolves the handoff's conflicts
+            </label>
+            <Button
+              size="sm"
+              variant="secondary"
+              onclick={() => {
+                memorySupersedesId = '';
+                memoryResolveConflicts = false;
+                memoryExpiry = '';
+                memoryCorrectionOriginalValue = '';
+                memoryCorrectionOriginalTimestamp = null;
+              }}>Cancel correction</Button
+            >
+          {/if}
           <label for="memory-expiry">Expires (optional)</label>
           <input id="memory-expiry" type="datetime-local" bind:value={memoryExpiry} />
         {/if}

@@ -371,6 +371,19 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::sync::{Arc, Condvar, Mutex};
 
+        const HELPER: &str = "SAIL_WINDOWS_PTY_DESCENDANT_HELPER";
+        if std::env::var_os(HELPER).is_some() {
+            let mut descendant = std::process::Command::new("ping.exe")
+                .args(["-n", "60", "127.0.0.1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start descendant inside PTY job");
+            std::thread::spawn(move || descendant.wait().expect("reap PTY descendant"));
+            return;
+        }
+
         let managed =
             std::env::temp_dir().join(format!("sail-owned-terminal-data-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&managed).expect("managed terminal data directory");
@@ -388,13 +401,12 @@ mod tests {
         let output_tail = Arc::new(Mutex::new(VecDeque::new()));
         let output_drain =
             drain_conpty_output(pair.master.as_ref(), Some(Arc::clone(&output_tail)));
-        let mut command = CommandBuilder::new("powershell.exe");
+        let mut command = CommandBuilder::new(std::env::current_exe().expect("test executable"));
         command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Start-Process -FilePath 'ping.exe' -ArgumentList @('-n','60','127.0.0.1'); exit 0",
+            "--exact",
+            "terminal::tests::worktree_removal_stops_pty_descendant_after_shell_exits",
         ]);
+        command.env(HELPER, "1");
         command.set_job_handle(job.raw_handle());
         let mut child = pair
             .slave
@@ -414,7 +426,7 @@ mod tests {
                 let output =
                     String::from_utf8_lossy(&tail.iter().copied().collect::<Vec<_>>()).into_owned();
                 panic!(
-                    "PowerShell parent did not exit: pid={:?}, elapsed={:?}, job active processes={:?}, ConPTY output tail={output:?}",
+                    "test helper did not exit: pid={:?}, elapsed={:?}, job active processes={:?}, ConPTY output tail={output:?}",
                     child.process_id(),
                     started.elapsed(),
                     job.active_processes(),

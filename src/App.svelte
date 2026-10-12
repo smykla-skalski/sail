@@ -79,6 +79,7 @@
     shipOwner,
     shipCheckpointOwner,
     shipTaskReceiptIdsToProtect,
+    shipWorkerProgressChanges,
     authorizeShipCheckpointThread,
     commitRevisionBoundValidation,
     rollbackValidationIssue,
@@ -478,6 +479,7 @@
     receiptForSource,
     receiptIsLatestFinishedTurn,
     replayResultForReceipt,
+    completeReceiptFromReplay,
     receiptMatchesTurn,
     receiptNeedsRefresh,
     receiptIsSettled,
@@ -868,9 +870,14 @@
   const initialSpawnReceipts = loadSpawnReceipts(getSetting('sai-agent-spawn-receipts'));
   let spawnReceipts = $state<SpawnReceipt[]>(initialSpawnReceipts);
   const spawnOutput = new SvelteMap<string, string>();
+  const receiptReplayNeeded = new SvelteSet<string>();
+  const postReloadReceiptTail = new SvelteMap<string, string>();
+  const recoveringSpawnResults = new SvelteMap<string, Promise<void>>();
   const activeSpawnTargets = new SvelteMap<string, string>();
   const spawnTargetKey = (path: string, targetId: string) => JSON.stringify([path, targetId]);
   for (const receipt of initialSpawnReceipts) {
+    if (receipt.targetId?.startsWith('acp:') && receipt.turnId && !receiptIsSettled(receipt.state))
+      receiptReplayNeeded.add(receipt.receiptId);
     if (
       receipt.targetId &&
       receipt.turnId &&
@@ -2758,6 +2765,7 @@
       cancelledAt: undefined,
       stage: undefined,
       reportedStatus: undefined,
+      workerRequest: null,
       claimFencePending: false,
       claimRevalidationPending: false,
       claimHandoffPending: false,
@@ -2899,6 +2907,8 @@
         state: 'failed',
         error: stoppedMessage,
         blockedReason: null,
+        reportedStatus: undefined,
+        workerRequest: null,
         workerSettled: true,
         cancelledAt: Date.now(),
         ...(checkpoint && checkpoint.status !== 'completed'
@@ -5664,6 +5674,8 @@
       if (pendingReceipt.dispatchPending) protectedIds.add(pendingReceipt.receiptId);
     spawnReceipts = saveBoundedReceipt(spawnReceipts, receipt, protectedIds);
     setSetting('sai-agent-spawn-receipts', JSON.stringify(spawnReceipts));
+    if (receipt.state === 'completed' && receiptReplayNeeded.has(receipt.receiptId))
+      void recoverAcpSpawnResult(receipt).catch(() => undefined);
     for (const run of shipRuns) {
       const issue = run.issues.find((item) => item.receiptId === receipt.receiptId);
       if (issue) {
@@ -5906,7 +5918,7 @@
             ? (outcome.error ?? receipt.error)
             : receipt.error,
       });
-      if (state === 'completed' && !spawnOutput.has(receipt.receiptId))
+      if (state === 'completed' && !spawnOutput.has(receipt.receiptId) && !receipt.result)
         void recoverAcpSpawnResult(receipt).catch(() => undefined);
       if (
         receipt.targetId &&
@@ -5917,7 +5929,18 @@
     }
   }
 
-  async function recoverAcpSpawnResult(receipt: SpawnReceipt) {
+  function recoverAcpSpawnResult(receipt: SpawnReceipt): Promise<void> {
+    const existing = recoveringSpawnResults.get(receipt.receiptId);
+    if (existing) return existing;
+    const pending = recoverAcpSpawnResultInner(receipt);
+    recoveringSpawnResults.set(receipt.receiptId, pending);
+    void pending
+      .finally(() => recoveringSpawnResults.delete(receipt.receiptId))
+      .catch(() => undefined);
+    return pending;
+  }
+
+  async function recoverAcpSpawnResultInner(receipt: SpawnReceipt) {
     const targetDirectory = receipt.targetDirectory;
     if (
       !receipt.targetId ||
@@ -5932,35 +5955,69 @@
       const activity = await acp.activity(worktreeDirectory).catch(() => null);
       return receiptIsLatestFinishedTurn(receipt, activity?.[receipt.provider], sessionId);
     }
+    await acp.connect(receipt.provider, worktreeDirectory);
+    const profile = capabilityProfileForAcpSession(
+      receipt.provider,
+      worktreeDirectory,
+      sessionId,
+      receipt.validation ? 'review' : undefined,
+    );
+    const reservation = await acp.beginRestore(
+      receipt.provider,
+      worktreeDirectory,
+      sessionId,
+      profile,
+    );
+    if (reservation.liveTurn) return;
+    if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
     const replay: AgentEntry[] = [];
-    const unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
-      if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId)) return;
-      const update = payload.message.params?.update;
-      if (update && typeof update === 'object')
-        updateEntriesInPlace(replay, update as Record<string, unknown>);
-    });
-    setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
+    let unlisten: (() => void) | undefined;
+    let replaying = false;
     try {
-      await acp.connect(receipt.provider, worktreeDirectory);
+      unlisten = await listen<AgentEvent>('acp-event', ({ payload }) => {
+        if (!acpEventMatchesSession(payload, receipt.provider, worktreeDirectory, sessionId))
+          return;
+        const update = payload.message.params?.update;
+        if (update && typeof update === 'object')
+          updateEntriesInPlace(replay, update as Record<string, unknown>);
+      });
+      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, true);
+      replaying = true;
       await acp.load(
         receipt.provider,
         worktreeDirectory,
         sessionId,
-        capabilityProfileForAcpSession(
-          receipt.provider,
-          worktreeDirectory,
-          sessionId,
-          receipt.validation ? 'review' : undefined,
-        ),
+        profile,
+        reservation.restoreToken,
       );
       const latestFinished = await isLatestFinishedTurn();
-      const result = replayResultForReceipt(replay, receipt.prompt, latestFinished);
-      if (result) updateSpawnReceipt(receipt.receiptId, { result }, true);
+      const result = completeReceiptFromReplay(
+        replayResultForReceipt(replay, receipt.prompt, latestFinished),
+        postReloadReceiptTail.get(receipt.receiptId) ?? '',
+      );
+      if (result) {
+        receiptReplayNeeded.delete(receipt.receiptId);
+        postReloadReceiptTail.delete(receipt.receiptId);
+        spawnOutput.set(receipt.receiptId, result);
+        updateSpawnReceipt(receipt.receiptId, { result }, true);
+      }
     } catch {
       return;
     } finally {
-      setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
-      unlisten();
+      try {
+        if (replaying) setAgentReplay(receipt.provider, worktreeDirectory, sessionId, false);
+      } finally {
+        try {
+          unlisten?.();
+        } finally {
+          await acp.endRestore(
+            receipt.provider,
+            worktreeDirectory,
+            sessionId,
+            reservation.restoreToken,
+          );
+        }
+      }
     }
   }
 
@@ -6546,7 +6603,11 @@
         return awaitReceipt(await boundedReceipt(current));
       }
       let current = await awaitReceipt(await boundedReceipt(receipt));
-      if (request.name === 'agent_result' && current.state === 'completed' && !current.result) {
+      if (
+        request.name === 'agent_result' &&
+        current.state === 'completed' &&
+        (!current.result || receiptReplayNeeded.has(current.receiptId))
+      ) {
         await recoverAcpSpawnResult(current);
         current = spawnReceipts.find((item) => item.receiptId === current.receiptId) ?? current;
       }
@@ -7226,8 +7287,7 @@
       if (!owner) throw new Error('Only the assigned Ship worker can report issue progress.');
       await updateShipIssue(owner.run, owner.issue, {
         stage: report.stage,
-        reportedStatus: report.status,
-        blockedReason: report.status === 'blocked' ? report.reason : null,
+        ...shipWorkerProgressChanges(report.status, report.reason),
         events: appendShipEvent(owner.issue.events, report.stage, report.reason),
       });
     }
@@ -10839,12 +10899,18 @@
     const confirmed = await confirmInApp(
       'Delete thread',
       `Delete “${thread.title}” from Sail? Its transcript and status are removed from Sail.${
-        stillRunning ? ' The agent is still working, and deleting the thread does not stop it.' : ''
+        stillRunning ? ' The active turn will be stopped.' : ''
       }`,
       'Delete thread',
       { destructive: true },
     );
-    if (confirmed) removeAgentThread(thread);
+    if (!confirmed) return;
+    try {
+      await acp.forget(thread.agent, thread.directory, thread.sessionId);
+      removeAgentThread(thread);
+    } catch (cause) {
+      error = `Could not stop thread: ${describe(cause)}`;
+    }
   }
 
   function removeAgentThread(thread: AgentThread) {
@@ -10891,7 +10957,6 @@
       // session/list keeps returning a deleted OpenCode session.
       removeSidebarThread(thread);
     }
-    void acp.forget(thread.agent, thread.directory, thread.sessionId).catch(() => {});
   }
 
   function agentThreadKey(thread: AgentThread): string {
@@ -11612,6 +11677,11 @@
             const result = `${receipt.result ?? ''}${text}`.slice(-16_000);
             updateSpawnReceipt(receipt.receiptId, { result, activity: 'Writing response…' });
             spawnOutput.set(receipt.receiptId, result);
+            if (receiptReplayNeeded.has(receipt.receiptId))
+              postReloadReceiptTail.set(
+                receipt.receiptId,
+                `${postReloadReceiptTail.get(receipt.receiptId) ?? ''}${text}`.slice(-16_000),
+              );
           }
         const toolTitle =
           update &&

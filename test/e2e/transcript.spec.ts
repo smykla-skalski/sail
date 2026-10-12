@@ -28,7 +28,7 @@ describe('shared transcript view', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer [data-pane-prompt]').setValue('Do a small thing');
-    await $('.agent-actions button').click();
+    await $('.agent-actions button:last-child').click();
     const card = $('.permission-card');
     await expect(card).toBeDisplayed();
     await expect(card).not.toHaveText(expect.stringContaining('Always'));

@@ -42,7 +42,7 @@ fn process_info(pid: u32) -> Option<nix::libc::proc_bsdinfo> {
         nix::libc::proc_pidinfo(
             pid as i32,
             nix::libc::PROC_PIDTBSDINFO,
-            0,
+            1, // Include unreaped zombies so a fast exit retains its identity.
             info.as_mut_ptr().cast(),
             size as i32,
         )

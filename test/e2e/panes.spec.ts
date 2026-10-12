@@ -257,7 +257,7 @@ describe('split agent panes', () => {
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Claude'));
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer [data-pane-prompt]').setValue('Parent memory');
-    await $('.agent-actions button').click();
+    await $('.agent-actions button:last-child').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await $('.agent-permission button').click();
     await expect($('.agent-conversation')).toHaveText(

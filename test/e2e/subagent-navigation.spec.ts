@@ -91,7 +91,7 @@ describe('subagent navigation and control', () => {
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
     await $('.agent-composer [data-pane-prompt]').setValue(text);
-    await $('.agent-actions button').click();
+    await $('.agent-actions button:last-child').click();
     await expect($('.spawn-permission')).toBeDisplayed();
   }
 

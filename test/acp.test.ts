@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  acp,
   acpDisconnectAffectsSession,
   acpCancelMatchesSession,
   acpEventMatchesSession,
@@ -10,6 +11,8 @@ import {
   groupAgentEntries,
   invalidateLiveTranscript,
   liveSessionView,
+  markLiveMessageBoundary,
+  restoredLiveTurnIsCurrent,
   liveTranscriptLimit,
   loadRecentTranscript,
   rememberSessionState,
@@ -113,6 +116,145 @@ void test('ACP chunks stream into one assistant message and tool updates keep th
     content: 'Done',
     terminalIds: [],
   });
+});
+
+void test('a resumed live chunk starts after an incomplete cached assistant message', () => {
+  const cached = updateEntries([], {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Historical answer' },
+  });
+  const resumed = updateEntries(cached, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Live answer' },
+    sailStartNewMessage: true,
+  });
+  assert.equal(resumed.length, 2);
+  assert.equal(resumed[0]?.type === 'assistant' && resumed[0].text, 'Historical answer');
+  assert.equal(resumed[1]?.type === 'assistant' && resumed[1].text, 'Live answer');
+});
+
+void test('a live chunk arriving before restore reservation keeps the cached message separate', async () => {
+  const cached = updateEntries([], {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Historical answer' },
+  });
+  const view = liveSessionView(cached, null, undefined);
+  const boundary = view.messageBoundary;
+  let finishConnect!: () => void;
+  const connecting = new Promise<void>((resolve) => {
+    finishConnect = resolve;
+  });
+  const activate = async () => {
+    await connecting;
+    return { liveTurn: 'turn-1' };
+  };
+  const reservation = activate();
+  const first = markLiveMessageBoundary(
+    {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'Live ' },
+    },
+    boundary,
+  );
+  let entries = updateEntries(view.entries, first);
+  finishConnect();
+  assert.deepEqual(await reservation, { liveTurn: 'turn-1' });
+  entries = updateEntries(
+    entries,
+    markLiveMessageBoundary(
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'answer' } },
+      boundary,
+    ),
+  );
+  assert.deepEqual(
+    entries.map((entry) => entry.type === 'assistant' && entry.text),
+    ['Historical answer', 'Live answer'],
+  );
+});
+
+void test('a workspace load does not join a concurrent background resume', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const calls: string[] = [];
+  let held = false;
+  let nextToken = 0;
+  const waiting: Array<() => void> = [];
+  let resumeStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resumeStarted = resolve;
+  });
+  let finishResume!: (value: Record<string, unknown>) => void;
+  const resumeResponse = new Promise<Record<string, unknown>>((resolve) => {
+    finishResume = resolve;
+  });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (command: string) => {
+          calls.push(command);
+          if (command === 'acp_begin_session_restore') {
+            if (held) await new Promise<void>((resolve) => waiting.push(resolve));
+            held = true;
+            return { restoreToken: `token-${++nextToken}` };
+          }
+          if (command === 'acp_end_session_restore') {
+            held = false;
+            waiting.shift()?.();
+            return undefined;
+          }
+          if (command === 'acp_resume_session') {
+            resumeStarted();
+            return resumeResponse;
+          }
+          if (command === 'acp_load_session') return { configOptions: [], history: 'replayed' };
+          throw new Error(`Unexpected command: ${command}`);
+        },
+      },
+    },
+  });
+  try {
+    const resume = acp.resume('claude', '/repo', 'shared-session', 'build');
+    await started;
+    const reservation = acp.beginRestore('claude', '/repo', 'shared-session', 'build');
+    finishResume({ configOptions: [], history: 'resume-only' });
+    assert.equal((await resume).history, 'resume-only');
+    const token = (await reservation).restoreToken;
+    assert.equal(token, 'token-2');
+    assert.equal(
+      (await acp.load('claude', '/repo', 'shared-session', 'build', token)).history,
+      'replayed',
+    );
+    await acp.endRestore('claude', '/repo', 'shared-session', token);
+    assert.deepEqual(calls, [
+      'acp_begin_session_restore',
+      'acp_resume_session',
+      'acp_begin_session_restore',
+      'acp_end_session_restore',
+      'acp_load_session',
+      'acp_end_session_restore',
+    ]);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
+});
+
+void test('a finished event overtakes a live restore snapshot without reviving its turn', async () => {
+  const finished: string[] = [];
+  let returnActivity!: (turnId: string) => void;
+  const activity = new Promise<string>((resolve) => {
+    returnActivity = resolve;
+  });
+  const reconcile = async () => restoredLiveTurnIsCurrent('turn-1', await activity, finished);
+  const pending = reconcile();
+  // The backend sampled turn-1 while it was active; its finish event reaches the webview
+  // before the activity result does.
+  finished.push('turn-1');
+  returnActivity('turn-1');
+  assert.equal(await pending, false);
+  assert.equal(restoredLiveTurnIsCurrent('turn-1', 'turn-1', []), true);
+  assert.equal(restoredLiveTurnIsCurrent('turn-1', undefined, []), false);
+  assert.equal(restoredLiveTurnIsCurrent('turn-1', 'turn-1', ['turn-2']), true);
 });
 
 void test('ACP tool calls keep terminal references across updates', () => {
@@ -481,7 +623,12 @@ void test('without a complete kept transcript the capped cache is shown as incom
   assert.equal(takeLiveTranscript('claude', '/repo', 'replayed'), null);
   trackLiveTranscript('claude', '/repo', 'unknown-state', [], true);
   const reloaded = liveSessionView(cached, null, sessionState('claude', '/repo', 'unknown-state'));
-  assert.deepEqual(reloaded, { complete: false, entries: cached, configOptions: [] });
+  assert.deepEqual(reloaded, {
+    complete: false,
+    messageBoundary: { pending: true },
+    entries: cached,
+    configOptions: [],
+  });
   takeLiveTranscript('claude', '/repo', 'unknown-state');
 });
 

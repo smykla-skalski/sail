@@ -14,7 +14,7 @@ import { join } from 'node:path';
 
 async function completeTurn(text: string) {
   await $('.agent-composer [data-pane-prompt]').setValue(text);
-  await $('.agent-actions button').click();
+  await $('.agent-actions button:last-child').click();
   await expect($('.agent-permission')).toBeDisplayed();
   await $('.agent-permission button').click();
   await expect($('.agent-conversation')).toHaveText(expect.stringContaining(`Done: ${text}`));
@@ -240,7 +240,7 @@ describe('post-turn checks', () => {
     await browser.pause(1_000);
     expect(existsSync(join(repository, 'reload-runs.txt'))).toBe(false);
     await $('.agent-composer [data-pane-prompt]').setValue('Long turn');
-    await $('.agent-actions button').click();
+    await $('.agent-actions button:last-child').click();
     await expect($('.agent-conversation')).toHaveText(expect.stringContaining('part-3 '));
     const active = await browser.execute(async (path) => {
       const tauri = Reflect.get(window, '__TAURI__');

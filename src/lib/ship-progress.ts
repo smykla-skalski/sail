@@ -276,6 +276,14 @@ export function parseShipReport(value: unknown) {
   return report;
 }
 
+export function shipWorkerProgressChanges(
+  status: 'running' | 'blocked',
+  reason?: string,
+): Pick<ShipIssue, 'reportedStatus' | 'blockedReason' | 'workerRequest'> {
+  const request = status === 'blocked' ? (reason ?? null) : null;
+  return { reportedStatus: status, blockedReason: request, workerRequest: request };
+}
+
 export function requireValidatorEconomics(
   report: ReturnType<typeof parseShipReport>,
   allowLegacyMissing: boolean,
@@ -1459,6 +1467,7 @@ const shipIssueSchema = z.object({
     .object({ at: z.number().int().nonnegative(), head: nullableString, comment: z.string() })
     .optional(),
   blockedReason: nullableString.optional(),
+  workerRequest: nullableString.optional(),
   models: z.array(z.string()).optional(),
   workerModel: z.string().optional(),
   workerState: z
@@ -1659,7 +1668,13 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
       unparsed.push(item);
       continue;
     }
-    for (const issue of parsed.data.issues)
+    for (const issue of parsed.data.issues) {
+      if (issue.workerRequest === undefined && issue.reportedStatus === 'blocked') {
+        const workerEvent = issue.events?.findLast(
+          (event) => stages.some((stage) => stage === event.stage) && !!event.reason?.trim(),
+        );
+        if (workerEvent) issue.workerRequest = workerEvent.reason;
+      }
       issue.contextHandoffs = issue.contextHandoffs?.map((handoff) =>
         handoff.outcome === 'pending' &&
         !handoff.toThreadId &&
@@ -1670,6 +1685,7 @@ export function loadShipRunStore(raw: string | null): ShipRunStore {
             })
           : handoff,
       );
+    }
     runs.push(preserveUnknownFields(item, parsed.data));
   }
   return { runs, unparsed };
