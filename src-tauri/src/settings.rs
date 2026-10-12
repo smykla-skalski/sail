@@ -134,6 +134,8 @@ pub struct AcpTurnEvidence {
     pub error: Option<String>,
     #[serde(default)]
     pub updated_at: u64,
+    #[serde(default)]
+    pub post_turn_pending: bool,
 }
 
 fn acp_turn_evidence(settings: &Settings) -> Vec<AcpTurnEvidence> {
@@ -213,6 +215,10 @@ fn merge_acp_turn_evidence_at(
 ) -> Result<(), String> {
     item.updated_at = now;
     let mut evidence = acp_turn_evidence(settings);
+    let previous_pending = evidence
+        .iter()
+        .filter(|saved| saved.post_turn_pending)
+        .count();
     let protected = protected_acp_turns(settings);
     if item.status == "prepared" {
         evidence.retain(|saved| {
@@ -220,6 +226,7 @@ fn merge_acp_turn_evidence_at(
                 || saved.directory != item.directory
                 || saved.session_id != item.session_id
                 || !unsettled_acp_evidence(&saved.status)
+                || saved.post_turn_pending
                 || protected.contains(&(
                     saved.agent.clone(),
                     saved.directory.clone(),
@@ -227,6 +234,25 @@ fn merge_acp_turn_evidence_at(
                     saved.turn_id.clone(),
                 ))
         });
+    }
+    if let Some(saved) = evidence.iter().find(|saved| {
+        saved.agent == item.agent
+            && saved.directory == item.directory
+            && saved.session_id == item.session_id
+            && saved.turn_id == item.turn_id
+    }) {
+        if matches!(item.status.as_str(), "done" | "failed" | "interrupted") {
+            item.post_turn_pending &= saved.post_turn_pending;
+        } else {
+            item.post_turn_pending |= saved.post_turn_pending;
+        }
+    } else if matches!(item.status.as_str(), "done" | "failed" | "interrupted") {
+        item.post_turn_pending = false;
+    }
+    // A failed request that never reached the dispatch fence is still labeled "prepared",
+    // but it cannot produce a completed turn or post-turn checks.
+    if item.status == "prepared" && item.error.is_some() {
+        item.post_turn_pending = false;
     }
     evidence.retain(|saved| {
         saved.agent != item.agent
@@ -245,14 +271,24 @@ fn merge_acp_turn_evidence_at(
             ))
             || now.saturating_sub(saved.updated_at) <= ACP_UNSETTLED_RETENTION_MS
     });
+    let pending = evidence
+        .iter()
+        .filter(|saved| saved.post_turn_pending)
+        .count();
+    if pending > ACP_TURN_EVIDENCE_LIMIT && pending > previous_pending {
+        return Err(format!(
+            "Post-turn check backlog is full ({ACP_TURN_EVIDENCE_LIMIT} turns). Resolve pending checks before sending another prompt."
+        ));
+    }
     let completed = evidence
         .iter()
-        .filter(|item| !unsettled_acp_evidence(&item.status))
+        .filter(|item| !unsettled_acp_evidence(&item.status) && !item.post_turn_pending)
         .count();
-    if completed > ACP_TURN_EVIDENCE_LIMIT {
-        let mut remove = completed - ACP_TURN_EVIDENCE_LIMIT;
+    let completed_limit = ACP_TURN_EVIDENCE_LIMIT.saturating_sub(pending);
+    if completed > completed_limit {
+        let mut remove = completed - completed_limit;
         evidence.retain(|item| {
-            if remove > 0 && !unsettled_acp_evidence(&item.status) {
+            if remove > 0 && !unsettled_acp_evidence(&item.status) && !item.post_turn_pending {
                 remove -= 1;
                 false
             } else {
@@ -302,6 +338,44 @@ pub fn get_acp_turn_evidence(
                 && item.session_id == session_id
                 && item.turn_id == turn_id
         }))
+}
+
+#[tauri::command]
+pub fn list_pending_acp_post_turn_checks(
+    app: tauri::AppHandle,
+) -> Result<Vec<AcpTurnEvidence>, String> {
+    let path = settings_path(&app)?;
+    let _lock = lock_settings(&path)?;
+    Ok(acp_turn_evidence(&read_settings(&path)?)
+        .into_iter()
+        .filter(|item| item.post_turn_pending && item.status == "done")
+        .collect())
+}
+
+#[tauri::command]
+pub fn finish_acp_post_turn_checks(
+    app: tauri::AppHandle,
+    agent: String,
+    directory: String,
+    session_id: String,
+    turn_id: String,
+) -> Result<(), String> {
+    let path = settings_path(&app)?;
+    let _lock = lock_settings(&path)?;
+    let mut settings = read_settings(&path)?;
+    let mut evidence = acp_turn_evidence(&settings);
+    let Some(item) = evidence.iter_mut().find(|item| {
+        item.agent == agent
+            && item.directory == directory
+            && item.session_id == session_id
+            && item.turn_id == turn_id
+            && item.status == "done"
+    }) else {
+        return Err("Completed ACP turn was not found.".into());
+    };
+    item.post_turn_pending = false;
+    write_acp_turn_evidence(&mut settings, &evidence)?;
+    write_settings(&path, &settings)
 }
 
 fn interrupted_turns(settings: &Settings) -> Vec<InterruptedAgentTurn> {
@@ -923,8 +997,9 @@ mod tests {
         acp_turn_evidence, filter_legacy, interrupted_turns, lock_settings,
         merge_acp_turn_evidence, merge_acp_turn_evidence_at, merge_catalog,
         merge_interrupted_turns, merge_threads, read_settings, remove_interrupted_turn,
-        update_deletions, write_settings, AcpTurnEvidence, Deletions, InterruptedAgentTurn,
-        Settings, ACP_TURN_EVIDENCE_LIMIT, ACP_UNSETTLED_RETENTION_MS, DELETIONS_KEY,
+        update_deletions, write_acp_turn_evidence, write_settings, AcpTurnEvidence, Deletions,
+        InterruptedAgentTurn, Settings, ACP_TURN_EVIDENCE_LIMIT, ACP_UNSETTLED_RETENTION_MS,
+        DELETIONS_KEY,
     };
     #[cfg(feature = "e2e")]
     use super::{E2eWriterGate, E2eWriterState};
@@ -932,6 +1007,192 @@ mod tests {
     use std::sync::{mpsc, Arc, Condvar, Mutex};
     #[cfg(feature = "e2e")]
     use std::time::Duration;
+
+    #[test]
+    fn prepared_turn_keeps_pending_check_until_completion_but_legacy_history_is_silent() {
+        let mut settings = Settings::new();
+        let turn = |status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+            post_turn_pending: pending,
+        };
+        merge_acp_turn_evidence_at(&mut settings, turn("prepared", true), 1).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, turn("dispatched", false), 2).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, turn("done", true), 3).unwrap();
+        assert!(acp_turn_evidence(&settings)[0].post_turn_pending);
+
+        let mut suppressed = Settings::new();
+        merge_acp_turn_evidence_at(&mut suppressed, turn("prepared", true), 1).unwrap();
+        merge_acp_turn_evidence_at(&mut suppressed, turn("done", false), 2).unwrap();
+        assert!(!acp_turn_evidence(&suppressed)[0].post_turn_pending);
+
+        let historical: AcpTurnEvidence = serde_json::from_value(serde_json::json!({
+            "agent": "claude", "directory": "/repo", "sessionId": "old",
+            "turnId": "old", "status": "done", "error": null
+        }))
+        .unwrap();
+        assert!(!historical.post_turn_pending);
+    }
+
+    #[test]
+    fn pending_completed_turn_survives_evidence_history_eviction() {
+        let mut settings = Settings::new();
+        let turn = |id: String, status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: id.clone(),
+            turn_id: id,
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+            post_turn_pending: pending,
+        };
+        merge_acp_turn_evidence_at(&mut settings, turn("pending".into(), "prepared", true), 1)
+            .unwrap();
+        merge_acp_turn_evidence_at(&mut settings, turn("pending".into(), "done", true), 2).unwrap();
+        for index in 0..=ACP_TURN_EVIDENCE_LIMIT {
+            merge_acp_turn_evidence_at(
+                &mut settings,
+                turn(format!("old-{index}"), "done", false),
+                index as u64 + 3,
+            )
+            .unwrap();
+        }
+        let saved = acp_turn_evidence(&settings);
+        assert!(saved
+            .iter()
+            .any(|item| item.turn_id == "pending" && item.post_turn_pending));
+        assert!(!saved.iter().any(|item| item.turn_id == "old-0"));
+    }
+
+    #[test]
+    fn pending_check_backlog_refuses_new_dispatch_without_losing_existing_recovery() {
+        let turn = |index: usize, status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: format!("session-{index}"),
+            turn_id: format!("turn-{index}"),
+            status: status.into(),
+            error: None,
+            updated_at: 1,
+            post_turn_pending: pending,
+        };
+        let mut settings = Settings::new();
+        let pending = (0..ACP_TURN_EVIDENCE_LIMIT)
+            .map(|index| turn(index, "done", true))
+            .collect::<Vec<_>>();
+        write_acp_turn_evidence(&mut settings, &pending).unwrap();
+
+        let error = merge_acp_turn_evidence_at(
+            &mut settings,
+            turn(ACP_TURN_EVIDENCE_LIMIT, "prepared", true),
+            2,
+        )
+        .unwrap_err();
+        assert!(error.contains("backlog is full"));
+        assert_eq!(acp_turn_evidence(&settings), pending);
+
+        let mut settled = pending;
+        settled[0].post_turn_pending = false;
+        write_acp_turn_evidence(&mut settings, &settled).unwrap();
+        merge_acp_turn_evidence_at(
+            &mut settings,
+            turn(ACP_TURN_EVIDENCE_LIMIT, "prepared", true),
+            3,
+        )
+        .unwrap();
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), ACP_TURN_EVIDENCE_LIMIT);
+        assert_eq!(
+            saved.iter().filter(|item| item.post_turn_pending).count(),
+            500
+        );
+        assert!(saved.iter().all(|item| item.turn_id != "turn-0"));
+    }
+
+    #[test]
+    fn failed_pre_dispatch_prompt_releases_its_pending_check_slot() {
+        let evidence = |turn: &str, error: Option<&str>| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "session".into(),
+            turn_id: turn.into(),
+            status: "prepared".into(),
+            error: error.map(str::to_string),
+            updated_at: 0,
+            post_turn_pending: error.is_none(),
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence_at(&mut settings, evidence("failed", None), 1).unwrap();
+        assert!(acp_turn_evidence(&settings)[0].post_turn_pending);
+
+        merge_acp_turn_evidence_at(
+            &mut settings,
+            evidence("failed", Some("dispatch fence rejected request")),
+            2,
+        )
+        .unwrap();
+        let failed = &acp_turn_evidence(&settings)[0];
+        assert_eq!(failed.status, "prepared");
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("dispatch fence rejected request")
+        );
+        assert!(!failed.post_turn_pending);
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("next", None), 3).unwrap();
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].turn_id, "next");
+        assert!(saved[0].post_turn_pending);
+    }
+
+    #[test]
+    fn failed_pre_dispatch_prompt_does_not_exhaust_the_500_turn_backlog() {
+        let mut settings = Settings::new();
+        let pending = (0..ACP_TURN_EVIDENCE_LIMIT - 1)
+            .map(|index| AcpTurnEvidence {
+                agent: "claude".into(),
+                directory: "/repo".into(),
+                session_id: format!("older-{index}"),
+                turn_id: format!("older-{index}"),
+                status: "done".into(),
+                error: None,
+                updated_at: 1,
+                post_turn_pending: true,
+            })
+            .collect::<Vec<_>>();
+        write_acp_turn_evidence(&mut settings, &pending).unwrap();
+        let prepared = |turn: &str, error: Option<&str>| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "current".into(),
+            turn_id: turn.into(),
+            status: "prepared".into(),
+            error: error.map(str::to_string),
+            updated_at: 0,
+            post_turn_pending: error.is_none(),
+        };
+        merge_acp_turn_evidence_at(&mut settings, prepared("failed", None), 2).unwrap();
+        assert_eq!(
+            acp_turn_evidence(&settings)
+                .iter()
+                .filter(|item| item.post_turn_pending)
+                .count(),
+            ACP_TURN_EVIDENCE_LIMIT
+        );
+        merge_acp_turn_evidence_at(&mut settings, prepared("failed", Some("not sent")), 3).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, prepared("next", None), 4).unwrap();
+        let saved = acp_turn_evidence(&settings);
+        assert_eq!(saved.len(), ACP_TURN_EVIDENCE_LIMIT);
+        assert!(saved.iter().any(|item| item.turn_id == "next"));
+        assert!(!saved.iter().any(|item| item.turn_id == "failed"));
+    }
 
     #[test]
     fn acp_turn_evidence_is_provider_correlated_replaced_and_bounded() {
@@ -943,6 +1204,7 @@ mod tests {
             status: status.into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: false,
         };
         let mut settings = Settings::new();
         merge_acp_turn_evidence(
@@ -1005,6 +1267,7 @@ mod tests {
             status: status.into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: false,
         };
         let mut settings = Settings::new();
         merge_acp_turn_evidence(&mut settings, evidence("prepared", "prepared")).unwrap();
@@ -1031,6 +1294,7 @@ mod tests {
             status: status.into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: false,
         };
         let mut settings = Settings::new();
         merge_acp_turn_evidence_at(
@@ -1080,6 +1344,7 @@ mod tests {
             status: status.into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: false,
         };
         let mut settings = Settings::new();
         merge_acp_turn_evidence_at(&mut settings, evidence("old", "dispatch_uncertain"), 1)
@@ -1090,6 +1355,33 @@ mod tests {
         let saved = acp_turn_evidence(&settings);
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].turn_id, "new");
+    }
+
+    #[test]
+    fn a_new_prompt_keeps_a_completed_turn_waiting_for_evidence_retry() {
+        let evidence = |turn: &str, status: &str, pending: bool| AcpTurnEvidence {
+            agent: "claude".into(),
+            directory: "/repo".into(),
+            session_id: "session".into(),
+            turn_id: turn.into(),
+            status: status.into(),
+            error: None,
+            updated_at: 0,
+            post_turn_pending: pending,
+        };
+        let mut settings = Settings::new();
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "prepared", true), 1).unwrap();
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "dispatched", false), 2).unwrap();
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("new", "prepared", true), 3).unwrap();
+        assert!(acp_turn_evidence(&settings)
+            .iter()
+            .any(|item| item.turn_id == "old" && item.post_turn_pending));
+
+        merge_acp_turn_evidence_at(&mut settings, evidence("old", "done", true), 4).unwrap();
+        assert!(acp_turn_evidence(&settings)
+            .iter()
+            .any(|item| item.turn_id == "old" && item.status == "done" && item.post_turn_pending));
     }
 
     #[test]

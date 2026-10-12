@@ -255,6 +255,25 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             report_pending(&data_directory, "owner-cache-key-mismatch");
             continue;
         }
+        // An active sibling shares the repository lock but has a separate lease. Check
+        // its lease first so skipping that sibling cannot hold the repository lock
+        // while a removed worktree from the same repository is reconciled.
+        let lease_path = match lock_path(cache_directory, "lease", &data_directory) {
+            Ok(path) => path,
+            Err(_) => {
+                report_pending(&data_directory, "active-use");
+                continue;
+            }
+        };
+        let lease = match FileLock::try_acquire(&lease_path, true) {
+            Ok(lock) => lock,
+            Err(_error) => {
+                #[cfg(test)]
+                eprintln!("reconcile lease lock: {_error}");
+                report_pending(&data_directory, "active-use");
+                continue;
+            }
+        };
         let repo_lock_path = match lock_path(cache_directory, "repo", &identity.common_dir) {
             Ok(path) => path,
             Err(_) => {
@@ -283,22 +302,6 @@ pub(crate) fn reconcile(cache_directory: &Path) {
             Err(_error) => {
                 #[cfg(test)]
                 eprintln!("reconcile mutation lock: {_error}");
-                report_pending(&data_directory, "active-use");
-                continue;
-            }
-        };
-        let lease_path = match lock_path(cache_directory, "lease", &data_directory) {
-            Ok(path) => path,
-            Err(_) => {
-                report_pending(&data_directory, "active-use");
-                continue;
-            }
-        };
-        let lease = match FileLock::try_acquire(&lease_path, true) {
-            Ok(lock) => lock,
-            Err(_error) => {
-                #[cfg(test)]
-                eprintln!("reconcile lease lock: {_error}");
                 report_pending(&data_directory, "active-use");
                 continue;
             }
@@ -1715,9 +1718,33 @@ mod tests {
 
         reconcile(&fixture.cache);
 
-        assert!(!first_directory.exists());
+        assert!(
+            !first_directory.exists(),
+            "reconciliation left removed worktree storage: {:?}",
+            cleanup_status(&fixture.cache)
+        );
         assert!(second_directory.exists());
         second_lease.release_clean().unwrap();
+    }
+
+    #[test]
+    fn active_sibling_registered_first_does_not_block_removed_worktree_cleanup() {
+        let fixture = GitFixture::new();
+        let (active_directory, active_lease) = register(&fixture.cache, &fixture.second).unwrap();
+        let (removed_directory, removed_lease) = register(&fixture.cache, &fixture.first).unwrap();
+        removed_lease.release_clean().unwrap();
+        drop(removed_lease);
+        fixture.remove(&fixture.first);
+
+        reconcile(&fixture.cache);
+
+        assert!(
+            !removed_directory.exists(),
+            "active sibling prevented cleanup: {:?}",
+            cleanup_status(&fixture.cache)
+        );
+        assert!(active_directory.exists());
+        active_lease.release_clean().unwrap();
     }
 
     #[test]

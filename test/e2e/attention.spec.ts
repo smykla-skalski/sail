@@ -460,5 +460,18 @@ describe('shared attention items', () => {
     await $('.inbox-attention').$('button=Dismiss').click();
     await expect($('[data-topbar-inbox]')).toHaveText('Inbox (1)');
     await expect($('.agent-status-bar')).toHaveText(expect.stringContaining('1 need attention'));
+    await browser.waitUntil(() =>
+      browser.execute(() => document.activeElement?.matches('.inbox-attention .inbox-open')),
+    );
+
+    await $('.inbox-attention').$('button=Snooze 1 hour').click();
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (0)');
+    await browser.waitUntil(() =>
+      browser.execute(() =>
+        document.activeElement?.matches(
+          '.inbox-dialog-top button[aria-label="Close pending requests"]',
+        ),
+      ),
+    );
   });
 });
