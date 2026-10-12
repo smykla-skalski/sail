@@ -42,6 +42,48 @@ fn git_config_quoted_path(path: &Path) -> Result<String, String> {
     ))
 }
 
+#[cfg(windows)]
+fn durable_rename(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = crate::extended_windows_path(source)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = crate::extended_windows_path(destination)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(windows))]
+fn durable_rename(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn sync_renamed_parent(_path: &Path) -> std::io::Result<()> {
+    // Windows cannot open directories through File::open. MoveFileExW with
+    // MOVEFILE_WRITE_THROUGH flushes each rename before it returns.
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_renamed_parent(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
 fn register(worktree: &Path, git_dir: &Path, source_git_dir: &Path) {
     let entries = ACTIVE.get_or_init(|| Mutex::new(Vec::new()));
     if let Ok(mut entries) = entries.lock() {
@@ -572,7 +614,7 @@ fn replace_index(
         );
     }
     if !source.exists() && backup.exists() {
-        fs::rename(&backup, source).map_err(|error| error.to_string())?;
+        durable_rename(&backup, source).map_err(|error| error.to_string())?;
     }
     let current = index_hash(source)?;
     if current.as_deref() == Some(replacement) {
@@ -590,6 +632,7 @@ fn replace_index(
     let mut input = File::open(private).map_err(|error| error.to_string())?;
     std::io::copy(&mut input, &mut locked_index).map_err(|error| error.to_string())?;
     locked_index.sync_all().map_err(|error| error.to_string())?;
+    drop(locked_index);
     // Detect direct index writers that ignore Git's lock convention.
     if index_hash(source)?.as_deref() != expected {
         return Err("Assigned index changed during promotion; promotion refused.".into());
@@ -607,10 +650,9 @@ fn replace_index(
             return Err("Assigned index changed while backing up; promotion refused.".into());
         }
     }
-    fs::rename(&lock_path, source).map_err(|error| error.to_string())?;
+    durable_rename(&lock_path, source).map_err(|error| error.to_string())?;
     owned_lock.0 = None;
-    File::open(source.parent().ok_or("Invalid linked index path.")?)
-        .and_then(|directory| directory.sync_all())
+    sync_renamed_parent(source.parent().ok_or("Invalid linked index path.")?)
         .map_err(|error| error.to_string())?;
     if backup.exists() {
         fs::remove_file(backup).map_err(|error| error.to_string())?;
@@ -633,6 +675,7 @@ fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), String> {
         file.write_all(&contents)
             .and_then(|_| file.sync_all())
             .map_err(|error| error.to_string())?;
+        drop(file);
         if path.exists() {
             if backup.exists() {
                 let prior: Manifest =
@@ -649,16 +692,15 @@ fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), String> {
                 }
                 fs::remove_file(&backup).map_err(|error| error.to_string())?;
             }
-            fs::rename(path, &backup).map_err(|error| error.to_string())?;
+            durable_rename(path, &backup).map_err(|error| error.to_string())?;
         }
-        if let Err(error) = fs::rename(&temporary, path) {
+        if let Err(error) = durable_rename(&temporary, path) {
             if backup.exists() {
-                let _ = fs::rename(&backup, path);
+                let _ = durable_rename(&backup, path);
             }
             return Err(error.to_string());
         }
-        File::open(path.parent().ok_or("Invalid overlay manifest path.")?)
-            .and_then(|directory| directory.sync_all())
+        sync_renamed_parent(path.parent().ok_or("Invalid overlay manifest path.")?)
             .map_err(|error| error.to_string())?;
         if backup.exists() {
             fs::remove_file(&backup).map_err(|error| error.to_string())?;
@@ -674,7 +716,7 @@ fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), String> {
 fn read_manifest(path: &Path) -> Result<Option<Manifest>, String> {
     let backup = path.with_extension("bak");
     if !path.exists() && backup.exists() {
-        fs::rename(&backup, path).map_err(|error| error.to_string())?;
+        durable_rename(&backup, path).map_err(|error| error.to_string())?;
     }
     if !path.exists() {
         return Ok(None);
@@ -688,7 +730,7 @@ fn read_manifest(path: &Path) -> Result<Option<Manifest>, String> {
         Err(error) if backup.exists() => {
             let manifest = parse(&backup).map_err(|_| error)?;
             fs::remove_file(path).map_err(|error| error.to_string())?;
-            fs::rename(&backup, path).map_err(|error| error.to_string())?;
+            durable_rename(&backup, path).map_err(|error| error.to_string())?;
             Ok(Some(manifest))
         }
         Err(error) => Err(error),
