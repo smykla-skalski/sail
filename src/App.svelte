@@ -262,10 +262,14 @@
   import { resolveTaskLocation, type TaskLocation as TaskLocationValue } from './lib/task-location';
   import {
     checkKey,
+    hasDurableCheckOutcome,
     personalChecks,
+    retryInterruptedCheck,
+    uniquePostTurnCheckCommands,
     upsertCheck,
     type PostTurnCheck,
   } from './lib/post-turn-checks';
+  import { createTurnVerificationQueue } from './lib/turn-verification-queue';
   import HarnessIcon from './HarnessIcon.svelte';
   import OptionPicker from './OptionPicker.svelte';
   import { promptSkill, type SkillChoice } from './lib/skills';
@@ -890,6 +894,8 @@
   };
   let postTurnResults = $state<PostTurnCheck[]>([]);
   const pendingPostTurnChecks = new SvelteSet<string>();
+  const queueTurnVerification = createTurnVerificationQueue();
+  const pendingCompletionErrors = new SvelteMap<string, string>();
   let personalPostTurnChecks = $state(personalChecks(getSetting('sai-post-turn-personal')));
   type TurnSnapshot = { id: string; kind: 'turn' | 'undo'; created: number };
   let selectedWorktreeConfig = $state<WorktreeConfig | null>(null);
@@ -2208,6 +2214,7 @@
   onMount(() => {
     window.addEventListener(OPEN_IN_SPLIT_EVENT, openLinkInSplit);
     let unlistenAgentEvents: (() => void) | undefined;
+    let unlistenPostTurnCheckEvents: (() => void) | undefined;
     let unlistenBrowserAccess: (() => void) | undefined;
     let unlistenCoordination: (() => void) | undefined;
     const unsubscribePlans = acpPlans().subscribe((change) => {
@@ -2412,22 +2419,40 @@
       void listen<(typeof agentTerminals)[number]>('acp-terminal-created', ({ payload }) => {
         agentTerminals = [...agentTerminals, payload];
       }).then((unlisten) => (unlistenAgentTerminals = unlisten));
-      void listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)).then(
-        (unlisten) => {
-          if (disposed) unlisten();
-          else {
-            unlistenAgentEvents = unlisten;
-            void recoverInterruptedAgentTurns()
-              .then(() => restoreAgentActivity())
-              .finally(() => {
-                acpRecoveryReady = true;
-                void tickShippingRuns();
-              });
-            scheduleInboxRefresh();
-          }
-          return undefined;
-        },
-      );
+      void Promise.all([
+        listen<PostTurnCheck>('post-turn-check-completed', ({ payload }) => {
+          postTurnResults = upsertCheck(postTurnResults, payload);
+          if (!hasDurableCheckOutcome(payload)) return;
+          const match = /^acp:([^:]+):(.+)$/.exec(payload.thread);
+          if (match)
+            void runVerifiedCompletedChecks(match[1], payload.directory, match[2], payload.turn);
+        }),
+        listen<AgentEvent>('acp-event', ({ payload }) => handleAgentEvent(payload)),
+      ]).then(([unlistenChecks, unlistenAgent]) => {
+        if (disposed) {
+          unlistenChecks();
+          unlistenAgent();
+        } else {
+          unlistenPostTurnCheckEvents = unlistenChecks;
+          unlistenAgentEvents = unlistenAgent;
+          if (import.meta.env.MODE === 'e2e')
+            Reflect.set(window, 'sailE2eStopAgentEvents', () => {
+              unlistenAgentEvents?.();
+              unlistenAgentEvents = undefined;
+            });
+          void recoverInterruptedAgentTurns()
+            .then(() => restoreAgentActivity())
+            .then(() => reconcilePendingPostTurnChecks())
+            .finally(() => {
+              acpRecoveryReady = true;
+              if (import.meta.env.MODE === 'e2e')
+                Reflect.set(window, 'sailE2eAcpRecoveryReady', true);
+              void tickShippingRuns();
+            });
+          scheduleInboxRefresh();
+        }
+        return undefined;
+      });
       if (import.meta.env.MODE === 'e2e') {
         const emulateClick = (event: Event) =>
           void openNotificationTarget((event as CustomEvent<unknown>).detail);
@@ -2482,6 +2507,9 @@
       clearTimeout(sidebarInventoryTimer);
       clearInterval(diffPollTimer);
       unlistenAgentEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eStopAgentEvents');
+      unlistenPostTurnCheckEvents?.();
+      if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eAcpRecoveryReady');
       unlistenBrowserAccess?.();
       unlistenCoordination?.();
       unsubscribePlans();
@@ -11277,15 +11305,22 @@
       }).catch(() => undefined),
   });
 
-  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false) {
+  async function runOnePostTurnCheck(check: PostTurnCheck, retry = false): Promise<boolean> {
     const key = checkKey(check);
-    if (
-      pendingPostTurnChecks.has(key) ||
-      (!retry && postTurnResults.some((item) => checkKey(item) === key))
-    )
-      return;
+    if (pendingPostTurnChecks.has(key)) return false;
     pendingPostTurnChecks.add(key);
+    let retryRecovered = false;
     try {
+      if (!retry) {
+        const stored = (await invoke<PostTurnCheck[]>('list_post_turn_checks')).find(
+          (item) => checkKey(item) === key,
+        );
+        if (stored) {
+          postTurnResults = upsertCheck(postTurnResults, stored);
+          retryRecovered = retryInterruptedCheck(stored);
+          if (!retryRecovered) return hasDurableCheckOutcome(stored);
+        }
+      }
       if (check.source === 'repository') {
         const approved = await invoke<boolean>('is_post_turn_check_approved', {
           directory: check.directory,
@@ -11302,7 +11337,7 @@
               invoke<PostTurnCheck>('cancel_post_turn_check', check),
             );
             postTurnResults = upsertCheck(postTurnResults, canceled);
-            return;
+            return hasDurableCheckOutcome(canceled);
           }
           await trackSettingsMutation(() =>
             invoke('approve_post_turn_check', {
@@ -11314,9 +11349,10 @@
       }
       postTurnResults = upsertCheck(postTurnResults, { ...check, status: 'running' });
       const result = await invoke<PostTurnCheck>('run_post_turn_check', {
-        request: { ...check, retry },
+        request: { ...check, retry: retry || retryRecovered },
       });
       postTurnResults = upsertCheck(postTurnResults, result);
+      return hasDurableCheckOutcome(result);
     } catch (cause) {
       postTurnResults = upsertCheck(postTurnResults, {
         ...check,
@@ -11324,18 +11360,21 @@
         output: describe(cause),
         code: null,
       });
+      return false;
     } finally {
       pendingPostTurnChecks.delete(key);
       scheduleInboxRefresh();
     }
   }
 
-  async function runCompletedChecks(path: string, thread: string, turn: string) {
-    if (!path || !thread || !turn) return;
+  async function runCompletedChecks(path: string, thread: string, turn: string): Promise<boolean> {
+    if (!path || !thread || !turn) return false;
     const entries: { source: 'repository' | 'personal'; command: string }[] =
       personalPostTurnChecks.map((command) => ({ source: 'personal', command }));
+    let configLoaded = false;
     try {
       const config = await invoke<WorktreeConfig | null>('worktree_config', { worktree: path });
+      configLoaded = true;
       entries.push(
         ...(config?.postTurnChecks ?? []).map((command) => ({
           source: 'repository' as const,
@@ -11345,18 +11384,71 @@
     } catch (cause) {
       error = `Could not load repository post-turn checks: ${describe(cause)}`;
     }
-    for (const entry of entries) {
-      void runOnePostTurnCheck({
-        id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
-        updated: Date.now(),
-        directory: path,
-        thread,
-        turn,
-        ...entry,
-        status: 'running',
-        output: '',
-        code: null,
-      });
+    const durable = await Promise.all(
+      uniquePostTurnCheckCommands(entries).map((entry) =>
+        runOnePostTurnCheck({
+          id: JSON.stringify([path, thread, turn, entry.source, entry.command]),
+          updated: Date.now(),
+          directory: path,
+          thread,
+          turn,
+          ...entry,
+          status: 'running',
+          output: '',
+          code: null,
+        }),
+      ),
+    );
+    return configLoaded && durable.every(Boolean);
+  }
+
+  async function runVerifiedCompletedChecks(
+    agent: AgentId,
+    path: string,
+    sessionId: string,
+    turnId: string,
+  ) {
+    const key = JSON.stringify([agent, path, sessionId, turnId]);
+    await queueTurnVerification(key, async () => {
+      try {
+        const evidence = await acp.turnEvidence(agent, path, sessionId, turnId);
+        if (
+          evidence?.status !== 'done' ||
+          !evidence.postTurnPending ||
+          evidence.agent !== agent ||
+          evidence.directory !== path ||
+          evidence.sessionId !== sessionId ||
+          evidence.turnId !== turnId
+        )
+          return;
+        const warning = pendingCompletionErrors.get(key);
+        pendingCompletionErrors.delete(key);
+        if (warning && error === warning) error = '';
+        if (!(await runCompletedChecks(path, `acp:${agent}:${sessionId}`, turnId))) return;
+        await acp.finishPostTurnChecks(agent, path, sessionId, turnId);
+      } catch (cause) {
+        error = `Could not verify completed agent turn: ${describe(cause)}`;
+      }
+    });
+  }
+
+  async function retryPostTurnCheck(check: PostTurnCheck) {
+    if (!(await runOnePostTurnCheck(check, true))) return;
+    const match = /^acp:([^:]+):(.+)$/.exec(check.thread);
+    if (!match) return;
+    await runVerifiedCompletedChecks(match[1], check.directory, match[2], check.turn);
+  }
+
+  async function reconcilePendingPostTurnChecks() {
+    try {
+      const pending = await acp.pendingPostTurnChecks();
+      await Promise.all(
+        pending.map((turn) =>
+          runVerifiedCompletedChecks(turn.agent, turn.directory, turn.sessionId, turn.turnId),
+        ),
+      );
+    } catch (cause) {
+      error = `Could not restore completed agent checks: ${describe(cause)}`;
     }
   }
 
@@ -11619,6 +11711,13 @@
       )
         removeStructuredQuestion(event.agent, eventDirectory, sessionId, requestID);
     }
+    if (event.message.method === 'sail/post_turn_evidence_ready') {
+      const sessionId = event.message.params?.sessionId;
+      const turnId = event.message.params?.turnId;
+      if (typeof sessionId === 'string' && typeof turnId === 'string') {
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
+      }
+    }
     if (event.message.method === 'sail/prompt_finished') {
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
@@ -11628,20 +11727,17 @@
         (status !== 'done' && status !== 'failed' && status !== 'interrupted')
       )
         return;
-      if (
-        status === 'done' &&
-        typeof turnId === 'string' &&
-        event.message.params?.notify !== false
-      ) {
-        const thread = agentThreads.find(
-          (item) =>
-            item.agent === event.agent &&
-            item.sessionId === sessionId &&
-            item.directory === eventDirectory,
+      const evidenceError = event.message.params?.evidenceError;
+      if (typeof evidenceError === 'string' && typeof turnId === 'string') {
+        const warning = `Completed turn is waiting for its post-turn check record: ${evidenceError}`;
+        pendingCompletionErrors.set(
+          JSON.stringify([event.agent, eventDirectory, sessionId, turnId]),
+          warning,
         );
-        if (thread)
-          void runCompletedChecks(thread.directory, `acp:${event.agent}:${sessionId}`, turnId);
+        error = warning;
       }
+      if (status === 'done' && typeof turnId === 'string' && event.message.params?.notify !== false)
+        void runVerifiedCompletedChecks(event.agent, eventDirectory, sessionId, turnId);
       for (const thread of agentThreads.filter(
         (item) =>
           item.agent === event.agent &&
@@ -12375,7 +12471,7 @@
                     check.directory === directory &&
                     check.thread === `acp:${acpAgent}:${acpThread.sessionId}`,
                 )}
-                onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+                onretrycheck={(check) => void retryPostTurnCheck(check)}
               />
             {/key}
           {:else}
@@ -12468,7 +12564,7 @@
           startShippingRun(graph, provider, limit, source)}
         onshipit={adoptDirectShipRunWithAuthorization}
         postTurnChecks={postTurnResults}
-        onretrycheck={(check) => void runOnePostTurnCheck(check, true)}
+        onretrycheck={(check) => void retryPostTurnCheck(check)}
         {agentUsage}
         {agentRates}
         onentries={(id, entries, sessionId, ready) =>

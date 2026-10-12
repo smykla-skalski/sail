@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "e2e")]
 use tauri::Manager;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 const APPROVALS_KEY: &str = "sai-post-turn-approvals";
 const HISTORY_KEY: &str = "sai-post-turn-history";
@@ -74,6 +74,8 @@ pub struct CheckResult {
     pub status: String,
     pub output: String,
     pub code: Option<i32>,
+    #[serde(default)]
+    pub restart_interrupted: bool,
 }
 
 #[derive(Deserialize)]
@@ -202,14 +204,17 @@ pub fn cancel_post_turn_check(
         return Err("Check command changed. Reload its configuration.".into());
     }
     let mut checks = history(&app)?;
-    if let Some(existing) = checks.iter().find(|item| {
+    let position = checks.iter().position(|item| {
         item.directory == directory
             && item.thread == thread
             && item.turn == turn
             && item.source == source
             && item.command == command
-    }) {
-        return Ok(existing.clone());
+    });
+    if let Some(index) = position {
+        if !checks[index].restart_interrupted {
+            return Ok(checks[index].clone());
+        }
     }
     let result = CheckResult {
         id: check_id(&directory, &thread, &turn, &source, &command),
@@ -222,9 +227,16 @@ pub fn cancel_post_turn_check(
         status: "canceled".into(),
         output: "Repository command was not approved.".into(),
         code: None,
+        restart_interrupted: false,
     };
-    checks.push(result.clone());
+    if let Some(index) = position {
+        checks[index] = result.clone();
+    } else {
+        checks.push(result.clone());
+    }
     save_history(&app, &checks)?;
+    drop(guard);
+    let _ = app.emit("post-turn-check-completed", &result);
     Ok(result)
 }
 
@@ -244,6 +256,7 @@ pub fn list_post_turn_checks(
             check.status = "canceled".into();
             check.updated = now_ms();
             check.output = "Sail closed while this check was running.".into();
+            check.restart_interrupted = true;
             changed = true;
         }
     }
@@ -324,6 +337,7 @@ pub async fn run_post_turn_check(
             status: "running".into(),
             output: String::new(),
             code: None,
+            restart_interrupted: false,
         };
         if let Some(index) = position {
             checks[index] = result.clone();
@@ -365,6 +379,8 @@ pub async fn run_post_turn_check(
             *item = result.clone();
         }
         save_history(&app, &checks)?;
+        drop(active);
+        let _ = app.emit("post-turn-check-completed", &result);
         Ok(result)
     })
     .await

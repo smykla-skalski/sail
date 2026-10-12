@@ -1707,6 +1707,55 @@ fn durable_prompt_status(status: &'static str, failed: bool, dispatch_phase: u8)
     }
 }
 
+fn retry_completed_turn_evidence(
+    mut write: impl FnMut() -> Result<(), String>,
+    mut report: impl FnMut(&str),
+    mut pause: impl FnMut(Duration),
+    attempts: usize,
+) -> Result<(), String> {
+    let mut delay = Duration::from_millis(50);
+    for attempt in 0..attempts {
+        match write() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                report(&error);
+                if attempt + 1 == attempts {
+                    return Err(error);
+                }
+            }
+        }
+        pause(delay);
+        delay = delay.saturating_mul(2).min(Duration::from_secs(2));
+    }
+    Err("No completion evidence write was attempted.".into())
+}
+
+async fn retry_completion_evidence_after_cleanup<F, R, P, Fut, S>(
+    mut write: F,
+    mut report: R,
+    mut pause: P,
+    on_saved: S,
+) where
+    F: FnMut() -> Result<(), String>,
+    R: FnMut(&str),
+    P: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+    S: FnOnce(),
+{
+    let mut delay = Duration::from_millis(50);
+    loop {
+        match write() {
+            Ok(()) => {
+                on_saved();
+                return;
+            }
+            Err(error) => report(&error),
+        }
+        pause(delay).await;
+        delay = delay.saturating_mul(2).min(Duration::from_secs(2));
+    }
+}
+
 impl ActivePrompt {
     fn observe_update(&mut self, update: &Value) {
         match update.get("sessionUpdate").and_then(Value::as_str) {
@@ -1761,6 +1810,7 @@ impl ActivePrompt {
 #[cfg(test)]
 mod interruption_report_tests {
     use super::*;
+    use std::cell::Cell;
 
     fn prompt() -> ActivePrompt {
         ActivePrompt {
@@ -2223,6 +2273,117 @@ mod interruption_report_tests {
         );
         assert_eq!(durable_prompt_status("failed", true, 2), "dispatched");
         assert_eq!(durable_prompt_status("done", false, 1), "done");
+    }
+
+    #[test]
+    fn transient_completion_write_failure_delays_finished_event_until_evidence_is_durable() {
+        let attempts = Cell::new(0);
+        let reports = Cell::new(0);
+        let pauses = Cell::new(0);
+        let finished = Cell::new(false);
+        retry_completed_turn_evidence(
+            || {
+                assert!(!finished.get());
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err("injected settings write failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |error| {
+                assert_eq!(error, "injected settings write failure");
+                assert!(!finished.get());
+                reports.set(reports.get() + 1);
+            },
+            |delay| {
+                assert_eq!(delay, Duration::from_millis(50));
+                assert!(!finished.get());
+                pauses.set(pauses.get() + 1);
+            },
+            3,
+        )
+        .unwrap();
+        finished.set(true);
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(reports.get(), 1);
+        assert_eq!(pauses.get(), 1);
+    }
+
+    #[test]
+    fn persistent_completion_write_failure_returns_without_signaling_a_finish() {
+        let attempts = Cell::new(0);
+        let pauses = Cell::new(0);
+        let result = retry_completed_turn_evidence(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err("injected persistent settings failure".into())
+            },
+            |_| {},
+            |_| pauses.set(pauses.get() + 1),
+            3,
+        );
+        assert_eq!(result.unwrap_err(), "injected persistent settings failure");
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(pauses.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_completion_write_retries_after_cleanup_and_signals_once_after_recovery() {
+        let attempts = Cell::new(0);
+        let ready_events = Cell::new(0);
+        let pauses = Cell::new(0);
+        retry_completion_evidence_after_cleanup(
+            || {
+                assert_eq!(ready_events.get(), 0);
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= 4 {
+                    Err("injected persistent settings failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| assert_eq!(ready_events.get(), 0),
+            |delay| {
+                pauses.set(pauses.get() + 1);
+                assert!(delay <= Duration::from_secs(2));
+                async {}
+            },
+            || ready_events.set(ready_events.get() + 1),
+        )
+        .await;
+        assert_eq!(attempts.get(), 5);
+        assert_eq!(pauses.get(), 4);
+        assert_eq!(ready_events.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn background_completion_retry_can_be_cancelled_when_the_app_stops() {
+        use std::sync::atomic::AtomicUsize;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let ready_events = Arc::new(AtomicUsize::new(0));
+        let retry_attempts = attempts.clone();
+        let retry_events = ready_events.clone();
+        let retry = tokio::spawn(async move {
+            retry_completion_evidence_after_cleanup(
+                || {
+                    retry_attempts.fetch_add(1, Ordering::SeqCst);
+                    Err("settings remain unwritable".into())
+                },
+                |_| {},
+                |_| std::future::pending::<()>(),
+                || {
+                    retry_events.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        retry.abort();
+        assert!(retry.await.unwrap_err().is_cancelled());
+        assert_eq!(ready_events.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3162,6 +3323,17 @@ fn connect_blocking_inner(
                     continue;
                 };
                 message = translated;
+            }
+            if message
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| method.starts_with("sail/"))
+            {
+                crate::diagnostics::record(
+                    "acp_reserved_method",
+                    json!({"agent":agent_id,"method":message.get("method")}),
+                );
+                continue;
             }
             if message.get("method").is_some() {
                 if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
@@ -4137,6 +4309,7 @@ pub async fn acp_prompt(
             status: "prepared".into(),
             error: None,
             updated_at: 0,
+            post_turn_pending: true,
         },
     ) {
         if let Ok(mut prompts) = runtime.prompt_state.lock() {
@@ -4195,6 +4368,7 @@ pub async fn acp_prompt(
                             status: "dispatch_uncertain".into(),
                             error: None,
                             updated_at: 0,
+                            post_turn_pending: false,
                         },
                     )
                     .map_err(|error| {
@@ -4217,6 +4391,7 @@ pub async fn acp_prompt(
                         status: "dispatched".into(),
                         error: None,
                         updated_at: 0,
+                        post_turn_pending: false,
                     },
                 ) {
                     Ok(()) => dispatched_phase.store(2, Ordering::Release),
@@ -4305,23 +4480,39 @@ pub async fn acp_prompt(
             result.is_err() && settlement_generation.is_none(),
             dispatch_phase.load(Ordering::Acquire),
         );
-        if let Err(error) = crate::settings::record_acp_turn_evidence(
-            &app,
-            crate::settings::AcpTurnEvidence {
-                agent: agent.clone(),
-                directory: directory.clone(),
-                session_id: session_id.clone(),
-                turn_id: turn_id.clone(),
-                status: evidence_status.into(),
-                error: result.as_ref().err().cloned(),
-                updated_at: 0,
-            },
-        ) {
+        let notify = !explicitly_cancelled && !interrupted;
+        let completion_evidence = crate::settings::AcpTurnEvidence {
+            agent: agent.clone(),
+            directory: directory.clone(),
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            status: evidence_status.into(),
+            error: result.as_ref().err().cloned(),
+            updated_at: 0,
+            post_turn_pending: evidence_status == "done" && notify,
+        };
+        let report_evidence_error = |error: &str| {
             crate::diagnostics::record(
                 "acp_turn_evidence_failed",
                 json!({"agent":agent,"sessionId":session_id,"turnId":turn_id,"error":error}),
             );
-        }
+        };
+        let completion_write_error = if completion_evidence.post_turn_pending {
+            retry_completed_turn_evidence(
+                || crate::settings::record_acp_turn_evidence(&app, completion_evidence.clone()),
+                |error| report_evidence_error(error),
+                std::thread::sleep,
+                4,
+            )
+            .err()
+        } else if let Err(error) =
+            crate::settings::record_acp_turn_evidence(&app, completion_evidence.clone())
+        {
+            report_evidence_error(&error);
+            None
+        } else {
+            None
+        };
         crate::diagnostics::record("prompt_finished", json!({
             "agent":agent,"sessionId":session_id,"turnId":turn_id,
             "status":status,"explicitlyCancelled":explicitly_cancelled,
@@ -4329,7 +4520,6 @@ pub async fn acp_prompt(
             "reportedErrorInterruption":reported_error_interruption,
             "stopReason":result.as_ref().ok().and_then(|value| value.get("stopReason")).and_then(Value::as_str)
         }));
-        let notify = !explicitly_cancelled && !interrupted;
         let stop_reason = result
             .as_ref()
             .ok()
@@ -4387,20 +4577,63 @@ pub async fn acp_prompt(
                 cleanup_session_processes(&app, &runtime, &agent, &session_id);
             },
         );
-        if latest {
-            let _ = app.emit(
-                "acp-event",
-                AgentEvent {
-                    agent,
-                    directory: directory.map(|path| path.to_string_lossy().into_owned()),
-                    worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
-                    message: json!({"method":"sail/prompt_finished","params":{
-                        "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
-                        "error":result.as_ref().err(),
-                        "sailCapabilityProfile":runtime.profile.as_str()
-                    }}),
-                },
-            );
+        let finished_event = AgentEvent {
+            agent: agent.clone(),
+            directory: directory.map(|path| path.to_string_lossy().into_owned()),
+            worktree: Some(runtime.worktree.to_string_lossy().into_owned()),
+            message: json!({"method":"sail/prompt_finished","params":{
+                "sessionId":session_id,"turnId":turn_id,"status":status,"notify":notify,
+                "error":result.as_ref().err(),
+                "sailCapabilityProfile":runtime.profile.as_str()
+            }}),
+        };
+        if let Some(write_error) = completion_write_error {
+            if latest {
+                let mut pending_event = finished_event.clone();
+                pending_event.message["params"]["notify"] = Value::Bool(false);
+                pending_event.message["params"]["evidenceError"] = Value::String(write_error);
+                let _ = app.emit("acp-event", pending_event);
+            }
+            let retry_app = app.clone();
+            let evidence_directory = completion_evidence.directory.clone();
+            // The retry belongs to the app, not the ACP connection: disconnecting the agent
+            // must not discard a completion whose check is still pending.
+            drop(tauri::async_runtime::spawn(async move {
+                retry_completion_evidence_after_cleanup(
+                    || {
+                        crate::settings::record_acp_turn_evidence(
+                            &retry_app,
+                            completion_evidence.clone(),
+                        )
+                    },
+                    |error| {
+                        crate::diagnostics::record(
+                            "acp_turn_evidence_failed",
+                            json!({"agent":agent,"sessionId":session_id,"turnId":turn_id,
+                                "error":error}),
+                        );
+                    },
+                    tokio::time::sleep,
+                    || {
+                        if latest {
+                            let _ = retry_app.emit(
+                                "acp-event",
+                                AgentEvent {
+                                    agent: finished_event.agent,
+                                    directory: Some(evidence_directory),
+                                    worktree: finished_event.worktree,
+                                    message: json!({"method":"sail/post_turn_evidence_ready","params":{
+                                        "sessionId":session_id,"turnId":turn_id
+                                    }}),
+                                },
+                            );
+                        }
+                    },
+                )
+                .await;
+            }));
+        } else if latest {
+            let _ = app.emit("acp-event", finished_event);
         }
         result
     })

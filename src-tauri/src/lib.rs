@@ -3133,6 +3133,8 @@ pub fn run() {
             settings::list_interrupted_agent_turns,
             settings::finish_interrupted_agent_turn,
             settings::get_acp_turn_evidence,
+            settings::list_pending_acp_post_turn_checks,
+            settings::finish_acp_post_turn_checks,
             memory::memory_project_key,
             memory::memory_status,
             memory::memory_list,

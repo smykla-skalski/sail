@@ -115,11 +115,13 @@ export interface AcpPromptOutcome {
 
 export interface AcpTurnEvidence {
   agent: AgentId;
+  directory: string;
   sessionId: string;
   turnId: string;
   status: 'prepared' | 'dispatch_uncertain' | 'dispatched' | 'done' | 'failed' | 'interrupted';
   error: string | null;
   updatedAt: number;
+  postTurnPending: boolean;
 }
 
 export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
@@ -1042,6 +1044,9 @@ export const acp = {
       sessionId,
       turnId,
     }),
+  pendingPostTurnChecks: () => invoke<AcpTurnEvidence[]>('list_pending_acp_post_turn_checks'),
+  finishPostTurnChecks: (agent: AgentId, directory: string, sessionId: string, turnId: string) =>
+    invoke<void>('finish_acp_post_turn_checks', { agent, directory, sessionId, turnId }),
   interruptedTurns: () => invoke<InterruptedAgentTurn[]>('list_interrupted_agent_turns'),
   finishInterruptedTurn: (turn: InterruptedAgentTurn) =>
     invoke<void>('finish_interrupted_agent_turn', {
