@@ -17,6 +17,10 @@ const REPOSITORY_FILE: &str = "sail-repository-generation-v1";
 const REPOSITORY_HEADER: &str = "sail-repository-generation-v1";
 const ACTIVE_PREFIX: &str = ".active-";
 const QUARANTINE_PREFIX: &str = ".reclaim-";
+const TEMP_ROOT: &str = "turn-temp";
+const TEMP_OWNER_FILE: &str = "sail-temp-owner-v1";
+const TEMP_OWNER_HEADER: &str = "sail-temp-owner-v1";
+const TEMP_PENDING_FILE: &str = "sail-temp-cleanup-pending-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorktreeIdentity {
@@ -40,17 +44,132 @@ pub(crate) struct WorktreeDataLease {
     started: AtomicBool,
     released: AtomicBool,
     _lease_lock: FileLock,
+    temp: TempLease,
+}
+
+struct TempLease {
+    directory: PathBuf,
+    released: AtomicBool,
+    started: AtomicBool,
+    _lock: FileLock,
+}
+
+impl TempLease {
+    fn verify_root(&self) -> Result<(), String> {
+        let root = self
+            .directory
+            .parent()
+            .ok_or("Private temporary root is missing.")?;
+        if fs::symlink_metadata(root)
+            .map_err(|error| error.to_string())?
+            .is_dir()
+            && fs::symlink_metadata(&self.directory)
+                .map_err(|error| error.to_string())?
+                .is_dir()
+        {
+            Ok(())
+        } else {
+            Err("Private temporary root is not a directory.".into())
+        }
+    }
+
+    fn mark_pending(&self, reason: &str) {
+        if self.verify_root().is_ok() {
+            if let Ok(mut file) = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.directory.join(TEMP_PENDING_FILE))
+            {
+                let _ = file.write_all(reason.as_bytes());
+            }
+        }
+        report_pending(&self.directory, reason);
+    }
+
+    fn release_clean(&self) -> Result<(), String> {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let removal = self
+            .verify_root()
+            .and_then(|_| fs::remove_dir_all(&self.directory).map_err(|error| error.to_string()));
+        let removal = removal.map_err(|error| {
+            self.mark_pending("turn-temp-removal-failed");
+            format!("Cannot remove private temporary data: {error}")
+        });
+        let unlock = self._lock.unlock();
+        removal.and(unlock)
+    }
+
+    fn clear_contents(&self) -> Result<(), String> {
+        let result = self.clear_contents_inner();
+        if result.is_err() {
+            self.mark_pending("turn-temp-removal-failed");
+        } else if let Err(error) = fs::remove_file(self.directory.join(TEMP_PENDING_FILE)) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                self.mark_pending("turn-temp-pending-marker-remove-failed");
+                return Err(error.to_string());
+            }
+        }
+        result
+    }
+
+    fn clear_contents_inner(&self) -> Result<(), String> {
+        self.verify_root()?;
+        for entry in fs::read_dir(&self.directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.file_name() == TEMP_OWNER_FILE || entry.file_name() == TEMP_PENDING_FILE {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            let result = if metadata.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            result.map_err(|error| {
+                format!(
+                    "Cannot remove private temporary data {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TempLease {
+    fn drop(&mut self) {
+        if !self.started.load(Ordering::Acquire) && !self.released.load(Ordering::Acquire) {
+            let _ = self.release_clean();
+        }
+    }
 }
 
 impl WorktreeDataLease {
     pub(crate) fn mark_started(&self) {
+        self.temp.started.store(true, Ordering::Release);
         self.started.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn temp_directory(&self) -> &Path {
+        &self.temp.directory
+    }
+
+    pub(crate) fn clear_turn_temp(&self) -> Result<(), String> {
+        self.temp.clear_contents()?;
+        fs::create_dir_all(self.temp.directory.join("go-tmp")).map_err(|error| {
+            self.temp.mark_pending("turn-temp-prepare-failed");
+            format!("Cannot prepare private Go temporary data: {error}")
+        })
     }
 
     pub(crate) fn release_clean(&self) -> Result<(), String> {
         if self.released.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        let temp_result = self.temp.release_clean();
         if let Err(error) = fs::remove_file(&self.active_marker) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 self.released.store(false, Ordering::Release);
@@ -65,7 +184,7 @@ impl WorktreeDataLease {
             report_pending(&self.directory, "active-lease-release-failed");
             return Err(error);
         }
-        Ok(())
+        temp_result
     }
 }
 
@@ -114,6 +233,7 @@ pub(crate) fn register(
 
     let lease_path = lock_path(cache_directory, "lease", &data_directory)?;
     let lease_lock = FileLock::acquire(&lease_path, false)?;
+    let temp = create_temp_lease(cache_directory, &data_directory)?;
     let active_marker = data_directory.join(format!("{ACTIVE_PREFIX}{}.v1", uuid::Uuid::new_v4()));
     let marker_contents = format!("sail-active-worktree-v1\n{}\n{}\n", std::process::id(), key);
     let mut marker = OpenOptions::new()
@@ -133,6 +253,7 @@ pub(crate) fn register(
         started: AtomicBool::new(false),
         released: AtomicBool::new(false),
         _lease_lock: lease_lock,
+        temp,
     });
     Ok((lease.directory.clone(), lease))
 }
@@ -147,6 +268,7 @@ fn register_plain_folder(
     fs::create_dir_all(&data_directory).map_err(|error| error.to_string())?;
     let lease_path = lock_path(cache_directory, "lease", &data_directory)?;
     let lease_lock = FileLock::acquire(&lease_path, false)?;
+    let temp = create_temp_lease(cache_directory, &data_directory)?;
     let active_marker = data_directory.join(format!("{ACTIVE_PREFIX}{}.v1", uuid::Uuid::new_v4()));
     let mut marker = OpenOptions::new()
         .write(true)
@@ -163,8 +285,57 @@ fn register_plain_folder(
         started: AtomicBool::new(false),
         released: AtomicBool::new(false),
         _lease_lock: lease_lock,
+        temp,
     });
     Ok((lease.directory.clone(), lease))
+}
+
+fn create_temp_lease(cache_directory: &Path, data_directory: &Path) -> Result<TempLease, String> {
+    let root = data_directory.join(TEMP_ROOT);
+    match fs::create_dir(&root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    if !fs::symlink_metadata(&root)
+        .map_err(|error| error.to_string())?
+        .is_dir()
+    {
+        return Err("Private temporary root is not a directory.".into());
+    }
+    let name = format!("run-{}", uuid::Uuid::new_v4());
+    let directory = root.join(&name);
+    let staging = root.join(format!(".{name}.tmp"));
+    let lock = FileLock::acquire(&lock_path(cache_directory, "temp", &directory)?, true)?;
+    fs::create_dir(&staging).map_err(|error| error.to_string())?;
+    let result = (|| {
+        let contents = format!(
+            "{TEMP_OWNER_HEADER}\n{}\n{}\n",
+            cache_key(data_directory)?,
+            std::process::id()
+        );
+        let mut owner = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(staging.join(TEMP_OWNER_FILE))
+            .map_err(|error| error.to_string())?;
+        owner
+            .write_all(contents.as_bytes())
+            .and_then(|_| owner.sync_all())
+            .map_err(|error| error.to_string())?;
+        drop(owner);
+        fs::rename(&staging, &directory).map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    Ok(TempLease {
+        directory,
+        released: AtomicBool::new(false),
+        started: AtomicBool::new(false),
+        _lock: lock,
+    })
 }
 
 fn identity_data_directory(
@@ -254,6 +425,9 @@ pub(crate) fn reconcile(cache_directory: &Path) {
         if expected_directory != data_directory {
             report_pending(&data_directory, "owner-cache-key-mismatch");
             continue;
+        }
+        for item in temp_directory_status(cache_directory, &data_directory, true) {
+            report_pending(&data_directory, &item.reason);
         }
         // An active sibling shares the repository lock but has a separate lease. Check
         // its lease first so skipping that sibling cannot hold the repository lock
@@ -385,6 +559,7 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
         };
         let name = entry.file_name().to_string_lossy().into_owned();
         let directory = entry.path();
+        pending.extend(temp_directory_status(cache_directory, &directory, false));
         let reason = if name.starts_with(QUARANTINE_PREFIX) {
             Some("cleanup-interrupted")
         } else if !valid_cache_key(&name) {
@@ -447,6 +622,147 @@ pub(crate) fn cleanup_status(cache_directory: &Path) -> Vec<CleanupPending> {
 pub(crate) fn retry_cleanup(cache_directory: &Path) -> Vec<CleanupPending> {
     reconcile(cache_directory);
     cleanup_status(cache_directory)
+}
+
+fn temp_directory_status(
+    cache_directory: &Path,
+    data_directory: &Path,
+    remove: bool,
+) -> Vec<CleanupPending> {
+    let mut pending = Vec::new();
+    let Ok(identity) = read_owner(data_directory) else {
+        return pending;
+    };
+    if identity_data_directory(cache_directory, &identity)
+        .ok()
+        .as_deref()
+        != Some(data_directory)
+    {
+        return pending;
+    }
+    let root = data_directory.join(TEMP_ROOT);
+    if let Ok(metadata) = fs::symlink_metadata(&root) {
+        if !metadata.is_dir() {
+            pending.push(CleanupPending {
+                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                reason: "turn-temp-root-unverifiable".into(),
+            });
+            return pending;
+        }
+    }
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return pending,
+        Err(_) => {
+            pending.push(CleanupPending {
+                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                reason: "turn-temp-scan-failed".into(),
+            });
+            return pending;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            pending.push(CleanupPending {
+                cache_key: cache_key(data_directory).unwrap_or_else(|_| "unknown".into()),
+                reason: "turn-temp-entry-unreadable".into(),
+            });
+            continue;
+        };
+        let directory = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let lock_directory = if name.starts_with("run-") {
+            directory.clone()
+        } else if name.starts_with(".run-") && name.ends_with(".tmp") {
+            root.join(&name[1..name.len() - 4])
+        } else {
+            continue;
+        };
+        let key = cache_key(&directory).unwrap_or_else(|_| "unknown".into());
+        let reason = match read_temp_owner(&directory, data_directory) {
+            Ok(pid) => {
+                let cleanup_failed = fs::symlink_metadata(directory.join(TEMP_PENDING_FILE))
+                    .is_ok_and(|metadata| metadata.is_file());
+                let lock_path = lock_path(cache_directory, "temp", &lock_directory);
+                match lock_path.and_then(|path| FileLock::try_acquire(&path, true)) {
+                    Ok(_lock) if pid != std::process::id() && process_alive(pid) => {
+                        Some("turn-temp-process-active")
+                    }
+                    Ok(_lock) if remove => match fs::remove_dir_all(&directory) {
+                        Ok(()) => None,
+                        Err(_) => Some("turn-temp-removal-failed"),
+                    },
+                    Ok(_lock) => Some("abandoned-turn-temp"),
+                    Err(_) if cleanup_failed => Some("turn-temp-cleanup-failed"),
+                    Err(_) => None,
+                }
+            }
+            Err(_) => Some("turn-temp-owner-unverifiable"),
+        };
+        if let Some(reason) = reason {
+            pending.push(CleanupPending {
+                cache_key: key,
+                reason: reason.into(),
+            });
+        }
+    }
+    pending
+}
+
+fn read_temp_owner(directory: &Path, data_directory: &Path) -> Result<u32, String> {
+    if !fs::symlink_metadata(directory)
+        .map_err(|error| error.to_string())?
+        .is_dir()
+    {
+        return Err("Temporary owner is not a directory.".into());
+    }
+    let path = directory.join(TEMP_OWNER_FILE);
+    if !fs::symlink_metadata(&path)
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("Temporary owner marker is not a regular file.".into());
+    }
+    let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let mut lines = contents.lines();
+    if lines.next() != Some(TEMP_OWNER_HEADER)
+        || lines.next() != Some(cache_key(data_directory)?.as_str())
+    {
+        return Err("Temporary owner marker does not match its worktree.".into());
+    }
+    let pid = lines
+        .next()
+        .ok_or("Temporary owner marker lacks a process ID.")?
+        .parse::<u32>()
+        .map_err(|error| error.to_string())?;
+    if pid == 0 || lines.next().is_some() {
+        return Err("Temporary owner marker is malformed.".into());
+    }
+    Ok(pid)
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::unistd::Pid;
+
+    matches!(
+        nix::sys::signal::kill(Pid::from_raw(pid as i32), None),
+        Ok(()) | Err(Errno::EPERM)
+    )
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    let system = sysinfo::System::new_all();
+    system.process(sysinfo::Pid::from_u32(pid)).is_some()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 pub(crate) fn data_directory_for_root(cache_directory: &Path, root: &Path) -> Option<PathBuf> {
@@ -1504,6 +1820,130 @@ mod tests {
 
         assert!(!directory.exists());
         assert!(pending.is_empty(), "remaining: {pending:?}");
+    }
+
+    #[test]
+    fn completed_turn_temp_is_reclaimed_without_touching_a_live_terminal() {
+        let fixture = GitFixture::new();
+        let (_, runtime) = register(&fixture.cache, &fixture.first).unwrap();
+        let (_, terminal) = register(&fixture.cache, &fixture.first).unwrap();
+        runtime.mark_started();
+        terminal.mark_started();
+        let earlier = runtime.temp_directory().join("earlier-turn");
+        let active = terminal.temp_directory().join("active-terminal");
+        fs::write(&earlier, "finished").unwrap();
+        fs::write(&active, "running").unwrap();
+
+        runtime.clear_turn_temp().unwrap();
+
+        assert!(!earlier.exists());
+        assert_eq!(fs::read_to_string(&active).unwrap(), "running");
+        assert!(runtime.temp_directory().join("go-tmp").is_dir());
+        runtime.temp.mark_pending("turn-temp-removal-failed");
+        assert!(cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "turn-temp-cleanup-failed"));
+        fs::write(runtime.temp_directory().join("next-turn"), "new").unwrap();
+        runtime.clear_turn_temp().unwrap();
+        assert!(!runtime.temp_directory().join("next-turn").exists());
+        assert!(!cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "turn-temp-cleanup-failed"));
+        terminal.release_clean().unwrap();
+        runtime.release_clean().unwrap();
+        assert!(!active.exists());
+    }
+
+    #[test]
+    fn abandoned_temp_is_reconciled_only_after_ownership_is_verified() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let abandoned = lease.temp_directory().to_path_buf();
+        fs::write(abandoned.join("artifact"), "old").unwrap();
+        lease.mark_started();
+        drop(lease);
+
+        assert!(cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "abandoned-turn-temp"));
+        retry_cleanup(&fixture.cache);
+        assert!(!abandoned.exists());
+        assert!(directory.exists());
+
+        let (_, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let unverified = lease.temp_directory().to_path_buf();
+        fs::write(unverified.join("artifact"), "retain").unwrap();
+        fs::write(unverified.join(TEMP_OWNER_FILE), "invalid").unwrap();
+        lease.mark_started();
+        drop(lease);
+
+        retry_cleanup(&fixture.cache);
+        assert_eq!(
+            fs::read_to_string(unverified.join("artifact")).unwrap(),
+            "retain"
+        );
+        assert!(cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "turn-temp-owner-unverifiable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_temp_waits_for_its_owner_process_to_exit() {
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        let temp = lease.temp_directory().to_path_buf();
+        let mut owner = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        fs::write(
+            temp.join(TEMP_OWNER_FILE),
+            format!(
+                "{TEMP_OWNER_HEADER}\n{}\n{}\n",
+                cache_key(&directory).unwrap(),
+                owner.id()
+            ),
+        )
+        .unwrap();
+        lease.mark_started();
+        drop(lease);
+
+        retry_cleanup(&fixture.cache);
+        assert!(temp.exists());
+        assert!(cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "turn-temp-process-active"));
+
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        retry_cleanup(&fixture.cache);
+        assert!(!temp.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_temp_root_is_not_used_or_reclaimed() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = GitFixture::new();
+        let (directory, lease) = register(&fixture.cache, &fixture.first).unwrap();
+        lease.release_clean().unwrap();
+        let outside = fixture.root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "retain").unwrap();
+        fs::remove_dir(directory.join(TEMP_ROOT)).unwrap();
+        symlink(&outside, directory.join(TEMP_ROOT)).unwrap();
+
+        assert!(register(&fixture.cache, &fixture.first).is_err());
+        retry_cleanup(&fixture.cache);
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "retain"
+        );
+        assert!(cleanup_status(&fixture.cache)
+            .iter()
+            .any(|item| item.reason == "turn-temp-root-unverifiable"));
     }
 
     #[cfg(windows)]

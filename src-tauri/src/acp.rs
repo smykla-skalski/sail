@@ -412,6 +412,7 @@ struct Connection {
     elicitation_state: Mutex<HashMap<String, PendingElicitation>>,
     next_permission_generation: AtomicU64,
     prompt_state: Mutex<PromptState>,
+    temp_cleanup_gate: Mutex<()>,
     prompt_dispatch: Mutex<()>,
     cancelled_prompts: Mutex<HashSet<String>>,
     next_id: AtomicU64,
@@ -1206,7 +1207,41 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    fn clear_idle_temp(&self) -> Result<(), String> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _temp_gate = self
+            .temp_cleanup_gate
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let idle = self
+            .prompt_state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .active
+            .is_empty();
+        let subagents_idle = self
+            .native_subagents
+            .lock()
+            .map_err(|error| error.to_string())?
+            .active_in(&self.worktree)
+            .is_empty();
+        let process_idle =
+            !runtime_has_live_children(self.child.lock().map_err(|error| error.to_string())?.id());
+        if idle && subagents_idle && process_idle {
+            if let Some(lease) = &self._storage_lease {
+                lease.clear_turn_temp()?;
+            }
+        }
+        Ok(())
+    }
+
     fn stop_child(&self) -> Result<(), String> {
+        let _temp_gate = self
+            .temp_cleanup_gate
+            .lock()
+            .map_err(|error| error.to_string())?;
         if let Ok(mut child) = self.child.lock() {
             if self.stopped.swap(true, Ordering::AcqRel) {
                 return self
@@ -1458,8 +1493,11 @@ fn session_directory(runtime: &Connection, session_id: &str) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
-fn runtime_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
-    let mut environment = crate::acp_terminal::terminal_environment(data_directory);
+fn runtime_environment(
+    data_directory: &Path,
+    temp_directory: &Path,
+) -> Vec<(&'static str, PathBuf)> {
+    let mut environment = crate::acp_terminal::terminal_environment(data_directory, temp_directory);
     let shared_download_cache = data_directory
         .parent()
         .and_then(Path::parent)
@@ -1469,7 +1507,7 @@ fn runtime_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
     environment.extend([
         ("CARGO_TARGET_DIR", build_directory.join("cargo-target")),
         ("GOCACHE", build_directory.join("go-cache")),
-        ("GOTMPDIR", build_directory.join("go-tmp")),
+        ("GOTMPDIR", temp_directory.join("go-tmp")),
         ("NPM_CONFIG_CACHE", shared_download_cache.join("npm")),
         ("YARN_CACHE_FOLDER", shared_download_cache.join("yarn")),
         ("COREPACK_HOME", shared_download_cache.join("corepack")),
@@ -1477,12 +1515,12 @@ fn runtime_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
     environment
 }
 
-fn prepare_runtime_directories(data_directory: &Path) -> Result<(), String> {
+fn prepare_runtime_directories(data_directory: &Path, temp_directory: &Path) -> Result<(), String> {
     for directory in [
-        data_directory.join("tmp"),
+        temp_directory.to_path_buf(),
         data_directory.join("cache"),
         data_directory.join("build"),
-        data_directory.join("build/go-tmp"),
+        temp_directory.join("go-tmp"),
     ] {
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     }
@@ -1515,6 +1553,23 @@ pub struct AgentManager(
 );
 
 impl AgentManager {
+    pub fn retry_turn_temp_cleanup(&self) {
+        let connections = self
+            .0
+            .lock()
+            .ok()
+            .map(|agents| agents.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for connection in connections {
+            if let Err(error) = connection.clear_idle_temp() {
+                crate::diagnostics::record(
+                    "turn_temp_cleanup_failed",
+                    json!({"agent":connection.agent,"error":error}),
+                );
+            }
+        }
+    }
+
     fn forget_generation(
         &self,
         agent: &str,
@@ -3778,8 +3833,8 @@ fn connect_blocking_inner(
         .map_err(|error| error.to_string())?;
     let (data_directory, storage_lease) =
         crate::register_worktree_storage(&cache_directory, worktree)?;
-    prepare_runtime_directories(&data_directory)?;
-    for (name, value) in runtime_environment(&data_directory) {
+    prepare_runtime_directories(&data_directory, storage_lease.temp_directory())?;
+    for (name, value) in runtime_environment(&data_directory, storage_lease.temp_directory()) {
         command.env(name, value);
     }
     command.current_dir(worktree);
@@ -3852,6 +3907,7 @@ fn connect_blocking_inner(
         elicitation_state: Mutex::new(HashMap::new()),
         next_permission_generation: AtomicU64::new(1),
         prompt_state: Mutex::new(PromptState::default()),
+        temp_cleanup_gate: Mutex::new(()),
         prompt_dispatch: Mutex::new(()),
         cancelled_prompts: Mutex::new(HashSet::new()),
         next_id: AtomicU64::new(1),
@@ -4213,8 +4269,15 @@ fn connect_blocking_inner(
             "agent_disconnected",
             json!({"agent":agent_id,"profile":profile.as_str(),"sessionIds":session_ids}),
         );
-        app.state::<crate::acp_terminal::AcpTerminalManager>()
-            .stop_sessions(&agent_id, profile, &reader.worktree, &session_ids);
+        if let Err(error) = app
+            .state::<crate::acp_terminal::AcpTerminalManager>()
+            .stop_sessions(&agent_id, profile, &reader.worktree, &session_ids)
+        {
+            crate::diagnostics::record(
+                "owned_process_cleanup_failed",
+                json!({"agent":agent_id,"error":error}),
+            );
+        }
         reader.ready.notify_all();
         if let Ok(mut state) = reader.permission_state.lock() {
             state.pending.clear();
@@ -5137,6 +5200,10 @@ pub async fn acp_prompt(
             .lock()
             .map_err(|error| error.to_string())?;
         let _claims = preflight_runtime.wait_for_restore(claims, &preflight_session)?;
+        let _temp_gate = preflight_runtime
+            .temp_cleanup_gate
+            .lock()
+            .map_err(|error| error.to_string())?;
         let mut prompts = preflight_runtime
             .prompt_state
             .lock()
@@ -5440,6 +5507,7 @@ pub async fn acp_prompt(
             cancelled.remove(&turn_id);
         }
         crate::memory_capture::store_completed(&app, candidates);
+        let mut process_cleanup_succeeded = false;
         let latest = finish_prompt_after_cleanup(
             &runtime.prompt_state,
             &session_id,
@@ -5462,9 +5530,18 @@ pub async fn acp_prompt(
                     );
                     }
                 }
-                cleanup_session_processes(&app, &runtime, &agent, &session_id);
+                process_cleanup_succeeded =
+                    cleanup_session_processes(&app, &runtime, &agent, &session_id);
             },
         );
+        if latest && process_cleanup_succeeded {
+            if let Err(error) = runtime.clear_idle_temp() {
+                crate::diagnostics::record(
+                    "turn_temp_cleanup_failed",
+                    json!({"agent":agent,"turnId":turn_id,"error":error}),
+                );
+            }
+        }
         let finished_event = AgentEvent {
             agent: agent.clone(),
             directory: directory.map(|path| path.to_string_lossy().into_owned()),
@@ -5587,6 +5664,21 @@ pub async fn acp_steer(
     .map_err(|error| error.to_string())?
 }
 
+fn runtime_has_live_children(root: u32) -> bool {
+    let system = sysinfo::System::new_all();
+    let root = sysinfo::Pid::from_u32(root);
+    system.processes().values().any(|process| {
+        let mut parent = process.parent();
+        while let Some(pid) = parent {
+            if pid == root {
+                return true;
+            }
+            parent = system.process(pid).and_then(sysinfo::Process::parent);
+        }
+        false
+    })
+}
+
 fn finish_prompt_after_cleanup(
     state: &Mutex<PromptState>,
     session_id: &str,
@@ -5672,7 +5764,13 @@ pub fn with_active_owned_terminal<T>(
     with_active_terminal_prompt(&runtime, session_id, action)
 }
 
-fn cleanup_session_processes(app: &AppHandle, runtime: &Connection, agent: &str, session_id: &str) {
+fn cleanup_session_processes(
+    app: &AppHandle,
+    runtime: &Connection,
+    agent: &str,
+    session_id: &str,
+) -> bool {
+    let mut clean = true;
     let directory = runtime
         .session_directories
         .lock()
@@ -5681,6 +5779,7 @@ fn cleanup_session_processes(app: &AppHandle, runtime: &Connection, agent: &str,
     if let Some(directory) = directory {
         let owner = format!("{}\0acp:{}:{}", directory.display(), agent, session_id);
         if let Err(error) = crate::owned_processes::stop_run(&owner) {
+            clean = false;
             crate::diagnostics::record(
                 "owned_process_cleanup_failed",
                 json!({
@@ -5692,19 +5791,29 @@ fn cleanup_session_processes(app: &AppHandle, runtime: &Connection, agent: &str,
             .state::<crate::terminal::TerminalManager>()
             .stop_owner(&owner)
         {
+            clean = false;
             crate::diagnostics::record(
                 "owned_process_cleanup_failed",
                 json!({"run":owner,"error":error}),
             );
         }
     }
-    app.state::<crate::acp_terminal::AcpTerminalManager>()
+    if let Err(error) = app
+        .state::<crate::acp_terminal::AcpTerminalManager>()
         .stop_sessions(
             agent,
             runtime.profile,
             &runtime.worktree,
             &[session_id.to_string()],
+        )
+    {
+        clean = false;
+        crate::diagnostics::record(
+            "owned_process_cleanup_failed",
+            json!({"agent":agent,"sessionId":session_id,"error":error}),
         );
+    }
+    clean
 }
 
 #[tauri::command]
@@ -5786,7 +5895,7 @@ fn cancel_session(
         return result;
     }
     if cleanup_current {
-        cleanup_session_processes(app, runtime, &agent, &session_id);
+        let _ = cleanup_session_processes(app, runtime, &agent, &session_id);
     }
     resolve_session_permissions(
         &mut permission_state.pending,
@@ -6007,6 +6116,7 @@ mod session_config_tests {
             )])),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
+            temp_cleanup_gate: Mutex::new(()),
             prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),
@@ -6181,10 +6291,12 @@ mod session_config_tests {
         let cache = scratch.join("app-cache");
         let first_data = crate::acp_terminal::worktree_data_directory(&cache, &first);
         let second_data = crate::acp_terminal::worktree_data_directory(&cache, &second);
-        prepare_runtime_directories(&first_data).unwrap();
-        prepare_runtime_directories(&second_data).unwrap();
-        let first_environment = runtime_environment(&first_data);
-        let second_environment = runtime_environment(&second_data);
+        let first_temp = first_data.join("turn-temp/run-one");
+        let second_temp = second_data.join("turn-temp/run-two");
+        prepare_runtime_directories(&first_data, &first_temp).unwrap();
+        prepare_runtime_directories(&second_data, &second_temp).unwrap();
+        let first_environment = runtime_environment(&first_data, &first_temp);
+        let second_environment = runtime_environment(&second_data, &second_temp);
         let path = |environment: &[(&str, PathBuf)], name| {
             environment
                 .iter()
@@ -6206,12 +6318,12 @@ mod session_config_tests {
             );
         }
         for directory in [
-            first_data.join("tmp"),
+            first_temp.clone(),
             first_data.join("cache"),
-            first_data.join("build/go-tmp"),
-            second_data.join("tmp"),
+            first_temp.join("go-tmp"),
+            second_temp.clone(),
             second_data.join("cache"),
-            second_data.join("build/go-tmp"),
+            second_temp.join("go-tmp"),
         ] {
             assert!(
                 directory.is_dir(),
@@ -6352,6 +6464,7 @@ mod session_config_tests {
                 elicitation_state: Mutex::new(HashMap::new()),
                 next_permission_generation: AtomicU64::new(1),
                 prompt_state: Mutex::new(PromptState::default()),
+                temp_cleanup_gate: Mutex::new(()),
                 prompt_dispatch: Mutex::new(()),
                 cancelled_prompts: Mutex::new(HashSet::new()),
                 next_id: AtomicU64::new(1),
@@ -6835,6 +6948,7 @@ mod native_subagent_fence_tests {
             elicitation_state: Mutex::new(HashMap::new()),
             next_permission_generation: AtomicU64::new(1),
             prompt_state: Mutex::new(PromptState::default()),
+            temp_cleanup_gate: Mutex::new(()),
             prompt_dispatch: Mutex::new(()),
             cancelled_prompts: Mutex::new(HashSet::new()),
             next_id: AtomicU64::new(1),

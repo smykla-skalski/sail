@@ -93,10 +93,10 @@ impl TerminalSession {
                 .exit_code
                 .is_some()
             {
+                ownership_stop?;
                 if let Some(lease) = &self._storage_lease {
                     lease.release_clean()?;
                 }
-                ownership_stop?;
                 return Ok(());
             }
             kill_terminal_process_groups(
@@ -108,10 +108,10 @@ impl TerminalSession {
         {
             self.job.stop()?;
         }
+        ownership_stop?;
         if let Some(lease) = &self._storage_lease {
             lease.release_clean()?;
         }
-        ownership_stop?;
         Ok(())
     }
 }
@@ -1188,11 +1188,13 @@ fn spawn(
             .map_err(|error| error.to_string())?;
         let (data_directory, lease) =
             crate::register_worktree_storage(&cache_directory, &worktree)?;
-        storage_lease = Some(lease);
-        for (key, value) in crate::acp_terminal::terminal_environment(&data_directory) {
+        for (key, value) in
+            crate::acp_terminal::terminal_environment(&data_directory, lease.temp_directory())
+        {
             std::fs::create_dir_all(&value).map_err(|error| error.to_string())?;
             command.env(key, value);
         }
+        storage_lease = Some(lease);
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");

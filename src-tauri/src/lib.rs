@@ -3347,6 +3347,7 @@ fn worktree_storage_cleanup_status(
 fn retry_worktree_storage_cleanup(
     app: tauri::AppHandle,
 ) -> Result<Vec<worktree_storage::CleanupPending>, String> {
+    app.state::<acp::AgentManager>().retry_turn_temp_cleanup();
     let cache = app
         .path()
         .app_cache_dir()

@@ -95,16 +95,19 @@ pub(crate) fn worktree_contains(root: &Path, candidate: &Path) -> bool {
     candidate == root || candidate.starts_with(&root)
 }
 
-pub(crate) fn terminal_environment(data_directory: &Path) -> Vec<(&'static str, PathBuf)> {
+pub(crate) fn terminal_environment(
+    data_directory: &Path,
+    temp_directory: &Path,
+) -> Vec<(&'static str, PathBuf)> {
     let shared_download_cache = data_directory
         .parent()
         .and_then(Path::parent)
         .unwrap_or(data_directory)
         .join("terminal-package-downloads");
     vec![
-        ("TMPDIR", data_directory.join("tmp")),
-        ("TEMP", data_directory.join("tmp")),
-        ("TMP", data_directory.join("tmp")),
+        ("TMPDIR", temp_directory.to_path_buf()),
+        ("TEMP", temp_directory.to_path_buf()),
+        ("TMP", temp_directory.to_path_buf()),
         ("XDG_CACHE_HOME", data_directory.join("cache")),
         ("PIP_CACHE_DIR", shared_download_cache.join("pip")),
         ("UV_CACHE_DIR", shared_download_cache.join("uv")),
@@ -321,7 +324,7 @@ impl AcpTerminalManager {
         profile: CapabilityProfile,
         worktree: &Path,
         session_ids: &[String],
-    ) {
+    ) -> Result<(), String> {
         let scope = TerminalConnectionScope {
             agent,
             profile,
@@ -331,7 +334,7 @@ impl AcpTerminalManager {
         let terminals = self
             .active
             .lock()
-            .ok()
+            .map_err(|error| error.to_string())
             .map(|active| {
                 active
                     .iter()
@@ -346,11 +349,11 @@ impl AcpTerminalManager {
                     })
                     .map(|(id, terminal)| (id.clone(), Arc::clone(terminal)))
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            })?;
         for (id, terminal) in terminals {
-            let _ = self.archive(id, &terminal);
+            self.archive(id, &terminal)?;
         }
+        Ok(())
     }
 
     pub fn stop_worktree(&self, worktree: &Path) -> Result<(), String> {
@@ -814,9 +817,9 @@ pub fn handle(
                     .map_err(|error| error.to_string())?,
                 worktree,
             )?;
-            let temp_directory = data_directory.join("tmp");
+            let temp_directory = storage_lease.temp_directory();
             let cache_directory = data_directory.join("cache");
-            std::fs::create_dir_all(&temp_directory).map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(temp_directory).map_err(|error| error.to_string())?;
             std::fs::create_dir_all(&cache_directory).map_err(|error| error.to_string())?;
             let background = crate::background_priority::enabled(app);
             #[cfg(unix)]
@@ -844,7 +847,7 @@ pub fn handle(
             for variable in params.env {
                 command.env(variable.name, variable.value);
             }
-            for (name, value) in terminal_environment(&data_directory) {
+            for (name, value) in terminal_environment(&data_directory, temp_directory) {
                 command.env(name, value);
             }
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -1765,9 +1768,10 @@ mod tests {
     #[test]
     fn terminal_environment_keeps_package_download_caches_shared() {
         let root = Path::new("/sail-cache/terminal-worktrees/worktree");
-        let environment = terminal_environment(root);
+        let temp = root.join("turn-temp/run-1");
+        let environment = terminal_environment(root, &temp);
 
-        assert!(environment.contains(&("TMPDIR", root.join("tmp"))));
+        assert!(environment.contains(&("TMPDIR", temp)));
         assert!(environment.contains(&("XDG_CACHE_HOME", root.join("cache"))));
         let shared = Path::new("/sail-cache/terminal-package-downloads");
         assert!(environment.contains(&("PIP_CACHE_DIR", shared.join("pip"))));
