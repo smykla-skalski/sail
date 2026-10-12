@@ -2,7 +2,20 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ResourceQueue } from '../src/lib/resource-queue.ts';
 import { isSetting } from '../src/lib/settings.ts';
-import { acp } from '../src/lib/acp.ts';
+import {
+  acp,
+  rememberSessionState,
+  sessionState,
+  trackLiveTranscript,
+  tracksLiveTranscript,
+} from '../src/lib/acp.ts';
+import { acpPlans } from '../src/lib/acp-plans.ts';
+import {
+  loadNativePlan,
+  loadStructuredQuestions,
+  saveNativePlan,
+  saveStructuredQuestions,
+} from '../src/lib/planning-state.ts';
 import { pressureReasonsForResults, resourceQueues } from '../src/lib/resource-limits.ts';
 import {
   defaultPressureThresholds,
@@ -237,6 +250,7 @@ void test('closed pane turns run when retained and cancel before deletion', asyn
   const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
   const settings = new Map<string, string>();
   const invokes: { command: string; waiting: number }[] = [];
+  let forgetGate: Promise<void> | undefined;
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
     value: {
@@ -244,6 +258,7 @@ void test('closed pane turns run when retained and cancel before deletion', asyn
         invoke: async (command: string) => {
           if (command === 'machine_pressure') return healthy;
           invokes.push({ command, waiting: resourceQueues.agent.status.waiting });
+          if (command === 'acp_forget_session') await forgetGate;
           return undefined;
         },
       },
@@ -304,6 +319,69 @@ void test('closed pane turns run when retained and cancel before deletion', asyn
     } finally {
       release();
     }
+
+    const scope = { agent: 'codex' as const, directory: '/repo', sessionId: 'saved-state-thread' };
+    const nativePlan = {
+      provider: 'codex' as const,
+      markdown: 'Keep the plan',
+      updated: 1,
+      tasks: [{ title: 'One step', status: 'pending' }],
+    };
+    const questions = [
+      { id: 'question-1', sessionId: scope.sessionId, message: 'Keep the question?', schema: {} },
+    ];
+    rememberSessionState(scope.agent, scope.directory, scope.sessionId, { configOptions: [] });
+    trackLiveTranscript(scope.agent, scope.directory, scope.sessionId, [], true);
+    saveNativePlan(scope, nativePlan);
+    saveStructuredQuestions(scope, questions);
+    const plans = acpPlans();
+    assert.match(
+      plans.runTool(scope, 'sail_plan_propose', {
+        title: 'Keep history',
+        summary: 'A saved plan.',
+        sequence: ['User->>Agent: plan', 'Agent-->>User: review'],
+        overview: ['Agent[agent] --> Plan[plan]'],
+        steps: [{ id: 'step-1', title: 'Work', detail: 'Do the work.', files: ['file.ts'] }],
+      }),
+      /Plan v1/,
+    );
+    plans.runTool(scope, 'sail_plan_ask', {
+      questions: [{ id: 'question-2', question: 'Proceed?', kind: 'confirm' }],
+    });
+    const savedPlan = plans.snapshot(scope);
+    const savedHistory = plans.history(scope);
+    assert.equal(savedHistory.length, 1);
+
+    let rejectForget: ((error: Error) => void) | undefined;
+    forgetGate = new Promise<void>((_resolve, reject) => {
+      rejectForget = reject;
+    });
+    const failedForget = acp.forget(scope.agent, scope.directory, scope.sessionId);
+    assert.equal(
+      sessionState(scope.agent, scope.directory, scope.sessionId)?.configOptions?.length,
+      0,
+    );
+    assert.equal(tracksLiveTranscript(scope.agent, scope.directory, scope.sessionId), true);
+    assert.deepEqual(loadNativePlan(scope), nativePlan);
+    assert.deepEqual(loadStructuredQuestions(scope), questions);
+    assert.deepEqual(plans.snapshot(scope), savedPlan);
+    assert.deepEqual(plans.history(scope), savedHistory);
+    rejectForget!(new Error('cancel timed out'));
+    await assert.rejects(failedForget, /cancel timed out/);
+    assert.equal(tracksLiveTranscript(scope.agent, scope.directory, scope.sessionId), true);
+    assert.deepEqual(loadNativePlan(scope), nativePlan);
+    assert.deepEqual(loadStructuredQuestions(scope), questions);
+    assert.deepEqual(plans.snapshot(scope), savedPlan);
+    assert.deepEqual(plans.history(scope), savedHistory);
+
+    forgetGate = undefined;
+    await acp.forget(scope.agent, scope.directory, scope.sessionId);
+    assert.equal(sessionState(scope.agent, scope.directory, scope.sessionId), undefined);
+    assert.equal(tracksLiveTranscript(scope.agent, scope.directory, scope.sessionId), false);
+    assert.equal(loadNativePlan(scope), null);
+    assert.deepEqual(loadStructuredQuestions(scope), []);
+    assert.deepEqual(plans.snapshot(scope), { plan: null, questions: null });
+    assert.deepEqual(plans.history(scope), []);
   } finally {
     resourceQueues.agent.setLimit(4);
     if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);

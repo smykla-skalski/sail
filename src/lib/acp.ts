@@ -964,12 +964,12 @@ export const acp = {
     restoreSession('acp_load_session', agent, cwd, sessionId, profile),
   resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
     restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
-  forget: (agent: AgentId, directory: string, sessionId: string) => {
+  forget: async (agent: AgentId, directory: string, sessionId: string) => {
     cancelSessionQueues(agent, directory, sessionId);
+    await invoke<void>('acp_forget_session', { agent, directory, sessionId });
     forgetSessionState(agent, directory, sessionId);
     forgetPlanningState({ agent, directory, sessionId });
     acpPlans().forget({ agent, directory, sessionId });
-    return invoke<void>('acp_forget_session', { agent, directory, sessionId });
   },
   prompt: (
     agent: AgentId,
