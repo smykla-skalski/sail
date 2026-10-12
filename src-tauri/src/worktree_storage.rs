@@ -2348,6 +2348,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn assert_verified_temp_reclaimed(cache: &Path, temp: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -2810,13 +2811,17 @@ mod tests {
         let fixture = GitFixture::new();
         let plain = fixture.root.join("plain-folder");
         fs::create_dir(&plain).unwrap();
-        let directory = legacy_data_directory(&fixture.cache, &plain).unwrap();
+        let canonical_plain = stable_worktree_identity(&plain);
+        let directory = legacy_data_directory(&fixture.cache, &canonical_plain).unwrap();
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join(PLAIN_OWNER_FILE), "").unwrap();
 
         let (_, lease) = register(&fixture.cache, &plain).unwrap();
 
-        assert_eq!(read_plain_owner(&fixture.cache, &directory).unwrap(), plain);
+        assert_eq!(
+            read_plain_owner(&fixture.cache, &directory).unwrap(),
+            canonical_plain
+        );
         lease.release_clean().unwrap();
     }
 
