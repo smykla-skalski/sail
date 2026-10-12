@@ -69,7 +69,7 @@ describe('close worktree shortcut', () => {
 
   async function select(directory: string, waitForInventory = true) {
     await browser.execute(
-      (repo, selected, firstPath, secondPath) => {
+      (repo, selected, firstPath, secondPath, firstPresent, secondPresent) => {
         sessionStorage.removeItem('sai-e2e-delete-worktree');
         localStorage.setItem('sai-directory', selected);
         localStorage.setItem(`sai-main-pane-empty:${selected}`, 'true');
@@ -80,8 +80,8 @@ describe('close worktree shortcut', () => {
             groups: [],
             worktrees: {
               [repo]: [
-                { path: firstPath, branch: 'first' },
-                { path: secondPath, branch: 'second' },
+                ...(firstPresent ? [{ path: firstPath, branch: 'first' }] : []),
+                ...(secondPresent ? [{ path: secondPath, branch: 'second' }] : []),
               ],
             },
           }),
@@ -91,6 +91,8 @@ describe('close worktree shortcut', () => {
       directory,
       first,
       second,
+      existsSync(first),
+      existsSync(second),
     );
     await browser.refresh();
     await diagnose('Workspace load', () => expect(topbarMenuTrigger('New agent')).toBeDisplayed());
@@ -240,6 +242,70 @@ describe('close worktree shortcut', () => {
       await browser.execute((path) => localStorage.getItem(`sai-main-pane-empty:${path}`), second),
     ).toBeNull();
     await expect($('dialog[open]')).not.toExist();
+  });
+
+  it('reconciles a completed cleanup after restart but keeps a leftover path pending', async () => {
+    const completed = join(worktrees, 'completed-after-crash');
+    const leftover = join(completed, 'leftover.txt');
+    git('worktree', 'add', '-q', '-b', 'completed-after-crash', completed);
+    await select(first, false);
+    const registered = await browser.tauri.execute(
+      async ({ core }, repo) =>
+        core.invoke<{ path: string; generation: string | null }[]>('repository_worktrees', {
+          repository: repo,
+        }),
+      repository,
+    );
+    const generation = registered.find((worktree) => worktree.path === completed)?.generation;
+    if (!generation) throw new Error('Missing generation for completed cleanup fixture');
+    await browser.execute(
+      (repo, root, child, childGeneration) => {
+        localStorage.setItem(
+          'sai-project-catalog',
+          JSON.stringify({
+            repositories: [repo],
+            groups: [],
+            worktrees: {
+              [repo]: [
+                { path: root, branch: 'first' },
+                {
+                  path: child,
+                  branch: 'completed-after-crash',
+                  generation: childGeneration,
+                  pendingCleanup: {
+                    originalPath: child,
+                    recoveryPath: child,
+                    sizeBytes: 8,
+                    reason: 'Cleanup was interrupted.',
+                  },
+                },
+              ],
+            },
+          }),
+        );
+      },
+      repository,
+      first,
+      completed,
+      generation,
+    );
+    git('worktree', 'remove', completed);
+    mkdirSync(completed);
+    writeFileSync(leftover, 'keep');
+    await browser.refresh();
+    await expect($(`[data-pending-worktree="${completed}"]`)).toBeDisplayed();
+    await $(`[data-pending-worktree="${completed}"]`).$('button=Recheck worktree').click();
+    await browser.waitUntil(async () =>
+      (await pendingCleanup(completed))?.reason.includes(
+        'a saved checkout or storage path still exists',
+      ),
+    );
+    expect(existsSync(leftover)).toBe(true);
+
+    rmSync(completed, { recursive: true });
+    await $(`[data-pending-worktree="${completed}"]`).$('button=Recheck worktree').click();
+    await browser.waitUntil(async () => !(await catalogPaths()).includes(completed));
+    expect(await catalogPaths()).toEqual([first]);
   });
 
   it('preserves a detached descendant changed after preview', async () => {

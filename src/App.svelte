@@ -8726,6 +8726,10 @@
   }
 
   function removeProjectRepository(path: string) {
+    if ((projectCatalog.worktrees[path] ?? []).some((worktree) => worktree.pendingCleanup)) {
+      error = 'Finish pending worktree cleanup before removing this repository from the sidebar.';
+      return;
+    }
     if (
       path !== directory &&
       !(projectCatalog.worktrees[path] ?? []).some((worktree) => worktree.path === directory)
@@ -9133,10 +9137,10 @@
             );
             const keys = new Set(pending.storagePaths.map((path) => path.split(/[/\\]/).at(-1)));
             const retained = statuses.filter((status) => keys.has(status.cacheKey));
-            reason = retained.length
-              ? `Git checkout was removed; private storage remains pending: ${retained.map((status) => `${status.cacheKey}: ${status.reason}`).join(', ')}.`
-              : `Git checkout was removed; verify whether private storage remains at ${pending.storagePaths.join(', ')}.`;
-            return { entry, pending, sizeBytes, reason };
+            if (retained.length) {
+              reason = `Git checkout was removed; private storage remains pending: ${retained.map((status) => `${status.cacheKey}: ${status.reason}`).join(', ')}.`;
+              return { entry, pending, sizeBytes, reason, completed: false };
+            }
           }
           const live = current.get(entry.path);
           const recovered =
@@ -9154,9 +9158,20 @@
               pending: { ...pending, recoveryPath },
               sizeBytes,
               reason: `The interrupted cleanup left the same Git generation registered at ${recoveryPath}. Review this recovery checkout before retrying.`,
+              completed: false,
             };
           }
           if ((!live || live.generation !== entry.generation) && entry.generation) {
+            const moved = registered.find((item) => item.generation === entry.generation);
+            if (moved) {
+              return {
+                entry,
+                pending,
+                sizeBytes,
+                reason: `The same Git generation is registered at ${moved.path}. Its files were kept; inspect the moved checkout.`,
+                completed: false,
+              };
+            }
             try {
               const storage = await invoke<
                 { cacheKey: string; path: string; sizeBytes: number | null }[]
@@ -9177,11 +9192,23 @@
                     ? storage.reduce((total, item) => total + item.sizeBytes!, 0)
                     : null,
                   reason: `The Git checkout was removed; selected private storage remains at ${storage.map((item) => item.path).join(', ')}. Confirm it is unused before retrying.`,
+                  completed: false,
                 };
               }
+              const paths = [
+                pending.originalPath,
+                pending.recoveryPath,
+                ...(pending.storagePaths ?? []),
+              ];
+              const absent = await invoke<boolean>('pending_cleanup_paths_absent', { paths });
+              if (absent) {
+                return { entry, pending, sizeBytes: null, reason: '', completed: true };
+              }
+              reason = `The Git generation is unregistered, but a saved checkout or storage path still exists. Inspect ${paths.join(', ')} before clearing this pending entry.`;
+              return { entry, pending, sizeBytes: null, reason, completed: false };
             } catch (cause) {
               reason = `Could not verify retained private storage: ${describe(cause)}`;
-              return { entry, pending, sizeBytes, reason };
+              return { entry, pending, sizeBytes, reason, completed: false };
             }
           }
           if (!live || !entry.generation || live.generation !== entry.generation) {
@@ -9209,11 +9236,22 @@
               reason = `Could not verify checkout: ${describe(cause)}`;
             }
           }
-          return { entry, pending, sizeBytes, reason };
+          return { entry, pending, sizeBytes, reason, completed: false };
         }),
       );
       let catalog = projectCatalog;
-      for (const { entry, pending, sizeBytes, reason } of updates) {
+      for (const { entry, pending, sizeBytes, reason, completed } of updates) {
+        const currentEntry = catalog.worktrees[repository]?.find(
+          (worktree) =>
+            worktree.path === entry.path &&
+            worktree.generation === entry.generation &&
+            worktree.pendingCleanup,
+        );
+        if (!currentEntry) continue;
+        if (completed) {
+          catalog = removeWorktree(catalog, repository, entry.path);
+          continue;
+        }
         catalog = markWorktreeCleanupPending(catalog, repository, entry.path, {
           ...pending,
           sizeBytes,
@@ -9266,6 +9304,14 @@
       )
     ) {
       await checkPendingWorktreeCleanup(repository, selectedPath);
+      if (
+        !(projectCatalog.worktrees[repository] ?? []).some(
+          (worktree) => worktree.path === selectedPath && worktree.pendingCleanup,
+        )
+      ) {
+        error = '';
+        return;
+      }
       error =
         'The pending worktree moved or was removed during cleanup. Review its updated recovery location and retry.';
       return;

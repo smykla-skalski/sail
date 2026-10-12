@@ -230,6 +230,7 @@ export function assignRepository(
 }
 
 export function removeRepository(catalog: ProjectCatalog, path: string): ProjectCatalog {
+  if ((catalog.worktrees[path] ?? []).some((worktree) => worktree.pendingCleanup)) return catalog;
   const { collapsedRepositories, ...remaining } = catalog;
   const repositories = catalog.repositories.filter((repository) => repository !== path);
   return {

@@ -520,6 +520,30 @@ fn repository_path_available(path: String) -> bool {
 }
 
 #[tauri::command]
+fn pending_cleanup_paths_absent(paths: Vec<String>) -> Result<bool, String> {
+    if paths.is_empty() {
+        return Err("Pending cleanup paths are missing.".into());
+    }
+    for path in paths {
+        let path = Path::new(&path);
+        if !path.is_absolute() {
+            return Err("A pending cleanup path is not absolute.".into());
+        }
+        match path.symlink_metadata() {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Cannot verify pending cleanup path {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[tauri::command]
 fn validate_repository(path: String) -> Result<String, String> {
     let directory = Path::new(&path)
         .git_canonical()
@@ -3994,6 +4018,7 @@ pub fn run() {
             memory_provider::sync_memory_provider,
             memory_provider::resolve_memory_provider_pending,
             repository_path_available,
+            pending_cleanup_paths_absent,
             opencode_config::opencode_plan_review_plugin,
             validate_repository,
             list_picker_directory,
@@ -4266,21 +4291,24 @@ fn clean_pending_worktree_temp(
 mod tests {
     #[cfg(any(unix, windows))]
     use super::working_tree_generation;
+    #[cfg(unix)]
+    use super::worktree_size_bytes;
     use super::{
         add_worktree, archive_ignored_and_remove, archive_ignored_and_remove_with_hook,
         discover_nested_worktree_terminal_roots, encode_manifest_path,
         ensure_expected_worktree_generation, ensure_expected_worktree_inventory,
         existing_shipping_worktree, git_change_action, git_patch, git_reference,
         move_worktree_for_removal, normalize_picker_path, parse_registered_worktrees,
-        persist_worktree_data_manifest, register_worktree_terminal_data, registered_worktrees,
-        remove_worktree, remove_worktree_guarded, remove_worktree_then_terminal_data,
+        pending_cleanup_paths_absent, persist_worktree_data_manifest,
+        register_worktree_terminal_data, registered_worktrees, remove_worktree,
+        remove_worktree_guarded, remove_worktree_then_terminal_data,
         remove_worktree_then_terminal_data_many, remove_worktree_with_hook,
         remove_worktree_with_hooks, replacement_worktree_at_checkpoint, repository_namespace,
         repository_worktrees_inner, restore_pending_worktree_inner, shipping_base_revision,
         shipping_changed_paths, shipping_default_branch, shipping_fetch_source,
         version_is_compatible, version_number, working_tree_diff, worktree_overviews,
-        worktree_preview_state_with_hook, worktree_size_bytes, ExpectedRegisteredWorktree,
-        WorktreeOperationLocks, NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
+        worktree_preview_state_with_hook, ExpectedRegisteredWorktree, WorktreeOperationLocks,
+        NESTED_WORKTREE_MANIFEST_HEADER, WORKTREE_DATA_OWNER_FILE,
     };
     use super::{working_tree_commit, working_tree_revision};
     use crate::worktree_storage;
@@ -4288,6 +4316,49 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[test]
+    fn pending_cleanup_completion_requires_every_path_to_be_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-pending-cleanup-presence-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("original");
+        let recovery = root.join("recovery");
+        let paths = || {
+            vec![
+                original.to_string_lossy().into_owned(),
+                recovery.to_string_lossy().into_owned(),
+            ]
+        };
+
+        assert!(pending_cleanup_paths_absent(paths()).unwrap());
+        fs::write(&recovery, b"retained").unwrap();
+        assert!(!pending_cleanup_paths_absent(paths()).unwrap());
+        fs::remove_file(&recovery).unwrap();
+        fs::create_dir(&original).unwrap();
+        assert!(!pending_cleanup_paths_absent(paths()).unwrap());
+        fs::remove_dir(&original).unwrap();
+        assert!(pending_cleanup_paths_absent(paths()).unwrap());
+        assert!(pending_cleanup_paths_absent(vec!["relative".into()]).is_err());
+        assert!(pending_cleanup_paths_absent(vec![]).is_err());
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_cleanup_dangling_symlink_is_still_present() {
+        let root = std::env::temp_dir().join(format!(
+            "sail-pending-cleanup-link-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let link = root.join("recovery");
+        std::os::unix::fs::symlink(root.join("missing"), &link).unwrap();
+        assert!(!pending_cleanup_paths_absent(vec![link.to_string_lossy().into_owned()]).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn terminal_data_survives_failed_removal_and_is_deleted_after_success() {

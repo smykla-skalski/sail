@@ -65,6 +65,7 @@ fn main() {
             "resolve_memory_provider_pending",
             "start_runtime",
             "repository_path_available",
+            "pending_cleanup_paths_absent",
             "opencode_plan_review_plugin",
             "validate_repository",
             "list_picker_directory",

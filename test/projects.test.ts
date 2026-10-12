@@ -199,6 +199,24 @@ await test('keeps a removed checkout visible while its private storage remains p
   assert.deepEqual(restored.worktrees['/repo'][0].pendingCleanup?.storageKeys, ['a'.repeat(64)]);
 });
 
+await test('keeps a repository and retry controls while descendant cleanup is pending', () => {
+  const catalog = addWorktree(loadProjectCatalog(null, '/repo'), '/repo', {
+    path: '/worktrees/child',
+    branch: 'child',
+    generation: testGeneration(44),
+  });
+  const pending = markWorktreeCleanupPending(catalog, '/repo', '/worktrees/child', {
+    originalPath: '/worktrees/child',
+    recoveryPath: '/worktrees/child',
+    sizeBytes: 5,
+    reason: 'Awaiting explicit cleanup.',
+  });
+
+  assert.equal(removeRepository(pending, '/repo'), pending);
+  assert.deepEqual(removeRepository(pending, '/repo').repositories, ['/repo']);
+  assert.ok(removeRepository(pending, '/repo').worktrees['/repo'][0].pendingCleanup);
+});
+
 await test('restores sibling worktrees in their Sail creation ancestry', () => {
   const rootGeneration =
     '00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002';

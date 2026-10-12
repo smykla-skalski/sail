@@ -1626,11 +1626,15 @@
         role="menuitem"
         class="danger"
         disabled={target.path === directory ||
-          (catalog.worktrees[target.path] ?? []).some((worktree) => worktree.path === directory)}
+          (catalog.worktrees[target.path] ?? []).some(
+            (worktree) => worktree.path === directory || worktree.pendingCleanup,
+          )}
         title={target.path === directory ||
         (catalog.worktrees[target.path] ?? []).some((worktree) => worktree.path === directory)
           ? 'Switch repositories before removing this one'
-          : 'Remove from sidebar'}
+          : (catalog.worktrees[target.path] ?? []).some((worktree) => worktree.pendingCleanup)
+            ? 'Finish pending worktree cleanup before removing this repository'
+            : 'Remove from sidebar'}
         onclick={() => {
           onremoverepository(target.path);
           closeMenu();
