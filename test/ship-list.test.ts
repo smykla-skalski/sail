@@ -193,6 +193,24 @@ void test('a worker thread opens with its pending request quoted for the reply',
   assert.equal(shipWorkerRequest(issue), null);
 });
 
+void test('a stopped run keeps its worker thread without a stale reply', () => {
+  const run = fixture(1);
+  const [issue] = run.issues;
+  issue.threadId = 'acp:opencode:s1';
+  working(issue, 'implementing', {
+    reportedStatus: 'blocked',
+    blockedReason: 'Choose a theme.',
+    workerRequest: 'Choose a theme.',
+  });
+  assert.equal(shipWorkerRequest(issue), '> Choose a theme.\n\n');
+
+  issue.state = 'failed';
+  issue.cancelledAt = 10;
+  const restored = parseShipRuns(JSON.stringify([run]))[0].issues[0];
+  assert.equal(restored.threadId, 'acp:opencode:s1');
+  assert.equal(shipWorkerRequest(restored), null);
+});
+
 void test('a Sail gate error cannot replace the worker request in a reply', () => {
   const run = fixture(1);
   const [issue] = run.issues;

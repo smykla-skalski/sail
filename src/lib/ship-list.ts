@@ -149,7 +149,7 @@ export function shipDetailFallback(
 
 /** What the worker waits on the user for, quoted for its composer, or null when nothing is pending. */
 export function shipWorkerRequest(issue: ShipIssue): string | null {
-  if (issue.state === 'merged' || !issue.threadId) return null;
+  if (issue.state === 'merged' || issue.cancelledAt !== undefined || !issue.threadId) return null;
   const lines = [
     ...new Set(
       [

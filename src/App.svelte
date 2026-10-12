@@ -2901,6 +2901,8 @@
         state: 'failed',
         error: stoppedMessage,
         blockedReason: null,
+        reportedStatus: undefined,
+        workerRequest: null,
         workerSettled: true,
         cancelledAt: Date.now(),
         ...(checkpoint && checkpoint.status !== 'completed'
