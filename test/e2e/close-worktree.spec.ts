@@ -1092,15 +1092,19 @@ describe('close worktree shortcut', () => {
       { timeout: 20000, timeoutMsg: 'Descendant catalog did not settle after reload' },
     );
     const openRemoval = async () => {
+      let preview: { path: string; revision: string; sizeBytes: number | null }[] = [];
       await browser.waitUntil(
         async () => {
           try {
-            await browser.tauri.execute(
+            preview = await browser.tauri.execute(
               async ({ core }, input) =>
-                core.invoke('worktree_removal_preview', {
-                  repository: input.repository,
-                  paths: input.paths,
-                }),
+                core.invoke<{ path: string; revision: string; sizeBytes: number | null }[]>(
+                  'worktree_removal_preview',
+                  {
+                    repository: input.repository,
+                    paths: input.paths,
+                  },
+                ),
               { repository, paths: [grandchild, child, first] },
             );
             return true;
@@ -1116,14 +1120,22 @@ describe('close worktree shortcut', () => {
       );
       await $(`.project-worktree-select[title="${first}"]`).click({ button: 'right' });
       await $('[aria-label="Delete worktree first"]').click();
+      return preview;
     };
-    await openRemoval();
+    const preview = await openRemoval();
     const dialog = $('dialog.confirmation-dialog[open]');
     await diagnose('Descendant dialog', () =>
       expect(dialog).toHaveText(expect.stringContaining('grandchild')),
     );
     await expect(dialog).toHaveText(expect.stringContaining('uncommitted changes'));
     await expect(dialog).not.toHaveText(expect.stringContaining('external'));
+    const cleanChild = preview.find((entry) => entry.path === child);
+    if (!cleanChild || cleanChild.sizeBytes === null)
+      throw new Error('Clean child preview lacks retained size');
+    await expect(dialog).toHaveText(expect.stringContaining(`Revision: ${cleanChild.revision}`));
+    await expect(dialog).toHaveText(
+      expect.stringContaining(`Retained size: ${cleanChild.sizeBytes} bytes`),
+    );
     await captureDescendantPreviewTheme('light');
     await captureDescendantPreviewTheme('dark');
     await browser.setWindowSize(1920, 1200);

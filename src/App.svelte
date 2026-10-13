@@ -9197,7 +9197,7 @@
         state.dirty ? 'uncommitted changes' : null,
         state.activeSessions.length ? `connected: ${state.activeSessions.join(', ')}` : null,
       ].filter(Boolean);
-      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}`;
+      return `• ${state.branch ?? 'detached'} — ${worktree.path}${warnings.length ? ` (${warnings.join(', ')})` : ''}\n  Revision: ${state.revision}\n  Retained size: ${state.sizeBytes === null ? 'unknown' : `${state.sizeBytes} bytes`}`;
     });
     const e2eAnswer =
       import.meta.env.MODE === 'e2e' ? sessionStorage.getItem('sai-e2e-delete-worktree') : null;
