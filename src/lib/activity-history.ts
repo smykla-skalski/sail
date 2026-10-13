@@ -20,6 +20,10 @@ export type ActivityHistoryEvent = {
 
 export type ActivityHistoryInput = Omit<ActivityHistoryEvent, 'id'> & { id?: string };
 
+const automaticDecisionsPerSession = 20;
+const automaticDecisionsTotal = 400;
+const maxEventCharacters = 2_048;
+
 function isActivityKind(value: unknown): value is ActivityHistoryKind {
   return (
     value === 'parent' ||
@@ -47,6 +51,12 @@ function bounded(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
 }
 
+function automaticDecisionSession(event: ActivityHistoryEvent): string | null {
+  return event.kind === 'decision' && event.automatic && event.agent && event.sessionId
+    ? JSON.stringify([event.workspace, event.agent, event.sessionId])
+    : null;
+}
+
 export function recentActivityEvents(
   input: ActivityHistoryInput[],
   limit = 100,
@@ -69,12 +79,40 @@ export function recentActivityEvents(
       outcome: bounded(candidate.outcome, 80),
       ...(candidate.reason === undefined ? {} : { reason: bounded(candidate.reason, 240) }),
     };
+    if (JSON.stringify(event).length > maxEventCharacters) continue;
     const previous = events.get(id);
     if (!previous || previous.at <= event.at) events.set(id, event);
   }
-  return [...events.values()]
-    .toSorted((left, right) => right.at - left.at || left.id.localeCompare(right.id))
-    .slice(0, Math.max(0, limit));
+  const sorted = [...events.values()].toSorted(
+    (left, right) => right.at - left.at || left.id.localeCompare(right.id),
+  );
+  const sessions = new Map<string, number>();
+  const decisions = new Set<string>();
+  // Reserve each session's latest decision first, so a busy workspace cannot erase another
+  // session's entire policy history. The global cap still bounds settings storage.
+  for (const event of sorted) {
+    const session = automaticDecisionSession(event);
+    if (!session || sessions.has(session)) continue;
+    decisions.add(event.id);
+    sessions.set(session, 1);
+    if (decisions.size === automaticDecisionsTotal) break;
+  }
+  for (const event of sorted) {
+    if (decisions.size === automaticDecisionsTotal) break;
+    const session = automaticDecisionSession(event);
+    if (!session || !sessions.has(session) || decisions.has(event.id)) continue;
+    const count = sessions.get(session) ?? 0;
+    if (count >= automaticDecisionsPerSession) continue;
+    decisions.add(event.id);
+    sessions.set(session, count + 1);
+  }
+  let ordinary = 0;
+  return sorted.filter((event) => {
+    if (automaticDecisionSession(event)) return decisions.has(event.id);
+    if (ordinary >= Math.max(0, limit)) return false;
+    ordinary += 1;
+    return true;
+  });
 }
 
 export function activityWorkspaces(events: ActivityHistoryEvent[]): string[] {

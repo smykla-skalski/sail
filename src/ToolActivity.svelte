@@ -13,6 +13,7 @@
     source = '',
     expanded = false,
     activityId,
+    toolId,
     live = false,
     children,
   }: {
@@ -24,6 +25,7 @@
     source?: string;
     expanded?: boolean;
     activityId?: string;
+    toolId?: string;
     /** False while the host replays history; errors already present then stay silent. */
     live?: boolean;
     children?: import('svelte').Snippet;
@@ -44,7 +46,7 @@
   const formattedInput = $derived(toolInput(input));
 </script>
 
-<details class="tool-activity" data-tool-id={activityId} bind:open>
+<details class="tool-activity" data-tool-id={toolId ?? activityId} bind:open>
   <summary>
     <span class="tool-activity-name">{title}</span>
     <ActivityStatus {status} compact />

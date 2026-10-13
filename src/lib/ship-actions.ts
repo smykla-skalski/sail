@@ -14,13 +14,24 @@ export type ShipActionState = { enabled: boolean; reason: string | null };
 
 const available: ShipActionState = { enabled: true, reason: null };
 const unavailable = (reason: string): ShipActionState => ({ enabled: false, reason });
+export const shipMergeRetryDelay = 10 * 60 * 1000;
+
+export function shipMergeRetryReason(issue: ShipIssue, now = Date.now()): string | null {
+  const request = issue.mergeRequested;
+  if (!request) return null;
+  if (issue.pullRequestHead && request.head !== issue.pullRequestHead)
+    return 'The pull request head changed since the last merge request.';
+  if (now - request.at >= shipMergeRetryDelay)
+    return 'The last merge request is more than 10 minutes old.';
+  return null;
+}
 
 /** The first thing keeping a pull request from merging, in the order a user can fix it. */
-export function shipMergeBlocker(issue: ShipIssue): string | null {
+export function shipMergeBlocker(issue: ShipIssue, now = Date.now()): string | null {
   if (issue.state === 'merged') return 'Already merged.';
   if (!issue.pullRequest) return 'No pull request yet.';
   if (issue.pullRequestState !== 'OPEN') return 'The pull request is not open.';
-  if (issue.mergeRequested)
+  if (issue.mergeRequested && !shipMergeRetryReason(issue, now))
     return `Merge already requested with “${issue.mergeRequested.comment}”. Waiting for the repository's bot to merge it.`;
   const evidence = shipEvidenceReadiness(issue);
   if (!evidence.ready) return evidence.reason ?? 'Merge evidence is not ready.';
@@ -33,8 +44,8 @@ export function shipMergeBlocker(issue: ShipIssue): string | null {
   return shipPullRequestReady(issue) ? null : 'The pull request is not ready to merge.';
 }
 
-export function shipMergeAction(issue: ShipIssue): ShipActionState {
-  const blocker = shipMergeBlocker(issue);
+export function shipMergeAction(issue: ShipIssue, now = Date.now()): ShipActionState {
+  const blocker = shipMergeBlocker(issue, now);
   return blocker ? unavailable(blocker) : available;
 }
 
@@ -96,9 +107,17 @@ export function shipRunTarget(run: ShipRun): string {
 }
 
 export function shipMergeConfirmation(issue: ShipIssue, remote: string): ShipConfirmation {
+  const retryReason = shipMergeRetryReason(issue);
+  if (issue.mergeRequested && retryReason)
+    return {
+      title: `Request merge again for ${shipIssueTarget(issue)}?`,
+      message: `${retryReason} Sail will request the merge again for ${shipIssueTarget(issue)} in ${remote} using the repository's current release policy. Sail does not post GitHub comments. Confirm only if the previous request did not merge it.`,
+      confirmLabel: 'Request again',
+      destructive: false,
+    };
   return {
     title: `Merge ${shipIssueTarget(issue)}?`,
-    message: `Sail merges the pull request for ${shipIssueTarget(issue)} in ${remote} the way the repository's release policy says, only while its head still matches the checkpoint revision. A merge cannot be undone from Sail.`,
+    message: `Sail merges the pull request for ${shipIssueTarget(issue)} in ${remote} through GitHub, only while its head still matches the checkpoint revision. Sail does not post bot comments; repositories that require one must be merged outside Sail. A merge cannot be undone from Sail.`,
     confirmLabel: 'Merge',
     destructive: false,
   };
@@ -122,6 +141,35 @@ export function shipReopenConfirmation(issue: ShipIssue, remote: string): ShipCo
     confirmLabel: 'Reopen',
     destructive: false,
   };
+}
+
+export function shipReplacementConfirmation(issue: ShipIssue, remote: string): ShipConfirmation {
+  const number = issue.pullRequest?.match(/\/pull\/(\d+)/)?.[1];
+  const closed = number ? `pull request #${number}` : 'the closed pull request';
+  return {
+    title: `Start a replacement for ${closed}?`,
+    message: `GitHub refused to reopen ${closed}. Sail keeps it closed and starts a replacement pull request for ${shipIssueTarget(issue)} in ${remote} on a new branch from the saved checkpoint. The replacement does not merge until you confirm Merge.`,
+    confirmLabel: 'Start replacement',
+    destructive: false,
+  };
+}
+
+export function shipCheckpointCommit(issue: ShipIssue): string | null {
+  const revision = issue.checkpoint?.revision;
+  const commit =
+    issue.checkpoint?.commit ??
+    (revision && issue.evidenceRevision === revision ? issue.evidenceCommit : null);
+  return commit && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commit) ? commit : null;
+}
+
+export function shipReopenHeadWarning(
+  head: string,
+  checkpointCommit: string | null | undefined,
+): string {
+  if (!checkpointCommit)
+    return ` Warning: the saved checkpoint has no Git commit to compare with reopened head ${head.slice(0, 8)}. Review the pull request before continuing.`;
+  if (head.toLowerCase() === checkpointCommit.toLowerCase()) return '';
+  return ` Warning: reopened head ${head.slice(0, 8)} differs from checkpoint commit ${checkpointCommit.slice(0, 8)}. Review the changed commits before continuing.`;
 }
 
 export function shipStopConfirmation(run: ShipRun): ShipConfirmation {

@@ -51,6 +51,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../vendor/codex-acp/dist/index.js.txt": "codex-acp/index.js.txt",
+      "../vendor/codex-acp/LICENSE": "codex-acp/LICENSE"
+    },
     "macOS": {
       "entitlements": "./Entitlements.plist",
       "files": {

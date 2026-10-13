@@ -1,6 +1,6 @@
 import { browser, $, $$, expect } from '@wdio/globals';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -77,7 +77,7 @@ describe('subagent navigation and control', () => {
     rmSync(other, { recursive: true, force: true });
   });
 
-  async function startChildPermission() {
+  async function startChildPermission(text = 'Native child permission') {
     await browser.execute((path) => {
       localStorage.setItem('sai-directory', path);
       localStorage.setItem(
@@ -90,8 +90,8 @@ describe('subagent navigation and control', () => {
     await browser.refresh();
     await $('.agent-launches button').click();
     await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
-    await $('.agent-composer [data-pane-prompt]').setValue('Native child permission');
-    await $('.agent-actions button').click();
+    await $('.agent-composer [data-pane-prompt]').setValue(text);
+    await $('.agent-actions button:last-child').click();
     await expect($('.spawn-permission')).toBeDisplayed();
   }
 
@@ -164,6 +164,67 @@ describe('subagent navigation and control', () => {
     await expect($('.spawn-permission')).not.toExist();
   });
 
+  it('prompts and stops one capable child while its parent and sibling continue', async () => {
+    await browser.execute((path) => {
+      localStorage.setItem('sai-directory', path);
+      localStorage.setItem(
+        'sai-project-catalog',
+        JSON.stringify({ repositories: [path], groups: [], worktrees: {} }),
+      );
+      localStorage.removeItem('sai-pane-layouts');
+      localStorage.removeItem('sail-agent-threads');
+    }, realpathSync(repository));
+    await browser.refresh();
+    await $('.agent-launches button').click();
+    await expect($('.agent-header')).toHaveText(expect.stringContaining('Ready'));
+    await $('.agent-composer [data-pane-prompt]').setValue('Native child controls');
+    await $('.agent-actions button:last-child').click();
+    await expect($$('.spawn-open')).toBeElementsArrayOfSize(2);
+    await expect($('.spawn-stop-hint')).not.toExist();
+    await $$('.spawn-open')[0].click();
+    await expect($('.agent-readonly')).not.toExist();
+    await expect($('.agent-composer [data-pane-prompt]')).toHaveAttribute(
+      'contenteditable',
+      'true',
+    );
+    await $('.agent-composer [data-pane-prompt]').setValue('Continue first');
+    await $('.agent-actions button:last-child').click();
+    await expect($('.agent-conversation')).toHaveText(
+      expect.stringContaining('Child follow-up: Continue first'),
+    );
+    await $('button[aria-label="Go to parent thread"]').click();
+    await $('button[aria-label="Stop first subagent"]').click();
+    await expect($('button[aria-label="Stop first subagent"]')).not.toExist();
+    await expect($('.spawn-activity')).toHaveText(expect.stringContaining('sibling'));
+    await expect($('button[aria-label="Stop sibling subagent"]')).toBeDisplayed();
+    await expect($('.agent-busy')).toBeDisplayed();
+    const evidence = process.env.SAIL_VISUAL_AUDIT_DIR;
+    if (evidence) {
+      mkdirSync(evidence, { recursive: true });
+      await [
+        [2560, 1440],
+        [1920, 1200],
+        [390, 800],
+      ].reduce(async (previous, [requestedWidth, height]) => {
+        await previous;
+        await browser.setWindowSize(requestedWidth, height);
+        const width = await browser.execute(() => innerWidth);
+        console.log('Native child controls viewport', { requestedWidth, width });
+        if (requestedWidth === 390)
+          expect(
+            await browser.execute(() => document.documentElement.scrollWidth),
+          ).toBeLessThanOrEqual(width);
+        await ['light', 'dark'].reduce(async (previousTheme, theme) => {
+          await previousTheme;
+          await browser.execute((value) => {
+            document.documentElement.dataset.suiTheme = value;
+          }, theme);
+          await browser.saveScreenshot(join(evidence, `native-child-${width}-${theme}.png`));
+        }, Promise.resolve());
+      }, Promise.resolve());
+    }
+  });
+
   it('replays a pending child permission in the child view and navigates back', async () => {
     await startChildPermission();
     await $('button.spawn-open').click();
@@ -171,6 +232,13 @@ describe('subagent navigation and control', () => {
     await expect($('.agent-readonly')).toHaveText(
       expect.stringContaining("Read-only: the agent doesn't accept messages for subagents yet"),
     );
+    expect(
+      await browser.execute(() => {
+        const prompt = document.querySelector('.agent-composer [data-pane-prompt]')!;
+        const note = document.querySelector('.agent-readonly')!;
+        return Math.round(note.getBoundingClientRect().left - prompt.getBoundingClientRect().left);
+      }),
+    ).toBe(16);
     await expect($('.agent-busy button')).not.toExist();
     await expect($('.agent-composer [data-pane-prompt]')).toHaveAttribute(
       'contenteditable',
@@ -202,6 +270,19 @@ describe('subagent navigation and control', () => {
     await expect($('.agent-permission-answered')).not.toHaveText(
       expect.stringContaining('Answered'),
     );
+    expect(
+      await browser.execute(() => {
+        const prompt = document.querySelector('.agent-composer [data-pane-prompt]')!;
+        const note = document.querySelector('.agent-permission-answered')!;
+        return Math.round(note.getBoundingClientRect().left - prompt.getBoundingClientRect().left);
+      }),
+    ).toBe(16);
+    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
+      'data-state',
+      'waiting',
+    );
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
+    await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
     expect(await answerOutsideUi(request, 'allow')).toContain('no longer pending');
     await $('button[aria-label="Go to parent thread"]').click();
     await expect($('.spawn-permission-answered')).not.toHaveText(
@@ -220,5 +301,83 @@ describe('subagent navigation and control', () => {
     expect(await answerOutsideUi(request, 'reject')).toContain('no longer pending');
     await $('button[aria-label="Go to parent thread"]').click();
     await expect($('.spawn-permission-answered')).toHaveText(expect.stringContaining('Answered'));
+  });
+
+  it('keeps a child waiting while its form question remains pending', async () => {
+    await startChildPermission('Native child permission and question');
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (2)');
+    await $('button.spawn-open').click();
+    await expect($('.agent-permission')).toBeDisplayed();
+    await expect($('.elicitation')).toBeDisplayed();
+    const request = await childRequest();
+    expect(await answerOutsideUi(request, 'allow')).toBe('ok');
+    await expect($('.agent-permission-answered')).toHaveText(expect.stringContaining('Answered'));
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (1)');
+    await expect($('.project-agent-row[data-depth="1"] .activity-status')).toHaveAttribute(
+      'data-state',
+      'waiting',
+    );
+    await expect($('.agent-status-bar')).toHaveText(expect.stringContaining('1 need attention'));
+    await $('.elicitation').$('button=Decline').click();
+    await expect($('.elicitation')).not.toExist();
+    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
+      'data-state',
+      'waiting',
+    );
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
+    await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
+  });
+
+  it('clears child attention when the remaining form question is cancelled', async () => {
+    await startChildPermission('Native child permission and cancelled question');
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (2)');
+    const request = await childRequest();
+    expect(await answerOutsideUi(request, 'allow')).toBe('ok');
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
+    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
+      'data-state',
+      'waiting',
+    );
+    await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
+  });
+
+  it('recovers child attention after two pending Inbox query failures', async () => {
+    await startChildPermission();
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox (1)');
+    const request = await childRequest();
+    await browser.execute(() => {
+      const internals: unknown = Reflect.get(window, '__TAURI_INTERNALS__');
+      if (!internals || typeof internals !== 'object') throw new Error('Tauri bridge unavailable');
+      const original: unknown = Reflect.get(internals, 'invoke');
+      if (typeof original !== 'function') throw new Error('Tauri invoke unavailable');
+      let failures = 0;
+      Reflect.set(internals, 'invoke', (...args: unknown[]) => {
+        if (args[0] === 'acp_pending_inbox' && failures < 2) {
+          failures++;
+          if (failures === 2) Reflect.set(internals, 'invoke', original);
+          return Promise.reject(new Error('Temporary pending Inbox failure'));
+        }
+        const result: unknown = Reflect.apply(original, internals, args);
+        return Promise.resolve(result);
+      });
+      Reflect.set(window, '__sailPendingInboxFailures', () => failures);
+    });
+    await browser.execute(async (value) => {
+      const tauri = Reflect.get(window, '__TAURI__');
+      await tauri.core.invoke('acp_cancel', {
+        agent: value.agent,
+        sessionId: value.sessionId,
+        turnId: null,
+      });
+    }, request);
+    await expect($('[data-topbar-inbox]')).toHaveText('Inbox');
+    expect(await browser.execute(() => Reflect.get(window, '__sailPendingInboxFailures')())).toBe(
+      2,
+    );
+    await expect($('.project-agent-row[data-depth="1"] .activity-status')).not.toHaveAttribute(
+      'data-state',
+      'waiting',
+    );
+    await expect($('.agent-status-bar')).not.toHaveText(expect.stringContaining('need attention'));
   });
 });
