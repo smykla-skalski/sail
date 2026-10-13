@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, State};
+#[cfg(feature = "e2e")]
+use tauri::Manager;
+use tauri::{AppHandle, Emitter, State};
 
 const APPROVALS_KEY: &str = "sai-post-turn-approvals";
 const HISTORY_KEY: &str = "sai-post-turn-history";
@@ -15,7 +17,47 @@ const MAX_OUTPUT: usize = 32 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
-pub struct CheckLock(pub Arc<Mutex<HashSet<String>>>);
+pub struct CheckLock(Arc<Mutex<CheckState>>);
+
+#[derive(Default)]
+struct CheckState {
+    active: HashMap<String, Arc<AtomicBool>>,
+    generation: u64,
+    resetting: bool,
+}
+
+#[cfg(feature = "e2e")]
+pub(crate) fn quiesce_test_checks(app: &AppHandle) -> Result<(), String> {
+    let lock = app.state::<CheckLock>();
+    {
+        let mut state = lock.0.lock().map_err(|error| error.to_string())?;
+        state.resetting = true;
+        state.generation = state.generation.wrapping_add(1);
+        for cancel in state.active.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = lock.0.lock().map_err(|error| error.to_string())?;
+        if state.active.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("Timed out quiescing E2E post-turn checks".into());
+        }
+        drop(state);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(feature = "e2e")]
+pub(crate) fn resume_test_checks(app: &AppHandle) -> Result<(), String> {
+    let lock = app.state::<CheckLock>();
+    let mut state = lock.0.lock().map_err(|error| error.to_string())?;
+    state.resetting = false;
+    Ok(())
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +74,8 @@ pub struct CheckResult {
     pub status: String,
     pub output: String,
     pub code: Option<i32>,
+    #[serde(default)]
+    pub restart_interrupted: bool,
 }
 
 #[derive(Deserialize)]
@@ -57,7 +101,7 @@ fn check_id(directory: &str, thread: &str, turn: &str, source: &str, command: &s
 }
 
 fn settings(app: &AppHandle, key: &str) -> Result<String, String> {
-    Ok(crate::settings::load_settings(app.clone())?
+    Ok(crate::settings::load_settings_sync(app.clone())?
         .remove(key)
         .unwrap_or_default())
 }
@@ -71,7 +115,7 @@ fn history(app: &AppHandle) -> Result<Vec<CheckResult>, String> {
 }
 
 fn save_history(app: &AppHandle, checks: &[CheckResult]) -> Result<(), String> {
-    crate::settings::save_setting(
+    crate::settings::save_setting_sync(
         app.clone(),
         HISTORY_KEY.into(),
         Some(serde_json::to_string(checks).map_err(|error| error.to_string())?),
@@ -112,6 +156,8 @@ pub fn approve_post_turn_check(
     directory: String,
     command: String,
 ) -> Result<(), String> {
+    #[cfg(feature = "e2e")]
+    let _writer = crate::settings::begin_e2e_settings_write()?;
     let directory = canonical_directory(&directory)?;
     if !configured(&app, &directory, "repository", &command)? {
         return Err("Repository check changed. Review its new command.".into());
@@ -119,7 +165,7 @@ pub fn approve_post_turn_check(
     let mut approvals: HashSet<String> =
         serde_json::from_str(&settings(&app, APPROVALS_KEY)?).unwrap_or_default();
     approvals.insert(serde_json::to_string(&(&directory, &command)).map_err(|e| e.to_string())?);
-    crate::settings::save_setting(
+    crate::settings::save_setting_sync(
         app,
         APPROVALS_KEY.into(),
         Some(serde_json::to_string(&approvals).map_err(|e| e.to_string())?),
@@ -149,20 +195,26 @@ pub fn cancel_post_turn_check(
     source: String,
     command: String,
 ) -> Result<CheckResult, String> {
-    let _guard = lock.0.lock().map_err(|error| error.to_string())?;
+    let guard = lock.0.lock().map_err(|error| error.to_string())?;
+    if guard.resetting {
+        return Err("Post-turn checks are resetting for E2E".into());
+    }
     let directory = canonical_directory(&directory)?;
     if !configured(&app, &directory, &source, &command)? {
         return Err("Check command changed. Reload its configuration.".into());
     }
     let mut checks = history(&app)?;
-    if let Some(existing) = checks.iter().find(|item| {
+    let position = checks.iter().position(|item| {
         item.directory == directory
             && item.thread == thread
             && item.turn == turn
             && item.source == source
             && item.command == command
-    }) {
-        return Ok(existing.clone());
+    });
+    if let Some(index) = position {
+        if !checks[index].restart_interrupted {
+            return Ok(checks[index].clone());
+        }
     }
     let result = CheckResult {
         id: check_id(&directory, &thread, &turn, &source, &command),
@@ -175,9 +227,16 @@ pub fn cancel_post_turn_check(
         status: "canceled".into(),
         output: "Repository command was not approved.".into(),
         code: None,
+        restart_interrupted: false,
     };
-    checks.push(result.clone());
+    if let Some(index) = position {
+        checks[index] = result.clone();
+    } else {
+        checks.push(result.clone());
+    }
     save_history(&app, &checks)?;
+    drop(guard);
+    let _ = app.emit("post-turn-check-completed", &result);
     Ok(result)
 }
 
@@ -187,13 +246,17 @@ pub fn list_post_turn_checks(
     lock: State<'_, CheckLock>,
 ) -> Result<Vec<CheckResult>, String> {
     let active = lock.0.lock().map_err(|error| error.to_string())?;
+    if active.resetting {
+        return Err("Post-turn checks are resetting for E2E".into());
+    }
     let mut checks = history(&app)?;
     let mut changed = false;
     for check in &mut checks {
-        if check.status == "running" && !active.contains(&check.id) {
+        if check.status == "running" && !active.active.contains_key(&check.id) {
             check.status = "canceled".into();
             check.updated = now_ms();
             check.output = "Sail closed while this check was running.".into();
+            check.restart_interrupted = true;
             changed = true;
         }
     }
@@ -222,6 +285,13 @@ pub async fn run_post_turn_check(
     }
     let directory = canonical_directory(&directory)?;
     let mutex = lock.inner().0.clone();
+    let generation = {
+        let state = mutex.lock().map_err(|error| error.to_string())?;
+        if state.resetting {
+            return Err("Post-turn checks are resetting for E2E".into());
+        }
+        state.generation
+    };
     tauri::async_runtime::spawn_blocking(move || {
         if !configured(&app, &directory, &source, &command)? {
             return Err("Check command changed. Reload its configuration.".into());
@@ -235,6 +305,9 @@ pub async fn run_post_turn_check(
             }
         }
         let mut active = mutex.lock().map_err(|error| error.to_string())?;
+        if active.resetting || active.generation != generation {
+            return Err("Post-turn check was reset before it started".into());
+        }
         let mut checks = history(&app)?;
         let position = checks.iter().position(|item| {
             item.directory == directory
@@ -264,6 +337,7 @@ pub async fn run_post_turn_check(
             status: "running".into(),
             output: String::new(),
             code: None,
+            restart_interrupted: false,
         };
         if let Some(index) = position {
             checks[index] = result.clone();
@@ -271,9 +345,10 @@ pub async fn run_post_turn_check(
             checks.push(result.clone());
         }
         save_history(&app, &checks)?;
-        active.insert(result.id.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        active.active.insert(result.id.clone(), cancel.clone());
         drop(active);
-        match execute(&directory, &command) {
+        match execute_with_timeout(&directory, &command, TIMEOUT, Some(cancel.as_ref())) {
             Ok((status, code, output)) => {
                 result.status = status;
                 result.code = code;
@@ -286,7 +361,13 @@ pub async fn run_post_turn_check(
         }
         result.updated = now_ms();
         let mut active = mutex.lock().map_err(|error| error.to_string())?;
-        active.remove(&result.id);
+        active.active.remove(&result.id);
+        if active.resetting || active.generation != generation {
+            result.status = "canceled".into();
+            result.code = None;
+            result.output = "Sail reset this check before it finished.".into();
+            return Ok(result);
+        }
         let mut checks = history(&app)?;
         if let Some(item) = checks.iter_mut().find(|item| {
             item.directory == result.directory
@@ -298,12 +379,15 @@ pub async fn run_post_turn_check(
             *item = result.clone();
         }
         save_history(&app, &checks)?;
+        drop(active);
+        let _ = app.emit("post-turn-check-completed", &result);
         Ok(result)
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
+#[cfg(all(test, unix))]
 fn execute(directory: &str, command: &str) -> Result<(String, Option<i32>, String), String> {
     execute_with_timeout(directory, command, TIMEOUT, None)
 }

@@ -1,7 +1,7 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const sessions = new Map();
@@ -157,9 +157,12 @@ function runTerminal(sessionId, text, promptId) {
     return;
   }
   const stop = text.includes('stop');
-  const script = stop
-    ? 'echo started; sleep 30; echo done'
-    : 'echo started; sleep 1; echo finished; exit 7';
+  const script =
+    text === 'Terminal: Native build'
+      ? 'mkdir -p "$CARGO_TARGET_DIR"; printf marker > "$CARGO_TARGET_DIR/terminal-marker"; printf "CARGO_TARGET_DIR=%s\\n" "$CARGO_TARGET_DIR"'
+      : stop
+        ? 'echo started; sleep 30; echo done'
+        : 'echo started; sleep 1; echo finished; exit 7';
   terminalRequest(
     'terminal/create',
     { sessionId, command: '/bin/sh', args: ['-c', script], outputByteLimit: 1024 },
@@ -326,17 +329,25 @@ for await (const line of createInterface({ input: process.stdin })) {
       message.params.cwd.includes('sail-attention-') &&
       !delayedSessionDirectories.has(message.params.cwd);
     if (delayFirstAttentionSession) delayedSessionDirectories.add(message.params.cwd);
+    const delayWorktreeDeleteSession = message.params.cwd.includes('sail-force-delete-');
+    if (delayWorktreeDeleteSession) {
+      writeFileSync(join(message.params.cwd, '.sail-e2e-session-starting'), 'ready');
+    }
     setTimeout(
       () =>
         send({
           id: message.id,
           result: { sessionId, configOptions: configOptions(sessionId), availableCommands },
         }),
-      delayFirstAttentionSession ? 3000 : 1000,
+      delayWorktreeDeleteSession ? 10_000 : delayFirstAttentionSession ? 3000 : 1000,
     );
   } else if (message.method === 'session/list') {
     const pageSize = 2;
     const cwd = message.params.cwd;
+    if (agent === 'opencode' && existsSync(join(cwd, '.acp-session-list-error'))) {
+      send({ id: message.id, error: { code: -1, message: 'Session listing unavailable' } });
+      continue;
+    }
     const known = [...sessions.entries()]
       .filter(([, session]) => !cwd || session.cwd === cwd)
       .map(([sessionId, session]) => ({
@@ -373,6 +384,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         },
       });
   } else if (message.method === 'session/load') {
+    const failLoad = join(message.params.cwd, 'codex-fail-next-load.txt');
+    if (agent === 'codex' && existsSync(failLoad)) {
+      unlinkSync(failLoad);
+      send({ id: message.id, error: { code: -32002, message: 'Injected history load failure' } });
+      continue;
+    }
     adoptExternalSession(message.params.sessionId, message.params.cwd);
     applyClaudeDefaults(message.params.sessionId);
     const session = sessions.get(message.params.sessionId);
@@ -446,12 +463,60 @@ for await (const line of createInterface({ input: process.stdin })) {
     setTimeout(() => send({ id: message.id, result: { outcome: 'injected' } }), 200);
   } else if (message.method === 'session/prompt') {
     const { sessionId } = message.params;
+    const controlledChild = sessions.get(sessionId);
+    if (controlledChild?.nativeControlParent) {
+      const text = message.params.prompt[0].text;
+      recordUpdate(controlledChild.nativeControlParent, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Child follow-up: ${text}` },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
     if (sessions.get(sessionId)?.evicted) {
       send({ id: message.id, error: { code: -32002, message: `Session not found: ${sessionId}` } });
       continue;
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    if (text === 'Long owned history') {
+      for (let index = 0; index < 80; index++)
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId: `owned-history-${index}`,
+          title: `Owned history ${index}`,
+          status: 'completed',
+        });
+      recordUpdate(sessionId, sessionId, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Long history complete.' },
+      });
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Native child controls') {
+      for (const suffix of ['first', 'sibling']) {
+        const childId = `${sessionId}:${suffix}`;
+        sessions.set(childId, {
+          ...sessions.get(sessionId),
+          history: [],
+          nativeControlParent: sessionId,
+        });
+        update(sessionId, {
+          sessionUpdate: 'subagent_spawned',
+          subagentSessionId: childId,
+          name: suffix,
+          task: `Controlled ${suffix}`,
+          capabilities: { prompt: {}, cancel: {} },
+        });
+      }
+      const timer = setTimeout(() => {
+        stop();
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      }, 120_000);
+      const stop = trackWork(sessionId, () => clearTimeout(timer));
+      continue;
+    }
     if (text === 'Ask structured question') {
       const id = ++nextPermission;
       elicitations.set(id, { sessionId, promptId: message.id });
@@ -882,20 +947,56 @@ for await (const line of createInterface({ input: process.stdin })) {
       });
       continue;
     }
-    if (text === 'Background task') {
+    if (text === 'Thinking demo') {
+      const thought = {
+        sessionUpdate: 'agent_thought_chunk',
+        content: { type: 'text', text: 'I should inspect the result.' },
+      };
+      const answer = {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'The result is ready.' },
+      };
+      sessions.get(sessionId).history.push(thought, answer);
+      update(sessionId, thought);
+      update(sessionId, answer);
+      send({ id: message.id, result: { stopReason: 'end_turn' } });
+      continue;
+    }
+    if (text === 'Background task' || text === 'Background task with history') {
+      if (text === 'Background task with history')
+        for (let index = 1; index <= 60; index += 1) {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'tool_call',
+            toolCallId: `background-history-${message.id}-${index}`,
+            title: `History step ${index}`,
+            status: 'completed',
+          });
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `History marker ${index}. ` },
+          });
+        }
       recordUpdate(sessionId, sessionId, {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Background task started.' },
       });
       send({ id: message.id, result: { stopReason: 'end_turn' } });
-      const timer = setTimeout(() => {
+      const started = Date.now();
+      const finish = () => {
         stop();
+        clearInterval(timer);
         recordUpdate(sessionId, sessionId, {
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: ' Background task finished.' },
         });
-      }, 6000);
-      const stop = trackWork(sessionId, () => clearTimeout(timer));
+      };
+      const timer = setInterval(() => {
+        if (agent === 'codex') {
+          if (existsSync(join(sessions.get(sessionId).cwd, 'codex-background-release.txt')))
+            finish();
+        } else if (Date.now() - started >= 6000) finish();
+      }, 100);
+      const stop = trackWork(sessionId, () => clearInterval(timer));
       continue;
     }
     if (text === 'Second live subagent') {
@@ -1061,7 +1162,11 @@ for await (const line of createInterface({ input: process.stdin })) {
       send({ id: message.id, result: { stopReason: 'end_turn' } });
       continue;
     }
-    if (text === 'Native child permission') {
+    if (
+      text === 'Native child permission' ||
+      text === 'Native child permission and question' ||
+      text === 'Native child permission and cancelled question'
+    ) {
       const child = `${sessionId}:permission-child`;
       update(sessionId, {
         sessionUpdate: 'subagent_spawned',
@@ -1074,6 +1179,24 @@ for await (const line of createInterface({ input: process.stdin })) {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Child waits for approval.' },
       });
+      if (text !== 'Native child permission') {
+        const id = ++nextPermission;
+        elicitations.set(id, { sessionId: child, promptId: message.id });
+        send({
+          id,
+          method: 'elicitation/create',
+          params: {
+            sessionId: child,
+            mode: 'form',
+            message: 'Choose the delivery approach',
+            requestedSchema: {
+              type: 'object',
+              properties: { approach: { type: 'string', enum: ['safe', 'fast'] } },
+              required: ['approach'],
+            },
+          },
+        });
+      }
       requestPermission(child, text, message.id, sessionId);
       continue;
     }
@@ -1249,6 +1372,15 @@ for await (const line of createInterface({ input: process.stdin })) {
       setTimeout(() => requestPermission(sessionId, text, message.id, undefined, toolCallId), 1500);
     else requestPermission(sessionId, text, message.id, undefined, toolCallId);
   } else if (message.method === 'session/cancel') {
+    const child = sessions.get(message.params.sessionId);
+    if (child?.nativeControlParent) {
+      update(child.nativeControlParent, {
+        sessionUpdate: 'subagent_state_update',
+        subagentSessionId: message.params.sessionId,
+        state: 'cancelled',
+      });
+      continue;
+    }
     const activePromptId = activePrompts.get(message.params.sessionId);
     const awaitingPermission = [...permissions.values()].some(
       (pending) => pending.sessionId === message.params.sessionId,
@@ -1271,7 +1403,16 @@ for await (const line of createInterface({ input: process.stdin })) {
               result: { stopReason: pending.text === 'Cancel ignored' ? 'end_turn' : 'cancelled' },
             });
         };
-        if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
+        if (pending.text === 'Delete with browser call') {
+          setTimeout(() => {
+            const session = sessions.get(pending.sessionId);
+            const server = session.mcpServers.find((item) => item.name === 'sail-browser');
+            callWorktreeList(server, (result) => {
+              writeFileSync(join(session.cwd, 'acp-delete-browser-result.txt'), result);
+              finish();
+            });
+          }, 250);
+        } else if (pending.text === 'Slow cancel') setTimeout(finish, 5000);
         else finish();
       }
     }
@@ -1298,6 +1439,13 @@ for await (const line of createInterface({ input: process.stdin })) {
       status: 'completed',
     });
     if (pending.parent) {
+      if (pending.text === 'Native child permission and cancelled question') {
+        for (const [id, question] of elicitations) {
+          if (question.sessionId !== pending.sessionId) continue;
+          elicitations.delete(id);
+          send({ method: '$/cancel_request', params: { id } });
+        }
+      }
       // The child keeps working after the answer, as a real one does.
       update(pending.sessionId, {
         sessionUpdate: 'agent_message_chunk',

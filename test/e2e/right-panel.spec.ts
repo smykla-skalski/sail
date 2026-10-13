@@ -60,6 +60,13 @@ describe('right details panel', () => {
     await browser.setWindowSize(390, 600);
     await $('.mobile-switcher button:nth-child(3)').click();
     await expect($('#session-details')).toBeDisplayed();
+    await browser.waitUntil(async () =>
+      browser.execute(() => {
+        const topbar = document.querySelector('.topbar')?.getBoundingClientRect();
+        const details = document.querySelector('#session-details')?.getBoundingClientRect();
+        return !!topbar && !!details && details.top === topbar.bottom;
+      }),
+    );
     const mobile = await browser.execute(() => ({
       topbar: document.querySelector('.topbar')!.getBoundingClientRect().toJSON(),
       details: document.querySelector('#session-details')!.getBoundingClientRect().toJSON(),

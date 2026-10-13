@@ -372,7 +372,7 @@ describe('visual layout audit', () => {
     await capture('desktop-worktree-menu');
     await $('.brand').click();
     await $('.agent-composer [data-pane-prompt]').setValue('unbrokentoken'.repeat(30));
-    await $('.agent-actions button').click();
+    await $('.agent-actions button:last-child').click();
     await expect($('.agent-permission')).toBeDisplayed();
     await capture('desktop-agent-permission');
     await $('.agent-permission button').click();

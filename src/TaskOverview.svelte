@@ -23,6 +23,7 @@
     path: string;
     branch: string | null;
     changedFiles: number | null;
+    gitState: string | null;
     error: string | null;
   };
   type PullRequestCheck = {
@@ -396,6 +397,9 @@
         <button class="task-card-main" data-overview-control="main" onclick={() => void open(card)}>
           <strong>{card.task}</strong>
           <span class="task-card-branch" title={card.path}>⑂ {cardBranch(card)}</span>
+          {#if metadata[card.path]?.gitState}<span class="task-card-git-state" role="status"
+              >{metadata[card.path].gitState}</span
+            >{/if}
           <span class="task-card-agent">
             {#if card.agent}<HarnessIcon agent={card.agent} size={14} />{/if}
             {card.agentName}
@@ -578,6 +582,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .task-card-git-state {
+    color: var(--shell-muted);
+    font-size: var(--type-12);
   }
   .task-card-agent :global(.activity-status) {
     margin-left: auto;

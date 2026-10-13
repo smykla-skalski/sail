@@ -80,6 +80,10 @@ if (fixture.pulls) {
     const key = `${pull[1]}#${pull[2]}`;
     const fields = args.filter((arg) => arg.includes('=') && !arg.startsWith('repos/'));
     log({ method, endpoint, fields });
+    if (fixture.pulls[key]?.reopenRefused) {
+      process.stderr.write('HTTP 422: Pull request cannot be reopened\n');
+      process.exit(1);
+    }
     if (fixture.pulls[key] && fields.includes('state=open')) {
       fixture.pulls[key].state = 'open';
       writeFileSync(statePath, JSON.stringify(fixture));

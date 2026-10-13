@@ -2,6 +2,8 @@
 
 How ship-it turns its arguments into a task source. Make no repository changes (no branch, edit or commit) until the input is resolved.
 
+In Sail mode, Sail owns a local issue claim and the portable `claim` stays null. Never create a GitHub claim comment.
+
 ## Flags
 
 Parse leading `--issue` and `--risk low|medium|high` flags in either order, strip them, and remember their values. Reject a missing or unknown risk value. The same tokens after task text begins are part of the description. `--issue` applies only to task descriptions; with a URL or reference, say it is ignored and continue. Risk applies to every source as a validation floor and is reconciled with repository rules after exploration.

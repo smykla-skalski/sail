@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    #[cfg(unix)]
+    if std::env::args().nth(1).as_deref() == Some("--exec-with-scratch-owner") {
+        sail_lib::exec_with_scratch_owner();
+    }
     #[cfg(all(target_os = "macos", feature = "e2e"))]
     if std::env::args().nth(1).as_deref() == Some("--context-auth-replay-probe") {
         let Some(directory) = std::env::args().nth(2) else {
@@ -97,6 +101,7 @@ fn main() {
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("--browser-mcp") {
+        sail_lib::background_priority::lower_current_process();
         sail_lib::browser_agent::run_mcp_stdio();
         return;
     }

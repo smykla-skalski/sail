@@ -33,6 +33,11 @@ const taskCheckpointObjectSchema = z.object({
   phase: z.enum(checkpointPhases),
   status: z.enum(checkpointStatuses),
   revision: z.string().min(1).nullable(),
+  commit: z
+    .string()
+    .regex(/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/)
+    .nullable()
+    .optional(),
   requiredGates: z.array(z.string().min(1)),
   blocker: z.string().min(1).nullable(),
   unresolvedQuestions: z.array(z.string().min(1)),
@@ -68,6 +73,7 @@ const checkpointPatchSchema = taskCheckpointObjectSchema
     taskId: true,
     source: true,
     revision: true,
+    commit: true,
     createdAt: true,
     updatedAt: true,
   })
@@ -87,6 +93,7 @@ export function initialTaskCheckpoint(task: CheckpointTask, now: number): TaskCh
     phase: 'resolve',
     status: 'active',
     revision: null,
+    commit: null,
     requiredGates: ['code-adversary', 'findings-adversary', 'test-adversary'],
     blocker: null,
     unresolvedQuestions: [],
@@ -118,6 +125,7 @@ export function prepareTaskCheckpointUpdate(
   expectedRevision: unknown,
   rebindRevision: unknown,
   now: number,
+  commit: string | null = null,
 ): TaskCheckpoint {
   if (expectedSequence !== checkpoint.sequence)
     throw new Error('Checkpoint changed after it was read. Read it again before updating.');
@@ -129,7 +137,7 @@ export function prepareTaskCheckpointUpdate(
     throw new Error(
       'Worktree revision differs from the checkpoint. Inspect it and explicitly rebind before updating.',
     );
-  return updateTaskCheckpoint({ ...checkpoint, revision: currentRevision }, patch, now);
+  return updateTaskCheckpoint({ ...checkpoint, revision: currentRevision, commit }, patch, now);
 }
 
 export function reconcileTaskCheckpoint(

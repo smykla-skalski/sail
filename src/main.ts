@@ -63,6 +63,12 @@ async function start() {
     mount(TaskOverviewScaleFixture, { target: document.getElementById('root')! });
   } else if (
     import.meta.env.MODE === 'e2e' &&
+    new URLSearchParams(location.search).has('diff-scale-fixture')
+  ) {
+    const { default: DiffScaleFixture } = await import('../test/e2e/diff-scale-fixture.svelte');
+    mount(DiffScaleFixture, { target: document.getElementById('root')! });
+  } else if (
+    import.meta.env.MODE === 'e2e' &&
     new URLSearchParams(location.search).has('settings-durable-fixture')
   ) {
     await initializeSettings();

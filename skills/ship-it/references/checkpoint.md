@@ -2,6 +2,8 @@
 
 Use one portable JSON checkpoint as the source of truth for a task across Claude Code, Codex, OpenCode, Copilot CLI and Sail. It is both resumable workflow state and the task context supplied to review and test gates.
 
+In Sail mode, keep the portable `claim` null. Sail keeps ownership in its local claim store; do not create or update a GitHub claim comment.
+
 ## Location and identity
 
 Resolve the data root once as `${XDG_DATA_HOME:-$HOME/.local/share}/sai/ship-it/checkpoints/`. Create it with owner-only permissions. Never store checkpoints in a repository, plugin cache or system temporary directory.

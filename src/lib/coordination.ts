@@ -1,15 +1,24 @@
 import type { AgentThread } from './acp';
 import type { AttentionMap, ThreadStatus } from './attention';
-import type { ProjectCatalog } from './projects';
+import type { ProjectCatalog, WorktreeOrigin } from './projects';
+import { worktreeAncestry } from './projects.ts';
 import { threadKey } from './recent-threads.ts';
 
-export type RegisteredWorktree = { path: string; branch: string | null; present: boolean };
+export type RegisteredWorktree = {
+  path: string;
+  branch: string | null;
+  present: boolean;
+  generation: string | null;
+};
 export type WorktreeInfo = {
   repository: string;
   path: string;
   branch: string | null;
   statusComment: string | null;
   stale: boolean;
+  origin: WorktreeOrigin | null;
+  sourceMissing: boolean;
+  ancestryDepth: number;
   threadCount: number;
   threadStatuses: Record<ThreadStatus | 'unknown', number>;
 };
@@ -23,6 +32,9 @@ export function projectWorktreeInfo(
 ): WorktreeInfo[] {
   if (!catalog.repositories.includes(project)) return [];
   const live = new Map(registered.map((worktree) => [worktree.path, worktree]));
+  const ancestry = new Map(
+    worktreeAncestry(catalog, project, registered).map((row) => [row.worktree.path, row]),
+  );
   return [
     { path: project, branch: '', statusComment: undefined },
     ...(catalog.worktrees[project] ?? []),
@@ -38,12 +50,16 @@ export function projectWorktreeInfo(
     };
     for (const thread of known) threadStatuses[attention[threadKey(thread)]?.status ?? 'unknown']++;
     const registeredWorktree = live.get(worktree.path);
+    const row = ancestry.get(worktree.path);
     return {
       repository: project,
       path: worktree.path,
       branch: registeredWorktree ? registeredWorktree.branch : (worktree.branch ?? null),
       statusComment: worktree.statusComment ?? null,
       stale: !registeredWorktree?.present,
+      origin: row?.origin ?? null,
+      sourceMissing: row?.sourceMissing ?? false,
+      ancestryDepth: row?.depth ?? 0,
       threadCount: known.length,
       threadStatuses,
     };

@@ -1,9 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
-import { getSetting, setSetting } from './settings.ts';
+import { getSetting, setSetting, setTranscriptSetting } from './settings.ts';
 import { resourceQueues } from './resource-limits.ts';
 import { acpPlans } from './acp-plans.ts';
 import { forgetPlanningState } from './planning-state.ts';
 import { toolCommand } from './tool-display.ts';
+import {
+  flushOwnedTranscriptWrites,
+  forgetOwnedTranscript,
+  saveOwnedTranscript,
+  updateOwnedTranscript,
+} from './owned-transcripts.ts';
 import type { CapabilityProfile, PermissionPolicyDecision } from './capability-profiles.ts';
 
 export type AgentId = string;
@@ -115,15 +121,35 @@ export interface AcpPromptOutcome {
 
 export interface AcpTurnEvidence {
   agent: AgentId;
+  directory: string;
   sessionId: string;
   turnId: string;
   status: 'prepared' | 'dispatch_uncertain' | 'dispatched' | 'done' | 'failed' | 'interrupted';
   error: string | null;
   updatedAt: number;
+  postTurnPending: boolean;
 }
 
 export function acpPromptInterrupted(outcome: AcpPromptOutcome): boolean {
   return outcome.stopReason === 'cancelled' || outcome.sailInterrupted === true;
+}
+
+export async function recoverMissingCodexSession<T>(
+  agent: AgentId,
+  prompt: () => Promise<T>,
+  resume: () => Promise<unknown>,
+): Promise<T> {
+  try {
+    return await prompt();
+  } catch (cause) {
+    const message = typeof cause === 'string' ? cause : cause instanceof Error ? cause.message : '';
+    const missing =
+      /(?:session|thread) (?:not found|missing)/i.test(message) ||
+      message === 'Agent session is not connected in this worktree.';
+    if (agent !== 'codex' || !missing) throw cause;
+    await resume();
+    return prompt();
+  }
 }
 
 export function loadInterruptedAgentTurns(raw: string | null): InterruptedAgentTurn[] {
@@ -217,6 +243,29 @@ export function restoreEntryTimes(history: AgentEntry[], recent: AgentEntry[]): 
   return restored;
 }
 
+/** A provider may accept session/load while replaying no history. Keep Sail's complete owned copy. */
+export function restoreOwnedEntries(history: AgentEntry[], saved: AgentEntry[]): AgentEntry[] {
+  return history.length >= saved.length ? restoreEntryTimes(history, saved) : saved;
+}
+
+export function acpRestoreMode(capabilities: unknown): 'load' | 'resume' | null {
+  if (!capabilities || typeof capabilities !== 'object') return null;
+  const canLoad = 'loadSession' in capabilities && capabilities.loadSession === true;
+  const sessionCapabilities =
+    'sessionCapabilities' in capabilities ? capabilities.sessionCapabilities : null;
+  const session =
+    sessionCapabilities && typeof sessionCapabilities === 'object' ? sessionCapabilities : null;
+  const canResume =
+    !!session && 'resume' in session && !!session.resume && typeof session.resume === 'object';
+  const restoresSubagents =
+    !!session &&
+    'subagents' in session &&
+    !!session.subagents &&
+    typeof session.subagents === 'object';
+  if (canLoad && (restoresSubagents || !canResume)) return 'load';
+  return canResume ? 'resume' : null;
+}
+
 export interface AgentPermission {
   id: string | number;
   sessionId: string;
@@ -298,6 +347,14 @@ export function acpDisconnectedSessionIds(message: AgentEvent['message']): strin
   return sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string');
 }
 
+export function acpSessionOwner(sessionId: string | null): string | null {
+  if (!sessionId) return null;
+  const match = /^sail-owned:([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}):/.exec(
+    sessionId,
+  );
+  return match?.[1] ?? null;
+}
+
 export function acpDisconnectAffectsSession(
   message: AgentEvent['message'],
   sessionId: string | null,
@@ -345,6 +402,7 @@ export interface NativeSubagentSnapshotSet {
 export interface AcpPendingInboxItem {
   agent: AgentId;
   directory: string;
+  profile: CapabilityProfile;
   message: AgentEvent['message'];
   receivedAt: number;
 }
@@ -359,33 +417,90 @@ function transcriptId(agent: AgentId, directory: string, sessionId: string): str
 }
 
 type SavedTranscript = { id: string; entries: AgentEntry[] };
+type PendingTranscript = {
+  thread: AgentThread;
+  entries: AgentEntry[];
+  frame?: number;
+  timer: ReturnType<typeof setTimeout>;
+};
+let transcriptCache: SavedTranscript[] | null = null;
+let transcriptCacheStorage: Storage | null = null;
+const pendingTranscripts = new Map<string, PendingTranscript>();
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (event) => {
+    if (event.key === null || event.key === transcriptKey) transcriptCache = null;
+  });
+  window.addEventListener('pagehide', () => {
+    for (const pending of pendingTranscripts.values())
+      saveRecentTranscript(pending.thread, pending.entries);
+  });
+}
 
 function savedTranscripts(): SavedTranscript[] {
   try {
+    const storage = globalThis.localStorage;
+    if (transcriptCache && transcriptCacheStorage === storage) return transcriptCache;
     const value: unknown = JSON.parse(getSetting(transcriptKey) ?? '[]');
-    if (!Array.isArray(value)) return [];
-    return value.filter(
+    transcriptCacheStorage = storage;
+    if (!Array.isArray(value)) return (transcriptCache = []);
+    return (transcriptCache = value.filter(
       (item): item is SavedTranscript =>
         item &&
         typeof item === 'object' &&
         typeof item.id === 'string' &&
         Array.isArray(item.entries),
-    );
+    ));
   } catch {
-    return [];
+    transcriptCacheStorage = null;
+    return (transcriptCache = []);
   }
 }
 
+function cancelPendingTranscript(id: string): void {
+  const pending = pendingTranscripts.get(id);
+  if (!pending) return;
+  if (pending.frame !== undefined) globalThis.cancelAnimationFrame?.(pending.frame);
+  clearTimeout(pending.timer);
+  pendingTranscripts.delete(id);
+}
+
 export function loadRecentTranscript(thread: AgentThread): AgentEntry[] {
+  const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  const pending = pendingTranscripts.get(id);
+  if (pending) return pending.entries.slice();
   return (
-    savedTranscripts().find(
-      (item) => item.id === transcriptId(thread.agent, thread.directory, thread.sessionId),
-    )?.entries ?? []
+    savedTranscripts()
+      .find((item) => item.id === id)
+      ?.entries.slice() ?? []
   );
+}
+
+export function saveRecentTranscriptAfterPaint(thread: AgentThread, entries: AgentEntry[]): void {
+  const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  cancelPendingTranscript(id);
+  const pending: PendingTranscript = {
+    thread,
+    entries: entries.slice(-transcriptLimit),
+    timer: setTimeout(() => persist(), 100),
+  };
+  const persist = () => {
+    if (pendingTranscripts.get(id) !== pending) return;
+    cancelPendingTranscript(id);
+    saveRecentTranscript(pending.thread, pending.entries);
+  };
+  pendingTranscripts.set(id, pending);
+  pending.frame = globalThis.requestAnimationFrame?.(() => {
+    pending.frame = undefined;
+    clearTimeout(pending.timer);
+    pending.timer = setTimeout(persist, 0);
+  });
 }
 
 export function saveRecentTranscript(thread: AgentThread, entries: AgentEntry[]): void {
   const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
+  cancelPendingTranscript(id);
+  if (acpSessionOwner(thread.sessionId)) saveOwnedTranscript(id, entries);
   const recent: AgentEntry[] = [];
   const encoder = new TextEncoder();
   let remaining = 128 * 1024 - encoder.encode(JSON.stringify({ id, entries: [] })).length;
@@ -415,12 +530,16 @@ export function saveRecentTranscript(thread: AgentThread, entries: AgentEntry[])
   recent.reverse();
   const saved = savedTranscripts().filter((item) => item.id !== id);
   saved.push({ id, entries: recent });
-  setSetting(transcriptKey, JSON.stringify(saved.slice(-threadLimit)));
+  transcriptCache = saved.slice(-threadLimit);
+  setTranscriptSetting(JSON.stringify(transcriptCache));
 }
 
 export function forgetRecentTranscript(thread: AgentThread): void {
   const id = transcriptId(thread.agent, thread.directory, thread.sessionId);
-  setSetting(transcriptKey, JSON.stringify(savedTranscripts().filter((item) => item.id !== id)));
+  cancelPendingTranscript(id);
+  if (acpSessionOwner(thread.sessionId)) forgetOwnedTranscript(id);
+  transcriptCache = savedTranscripts().filter((item) => item.id !== id);
+  setTranscriptSetting(JSON.stringify(transcriptCache));
 }
 
 export function loadAgentThreads(): AgentThread[] {
@@ -504,6 +623,44 @@ export function updateEntriesInPlace(
   applyEntryUpdate(entries, update, toolIndexes, created);
 }
 
+/** Record owned turns even when no AgentWorkspace pane is mounted. */
+export function archiveOwnedPrompt(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+  turnId: string,
+  text: string,
+): Promise<void> {
+  if (!acpSessionOwner(sessionId)) return Promise.resolve();
+  const id = `owned-prompt:${turnId}`;
+  return updateOwnedTranscript(sessionKey(agent, directory, sessionId), (entries) => {
+    if (!entries.some((entry) => entry.id === id))
+      entries.push({ id, type: 'user', text, created: Date.now() });
+    return entries;
+  });
+}
+
+export function archiveOwnedTranscriptUpdate(
+  agent: AgentId,
+  directory: string,
+  sessionId: string,
+  update: Record<string, unknown>,
+): Promise<void> {
+  if (!acpSessionOwner(sessionId) || update.sessionUpdate === 'user_message_chunk')
+    return Promise.resolve();
+  if (
+    update.sessionUpdate !== 'agent_message_chunk' &&
+    update.sessionUpdate !== 'agent_thought_chunk' &&
+    update.sessionUpdate !== 'tool_call' &&
+    update.sessionUpdate !== 'tool_call_update'
+  )
+    return Promise.resolve();
+  return updateOwnedTranscript(sessionKey(agent, directory, sessionId), (entries) => {
+    updateEntriesInPlace(entries, update, Date.now());
+    return entries;
+  });
+}
+
 function indexTools(entries: AgentEntry[]): Map<string, number> {
   const indexes = new Map<string, number>();
   entries.forEach((entry, index) => {
@@ -534,7 +691,7 @@ function applyEntryUpdate(
           ? 'thought'
           : 'assistant';
     const last = entries.at(-1);
-    if (last?.type === role) {
+    if (last?.type === role && update.sailStartNewMessage !== true) {
       entries[entries.length - 1] = { ...last, text: last.text + block.text };
       return true;
     }
@@ -738,15 +895,36 @@ export function liveSessionView(
 ): {
   entries: AgentEntry[];
   complete: boolean;
+  messageBoundary: { pending: boolean };
   configOptions: AgentConfigOption[];
   availableCommands?: AgentCommand[];
 } {
   return {
     complete: live?.complete ?? false,
+    messageBoundary: { pending: !live?.complete },
     entries: live ? live.entries.slice() : cached,
     configOptions: state?.configOptions ?? [],
     ...(state?.availableCommands ? { availableCommands: state.availableCommands } : {}),
   };
+}
+
+/** Marks the first assistant chunk received while an incomplete transcript is being activated. */
+export function markLiveMessageBoundary(
+  update: Record<string, unknown>,
+  boundary: { pending: boolean },
+): Record<string, unknown> {
+  if (!boundary.pending || update.sessionUpdate !== 'agent_message_chunk') return update;
+  boundary.pending = false;
+  return { ...update, sailStartNewMessage: true };
+}
+
+/** A restore's live-turn snapshot can become stale before the webview receives it. */
+export function restoredLiveTurnIsCurrent(
+  turnId: string,
+  activeTurnId: string | undefined,
+  finishedTurnIds: readonly string[],
+): boolean {
+  return activeTurnId === turnId && !finishedTurnIds.includes(turnId);
 }
 
 function isConfigOption(value: unknown): value is AgentConfigOption {
@@ -792,37 +970,79 @@ function restoreSession(
   cwd: string,
   sessionId: string,
   profile: CapabilityProfile,
+  restoreToken?: string,
 ) {
-  const key = JSON.stringify([agent, cwd, sessionId, profile]);
-  const existing = restoringSessions.get(key);
+  // Explicit reservations have their own replay consumer and must never join another restore.
+  const key = restoreToken ? null : JSON.stringify([method, agent, cwd, sessionId, profile]);
+  const existing = key === null ? undefined : restoringSessions.get(key);
   if (existing) return existing;
-  // A restore replays history, so this session's kept transcript can no longer be trusted.
-  invalidateLiveTranscript(agent, cwd, sessionId);
   const live = sessionKey(agent, cwd, sessionId);
-  restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
-  const request = invoke<Record<string, unknown>>(method, {
-    agent,
-    cwd,
-    sessionId,
-    profile,
-  }).then((session) => {
+  const request = async () => {
+    let token = restoreToken;
+    let ownsToken = false;
+    if (!token) {
+      const reservation = await invoke<{ liveTurn?: string; restoreToken?: string }>(
+        'acp_begin_session_restore',
+        { agent, cwd, sessionId, profile },
+      );
+      if (reservation.liveTurn) return { sailLiveTurn: reservation.liveTurn };
+      if (!reservation.restoreToken) throw new Error('Session restore reservation is missing.');
+      token = reservation.restoreToken;
+      ownsToken = true;
+    }
+    // A replay invalidates the kept transcript only after a live turn has been ruled out.
     invalidateLiveTranscript(agent, cwd, sessionId);
-    rememberRestoredState(agent, cwd, sessionId, session);
-    return session;
-  });
-  restoringSessions.set(key, request);
-  void request
-    .finally(() => {
-      if (restoringSessions.get(key) === request) restoringSessions.delete(key);
+    restoringTranscripts.set(live, (restoringTranscripts.get(live) ?? 0) + 1);
+    try {
+      const session = await invoke<Record<string, unknown>>(method, {
+        params: { agent, cwd, sessionId, profile, restoreToken: token },
+      });
+      invalidateLiveTranscript(agent, cwd, sessionId);
+      rememberRestoredState(agent, cwd, sessionId, session);
+      return session;
+    } finally {
       const remaining = (restoringTranscripts.get(live) ?? 1) - 1;
       if (remaining > 0) restoringTranscripts.set(live, remaining);
       else restoringTranscripts.delete(live);
-    })
-    .catch(() => undefined);
-  return request;
+      if (ownsToken && token)
+        await invoke('acp_end_session_restore', {
+          agent,
+          directory: cwd,
+          sessionId,
+          restoreToken: token,
+        });
+    }
+  };
+  const pending = request();
+  if (key !== null) {
+    restoringSessions.set(key, pending);
+    void pending
+      .finally(() => {
+        if (restoringSessions.get(key) === pending) restoringSessions.delete(key);
+      })
+      .catch(() => undefined);
+  }
+  return pending;
 }
 
-const queuedPrompts = new Map<string, { agent: string; directory: string; sessionId: string }>();
+type PendingTurn = {
+  agent: AgentId;
+  directory: string;
+  sessionId: string;
+  cancelled: boolean;
+};
+
+const queuedPrompts = new Map<string, PendingTurn>();
+const workspaceTurns = new Map<string, PendingTurn>();
+
+function cancelSessionQueues(agent: AgentId, directory: string, sessionId: string): void {
+  for (const [id, target] of [...workspaceTurns, ...queuedPrompts]) {
+    if (target.agent !== agent || target.directory !== directory || target.sessionId !== sessionId)
+      continue;
+    target.cancelled = true;
+    resourceQueues.agent.cancel(id);
+  }
+}
 
 function queuedPromptKey(
   agent: AgentId,
@@ -837,15 +1057,31 @@ async function acquireTurnSlot(
   turnId: string,
   onQueue?: (limit: number | null, reason: string | null) => void,
   directory = '',
+  target?: { agent: AgentId; sessionId: string | null },
 ): Promise<() => void> {
   const queue = resourceQueues.agent;
+  const pending = target?.sessionId
+    ? { agent: target.agent, directory, sessionId: target.sessionId, cancelled: false }
+    : null;
+  if (pending) workspaceTurns.set(turnId, pending);
   if (queue.reason || queue.status.active >= queue.status.limit || queue.status.waiting)
     onQueue?.(queue.status.limit, queue.reason);
   const unsubscribe = queue.subscribe(() => {
     if (queue.isQueued(turnId)) onQueue?.(queue.status.limit, queue.reasonFor(turnId));
   });
   try {
-    return await queue.acquire(turnId, directory);
+    const release = await queue.acquire(turnId, directory);
+    if (pending?.cancelled) {
+      release();
+      throw new Error('Agent turn was cancelled.');
+    }
+    return () => {
+      if (workspaceTurns.get(turnId) === pending) workspaceTurns.delete(turnId);
+      release();
+    };
+  } catch (cause) {
+    if (workspaceTurns.get(turnId) === pending) workspaceTurns.delete(turnId);
+    throw cause;
   } finally {
     unsubscribe();
     onQueue?.(null, null);
@@ -860,6 +1096,9 @@ async function limitedConnect(
     directory?: string;
     onQueue?: (limit: number | null, reason: string | null) => void;
     signal?: AbortSignal;
+    owner?: string;
+    buildOwner?: string;
+    buildRevision?: string;
   },
 ): Promise<Record<string, unknown>> {
   if (options?.signal?.aborted) throw new Error('Agent connection was cancelled.');
@@ -870,7 +1109,16 @@ async function limitedConnect(
   try {
     release = await acquireTurnSlot(id, options?.onQueue, options?.directory ?? directory);
     if (options?.signal?.aborted) throw new Error('Agent connection was cancelled.');
-    return await invoke<Record<string, unknown>>('acp_connect', { agent, directory, profile });
+    return await invoke<Record<string, unknown>>('acp_connect', {
+      agent,
+      directory,
+      profile,
+      owner: options?.owner,
+      buildLease:
+        options?.buildOwner && options?.buildRevision
+          ? { owner: options.buildOwner, revision: options.buildRevision }
+          : undefined,
+    });
   } finally {
     options?.signal?.removeEventListener('abort', cancel);
     release?.();
@@ -887,37 +1135,46 @@ async function limitedPrompt(
   onQueue?: (limit: number | null, reason: string | null) => void,
   slotHeld = false,
 ): Promise<AcpPromptOutcome> {
-  if (slotHeld)
+  if (slotHeld) {
+    if (workspaceTurns.get(turnId)?.cancelled) throw new Error('Agent turn was cancelled.');
+    await archiveOwnedPrompt(agent, directory, sessionId, turnId, text);
     return invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
+  }
   const queueId = queuedPromptKey(agent, directory, sessionId, turnId);
-  queuedPrompts.set(queueId, { agent, directory, sessionId });
-  let release: () => void;
+  const pending = { agent, directory, sessionId, cancelled: false };
+  queuedPrompts.set(queueId, pending);
+  let release: (() => void) | null = null;
   try {
     release = await acquireTurnSlot(queueId, onQueue, directory);
-  } finally {
-    queuedPrompts.delete(queueId);
-  }
-  try {
+    if (pending.cancelled) throw new Error('Agent turn was cancelled.');
+    await archiveOwnedPrompt(agent, directory, sessionId, turnId, text);
     return await invoke<AcpPromptOutcome>('acp_prompt', {
       params: { agent, directory, sessionId, text, turnId, imagePaths },
     });
   } finally {
-    release();
+    queuedPrompts.delete(queueId);
+    release?.();
   }
 }
 
 export const acp = {
   agents: () => invoke<AgentAvailability[]>('acp_agents'),
   connect: limitedConnect,
-  create: (agent: AgentId, cwd: string, profile?: CapabilityProfile, nativeGeneration?: number) =>
+  create: (
+    agent: AgentId,
+    cwd: string,
+    profile?: CapabilityProfile,
+    nativeGeneration?: number,
+    owner?: string,
+  ) =>
     invoke<{
       sessionId: string;
       configOptions?: AgentConfigOption[];
       availableCommands?: AgentCommand[];
     }>('acp_new_session', {
-      params: { agent, cwd, profile, nativeGeneration },
+      params: { agent, cwd, profile, nativeGeneration, owner },
     }).then((session) => {
       rememberRestoredState(agent, cwd, session.sessionId, session);
       return session;
@@ -926,15 +1183,49 @@ export const acp = {
     invoke<AgentSessionListing>('acp_list_sessions', { agent, cwd, cursor, profile }),
   releaseSessionFence: (agent: AgentId, directory: string, sessionId: string) =>
     invoke<void>('acp_release_session_fence', { agent, directory, sessionId }),
-  load: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
-    restoreSession('acp_load_session', agent, cwd, sessionId, profile),
-  resume: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
-    restoreSession('acp_resume_session', agent, cwd, sessionId, profile),
-  forget: (agent: AgentId, directory: string, sessionId: string) => {
+  releaseOwner: async (directory: string, owner: string) => {
+    let archiveError: unknown;
+    try {
+      await flushOwnedTranscriptWrites(owner);
+    } catch (cause) {
+      archiveError = cause;
+    }
+    await invoke<void>('acp_release_owner', { directory, owner });
+    if (archiveError) {
+      const detail =
+        archiveError instanceof Error ? archiveError.message : 'Transcript storage failed.';
+      throw new Error(`Run ended, but its local transcript could not be saved: ${detail}`);
+    }
+  },
+  beginRestore: (agent: AgentId, cwd: string, sessionId: string, profile: CapabilityProfile) =>
+    invoke<{
+      liveTurn?: string;
+      restoreToken?: string;
+      configOptions?: AgentConfigOption[];
+      availableCommands?: AgentCommand[];
+    }>('acp_begin_session_restore', { agent, cwd, sessionId, profile }),
+  endRestore: (agent: AgentId, directory: string, sessionId: string, restoreToken: string) =>
+    invoke<void>('acp_end_session_restore', { agent, directory, sessionId, restoreToken }),
+  load: (
+    agent: AgentId,
+    cwd: string,
+    sessionId: string,
+    profile: CapabilityProfile,
+    restoreToken?: string,
+  ) => restoreSession('acp_load_session', agent, cwd, sessionId, profile, restoreToken),
+  resume: (
+    agent: AgentId,
+    cwd: string,
+    sessionId: string,
+    profile: CapabilityProfile,
+    restoreToken?: string,
+  ) => restoreSession('acp_resume_session', agent, cwd, sessionId, profile, restoreToken),
+  forget: async (agent: AgentId, directory: string, sessionId: string) => {
+    cancelSessionQueues(agent, directory, sessionId);
+    await invoke<void>('acp_forget_session', { agent, directory, sessionId });
     forgetSessionState(agent, directory, sessionId);
     forgetPlanningState({ agent, directory, sessionId });
     acpPlans().forget({ agent, directory, sessionId });
-    return invoke<void>('acp_forget_session', { agent, directory, sessionId });
   },
   prompt: (
     agent: AgentId,
@@ -947,8 +1238,10 @@ export const acp = {
     slotHeld = false,
   ) => limitedPrompt(agent, directory, sessionId, text, turnId, imagePaths, onQueue, slotHeld),
   acquireTurnSlot,
-  cancelQueuedTurn: (agent: AgentId, directory: string, sessionId: string, turnId: string) =>
-    resourceQueues.agent.cancel(queuedPromptKey(agent, directory, sessionId, turnId)),
+  cancelQueuedTurn: (agent: AgentId, directory: string, sessionId: string | null, turnId: string) =>
+    resourceQueues.agent.cancel(turnId) ||
+    (sessionId !== null &&
+      resourceQueues.agent.cancel(queuedPromptKey(agent, directory, sessionId, turnId))),
   steer: (
     agent: AgentId,
     directory: string,
@@ -968,7 +1261,8 @@ export const acp = {
         (turnId === null || target.sessionId === sessionId) &&
         (turnId === null || id === queuedPromptKey(agent, directory, sessionId, turnId)),
     );
-    for (const [id] of queued) {
+    for (const [id, pending] of queued) {
+      pending.cancelled = true;
       queuedPrompts.delete(id);
       resourceQueues.agent.cancel(id);
     }
@@ -1039,6 +1333,9 @@ export const acp = {
       sessionId,
       turnId,
     }),
+  pendingPostTurnChecks: () => invoke<AcpTurnEvidence[]>('list_pending_acp_post_turn_checks'),
+  finishPostTurnChecks: (agent: AgentId, directory: string, sessionId: string, turnId: string) =>
+    invoke<void>('finish_acp_post_turn_checks', { agent, directory, sessionId, turnId }),
   interruptedTurns: () => invoke<InterruptedAgentTurn[]>('list_interrupted_agent_turns'),
   finishInterruptedTurn: (turn: InterruptedAgentTurn) =>
     invoke<void>('finish_interrupted_agent_turn', {

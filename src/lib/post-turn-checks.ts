@@ -9,7 +9,34 @@ export type PostTurnCheck = {
   status: 'running' | 'passed' | 'failed' | 'timed_out' | 'canceled';
   output: string;
   code: number | null;
+  /** A running check was recovered after Sail restarted and has not been retried yet. */
+  restartInterrupted?: boolean;
 };
+
+export function retryInterruptedCheck(check: PostTurnCheck): boolean {
+  return check.status === 'canceled' && check.restartInterrupted === true;
+}
+
+export function hasDurableCheckOutcome(check: PostTurnCheck): boolean {
+  return (
+    check.status === 'passed' ||
+    check.status === 'failed' ||
+    check.status === 'timed_out' ||
+    (check.status === 'canceled' && !retryInterruptedCheck(check))
+  );
+}
+
+export function uniquePostTurnCheckCommands(
+  checks: Pick<PostTurnCheck, 'source' | 'command'>[],
+): Pick<PostTurnCheck, 'source' | 'command'>[] {
+  const seen = new Set<string>();
+  return checks.filter((check) => {
+    const key = JSON.stringify([check.source, check.command]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 export function personalChecks(raw: string | null): string[] {
   try {
