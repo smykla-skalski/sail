@@ -32,7 +32,18 @@ if (
 }
 const binary = join(app, 'Contents', 'MacOS', 'sail');
 const env = { ...process.env, SAIL_E2E_CONFIG_DIR: config };
-for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']) delete env[key];
+for (const key of [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_COMMON_DIR',
+  'OPENCODE_CONFIG_DIR',
+  'OPENCODE_CONFIG',
+  'OPENCODE_CONFIG_CONTENT',
+  'CLAUDE_CONFIG_DIR',
+  'CODEX_HOME',
+])
+  delete env[key];
 const run = (command, args, options = {}) =>
   execFileSync(command, args, {
     encoding: 'utf8',
@@ -247,6 +258,8 @@ try {
     `XDG_CACHE_HOME=${join(scratch, 'xdg-cache')}`,
     '--env',
     `XDG_STATE_HOME=${join(scratch, 'xdg-state')}`,
+    '--env',
+    `OPENCODE_CONFIG_DIR=${join(scratch, 'opencode-config')}`,
     app,
   ];
   try {
