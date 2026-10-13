@@ -166,8 +166,14 @@ function startClient(directory) {
   return {
     child,
     stderr: () => stderr,
-    request: async (id, method = 'tools/list') => {
-      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method }) + '\n');
+    request: async (id, method = 'tools/list', params) => {
+      if (method === 'initialize')
+        params = {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 'sail-native-fixture', version: '1.0' },
+        };
+      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
       const line = await Promise.race([
         new Promise((resolve, reject) => {
           if (lines.length) resolve(lines.shift());
@@ -289,13 +295,21 @@ try {
   assert.equal(a.id, 1);
   assert.equal(b.id, 2);
   assert.ok(a.result.pid > 0);
+  assert.equal(a.result.protocolVersion, '2025-06-18');
+  assert.equal(a.result.serverInfo.name, 'sail-fixture');
   assert.equal(a.result.pid, b.result.pid, 'one provider process serves both agents');
   assert.equal(a.result.pid, c.result.pid, 'one provider process serves all three clients');
   assert.equal(a.result.initializeCount, 1);
   assert.equal(b.result.initializeCount, 1, 'second agent reuses the provider handshake');
   assert.equal(c.result.initializeCount, 1);
   const forwarded = await Promise.all([first.request(12), second.request(13), peer.request(14)]);
-  for (const response of forwarded) assert.equal(response.result.pid, a.result.pid);
+  for (const response of forwarded) {
+    assert.equal(response.result.pid, a.result.pid);
+    assert.equal(response.result.tools[0].name, 'fixture_ping');
+  }
+  const called = await first.request(16, 'tools/call', { name: 'fixture_ping', arguments: {} });
+  assert.equal(called.result.content[0].text, 'fixture reply');
+  assert.equal(called.result.pid, a.result.pid);
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', revoked, 'fixture-provider', provider]),

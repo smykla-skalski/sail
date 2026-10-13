@@ -184,11 +184,19 @@ function callContextProvider(server, callback) {
   child.on('error', (error) => finish({ error: error.message }));
   child.on('exit', (code) => finish({ error: stderr.trim() || `Context bridge exited ${code}` }));
   child.stdin.on('error', (error) => finish({ error: error.message }));
-  for (const [id, method] of [
-    [1, 'initialize'],
-    [2, 'tools/list'],
-  ])
-    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method })}\n`);
+  child.stdin.write(
+    `${JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'sail-acp-fixture', version: '1.0' },
+      },
+    })}\n`,
+  );
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' })}\n`);
 }
 
 function terminalRequest(method, params, callback) {

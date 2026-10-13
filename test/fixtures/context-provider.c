@@ -27,8 +27,18 @@ int main(void) {
         char *end = NULL;
         long value = strtol(id + 1, &end, 10);
         if (end == id + 1) continue;
-        printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"pid\":%ld,\"initializeCount\":%d}}\n",
-               value, (long)getpid(), initialization_count);
+        const char *result = "";
+        if (strstr(line, "\"method\":\"initialize\"")) {
+            result = ",\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},"
+                     "\"serverInfo\":{\"name\":\"sail-fixture\",\"version\":\"1.0\"}";
+        } else if (strstr(line, "\"method\":\"tools/list\"")) {
+            result = ",\"tools\":[{\"name\":\"fixture_ping\",\"description\":\"Reply from the fixture\","
+                     "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]";
+        } else if (strstr(line, "\"method\":\"tools/call\"")) {
+            result = ",\"content\":[{\"type\":\"text\",\"text\":\"fixture reply\"}],\"isError\":false";
+        }
+        printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"pid\":%ld,\"initializeCount\":%d%s}}\n",
+               value, (long)getpid(), initialization_count, result);
         fflush(stdout);
     }
     free(line);
