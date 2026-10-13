@@ -27,6 +27,8 @@
   } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import TasksPanel from './TasksPanel.svelte';
+  import { sessionTasks, TASK_TOOLS } from './lib/session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
   import { updateReplayingAgentSessions } from './lib/agent-replay';
@@ -822,6 +824,8 @@
       | 'task_checkpoint_read'
       | 'task_checkpoint_update'
       | 'task_evidence_record'
+      | 'sail_tasks_read'
+      | 'sail_tasks_report'
       | 'sail_plan_propose'
       | 'sail_plan_ask'
       | 'sail_plan_step'
@@ -1451,7 +1455,7 @@
   let diffLoading = $state(false);
   let diffError = $state('');
   let selectedFilePath = $state<string | null>(null);
-  type SideTab = 'plan' | 'planhistory' | 'changes' | 'history' | 'ship';
+  type SideTab = 'tasks' | 'plan' | 'planhistory' | 'changes' | 'history' | 'ship';
   let sideTab = $state<SideTab>('plan');
   let detailsOpen = $state(true);
   let diffRefresh = 0;
@@ -2059,6 +2063,13 @@
     setSidebarWidth(width);
   }
 
+  let tasksTick = $state(0);
+  let taskSnapshot = $derived.by(() => {
+    void tasksTick;
+    return acpPlanScope
+      ? sessionTasks().snapshot(acpPlanScope)
+      : { turnId: null, revision: 0, tasks: [], focus: null };
+  });
   let acpPlanTick = $state(0);
   let acpPlanScope = $derived<PlanScope | null>(
     acpAgent && acpThread ? { agent: acpAgent, directory, sessionId: acpThread.sessionId } : null,
@@ -2080,17 +2091,19 @@
   );
   let showPlanPanel = $derived(!!nativePlan || !!acpSnapshot.plan || !!acpSnapshot.questions);
   let activeSideTab = $derived(
-    sideTab === 'ship'
-      ? 'ship'
-      : showPlanPanel && sideTab === 'plan'
-        ? 'plan'
-        : acpAgent && sideTab === 'planhistory' && acpPlanHistory.length
-          ? 'planhistory'
-          : acpAgent && sideTab !== 'history'
-            ? 'changes'
-            : sideTab === 'history'
-              ? 'history'
-              : 'changes',
+    acpAgent && sideTab === 'tasks'
+      ? 'tasks'
+      : sideTab === 'ship'
+        ? 'ship'
+        : showPlanPanel && sideTab === 'plan'
+          ? 'plan'
+          : acpAgent && sideTab === 'planhistory' && acpPlanHistory.length
+            ? 'planhistory'
+            : acpAgent && sideTab !== 'history'
+              ? 'changes'
+              : sideTab === 'history'
+                ? 'history'
+                : 'changes',
   );
   let mainDetailsVisible = $derived(
     workspaceView === 'workspace' &&
@@ -2234,6 +2247,9 @@
     let unlistenPostTurnCheckEvents: (() => void) | undefined;
     let unlistenBrowserAccess: (() => void) | undefined;
     let unlistenCoordination: (() => void) | undefined;
+    const unsubscribeTasks = sessionTasks().subscribe(() => {
+      tasksTick += 1;
+    });
     const unsubscribePlans = acpPlans().subscribe((change) => {
       acpPlanTick += 1;
       revealMainPlan(change.scope, change.reason);
@@ -2537,6 +2553,7 @@
       if (import.meta.env.MODE === 'e2e') Reflect.deleteProperty(window, 'sailE2eAcpRecoveryReady');
       unlistenBrowserAccess?.();
       unlistenCoordination?.();
+      unsubscribeTasks();
       unsubscribePlans();
       unlistenTerminalExit?.();
       unlistenAgentTerminals?.();
@@ -6444,6 +6461,18 @@
         `${requestedTool} is unavailable under the ${effectiveProfile} capability profile.`,
       );
     if (request.name === 'capability_check') return { profile: effectiveProfile };
+    if (request.name === TASK_TOOLS.read || request.name === TASK_TOOLS.report) {
+      const scope = {
+        agent: source.agent,
+        directory: request.directory,
+        sessionId: request.sessionId,
+      };
+      if (request.name === TASK_TOOLS.read) return sessionTasks().snapshot(scope);
+      const runtime = (await acp.activity(request.directory))[source.agent];
+      if (runtime?.activeTurns[request.sessionId] !== request.arguments.turnId)
+        throw new Error('Task report belongs to an inactive or different turn.');
+      return sessionTasks().report(scope, request.arguments);
+    }
     if (isPlanTool(request.name)) {
       return acpPlans().runTool(
         { agent: source.agent, directory: request.directory, sessionId: request.sessionId },
@@ -11410,6 +11439,9 @@
           directory,
         ]),
       ];
+      const taskObservations = sessionTasks()
+        .scopes()
+        .map((scope) => ({ scope, revision: sessionTasks().snapshot(scope).revision }));
       const backendActivity: Record<string, AgentActivity> = {};
       await Promise.all(
         activityDirectories.map(async (path) => {
@@ -11419,6 +11451,15 @@
         }),
       );
       if (disposed) return;
+      await Promise.all(
+        taskObservations.map(({ scope, revision: taskRevision }) => {
+          const active =
+            backendActivity[JSON.stringify([scope.directory, scope.agent])]?.activeTurns[
+              scope.sessionId
+            ];
+          return sessionTasks().reconcile(scope, active ?? null, taskRevision);
+        }),
+      );
       for (const receipt of spawnReceipts.filter(
         (item) =>
           item.provider !== 'opencode' &&
@@ -11977,6 +12018,12 @@
       const sessionId = event.message.params?.sessionId;
       const status = event.message.params?.status;
       const turnId = event.message.params?.turnId;
+      if (typeof sessionId === 'string' && typeof turnId === 'string')
+        void sessionTasks()
+          .finish({ agent: event.agent, directory: eventDirectory, sessionId }, turnId)
+          .catch((cause) => {
+            error = `Could not save task completion: ${describe(cause)}`;
+          });
       const promotionError = event.message.params?.gitPromotionError;
       if (typeof promotionError === 'string')
         error = `Private Git changes remain pending: ${promotionError}`;
@@ -12961,6 +13008,12 @@
       onpointerdown={() => focusPane('main')}
     >
       <div class="side-tabs" role="tablist" aria-label="Session detail tabs">
+        {#if acpAgent}<button
+            class:active={activeSideTab === 'tasks'}
+            role="tab"
+            aria-selected={activeSideTab === 'tasks'}
+            onclick={() => switchSideTab('tasks')}>Tasks ({taskSnapshot.tasks.length})</button
+          >{/if}
         {#if showPlanPanel && acpAgent}<button
             class:active={activeSideTab === 'plan'}
             role="tab"
@@ -12989,6 +13042,9 @@
         >
       </div>
       <div class="side-panel-body">
+        {#if acpAgent}<div class:inactive={activeSideTab !== 'tasks'} class="side-view">
+            <TasksPanel snapshot={taskSnapshot} />
+          </div>{/if}
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
             {#if acpAgent && (acpSnapshot.plan || acpSnapshot.questions)}<PlanPanel
                 snapshot={acpSnapshot}
