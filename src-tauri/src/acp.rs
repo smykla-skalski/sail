@@ -752,6 +752,15 @@ fn session_servers(browser: Value) -> Vec<Value> {
     vec![browser]
 }
 
+fn with_context_server(servers: &mut Vec<Value>, context: Option<Value>) {
+    servers.retain(|server| {
+        server.pointer("/args/0").and_then(Value::as_str) != Some("--context-mcp")
+    });
+    if let Some(context) = context {
+        servers.push(context);
+    }
+}
+
 fn per_load_mcp() -> bool {
     std::env::var("SAIL_ACP_PER_LOAD_MCP").as_deref() == Ok("1")
 }
@@ -5228,7 +5237,11 @@ pub async fn acp_new_session(
             Some(profile.as_str()),
             crate::background_priority::enabled(&app),
         )?;
-        let servers = session_servers(mcp_server(&config));
+        let mut servers = session_servers(mcp_server(&config));
+        with_context_server(
+            &mut servers,
+            crate::context::provider_mcp_server(&app, Path::new(&cwd)),
+        );
         let _serial = runtime
             .session_creation
             .lock()
@@ -5784,7 +5797,7 @@ async fn restore_session(
                             .get(&session_id)
                             .copied()
                             .unwrap_or(0);
-                        let (params, minted_token) = {
+                        let (mut params, minted_token) = {
                             let mut configs = runtime
                                 .session_configs
                                 .lock()
@@ -5820,6 +5833,17 @@ async fn restore_session(
                                 |token| browser.release(token),
                             )?
                         };
+                        let context = crate::context::provider_mcp_server(&app, Path::new(&cwd));
+                        if let Some(servers) =
+                            params.get_mut("mcpServers").and_then(Value::as_array_mut)
+                        {
+                            with_context_server(servers, context);
+                            if let Ok(mut configs) = runtime.session_configs.lock() {
+                                if let Some(config) = configs.get_mut(&session_id) {
+                                    config.servers = servers.clone();
+                                }
+                            }
+                        }
                         Ok((forget_generation, params, minted_token))
                     },
                 )?;
@@ -7027,6 +7051,20 @@ fn spawn_test_session_process() -> std::process::Child {
 mod session_config_tests {
     use super::*;
     use crate::browser_agent::McpConfig;
+
+    #[test]
+    fn context_server_is_optional_and_registered_once() {
+        let browser = json!({"name":"sail-browser", "args":["--browser-mcp"]});
+        let context = json!({"name":"project-files", "args":["--context-mcp", "/project"]});
+        let mut servers = session_servers(browser.clone());
+        with_context_server(&mut servers, None);
+        assert_eq!(servers, vec![browser.clone()]);
+        with_context_server(&mut servers, Some(context.clone()));
+        with_context_server(&mut servers, Some(context.clone()));
+        assert_eq!(servers, vec![browser.clone(), context]);
+        with_context_server(&mut servers, None);
+        assert_eq!(servers, vec![browser]);
+    }
     use std::collections::BTreeMap;
 
     #[test]
