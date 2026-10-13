@@ -2246,6 +2246,45 @@ fn ensure_expected_worktree_generation(
     Ok(())
 }
 
+fn tracked_worktree_matches_head(root: &Path) -> Result<bool, String> {
+    // A fresh index has no cached file stats, so refresh must read tracked content.
+    let temporary =
+        std::env::temp_dir().join(format!("sail-worktree-check-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&temporary)
+        .map_err(|error| format!("Cannot prepare worktree content check: {error}"))?;
+    let index = temporary.join("index");
+    let result = (|| {
+        let tree = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "core.fsmonitor=false", "read-tree", "HEAD"])
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .map_err(|error| format!("Cannot inspect tracked worktree files: {error}"))?;
+        if !tree.status.success() {
+            return Err("Cannot inspect tracked worktree files before deletion.".into());
+        }
+        let refresh = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.ignoreStat=false",
+                "update-index",
+                "--really-refresh",
+            ])
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .map_err(|error| format!("Cannot inspect tracked worktree files: {error}"))?;
+        Ok(refresh.status.success())
+    })();
+    std::fs::remove_dir_all(&temporary)
+        .map_err(|error| format!("Cannot finish worktree content check: {error}"))?;
+    result
+}
+
 fn worktree_preview_state_with_hook<F>(
     root: &Path,
     after_status: F,
@@ -2271,6 +2310,7 @@ where
             root.display()
         ));
     }
+    let dirty = !status.stdout.is_empty() || !tracked_worktree_matches_head(root)?;
     after_status();
     if git_directory_revision(root)? != revision {
         return Err(format!(
@@ -2278,7 +2318,7 @@ where
             root.display()
         ));
     }
-    Ok((revision, !status.stdout.is_empty()))
+    Ok((revision, dirty))
 }
 
 #[tauri::command]
@@ -4087,6 +4127,12 @@ where
                     .into(),
             );
         }
+        if expected_generation.is_some() && !tracked_worktree_matches_head(&worktree)? {
+            return Err(
+                "Worktree contains modified or untracked files. Clean it and retry deletion."
+                    .into(),
+            );
+        }
         Ok(())
     };
     ensure_nonforce_clean()?;
@@ -4224,6 +4270,9 @@ where
                 return Err("Cannot inspect the staged worktree files before deletion.".into());
             }
             if !status.stdout.is_empty() {
+                return Err("Worktree contains modified, untracked or ignored files. Clean it and retry deletion.".into());
+            }
+            if !tracked_worktree_matches_head(removal_target)? {
                 return Err("Worktree contains modified, untracked or ignored files. Clean it and retry deletion.".into());
             }
         } else {
@@ -6267,6 +6316,119 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read_to_string(&late_file).unwrap(), "must survive");
+        assert_eq!(
+            worktree_storage::generation(Path::new(&worktree)).unwrap(),
+            generation
+        );
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_removal_preserves_hidden_tracked_edit_before_preview() {
+        let (root, repository, worktree, revision) =
+            ignored_archive_fixture("sail-removal-hidden-tracked-edit");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        let tracked = Path::new(&worktree).join("tracked.txt");
+        fs::File::open(&tracked)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+            .unwrap();
+        git(&worktree, &["update-index", "--refresh"]);
+        git(&worktree, &["config", "core.trustctime", "false"]);
+        git(&worktree, &["config", "core.checkStat", "minimal"]);
+        let modified = fs::metadata(&tracked).unwrap().modified().unwrap();
+        fs::write(&tracked, "change\n").unwrap();
+        fs::File::open(&tracked)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty());
+
+        let (_, dirty) = worktree_preview_state_with_hook(Path::new(&worktree), || {}).unwrap();
+        assert!(dirty);
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+        let error = remove_worktree_guarded(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            Some("child"),
+            Some(&generation),
+        )
+        .unwrap_err();
+        assert!(error.contains("modified or untracked files"), "{error}");
+        assert_eq!(fs::read_to_string(&tracked).unwrap(), "change\n");
+        remove_worktree(repository, worktree, Some(true), None, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guarded_removal_preserves_hidden_tracked_edit_after_staging() {
+        let (root, repository, worktree, revision) =
+            ignored_archive_fixture("sail-removal-staged-hidden-edit");
+        fs::remove_file(Path::new(&worktree).join("one.tmp")).unwrap();
+        fs::remove_file(Path::new(&worktree).join("two.tmp")).unwrap();
+        let tracked = Path::new(&worktree).join("tracked.txt");
+        fs::File::open(&tracked)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+            .unwrap();
+        git(&worktree, &["update-index", "--refresh"]);
+        git(&worktree, &["config", "core.trustctime", "false"]);
+        git(&worktree, &["config", "core.checkStat", "minimal"]);
+        let generation = worktree_storage::generation(Path::new(&worktree)).unwrap();
+
+        let error = remove_worktree_with_hooks(
+            repository.clone(),
+            worktree.clone(),
+            Some(true),
+            Some(&revision),
+            Some("child"),
+            Some(&generation),
+            (
+                || Ok(()),
+                || Ok(()),
+                || Ok(()),
+                |staged| {
+                    let tracked = staged.join("tracked.txt");
+                    let modified = fs::metadata(&tracked).unwrap().modified().unwrap();
+                    fs::write(&tracked, "change\n").unwrap();
+                    fs::File::open(&tracked)
+                        .unwrap()
+                        .set_modified(modified)
+                        .unwrap();
+                    let status = Command::new("git")
+                        .arg("-C")
+                        .arg(staged)
+                        .args(["status", "--porcelain=v1"])
+                        .output()
+                        .unwrap();
+                    assert!(status.status.success());
+                    assert!(status.stdout.is_empty());
+                    Ok(())
+                },
+                || Ok(()),
+            ),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("modified, untracked or ignored files"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(Path::new(&worktree).join("tracked.txt")).unwrap(),
+            "change\n"
+        );
         assert_eq!(
             worktree_storage::generation(Path::new(&worktree)).unwrap(),
             generation
