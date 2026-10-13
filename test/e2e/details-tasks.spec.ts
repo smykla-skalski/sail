@@ -92,5 +92,35 @@ describe('Tasks default details tab', () => {
       'true',
     );
     await expect($('#session-details')).not.toBeDisplayed();
+    const splitId = await $('.pane-leaf.focused').getAttribute('data-pane-id');
+    await browser.execute(() => {
+      const saved = JSON.parse(localStorage.getItem('sai-session-tasks') ?? '[]');
+      const session = saved.find((item: { snapshot: { tasks: { id: string }[] } }) =>
+        item.snapshot.tasks.some((task) => task.id === 'smoke'),
+      );
+      if (!session) throw new Error('Split task report was not persisted');
+      session.snapshot.tasks = Array.from({ length: 100 }, (_, index) => ({
+        id: `long-${index}`,
+        title: `Task ${index + 1}`,
+        status: 'done',
+        origin: 'agent',
+        turnId: 'completed-turn',
+      }));
+      localStorage.setItem('sai-session-tasks', JSON.stringify(saved));
+    });
+    await browser.refresh();
+    await $(`.pane-leaf[data-pane-id="${splitId}"] .agent-header`).click();
+    await toggleDetails();
+    const taskList = $('.pane-leaf.focused .tasks-view');
+    await expect(taskList).toHaveText(expect.stringContaining('Task 100'));
+    await taskList.click();
+    await browser.keys(['Control', 'End']);
+    await browser.waitUntil(async () =>
+      browser.execute(() => {
+        const viewport = document.querySelector('.pane-leaf.focused .tasks-view')!;
+        const last = viewport.querySelector('li:last-child')!;
+        return last.getBoundingClientRect().bottom <= viewport.getBoundingClientRect().bottom;
+      }),
+    );
   });
 });

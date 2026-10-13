@@ -943,7 +943,14 @@
                   >
                 </nav>
                 {#if acpTab === 'tasks'}
-                  <TasksPanel snapshot={taskSnapshot} />
+                  <div
+                    class="tasks-view"
+                    role="tabpanel"
+                    aria-label="Session task list"
+                    tabindex="0"
+                  >
+                    <TasksPanel snapshot={taskSnapshot} />
+                  </div>
                 {:else if acpTab === 'plan' && (acpSnapshot.plan || acpSnapshot.questions)}
                   <PlanPanel
                     snapshot={acpSnapshot}
