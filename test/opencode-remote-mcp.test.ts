@@ -50,13 +50,18 @@ function runProbe(binary: string) {
   return probeResultSchema.parse(JSON.parse(stdout));
 }
 
-await test('the probe serves HTTP requests while its client command is running', () => {
-  const scratch = mkdtempSync(join(tmpdir(), 'sail-660-probe-test-'));
-  try {
-    const binary = join(scratch, 'fixture-client.mjs');
-    writeFileSync(
-      binary,
-      `#!/usr/bin/env node
+await test(
+  'the probe serves HTTP requests while its client command is running',
+  {
+    skip: process.platform === 'win32' ? 'the fixture requires POSIX executable scripts' : false,
+  },
+  () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'sail-660-probe-test-'));
+    try {
+      const binary = join(scratch, 'fixture-client.mjs');
+      writeFileSync(
+        binary,
+        `#!/usr/bin/env node
 import { readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 if (args[0] === '--version') {
@@ -99,18 +104,19 @@ if (args[0] === '--version') {
   }
 }
 `,
-      { mode: 0o700 },
-    );
-    const result = runProbe(binary);
-    assert.equal(result.status, 'complete');
-    assert.deepEqual(
-      result.findings.filter((finding) => !finding.pass).map((finding) => finding.id),
-      [],
-    );
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
-  }
-});
+        { mode: 0o700 },
+      );
+      const result = runProbe(binary);
+      assert.equal(result.status, 'complete');
+      assert.deepEqual(
+        result.findings.filter((finding) => !finding.pass).map((finding) => finding.id),
+        [],
+      );
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  },
+);
 
 await test('the pinned OpenCode client registers, replaces, removes, and authenticates remote MCP servers', async (t) => {
   const binary = openCodeBinary();
