@@ -21,6 +21,7 @@ const SnapshotSchema = z.strictObject({
   revision: z.number().int().nonnegative(),
   tasks: z.array(TaskSchema).max(200),
   focus: z.string().nullable(),
+  reportedAt: z.number().finite().nonnegative().nullable().optional(),
 });
 export type TaskSnapshot = z.infer<typeof SnapshotSchema>;
 const SavedSchema = z.object({
@@ -39,7 +40,13 @@ export interface TaskStorage {
   read(): string | null;
   write(value: string): Promise<void>;
 }
-const empty = (): TaskSnapshot => ({ turnId: null, revision: 0, tasks: [], focus: null });
+const empty = (): TaskSnapshot => ({
+  turnId: null,
+  revision: 0,
+  tasks: [],
+  focus: null,
+  reportedAt: null,
+});
 const storageKey = 'sai-session-tasks';
 
 export function createTaskStore(storage: TaskStorage, clock = Date.now) {
@@ -110,6 +117,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           ...before,
           turnId: null,
           focus: null,
+          reportedAt: null,
           revision: before.revision + 1,
         });
       });
@@ -134,6 +142,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           revision: before.revision + 1,
           tasks: [...before.tasks.filter((item) => item.id !== task.id).slice(-199), task],
           focus: task.id,
+          reportedAt: null,
         });
         localTurns.set(taskScopeKey(scope), turnId);
         return started;
@@ -183,6 +192,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           revision: before.revision + 1,
           tasks: [...history, ...current],
           focus: report.focus,
+          reportedAt: clock(),
         });
       });
     },
@@ -195,6 +205,7 @@ export function createTaskStore(storage: TaskStorage, clock = Date.now) {
           ...before,
           turnId: null,
           focus: null,
+          reportedAt: null,
           revision: before.revision + 1,
         });
       });

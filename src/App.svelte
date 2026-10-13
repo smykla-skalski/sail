@@ -27,8 +27,9 @@
   } from './lib/activity-history';
   import Markdown from './Markdown.svelte';
   import PlanPanel from './PlanPanel.svelte';
+  import { agentFocusDisplay, type AgentFocusDisplay } from './lib/agent-focus';
   import TasksPanel from './TasksPanel.svelte';
-  import { sessionTasks, TASK_TOOLS } from './lib/session-tasks';
+  import { sessionTasks, TASK_TOOLS, taskScopeKey } from './lib/session-tasks';
   import PlanHistoryPanel from './PlanHistoryPanel.svelte';
   import { acpPlanBackend, acpPlans, planKey, type PlanScope } from './lib/acp-plans';
   import { updateReplayingAgentSessions } from './lib/agent-replay';
@@ -1133,13 +1134,32 @@
         ]),
     ),
   );
+  let focusActiveTurns = $state<Record<string, string>>({});
+  let focusByThread = $derived.by(() => {
+    void tasksTick;
+    const result: Record<string, AgentFocusDisplay> = {};
+    for (const thread of Object.values(sidebarThreads).flat()) {
+      const key = threadKey(thread);
+      const focus = agentFocusDisplay(
+        sessionTasks().snapshot(thread),
+        taskOverviewStatuses[key] ?? null,
+        focusActiveTurns[key] ?? null,
+      );
+      if (focus) result[key] = focus;
+    }
+    return result;
+  });
   let taskOverviewAgentNames = $derived(
     Object.fromEntries([
       ['opencode', 'OpenCode'],
       ...agentAvailability.map((agent) => [agent.id, agent.name]),
     ]),
   );
-  let agentStatusThreads = $derived([...agentThreads, ...sidebarOpenCodeThreads]);
+  let agentStatusThreads = $derived([
+    ...agentThreads,
+    ...nativeChildThreads,
+    ...sidebarOpenCodeThreads,
+  ]);
   let agentStatusStatuses = $derived(
     Object.fromEntries(
       agentStatusThreads.map((thread) => [
@@ -1162,6 +1182,7 @@
       agentNames: taskOverviewAgentNames,
       usage: agentUsage,
       rates: agentRates,
+      focusByThread,
     }),
   );
   let sidebarDirectoryKey = $derived(
@@ -6471,7 +6492,10 @@
       const runtime = (await acp.activity(request.directory))[source.agent];
       if (runtime?.activeTurns[request.sessionId] !== request.arguments.turnId)
         throw new Error('Task report belongs to an inactive or different turn.');
-      return sessionTasks().report(scope, request.arguments);
+      const snapshot = await sessionTasks().report(scope, request.arguments);
+      if (snapshot.turnId)
+        focusActiveTurns = { ...focusActiveTurns, [taskScopeKey(scope)]: snapshot.turnId };
+      return snapshot;
     }
     if (isPlanTool(request.name)) {
       return acpPlans().runTool(
@@ -11475,6 +11499,15 @@
         if (attempt < 2) await restoreAgentActivity(attempt + 1);
         return;
       }
+      focusActiveTurns = Object.fromEntries(
+        agentThreads.flatMap((thread) => {
+          const turn =
+            backendActivity[JSON.stringify([thread.directory, thread.agent])]?.activeTurns[
+              thread.sessionId
+            ];
+          return turn ? [[threadKey(thread), turn]] : [];
+        }),
+      );
       const previousAttention = threadAttention;
       threadAttention = reconcileAttention(
         threadAttention,
@@ -12829,6 +12862,7 @@
         agentNames={taskOverviewAgentNames}
         checks={postTurnResults}
         receipts={visibleSpawnReceipts}
+        {focusByThread}
         {directory}
         onopen={openTaskOverviewTarget}
         onopencheck={openTaskOverviewCheck}
@@ -13043,7 +13077,10 @@
       </div>
       <div class="side-panel-body">
         {#if acpAgent}<div class:inactive={activeSideTab !== 'tasks'} class="side-view">
-            <TasksPanel snapshot={taskSnapshot} />
+            <TasksPanel
+              snapshot={taskSnapshot}
+              status={acpThread ? (taskOverviewStatuses[threadKey(acpThread)] ?? null) : null}
+            />
           </div>{/if}
         {#if showPlanPanel}<div class:inactive={activeSideTab !== 'plan'} class="side-view">
             {#if acpAgent && (acpSnapshot.plan || acpSnapshot.questions)}<PlanPanel

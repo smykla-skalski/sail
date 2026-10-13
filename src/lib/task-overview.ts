@@ -1,3 +1,4 @@
+import type { AgentFocusDisplay } from './agent-focus.ts';
 import type { AgentThread } from './acp.ts';
 import type { SpawnReceipt } from './agent-results.ts';
 import type { ThreadStatus } from './attention.ts';
@@ -27,6 +28,13 @@ export type TaskOverviewCard = {
   check: PostTurnCheck | null;
   setupFailed: boolean;
   setupPending: boolean;
+  agentFocus: {
+    key: string;
+    agent: string;
+    agentName: string;
+    title: string;
+    focus: AgentFocusDisplay;
+  }[];
 };
 
 export type TaskOverviewPreferences = {
@@ -98,6 +106,7 @@ export function buildTaskOverviewCards(input: {
   agentNames: Record<string, string>;
   checks: PostTurnCheck[];
   receipts: SpawnReceipt[];
+  focusByThread?: Record<string, AgentFocusDisplay>;
 }): TaskOverviewCard[] {
   const checksByDirectory = new Map<string, PostTurnCheck[]>();
   for (const check of input.checks) {
@@ -199,6 +208,23 @@ export function buildTaskOverviewCards(input: {
       check: failedCheck ?? recentCheck ?? null,
       setupFailed: location.setupFailed,
       setupPending: location.setupPending,
+      agentFocus: [
+        ...new Map(threads.map((thread) => [threadKey(thread), thread])).values(),
+      ].flatMap((thread) => {
+        const key = threadKey(thread);
+        const focus = input.focusByThread?.[key];
+        return focus && ['working', 'waiting'].includes(input.statuses[key] ?? '')
+          ? [
+              {
+                key,
+                agent: thread.agent,
+                agentName: input.agentNames[thread.agent] ?? thread.agent,
+                title: thread.title,
+                focus,
+              },
+            ]
+          : [];
+      }),
     };
   });
 }

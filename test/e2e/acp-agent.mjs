@@ -145,7 +145,7 @@ function callWorktreeList(server, callback) {
   request(2, 'tools/call', { name: 'worktree_list', arguments: {} });
 }
 
-function reportSessionTasks(server, callback) {
+function reportSessionTasks(server, callback, focusDuration = 1500) {
   const child = spawn(server.command, server.args ?? [], {
     env: {
       ...process.env,
@@ -194,7 +194,7 @@ function reportSessionTasks(server, callback) {
               tasks: [{ id: 'smoke', title: 'Test live tasks', status: 'done' }],
               focus: null,
             }),
-          1500,
+          focusDuration,
         );
       } else if (response.id === 4) finish('Task reporting passed');
     } catch (error) {
@@ -542,17 +542,21 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
-    if (text === 'Report session tasks') {
+    if (text === 'Report session tasks' || text === 'Report session focus') {
       const server = sessions
         .get(sessionId)
         .mcpServers.find((item) => item.name === 'sail-browser');
-      reportSessionTasks(server, (result) => {
-        recordUpdate(sessionId, sessionId, {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: result },
-        });
-        send({ id: message.id, result: { stopReason: 'end_turn' } });
-      });
+      reportSessionTasks(
+        server,
+        (result) => {
+          recordUpdate(sessionId, sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: result },
+          });
+          send({ id: message.id, result: { stopReason: 'end_turn' } });
+        },
+        text === 'Report session focus' ? 12_000 : 1500,
+      );
       continue;
     }
     if (text === 'Long owned history') {
