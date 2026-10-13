@@ -109,6 +109,80 @@ await test('canonicalizes a saved repository without losing its group', () => {
   assert.deepEqual(normalized.groups[0].repositories, ['/private/var/repo']);
 });
 
+await test('canonicalizing a saved alias preserves pending and canonical worktrees across restart', () => {
+  const pending = {
+    originalPath: '/alias/child',
+    recoveryPath: '/alias/child',
+    sizeBytes: 12,
+    reason: 'Selected checkout cleanup is pending.',
+  };
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/alias', '/canonical'],
+      worktrees: {
+        '/alias': [
+          { path: '/alias/child', branch: 'alias-child', pendingCleanup: pending },
+          {
+            path: '/shared',
+            branch: 'shared',
+            pendingCleanup: {
+              ...pending,
+              originalPath: '/shared',
+              recoveryPath: '/shared',
+            },
+          },
+        ],
+        '/canonical': [
+          { path: '/canonical/child', branch: 'canonical-child' },
+          { path: '/shared', branch: 'shared' },
+        ],
+      },
+    }),
+    '',
+  );
+  const migrated = replaceRepositoryPath(catalog, '/alias', '/canonical');
+  const restored = loadProjectCatalog(JSON.stringify(migrated), '');
+  assert.deepEqual(restored.repositories, ['/canonical']);
+  assert.deepEqual(
+    restored.worktrees['/canonical'].map((worktree) => worktree.path),
+    ['/alias/child', '/shared', '/canonical/child'],
+  );
+  assert.deepEqual(restored.worktrees['/canonical'][0].pendingCleanup, pending);
+  assert.equal(restored.worktrees['/canonical'][1].pendingCleanup?.recoveryPath, '/shared');
+});
+
+await test('canonicalization refuses conflicting generations without changing the saved catalog', () => {
+  const catalog = loadProjectCatalog(
+    JSON.stringify({
+      repositories: ['/alias', '/canonical'],
+      worktrees: {
+        '/alias': [
+          {
+            path: '/shared',
+            branch: 'old',
+            generation: testGeneration(1),
+            pendingCleanup: {
+              originalPath: '/shared',
+              recoveryPath: '/shared',
+              sizeBytes: 12,
+              reason: 'Selected checkout cleanup is pending.',
+            },
+          },
+        ],
+        '/canonical': [{ path: '/shared', branch: 'new', generation: testGeneration(2) }],
+      },
+    }),
+    '',
+  );
+  assert.throws(
+    () => replaceRepositoryPath(catalog, '/alias', '/canonical'),
+    /Cannot merge conflicting saved worktrees at \/shared/,
+  );
+  assert.equal(catalog.worktrees['/alias'][0].generation, testGeneration(1));
+  assert.equal(catalog.worktrees['/alias'][0].pendingCleanup?.recoveryPath, '/shared');
+  assert.equal(catalog.worktrees['/canonical'][0].generation, testGeneration(2));
+});
+
 await test('restores collapsed projects and follows repository path changes', () => {
   const catalog = loadProjectCatalog(
     JSON.stringify({

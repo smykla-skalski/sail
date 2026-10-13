@@ -10521,6 +10521,7 @@
         setSetting('sai-directory', repository);
         return;
       }
+      const canonicalCatalog = replaceRepositoryPath(projectCatalog, path, repository);
       if (paneLayouts[path]) {
         paneLayouts = {
           ...paneLayouts,
@@ -10529,7 +10530,7 @@
         delete paneLayouts[path];
         persistPaneLayouts();
       }
-      saveProjectCatalog(replaceRepositoryPath(projectCatalog, path, repository));
+      saveProjectCatalog(canonicalCatalog);
       const knownThreads = [...agentThreads, ...nativeThreads, ...sidebarOpenCodeThreads];
       if (recentCycleKeys) {
         const selectedKey = recentCycleKeys[recentCycleIndex];

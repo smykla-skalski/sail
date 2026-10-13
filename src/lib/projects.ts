@@ -639,18 +639,35 @@ export function replaceRepositoryPath(
         return true;
       }),
   }));
-  const worktrees = Object.fromEntries(
-    Object.entries(catalog.worktrees).map(([parent, entries]) => [
-      parent === oldPath ? canonicalPath : parent,
-      entries.map((entry) => ({
+  const worktrees: ProjectCatalog['worktrees'] = {};
+  for (const [parent, entries] of Object.entries(catalog.worktrees)) {
+    const destination = parent === oldPath ? canonicalPath : parent;
+    const merged = (worktrees[destination] ??= []);
+    for (const entry of entries) {
+      const renamed = {
         ...entry,
         path: entry.path === oldPath ? canonicalPath : entry.path,
         ...(entry.origin?.sourcePath === oldPath
           ? { origin: { ...entry.origin, sourcePath: canonicalPath } }
           : {}),
-      })),
-    ]),
-  );
+      };
+      const index = merged.findIndex((saved) => saved.path === renamed.path);
+      if (index < 0) {
+        merged.push(renamed);
+        continue;
+      }
+      const saved = merged[index];
+      if (
+        saved.generation !== renamed.generation ||
+        (saved.pendingCleanup &&
+          renamed.pendingCleanup &&
+          JSON.stringify(saved.pendingCleanup) !== JSON.stringify(renamed.pendingCleanup))
+      )
+        throw new Error(`Cannot merge conflicting saved worktrees at ${renamed.path}`);
+      if (renamed.pendingCleanup || (parent === canonicalPath && !saved.pendingCleanup))
+        merged[index] = renamed;
+    }
+  }
   return {
     ...remaining,
     repositories,
