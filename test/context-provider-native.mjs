@@ -177,22 +177,25 @@ function startClient(directory) {
           clientInfo: { name: 'sail-native-fixture', version: '1.0' },
         };
       child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-      for (;;) {
-        const line = await Promise.race([
+      const controller = new AbortController();
+      const timeout = delay(30_000, undefined, { signal: controller.signal }).then(() => {
+        throw new Error('Provider response timed out');
+      });
+      const readResponse = () =>
+        Promise.race([
           new Promise((resolve, reject) => {
             if (lines.length) resolve(lines.shift());
             else if (exited) reject(new Error(stderr.trim()));
             else waiters.push({ resolve, reject });
           }),
-          delay(30_000).then(() => {
-            throw new Error('Provider response timed out');
-          }),
-        ]);
-        const response = JSON.parse(line);
-        if (response.method && response.id === undefined) continue;
-        assert.equal(response.id, id);
-        return response;
-      }
+          timeout,
+        ]).then((line) => {
+          const response = JSON.parse(line);
+          if (response.method && response.id === undefined) return readResponse();
+          assert.equal(response.id, id);
+          return response;
+        });
+      return readResponse().finally(() => controller.abort());
     },
     waitForExit: () =>
       Promise.race([
