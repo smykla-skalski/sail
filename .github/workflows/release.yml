@@ -367,9 +367,14 @@ jobs:
       - name: Configure private fixture paths
         shell: bash
         run: |
-          private="$RUNNER_TEMP/sail-553-$GITHUB_RUN_ID"
+          test -n "${HOME:-}"
+          mkdir -p "$HOME/Applications"
+          private="$(mktemp -d "$HOME/Applications/sail-553-context.XXXXXX")"
+          mkdir -p "$private/tmp"
           {
-            echo "SAIL_E2E_CONFIG_DIR=$private/config"
+            echo "SAIL_CONTEXT_AUTH_ROOT=$private"
+            echo "TMPDIR=$private/tmp"
+            echo "SAIL_E2E_CONFIG_DIR=$private/tmp/config"
             echo "SAIL_TEST_SCRATCH=$private/test"
             echo "CARGO_TARGET_DIR=$private/target"
             echo "npm_config_cache=$private/npm-cache"
@@ -395,7 +400,7 @@ jobs:
           test -n "$APPLE_CERTIFICATE"
           test -n "$APPLE_CERTIFICATE_PASSWORD"
           test -n "$APPLE_SIGNING_IDENTITY"
-          private="$RUNNER_TEMP/sail-553-$GITHUB_RUN_ID"
+          private="$SAIL_CONTEXT_AUTH_ROOT"
           mkdir -p "$private"
           certificate="$private/certificate.p12"
           keychain="$private/signing.keychain-db"
@@ -418,18 +423,35 @@ jobs:
           apps=("$CARGO_TARGET_DIR"/debug/bundle/macos/*.app)
           test "${#apps[@]}" -eq 1
           codesign --verify --deep --strict "${apps[0]}"
+          codesign --verify -v -R '=anchor apple generic' "${apps[0]}"
           test "$(codesign -dv --verbose=4 "${apps[0]}" 2>&1 | sed -n 's/^Signature=//p')" != 'adhoc'
           echo "SAIL_E2E_APP=${apps[0]}" >> "$GITHUB_ENV"
 
+      - name: Export signed private provider bundles
+        if: inputs.context_auth_export
+        run: node scripts/export-context-auth-fixture.mjs
+        env:
+          SAIL_CONTEXT_AUTH_EXPORT_CONFIG: ${{ inputs.context_auth_export_config }}
+          SAIL_CONTEXT_AUTH_EXPORT_TMPDIR: ${{ inputs.context_auth_export_tmpdir }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: inputs.context_auth_export
+        with:
+          name: signed-context-provider-${{ github.sha }}
+          path: ${{ env.SAIL_CONTEXT_AUTH_ROOT }}/artifact/*.app.zip
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Exercise signed provider relay
+        if: '!inputs.context_auth_export'
         run: node test/context-provider-native.mjs
 
       - name: Remove private signing material and state
         if: always()
         shell: bash
         run: |
-          private="$RUNNER_TEMP/sail-553-$GITHUB_RUN_ID"
-          if [[ -n "$private" && "$private" == "$RUNNER_TEMP"/sail-553-* ]]; then
+          private="${SAIL_CONTEXT_AUTH_ROOT:-}"
+          if [[ -n "$private" && -n "${HOME:-}" && "$(dirname "$private")" == "$HOME/Applications" && "$(basename "$private")" == sail-553-context.* ]]; then
             security delete-keychain "$private/signing.keychain-db" 2>/dev/null || true
             rm -rf "$private"
           fi

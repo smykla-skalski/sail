@@ -1,20 +1,41 @@
 import assert from 'node:assert/strict';
 import { spawn, execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer } from 'node:net';
-import { join } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import process from 'node:process';
 
 const app = process.env.SAIL_E2E_APP;
 const config = process.env.SAIL_E2E_CONFIG_DIR;
 const scratch = process.env.SAIL_TEST_SCRATCH;
+const temporary = process.env.TMPDIR;
 assert.ok(
-  app && config && scratch && process.env.APPLE_SIGNING_IDENTITY,
-  'Set private SAIL_E2E_APP, SAIL_E2E_CONFIG_DIR, SAIL_TEST_SCRATCH, and APPLE_SIGNING_IDENTITY',
+  app && config && scratch && temporary && isAbsolute(temporary),
+  'Set private SAIL_E2E_APP, SAIL_E2E_CONFIG_DIR, SAIL_TEST_SCRATCH, and TMPDIR',
 );
 const binary = join(app, 'Contents', 'MacOS', 'sail');
 const env = { ...process.env, SAIL_E2E_CONFIG_DIR: config };
+for (const key of [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_COMMON_DIR',
+  'OPENCODE_CONFIG_DIR',
+  'OPENCODE_CONFIG',
+  'OPENCODE_CONFIG_CONTENT',
+  'CLAUDE_CONFIG_DIR',
+  'CODEX_HOME',
+])
+  delete env[key];
 const run = (command, args) =>
   execFileSync(command, args, {
     encoding: 'utf8',
@@ -22,12 +43,39 @@ const run = (command, args) =>
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
+for (const directory of [run('getconf', ['DARWIN_USER_TEMP_DIR']), '/tmp']) {
+  const path = relative(realpathSync(directory), realpathSync(app));
+  assert.ok(
+    path === '..' || path.startsWith('../') || isAbsolute(path),
+    'Install SAIL_E2E_APP outside macOS temporary directories; see docs/context-auth-native.md',
+  );
+}
 const signature = spawnSync('codesign', ['-dv', '--verbose=4', app], {
   encoding: 'utf8',
 });
 assert.equal(signature.status, 0, signature.stderr);
 assert.doesNotMatch(signature.stderr, /^Signature=adhoc$/m);
 run('codesign', ['--verify', '--deep', '--strict', app]);
+run('codesign', ['--verify', '-v', '-R', '=anchor apple generic', app]);
+const bundleId = run('plutil', [
+  '-extract',
+  'CFBundleIdentifier',
+  'raw',
+  '-o',
+  '-',
+  join(app, 'Contents/Info.plist'),
+]);
+assert.match(bundleId, /^dev\.smykla\.sail\.e2e\.[a-f0-9]{32}$/);
+const label = `${bundleId}.context-supervisor`;
+const plist = join(app, 'Contents/Library/LaunchAgents', `${label}.plist`);
+for (const [key, value] of [
+  ['SAIL_E2E_CONFIG_DIR', config],
+  ['TMPDIR', temporary],
+])
+  assert.equal(
+    run('plutil', ['-extract', `EnvironmentVariables.${key}`, 'raw', '-o', '-', plist]),
+    value,
+  );
 
 const port = await new Promise((resolve, reject) => {
   const server = createServer();
@@ -67,6 +115,10 @@ function makeProject(directory, command) {
     }),
   );
   run('git', ['init', '-q', directory]);
+  assert.equal(
+    run('git', ['-C', directory, 'rev-parse', '--show-toplevel']),
+    realpathSync(directory),
+  );
   run('git', ['-C', directory, 'add', '.sail']);
   run('git', [
     '-C',
@@ -166,6 +218,7 @@ async function waitForProcessExit(pid, attempt = 0) {
 }
 
 try {
+  mkdirSync(join(root, 'home'), { recursive: true });
   makeProject(project, 'fixture-provider');
   makeProject(broken, 'broken-provider');
   makeProject(revoked, 'fixture-provider');
@@ -184,11 +237,21 @@ try {
     '-n',
     '-g',
     '--env',
+    `HOME=${join(root, 'home')}`,
+    '--env',
     `SAIL_E2E_CONFIG_DIR=${config}`,
+    '--env',
+    `TMPDIR=${temporary}`,
     '--env',
     `TAURI_WEBDRIVER_PORT=${port}`,
     '--env',
     `SAIL_WORKTREE_ROOT=${join(root, 'worktrees')}`,
+    '--env',
+    `SAIL_E2E_BINARY=${binary}`,
+    '--env',
+    `SAIL_ACP_TEST_AGENT=${join(process.cwd(), 'test', 'e2e', 'acp-agent.mjs')}`,
+    '--env',
+    `OPENCODE_CONFIG_DIR=${join(root, 'opencode-config')}`,
     '--env',
     `XDG_CONFIG_HOME=${join(root, 'xdg-config')}`,
     '--env',
@@ -201,6 +264,17 @@ try {
   ]);
   await waitForReady();
   appPid = run('lsof', ['-nP', `-tiTCP:${port}`, '-sTCP:LISTEN']);
+  assert.equal(
+    run('osascript', [
+      '-l',
+      'JavaScript',
+      '-e',
+      'ObjC.import("AppKit"); function run(args) { const url = $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier(args[0]); return ObjC.unwrap(url.path) || ""; }',
+      bundleId,
+    ]),
+    realpathSync(app),
+    'LaunchServices must resolve the installed private bundle before service registration',
+  );
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', project, 'fixture-provider', provider]),
@@ -208,14 +282,24 @@ try {
   );
   const first = startClient(project);
   const second = startClient(project);
+  const peer = startClient(project);
   const a = await first.request(1, 'initialize');
   const b = await second.request(2, 'initialize');
+  const c = await peer.request(11, 'initialize');
   assert.equal(a.id, 1);
   assert.equal(b.id, 2);
   assert.ok(a.result.pid > 0);
   assert.equal(a.result.pid, b.result.pid, 'one provider process serves both agents');
+  assert.equal(a.result.pid, c.result.pid, 'one provider process serves all three clients');
   assert.equal(a.result.initializeCount, 1);
   assert.equal(b.result.initializeCount, 1, 'second agent reuses the provider handshake');
+  assert.equal(c.result.initializeCount, 1);
+  for (const [client, id] of [
+    [first, 12],
+    [second, 13],
+    [peer, 14],
+  ])
+    assert.equal((await client.request(id)).result.pid, a.result.pid);
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', revoked, 'fixture-provider', provider]),
@@ -265,19 +349,24 @@ try {
   await first.waitForExit();
   await assert.rejects(second.request(5));
   await second.waitForExit();
+  await assert.rejects(peer.request(15));
+  await peer.waitForExit();
   assert.match(first.stderr(), /revoked|approval changed/i);
+  await waitForProcessExit(a.result.pid);
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', project, 'fixture-provider', provider]),
     'approved',
   );
   const third = startClient(project);
-  assert.equal((await third.request(6)).id, 6);
+  const replacementSession = await third.request(6);
+  assert.equal(replacementSession.id, 6);
   copyFileSync('/usr/bin/false', join(root, 'replacement'));
   renameSync(join(root, 'replacement'), provider);
   await assert.rejects(third.request(7));
   await third.waitForExit();
   assert.match(third.stderr(), /revoked|approval changed/i);
+  await waitForProcessExit(replacementSession.result.pid);
 
   assert.equal(
     run(binary, ['--context-auth-approve-probe', broken, 'broken-provider', '/usr/bin/false']),
@@ -298,7 +387,14 @@ try {
   try {
     run(binary, ['--context-auth-unregister-probe']);
   } catch {
-    /* Fixture may not have registered. */
+    console.error('Private provider service unregister failed');
+    process.exitCode = 1;
+  }
+  try {
+    assert.equal(run(binary, ['--context-auth-service-status-probe']), '0');
+  } catch {
+    console.error('Private provider service did not confirm unregistered cleanup');
+    process.exitCode = 1;
   }
   if (appPid)
     for (const pid of appPid.split(/\s+/)) {
