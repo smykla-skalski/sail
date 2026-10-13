@@ -139,6 +139,31 @@ export async function setSettingDurable(key: string, value: string): Promise<voi
   await writes;
 }
 
+export async function commitSetting(key: string, value: string): Promise<void> {
+  if (e2eQuiesced) throw new Error('E2E settings writes are quiesced');
+  if (isTauri() && !ready && !e2eSettingsDisabled)
+    throw new Error('Sail settings are unavailable.');
+  const nativeWrite = ready;
+  const mutation = writes
+    .catch(() => undefined)
+    .then(async () => {
+      if (nativeWrite) {
+        await invoke<void>('save_setting', { key, value });
+        if (!e2eQuiesced) {
+          values[key] = value;
+          try {
+            localStorage.setItem(key, value);
+          } catch (cause) {
+            settingsError.set(`Could not mirror Sail settings: ${String(cause)}`);
+          }
+        }
+      } else if (!e2eQuiesced) localStorage.setItem(key, value);
+      return undefined;
+    });
+  writes = mutation;
+  await mutation;
+}
+
 export function removeSetting(key: string): void {
   if (e2eQuiesced) return;
   localStorage.removeItem(key);

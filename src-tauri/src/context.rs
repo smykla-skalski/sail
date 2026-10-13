@@ -685,6 +685,8 @@ unsafe extern "C" {
     ) -> bool;
     fn sail_context_session_close(handle: *mut std::ffi::c_void);
     #[cfg(feature = "e2e")]
+    fn sail_context_probe_service_status(output: *mut std::ffi::c_char, length: usize) -> bool;
+    #[cfg(feature = "e2e")]
     fn sail_context_probe_replay(
         directory: *const std::ffi::c_char,
         error: *mut std::ffi::c_char,
@@ -702,6 +704,19 @@ pub fn service_main() -> i32 {
 #[cfg(target_os = "macos")]
 pub fn is_service_process() -> bool {
     std::env::args().nth(1).as_deref() == Some("--sail-context-service")
+}
+
+#[cfg(all(target_os = "macos", feature = "e2e"))]
+pub fn probe_e2e_service_status() -> Result<String, String> {
+    crate::e2e_config::root()?;
+    let mut output = [0_i8; 2048];
+    if unsafe { sail_context_probe_service_status(output.as_mut_ptr(), output.len()) } {
+        Ok(unsafe { std::ffi::CStr::from_ptr(output.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
+    } else {
+        Err("Context service status diagnostic unavailable.".into())
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "e2e"))]

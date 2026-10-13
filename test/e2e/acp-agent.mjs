@@ -145,6 +145,69 @@ function callWorktreeList(server, callback) {
   request(2, 'tools/call', { name: 'worktree_list', arguments: {} });
 }
 
+function reportSessionTasks(server, callback) {
+  const child = spawn(server.command, server.args ?? [], {
+    env: {
+      ...process.env,
+      ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])),
+    },
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  const lines = createInterface({ input: child.stdout });
+  const request = (id, name, args) =>
+    child.stdin.write(
+      `${JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } })}\n`,
+    );
+  let snapshot;
+  let finished = false;
+  const finish = (result) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timeout);
+    lines.close();
+    child.kill();
+    callback(result);
+  };
+  const timeout = setTimeout(() => finish('Task reporting timed out'), 20_000);
+  lines.on('line', (line) => {
+    try {
+      const response = JSON.parse(line);
+      if (response.result?.isError || response.error) {
+        finish(`Task reporting failed: ${line}`);
+        return;
+      }
+      if (response.id === 2) {
+        snapshot = JSON.parse(response.result.content[0].text);
+        request(3, 'sail_tasks_report', {
+          turnId: snapshot.turnId,
+          expectedRevision: snapshot.revision,
+          tasks: [{ id: 'smoke', title: 'Test live tasks', status: 'in_progress' }],
+          focus: 'smoke',
+        });
+      } else if (response.id === 3) {
+        snapshot = JSON.parse(response.result.content[0].text);
+        setTimeout(
+          () =>
+            request(4, 'sail_tasks_report', {
+              turnId: snapshot.turnId,
+              expectedRevision: snapshot.revision,
+              tasks: [{ id: 'smoke', title: 'Test live tasks', status: 'done' }],
+              focus: null,
+            }),
+          1500,
+        );
+      } else if (response.id === 4) finish('Task reporting passed');
+    } catch (error) {
+      finish(`Task reporting failed: ${String(error)}`);
+    }
+  });
+  child.on('error', (error) => finish(`Task reporting failed: ${String(error)}`));
+  child.stdin.write(
+    `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {} } })}\n`,
+  );
+  setTimeout(() => request(2, 'sail_tasks_read', {}), 1500);
+}
+
 function terminalRequest(method, params, callback) {
   const id = ++nextTerminalRequest;
   terminalRequests.set(id, callback);
@@ -479,6 +542,19 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     activePrompts.set(sessionId, message.id);
     const text = message.params.prompt[0].text;
+    if (text === 'Report session tasks') {
+      const server = sessions
+        .get(sessionId)
+        .mcpServers.find((item) => item.name === 'sail-browser');
+      reportSessionTasks(server, (result) => {
+        recordUpdate(sessionId, sessionId, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: result },
+        });
+        send({ id: message.id, result: { stopReason: 'end_turn' } });
+      });
+      continue;
+    }
     if (text === 'Long owned history') {
       for (let index = 0; index < 80; index++)
         recordUpdate(sessionId, sessionId, {
